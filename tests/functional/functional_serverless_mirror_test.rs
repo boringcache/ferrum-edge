@@ -66,7 +66,7 @@ async fn start_function_server(port: u16, invocations: Arc<AtomicUsize>) {
 
                 let body = r#"{"source":"serverless-function","message":"hello from function"}"#;
                 let response = format!(
-                    "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nContent-Type: application/json\r\nRetry-After: 30\r\nETag: \"function-v1\"\r\nContent-Disposition: attachment; filename=decision.json\r\nSet-Cookie: first=1; Path=/\r\nSet-Cookie: second=2; Path=/\r\nConnection: close, x-function-internal\r\nX-Function-Internal: strip-me\r\nX-Amz-Request-Id: provider-control\r\n\r\n{}",
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nContent-Type: application/json\r\nRetry-After: 30\r\nWWW-Authenticate: Bearer realm=function\r\nTraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nX-RateLimit-Remaining: 0\r\nETag: \"function-v1\"\r\nLast-Modified: Wed, 01 Jan 2025 00:00:00 GMT\r\nDigest: sha-256=stale\r\nContent-Digest: sha-256=:stale:\r\nRepr-Digest: sha-256=:stale:\r\nContent-MD5: stale-md5\r\nContent-Range: bytes 0-63/64\r\nAccept-Ranges: bytes\r\nSignature-Input: sig1=(\"content-digest\")\r\nSignature: sig1=:stale:\r\nContent-Disposition: attachment; filename=decision.json\r\nSet-Cookie: first=1; Path=/\r\nSet-Cookie: second=2; Path=/\r\nConnection: close, x-function-internal\r\nX-Function-Internal: strip-me\r\nX-Amz-Request-Id: provider-control\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -219,6 +219,7 @@ proxies:
     plugins:
       - plugin_config_id: "dedup-1"
       - plugin_config_id: "serverless-1"
+      - plugin_config_id: "response-transformer-1"
 
 consumers: []
 
@@ -240,6 +241,17 @@ plugin_configs:
       mode: "terminate"
       function_url: "http://127.0.0.1:{function_port}/function"
       timeout_ms: 5000
+  - id: "response-transformer-1"
+    proxy_id: "serverless-proxy"
+    plugin_name: "response_transformer"
+    scope: "proxy"
+    enabled: true
+    config:
+      rules:
+        - operation: "update"
+          target: "body"
+          key: "source"
+          value: "gateway-rewritten"
 
 upstreams: []
 "#
@@ -283,12 +295,23 @@ upstreams: []
             .and_then(|value| value.to_str().ok()),
         Some("30")
     );
-    assert_eq!(
-        resp.headers()
-            .get("etag")
-            .and_then(|value| value.to_str().ok()),
-        Some("\"function-v1\"")
-    );
+    for invalidated in [
+        "etag",
+        "last-modified",
+        "digest",
+        "content-digest",
+        "repr-digest",
+        "content-md5",
+        "content-range",
+        "accept-ranges",
+        "signature-input",
+        "signature",
+    ] {
+        assert!(
+            !resp.headers().contains_key(invalidated),
+            "rewritten response retained stale {invalidated}"
+        );
+    }
     assert_eq!(
         resp.headers()
             .get("content-disposition")
@@ -296,14 +319,17 @@ upstreams: []
         Some("attachment; filename=decision.json")
     );
     assert_eq!(resp.headers().get_all("set-cookie").iter().count(), 2);
+    assert!(resp.headers().contains_key("www-authenticate"));
+    assert!(resp.headers().contains_key("traceparent"));
+    assert!(resp.headers().contains_key("x-ratelimit-remaining"));
     assert!(!resp.headers().contains_key("connection"));
     assert!(!resp.headers().contains_key("x-function-internal"));
     assert!(!resp.headers().contains_key("x-amz-request-id"));
 
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("serverless-function"),
-        "Response should come from the serverless function, not the backend. Got: {}",
+        body.contains("gateway-rewritten"),
+        "Response should be the transformed serverless body. Got: {}",
         body
     );
     assert!(
@@ -327,7 +353,19 @@ upstreams: []
             .and_then(|value| value.to_str().ok()),
         Some("true")
     );
-    assert!(replay.text().await.unwrap().contains("serverless-function"));
+    for sanitized in [
+        "retry-after",
+        "www-authenticate",
+        "traceparent",
+        "x-ratelimit-remaining",
+    ] {
+        assert!(
+            !replay.headers().contains_key(sanitized),
+            "dedup replay retained per-request {sanitized}"
+        );
+    }
+    assert_eq!(replay.headers().get_all("set-cookie").iter().count(), 0);
+    assert!(replay.text().await.unwrap().contains("gateway-rewritten"));
     assert_eq!(function_invocations.load(Ordering::SeqCst), 1);
 
     // Exercise the same terminate contract over an H2 frontend connection.
@@ -357,6 +395,8 @@ upstreams: []
             .and_then(|value| value.to_str().ok()),
         Some("30")
     );
+    assert!(!response.headers().contains_key("etag"));
+    assert!(!response.headers().contains_key("content-digest"));
     assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
     assert!(!response.headers().contains_key("x-function-internal"));
     let h2_body = response
@@ -365,7 +405,7 @@ upstreams: []
         .await
         .expect("collect H2 response")
         .to_bytes();
-    assert!(String::from_utf8_lossy(&h2_body).contains("serverless-function"));
+    assert!(String::from_utf8_lossy(&h2_body).contains("gateway-rewritten"));
     assert_eq!(function_invocations.load(Ordering::SeqCst), 2);
 
     let replay_request = Request::builder()
@@ -393,7 +433,7 @@ upstreams: []
         .await
         .expect("collect H2 replay response")
         .to_bytes();
-    assert!(String::from_utf8_lossy(&replay_body).contains("serverless-function"));
+    assert!(String::from_utf8_lossy(&replay_body).contains("gateway-rewritten"));
     assert_eq!(function_invocations.load(Ordering::SeqCst), 2);
     connection_task.abort();
 

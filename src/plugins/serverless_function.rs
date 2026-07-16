@@ -170,6 +170,9 @@ pub struct ServerlessFunction {
     mode: InvocationMode,
     /// For Azure/GCP: the user-supplied URL. For AWS: the computed Lambda Invoke API URL.
     function_url: String,
+    /// Parsed destination used to prevent signed path/query credentials from
+    /// returning to clients through a function-controlled redirect.
+    function_destination: FunctionDestination,
     /// Credential-safe structural form used in every diagnostic and client error path.
     function_display_url: String,
     function_hostname: Option<String>,
@@ -480,6 +483,7 @@ impl ServerlessFunction {
         let function_hostname = Url::parse(&function_url)
             .ok()
             .and_then(|u| http_url_hostname(&u, "function_url").ok());
+        let function_destination = FunctionDestination::new(&function_url)?;
         let function_display_url = redact_serverless_url(&function_url);
         let metadata_prefix = format!(
             "serverless_function.{}.",
@@ -493,6 +497,7 @@ impl ServerlessFunction {
             provider,
             mode,
             function_url,
+            function_destination,
             function_display_url,
             function_hostname,
             metadata_prefix,
@@ -577,7 +582,7 @@ impl ServerlessFunction {
             // this map, so consulting ctx.headers here would miss even the
             // original Content-Type and Content-Encoding values.
             let content_type = proxy_headers.get("content-type");
-            if content_type.is_some_and(is_json_content_type)
+            if content_type.is_some_and(|content_type| is_json_content_type(content_type))
                 && let Ok(json_body) = serde_json::from_slice::<Value>(body)
             {
                 payload.insert("body".into(), json_body);
@@ -620,18 +625,15 @@ impl ServerlessFunction {
             Provider::AwsLambda => {
                 if let Some(ref aws) = self.aws_config {
                     let now = Utc::now();
-                    let auth_headers = sign_aws_request(
-                        aws,
-                        &self.function_url,
-                        &payload_bytes,
-                        &now,
-                    )
-                    .map_err(|_| {
-                        InvocationFailure::new(
-                            "request_signing_failed",
-                            "failed to sign AWS Lambda invocation",
-                        )
-                    })?;
+                    let auth_headers =
+                        sign_aws_request(aws, &self.function_url, &payload_bytes, &now).map_err(
+                            |_| {
+                                InvocationFailure::new(
+                                    "request_signing_failed",
+                                    "failed to sign AWS Lambda invocation",
+                                )
+                            },
+                        )?;
                     for (k, v) in &auth_headers {
                         req_builder = req_builder.header(k.as_str(), v.as_str());
                     }
@@ -665,7 +667,10 @@ impl ServerlessFunction {
         let status = response.status().as_u16();
         let lambda_function_error = self.provider == Provider::AwsLambda
             && response.headers().contains_key("x-amz-function-error");
-        let response_headers = sanitize_function_response_headers(response.headers());
+        let response_headers = sanitize_function_response_headers(
+            response.headers(),
+            &self.function_destination,
+        );
 
         // Stream the response body with a hard cap. Calling `.bytes().await`
         // would buffer the whole payload before any size check fires — a
@@ -797,8 +802,7 @@ fn validate_function_url(url: &str) -> Result<(), String> {
 /// Lambda `aws_endpoint_url` override. Surfaces the field name in the error
 /// so operators see exactly which config key was rejected.
 fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
-    let parsed =
-        Url::parse(url).map_err(|_| format!("serverless_function: invalid {field}"))?;
+    let parsed = Url::parse(url).map_err(|_| format!("serverless_function: invalid {field}"))?;
 
     match parsed.scheme() {
         "http" | "https" => {}
@@ -832,8 +836,8 @@ fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
 
 fn validate_aws_endpoint_url(url: &str) -> Result<(), String> {
     validate_http_url_field(url, "aws_endpoint_url")?;
-    let parsed = Url::parse(url)
-        .map_err(|_| "serverless_function: invalid aws_endpoint_url".to_string())?;
+    let parsed =
+        Url::parse(url).map_err(|_| "serverless_function: invalid aws_endpoint_url".to_string())?;
     if parsed.path() != "/" || parsed.query().is_some() {
         return Err(
             "serverless_function: aws_endpoint_url must be an HTTP(S) origin without a path, query, or fragment"
@@ -875,9 +879,7 @@ fn encode_metadata_segment(segment: &str) -> String {
     encoded
 }
 
-fn reject_encoded_request_body(
-    headers: &HashMap<String, String>,
-) -> Result<(), InvocationFailure> {
+fn reject_encoded_request_body(headers: &HashMap<String, String>) -> Result<(), InvocationFailure> {
     if let Some(encoding) = headers.get("content-encoding")
         && !encoding.trim().eq_ignore_ascii_case("identity")
     {
@@ -920,7 +922,10 @@ fn unambiguous_query_params(
                     "query parameter value was not valid percent-encoded UTF-8",
                 )
             })?;
-            if ordered.insert(key.into_owned(), value.into_owned()).is_some() {
+            if ordered
+                .insert(key.into_owned(), value.into_owned())
+                .is_some()
+            {
                 return Err(InvocationFailure::governed_input(
                     "duplicate_query_parameter",
                     "query forwarding rejected a duplicate decoded parameter name",
@@ -958,12 +963,195 @@ fn has_valid_percent_triplets(value: &str) -> bool {
     true
 }
 
-fn sanitize_function_response_headers(headers: &http::HeaderMap) -> HashMap<String, String> {
+#[derive(Clone)]
+struct FunctionDestination {
+    url: Url,
+    sensitive_path: Option<String>,
+    sensitive_query_pairs: Vec<(String, String)>,
+}
+
+impl FunctionDestination {
+    fn new(raw: &str) -> Result<Self, String> {
+        let url = Url::parse(raw)
+            .map_err(|_| "serverless_function: invalid function destination URL".to_string())?;
+        let sensitive_path = (url.path() != "/" && !url.path().is_empty())
+            .then(|| decode_percent_layers(url.path()));
+        let sensitive_query_pairs = url
+            .query_pairs()
+            .map(|(key, value)| {
+                (
+                    decode_percent_layers(key.as_ref()),
+                    decode_percent_layers(value.as_ref()),
+                )
+            })
+            .collect();
+        Ok(Self {
+            url,
+            sensitive_path,
+            sensitive_query_pairs,
+        })
+    }
+
+    fn has_sensitive_components(&self) -> bool {
+        self.sensitive_path.is_some() || !self.sensitive_query_pairs.is_empty()
+    }
+
+    fn location_exposes_destination(&self, location: &str) -> bool {
+        if !self.has_sensitive_components() {
+            return false;
+        }
+        self.location_exposes_destination_inner(location, 0)
+    }
+
+    fn location_exposes_destination_inner(&self, location: &str, depth: usize) -> bool {
+        // A signed destination makes an unparseable Location unsafe: Ferrum
+        // cannot prove that an encoded credential is absent, so fail closed by
+        // removing the field. Valid benign relative/absolute redirects remain
+        // eligible below.
+        let decoded_location = decode_percent_layers(location);
+        let Some(candidate) = self
+            .url
+            .join(location)
+            .ok()
+            .or_else(|| self.url.join(&decoded_location).ok())
+        else {
+            return true;
+        };
+
+        // Do not forward redirect userinfo supplied by a function. It is both a
+        // credential-bearing URI surface and unnecessary for identifying a
+        // benign redirect destination.
+        if !candidate.username().is_empty() || candidate.password().is_some() {
+            return true;
+        }
+
+        let candidate_pairs: Vec<(String, String)> = candidate
+            .query_pairs()
+            .map(|(key, value)| {
+                (
+                    decode_percent_layers(key.as_ref()),
+                    decode_percent_layers(value.as_ref()),
+                )
+            })
+            .collect();
+
+        let candidate_path = decode_percent_layers(candidate.path());
+        let exposes_signed_path = self
+            .sensitive_path
+            .as_deref()
+            .is_some_and(|path| candidate_path == path);
+        // A signed path is credential material even if the function copies it
+        // onto another authority. Restricting this comparison to same-origin
+        // redirects would disclose path-embedded tokens through an attacker
+        // controlled host.
+        if exposes_signed_path {
+            return true;
+        }
+
+        // Query credentials are unsafe even when copied onto another host or
+        // path. Compare decoded pairs structurally so reordering and ordinary
+        // percent-encoding changes cannot evade the check.
+        if self
+            .sensitive_query_pairs
+            .iter()
+            .any(|pair| candidate_pairs.iter().any(|candidate| candidate == pair))
+        {
+            return true;
+        }
+
+        // Redirectors commonly embed their next destination as an encoded
+        // query value or fragment. Inspect those URI references recursively,
+        // but only when they are syntactically URI-like: treating every scalar
+        // as a relative path would remove benign redirects such as
+        // `https://example.test/next?label=signed/trigger`. Cap depth so hostile
+        // nested values have fixed work per response.
+        if depth < 2 {
+            for (key, value) in &candidate_pairs {
+                if nested_uri_reference(key).is_some_and(|reference| {
+                    self.location_exposes_destination_inner(reference, depth + 1)
+                }) || nested_uri_reference(value).is_some_and(|reference| {
+                    self.location_exposes_destination_inner(reference, depth + 1)
+                }) {
+                    return true;
+                }
+            }
+            if let Some(reference) = nested_uri_reference(&candidate_path)
+                && self.location_exposes_destination_inner(reference, depth + 1)
+            {
+                return true;
+            }
+            if let Some(fragment) = candidate.fragment() {
+                let decoded_fragment = decode_percent_layers(fragment);
+                if let Some(reference) = nested_uri_reference(&decoded_fragment)
+                    && self.location_exposes_destination_inner(reference, depth + 1)
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
+fn nested_uri_reference(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // An encoded absolute URL embedded in a path commonly appears as
+    // `/https://host/...` after decoding. Remove only that transport slash;
+    // ordinary absolute-path references retain their leading slash.
+    if let Some(without_slash) = trimmed.strip_prefix('/')
+        && (has_ascii_case_insensitive_prefix(without_slash, "http://")
+            || has_ascii_case_insensitive_prefix(without_slash, "https://"))
+    {
+        return Some(without_slash);
+    }
+
+    (has_ascii_case_insensitive_prefix(trimmed, "http://")
+        || has_ascii_case_insensitive_prefix(trimmed, "https://")
+        || trimmed.starts_with("//")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with('?')
+        || trimmed.starts_with('#'))
+    .then_some(trimmed)
+}
+
+fn has_ascii_case_insensitive_prefix(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+fn decode_percent_layers(value: &str) -> String {
+    let mut decoded = value.to_string();
+    for _ in 0..3 {
+        let next = percent_decode_str(&decoded)
+            .decode_utf8_lossy()
+            .into_owned();
+        if next == decoded {
+            break;
+        }
+        decoded = next;
+    }
+    decoded
+}
+
+fn sanitize_function_response_headers(
+    headers: &http::HeaderMap,
+    function_destination: &FunctionDestination,
+) -> HashMap<String, String> {
     let connection_listed: HashSet<HeaderName> =
         crate::proxy::headers::parse_connection_listed_headers(headers)
             .into_iter()
             .collect();
     let mut safe = HashMap::new();
+    let mut location_blocked = false;
     for (name, value) in headers {
         let lower = name.as_str();
         if connection_listed.contains(name)
@@ -975,6 +1163,15 @@ fn sanitize_function_response_headers(headers: &http::HeaderMap) -> HashMap<Stri
         let Ok(value) = value.to_str() else {
             continue;
         };
+        if lower == "location" {
+            if location_blocked
+                || function_destination.location_exposes_destination(value)
+            {
+                safe.remove("location");
+                location_blocked = true;
+                continue;
+            }
+        }
         if lower == "set-cookie" {
             crate::proxy::headers::append_set_cookie_header(&mut safe, value.to_string());
         } else {
@@ -1217,7 +1414,9 @@ impl Plugin for ServerlessFunction {
             // distinguish an attempted externally executing terminal response
             // from other synthetic short-circuits that must not be cached.
             // Set it only after all plugin-local fail-closed inspection passes.
-            ctx.serverless_external_side_effect = true;
+            ctx.serverless_external_side_effect_owners.extend(
+                ctx.request_deduplication_states.keys().copied(),
+            );
         }
 
         let (status, response_headers, body) = match self.invoke(&payload, ctx).await {
@@ -1243,8 +1442,7 @@ impl Plugin for ServerlessFunction {
                     "serverless_function: terminate mode — returning function response (status {})",
                     status
                 );
-                let body = if ctx.method.eq_ignore_ascii_case("HEAD")
-                    || matches!(status, 204 | 304)
+                let body = if ctx.method.eq_ignore_ascii_case("HEAD") || matches!(status, 204 | 304)
                 {
                     Bytes::new()
                 } else {
@@ -1288,9 +1486,11 @@ impl Plugin for ServerlessFunction {
                             candidates.insert(name.as_str().to_string(), value.to_string());
                         }
                         let connection_listed: HashSet<String> =
-                            crate::proxy::headers::parse_connection_listed_from_str_map(&candidates)
-                                .into_iter()
-                                .collect();
+                            crate::proxy::headers::parse_connection_listed_from_str_map(
+                                &candidates,
+                            )
+                            .into_iter()
+                            .collect();
                         for (key, value) in candidates {
                             if connection_listed.contains(&key)
                                 || crate::proxy::headers::is_backend_request_strip_header(&key)
@@ -1306,7 +1506,8 @@ impl Plugin for ServerlessFunction {
                         for (key, val) in meta_map {
                             if let Some(value) = val.as_str() {
                                 let suffix = format!("metadata.{}", encode_metadata_segment(key));
-                                ctx.metadata.insert(self.metadata_key(&suffix), value.to_string());
+                                ctx.metadata
+                                    .insert(self.metadata_key(&suffix), value.to_string());
                             }
                         }
                     }

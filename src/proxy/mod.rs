@@ -13505,7 +13505,11 @@ async fn apply_synthetic_response_body_hooks(
         {
             response_headers.insert("content-length".to_string(), transformed.len().to_string());
             *response_body = transformed;
-            plugin.on_response_body_transformed(ctx, response_headers);
+            crate::plugins::finalize_response_body_transformation(
+                plugin.as_ref(),
+                ctx,
+                response_headers,
+            );
         }
     }
 
@@ -19040,7 +19044,8 @@ async fn handle_proxy_request_inner(
                                 transformed.len().to_string(),
                             );
                             response_body = transformed;
-                            plugin.on_response_body_transformed(
+                            crate::plugins::finalize_response_body_transformation(
+                                plugin.as_ref(),
                                 &mut ctx,
                                 &mut plugin_response_headers,
                             );
@@ -20684,7 +20689,11 @@ async fn handle_proxy_request_inner(
                 response_headers
                     .insert("content-length".to_string(), transformed.len().to_string());
                 *data = transformed;
-                plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
+                crate::plugins::finalize_response_body_transformation(
+                    plugin.as_ref(),
+                    &mut ctx,
+                    &mut response_headers,
+                );
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;

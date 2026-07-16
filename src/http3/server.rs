@@ -5578,7 +5578,11 @@ async fn handle_h3_request(
                     response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());
                     response_body = transformed;
-                    plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
+                    crate::plugins::finalize_response_body_transformation(
+                        plugin.as_ref(),
+                        &mut ctx,
+                        &mut response_headers,
+                    );
                     // A plugin (response_transformer, compression, grpc_web, …)
                     // replaced the bytes sent to the client. The backend's
                     // trailers (digest/checksum/app-status) described the

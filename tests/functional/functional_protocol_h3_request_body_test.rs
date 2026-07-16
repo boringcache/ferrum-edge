@@ -332,7 +332,10 @@ async fn functional_h3_serverless_redirect_is_not_pre_proxy_approval() {
     drop(https_reservation);
 
     let mut gateway = TestGateway::builder()
-        .mode_file(build_serverless_redirect_config(backend_port, function_port))
+        .mode_file(build_serverless_redirect_config(
+            backend_port,
+            function_port,
+        ))
         .log_level("warn")
         .capture_output()
         .env("FERRUM_ENABLE_HTTP3", "true")

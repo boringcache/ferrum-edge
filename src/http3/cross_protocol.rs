@@ -2374,7 +2374,11 @@ where
                     response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());
                     response_body = transformed;
-                    plugin.on_response_body_transformed(ctx, &mut response_headers);
+                    crate::plugins::finalize_response_body_transformation(
+                        plugin.as_ref(),
+                        ctx,
+                        &mut response_headers,
+                    );
                 }
             }
 
@@ -3799,7 +3803,11 @@ where
                     plugin_response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());
                     response_body = transformed;
-                    plugin.on_response_body_transformed(ctx, &mut plugin_response_headers);
+                    crate::plugins::finalize_response_body_transformation(
+                        plugin.as_ref(),
+                        ctx,
+                        &mut plugin_response_headers,
+                    );
                 }
             }
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {

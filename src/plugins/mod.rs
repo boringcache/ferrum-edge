@@ -113,7 +113,7 @@ use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -220,6 +220,62 @@ pub fn apply_initial_response_header_policies(
     for plugin in policy_plugins {
         plugin.apply_initial_response_header_policy(response_headers);
     }
+}
+
+/// Representation metadata that becomes invalid whenever a buffered response
+/// transform replaces the client-visible bytes.
+const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
+    "accept-ranges",
+    "content-range",
+    "content-md5",
+    "digest",
+    "content-digest",
+    "repr-digest",
+    "etag",
+    "last-modified",
+    "delta-base",
+    "im",
+    "variant-key",
+    "signature",
+    "signature-input",
+    "content-signature",
+    "content-signature-input",
+    "content-checksum",
+];
+
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+fn is_transform_invalidated_response_header(name: &str) -> bool {
+    TRANSFORM_INVALIDATED_RESPONSE_HEADERS
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
+        || starts_with_ascii_case_insensitive(name, "x-amz-checksum-")
+        || starts_with_ascii_case_insensitive(name, "x-checksum-")
+        || name.eq_ignore_ascii_case("x-goog-hash")
+        || name.eq_ignore_ascii_case("x-ms-content-crc64")
+}
+
+/// Finalize one successful buffered response-body transformation.
+///
+/// Every protocol path calls this immediately after replacing the bytes and
+/// recomputing `Content-Length`. The lifecycle owns invalidation of upstream
+/// validators, range metadata, integrity digests, and content-bound signatures
+/// so an individual transformer cannot accidentally leave stale metadata. The
+/// plugin-specific hook runs afterward and may attach metadata it recomputed
+/// for the new representation. Returning `None` from the transform skips this
+/// function, preserving untouched response semantics.
+pub(crate) fn finalize_response_body_transformation(
+    plugin: &dyn Plugin,
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+) {
+    response_headers.retain(|name, _| !is_transform_invalidated_response_header(name));
+    plugin.on_response_body_transformed(ctx, response_headers);
 }
 
 /// Ordered outcome of deterministic initial-response policy for a buffered
@@ -769,10 +825,18 @@ pub struct RequestContext {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
-    /// Private provenance for a terminal serverless invocation. Deduplication
-    /// uses this to cache an externally executed synthetic response rather than
-    /// releasing the idempotency key and repeating the side effect on retry.
-    pub(crate) serverless_external_side_effect: bool,
+    /// Per-`request_deduplication`-instance completion state acquired during
+    /// `before_proxy`. Keeping this out of public metadata prevents internal
+    /// cache keys and lock tokens from entering transaction logs. The map is
+    /// bounded by the configured deduplication instances on the matched proxy.
+    pub(crate) request_deduplication_states:
+        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
+    /// Deduplication instances that own protection for a terminal serverless
+    /// invocation. Each committed/stream-terminal hook consumes or observes
+    /// only its own entry, so one instance cannot publish into another cache or
+    /// release another instance's in-flight marker. This set is bounded by the
+    /// completion-state map above.
+    pub(crate) serverless_external_side_effect_owners: HashSet<u64>,
     /// Encoding selected by the built-in compression plugin for the response it
     /// will create at the gateway. This is authoritative ownership state for
     /// distinguishing planned gateway compression from an already-encoded
@@ -1100,7 +1164,8 @@ impl RequestContext {
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
-            serverless_external_side_effect: false,
+            request_deduplication_states: HashMap::new(),
+            serverless_external_side_effect_owners: HashSet::new(),
             gateway_response_compression_algorithm: None,
             response_stream_id: None,
             response_stream_completion: None,
@@ -1262,7 +1327,10 @@ impl RequestContext {
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
-            serverless_external_side_effect: self.serverless_external_side_effect,
+            request_deduplication_states: self.request_deduplication_states.clone(),
+            serverless_external_side_effect_owners: self
+                .serverless_external_side_effect_owners
+                .clone(),
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
@@ -3834,12 +3902,13 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Called immediately after this plugin returns a transformed response
-    /// body, before the next body transform runs.
+    /// body, after the core removes stale representation metadata and before
+    /// the next body transform runs.
     ///
-    /// Use this for response headers that are valid only for the original body
-    /// representation, such as upstream validators or integrity digests. The
-    /// hook is not called when the transform returns `None`, so unchanged
-    /// responses retain their original headers.
+    /// Use this to attach validators, integrity digests, or other headers the
+    /// plugin recomputed for its replacement bytes. The hook is not called when
+    /// the transform returns `None`, so unchanged responses retain their
+    /// original headers.
     fn on_response_body_transformed(
         &self,
         _ctx: &mut RequestContext,

@@ -6,7 +6,10 @@ use ferrum_edge::{
         jwt_auth::{JwtConfig, JwtManager},
         serve_admin_on_listener,
     },
-    config::db_loader::{DatabaseStore, DbPoolConfig},
+    config::{
+        db_loader::{DatabaseStore, DbPoolConfig},
+        types::{PluginConfig, PluginScope},
+    },
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -502,12 +505,8 @@ async fn serverless_config_audit_and_non_admin_reads_redact_url_credentials() {
         "[REDACTED]"
     );
 
-    let (status, viewer_body) = get_json(
-        &base,
-        "/plugins/config/serverless-redaction",
-        &viewer,
-    )
-    .await;
+    let (status, viewer_body) =
+        get_json(&base, "/plugins/config/serverless-redaction", &viewer).await;
     assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
     assert_eq!(
         viewer_body["config"]["function_url"],
@@ -517,6 +516,76 @@ async fn serverless_config_audit_and_non_admin_reads_redact_url_credentials() {
     let serialized = format!("{event:?}{viewer_body:?}");
     assert!(!serialized.contains(trigger_secret));
     assert!(!serialized.contains(function_key));
+}
+
+#[tokio::test]
+async fn malformed_persisted_serverless_url_is_wholly_redacted_from_views_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let store = make_store(&tmp).await;
+    let nested_secret = "nested-signed-trigger-secret";
+    let plugin_id = "malformed-serverless-redaction";
+    store
+        .create_plugin_config(&PluginConfig {
+            id: plugin_id.to_string(),
+            plugin_name: "serverless_function".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "provider": "azure_functions",
+                "function_url": [
+                    null,
+                    {"nested": format!("https://functions.example/run?code={nested_secret}")}
+                ]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist malformed legacy plugin config");
+
+    let state = admin_state(store);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+
+    let (status, viewer_body) = get_json(
+        &base,
+        &format!("/plugins/config/{plugin_id}"),
+        &viewer,
+    )
+    .await;
+    assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
+    assert_eq!(viewer_body["config"]["function_url"], "[REDACTED]");
+    assert!(!viewer_body.to_string().contains(nested_secret));
+
+    let response = reqwest::Client::new()
+        .delete(format!("{base}/plugins/config/{plugin_id}"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .expect("delete malformed persisted plugin config");
+    assert_eq!(response.status().as_u16(), 204);
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        &format!("/audit?resource_type=plugin_config&resource_id={plugin_id}"),
+        &admin,
+        1,
+    )
+    .await;
+    let event = &audit_body["items"].as_array().expect("audit items")[0];
+    assert_eq!(
+        event["diff"]["before"]["config"]["function_url"],
+        "[REDACTED]"
+    );
+    assert!(
+        !event["diff"].to_string().contains(nested_secret),
+        "malformed nested function URL leaked into audit: {event:?}"
+    );
 }
 
 #[tokio::test]

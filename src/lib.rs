@@ -330,6 +330,13 @@ pub mod _test_support {
         plugin.completed_size_snapshot_for_tests()
     }
 
+    pub fn request_deduplication_request_identity_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<(String, String)> {
+        plugin.request_identity_for_tests(ctx)
+    }
+
     pub fn request_deduplication_expire_completed_entries_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
     ) {

@@ -1855,8 +1855,7 @@ pub(crate) fn validate_hmac_request_transform_candidate(
                         .get("forward_body")
                         .and_then(serde_json::Value::as_bool)
                         == Some(true)))
-    })
-    {
+    }) {
         return Ok(());
     }
     let mut errors = Vec::new();

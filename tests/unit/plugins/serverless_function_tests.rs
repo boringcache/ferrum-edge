@@ -179,7 +179,10 @@ fn test_explicit_null_is_rejected_instead_of_defaulted() {
         config[field] = Value::Null;
         let err = expect_err(ServerlessFunction::new(&config, default_client()));
         assert!(err.contains(field), "field={field}, got: {err}");
-        assert!(err.contains("must not be null"), "field={field}, got: {err}");
+        assert!(
+            err.contains("must not be null"),
+            "field={field}, got: {err}"
+        );
     }
 }
 
@@ -194,7 +197,10 @@ fn test_function_urls_reject_userinfo_without_echoing_credentials() {
         default_client(),
     ));
     assert!(err.contains("must not contain URL userinfo"));
-    assert!(!err.contains(secret), "credential leaked in config error: {err}");
+    assert!(
+        !err.contains(secret),
+        "credential leaked in config error: {err}"
+    );
 }
 
 #[test]
@@ -206,8 +212,14 @@ fn test_function_urls_reject_fragments_that_clients_do_not_send() {
         }),
         default_client(),
     ));
-    assert!(err.contains("must not contain a URL fragment"), "got: {err}");
-    assert!(!err.contains("credential"), "fragment leaked in config error: {err}");
+    assert!(
+        err.contains("must not contain a URL fragment"),
+        "got: {err}"
+    );
+    assert!(
+        !err.contains("credential"),
+        "fragment leaked in config error: {err}"
+    );
 }
 
 #[test]
@@ -560,7 +572,10 @@ fn test_error_status_code_below_400_rejects() {
             }),
             default_client(),
         ));
-        assert!(err.contains("error_status_code"), "status={status}, got: {err}");
+        assert!(
+            err.contains("error_status_code"),
+            "status={status}, got: {err}"
+        );
     }
 }
 
@@ -1203,10 +1218,7 @@ async fn test_terminate_forwards_safe_headers_and_preserves_repeated_cookies() {
     .unwrap();
     let mut ctx = create_test_context();
 
-    match plugin
-        .before_proxy(&mut ctx, &mut HashMap::new())
-        .await
-    {
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
         PluginResult::RejectBinary {
             status_code,
             body,
@@ -1216,7 +1228,10 @@ async fn test_terminate_forwards_safe_headers_and_preserves_repeated_cookies() {
             assert_eq!(&body[..], b"redirect");
             assert_eq!(headers.get("location").map(String::as_str), Some("/next"));
             assert_eq!(headers.get("retry-after").map(String::as_str), Some("30"));
-            assert_eq!(headers.get("etag").map(String::as_str), Some("\"version-1\""));
+            assert_eq!(
+                headers.get("etag").map(String::as_str),
+                Some("\"version-1\"")
+            );
             assert_eq!(
                 headers.get("set-cookie").map(String::as_str),
                 Some("a=1; Path=/\nb=2; Path=/")
@@ -1228,10 +1243,118 @@ async fn test_terminate_forwards_safe_headers_and_preserves_repeated_cookies() {
                 "x-amz-request-id",
                 "x-api-key",
             ] {
-                assert!(!headers.contains_key(stripped), "header survived: {stripped}");
+                assert!(
+                    !headers.contains_key(stripped),
+                    "header survived: {stripped}"
+                );
             }
         }
         other => panic!("expected terminal function response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_strips_redirects_that_expose_signed_function_destination() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for case in [
+        "relative-query",
+        "absolute-destination",
+        "scheme-relative",
+        "decoded-path",
+        "copied-path-other-host",
+        "nested-double-encoded",
+        "nested-path-encoded",
+        "copied-query-other-host",
+        "malformed",
+        "userinfo",
+        "benign-relative",
+        "benign-same-origin",
+        "benign-external",
+        "benign-external-label",
+    ] {
+        let server = MockServer::start().await;
+        let function_url = format!(
+            "{}/signed%2Ftrigger?code=secret%2Fvalue",
+            server.uri()
+        );
+        let location = match case {
+            "relative-query" => "?code=secret%2Fvalue".to_string(),
+            "absolute-destination" => function_url.clone(),
+            "scheme-relative" => function_url
+                .strip_prefix("http:")
+                .expect("wiremock URI uses HTTP")
+                .to_string(),
+            "decoded-path" => {
+                format!("{}/signed/trigger?unrelated=1", server.uri())
+            }
+            "copied-path-other-host" => {
+                "https://redirect.example/signed/trigger?unrelated=1".to_string()
+            }
+            "nested-double-encoded" => {
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();
+                let double_encoded: String =
+                    url::form_urlencoded::byte_serialize(encoded.as_bytes()).collect();
+                format!("https://redirect.example/continue?next={double_encoded}")
+            }
+            "nested-path-encoded" => {
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();
+                format!("https://redirect.example/{encoded}")
+            }
+            "copied-query-other-host" => {
+                "https://redirect.example/next?code=secret%2Fvalue".to_string()
+            }
+            "malformed" => "http://[signed%2Ftrigger?code=secret%2Fvalue".to_string(),
+            "userinfo" => "https://user:password@redirect.example/next".to_string(),
+            "benign-relative" => "/next".to_string(),
+            "benign-same-origin" => format!("{}/safe?code=other", server.uri()),
+            "benign-external" => "https://redirect.example/next?code=other".to_string(),
+            "benign-external-label" => {
+                "https://redirect.example/next?label=signed/trigger".to_string()
+            }
+            _ => unreachable!(),
+        };
+        let should_strip = !case.starts_with("benign-");
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .set_body_string("redirect")
+                    .insert_header("location", location.as_str()),
+            )
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": function_url,
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::RejectBinary { headers, .. } => {
+                if should_strip {
+                    assert!(
+                        !headers.contains_key("location"),
+                        "credential-bearing Location survived case {case}: {headers:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        headers.get("location").map(String::as_str),
+                        Some(location.as_str()),
+                        "benign Location changed in case {case}"
+                    );
+                }
+            }
+            other => panic!("expected terminal redirect for case {case}, got {other:?}"),
+        }
     }
 }
 
@@ -1529,10 +1652,11 @@ async fn test_secret_bearing_url_never_reaches_client_or_metadata() {
         }
         other => panic!("expected opaque invocation error, got {other:?}"),
     }
-    assert!(ctx
-        .metadata
-        .iter()
-        .all(|(key, value)| !key.contains(secret) && !value.contains(secret)));
+    assert!(
+        ctx.metadata
+            .iter()
+            .all(|(key, value)| !key.contains(secret) && !value.contains(secret))
+    );
 }
 
 #[tokio::test]
@@ -1560,9 +1684,10 @@ async fn test_pre_proxy_mode_allows_grpc_requests() {
     // Should NOT get the gRPC rejection — should proceed to invoke (and fail with continue)
     match result {
         PluginResult::Continue => {
-            assert!(ctx
-                .metadata
-                .contains_key("serverless_function.standalone.error_class"));
+            assert!(
+                ctx.metadata
+                    .contains_key("serverless_function.standalone.error_class")
+            );
         }
         other => panic!("Expected Continue (not gRPC rejection), got {:?}", other),
     }

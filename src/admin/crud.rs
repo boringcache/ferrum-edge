@@ -1431,9 +1431,15 @@ fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
     if let Some(config) = body.get_mut("config") {
         if resource.plugin_name == "serverless_function"
             && let Some(url) = config.get_mut("function_url")
-            && let Some(raw) = url.as_str()
         {
-            *url = json!(crate::plugins::serverless_function::redact_serverless_url(raw));
+            *url = match url.as_str() {
+                Some(raw) => {
+                    json!(crate::plugins::serverless_function::redact_serverless_url(
+                        raw
+                    ))
+                }
+                None => json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER),
+            };
         }
         redact_sensitive_plugin_config_fields(config);
     }

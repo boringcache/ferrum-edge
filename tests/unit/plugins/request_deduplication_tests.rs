@@ -3,6 +3,7 @@ use ferrum_edge::_test_support::{
     request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
     request_deduplication_expire_inflight_entries_for_test,
+    request_deduplication_request_identity_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
     request_deduplication_redis_payload_for_test,
 };
@@ -17,11 +18,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 
-const DEDUP_KEY_METADATA: &str = "_dedup_key";
-const DEDUP_FINGERPRINT_METADATA: &str = "_dedup_fingerprint";
-
 fn make_plugin(config: serde_json::Value) -> RequestDeduplication {
     RequestDeduplication::new(&config, PluginHttpClient::default()).unwrap()
+}
+
+fn request_identity(
+    plugin: &RequestDeduplication,
+    ctx: &RequestContext,
+) -> Option<(String, String)> {
+    request_deduplication_request_identity_for_test(plugin, ctx)
 }
 
 fn keyed_headers(key: &str, host: &str, body_len: usize) -> HashMap<String, String> {
@@ -324,7 +329,7 @@ async fn test_first_request_passes_then_replay() {
 
     let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx1.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx1).is_some());
 
     // Simulate response caching
     let mut response_headers = HashMap::new();
@@ -386,7 +391,7 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
 
     let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx1.metadata.contains_key(DEDUP_KEY_METADATA));
+    assert!(request_identity(&plugin, &ctx1).is_some());
 
     // A later before_proxy plugin short-circuits with a synthetic 2xx body. The
     // proxy marks the context before running the response-body hooks; emulate it.
@@ -424,7 +429,7 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
         matches!(result, PluginResult::Continue),
         "second request with same key must pass through, not replay a synthetic body; got {result:?}"
     );
-    assert!(ctx2.metadata.contains_key(DEDUP_KEY_METADATA));
+    assert!(request_identity(&plugin, &ctx2).is_some());
 }
 
 #[tokio::test]
@@ -497,6 +502,105 @@ async fn terminal_serverless_non_2xx_is_stored_at_response_commit() {
             );
         }
         other => panic!("retry must replay without invoking again, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("one-side-effect"))
+        .mount(&server)
+        .await;
+
+    let first = make_plugin(json!({"header_name": "idempotency-key-a"}));
+    let second = make_plugin(json!({"header_name": "idempotency-key-b"}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::from([
+        ("idempotency-key-a".to_string(), "owner-a".to_string()),
+        ("idempotency-key-b".to_string(), "owner-b".to_string()),
+    ]);
+    for plugin in [&first, &second] {
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+
+    let (status, response_headers, body) = match serverless
+        .before_proxy(&mut ctx, &mut headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+        } => (status_code, headers, body),
+        other => panic!("expected terminal serverless response, got {other:?}"),
+    };
+    assert_eq!(status, 503);
+
+    // The ordinary final-body phase must leave both owners pending until the
+    // settled committed terminal response is available.
+    for plugin in [&first, &second] {
+        assert!(matches!(
+            plugin
+                .on_final_response_body(&mut ctx, status, &response_headers, &body)
+                .await,
+            PluginResult::Continue
+        ));
+        assert_eq!(plugin.tracked_keys_count(), Some(1));
+    }
+
+    // Each committed hook consumes only its own provenance and publishes into
+    // its own cache. The first hook must not clear the second owner's marker.
+    first
+        .on_response_committed(&mut ctx, status, &response_headers, &body)
+        .await;
+    second
+        .on_response_committed(&mut ctx, status, &response_headers, &body)
+        .await;
+
+    for (plugin, header_name, key) in [
+        (&first, "idempotency-key-a", "owner-a"),
+        (&second, "idempotency-key-b", "owner-b"),
+    ] {
+        let mut retry_ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        let mut retry_headers = HashMap::from([(header_name.to_string(), key.to_string())]);
+        match plugin
+            .before_proxy(&mut retry_ctx, &mut retry_headers)
+            .await
+        {
+            PluginResult::RejectBinary {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 503);
+                assert_eq!(&body[..], b"one-side-effect");
+            }
+            other => panic!("instance {header_name} did not retain its replay: {other:?}"),
+        }
     }
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
@@ -623,7 +727,7 @@ async fn test_put_method_deduplicates() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx).is_some());
 }
 
 #[tokio::test]
@@ -644,7 +748,7 @@ async fn test_custom_applicable_methods() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(!ctx.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx).is_none());
 
     // DELETE should be deduplication-eligible
     let mut ctx2 = RequestContext::new(
@@ -657,7 +761,7 @@ async fn test_custom_applicable_methods() {
 
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx2.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx2).is_some());
 }
 
 #[test]
@@ -761,7 +865,7 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_clean_completion
     assert!(matches!(result, PluginResult::Continue));
     // The fresh key is marked in-flight and stays that way for the stream.
     assert_eq!(plugin.tracked_keys_count(), Some(1));
-    assert!(ctx.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx).is_some());
 
     // The SSE response is streamed (not buffered), confirmed by the content-type
     // refinement declining to buffer it.
@@ -885,9 +989,7 @@ async fn test_streamed_fallback_retains_marker_after_uncertain_serverless_side_e
         "serverless-stream-key".to_string(),
     );
     assert!(matches!(
-        dedup
-            .before_proxy(&mut retry_ctx, &mut retry_headers)
-            .await,
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
         PluginResult::Reject {
             status_code: 409,
             ..
@@ -1040,7 +1142,7 @@ async fn test_buffered_response_transitions_inflight_to_completed() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(plugin.tracked_keys_count(), Some(1));
-    assert!(ctx.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx).is_some());
 
     // A JSON response is buffered (the content-type refinement still votes to
     // buffer), so `on_final_response_body` runs and caches it.
@@ -1745,7 +1847,7 @@ async fn test_keyed_idempotency_header_can_fingerprint_prebuffered_body() {
     let mut headers = keyed_headers("transformed-key", "api.example", 7);
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx.metadata.contains_key(DEDUP_FINGERPRINT_METADATA));
+    assert!(request_identity(&plugin, &ctx).is_some());
 }
 
 #[tokio::test]
@@ -2324,8 +2426,8 @@ async fn test_delimiter_containing_identities_and_keys_do_not_collide() {
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let key1 = ctx1.metadata.get(DEDUP_KEY_METADATA).unwrap();
-    let key2 = ctx2.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    let (key1, _) = request_identity(&plugin, &ctx1).unwrap();
+    let (key2, _) = request_identity(&plugin, &ctx2).unwrap();
     assert_ne!(key1, key2);
     assert!(!key1.contains("alice"));
     assert!(!key1.contains("key"));
@@ -2354,8 +2456,8 @@ async fn test_peer_spiffe_id_scopes_logical_key() {
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let key1 = ctx1.metadata.get(DEDUP_KEY_METADATA).unwrap();
-    let key2 = ctx2.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    let (key1, _) = request_identity(&plugin, &ctx1).unwrap();
+    let (key2, _) = request_identity(&plugin, &ctx2).unwrap();
     assert_ne!(key1, key2);
     assert!(!key1.contains("blue"));
     assert!(!key2.contains("green"));
@@ -2376,8 +2478,7 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let logical_key = ctx.metadata.get(DEDUP_KEY_METADATA).unwrap();
-    let fingerprint = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA).unwrap();
+    let (logical_key, fingerprint) = request_identity(&plugin, &ctx).unwrap();
     assert!(logical_key.starts_with("v2:"));
     assert!(fingerprint.starts_with("sha256-"));
     for secret in [
@@ -2418,11 +2519,11 @@ async fn test_local_and_redis_modes_compute_identical_request_identity() {
     assert!(matches!(redis_result, PluginResult::Continue));
 
     assert_eq!(
-        local_ctx.metadata.get(DEDUP_KEY_METADATA),
-        redis_ctx.metadata.get(DEDUP_KEY_METADATA)
+        request_identity(&local_plugin, &local_ctx).map(|identity| identity.0),
+        request_identity(&redis_plugin, &redis_ctx).map(|identity| identity.0)
     );
     assert_eq!(
-        local_ctx.metadata.get(DEDUP_FINGERPRINT_METADATA),
-        redis_ctx.metadata.get(DEDUP_FINGERPRINT_METADATA)
+        request_identity(&local_plugin, &local_ctx).map(|identity| identity.1),
+        request_identity(&redis_plugin, &redis_ctx).map(|identity| identity.1)
     );
 }
