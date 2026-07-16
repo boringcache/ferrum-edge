@@ -1919,7 +1919,10 @@ async fn test_admin_create_rejects_malformed_correlation_id_configs() {
         });
         let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
 
-        assert_eq!(status, 400, "malformed correlation config was admitted: {body}");
+        assert_eq!(
+            status, 400,
+            "malformed correlation config was admitted: {body}"
+        );
         assert!(
             body.to_string().contains(expected_error),
             "unexpected admin validation response: {body}"

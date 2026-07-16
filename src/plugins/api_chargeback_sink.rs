@@ -2355,7 +2355,11 @@ fn event_from_http_summary(
         request_id: if config.include_request_id {
             metadata_value(
                 metadata,
-                &[super::REQUEST_ID_METADATA_KEY, "x-request-id", "correlation_id"],
+                &[
+                    super::REQUEST_ID_METADATA_KEY,
+                    "x-request-id",
+                    "correlation_id",
+                ],
             )
         } else {
             None
@@ -2405,7 +2409,11 @@ fn event_from_stream_summary(
         request_id: if config.include_request_id {
             metadata_value(
                 metadata,
-                &[super::REQUEST_ID_METADATA_KEY, "x-request-id", "correlation_id"],
+                &[
+                    super::REQUEST_ID_METADATA_KEY,
+                    "x-request-id",
+                    "correlation_id",
+                ],
             )
         } else {
             None
@@ -2455,7 +2463,11 @@ fn event_from_ws_summary(
         request_id: if config.include_request_id {
             metadata_value(
                 metadata,
-                &[super::REQUEST_ID_METADATA_KEY, "x-request-id", "correlation_id"],
+                &[
+                    super::REQUEST_ID_METADATA_KEY,
+                    "x-request-id",
+                    "correlation_id",
+                ],
             )
         } else {
             None

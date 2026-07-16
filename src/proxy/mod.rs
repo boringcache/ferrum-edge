@@ -8416,11 +8416,7 @@ pub(crate) fn finalize_successful_websocket_response_headers(
     response_headers: &mut HashMap<String, String>,
 ) {
     for plugin in plugins {
-        plugin.apply_websocket_handshake_response_headers(
-            ctx,
-            response_status,
-            response_headers,
-        );
+        plugin.apply_websocket_handshake_response_headers(ctx, response_status, response_headers);
         if plugin.is_initial_response_header_policy() {
             plugin.apply_initial_response_header_policy(response_headers);
         }

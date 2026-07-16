@@ -3452,7 +3452,10 @@ async fn correlation_id_priority_overrides_select_canonical_without_collapsing_i
         let cache = PluginCache::new(&config).expect("multi-instance correlation cache");
         let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
         assert_eq!(plugins.len(), 2);
-        assert_eq!(plugins[0].priority(), internal_priority.min(external_priority));
+        assert_eq!(
+            plugins[0].priority(),
+            internal_priority.min(external_priority)
+        );
 
         let mut ctx = RequestContext::new(
             "127.0.0.1".to_string(),
@@ -3485,11 +3488,7 @@ async fn correlation_id_priority_overrides_select_canonical_without_collapsing_i
 
         let mut handshake_headers = HashMap::new();
         for plugin in plugins.iter() {
-            plugin.apply_websocket_handshake_response_headers(
-                &ctx,
-                101,
-                &mut handshake_headers,
-            );
+            plugin.apply_websocket_handshake_response_headers(&ctx, 101, &mut handshake_headers);
         }
         assert_eq!(
             handshake_headers.get("x-internal-request-id"),

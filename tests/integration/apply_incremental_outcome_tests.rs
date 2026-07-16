@@ -24,9 +24,7 @@ use ferrum_edge::config::types::{
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::plugins::{
-    PluginResult, ProxyProtocol, REQUEST_ID_METADATA_KEY, RequestContext,
-};
+use ferrum_edge::plugins::{PluginResult, ProxyProtocol, REQUEST_ID_METADATA_KEY, RequestContext};
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 
 /// Minimal test proxy with safe defaults.
@@ -593,9 +591,11 @@ async fn correlation_id_malformed_reload_keeps_last_known_good_plugin_generation
     let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
         panic!("unknown correlation_id field must reject reload");
     };
-    assert!(errors.iter().any(|error| {
-        error.contains("correlation_id") && error.contains("echo_downsteam")
-    }));
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.contains("correlation_id") && error.contains("echo_downsteam") })
+    );
     assert_eq!(
         state.config.load().plugin_configs[0].config["header_name"],
         "x-stable-request-id"

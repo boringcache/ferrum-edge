@@ -1,8 +1,8 @@
 //! Tests for the Correlation ID plugin
 
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, REQUEST_ID_METADATA_KEY, RequestContext,
-    correlation_id::CorrelationId, priority,
+    ALL_PROTOCOLS, Plugin, REQUEST_ID_METADATA_KEY, RequestContext, correlation_id::CorrelationId,
+    priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -731,7 +731,9 @@ async fn assert_isolated_instances(external_first: bool) {
         .clone();
     assert!(uuid::Uuid::parse_str(&internal_id).is_ok());
     assert_eq!(
-        ctx.headers.get("x-external-correlation-id").map(String::as_str),
+        ctx.headers
+            .get("x-external-correlation-id")
+            .map(String::as_str),
         Some("attacker-preserved-id")
     );
     assert_ne!(internal_id, "attacker-preserved-id");
@@ -762,9 +764,7 @@ async fn assert_isolated_instances(external_first: bool) {
 
     let mut backend_headers = HashMap::new();
     for plugin in ordered {
-        plugin_utils::assert_continue(
-            plugin.before_proxy(&mut ctx, &mut backend_headers).await,
-        );
+        plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
     }
     assert_eq!(
         backend_headers.get("x-internal-request-id"),
@@ -825,11 +825,7 @@ async fn test_websocket_handshake_response_echoes_generated_and_preserved_ids() 
                 .expect("canonical request ID")
                 .clone();
             let mut response_headers = HashMap::new();
-            plugin.apply_websocket_handshake_response_headers(
-                &ctx,
-                status,
-                &mut response_headers,
-            );
+            plugin.apply_websocket_handshake_response_headers(&ctx, status, &mut response_headers);
             assert_eq!(response_headers.get("x-request-id"), Some(&expected));
             if let Some(inbound) = inbound {
                 assert_eq!(expected, inbound);

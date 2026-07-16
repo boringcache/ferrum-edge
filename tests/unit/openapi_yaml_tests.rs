@@ -1317,10 +1317,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         ("correlation_id", None),
         ("correlation_id", Some(serde_json::Value::Null)),
         ("correlation_id", Some(json!([]))),
-        (
-            "correlation_id",
-            Some(json!({"echo_downsteam": false})),
-        ),
+        ("correlation_id", Some(json!({"echo_downsteam": false}))),
         ("bot_detection", None),
         ("bot_detection", Some(serde_json::Value::Null)),
         ("bot_detection", Some(json!([]))),
