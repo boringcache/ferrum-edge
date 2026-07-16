@@ -65,16 +65,24 @@ runs:
         # then dies with "connection forcibly closed (os error 10054)". 0 = run
         # until the ephemeral runner is torn down.
         export SCCACHE_IDLE_TIMEOUT=0
-        # Restart any server a prior step started so it adopts the timeout above
-        # (a server that's already running keeps the value it started with).
+        # Stop any server a prior step started so no daemon holds stale
+        # settings (a running server keeps the values it started with).
         command -v sccache &> /dev/null && sccache --stop-server > /dev/null 2>&1 || true
         if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+          # The start above is only a health probe. This action runs BEFORE the
+          # cache step that restores ${SCCACHE_DIR} (rust-cache
+          # `cache-directories`), and the local-disk backend indexes its cache
+          # when the server starts — entries unpacked afterwards would never be
+          # hits. Stop the probe server; the first rustc invocation lazily
+          # respawns it AFTER the cache restore, inheriting SCCACHE_* from
+          # GITHUB_ENV, so the persisted cache is actually indexed and reused.
+          sccache --stop-server > /dev/null 2>&1 || true
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          # Persist for build steps in case sccache lazily re-spawns a server.
+          # Persisted for build steps: the lazily-spawned server reads these.
           echo "SCCACHE_DIR=${SCCACHE_DIR}" >> "$GITHUB_ENV"
           echo "SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE}" >> "$GITHUB_ENV"
           echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
-          echo "sccache enabled (2 GiB local cache; idle timeout disabled)"
+          echo "sccache enabled (2 GiB local cache; idle timeout disabled; server starts lazily after cache restore)"
         else
           echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTC_WRAPPER=" >> "$GITHUB_ENV"

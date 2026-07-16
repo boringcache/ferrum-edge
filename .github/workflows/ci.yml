@@ -3872,7 +3872,8 @@ jobs:
                   src/circuit_breaker.rs|src/retry.rs|src/overload.rs|\
                   src/router_cache.rs|src/plugin_cache.rs|src/consumer_index.rs|\
                   src/date_cache.rs|src/lazy_timeout.rs|src/socket_opts.rs|src/tls_offload.rs|\
-                  src/config/types.rs|src/plugins/mod.rs|\
+                  src/config/types.rs|src/config/mod.rs|src/config/env_config.rs|\
+                  src/config/file_loader.rs|src/plugins/mod.rs|\
                   src/main.rs|src/startup.rs|src/modes/file.rs|src/modes/mod.rs|\
                   vendor/*|ebpf/*|tests/performance/*|proto/*|.cargo/*|.github/actions/*|\
                   build.rs|ferrum.conf|Cargo.toml|Cargo.lock|rust-toolchain.toml|\
@@ -4003,7 +4004,7 @@ jobs:
               echo ""
               echo "Relevant paths:"
               echo "- Proxy and connection hot paths: \`src/proxy/**\`, \`src/http3/**\`, \`src/dns/**\`, \`src/pool/**\`, \`src/connection_pool.rs\`, \`src/load_balancer.rs\`, \`src/health_check.rs\`, \`src/circuit_breaker.rs\`, \`src/retry.rs\`, \`src/overload.rs\`, \`src/router_cache.rs\`, \`src/plugin_cache.rs\`, \`src/consumer_index.rs\`, \`src/date_cache.rs\`, \`src/lazy_timeout.rs\`, \`src/socket_opts.rs\`, and \`src/tls_offload.rs\`."
-              echo "- File-mode gateway path: \`src/config/types.rs\`, \`src/plugins/mod.rs\`, \`src/main.rs\`, \`src/startup.rs\`, \`src/modes/file.rs\`, and \`src/modes/mod.rs\`."
+              echo "- File-mode gateway path: \`src/config/types.rs\`, \`src/config/mod.rs\`, \`src/config/env_config.rs\`, \`src/config/file_loader.rs\`, \`src/plugins/mod.rs\`, \`src/main.rs\`, \`src/startup.rs\`, \`src/modes/file.rs\`, and \`src/modes/mod.rs\`."
               echo "- Build and dependency graph: \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`proto/**\`, \`.cargo/**\`, \`build.rs\`, \`ferrum.conf\`, \`Cargo.toml\`, \`Cargo.lock\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, and \`.github/actions/**\`."
               echo ""
               echo "Changed files:"
