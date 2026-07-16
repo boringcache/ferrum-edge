@@ -80,6 +80,18 @@ struct LateDeleteSnapshots<'a> {
     api_spec: Option<&'a ApiSpecDeleteSnapshot>,
 }
 
+struct LateResourceRecovery<'a, R> {
+    written: Option<&'a R>,
+    previous: Option<&'a R>,
+    delete_snapshots: Option<LateDeleteSnapshots<'a>>,
+}
+
+struct OwnedLateDeleteRecovery<R> {
+    previous: R,
+    config: Option<GatewayConfig>,
+    api_spec: Option<ApiSpecDeleteSnapshot>,
+}
+
 pub(crate) enum AfterValidateError {
     BadRequest(Vec<String>),
     Conflict(Vec<String>),
@@ -513,9 +525,7 @@ async fn recover_late_resource_write<R: AdminResource>(
     lost_generation: u64,
     http_client: crate::plugins::PluginHttpClient,
     action: LateResourceWrite<'_>,
-    written: Option<&R>,
-    previous: Option<&R>,
-    previous_snapshots: Option<LateDeleteSnapshots<'_>>,
+    recovery: LateResourceRecovery<'_, R>,
 ) -> Result<bool, anyhow::Error> {
     let recovery_guard = lock_namespace_config_admission(db.clone(), namespace).await?;
     if recovery_guard.immediately_succeeds_generation(lost_generation) {
@@ -525,7 +535,13 @@ async fn recover_late_resource_write<R: AdminResource>(
         &action,
         LateResourceWrite::Update { .. } | LateResourceWrite::Delete { .. }
     ) && matches!(
-        R::intervening_write_recovery(db.as_ref(), namespace, previous, http_client,).await?,
+        R::intervening_write_recovery(
+            db.as_ref(),
+            namespace,
+            recovery.previous,
+            http_client,
+        )
+        .await?,
         InterveningWriteRecovery::KeepCurrent
     ) {
         return Ok(false);
@@ -534,7 +550,7 @@ async fn recover_late_resource_write<R: AdminResource>(
     let compensation = async {
         match action {
             LateResourceWrite::Create => {
-                let written = written.ok_or_else(|| {
+                let written = recovery.written.ok_or_else(|| {
                     anyhow::anyhow!("late create recovery is missing the written resource")
                 })?;
                 if let Some(current) =
@@ -544,7 +560,9 @@ async fn recover_late_resource_write<R: AdminResource>(
                         namespace,
                         &current,
                         written,
-                        previous_snapshots.map(|snapshots| snapshots.config),
+                        recovery
+                            .delete_snapshots
+                            .map(|snapshots| snapshots.config),
                     )
                     .await?
                     && !R::db_delete(db.as_ref(), namespace, written.id()).await?
@@ -553,10 +571,10 @@ async fn recover_late_resource_write<R: AdminResource>(
                 }
             }
             LateResourceWrite::Update { id } => {
-                let written = written.ok_or_else(|| {
+                let written = recovery.written.ok_or_else(|| {
                     anyhow::anyhow!("late update recovery is missing the written resource")
                 })?;
-                let previous = previous.ok_or_else(|| {
+                let previous = recovery.previous.ok_or_else(|| {
                     anyhow::anyhow!("late update recovery is missing the prior resource")
                 })?;
                 if R::db_get_for_write(db.as_ref(), namespace, id)
@@ -568,7 +586,7 @@ async fn recover_late_resource_write<R: AdminResource>(
                 }
             }
             LateResourceWrite::Delete { id } => {
-                let previous = previous.ok_or_else(|| {
+                let previous = recovery.previous.ok_or_else(|| {
                     anyhow::anyhow!("late delete recovery is missing the prior resource")
                 })?;
                 if R::db_get_for_write(db.as_ref(), namespace, id)
@@ -579,8 +597,12 @@ async fn recover_late_resource_write<R: AdminResource>(
                         db.as_ref(),
                         namespace,
                         previous,
-                        previous_snapshots.map(|snapshots| snapshots.config),
-                        previous_snapshots.and_then(|snapshots| snapshots.api_spec),
+                        recovery
+                            .delete_snapshots
+                            .map(|snapshots| snapshots.config),
+                        recovery
+                            .delete_snapshots
+                            .and_then(|snapshots| snapshots.api_spec),
                     )
                     .await?;
                 }
@@ -623,9 +645,11 @@ async fn persist_create_to_settlement<R: AdminResource>(
                     lost_generation,
                     http_client,
                     LateResourceWrite::Create,
-                    Some(&written),
-                    None,
-                    None,
+                    LateResourceRecovery {
+                        written: Some(&written),
+                        previous: None,
+                        delete_snapshots: None,
+                    },
                 )
                 .await
                 {
@@ -671,9 +695,11 @@ async fn persist_update_to_settlement<R: AdminResource>(
                     lost_generation,
                     http_client,
                     LateResourceWrite::Update { id: &id },
-                    Some(&written),
-                    Some(&previous),
-                    None,
+                    LateResourceRecovery {
+                        written: Some(&written),
+                        previous: Some(&previous),
+                        delete_snapshots: None,
+                    },
                 )
                 .await
                 {
@@ -699,9 +725,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
     namespace: String,
     mut guard: Option<NamespaceConfigAdmissionGuard>,
     id: String,
-    previous: R,
-    previous_snapshot: Option<GatewayConfig>,
-    previous_api_spec: Option<ApiSpecDeleteSnapshot>,
+    recovery: OwnedLateDeleteRecovery<R>,
     http_client: crate::plugins::PluginHttpClient,
 ) -> DbResult<bool> {
     match run_db_write_while_held(guard.as_ref(), R::db_delete(db.as_ref(), &namespace, &id)).await
@@ -721,14 +745,16 @@ async fn persist_delete_to_settlement<R: AdminResource>(
                     lost_generation,
                     http_client,
                     LateResourceWrite::Delete { id: &id },
-                    None,
-                    Some(&previous),
-                    previous_snapshot
-                        .as_ref()
-                        .map(|config| LateDeleteSnapshots {
-                            config,
-                            api_spec: previous_api_spec.as_ref(),
+                    LateResourceRecovery {
+                        written: None,
+                        previous: Some(&recovery.previous),
+                        delete_snapshots: recovery.config.as_ref().map(|config| {
+                            LateDeleteSnapshots {
+                                config,
+                                api_spec: recovery.api_spec.as_ref(),
+                            }
                         }),
+                    },
                 )
                 .await
                 {
@@ -1615,9 +1641,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         namespace.to_string(),
         namespace_config_admission_guard.take(),
         id.to_string(),
-        existing.clone(),
-        previous_snapshot,
-        previous_api_spec,
+        OwnedLateDeleteRecovery {
+            previous: existing.clone(),
+            config: previous_snapshot,
+            api_spec: previous_api_spec,
+        },
         super::plugin_validation_http_client(state),
     ))
     .await
