@@ -2086,7 +2086,10 @@ async fn test_terminate_revalidates_combined_link_headers() {
                     );
                 } else {
                     let expected = format!("{first}, {second}");
-                    assert_eq!(headers.get("link").map(String::as_str), Some(expected.as_str()));
+                    assert_eq!(
+                        headers.get("link").map(String::as_str),
+                        Some(expected.as_str())
+                    );
                 }
             }
             other => panic!("expected terminal Link response, got {other:?}"),
