@@ -2712,12 +2712,19 @@ fn prepare_batch_items<R: crud::AdminResource>(
     now: chrono::DateTime<Utc>,
     validation_ctx: &crud::ValidationCtx<'_>,
     validation_errors: &mut Vec<String>,
-) {
+) -> Result<(), String> {
     for item in items {
-        if let Err(errors) = crud::prepare_batch_resource(item, namespace, now, validation_ctx) {
-            extend_prefixed_errors(validation_errors, kind, item.id(), errors);
+        match crud::prepare_batch_resource(item, namespace, now, validation_ctx) {
+            Ok(()) => {}
+            Err(crud::BatchPreparationError::Validation(errors)) => {
+                extend_prefixed_errors(validation_errors, kind, item.id(), errors);
+            }
+            Err(crud::BatchPreparationError::Internal(error)) => {
+                return Err(format!("{} '{}': {}", kind, item.id(), error));
+            }
         }
     }
+    Ok(())
 }
 
 async fn load_consumer_in_namespace(
@@ -2735,16 +2742,30 @@ async fn load_consumer_in_namespace(
     }
 }
 
-fn hash_credential_if_needed(
+pub(crate) fn basic_auth_credential_error_status(
+    error: &crate::config::types::BasicAuthCredentialPreparationError,
+) -> StatusCode {
+    match error {
+        crate::config::types::BasicAuthCredentialPreparationError::InvalidCredential(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        crate::config::types::BasicAuthCredentialPreparationError::ServerConfiguration(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+pub(crate) fn hash_credential_if_needed(
     cred_type: &str,
     cred_value: &mut Value,
 ) -> Result<(), Box<Response<Full<Bytes>>>> {
     if cred_type == "basicauth"
         && let Err(e) = crud::hash_basic_auth_credentials(cred_value)
     {
+        let status = basic_auth_credential_error_status(&e);
         return Err(Box::new(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": e}),
+            status,
+            &json!({"error": e.to_string()}),
         )));
     }
     Ok(())
@@ -2796,11 +2817,39 @@ async fn ensure_mtls_consumer_candidate(
     }
 }
 
+async fn ensure_hmac_consumer_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    match crud::hmac_consumer_candidate_errors(db, namespace, consumer).await {
+        Ok(errors) if errors.is_empty() => Ok(()),
+        Ok(errors) => Err(Box::new(json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": errors.join("; ")}),
+        ))),
+        Err(error) => Err(Box::new(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&error),
+        ))),
+    }
+}
+
 async fn persist_consumer_update(
     db: &dyn DatabaseBackend,
     mut consumer: Consumer,
     success_status: StatusCode,
 ) -> Response<Full<Bytes>> {
+    // Every credential endpoint rewrites the complete Consumer and rebuilds
+    // its credential index entries. Revalidate retained HMAC credentials even
+    // when the requested mutation targets another credential type, so stale or
+    // out-of-band duplicates fail before the datastore uniqueness backstop.
+    if !consumer.credential_entries("hmac_auth").is_empty()
+        && let Err(response) =
+            ensure_hmac_consumer_candidate(db, &consumer.namespace, &consumer).await
+    {
+        return *response;
+    }
     consumer.updated_at = Utc::now();
     match db.update_consumer(&consumer).await {
         // The consumer vanished between the namespace-scoped load and the
@@ -3098,7 +3147,10 @@ async fn persist_payload_resources(
     if should_continue(&errors) && !payload.consumers.is_empty() {
         match db.batch_create_consumers(&payload.consumers).await {
             Ok(n) => counts.consumers = n,
-            Err(e) => errors.push(format!("consumers: {}", e)),
+            Err(e) => errors.push(format!(
+                "consumers: {}",
+                crud::consumer_persist_error_message(&e)
+            )),
         }
     }
     if should_continue(&errors) && !payload.upstreams.is_empty() {
@@ -3390,7 +3442,6 @@ async fn handle_update_credentials(
     {
         return Ok(*resp);
     }
-
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
     if response.status().is_success() {
         let event = audit::AuditEvent::new(
@@ -3399,9 +3450,10 @@ async fn handle_update_credentials(
             "consumer_credentials",
             consumer_id,
             namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
+            audit::credential_update_diff(
+                cred_type,
+                crud::consumer_audit_body(&before),
+                crud::consumer_audit_body(&consumer),
             ),
         );
         if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
@@ -3451,9 +3503,10 @@ async fn handle_delete_credentials(
             "consumer_credentials",
             consumer_id,
             namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
+            audit::credential_update_diff(
+                cred_type,
+                crud::consumer_audit_body(&before),
+                crud::consumer_audit_body(&consumer),
             ),
         );
         if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
@@ -3554,7 +3607,6 @@ async fn handle_append_credential(
     {
         return Ok(*resp);
     }
-
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
     if response.status().is_success() {
         let event = audit::AuditEvent::new(
@@ -3563,9 +3615,10 @@ async fn handle_append_credential(
             "consumer_credentials",
             consumer_id,
             namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
+            audit::credential_update_diff(
+                cred_type,
+                crud::consumer_audit_body(&before),
+                crud::consumer_audit_body(&consumer),
             ),
         );
         if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
@@ -3660,9 +3713,10 @@ async fn handle_delete_credential_by_index(
             "consumer_credentials",
             consumer_id,
             namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
+            audit::credential_update_diff(
+                cred_type,
+                crud::consumer_audit_body(&before),
+                crud::consumer_audit_body(&consumer),
             ),
         );
         if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
@@ -3697,10 +3751,20 @@ fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClien
         })
 }
 
-fn validate_plugin_config_definition(
+pub(crate) fn validate_plugin_config_definition(
     pc: &PluginConfig,
     http_client: plugins::PluginHttpClient,
 ) -> Result<(), String> {
+    let known_plugins = plugins::available_plugins();
+    if !known_plugins.contains(&pc.plugin_name.as_str()) {
+        return Err(format!(
+            "Unknown plugin name '{}'. Available plugins: {:?}",
+            pc.plugin_name, known_plugins
+        ));
+    }
+    if !pc.enabled {
+        return Ok(());
+    }
     plugins::validate_plugin_config_with_http_client(&pc.plugin_name, &pc.config, http_client)
 }
 
@@ -4054,38 +4118,58 @@ async fn handle_batch_create(
     let known_plugins = crate::plugins::available_plugins();
     let mut validation_errors: Vec<String> = Vec::new();
 
-    prepare_batch_items(
+    if let Err(error) = prepare_batch_items(
         &mut batch.consumers,
         "Consumer",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
-    prepare_batch_items(
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
+    if let Err(error) = prepare_batch_items(
         &mut batch.upstreams,
         "Upstream",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
-    prepare_batch_items(
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
+    if let Err(error) = prepare_batch_items(
         &mut batch.proxies,
         "Proxy",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
-    prepare_batch_items(
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
+    if let Err(error) = prepare_batch_items(
         &mut batch.plugin_configs,
         "PluginConfig",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
 
     for plugin_config in &batch.plugin_configs {
         if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
@@ -4187,11 +4271,49 @@ async fn handle_batch_create(
             if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
                 validation_errors.extend(errors);
             }
+            // Match single-resource admission: legacy duplicates are already
+            // quarantined at load time and must not block unrelated batch
+            // writes. Re-evaluate the authoritative candidate only when this
+            // batch submits a Consumer that carries HMAC credentials.
+            if batch
+                .consumers
+                .iter()
+                .any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())
+                && let Err(errors) = candidate_config.validate_unique_hmac_credentials()
+            {
+                validation_errors.extend(errors);
+            }
         }
         Err(error) => validation_errors.push(format!(
-            "Failed to load namespace config for mTLS candidate validation: {}",
+            "Failed to load namespace config for credential candidate validation: {}",
             error
         )),
+    }
+
+    if !batch.proxies.is_empty() || !batch.plugin_configs.is_empty() {
+        match crud::validate_hmac_request_transform_candidates(
+            db.as_ref(),
+            state,
+            namespace,
+            &batch.proxies,
+            &batch.plugin_configs,
+            None,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(crud::AfterValidateError::BadRequest(errors)) => {
+                validation_errors.extend(errors);
+            }
+            Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
+                "Failed to load config for HMAC request-transform candidate validation: {}",
+                error
+            )),
+            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
+                "HMAC request-transform candidate validation returned an unexpected response"
+                    .to_string(),
+            ),
+        }
     }
 
     match ValidationPipeline::new(&mut batch_config)
@@ -4799,6 +4921,27 @@ async fn handle_restore(
                 }
             }
         }
+        match crud::validate_hmac_request_transform_restore_candidate(state, &temp_config) {
+            Ok(()) => {}
+            Err(crud::AfterValidateError::BadRequest(errors)) => {
+                validation_errors.extend(errors);
+            }
+            Err(crud::AfterValidateError::Db(error)) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Restore aborted: HMAC request-transform composition could not be validated: {}. Existing config was NOT deleted.",
+                            error
+                        )
+                    }),
+                ));
+            }
+            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
+                "HMAC request-transform candidate validation returned an unexpected response"
+                    .to_string(),
+            ),
+        }
         if !validation_errors.is_empty() {
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
@@ -5197,12 +5340,20 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     crate::config::types::redact_consumer_credentials(consumer)
 }
 
-fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
+fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
+    crate::config::types::redact_consumer_credentials_for_audit(consumer)
+}
+
+fn hash_consumer_secrets(
+    consumer: &mut Consumer,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     crate::config::types::hash_consumer_secrets(consumer)
 }
 
 /// Hash passwords in basicauth credential payloads where the credential type is known.
-fn hash_credential_passwords(cred: &mut serde_json::Value) -> Result<(), String> {
+fn hash_credential_passwords(
+    cred: &mut serde_json::Value,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     crate::config::types::hash_credential_passwords(cred)
 }
 
@@ -5498,6 +5649,20 @@ async fn handle_node_waypoint_identities_get(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer_unique_conflict_response_redacts_mongo_credential_metadata() {
+        let secret = "must-not-escape-hmac-secret-at-least-32-characters";
+        let error = anyhow::anyhow!(
+            "E11000 duplicate key error dup key: {{ namespace: ferrum, credentials.hmac_auth.secret: {} }}",
+            secret
+        );
+
+        let message = crud::consumer_persist_error_message(&error);
+        assert!(message.contains("conflicts with another Consumer"));
+        assert!(!message.contains(secret));
+        assert!(!message.contains("credentials.hmac_auth.secret"));
+    }
 
     #[test]
     fn namespace_scoped_routes_cover_tenant_resources_only() {

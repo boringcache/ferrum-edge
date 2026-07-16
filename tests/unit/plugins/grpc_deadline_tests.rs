@@ -294,6 +294,7 @@ fn test_plugin_creation() {
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
     assert_eq!(plugin.name(), "grpc_deadline");
     assert_eq!(plugin.priority(), priority::GRPC_DEADLINE);
+    assert!(plugin.defer_before_proxy_until_backend_path_resolved());
 }
 
 #[test]

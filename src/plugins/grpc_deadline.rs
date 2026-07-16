@@ -290,7 +290,6 @@ impl Plugin for GrpcDeadline {
 
     fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
         let mut deadline_ms = ctx.grpc_deadline_budget_ms;
-
         if deadline_ms.is_none() && self.reject_no_deadline {
             debug!(
                 plugin = "grpc_deadline",
@@ -322,6 +321,14 @@ impl Plugin for GrpcDeadline {
         ctx.set_grpc_deadline_budget(deadline_ms);
         ctx.grpc_deadline_header_is_remaining |= self.subtract_gateway_processing;
         PluginResult::Continue
+    }
+
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        // grpc_method_router historically ran before this hook. Preserve that
+        // terminal-policy ordering when method authorization moves to the
+        // backend-effective path boundary; without such a policy, the gateway
+        // still runs this hook in the ordinary initial pass.
+        true
     }
 
     fn modifies_request_headers(&self) -> bool {

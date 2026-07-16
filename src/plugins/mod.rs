@@ -2,9 +2,12 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → `transform_request_body` → `on_final_request_body` →
-//! `backend_admission` → `after_proxy` → `normalize_response_body` →
-//! `on_response_body` → `transform_response_body` → `on_final_response_body` →
+//! `before_proxy` → backend-path policy preview → deferred routing-header hooks →
+//! final backend-path enforcement → remaining deferred `before_proxy` hooks →
+//! `transform_request_body` →
+//! `on_final_request_body` → `backend_admission` → `after_proxy` →
+//! `normalize_response_body` → `on_response_body` →
+//! `transform_response_body` → `on_final_response_body` →
 //! `on_response_committed` (buffered responses only) →
 //! `on_response_stream_terminated` (streamed responses only) → `log` →
 //! `on_ws_frame`.
@@ -145,6 +148,19 @@ pub enum ProxyProtocol {
     Udp,
 }
 
+/// Whether a backend-effective path policy hook is validating a provisional
+/// selection or enforcing the final selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendPathPolicyPhase {
+    /// Validate access rules before a deferred routing hook performs external
+    /// work. Stateful policy such as rate limiting must not be charged here.
+    Preview,
+    /// Enforce the settled backend-effective path immediately before the
+    /// remaining deferred hooks, a deferred-hook rejection, or backend
+    /// dispatch. Stateful policy is committed exactly once in this phase.
+    Enforce,
+}
+
 /// All protocol variants, for plugins that support every protocol.
 pub const ALL_PROTOCOLS: &[ProxyProtocol] = &[
     ProxyProtocol::Http,
@@ -188,6 +204,226 @@ pub const TCP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Tcp];
 
 /// UDP-only (datagram-level plugins that do not apply to TCP or HTTP).
 pub const UDP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Udp];
+
+/// Apply the pre-filtered initial-response header policy chain in configured
+/// priority order.
+///
+/// The plugin cache builds this list once per proxy/protocol generation. Callers
+/// at protocol-specific client boundaries (notably WebSocket handshakes) can
+/// therefore enforce deterministic response policy without filtering or
+/// allocating on the request path. Ordinary HTTP responses continue to use the
+/// full `after_proxy` lifecycle.
+pub fn apply_initial_response_header_policies(
+    policy_plugins: &[Arc<dyn Plugin>],
+    response_headers: &mut HashMap<String, String>,
+) {
+    for plugin in policy_plugins {
+        plugin.apply_initial_response_header_policy(response_headers);
+    }
+}
+
+/// Ordered outcome of deterministic initial-response policy for a buffered
+/// response whose hook-visible map also contains trailer compatibility fields.
+///
+/// `desired_headers` starts from genuine backend initial HEADERS, while
+/// `observed_headers` starts from the merged header+trailer view passed to
+/// `after_proxy`. After each hook, [`Self::record_after_proxy_plugin`] advances
+/// the desired map: policy plugins apply directly to genuine initial-header
+/// state, while any mutation made by another (including custom) plugin is
+/// copied from the already-ordered real hook result. This preserves priority
+/// overrides and multiple-instance ordering without rerunning hooks or scanning
+/// the plugin chain at the client boundary.
+#[derive(Debug, Clone)]
+pub struct BufferedInitialResponseHeaderPolicyState {
+    header_names: Arc<Vec<String>>,
+    desired_headers: HashMap<String, String>,
+    observed_headers: HashMap<String, String>,
+    /// Application-trailer outcomes immediately before initial-header policy
+    /// first changed each name. A later non-policy hook clears the entry and
+    /// owns both visible copies. Otherwise a final policy set/override restores
+    /// this pre-policy outcome on the trailer channel, while a final policy
+    /// removal suppresses both compatibility-view copies.
+    pre_policy_application_trailers: HashMap<String, Option<String>>,
+}
+
+impl BufferedInitialResponseHeaderPolicyState {
+    /// Build state from cache-prefiltered policy names. Returns `None` when no
+    /// initial-response policy is configured, leaving ordinary buffered paths
+    /// allocation-free.
+    pub fn new(
+        header_names: Arc<Vec<String>>,
+        initial_headers: &HashMap<String, String>,
+        merged_headers: &HashMap<String, String>,
+    ) -> Option<Self> {
+        if header_names.is_empty() {
+            return None;
+        }
+        Some(Self {
+            desired_headers: Self::select_headers(&header_names, initial_headers),
+            observed_headers: Self::select_headers(&header_names, merged_headers),
+            pre_policy_application_trailers: HashMap::new(),
+            header_names,
+        })
+    }
+
+    fn select_headers(
+        header_names: &[String],
+        source: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut selected = HashMap::with_capacity(header_names.len());
+        for name in header_names {
+            if let Some(value) = Self::header_value_ci(source, name) {
+                selected.insert(name.clone(), value.clone());
+            }
+        }
+        selected
+    }
+
+    fn header_value_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a String> {
+        headers.get(name).or_else(|| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value)
+        })
+    }
+
+    fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
+        headers.retain(|key, _| !key.eq_ignore_ascii_case(name));
+    }
+
+    /// Select the effective value after one hook and canonicalize every
+    /// case-insensitive spelling to the cache-owned lowercase name. If a later
+    /// plugin inserted a differently-cased duplicate alongside the previously
+    /// observed canonical entry, the changed value is the mutation that wins.
+    fn canonicalize_header_after_mutation(
+        headers: &mut HashMap<String, String>,
+        name: &str,
+        observed: Option<&str>,
+    ) -> Option<String> {
+        let current = headers
+            .get(name)
+            .filter(|value| observed != Some(value.as_str()))
+            .cloned()
+            .or_else(|| {
+                headers
+                    .iter()
+                    .filter(|(key, value)| {
+                        key.as_str() != name
+                            && key.eq_ignore_ascii_case(name)
+                            && observed != Some(value.as_str())
+                    })
+                    .min_by(|(left, _), (right, _)| left.cmp(right))
+                    .map(|(_, value)| value.clone())
+            })
+            .or_else(|| Self::header_value_ci(headers, name).cloned());
+
+        Self::remove_header_ci(headers, name);
+        if let Some(value) = current.as_ref() {
+            headers.insert(name.to_string(), value.clone());
+        }
+        current
+    }
+
+    /// Advance the genuine-initial-header outcome after one real hook has run.
+    /// Values are cloned only when a hook actually changes a policy-owned name.
+    pub fn record_after_proxy_plugin(
+        &mut self,
+        plugin: &dyn Plugin,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if plugin.is_initial_response_header_policy() {
+            plugin.apply_initial_response_header_policy(&mut self.desired_headers);
+            for name in self.header_names.iter() {
+                let previous_value = self.observed_headers.get(name).cloned();
+                let desired_value = self.desired_headers.get(name).cloned();
+                if previous_value != desired_value {
+                    self.pre_policy_application_trailers
+                        .entry(name.clone())
+                        .or_insert(previous_value.clone());
+                    Self::remove_header_ci(response_headers, name);
+                    if let Some(value) = desired_value.as_ref() {
+                        response_headers.insert(name.clone(), value.clone());
+                    }
+                }
+                let current = Self::canonicalize_header_after_mutation(
+                    response_headers,
+                    name,
+                    previous_value.as_deref(),
+                );
+                match current {
+                    Some(value) => {
+                        self.observed_headers.insert(name.clone(), value);
+                    }
+                    None => {
+                        self.observed_headers.remove(name);
+                    }
+                }
+            }
+            return;
+        }
+
+        self.record_later_response_header_mutations(response_headers);
+    }
+
+    /// Advance policy-owned initial-header state after a later response phase
+    /// changes representation metadata. Body transforms run after the ordered
+    /// `after_proxy` chain, so their final edits and removals must remain
+    /// authoritative when the buffered response is split back onto the wire.
+    pub fn record_later_response_header_mutations(
+        &mut self,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        for name in self.header_names.iter() {
+            let observed = self.observed_headers.get(name).cloned();
+            let current = Self::canonicalize_header_after_mutation(
+                response_headers,
+                name,
+                observed.as_deref(),
+            );
+            if observed == current {
+                continue;
+            }
+            match current {
+                Some(value) => {
+                    self.desired_headers.insert(name.clone(), value.clone());
+                    self.observed_headers.insert(name.clone(), value);
+                    self.pre_policy_application_trailers.remove(name);
+                }
+                None => {
+                    self.desired_headers.remove(name);
+                    self.observed_headers.remove(name);
+                    self.pre_policy_application_trailers.remove(name);
+                }
+            }
+        }
+    }
+
+    /// Return the pre-policy application-trailer outcome and whether the final
+    /// policy keeps this name in genuine initial headers. Reconciliation uses
+    /// the presence flag to distinguish a final set/override from a removal;
+    /// `None` leaves the ordinary merged-view outcome authoritative.
+    pub fn application_trailer_initial_response_policy_outcome(
+        &self,
+        name: &str,
+    ) -> Option<(Option<&str>, bool)> {
+        let pre_policy_value = self.pre_policy_application_trailers.get(name)?;
+        Some((
+            pre_policy_value.as_deref(),
+            self.desired_headers.contains_key(name),
+        ))
+    }
+
+    /// Apply the final ordered policy-owned fields to genuine initial HEADERS.
+    pub fn apply_to_initial_headers(&self, response_headers: &mut HashMap<String, String>) {
+        for name in self.header_names.iter() {
+            Self::remove_header_ci(response_headers, name);
+            if let Some(value) = self.desired_headers.get(name) {
+                response_headers.insert(name.clone(), value.clone());
+            }
+        }
+    }
+}
 
 /// How plugin construction or validation failures affect cache publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,6 +655,12 @@ pub struct RequestContext {
     pub direct_client_ip: String,
     pub method: String,
     pub path: String,
+    /// Canonical client-request authority for authentication mechanisms that
+    /// bind signatures to the selected virtual host. Hostnames are
+    /// ASCII-lowercased with a trailing DNS dot removed; an explicit
+    /// non-default port is retained. HTTP frontends populate this after
+    /// Host/`:authority` validation and before authentication.
+    pub request_authority: Option<String>,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
     /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
@@ -426,6 +668,10 @@ pub struct RequestContext {
     /// SNI hostname from the frontend TLS/QUIC handshake for HTTP-family
     /// requests. Populated only when the downstream client supplied SNI.
     pub frontend_sni_hostname: Option<String>,
+    /// Load-balancer snapshot generation pinned by this request. Backend
+    /// admission uses it to reject a retired service-discovery target view
+    /// after a structural target-set publication.
+    pub lb_generation: u64,
     /// Raw HTTP headers from the request. Stored at init time and consumed by
     /// `materialize_headers()`. Core proxy lookups (IP resolution, host
     /// extraction) read from this directly via `raw_header_get()` to avoid
@@ -487,10 +733,26 @@ pub struct RequestContext {
     pub(crate) grpc_deadline_header_is_remaining: bool,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Claim-derived upstream headers committed by the first accepted
+    /// authentication attempt and held until `before_proxy`. Kept out of
+    /// `metadata` so authorization-phase rejection logging can never serialize
+    /// raw claim values.
+    pub(crate) pending_claim_headers: HashMap<String, String>,
     /// Credential header names precomputed by the plugin cache for safe
     /// diagnostics and policy calls. Kept outside public metadata so plugin
     /// configuration details do not enter transaction logs.
     request_headers_to_redact: Option<Arc<Vec<String>>>,
+    /// Buffered response policy provenance, present only while the ordered
+    /// `after_proxy` chain is processing a merged gRPC header+trailer view.
+    /// Shared through `Arc` so the rare hook-preflight context clone remains
+    /// cheap; the live request uses `Arc::make_mut` after the clone is dropped.
+    buffered_initial_response_header_policy_state:
+        Option<Arc<BufferedInitialResponseHeaderPolicyState>>,
+    /// Whether client-visible rejection responses for this request cross a
+    /// WebSocket handshake boundary. Set once after request-flavor detection so
+    /// the shared reject finalizer can remove transport-owned handshake fields
+    /// after every ordered response hook without reclassifying or allocating.
+    websocket_response_boundary: bool,
     /// Semantic-cache embedding vector staged between `before_proxy` and
     /// `on_final_response_body`. Kept out of `metadata` so high-dimensional
     /// vectors cannot enter transaction logs.
@@ -529,6 +791,12 @@ pub struct RequestContext {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
+    /// Encoding selected by the built-in compression plugin for the response it
+    /// will create at the gateway. This is authoritative ownership state for
+    /// distinguishing planned gateway compression from an already-encoded
+    /// origin response; public plugin metadata is not trusted for that security
+    /// decision.
+    gateway_response_compression_algorithm: Option<&'static str>,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -616,11 +884,21 @@ pub struct RequestContext {
     /// Set by the plugin in `before_proxy`; collected before building
     /// `TransactionSummary` so all logging plugins receive mirror results.
     pub mirror_result_rx: Option<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
+    /// One-shot HMAC work staged before request-body collection and consumed
+    /// at authentication. This is private rather than transaction metadata so
+    /// credential/signature/Consumer secret data cannot be forwarded or
+    /// logged. Its custom `Clone` intentionally clears the staged value.
+    hmac_prebuffer_state: hmac_auth::HmacPrebufferState,
     /// Binary-safe request body bytes, populated when a plugin requires the
     /// body before `before_proxy` (e.g., `request_mirror`). Unlike the
     /// `"request_body"` metadata key (UTF-8 only), this preserves non-UTF-8
     /// payloads such as gRPC protobuf.
     pub request_body_bytes: Option<bytes::Bytes>,
+    /// Precomputed body hashes for integrity-verifying authentication plugins.
+    /// Keeping fixed-size hashes avoids retaining a second full body while the
+    /// sole buffered representation continues to the backend.
+    pub request_body_sha256: Option<[u8; 32]>,
+    pub request_body_sha512: Option<[u8; 64]>,
     /// Shared counter for request body bytes received from the client,
     /// populated by proxy body handlers and read by the summary builders.
     ///
@@ -715,6 +993,11 @@ pub struct RequestContext {
     /// path; VS-derived proxies never set `strip_listen_path`, so the override
     /// is the literal forwarded path.
     pub route_override_path: Option<String>,
+    /// Backend-effective path that successfully passed the final route policy
+    /// boundary. Not exposed through the public plugin API, so custom plugins
+    /// cannot forge the path consumed by security-sensitive deferred work such
+    /// as request mirroring.
+    authorized_backend_path: Option<String>,
     /// Treat `route_override_path` as an absolute backend path by disabling
     /// `strip_listen_path` on the effective proxy. Used by direct upstream
     /// routers when the override is already the final upstream URL path rather
@@ -781,6 +1064,13 @@ pub struct RequestContext {
     pub mesh_inbound_listener_authz_port: Option<u16>,
 }
 
+/// Return an identity only when it contains a meaningful non-whitespace value.
+/// Security identities are preserved byte-for-byte; this helper rejects blank
+/// principals rather than silently canonicalizing signed claim content.
+pub(crate) fn meaningful_identity(identity: Option<&str>) -> Option<&str> {
+    identity.filter(|identity| !identity.trim().is_empty())
+}
+
 fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
     metadata
         .entry(key.to_string())
@@ -800,8 +1090,10 @@ impl RequestContext {
             client_ip,
             method,
             path,
+            request_authority: None,
             frontend_listen_port: None,
             frontend_sni_hostname: None,
+            lb_generation: 1,
             raw_headers: None,
             headers: HashMap::new(),
             raw_query_string: None,
@@ -820,7 +1112,10 @@ impl RequestContext {
             grpc_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             metadata: HashMap::new(),
+            pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
+            buffered_initial_response_header_policy_state: None,
+            websocket_response_boundary: false,
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
@@ -829,6 +1124,7 @@ impl RequestContext {
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
+            gateway_response_compression_algorithm: None,
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -849,7 +1145,10 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
+            hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
+            request_body_sha256: None,
+            request_body_sha512: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
             mesh_route_dispatch_reject_unmatched: false,
@@ -864,6 +1163,7 @@ impl RequestContext {
             route_override_request_transform: None,
             route_override_response_transform: None,
             route_override_path: None,
+            authorized_backend_path: None,
             route_override_path_is_absolute: false,
             route_override_authority: None,
             node_waypoint_pod_uid: None,
@@ -918,6 +1218,55 @@ impl RequestContext {
         self.response_stream_id
     }
 
+    pub(crate) fn mark_gateway_response_compression(&mut self, algorithm: &'static str) {
+        self.gateway_response_compression_algorithm = Some(algorithm);
+    }
+
+    pub(crate) fn gateway_response_compression_algorithm(&self) -> Option<&'static str> {
+        self.gateway_response_compression_algorithm
+    }
+
+    pub(crate) fn bind_authorized_backend_path(&mut self, path: String) {
+        self.authorized_backend_path = Some(path);
+    }
+
+    pub(crate) fn authorized_backend_path(&self) -> Option<&str> {
+        self.authorized_backend_path.as_deref()
+    }
+
+    /// Begin tracking initial-response policy against genuine initial headers
+    /// while hooks operate on a merged buffered gRPC compatibility view.
+    pub(crate) fn begin_buffered_initial_response_header_policy(
+        &mut self,
+        header_names: Arc<Vec<String>>,
+        initial_headers: &HashMap<String, String>,
+        merged_headers: &HashMap<String, String>,
+    ) {
+        self.buffered_initial_response_header_policy_state =
+            BufferedInitialResponseHeaderPolicyState::new(
+                header_names,
+                initial_headers,
+                merged_headers,
+            )
+            .map(Arc::new);
+    }
+
+    pub(crate) fn record_buffered_initial_response_header_plugin(
+        &mut self,
+        plugin: &dyn Plugin,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if let Some(state) = self.buffered_initial_response_header_policy_state.as_mut() {
+            Arc::make_mut(state).record_after_proxy_plugin(plugin, response_headers);
+        }
+    }
+
+    pub(crate) fn take_buffered_initial_response_header_policy(
+        &mut self,
+    ) -> Option<Arc<BufferedInitialResponseHeaderPolicyState>> {
+        self.buffered_initial_response_header_policy_state.take()
+    }
+
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
     /// transforms. Only `metadata` is copied back to the real context by the
@@ -929,8 +1278,10 @@ impl RequestContext {
             direct_client_ip: self.direct_client_ip.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
+            request_authority: self.request_authority.clone(),
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
+            lb_generation: self.lb_generation,
             raw_headers: None,
             headers: self.headers.clone(),
             raw_query_string: None,
@@ -960,7 +1311,13 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            // Claim-header staging stays on the real request context. Final
+            // body hooks never consume it, and copying raw claim values into a
+            // compatibility clone would extend their lifetime unnecessarily.
+            pending_claim_headers: HashMap::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
+            buffered_initial_response_header_policy_state: None,
+            websocket_response_boundary: self.websocket_response_boundary,
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
@@ -969,6 +1326,7 @@ impl RequestContext {
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
+            gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
@@ -989,7 +1347,10 @@ impl RequestContext {
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
             mirror_result_rx: None,
+            hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
+            request_body_sha256: None,
+            request_body_sha512: None,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             is_early_data: self.is_early_data,
             mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,
@@ -1004,6 +1365,7 @@ impl RequestContext {
             route_override_request_transform: self.route_override_request_transform.clone(),
             route_override_response_transform: self.route_override_response_transform.clone(),
             route_override_path: self.route_override_path.clone(),
+            authorized_backend_path: self.authorized_backend_path.clone(),
             route_override_path_is_absolute: self.route_override_path_is_absolute,
             route_override_authority: self.route_override_authority.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
@@ -1028,6 +1390,14 @@ impl RequestContext {
         if !headers.is_empty() {
             self.request_headers_to_redact = Some(headers);
         }
+    }
+
+    pub(crate) fn set_websocket_response_boundary(&mut self, enabled: bool) {
+        self.websocket_response_boundary = enabled;
+    }
+
+    pub(crate) fn has_websocket_response_boundary(&self) -> bool {
+        self.websocket_response_boundary
     }
 
     pub(crate) fn request_header_requires_redaction(&self, header_name: &str) -> bool {
@@ -1516,7 +1886,7 @@ impl RequestContext {
         self.identified_consumer
             .as_ref()
             .map(|consumer| consumer.username.as_str())
-            .or(self.authenticated_identity.as_deref())
+            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
     }
 
     /// Return the identity value to forward to the backend in
@@ -1537,8 +1907,8 @@ impl RequestContext {
             .identified_consumer
             .as_ref()
             .map(|consumer| consumer.username.as_str())
-            .or(self.authenticated_identity_header.as_deref())
-            .or(self.authenticated_identity.as_deref())?;
+            .or_else(|| meaningful_identity(self.authenticated_identity_header.as_deref()))
+            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))?;
         if self.suppresses_backend_consumer_identity_headers() {
             return None;
         }
@@ -2596,7 +2966,7 @@ impl StreamConnectionContext {
         self.identified_consumer
             .as_ref()
             .map(|consumer| consumer.username.as_str())
-            .or(self.authenticated_identity.as_deref())
+            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
     }
 
     /// Insert a metadata value, lazily allocating the map on first write.
@@ -2989,13 +3359,28 @@ pub trait Plugin: Send + Sync {
     ///
     /// This is even narrower than `requires_request_body_before_before_proxy()`:
     /// it forces request body buffering BEFORE the authenticate phase runs, so
-    /// auth plugins can verify body integrity (e.g., HMAC signing string that
-    /// covers a `Digest:` header per RFC 9421 / RFC 3230).
+    /// auth plugins can verify body integrity (e.g., a Ferrum HMAC signing
+    /// string that covers RFC 9530 `Content-Digest` or legacy `Digest`).
     ///
     /// Override this only for auth plugins that perform body integrity checks
     /// at authentication time (e.g., `hmac_auth`).
     fn requires_request_body_before_authenticate(&self) -> bool {
         false
+    }
+
+    /// Return whether this request should be buffered before authentication
+    /// after credential checks that do not require body bytes.
+    ///
+    /// The default preserves the ordinary request-time buffering predicate.
+    /// Body-authentication plugins can override this to reject malformed,
+    /// expired, or unknown credentials without first collecting an attacker-
+    /// controlled request body.
+    fn should_buffer_request_body_before_authenticate(
+        &self,
+        ctx: &RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> bool {
+        self.should_buffer_request_body(ctx)
     }
 
     /// Returns `true` if this plugin needs the raw request body to be available
@@ -3016,6 +3401,12 @@ pub trait Plugin: Send + Sync {
     /// that would otherwise run on every buffered request. Only override
     /// this for plugins that handle non-UTF-8 payloads (e.g., gRPC protobuf).
     fn needs_request_body_bytes(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when the plugin needs SHA-256 and SHA-512 snapshots of
+    /// the body but does not need to retain the body itself.
+    fn needs_request_body_digests(&self) -> bool {
         false
     }
 
@@ -3054,6 +3445,51 @@ pub trait Plugin: Send + Sync {
         &self,
         _ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Returns `true` when `before_proxy` can dispatch external work or
+    /// synthesize a terminal response and therefore must wait until an active
+    /// backend-path policy has authorized the resolved route and target path.
+    ///
+    /// The ordinary plugin pipeline is unchanged when no backend-path plugin
+    /// is active. Opt-in hooks retain their relative order in a deferred pass.
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when a deferred `before_proxy` hook can mutate headers
+    /// that normally participate in upstream target selection. The gateway
+    /// runs these hooks in a separate deferred subphase after an access preview
+    /// and pins that previewed target across the external call; the returned
+    /// headers cannot steer this request onto an unpreviewed path.
+    fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin must inspect the backend-effective path
+    /// after route overrides and load balancing have selected the first target.
+    ///
+    /// The plugin cache precomputes this opt-in list, so requests without a
+    /// participating plugin do not scan the full chain at this boundary.
+    fn requires_backend_path_resolution(&self) -> bool {
+        false
+    }
+
+    /// Called after the backend-effective path has been assembled from the
+    /// route override, listen-path stripping, proxy/backend path, and selected
+    /// upstream target path, but before any backend is dialed.
+    ///
+    /// When a deferred hook can mutate routing headers, `Preview` runs before
+    /// that hook and `Enforce` runs afterward against the same pinned target.
+    /// Otherwise only `Enforce` runs. Implementations must keep `Preview` free
+    /// of state-consuming effects such as rate-limit charges.
+    async fn on_backend_path_resolved(
+        &self,
+        _ctx: &mut RequestContext,
+        _backend_path: &str,
+        _phase: BackendPathPolicyPhase,
     ) -> PluginResult {
         PluginResult::Continue
     }
@@ -3098,6 +3534,33 @@ pub trait Plugin: Send + Sync {
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin defines deterministic response-header
+    /// policy that must be enforced on protocol-specific initial response
+    /// boundaries as well as the ordinary `after_proxy` path.
+    ///
+    /// The plugin cache uses this marker to pre-filter a priority-ordered list;
+    /// request paths must not rediscover these plugins with name checks or scans.
+    fn is_initial_response_header_policy(&self) -> bool {
+        false
+    }
+
+    /// Apply this plugin's deterministic policy to an initial response header
+    /// map. Called only for plugins that opt in through
+    /// [`Self::is_initial_response_header_policy`]. Implementations must not
+    /// consume request-local state or perform I/O.
+    fn apply_initial_response_header_policy(
+        &self,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
+    }
+
+    /// Canonical field names this initial-response policy may set or remove.
+    /// The plugin cache unions these at reload time so buffered protocol paths
+    /// track only relevant fields and never scan the plugin chain per request.
+    fn initial_response_header_policy_names(&self) -> &[String] {
+        &[]
     }
 
     /// Returns `true` when this plugin may change the response `Content-Type`
@@ -3321,9 +3784,13 @@ pub trait Plugin: Send + Sync {
     /// decision, which is why this is a separate hook.
     ///
     /// The full `response_headers` map (and `response_status`) are also passed so
-    /// a plugin can release a response it will decline to transform once headers
-    /// are known — e.g. `compression` skips `206 Partial Content` / `Content-Range`
-    /// responses, so it must not pin them onto the buffered path either.
+    /// the refinement can account for representation metadata beyond
+    /// `Content-Type`. A plugin can release a response it will decline to
+    /// transform once headers are known — e.g. `compression` skips `206 Partial
+    /// Content` / `Content-Range` responses, so it must not pin them onto the
+    /// buffered path either. Conversely, a buffered final hook that must decode
+    /// or reject a non-identity `Content-Encoding` must keep that representation
+    /// buffered; releasing opaque wire bytes would bypass the final hook.
     ///
     /// Contract: this MUST only narrow `should_buffer_response_body` — it may
     /// return `false` where the unconditional check returned `true`, but never
@@ -3844,6 +4311,13 @@ pub trait Plugin: Send + Sync {
     fn active_jwks_uris(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Returns the refresh interval required for each actively referenced
+    /// shared JWKS URI. The plugin cache reconciles duplicate consumers to the
+    /// minimum interval after every full or incremental publication.
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+        Vec::new()
+    }
 }
 
 /// Create a plugin instance from its name and configuration.
@@ -3874,12 +4348,11 @@ pub fn create_plugin_with_http_client(
     config: &Value,
     http_client: PluginHttpClient,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
-    // Fail CLOSED *before* constructing plugins that dial their OWN resolver —
-    // ldap_auth (ldap3), kafka_logging (librdkafka), ws_logging (tungstenite).
-    // These never go through this `PluginHttpClient` + `DnsCache`, and their
-    // constructors spawn the dial task immediately, so a denied literal endpoint
-    // must be rejected here, not merely warned at config-load. Because the
-    // production `PluginCache` is built with the real-policy client
+    // Fail CLOSED before constructing plugins with literal endpoints. Some
+    // (ldap_auth, kafka_logging, ws_logging) dial through their own resolver;
+    // jwks_auth uses the shared client but must still reject denied literals at
+    // config admission rather than installing a permanently keyless provider.
+    // The production `PluginCache` is built with the real-policy client
     // (`proxy/mod.rs` → `PluginHttpClient::new` → `with_http_client`), this also
     // makes a database-mode legacy row pointing at e.g. `169.254.169.254` exclude
     // the plugin instead of letting its background loop reach the metadata service
@@ -4266,24 +4739,48 @@ pub(crate) fn screen_redis_endpoint_egress(
     Ok(())
 }
 
-/// Screen the literal-IP endpoints of plugins that dial OUTSIDE the shared
-/// `PluginHttpClient` / `DnsCache`: `ldap_auth` (`ldap_url`, via the `ldap3`
-/// crate) and `kafka_logging` (`broker_list`, via librdkafka). Both perform
-/// their own DNS resolution and connect, so the HTTP-endpoint screen in
-/// [`validate_plugin_config_with_policy`] never sees them — a literal denied
-/// endpoint (`ldap://169.254.169.254:389`, `broker_list=169.254.169.254:9092`)
-/// would otherwise pass file/admin validation and reach the metadata service at
-/// runtime under the default baseline. Reject the literal at config-load.
+/// Screen literal-IP endpoints that require config-admission enforcement.
+/// `jwks_auth` retains the shared client's runtime DNS/IP backstop, while
+/// `ldap_auth` (`ldap_url`, via `ldap3`), `kafka_logging` (`broker_list`, via
+/// librdkafka), and `ws_logging` dial outside it. A denied literal endpoint
+/// would otherwise pass file/admin validation and either install a permanently
+/// keyless auth provider or reach the metadata service at runtime. Reject it at
+/// config-load.
 ///
-/// Hostname endpoints that later rebind to a denied address are an accepted
-/// limitation (the client resolves outside `DnsCache`), mirroring the
-/// `rediss://`-hostname case documented in `redis_rate_limiter`.
+/// For the clients outside `DnsCache`, hostname endpoints that later rebind to
+/// a denied address are an accepted limitation, mirroring the
+/// `rediss://`-hostname case documented in `redis_rate_limiter`. JWKS hostname
+/// resolution retains the shared client's runtime policy backstop.
 pub(crate) fn screen_direct_client_endpoint_egress(
     name: &str,
     config: &Value,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     match name {
+        // JWKS endpoints use the shared client (which keeps a runtime DNS/IP
+        // backstop), but literal denials must fail config admission before a
+        // provider can become permanently keyless and reject all tokens.
+        "jwks_auth" => {
+            if let Some(providers) = config.get("providers").and_then(Value::as_array) {
+                for (provider_idx, provider) in providers.iter().enumerate() {
+                    let Some(provider) = provider.as_object() else {
+                        continue;
+                    };
+                    for field in ["jwks_uri", "discovery_url"] {
+                        if let Some(url) = provider.get(field).and_then(Value::as_str)
+                            && let Ok(parsed) = url::Url::parse(url.trim())
+                            && let Some(host) = parsed.host_str()
+                            && let Some(ip) = crate::config::types::egress_literal_ip(host)
+                            && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+                        {
+                            return Err(format!(
+                                "providers[{provider_idx}].{field} IP {ip} denied by backend egress policy: {reason}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         // ldap_url is a single ldap:// / ldaps:// URL.
         "ldap_auth" => {
             if let Some(url) = config.get("ldap_url").and_then(|v| v.as_str())

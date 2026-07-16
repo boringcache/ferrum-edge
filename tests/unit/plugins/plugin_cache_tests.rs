@@ -6,7 +6,9 @@ use ferrum_edge::config::types::{
     PluginScope, Proxy,
 };
 use ferrum_edge::config_delta::ConfigDelta;
-use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, ProxyProtocol, RequestContext, apply_initial_response_header_policies,
+};
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
@@ -2858,6 +2860,43 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
+#[test]
+fn test_grpc_backend_path_plugins_are_precomputed_with_priority_override() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["router"])],
+        vec![make_plugin_config_with_priority(
+            "router",
+            "grpc_method_router",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(300),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let grpc_view = cache.request_view("p1", ProxyProtocol::Grpc);
+    assert!(
+        grpc_view
+            .capabilities()
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+    );
+    assert_eq!(grpc_view.backend_path_plugins().len(), 1);
+    assert_eq!(
+        grpc_view.backend_path_plugins()[0].name(),
+        "grpc_method_router"
+    );
+    assert_eq!(grpc_view.backend_path_plugins()[0].priority(), 300);
+
+    let http_view = cache.request_view("p1", ProxyProtocol::Http);
+    assert!(
+        !http_view
+            .capabilities()
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+    );
+    assert!(http_view.backend_path_plugins().is_empty());
+}
+
 #[tokio::test]
 async fn test_priority_override_delegates_response_stream_termination_hook() {
     let config = make_config(
@@ -3144,6 +3183,61 @@ fn test_priority_override_delegates_response_header_refinement_hooks() {
     assert_eq!(plugins[1].name(), "security_headers");
     assert!(plugins[1].may_add_response_cache_control_no_transform(&ctx, &response_headers));
     assert!(plugins[1].may_add_response_strong_etag(&ctx, &response_headers));
+
+    let policy_plugins = cache
+        .request_view("p1", ProxyProtocol::Grpc)
+        .initial_response_header_policy_plugins();
+    assert_eq!(policy_plugins.len(), 1);
+    assert_eq!(policy_plugins[0].name(), "security_headers");
+    let mut policy_headers = HashMap::new();
+    apply_initial_response_header_policies(&policy_plugins, &mut policy_headers);
+    assert_eq!(
+        policy_headers.get("cache-control").map(String::as_str),
+        Some("no-transform")
+    );
+}
+
+#[test]
+fn test_initial_response_policy_plan_preserves_multiple_instance_priority_order() {
+    let mut first = make_plugin_config_with_json(
+        "sh-first",
+        "security_headers",
+        json!({ "set": { "X-Order": "first", "X-Removed": "first" }, "remove": [] }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    first.priority_override = Some(100);
+    let mut second = make_plugin_config_with_json(
+        "sh-second",
+        "security_headers",
+        json!({ "set": { "X-Order": "second" }, "remove": ["X-Removed"] }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second.priority_override = Some(200);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["sh-second", "sh-first"])],
+        vec![second, first],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("p1", ProxyProtocol::WebSocket);
+    let policy_plugins = view.initial_response_header_policy_plugins();
+    let mut headers = HashMap::new();
+
+    assert_eq!(policy_plugins.len(), 2);
+    let policy_names = view.initial_response_header_policy_names();
+    assert_eq!(
+        policy_names
+            .iter()
+            .filter(|name| name.as_str() == "x-order")
+            .count(),
+        1,
+        "multiple policy instances must share one precomputed provenance name"
+    );
+    assert!(policy_names.iter().any(|name| name == "x-removed"));
+    apply_initial_response_header_policies(&policy_plugins, &mut headers);
+    assert_eq!(headers.get("x-order").map(String::as_str), Some("second"));
+    assert!(!headers.contains_key("x-removed"));
 }
 
 #[test]
@@ -3721,6 +3815,56 @@ fn test_modifies_request_headers_flag_computed() {
         caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS),
         "request_transformer should set MODIFIES_REQUEST_HEADERS"
     );
+}
+
+#[test]
+fn test_hmac_auth_rejects_request_body_transformer_composition() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["hmac", "transform"])],
+        vec![
+            make_plugin_config("hmac", "hmac_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "gateway",
+                        "value": "ferrum"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("composition must fail closed");
+    assert!(error.contains("hmac_auth cannot be combined"));
+    assert!(error.contains("request_transformer"));
+    assert!(error.contains("protocol Http"));
+}
+
+#[test]
+fn test_hmac_auth_allows_header_only_request_transformer() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["hmac", "transform"])],
+        vec![
+            make_plugin_config("hmac", "hmac_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "transform",
+                "request_transformer",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+
+    assert!(PluginCache::new(&config).is_ok());
 }
 
 #[test]

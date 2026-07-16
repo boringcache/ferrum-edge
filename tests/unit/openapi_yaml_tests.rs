@@ -273,6 +273,76 @@ fn mtls_auth_schemas_match_runtime_contract() {
     }
 }
 
+#[test]
+fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let auth_mode = spec["components"]["schemas"]["AuthMode"]["description"]
+        .as_str()
+        .expect("AuthMode description");
+    let scoped_scheme_contract = "For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, \
+                                  `jwks_auth`, and `oauth2_introspection`, a foreign \
+                                  `Authorization` scheme is skipped; other mechanisms are not \
+                                  covered by this guarantee.";
+    let normalized_auth_mode = auth_mode.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized_auth_mode.contains(scoped_scheme_contract));
+    assert!(normalized_auth_mode.contains("Any rejection returned by a plugin is terminal"));
+    assert!(normalized_auth_mode.contains("run sequentially until one succeeds"));
+    assert!(normalized_auth_mode.contains("server rejection takes precedence"));
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(plugin_docs.contains(scoped_scheme_contract));
+
+    let basic_roundtrip_contract = "When `basicauth` is omitted from the request, an existing \
+                                    Basic credential type is preserved; use `DELETE \
+                                    /consumers/{id}/credentials/basicauth` to remove it.";
+    let consumer_update = spec["paths"]["/consumers/{id}"]["put"]["description"]
+        .as_str()
+        .expect("Consumer update description");
+    assert!(consumer_update.contains(basic_roundtrip_contract));
+    let admin_docs = include_str!("../../docs/admin_api.md");
+    assert!(admin_docs.contains(basic_roundtrip_contract));
+
+    let consumer_credentials =
+        &spec["components"]["schemas"]["Consumer"]["properties"]["credentials"];
+    let credentials_description = consumer_credentials["description"]
+        .as_str()
+        .expect("Consumer credentials description");
+    assert!(credentials_description.contains("responses omit `basicauth` entirely"));
+
+    let password_hash =
+        &spec["components"]["schemas"]["BasicAuthCredential"]["properties"]["password_hash"];
+    assert_eq!(password_hash["pattern"], "^hmac_sha256:[0-9a-f]{64}$");
+    assert!(password_hash.get("writeOnly").is_none());
+
+    let password = &spec["components"]["schemas"]["BasicAuthCredential"]["properties"]["password"];
+    let password_pattern = password["pattern"].as_str().expect("password pattern");
+    assert_eq!(password_pattern, r"^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$");
+    let password_pattern = Regex::new(password_pattern).expect("password pattern compiles");
+    assert!(!password_pattern.is_match("embedded\0null"));
+    assert!(password_pattern.is_match("tabs\tand\nnewlines\rremain valid"));
+
+    let plugin_config = &spec["components"]["schemas"]["PluginConfig"];
+    let config_description = plugin_config["properties"]["config"]["description"]
+        .as_str()
+        .expect("PluginConfig config description");
+    assert!(config_description.contains("Disabled plugin configs are stored without construction"));
+    assert!(config_description.contains("Enabling performs full validation"));
+
+    let audit_diff_description = spec["components"]["schemas"]["AuditEvent"]["properties"]["diff"]
+        ["description"]
+        .as_str()
+        .expect("AuditEvent diff description");
+    assert!(audit_diff_description.contains("stable `[REDACTED]` marker"));
+    assert!(audit_diff_description.contains("never values, entry fields, shape, or count"));
+
+    assert_eq!(
+        spec["paths"]["/batch"]["post"]["responses"]["500"]["$ref"],
+        "#/components/responses/InternalServerError"
+    );
+}
+
 fn normalized_path_template(path: &str) -> String {
     static PATH_PARAMETER: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\{[^}]+\}").expect("path-template regex compiles"));
@@ -559,10 +629,27 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"disallowed_consumers": ["bad"], "allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
+        json!({"allowed_consumers": ["  alice  "]}),
+        // U+FEFF ZWNBSP is not in Rust's Unicode White_Space set.
+        json!({"allowed_consumers": ["\u{feff}"]}),
+        json!({"disallowed_consumers": ["\u{feff}"]}),
+        json!({"allowed_groups": ["\u{feff}"]}),
+        json!({"disallowed_groups": ["\u{feff}"]}),
+        json!({"allowed_consumers": ["é".repeat(255)]}),
+        json!({"allowed_groups": ["é".repeat(255)]}),
+        json!({"disallowed_groups": ["é".repeat(255)]}),
+        json!({
+            "disallowed_consumers": ["é".repeat(4096)],
+            "allow_authenticated_identity": true
+        }),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
             "config should be valid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("access_control", &config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
         );
     }
 
@@ -572,6 +659,125 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"allowed_consumers": [], "allowed_groups": []}),
         json!({"allowed_consumers": ["alice"], "allow_authenticated_identity": true}),
         json!({"allowed_groups": ["engineering"], "allow_authenticated_identity": true}),
+        json!({"allowed_consumers": [""]}),
+        json!({"disallowed_consumers": [""]}),
+        json!({"allowed_groups": [""]}),
+        json!({"disallowed_groups": [""]}),
+        json!({"allowed_consumers": ["   "]}),
+        json!({"disallowed_consumers": ["\t"]}),
+        json!({"allowed_groups": ["\n"]}),
+        json!({"disallowed_groups": ["   "]}),
+        // U+0085 NEL is in Rust's Unicode White_Space set.
+        json!({"allowed_consumers": ["\u{0085}"]}),
+        json!({"disallowed_consumers": ["\u{0085}"]}),
+        json!({"allowed_groups": ["\u{0085}"]}),
+        json!({"disallowed_groups": ["\u{0085}"]}),
+        json!({"allowed_consumers": ["a".repeat(256)]}),
+        json!({
+            "disallowed_consumers": ["a".repeat(4097)],
+            "allow_authenticated_identity": true
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "config should be invalid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("access_control", &config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+}
+
+#[test]
+fn grpc_method_router_schema_matches_runtime_validation() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/GrpcMethodRouterConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("GrpcMethodRouterConfig schema compiles");
+
+    for config in [
+        json!({"allow_methods": []}),
+        json!({"deny_methods": ["pkg.Service/Denied"]}),
+        json!({"deny_methods": [" /pkg.Service/Denied "]}),
+        json!({
+            "method_rate_limits": {
+                "/pkg.Service/Call": {"max_requests": 1, "window_seconds": 60}
+            }
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379/0",
+            "redis_key_prefix": "ferrum:grpc",
+            "redis_pool_size": 1,
+            "redis_connect_timeout_seconds": 1,
+            "redis_health_check_interval_seconds": 1
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "config should be valid: {config}"
+        );
+    }
+
+    for config in [
+        json!({}),
+        json!({"deny_methods": []}),
+        json!({"method_rate_limits": {}}),
+        json!({"deny_methods": ["not-a-grpc-method"]}),
+        json!({"deny_methods": ["pkg.Service/Method", "pkg.Service/Method"]}),
+        json!({
+            "method_rate_limits": {
+                "pkg.Service/Call/Extra": {"max_requests": 1, "window_seconds": 60}
+            }
+        }),
+        json!({
+            "method_rate_limits": {
+                "pkg.Service/Call": {"max_requests": 0, "window_seconds": 60}
+            }
+        }),
+        json!({"deny_methods": ["pkg.Service/Denied"], "sync_mode": "redis"}),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": ""
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "http://localhost:6379"
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_key_prefix": ""
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_pool_size": 0
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_connect_timeout_seconds": 0
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_health_check_interval_seconds": 0
+        }),
     ] {
         assert!(
             validator.validate(&config).is_err(),
@@ -794,6 +1000,37 @@ fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
     assert!(guide.contains("`max_cache_entries` (default `10,000`)"));
     assert!(guide.contains("| `ldap_auth` | `max_cache_entries` | `10000` |"));
     assert!(guide.contains("| `ldap_auth` | `cache_ttl_seconds` | `0` |"));
+}
+
+#[test]
+fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/JwksAuthConfig")
+        .expect("JwksAuthConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["from_headers"]["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        schema["properties"]["jwks_refresh_interval_secs"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_JWKS_REFRESH_INTERVAL_SECS)
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_jti_cache_max_entries"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES)
+    );
+
+    let guide = include_str!("../../docs/cache_management.md");
+    assert!(guide.contains("`jwks_refresh_interval_secs`, default `900` seconds"));
+    assert!(guide.contains("| `jwks_auth` | `jwks_refresh_interval_secs` | `900` |"));
+    assert!(!guide.contains("| `jwks_auth` | `cache_ttl_seconds`"));
 }
 
 #[test]
@@ -1311,6 +1548,99 @@ fn assert_component_validity(
 }
 
 #[test]
+fn workload_metrics_schema_documents_runtime_tag_limits() {
+    use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let properties = spec
+        .pointer("/components/schemas/WorkloadMetricsConfig/properties")
+        .expect("WorkloadMetricsConfig properties exist");
+
+    for field in ["custom_tags", "custom_header_tags"] {
+        assert_eq!(properties[field]["maxProperties"], json!(32));
+        let description = properties[field]["description"]
+            .as_str()
+            .expect("custom tag description");
+        assert!(
+            description.contains("32 distinct tag names combined"),
+            "{field} must document the combined runtime cap"
+        );
+    }
+
+    let operation_value = properties
+        .pointer("/metrics/properties/tag_overrides/items/properties/operation/properties/value")
+        .expect("metric set operation value schema exists");
+    assert_eq!(operation_value["maxLength"], json!(256));
+    let value_description = operation_value["description"]
+        .as_str()
+        .expect("metric value description");
+    assert!(value_description.contains("256 UTF-8 bytes"));
+    assert!(value_description.contains("counts Unicode characters"));
+
+    let ascii_256 = "x".repeat(256);
+    let ascii_257 = "x".repeat(257);
+    let metric_config = |value: &str| {
+        json!({
+            "metrics": {
+                "tag_overrides": [{
+                    "name": "source_workload",
+                    "operation": {"type": "set", "value": value}
+                }]
+            }
+        })
+    };
+    assert_component_validity(
+        &spec,
+        "WorkloadMetricsConfig",
+        &metric_config(&ascii_256),
+        true,
+    );
+    assert!(WorkloadMetrics::new(&metric_config(&ascii_256)).is_ok());
+    assert_component_validity(
+        &spec,
+        "WorkloadMetricsConfig",
+        &metric_config(&ascii_257),
+        false,
+    );
+    assert!(WorkloadMetrics::new(&metric_config(&ascii_257)).is_err());
+
+    // JSON Schema maxLength counts characters, whereas runtime admission is
+    // deliberately stricter for multibyte input and counts encoded bytes.
+    let multibyte_over_256_bytes = "é".repeat(129);
+    assert_component_validity(
+        &spec,
+        "WorkloadMetricsConfig",
+        &metric_config(&multibyte_over_256_bytes),
+        true,
+    );
+    assert!(WorkloadMetrics::new(&metric_config(&multibyte_over_256_bytes)).is_err());
+
+    let custom_tags: serde_json::Map<String, serde_json::Value> = (0..16)
+        .map(|index| (format!("literal_{index}"), json!("value")))
+        .collect();
+    let custom_header_tags: serde_json::Map<String, serde_json::Value> = (0..16)
+        .map(|index| (format!("header_{index}"), json!("x-tag")))
+        .collect();
+    let combined_32 = json!({
+        "custom_tags": custom_tags,
+        "custom_header_tags": custom_header_tags,
+    });
+    assert_component_validity(&spec, "WorkloadMetricsConfig", &combined_32, true);
+    assert!(WorkloadMetrics::new(&combined_32).is_ok());
+
+    let mut combined_33 = combined_32;
+    combined_33["custom_header_tags"]
+        .as_object_mut()
+        .expect("custom_header_tags object")
+        .insert("header_16".to_string(), json!("x-tag"));
+    // The per-map OpenAPI bounds cannot express a sum across two objects; the
+    // property descriptions carry that contract and runtime rejects the union.
+    assert_component_validity(&spec, "WorkloadMetricsConfig", &combined_33, true);
+    assert!(WorkloadMetrics::new(&combined_33).is_err());
+}
+
+#[test]
 fn opa_schema_matches_runtime_validation_contract() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -1798,6 +2128,28 @@ fn jwt_auth_schema_rejects_unknown_config_keys() {
 }
 
 #[test]
+fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AdaptiveConcurrencyConfig")
+        .expect("missing AdaptiveConcurrencyConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AdaptiveConcurrencyConfig schema compiles");
+
+    assert!(
+        validator
+            .validate(&json!({"key_by": "backend_target", "max_limit": 32}))
+            .is_ok()
+    );
+    assert!(
+        validator.validate(&json!({"max_limt": 32})).is_err(),
+        "schema must reject unknown adaptive_concurrency policy keys"
+    );
+}
+
+#[test]
 fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 
@@ -2156,5 +2508,65 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
         }),
     ] {
         assert_component_validity(&spec, "AiResponseGuardConfig", &invalid, false);
+    }
+}
+
+#[test]
+fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/SecurityHeadersConfig")
+        .expect("SecurityHeadersConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["hsts"]["oneOf"][3]["additionalProperties"],
+        false
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({
+            "hsts": { "max_age": 300 },
+            "set": { "X!#$%&'*+.^_`|~Policy": "one\ttwo" },
+            "remove": ["X!Policy"]
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "fram_options": false }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "hsts": { "include_subdomain": true } }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "set": { "X Policy": "on" } }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "set": { "X-Policy": "one\u{0001}two" } }),
+        false,
+    );
+    for non_ascii_value in [
+        json!({ "content_type_options": "caf\u{00e9}" }),
+        json!({ "frame_options": "caf\u{00e9}" }),
+        json!({ "referrer_policy": "caf\u{00e9}" }),
+        json!({ "hsts": "caf\u{00e9}" }),
+        json!({ "content_security_policy": "caf\u{00e9}" }),
+        json!({ "permissions_policy": "caf\u{00e9}" }),
+        json!({ "set": { "X-Policy": "caf\u{00e9}" } }),
+    ] {
+        assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
 }

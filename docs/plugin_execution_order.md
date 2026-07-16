@@ -31,12 +31,32 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 4. before_proxy         │  Request transformation before backend call
+│ 4. before_proxy         │  Route/header preparation before backend-path policy
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 5. backend_admission    │  Target-aware backend admission after load balancing
+│ 5a. path policy preview │  Stateless access check for initial selected path
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 5b. routing-header hook │  Deferred enrichment with previewed target pinned
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 5c. final path policy   │  Enforce settled method; charge state once
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 5d. deferred before_proxy │  Remaining external/synthetic work after policy
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 6. backend_admission    │  Target-aware backend admission after load balancing
 └────────────┬────────────┘
              │
              ▼
@@ -46,48 +66,98 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 6. after_proxy          │  Response headers, fast-path rejection, CORS
+│ 7. after_proxy          │  Response headers, fast-path rejection, CORS
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 7. normalize_response_body │ Provider/protocol normalization
+│ 8. normalize_response_body │ Provider/protocol normalization
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 8. on_response_body     │  Normalized buffered body inspection
+│ 9. on_response_body     │  Normalized buffered body inspection
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 9. transform_response_body │ Buffered presentation rewrites
+│ 10. transform_response_body │ Buffered presentation rewrites
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 10. on_final_response_body │ Buffered body validation/storage
+│ 11. on_final_response_body │ Buffered body validation/storage
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 11. on_response_committed │ Observe final buffered response
+│ 12. on_response_committed │ Observe final buffered response
 └────────────┬────────────┘
              │
-             │  Streamed non-buffered bodies skip phases 7-11 and call
+             │  Streamed non-buffered bodies skip phases 8-12 and call
              │  on_response_stream_terminated here when the body terminates.
              │
              ▼
 ┌─────────────────────────┐
-│ 12. log                 │  Logging & observability (fire-and-forget)
+│ 13. log                 │  Logging & observability (fire-and-forget)
 └─────────────────────────┘
 ```
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
+`on_backend_path_resolved` is an opt-in, route-sensitive boundary after
+route/header-shaping `before_proxy` hooks and load balancing, but before
+circuit-breaker or backend dispatch. The gateway assembles the same path
+segments used by the backend URL builder, including regex/exact/prefix match
+length, encoded-slash normalization, `strip_listen_path`, `backend_path`, and
+the selected target's path. `grpc_method_router` uses this phase so
+allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
+backend wire. When a deferred external hook can inject headers used by load
+balancing, the policy hook first receives a non-state-consuming preview phase
+for the already selected path. That target remains pinned across the external
+call so the hook cannot cause side effects and then steer the request onto a
+method that was not authorized first. The same path is enforced once afterward;
+per-method rate limits are charged only in this final phase, so one request
+cannot consume two method buckets. Gateway-owned identity headers and
+configured egress baggage filtering are reapplied after every deferred mutation
+pass. Its
+pre-filtered plugin list is built on reload; proxies without an opt-in plugin do
+not scan the chain or allocate an effective-path string. Once policy binds the
+first target's path, retries may rotate host/port only when the candidate keeps
+the same assembled effective backend path, including the proxy `backend_path`
+fallback when a target has no explicit path. A candidate with a different path
+aborts the retry instead of redialing the failed target or silently changing
+the authorized method. This applies to HTTP, native and bridged gRPC/H3, and
+WebSocket retry loops.
+
+When backend-path policy is active, `before_proxy` hooks that can dispatch
+external work or synthesize a terminal response opt into the deferred phases.
+Ferrum runs them in their normal relative priority order only after path policy.
+`fault_injection`, `request_mirror`, pre-proxy `serverless_function`,
+`response_mock`, `grpc_deadline`, and `load_testing` use this boundary, so a
+backend-effective gRPC deny cannot be delayed, faulted, mirrored, invoked,
+mocked, deadline-rejected, or load-fanned-out before it is enforced. Proxies
+without a backend-path policy retain the ordinary single `before_proxy` pass.
+Deferred hooks generally observe the original client path, preserving their
+normal request semantics even when mesh routing rewrote the backend path.
+`request_mirror` is the security-sensitive exception: when backend-path policy
+is active and `mirror_path` is unset, it mirrors the exact effective path that
+passed final authorization. An explicit operator-configured `mirror_path`
+still wins. A deferred hook that can inject routing headers runs after the
+selected target's access preview, and that target is pinned across the external
+call. Ferrum performs the single state-consuming enforcement against the same
+effective path before any remaining external or synthetic hook. After each
+deferred pass, the gateway removes every case variant of the reserved
+`x-consumer-username` and `x-consumer-custom-id` headers, restores only
+authenticated gateway values, and reapplies configured egress baggage-key
+filtering. Plugin-returned headers therefore cannot spoof backend identity,
+restore forbidden baggage, or steer this request to an unpreviewed target.
+
 When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
 
 For gateway-generated rejection responses, a small set of header-only `after_proxy` plugins opt in to still run. This preserves headers such as `Access-Control-Allow-Origin`, `traceparent`, and request IDs on rejected responses without treating them as backend responses.
+
+Post-routing method-filter responses and native-gRPC gateway errors also apply the resolved route's precomputed initial-response policy at the client HEADERS boundary. Pre-routing failures have no resolved plugin configuration. Protocol-owned gRPC terminal metadata and HTTP framing are restored after policy.
 
 `after_proxy` rejections are also honored before anything is sent downstream. This matters for plugins like `response_size_limiting`, whose `Content-Length` fast path now replaces oversized backend responses instead of only logging a warning.
 
@@ -126,6 +196,8 @@ Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_va
 
 **Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or a UDP/DTLS session expires, is cleaned up, or otherwise ends). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
 
+Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream proxy because it is relayed through a mesh CONNECT tunnel. Those handlers run only the `workload_metrics` connect/disconnect lifecycle, once per logical captured session, to produce the source-side outbound CLIENT span with final duration, bytes, and error state. They do not run authentication, authorization, throttling, or other policy plugins a second time; destination-side mesh authorization remains the enforcement point.
+
 ### Stream Hook Implementations by Plugin
 
 | Plugin | `on_stream_connect` | `on_stream_disconnect` | Behavior |
@@ -150,7 +222,7 @@ Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_va
 | `ws_logging` | | ✓ | Sends stream connection logs to WebSocket endpoint |
 | `prometheus_metrics` | | ✓ | Records `ferrum_stream_connections_total` counter and `ferrum_stream_duration_ms` histogram |
 | `api_chargeback_sink` | | ✓ | Exports durable stream charge events or snapshot deltas to ClickHouse |
-| `workload_metrics` | ✓ | ✓ | Adds mesh workload/source labels to stream metadata and emits mesh spans when Telemetry providers are configured |
+| `workload_metrics` | ✓ | ✓ | Adds direction-aware mesh source/destination labels to stream metadata and emits mesh spans when Telemetry providers are configured |
 | `transaction_debugger` | | ✓ | Prints debug info for stream connections |
 
 ### When Hooks Fire
@@ -302,7 +374,7 @@ Given all built-in plugins enabled, the execution order is:
 | 9 | `spec_expose` | 210 | on_request_received |
 | 10 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body |
 | 11 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, on_final_request_body, after_proxy, transform_response_body |
-| 12 | `grpc_method_router` | 275 | on_request_received, before_proxy |
+| 12 | `grpc_method_router` | 275 | on_request_received, on_backend_path_resolved |
 | 13 | `spiffe_identity` | 940 | on_request_received, on_stream_connect |
 | 14 | `mtls_auth` | 950 | authenticate, on_stream_connect |
 | 15 | `jwks_auth` | 1000 | authenticate |
@@ -353,7 +425,7 @@ Given all built-in plugins enabled, the execution order is:
 | 60 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body |
 | 61 | `ai_federation` | 4060 | before_proxy |
 | 62 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
-| 63 | `security_headers` | 4080 | after_proxy |
+| 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
 | 66 | `stdout_logging` | 9000 | log, on_stream_disconnect |
@@ -370,7 +442,7 @@ Given all built-in plugins enabled, the execution order is:
 | 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect, on_ws_disconnect |
 | 78 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
 | 79 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
-| 80 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
+| 80 | `workload_metrics` | 9360 | on_request_received, before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
 | 81 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
 
 ## Why This Order Matters
@@ -579,7 +651,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 
 | Plugin | Http | Grpc | WebSocket | Tcp | Udp | Rationale |
 |--------|:----:|:----:|:---------:|:---:|:---:|-----------|
-| `cors` | ✓ | | | | | HTTP-only concept (Origin/ACAO headers) |
+| `cors` | ✓ | ✓ | | | | Origin/ACAO enforcement includes browser gRPC-Web requests |
 | `ip_restriction` | ✓ | ✓ | ✓ | ✓ | ✓ | IP filtering is protocol-agnostic |
 | `bot_detection` | ✓ | ✓ | ✓ | | | Needs User-Agent header |
 | `sse` | ✓ | | | | | SSE is HTTP-only (text/event-stream over chunked transfer) |
@@ -592,7 +664,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers or query parameters |
 | `ldap_auth` | ✓ | ✓ | ✓ | | | Requires HTTP Basic auth header; authenticates against LDAP directory |
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
-| `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
+| `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers and a buffered request body; HBONE CONNECT fails closed as incompatible |
 | `soap_ws_security` | ✓ | | | | | SOAP XML body parsing (text/xml, application/soap+xml) |
 | `access_control` | ✓ | ✓ | ✓ | ✓ | ✓ | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `mesh_authz` | ✓ | ✓ | ✓ | ✓ | ✓ | Applies Layer 2 mesh policy using SPIFFE or HBONE identities |

@@ -1169,6 +1169,8 @@ struct ValidatedBundle {
 /// Passed as a single value to [`validate_bundle`] so the function stays under
 /// the 7-argument clippy limit while keeping all PUT-specific fields together.
 struct PutContext<'a> {
+    /// Stored API spec whose owned resources are being replaced.
+    spec: &'a ApiSpec,
     /// ID of the proxy being replaced (excluded from uniqueness checks).
     proxy_id: &'a str,
     /// ID of the upstream currently owned by the spec (excluded from name checks).
@@ -1286,6 +1288,7 @@ async fn validate_bundle(
     }
 
     // Plugins
+    let known_plugins = crate::plugins::available_plugins();
     for plugin in &bundle.plugins {
         let mut plugin_errors: Vec<String> = Vec::new();
 
@@ -1297,14 +1300,22 @@ async fn validate_bundle(
             plugin_errors.extend(errs);
         }
 
-        // Plugin-specific config schema validation. Screen literal-IP plugin
-        // endpoints against the configured egress policy (same as direct admin
-        // POSTs and the file/db loaders).
-        if let Err(e) = crate::plugins::validate_plugin_config_with_policy(
-            &plugin.plugin_name,
-            &plugin.config,
-            &state.backend_allow_ips,
-        ) {
+        // Plugin names remain validated even while disabled. Construction and
+        // plugin-specific config validation are deferred until enabled, which
+        // lets operators stage configs whose runtime prerequisites are not yet
+        // provisioned without admitting unknown plugin types.
+        if !known_plugins.contains(&plugin.plugin_name.as_str()) {
+            plugin_errors.push(format!(
+                "Unknown plugin name '{}'. Available plugins: {:?}",
+                plugin.plugin_name, known_plugins
+            ));
+        } else if plugin.enabled
+            && let Err(e) = crate::plugins::validate_plugin_config_with_policy(
+                &plugin.plugin_name,
+                &plugin.config,
+                &state.backend_allow_ips,
+            )
+        {
             plugin_errors.push(e);
         }
 
@@ -1699,6 +1710,49 @@ async fn validate_bundle(
                     errors: vec![format!("An upstream with name '{}' already exists", name)],
                 }),
                 Err(e) => return Err(classify_db_error(e)),
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        let validation_result = if let Some(put_ctx) = put_ctx.as_ref() {
+            crate::admin::crud::validate_hmac_request_transform_api_spec_replacement_candidate(
+                db,
+                state,
+                namespace,
+                put_ctx.spec,
+                &bundle.proxy,
+                &bundle.plugins,
+            )
+            .await
+        } else {
+            crate::admin::crud::validate_hmac_request_transform_candidates(
+                db,
+                state,
+                namespace,
+                std::slice::from_ref(&bundle.proxy),
+                &bundle.plugins,
+                None,
+            )
+            .await
+        };
+        match validation_result {
+            Ok(()) => {}
+            Err(crate::admin::crud::AfterValidateError::BadRequest(errors)) => {
+                failures.push(ValidationFailure {
+                    resource_type: "plugin_composition",
+                    id: bundle.proxy.id.clone(),
+                    errors,
+                });
+            }
+            Err(crate::admin::crud::AfterValidateError::Db(error)) => {
+                return Err(classify_db_error(error));
+            }
+            Err(crate::admin::crud::AfterValidateError::Response(_)) => {
+                return Err(ApiSpecError::Internal(
+                    "HMAC request-transform candidate validation returned an unexpected response"
+                        .to_string(),
+                ));
             }
         }
     }
@@ -2437,6 +2491,7 @@ pub async fn handle_put_api_spec(
         db.as_ref(),
         state,
         Some(PutContext {
+            spec: &existing_spec,
             proxy_id: &existing_spec.proxy_id,
             upstream_id: existing_upstream_id,
             proxy: existing_proxy_row.as_ref(),

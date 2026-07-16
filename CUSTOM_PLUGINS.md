@@ -263,7 +263,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn should_buffer_request_body(&self, &ctx) -> bool` | Delegates | Per-request decision on whether to buffer. Defaults to `requires_request_body_buffering()`. Override for conditional buffering (e.g., only for certain content types). |
 | `fn requires_response_body_buffering(&self) -> bool` | `false` | Config-time upper bound. Set to `true` if the plugin may need the complete response body. |
 | `fn should_buffer_response_body(&self, &ctx) -> bool` | Delegates | Per-request refinement. Defaults to `requires_response_body_buffering()` and may skip buffering for irrelevant requests. |
-| `fn should_buffer_response_body_for_content_type(&self, &ctx, content_type, status, &headers) -> bool` | Delegates | Post-header refinement on supported dispatch paths. This is narrowing-only: it may release a response selected for buffering, but cannot force a streaming response to buffer. |
+| `fn should_buffer_response_body_for_content_type(&self, &ctx, content_type, status, &headers) -> bool` | Delegates | Post-header refinement on supported dispatch paths. Inspect status and the full header map (including `Content-Encoding`) when representation metadata affects safety. This is narrowing-only: it may release a response selected for buffering, but cannot force a streaming response to buffer. |
 | `fn may_modify_response_content_type(&self, &ctx, backend_content_type) -> bool` | `false` | Set when `after_proxy` may relabel the backend `Content-Type`; this prevents an unsafe buffer-to-stream downgrade. The answer must match the current request and backend type exactly. |
 | `fn requires_response_stream_hooks(&self) -> bool` | `false` | Config-time opt-in for streaming response inspection. |
 | `fn response_stream_inspector(&self, &ctx, status, content_type) -> Option<Box<dyn ResponseStreamInspector>>` | `None` | Create state owned by one eligible streaming response, or return `None` for passthrough. |
@@ -472,7 +472,7 @@ See the [response-body streaming guide](docs/response_body_streaming.md) for the
 
 ### Buffer the complete response
 
-`requires_response_body_buffering()` is the config-time upper bound. `should_buffer_response_body()` may narrow it using request context. On dispatch paths that support the post-header downgrade, `should_buffer_response_body_for_content_type()` gets one final opportunity to narrow the decision after the backend status and headers arrive. The content-type hook cannot turn a streaming decision into buffering; returning `true` where `should_buffer_response_body()` returned `false` has no effect. See the response-body streaming guide for the current protocol coverage.
+`requires_response_body_buffering()` is the config-time upper bound. `should_buffer_response_body()` may narrow it using request context. On dispatch paths that support the post-header downgrade, `should_buffer_response_body_for_content_type()` gets one final opportunity to narrow the decision after the backend status and headers arrive. Despite its historical name, this hook must consider any response header that determines whether the buffered hook can inspect the representation. In particular, do not release non-identity `Content-Encoding` bytes when correctness depends on a bounded final decode or fail-closed rejection. The content-type hook cannot turn a streaming decision into buffering; returning `true` where `should_buffer_response_body()` returned `false` has no effect. See the response-body streaming guide for the current protocol coverage.
 
 ```rust
 #[async_trait]
@@ -1071,7 +1071,7 @@ ferrum-edge/
 ├── build.rs                   # Auto-discovers plugins + migrations at compile time
 ├── custom_plugins/            # YOUR PLUGINS GO HERE — just drop .rs files
 │   ├── mod.rs                 # Thin shim (includes build-script-generated code)
-│   ├── example_plugin.rs      # Working example — header injection (can be removed)
+│   ├── example_plugin.rs      # Working example — header/body transforms (can be removed)
 │   ├── example_audit_plugin.rs # Working example — database migrations (can be removed)
 │   ├── my_header_injector.rs  # Your plugin
 │   └── my_custom_auth.rs      # Your plugin

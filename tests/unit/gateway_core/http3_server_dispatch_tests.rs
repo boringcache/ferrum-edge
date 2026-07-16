@@ -106,7 +106,8 @@ fn buffered_h3_deadline_replacements_keep_grpc_web_wire_flavor() {
         .expect("buffered H3 direct response write must remain present");
     assert!(replacement < response_write);
     assert!(
-        committed[..response_write].contains("response_flavor.grpc_web_content_type()"),
+        committed[..response_write]
+            .contains("grpc_web_response_content_type.as_deref()"),
         "the direct H3 buffered writer must pass the original gRPC-Web flavor into replacement"
     );
 
@@ -152,7 +153,7 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
         .expect("request-aware H3 gRPC error writer must remain present");
     let writer = &source[writer..];
     let writer_end = writer
-        .find("/// Send-only core of [`write_grpc_error`]")
+        .find("async fn write_grpc_error_send<S>(")
         .expect("request-aware H3 gRPC error writer must remain bounded");
     let writer = &writer[..writer_end];
     assert!(writer.contains("translated_error_response("));

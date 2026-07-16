@@ -53,13 +53,39 @@ pub(crate) enum WriteAction<'a> {
 pub(crate) enum AfterValidateError {
     BadRequest(Vec<String>),
     Db(anyhow::Error),
-    Response(Response<Full<Bytes>>),
+    Response(Box<Response<Full<Bytes>>>),
 }
 
 /// Validation outcomes for resource-specific checks and generic field validation.
 pub(crate) enum ValidationError {
     Fields(Vec<String>),
     Message(String),
+}
+
+/// A write-preparation failure whose origin determines the HTTP status.
+pub(crate) enum PrepareWriteError {
+    InvalidRequest(String),
+    Internal(String),
+}
+
+impl PrepareWriteError {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::InvalidRequest(message) | Self::Internal(message) => message,
+        }
+    }
+}
+
+pub(crate) enum BatchPreparationError {
+    Validation(Vec<String>),
+    Internal(String),
 }
 
 const MTLS_ADMISSION_LOCK_SHARDS: usize = 64;
@@ -145,11 +171,177 @@ async fn validate_mtls_auth_candidate(
     }
 }
 
-pub(crate) async fn mtls_consumer_candidate_errors(
+pub(crate) async fn validate_hmac_request_transform_candidates(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    proxies: &[Proxy],
+    plugins: &[PluginConfig],
+    removed_plugin_id: Option<&str>,
+) -> Result<(), AfterValidateError> {
+    // Global plugin scope is global within one runtime namespace. CP snapshots
+    // are filtered before broadcast and file/database modes load one namespace,
+    // so cross-namespace plugins must never create false admission conflicts.
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+
+    if let Some(removed_plugin_id) = removed_plugin_id {
+        candidate
+            .plugin_configs
+            .retain(|plugin| plugin.namespace != namespace || plugin.id != removed_plugin_id);
+    }
+
+    for proxy in proxies {
+        if let Some(existing) = candidate
+            .proxies
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == proxy.id)
+        {
+            *existing = proxy.clone();
+        } else {
+            candidate.proxies.push(proxy.clone());
+        }
+    }
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+
+    let http_client = super::plugin_validation_http_client(state);
+    crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
+        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+}
+
+/// Validate the exact post-PUT API-spec replacement candidate.
+///
+/// The persistence contract deletes plugin configs owned by the replaced spec,
+/// removes associations declared only by the previous spec, preserves manual
+/// associations, and then overlays the incoming proxy and plugins. Build that
+/// same graph here so admission neither rejects a valid replacement because of
+/// removed globals nor admits an invalid chain by dropping retained manual
+/// associations.
+pub(crate) async fn validate_hmac_request_transform_api_spec_replacement_candidate(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    existing_spec: &crate::config::types::ApiSpec,
+    proxy: &Proxy,
+    plugins: &[PluginConfig],
+) -> Result<(), AfterValidateError> {
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let replaced_plugins = db
+        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let replaced_plugin_ids: HashSet<String> = replaced_plugins
+        .into_iter()
+        .map(|plugin| plugin.id)
+        .collect();
+
+    // Only plugin configs owned by this spec are replaceable. Treating an
+    // incoming same-ID plugin as an overlay on a manual or differently owned
+    // config would make the in-memory candidate diverge from persistence,
+    // where the insert is rejected by the plugin-config primary key.
+    if let Some(plugin) = plugins.iter().find(|plugin| {
+        !replaced_plugin_ids.contains(&plugin.id)
+            && candidate
+                .plugin_configs
+                .iter()
+                .any(|existing| existing.namespace == namespace && existing.id == plugin.id)
+    }) {
+        return Err(AfterValidateError::BadRequest(vec![format!(
+            "plugin_config id '{}' already exists in namespace '{}' outside api_spec '{}'; replacement cannot take ownership of it",
+            plugin.id, namespace, existing_spec.id
+        )]));
+    }
+
+    candidate
+        .plugin_configs
+        .retain(|plugin| !replaced_plugin_ids.contains(&plugin.id));
+    for candidate_proxy in &mut candidate.proxies {
+        candidate_proxy
+            .plugins
+            .retain(|association| !replaced_plugin_ids.contains(&association.plugin_config_id));
+    }
+
+    let previous_declared_assoc_ids =
+        crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec(
+            existing_spec,
+        );
+    let incoming_assoc_ids: HashSet<&str> = proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    let mut replacement_proxy = proxy.clone();
+    let mut preserved_associations = candidate
+        .proxies
+        .iter()
+        .find(|item| item.namespace == namespace && item.id == proxy.id)
+        .map(|item| item.plugins.clone())
+        .unwrap_or_default();
+    preserved_associations.retain(|association| {
+        !previous_declared_assoc_ids.contains(&association.plugin_config_id)
+            && !incoming_assoc_ids.contains(association.plugin_config_id.as_str())
+    });
+    preserved_associations.extend(proxy.plugins.iter().cloned());
+    replacement_proxy.plugins = preserved_associations;
+
+    if let Some(existing) = candidate
+        .proxies
+        .iter_mut()
+        .find(|item| item.namespace == namespace && item.id == proxy.id)
+    {
+        *existing = replacement_proxy;
+    } else {
+        candidate.proxies.push(replacement_proxy);
+    }
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+
+    let http_client = super::plugin_validation_http_client(state);
+    crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
+        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+}
+
+/// Validate a wholesale namespace replacement without retaining resources that
+/// the restore will delete. Runtime plugin chains are namespace-scoped, so the
+/// normalized replacement is the complete authoritative candidate.
+pub(crate) fn validate_hmac_request_transform_restore_candidate(
+    state: &AdminState,
+    replacement: &GatewayConfig,
+) -> Result<(), AfterValidateError> {
+    let http_client = super::plugin_validation_http_client(state);
+    crate::plugin_cache::validate_hmac_request_transform_candidate(replacement, &http_client)
+        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+}
+
+async fn consumer_candidate_config(
     db: &dyn DatabaseBackend,
     namespace: &str,
     consumer: &Consumer,
-) -> DbResult<Vec<String>> {
+) -> DbResult<GatewayConfig> {
     let mut config = db.load_namespace_snapshot(namespace).await?;
     if let Some(existing) = config
         .consumers
@@ -160,8 +352,36 @@ pub(crate) async fn mtls_consumer_candidate_errors(
     } else {
         config.consumers.push(consumer.clone());
     }
-    Ok(config
+    Ok(config)
+}
+
+pub(crate) async fn mtls_consumer_candidate_errors(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> DbResult<Vec<String>> {
+    Ok(consumer_candidate_config(db, namespace, consumer)
+        .await?
         .validate_unique_mtls_credentials()
+        .err()
+        .unwrap_or_default())
+}
+
+/// Reject an admin Consumer/credential write whose hmac_auth secret is
+/// already claimed by another consumer in the namespace. Snapshot-based like
+/// the mTLS candidate check (rather than a credential-index probe) so
+/// pre-existing rows written before hmac secrets were policed are still
+/// authoritative. `lock_mtls_admission` serializes same-process prechecks;
+/// namespace-scoped SQL/Mongo uniqueness constraints are the cross-process
+/// persistence backstop.
+pub(crate) async fn hmac_consumer_candidate_errors(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> DbResult<Vec<String>> {
+    Ok(consumer_candidate_config(db, namespace, consumer)
+        .await?
+        .validate_unique_hmac_credentials()
         .err()
         .unwrap_or_default())
 }
@@ -217,7 +437,7 @@ pub(crate) trait AdminResource:
 
     fn prepare_for_update(&mut self, _existing: &Self) {}
 
-    fn prepare_for_write(&mut self) -> Result<(), String> {
+    fn prepare_for_write(&mut self) -> Result<(), PrepareWriteError> {
         Ok(())
     }
 
@@ -529,20 +749,26 @@ pub(crate) fn prepare_batch_resource<R: AdminResource>(
     namespace: &str,
     now: DateTime<Utc>,
     validation_ctx: &ValidationCtx<'_>,
-) -> Result<(), Vec<String>> {
+) -> Result<(), BatchPreparationError> {
     if resource.id().is_empty() {
         resource.set_id(Uuid::new_v4().to_string());
     } else if let Err(message) = validate_resource_id(resource.id()) {
-        return Err(vec![message]);
+        return Err(BatchPreparationError::Validation(vec![message]));
     }
 
     resource.normalize();
     resource.set_namespace(namespace.to_string());
     resource
         .validate(validation_ctx)
-        .map_err(ValidationError::into_messages)?;
-    if let Err(message) = resource.prepare_for_write() {
-        return Err(vec![message]);
+        .map_err(ValidationError::into_messages)
+        .map_err(BatchPreparationError::Validation)?;
+    if let Err(error) = resource.prepare_for_write() {
+        return Err(match error {
+            PrepareWriteError::InvalidRequest(message) => {
+                BatchPreparationError::Validation(vec![message])
+            }
+            PrepareWriteError::Internal(message) => BatchPreparationError::Internal(message),
+        });
     }
     resource.set_created_at(now);
     resource.set_updated_at(now);
@@ -557,12 +783,17 @@ pub(crate) fn consumer_response_body(consumer: &Consumer) -> Value {
     json!(redact_consumer_for_response(consumer))
 }
 
+pub(crate) fn consumer_audit_body(consumer: &Consumer) -> Value {
+    json!(super::redact_consumer_credentials_for_audit(consumer))
+}
+
 pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
     if config_update_target_was_not_found(error) {
         return not_found_response::<Consumer>();
     }
-    let message = error.to_string();
-    let status = if super::is_unique_constraint_violation(&message) {
+    let unique_conflict = super::is_unique_constraint_violation(&error.to_string());
+    let message = consumer_persist_error_message(error);
+    let status = if unique_conflict {
         StatusCode::CONFLICT
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
@@ -570,11 +801,28 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     super::json_response(status, &json!({"error": message}))
 }
 
-pub(crate) fn hash_consumer_credentials(consumer: &mut Consumer) -> Result<(), String> {
+/// Redact persistence-level uniqueness diagnostics before they reach an admin
+/// response. MongoDB duplicate-key errors can echo indexed credential-derived
+/// values; callers need the conflict disposition, never credential or index
+/// metadata.
+pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
+    if super::is_unique_constraint_violation(&error.to_string()) {
+        "Consumer identity or credential conflicts with another Consumer in the namespace"
+            .to_string()
+    } else {
+        error.to_string()
+    }
+}
+
+pub(crate) fn hash_consumer_credentials(
+    consumer: &mut Consumer,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     super::hash_consumer_secrets(consumer)
 }
 
-pub(crate) fn hash_basic_auth_credentials(cred: &mut Value) -> Result<(), String> {
+pub(crate) fn hash_basic_auth_credentials(
+    cred: &mut Value,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     super::hash_credential_passwords(cred)
 }
 
@@ -1783,13 +2031,22 @@ impl AdminResource for PluginConfig {
         {
             validate_mtls_auth_candidate(db, namespace, None, Some(resource), None).await?;
         }
+        validate_hmac_request_transform_candidates(
+            db,
+            state,
+            namespace,
+            &[],
+            std::slice::from_ref(resource),
+            None,
+        )
+        .await?;
 
         Ok(())
     }
 
     async fn before_delete(
         db: &dyn DatabaseBackend,
-        _state: &AdminState,
+        state: &AdminState,
         namespace: &str,
         existing: &Self,
         _ctx: &ValidationCtx<'_>,
@@ -1797,6 +2054,15 @@ impl AdminResource for PluginConfig {
         if existing.plugin_name == "mtls_auth" {
             validate_mtls_auth_candidate(db, namespace, None, None, Some(&existing.id)).await?;
         }
+        validate_hmac_request_transform_candidates(
+            db,
+            state,
+            namespace,
+            &[],
+            &[],
+            Some(&existing.id),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -2227,18 +2493,29 @@ impl AdminResource for Proxy {
         // effective `mtls_auth` association; compatibility validation itself
         // remains stream-specific.
         validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
+        validate_hmac_request_transform_candidates(
+            db,
+            state,
+            namespace,
+            std::slice::from_ref(resource),
+            &[],
+            None,
+        )
+        .await?;
 
         if resource.dispatch_kind.is_stream()
             && let Some(port) = resource.listen_port
             && ctx.mode != "cp"
         {
             if ctx.reserved_ports.contains(&port) {
-                return Err(AfterValidateError::Response(super::json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": format!(
-                        "listen_port {} conflicts with a gateway reserved port (proxy/admin/gRPC listener)",
-                        port
-                    )}),
+                return Err(AfterValidateError::Response(Box::new(
+                    super::json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} conflicts with a gateway reserved port (proxy/admin/gRPC listener)",
+                            port
+                        )}),
+                    ),
                 )));
             }
 
@@ -2255,12 +2532,14 @@ impl AdminResource for Proxy {
                 )
                 .await
             {
-                return Err(AfterValidateError::Response(super::json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": format!(
-                        "listen_port {} is not available on the host: {}",
-                        port, error
-                    )}),
+                return Err(AfterValidateError::Response(Box::new(
+                    super::json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} is not available on the host: {}",
+                            port, error
+                        )}),
+                    ),
                 )));
             }
         }
@@ -2339,12 +2618,42 @@ impl AdminResource for Consumer {
         consumer_response_body(resource)
     }
 
+    fn audit_body(resource: &Self) -> Value {
+        consumer_audit_body(resource)
+    }
+
+    fn prepare_for_update(&mut self, existing: &Self) {
+        // Ordinary Consumer responses omit Basic credentials entirely. Preserve
+        // them when a client round-trips that response through PUT; explicit
+        // credential replacement and deletion use the credential endpoints.
+        if !self.credentials.contains_key("basicauth")
+            && let Some(basic_credentials) = existing.credentials.get("basicauth")
+        {
+            self.credentials
+                .insert("basicauth".to_string(), basic_credentials.clone());
+        }
+    }
+
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
         super::json_response(StatusCode::CONFLICT, &json!({"error": errors.join("; ")}))
     }
 
-    fn prepare_for_write(&mut self) -> Result<(), String> {
-        hash_consumer_credentials(self)
+    fn prepare_for_write(&mut self) -> Result<(), PrepareWriteError> {
+        let consumer_id = self.id.clone();
+        hash_consumer_credentials(self).map_err(|error| match error {
+            crate::config::types::BasicAuthCredentialPreparationError::InvalidCredential(
+                message,
+            ) => PrepareWriteError::InvalidRequest(format!(
+                "Failed to prepare Basic-auth credentials for consumer {}: {}",
+                consumer_id, message
+            )),
+            crate::config::types::BasicAuthCredentialPreparationError::ServerConfiguration(
+                message,
+            ) => PrepareWriteError::Internal(format!(
+                "Failed to prepare Basic-auth credentials for consumer {}: {}",
+                consumer_id, message
+            )),
+        })
     }
 
     fn map_persist_db_error(
@@ -2415,12 +2724,21 @@ impl AdminResource for Consumer {
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
-        if !resource.has_credential("mtls_auth") {
-            return Ok(());
+        let mut errors = Vec::new();
+        if resource.has_credential("mtls_auth") {
+            errors.extend(
+                mtls_consumer_candidate_errors(db, namespace, resource)
+                    .await
+                    .map_err(AfterValidateError::Db)?,
+            );
         }
-        let errors = mtls_consumer_candidate_errors(db, namespace, resource)
-            .await
-            .map_err(AfterValidateError::Db)?;
+        if resource.has_credential("hmac_auth") {
+            errors.extend(
+                hmac_consumer_candidate_errors(db, namespace, resource)
+                    .await
+                    .map_err(AfterValidateError::Db)?,
+            );
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -2440,7 +2758,7 @@ fn map_after_validate_error<R: AdminResource>(error: AfterValidateError) -> Resp
     match error {
         AfterValidateError::BadRequest(field_errors) => R::map_after_validate_errors(&field_errors),
         AfterValidateError::Db(error) => R::map_precheck_db_error(&error),
-        AfterValidateError::Response(response) => response,
+        AfterValidateError::Response(response) => *response,
     }
 }
 
@@ -2596,10 +2914,10 @@ async fn handle_write<R: AdminResource>(
         return Ok(map_after_validate_error::<R>(error));
     }
 
-    if let Err(message) = resource.prepare_for_write() {
+    if let Err(error) = resource.prepare_for_write() {
         return Ok(super::json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": message}),
+            error.status(),
+            &json!({"error": error.message()}),
         ));
     }
 

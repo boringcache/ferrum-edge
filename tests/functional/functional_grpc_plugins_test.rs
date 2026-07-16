@@ -7,14 +7,17 @@
 //!
 //! Run with: cargo test --test functional_tests functional_grpc_plugins -- --ignored --nocapture
 
+use super::functional_auth_acl_test::{build_rsa_jwks_from_pem, create_rs256_token};
 use crate::scaffolding::ports::reserve_port;
 use bytes::Bytes;
+use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http2::Builder as Http2ServerBuilder;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -327,6 +330,94 @@ plugin_configs:
         .expect("Failed to write config");
 }
 
+/// Write a prefixed route whose client-visible path becomes a canonical gRPC
+/// method only after listen-path stripping.
+fn write_method_router_prefix_strip_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "grpc-router-proxy"
+    listen_path: "/prefix"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "grpc-method-router"
+
+consumers: []
+
+plugin_configs:
+  - id: "grpc-method-router"
+    plugin_name: "grpc_method_router"
+    scope: proxy
+    proxy_id: "grpc-router-proxy"
+    enabled: true
+    config:
+      deny_methods:
+        - "pkg.Svc/Denied"
+"#
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+/// Write a route where mesh_route_dispatch rewrites an allowed public method
+/// to a backend method denied by grpc_method_router.
+fn write_method_router_mesh_rewrite_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "grpc-router-proxy"
+    listen_path: "/"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: false
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "grpc-method-router"
+      - plugin_config_id: "mesh-route-dispatch"
+
+consumers: []
+
+plugin_configs:
+  - id: "grpc-method-router"
+    plugin_name: "grpc_method_router"
+    scope: proxy
+    proxy_id: "grpc-router-proxy"
+    enabled: true
+    config:
+      deny_methods:
+        - "admin.Service/Delete"
+  - id: "mesh-route-dispatch"
+    plugin_name: "mesh_route_dispatch"
+    scope: proxy
+    proxy_id: "grpc-router-proxy"
+    enabled: true
+    config:
+      rules:
+        - match:
+            uri:
+              exact: "/public.Service/Allowed"
+          destination:
+            backend_host: "127.0.0.1"
+            backend_port: {backend_port}
+          rewrite:
+            uri: "/admin.Service/Delete"
+"#
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
 /// Write config with grpc_method_router plugin: per-method rate limiting.
 fn write_method_router_ratelimit_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
@@ -446,9 +537,120 @@ plugin_configs:
         .expect("Failed to write config");
 }
 
+fn write_jwks_access_control_config(
+    config_path: &std::path::Path,
+    backend_port: u16,
+    jwks: &serde_json::Value,
+) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "grpc-jwks-acl-proxy"
+    listen_path: "/"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: false
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "grpc-jwks-auth"
+      - plugin_config_id: "grpc-access-control"
+
+consumers: []
+
+plugin_configs:
+  - id: "grpc-jwks-auth"
+    plugin_name: "jwks_auth"
+    scope: proxy
+    proxy_id: "grpc-jwks-acl-proxy"
+    enabled: true
+    config:
+      providers:
+        - jwks: {jwks}
+  - id: "grpc-access-control"
+    plugin_name: "access_control"
+    scope: proxy
+    proxy_id: "grpc-jwks-acl-proxy"
+    enabled: true
+    config:
+      allowed_consumers:
+        - "mapped-admin"
+"#
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
 // ============================================================================
 // grpc_method_router tests
 // ============================================================================
+
+#[ignore]
+#[tokio::test]
+async fn test_grpc_access_control_distinguishes_authorization_from_missing_identity() {
+    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
+    sleep(Duration::from_millis(300)).await;
+
+    let private_key_pem = include_bytes!("../fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_jwks_access_control_config(&config_path, backend_port, &jwks);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    let gateway_addr = format!("127.0.0.1:{gateway_port}");
+
+    let now = Utc::now();
+    let token = create_rs256_token(
+        &json!({
+            "sub": "authenticated-external-user",
+            "iat": now.timestamp(),
+            "exp": (now + chrono::Duration::seconds(3600)).timestamp()
+        }),
+        private_key_pem,
+    );
+    let authorization = format!("Bearer {token}");
+    let (status, headers, body) = send_grpc_request(
+        &gateway_addr,
+        "/my.EchoService/Echo",
+        b"",
+        &[("authorization", authorization.as_str())],
+    )
+    .await
+    .expect("authenticated-but-unmapped gRPC request should complete");
+    assert_eq!(status, 200);
+    assert!(body.is_empty(), "ACL denial must be trailers-only");
+    assert_eq!(
+        headers.get("grpc-status").map(String::as_str),
+        Some("7"),
+        "authenticated-but-unmapped ACL denial must be PERMISSION_DENIED"
+    );
+
+    let (status, headers, body) =
+        send_grpc_request(&gateway_addr, "/my.EchoService/Echo", b"", &[])
+            .await
+            .expect("missing-identity gRPC request should complete");
+    assert_eq!(status, 200);
+    assert!(
+        body.is_empty(),
+        "missing-identity rejection must be trailers-only"
+    );
+    assert_eq!(
+        headers.get("grpc-status").map(String::as_str),
+        Some("16"),
+        "missing identity must be UNAUTHENTICATED"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
 
 /// Allowed method passes through, disallowed method is rejected with PERMISSION_DENIED.
 #[ignore]
@@ -566,6 +768,75 @@ async fn test_grpc_method_router_deny_list() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_grpc_method_router_deny_list PASSED");
+}
+
+/// A deny/rate policy must see the method produced by listen-prefix stripping,
+/// not fail open because the client-visible path contains an extra segment.
+#[ignore]
+#[tokio::test]
+async fn test_grpc_method_router_enforces_stripped_backend_method() {
+    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_method_router_prefix_strip_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    let gateway_addr = format!("127.0.0.1:{}", gateway_port);
+
+    let (status, headers, body) =
+        send_grpc_request(&gateway_addr, "/prefix/pkg.Svc/Denied", b"", &[])
+            .await
+            .expect("Denied prefixed method request should complete");
+    assert_eq!(status, 200);
+    assert!(body.is_empty(), "gRPC rejection should be trailers-only");
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
+
+    let (_status, allowed_headers, _body) =
+        send_grpc_request(&gateway_addr, "/prefix/pkg.Svc/Allowed", b"", &[])
+            .await
+            .expect("Allowed prefixed method should reach the backend");
+    assert_eq!(
+        allowed_headers.get("x-echo-path").map(String::as_str),
+        Some("/pkg.Svc/Allowed")
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// A later mesh URI rewrite cannot turn an allowed client method into a denied
+/// backend method after grpc_method_router has already made its decision.
+#[ignore]
+#[tokio::test]
+async fn test_grpc_method_router_enforces_mesh_rewritten_backend_method() {
+    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_method_router_mesh_rewrite_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    let gateway_addr = format!("127.0.0.1:{}", gateway_port);
+
+    let (status, headers, body) =
+        send_grpc_request(&gateway_addr, "/public.Service/Allowed", b"", &[])
+            .await
+            .expect("Rewritten denied method request should complete");
+    assert_eq!(status, 200);
+    assert!(body.is_empty(), "gRPC rejection should be trailers-only");
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
 }
 
 /// Per-method rate limiting enforces request limits.

@@ -96,9 +96,12 @@ impl NamespacedResourceId {
 /// Result of an incremental config poll.
 ///
 /// Contains only resources referenced by durable change-log records newer than
-/// the caller's sequence cursor, plus keys of resources that were deleted. The
-/// polling loop advances `sequence_cursor` only after the delta validates and
-/// applies, so rejected deltas are retried from the same durable point.
+/// the caller's sequence cursor, plus keys of resources that were deleted.
+/// Consumer mutations are the exception: loaders return
+/// [`IncrementalFullReloadRequired`] so previously quarantined credentials can
+/// be rehydrated from storage. The polling loop advances `sequence_cursor` only
+/// after the delta validates and applies, so rejected deltas are retried from
+/// the same durable point.
 ///
 /// Serializable for CP-to-DP gRPC delta broadcasts.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -130,6 +133,48 @@ impl IncrementalResult {
             && self.added_or_modified_upstreams.is_empty()
             && self.removed_upstream_ids.is_empty()
     }
+}
+
+/// Marker returned by an incremental loader when a consumer mutation must be
+/// applied from an authoritative full snapshot.
+///
+/// Runtime HMAC quarantine deliberately removes invalid credentials from the
+/// published config. Patching a later consumer-only delta onto that sanitized
+/// snapshot cannot restore a different consumer whose stored credential was
+/// previously stripped. Consumer creates, updates, and deletes therefore
+/// escalate to the poller's existing same-tick full-reload path, which reloads
+/// every stored consumer before applying quarantine again.
+#[derive(Debug)]
+pub struct IncrementalFullReloadRequired {
+    namespace: String,
+}
+
+impl IncrementalFullReloadRequired {
+    pub(crate) fn for_consumer_changes(namespace: &str) -> Self {
+        Self {
+            namespace: namespace.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for IncrementalFullReloadRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "consumer changes in namespace '{}' require an authoritative full reload to rehydrate quarantined credentials",
+            self.namespace
+        )
+    }
+}
+
+impl std::error::Error for IncrementalFullReloadRequired {}
+
+/// Whether an incremental-load error is the expected consumer-change
+/// escalation rather than a database connectivity or query failure.
+pub fn is_incremental_full_reload_required(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<IncrementalFullReloadRequired>())
 }
 
 /// Result of a paginated database query.
