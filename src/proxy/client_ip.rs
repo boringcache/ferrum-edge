@@ -124,12 +124,12 @@ impl TrustedProxies {
 /// request through `X-Forwarded-Proto`.
 ///
 /// The rightmost value represents the proxy nearest Ferrum when multiple
-/// field lines or comma-separated values are present. Empty or unrecognized
-/// final values fail closed. Callers must never use this result for an
-/// untrusted socket peer because the header may then be client-controlled.
+/// field lines or comma-separated values are present. Empty, non-UTF-8, or
+/// unrecognized final values fail closed. Callers must never use this result
+/// for an untrusted socket peer because the header may then be client-controlled.
 pub fn trusted_forwarded_request_is_https<'a>(
     socket_addr: &IpAddr,
-    forwarded_proto_values: impl IntoIterator<Item = &'a str>,
+    forwarded_proto_values: impl IntoIterator<Item = &'a [u8]>,
     trusted_proxies: &TrustedProxies,
 ) -> bool {
     if !trusted_proxies.contains(socket_addr) {
@@ -138,11 +138,33 @@ pub fn trusted_forwarded_request_is_https<'a>(
 
     let mut nearest_proto = None;
     for value in forwarded_proto_values {
-        for proto in value.split(',') {
-            nearest_proto = Some(proto.trim_matches([' ', '\t']));
+        // A field line containing obs-text or controls is not a valid scheme
+        // list. Record an invalid nearest value instead of skipping the line;
+        // a later valid field line can still supersede it.
+        if value
+            .iter()
+            .any(|byte| !matches!(*byte, b'\t' | 0x20..=0x7e))
+        {
+            nearest_proto = Some(&value[..0]);
+            continue;
+        }
+        for proto in value.split(|byte| *byte == b',') {
+            nearest_proto = Some(trim_header_ows(proto));
         }
     }
-    nearest_proto.is_some_and(|proto| proto.eq_ignore_ascii_case("https"))
+    nearest_proto.is_some_and(|proto| proto.eq_ignore_ascii_case(b"https"))
+}
+
+fn trim_header_ows(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|byte| !matches!(*byte, b' ' | b'\t'))
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !matches!(*byte, b' ' | b'\t'))
+        .map_or(start, |index| index + 1);
+    &value[start..end]
 }
 
 /// Resolve the real client IP from the request context.

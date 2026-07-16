@@ -2,10 +2,10 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, UpstreamTarget,
 };
-use ferrum_edge::proxy::client_ip::{TrustedProxies, trusted_forwarded_request_is_https};
+use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::{
-    build_backend_effective_path, build_backend_url, build_backend_url_with_target,
-    retry_target_preserves_backend_path,
+    apply_trusted_forwarded_request_scheme, build_backend_effective_path, build_backend_url,
+    build_backend_url_with_target, retry_target_preserves_backend_path,
 };
 use ferrum_edge::router_cache::RouterCache;
 use std::collections::HashMap;
@@ -1443,6 +1443,36 @@ async fn test_auth_rejection_cookie_storage_key_excludes_secure_policy_rejection
 }
 
 #[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_enforces_http_only_prefixes() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "__Http-session=staged; Secure; HttpOnly; Path=/\n__Host-Http-session=staged; Secure; HttpOnly; Path=/\n__hTtP-case=staged; Secure; HttpOnly; Path=/\n__Http-valid=staged; Secure; HttpOnly; Path=/",
+    });
+    let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+        cookies: "__Http-session=selected; Secure; Path=/\n__Host-Http-session=selected; Secure; Path=/\n__hTtP-case=selected; Secure; Path=/\n__Http-valid=selected; Secure; HttpOnly; Path=/",
+    });
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cookie-scope".to_string(),
+    );
+    ctx.request_is_secure = true;
+
+    let (_, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("both auth attempts must reject");
+
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(
+            "__Http-session=selected; Secure; Path=/\n__Host-Http-session=selected; Secure; Path=/\n__hTtP-case=selected; Secure; Path=/\n__Http-valid=selected; Secure; HttpOnly; Path=/\n__Http-session=staged; Secure; HttpOnly; Path=/\n__Host-Http-session=staged; Secure; HttpOnly; Path=/\n__hTtP-case=staged; Secure; HttpOnly; Path=/"
+        )
+    );
+}
+
+#[tokio::test]
 async fn test_auth_rejection_cookie_storage_key_excludes_insecure_transport_secure_cookie() {
     let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
         cookies: "transport=staged; Path=/\nplain=staged; Path=/",
@@ -1547,7 +1577,30 @@ async fn test_auth_rejection_cookie_storage_key_allows_trusted_tls_termination()
         "GET".to_string(),
         "/cookie-scope".to_string(),
     );
-    ctx.request_is_secure = trusted_forwarded_request_is_https(&socket_peer, ["https"], &trusted);
+    ctx.metadata.insert(
+        "ferrum.frontend_scheme".to_string(),
+        "http".to_string(),
+    );
+    let mut raw_headers = http::HeaderMap::new();
+    raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("http"));
+    raw_headers.append(
+        "x-forwarded-proto",
+        http::HeaderValue::from_static("https"),
+    );
+    ctx.set_raw_headers(raw_headers);
+
+    assert!(apply_trusted_forwarded_request_scheme(
+        &mut ctx,
+        &socket_peer,
+        &trusted,
+    ));
+    assert!(ctx.request_is_secure);
+    assert_eq!(
+        ctx.metadata
+            .get("ferrum.frontend_scheme")
+            .map(String::as_str),
+        Some("https")
+    );
 
     let (_, _, headers) =
         run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
@@ -1557,6 +1610,44 @@ async fn test_auth_rejection_cookie_storage_key_allows_trusted_tls_termination()
     assert_eq!(
         headers.get("set-cookie").map(String::as_str),
         Some("transport=selected; Secure; Path=/")
+    );
+}
+
+#[test]
+fn test_trusted_tls_termination_fails_closed_on_invalid_final_proto_field() {
+    let trusted = TrustedProxies::parse("10.0.0.0/8");
+    let socket_peer: std::net::IpAddr = "10.0.0.8".parse().expect("valid trusted proxy IP");
+    let mut ctx = RequestContext::new(
+        socket_peer.to_string(),
+        "GET".to_string(),
+        "/cookie-scope".to_string(),
+    );
+    ctx.metadata.insert(
+        "ferrum.frontend_scheme".to_string(),
+        "http".to_string(),
+    );
+    let mut raw_headers = http::HeaderMap::new();
+    raw_headers.append(
+        "x-forwarded-proto",
+        http::HeaderValue::from_static("https"),
+    );
+    raw_headers.append(
+        "x-forwarded-proto",
+        http::HeaderValue::from_bytes(&[0x80]).expect("obs-text header value"),
+    );
+    ctx.set_raw_headers(raw_headers);
+
+    assert!(!apply_trusted_forwarded_request_scheme(
+        &mut ctx,
+        &socket_peer,
+        &trusted,
+    ));
+    assert!(!ctx.request_is_secure);
+    assert_eq!(
+        ctx.metadata
+            .get("ferrum.frontend_scheme")
+            .map(String::as_str),
+        Some("http")
     );
 }
 

@@ -14697,6 +14697,7 @@ fn set_cookie_storage_key<'a>(
     let mut path_attribute = None;
     let mut partitioned = false;
     let mut secure = false;
+    let mut http_only = false;
     let mut same_site_none = false;
 
     for attribute in set_cookie.split(';').skip(1) {
@@ -14718,6 +14719,8 @@ fn set_cookie_storage_key<'a>(
             partitioned = true;
         } else if attribute_name.eq_ignore_ascii_case("secure") {
             secure = true;
+        } else if attribute_name.eq_ignore_ascii_case("httponly") {
+            http_only = true;
         } else if attribute_name.eq_ignore_ascii_case("samesite") {
             // The last SameSite attribute wins; invalid and bare values map to
             // the default enforcement rather than preserving an earlier None.
@@ -14766,15 +14769,24 @@ fn set_cookie_storage_key<'a>(
     let host_prefix = name
         .get(.."__Host-".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Host-"));
+    let http_prefix = name
+        .get(.."__Http-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Http-"));
+    let host_http_prefix = name
+        .get(.."__Host-Http-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Host-Http-"));
     // Cookies that a browser will reject cannot own a staged cookie's storage
     // key. Keep the selected line in the response, but make it non-comparable
     // so a valid earlier cleanup is appended after it. `__Host-` additionally
-    // requires an explicit Path=/ attribute, not merely a default path of `/`.
+    // requires an explicit Path=/ attribute, not merely a default path of `/`;
+    // `__Http-` and `__Host-Http-` additionally require HttpOnly.
     if (secure && !request_is_secure)
         || (partitioned && !secure)
         || (same_site_none && !secure)
         || (secure_prefix && !secure)
         || (host_prefix && (!secure || !host_only || path_attribute != Some("/")))
+        || (http_prefix && (!secure || !http_only))
+        || (host_http_prefix && !http_only)
     {
         return None;
     }
@@ -15066,6 +15078,29 @@ pub async fn run_authentication_phase(
             }
         }
     }
+}
+
+/// Apply the original HTTPS scheme reported by a directly connected trusted
+/// proxy. The same accepted fact drives both browser cookie storage checks and
+/// canonical frontend URL metadata consumed by authentication plugins.
+pub fn apply_trusted_forwarded_request_scheme(
+    ctx: &mut RequestContext,
+    socket_addr: &IpAddr,
+    trusted_proxies: &client_ip::TrustedProxies,
+) -> bool {
+    let forwarded_request_is_https = client_ip::trusted_forwarded_request_is_https(
+        socket_addr,
+        ctx.raw_header_value_bytes("x-forwarded-proto"),
+        trusted_proxies,
+    );
+    if forwarded_request_is_https {
+        ctx.request_is_secure = true;
+        ctx.metadata.insert(
+            "ferrum.frontend_scheme".to_string(),
+            "https".to_string(),
+        );
+    }
+    forwarded_request_is_https
 }
 
 /// Handle a single proxy request.
@@ -15450,12 +15485,7 @@ async fn handle_proxy_request_inner(
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         if let Some(ref addr) = socket_addr {
-            let forwarded_request_is_https = client_ip::trusted_forwarded_request_is_https(
-                addr,
-                ctx.raw_header_values("x-forwarded-proto"),
-                &state.trusted_proxies,
-            );
-            ctx.request_is_secure |= forwarded_request_is_https;
+            apply_trusted_forwarded_request_scheme(&mut ctx, addr, &state.trusted_proxies);
             let real_ip_header_val =
                 state
                     .env_config

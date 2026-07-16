@@ -138,22 +138,32 @@ fn forwarded_https_requires_the_nearest_value_from_a_trusted_peer() {
 
     assert!(trusted_forwarded_request_is_https(
         &trusted_peer,
-        ["http", " HTTPS\t"],
+        [b"http".as_slice(), b" HTTPS\t".as_slice()],
         &trusted,
     ));
     assert!(!trusted_forwarded_request_is_https(
         &trusted_peer,
-        ["https, http"],
+        [b"https, http".as_slice()],
         &trusted,
     ));
     assert!(!trusted_forwarded_request_is_https(
         &trusted_peer,
-        ["https,"],
+        [b"https,".as_slice()],
+        &trusted,
+    ));
+    assert!(!trusted_forwarded_request_is_https(
+        &trusted_peer,
+        [b"https".as_slice(), &[0x80]],
+        &trusted,
+    ));
+    assert!(!trusted_forwarded_request_is_https(
+        &trusted_peer,
+        [b"https".as_slice(), b"\x80, https".as_slice()],
         &trusted,
     ));
     assert!(!trusted_forwarded_request_is_https(
         &untrusted_peer,
-        ["https"],
+        [b"https".as_slice()],
         &trusted,
     ));
 }

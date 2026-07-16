@@ -1698,6 +1698,20 @@ impl RequestContext {
             .filter_map(|value| value.to_str().ok())
     }
 
+    /// Iterate every raw field-line value as bytes, including values that are
+    /// not valid UTF-8. Security decisions that depend on the final field line
+    /// must use this instead of silently skipping an unparseable value.
+    #[inline]
+    pub fn raw_header_value_bytes<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a [u8]> + 'a {
+        self.raw_headers
+            .iter()
+            .flat_map(move |headers| headers.get_all(name).iter())
+            .map(|value| value.as_bytes())
+    }
+
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
     /// String>`). This is a one-time operation — subsequent calls are no-ops.
     /// Non-UTF-8 header values are silently skipped (same as the previous eager
