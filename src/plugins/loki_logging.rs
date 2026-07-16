@@ -482,7 +482,7 @@ fn validate_loki_resource_config(
     bounded_u64(
         config,
         defaults.batch_size_key,
-        defaults.batch_size as u64,
+        defaults.batch_size,
         1,
         MAX_BATCH_SIZE as u64,
     )?;
@@ -496,14 +496,14 @@ fn validate_loki_resource_config(
     bounded_u64(
         config,
         "buffer_capacity",
-        defaults.buffer_capacity as u64,
+        defaults.buffer_capacity,
         1,
         MAX_BUFFER_CAPACITY as u64,
     )?;
     let max_retries = bounded_u64(
         config,
         "max_retries",
-        defaults.max_retries as u64,
+        defaults.max_retries,
         0,
         LOKI_MAX_RETRIES,
     )?;
