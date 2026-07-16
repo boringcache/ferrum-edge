@@ -560,8 +560,7 @@ fn test_deferred_hooks_cannot_spoof_backend_gateway_assertions() {
 
     let remaining_hook = routing_hook + remaining_hook;
     assert!(
-        source[remaining_hook..]
-            .contains("refresh_effective_backend_gateway_assertion_headers("),
+        source[remaining_hook..].contains("refresh_effective_backend_gateway_assertion_headers("),
         "gateway assertions must be restored after every deferred hook pass"
     );
     assert!(

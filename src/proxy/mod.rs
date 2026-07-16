@@ -8499,11 +8499,7 @@ async fn handle_websocket_request_authenticated(
         );
     }
     if let Some(country) = ctx.backend_geo_country() {
-        push_forwardable_header_override(
-            &mut client_headers,
-            "x-geo-country",
-            country.to_string(),
-        );
+        push_forwardable_header_override(&mut client_headers, "x-geo-country", country.to_string());
     }
 
     // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`.
@@ -16705,10 +16701,7 @@ async fn handle_proxy_request_inner(
             // A deferred routing function can return arbitrary headers.
             // Restore gateway-owned assertions and reapply the egress baggage
             // policy before those headers can reach any backend transport.
-            refresh_effective_backend_gateway_assertion_headers(
-                &mut ctx,
-                &mut owned_proxy_headers,
-            );
+            refresh_effective_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
                 &ctx.headers,
@@ -16759,10 +16752,7 @@ async fn handle_proxy_request_inner(
             ctx.path = backend_ctx_path;
         }
         if matches!(deferred_result, PluginResult::Continue) {
-            refresh_effective_backend_gateway_assertion_headers(
-                &mut ctx,
-                &mut owned_proxy_headers,
-            );
+            refresh_effective_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
                 &ctx.headers,
@@ -32659,11 +32649,7 @@ mod tests {
             "x-consumer-custom-id",
             "trusted-custom".to_string(),
         );
-        push_forwardable_header_override(
-            &mut headers,
-            "x-geo-country",
-            "SE".to_string(),
-        );
+        push_forwardable_header_override(&mut headers, "x-geo-country", "SE".to_string());
 
         let usernames: Vec<&str> = headers
             .iter()

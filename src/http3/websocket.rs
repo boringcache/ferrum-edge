@@ -1980,11 +1980,7 @@ mod tests {
             "x-consumer-username",
             "authenticated-user".to_string(),
         );
-        push_h3_forwardable_header_override(
-            &mut out,
-            "x-geo-country",
-            "SE".to_string(),
-        );
+        push_h3_forwardable_header_override(&mut out, "x-geo-country", "SE".to_string());
         let count = out
             .iter()
             .filter(|(k, _)| k.eq_ignore_ascii_case("x-consumer-username"))
