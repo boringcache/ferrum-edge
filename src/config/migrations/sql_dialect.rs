@@ -1221,6 +1221,7 @@ mod tests {
                 format!("{col} VARCHAR(255) COLLATE utf8mb4_0900_as_cs"),
                 format!("{col} VARCHAR(50) COLLATE utf8mb4_0900_as_cs"),
                 format!("{col} VARCHAR(64) COLLATE utf8mb4_0900_as_cs"),
+                format!("{col} VARCHAR(36) COLLATE utf8mb4_0900_as_cs"),
             ];
             assert!(
                 needles.iter().any(|n| sql.contains(n)),
