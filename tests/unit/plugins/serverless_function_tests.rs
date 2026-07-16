@@ -1292,6 +1292,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "valued-query-key-fragment",
         "valued-query-key-slash-boundaries",
         "valued-query-key-slash-boundaries-path",
+        "query-value-leading-slash-path",
         "query-value-trailing-slash",
         "query-value-trailing-slash-path",
         "query-value-slash-only",
@@ -1318,6 +1319,8 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-query-path-lookalike",
         "benign-query-path-parameter-lookalike",
         "benign-key-only-query-lookalike",
+        "benign-leading-slash-scalar-suffix-lookalike",
+        "benign-trailing-slash-scalar-prefix-lookalike",
         "benign-trailing-slash-scalar-without-slash",
         "benign-authority-label-lookalike",
         "benign-authority-substring",
@@ -1359,8 +1362,13 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "valued-query-key-slash-boundaries" | "valued-query-key-slash-boundaries-path" => {
                 format!("{}/signed%2Ftrigger?%2FSIGNED%2F=1", server.uri())
             }
+            "query-value-leading-slash-path"
+            | "benign-leading-slash-scalar-suffix-lookalike" => {
+                format!("{}/signed%2Ftrigger?code=%2Fsigned", server.uri())
+            }
             "query-value-trailing-slash"
             | "query-value-trailing-slash-path"
+            | "benign-trailing-slash-scalar-prefix-lookalike"
             | "benign-trailing-slash-scalar-without-slash" => {
                 format!("{}/signed%2Ftrigger?code=secret%2F", server.uri())
             }
@@ -1468,6 +1476,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "valued-query-key-slash-boundaries-path" => {
                 "https://redirect.example/prefix/SIGNED/suffix".to_string()
             }
+            "query-value-leading-slash-path" => {
+                "https://redirect.example/prefix/signed".to_string()
+            }
             "query-value-trailing-slash" => {
                 "https://redirect.example/next?leak=secret%2F".to_string()
             }
@@ -1515,6 +1526,12 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-key-only-query-lookalike" => {
                 "https://redirect.example/next?leak=SIGNED_TOKEN_EXTRA".to_string()
+            }
+            "benign-leading-slash-scalar-suffix-lookalike" => {
+                "https://redirect.example/prefix/signed_extra".to_string()
+            }
+            "benign-trailing-slash-scalar-prefix-lookalike" => {
+                "https://redirect.example/prefixsecret/suffix".to_string()
             }
             "benign-trailing-slash-scalar-without-slash" => {
                 "https://redirect.example/next;leak=secret".to_string()
