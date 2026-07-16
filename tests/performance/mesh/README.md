@@ -63,6 +63,7 @@ A coarse one-shot baseline taken on the author's machine is checked in at [`base
 ## Architecture decisions recorded
 
 - **Standalone crate, not workspace member.** Same call as `tests/performance/multi_protocol/`. Keeps bench-only deps (criterion) out of the root manifest; isolates the target dir.
+- **Root dependency patches mirrored locally.** Standalone manifests do not inherit the root `[patch.crates-io]` table, so this crate mirrors its vendored overrides and keeps the corresponding lockfile entries synchronized. This ensures benchmarks compile and measure the same patched production dependencies as the root crate.
 - **Criterion, not `cargo bench` built-in.** Statistical sampling + change detection is non-negotiable for performance regression work; the unstable `test::Bencher` does not provide it.
 - **Public API only, no `#[doc(hidden)]` perf hatches.** Every bench calls a function that already has a `pub` visibility for the audit / mesh runtime path. If a future hot path is only reachable through private code, the right answer is an inline `#[cfg(test)]` bench in the source file (per CLAUDE.md "do NOT promote fns to `pub` to enable external tests"), not a hatch here.
 
