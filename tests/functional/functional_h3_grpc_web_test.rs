@@ -404,7 +404,7 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
     let method_policy = request_with_retry(
         &client,
         &format!("https://127.0.0.1:{https_port}/method-policy/pkg.Service/Denied"),
-        grpc_web(Method::POST),
+        grpc_web(Method::POST).header("grpc-timeout", "5S"),
     )
     .await;
     assert_grpc_web_error(&method_policy, "7", "application/grpc-web+proto");
@@ -423,6 +423,7 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
         GetOptions::default()
             .method(Method::POST)
             .header("content-type", "application/grpc")
+            .header("grpc-timeout", "5S")
             .body(Bytes::from(grpc_frame(b"ping"))),
     )
     .await;
@@ -669,7 +670,7 @@ async fn streaming_h3_grpc_web_deadline_cancels_withheld_backend_headers() {
             "scope": "proxy",
             "proxy_id": "h3-grpc-web-deadline-stall",
             "enabled": true,
-            "config": {},
+            "config": {"max_deadline_ms": 1000},
         }],
     });
     let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
