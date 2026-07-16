@@ -588,6 +588,20 @@ fn test_transaction_debugger_classifies_nonzero_grpc_status_under_http_200() {
 }
 
 #[test]
+fn test_transaction_debugger_classifies_mirror_transport_failure_separately() {
+    let mut summary = create_test_transaction_summary();
+    summary.mirror = true;
+    summary
+        .metadata
+        .insert("mirror_error".to_string(), "connection refused".to_string());
+
+    assert_eq!(
+        TransactionDebugger::classify_http_outcome(&summary),
+        "mirror_error"
+    );
+}
+
+#[test]
 fn test_transaction_debugger_prioritizes_rejection_over_nonzero_grpc_status() {
     let mut summary = create_test_transaction_summary();
     summary.response_status_code = 200;

@@ -98,7 +98,9 @@ impl TransactionDebugger {
             "body_incomplete"
         } else if summary.metadata.contains_key("rejection_phase") {
             "rejected"
-        } else if summary.is_terminal_failure() {
+        } else if summary.metadata.contains_key("mirror_error") {
+            "mirror_error"
+        } else if summary.grpc_status().is_some_and(|status| status != 0) {
             "grpc_error"
         } else {
             "completed"

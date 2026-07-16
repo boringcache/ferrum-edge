@@ -40,6 +40,13 @@ const PROXY_ID: &str = "frontend-tls-order-proxy";
 const DENY_LOCALHOST_PLUGIN_ID: &str = "deny-localhost";
 const ALLOW_LOCALHOST_PLUGIN_ID: &str = "allow-localhost";
 const STDOUT_LOGGING_PLUGIN_ID: &str = "stdout-logging";
+#[cfg(unix)]
+const STDOUT_LOGGING_CHILD_ENV: &str = "INTEGRATION_TEST_TCP_TLS_STDOUT_LOGGING_CHILD";
+#[cfg(unix)]
+const STDOUT_LOGGING_TEST_NAME: &str = concat!(
+    "integration::tcp_frontend_tls_order_tests::",
+    "tcp_tls_frontend_handshake_failure_logs_client_side_disconnect_summary",
+);
 const MAX_GATEWAY_ATTEMPTS: u32 = 3;
 const PER_ATTEMPT_STARTED_TIMEOUT: Duration = Duration::from_secs(2);
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -455,11 +462,11 @@ fn parse_direct_write_stream_summary(captured: &str) -> Option<Value> {
 /// observe what the injected non-blocking `stdout_logging` sink emits. The
 /// returned guard restores the original stdout fd on drop, even on panic.
 ///
-/// Safe under nextest's process-per-test model: the redirect is process-
-/// global, but nextest gives every test its own process so the redirect
-/// can't bleed into another test. The single-threaded `current_thread`
-/// runtime keeps gateway/listener tasks and the sink worker in the same
-/// process whose stdout is redirected, so the record lands in the tempfile.
+/// The test body always runs in an explicit child process, so this process-
+/// global redirect and the process-sink `OnceLock` cannot bleed into another
+/// test under either nextest or the standard libtest runner. The single-threaded
+/// `current_thread` runtime keeps gateway/listener tasks and the sink worker in
+/// the same child process whose stdout is redirected.
 #[cfg(unix)]
 struct StdoutRedirect {
     file: tempfile::NamedTempFile,
@@ -578,10 +585,29 @@ async fn tcp_tls_frontend_handshake_failure_does_not_connect_backend() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn tcp_tls_frontend_handshake_failure_logs_client_side_disconnect_summary() {
+    if std::env::var_os(STDOUT_LOGGING_CHILD_ENV).is_none() {
+        assert!(
+            ferrum_edge::logging::access_log_writer().is_none(),
+            "parent test process must not have process log sinks installed"
+        );
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("resolve integration test executable"),
+        )
+        .env(STDOUT_LOGGING_CHILD_ENV, "1")
+        .args(["--exact", STDOUT_LOGGING_TEST_NAME, "--nocapture"])
+        .status()
+        .expect("run isolated stdout_logging integration test");
+        assert!(status.success(), "isolated stdout_logging test failed");
+        assert!(
+            ferrum_edge::logging::access_log_writer().is_none(),
+            "child test must not mutate the parent process log sinks"
+        );
+        return;
+    }
+
     // Capture stdout at the libc fd level, then explicitly install the same
-    // bounded non-blocking sink shape that the binary installs. Safe under
-    // nextest's process-per-test model (used by `test-integration`); the
-    // redirect is undone on `Drop` for resilience against panic.
+    // bounded non-blocking sink shape that the binary installs in this isolated
+    // child. The redirect is undone on `Drop` for resilience against panic.
     let stdout_capture = StdoutRedirect::install();
     let sink_options = ferrum_edge::logging::NonBlockingOptions {
         record_capacity: 8,
