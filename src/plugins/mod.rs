@@ -733,7 +733,8 @@ impl CanonicalClientIpCache {
     }
 
     fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
-        self.correlation_ids.publish_correlation_id(instance_key, request_id)
+        self.correlation_ids
+            .publish_correlation_id(instance_key, request_id)
     }
 
     fn correlation_id(&self, instance_key: &str) -> Option<&str> {

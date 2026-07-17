@@ -2681,8 +2681,7 @@ async fn workload_metrics_on_stream_connect_adds_source_identity_metadata() {
         BackendScheme::Tcp,
         Arc::new(ConsumerIndex::new(&[])),
     );
-    ctx.authenticated_identity =
-        Some("spiffe://cluster.local/ns/default/sa/client".to_string());
+    ctx.authenticated_identity = Some("spiffe://cluster.local/ns/default/sa/client".to_string());
     ctx.tls_client_cert_der = Some(Arc::new(vec![1, 2, 3]));
 
     let result = plugin.on_stream_connect(&mut ctx).await;
