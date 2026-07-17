@@ -10869,6 +10869,9 @@ struct WsSizeLimitRule {
     close_reason: Arc<str>,
 }
 
+pub(crate) type WebSocketRelayPluginLists =
+    (Vec<Arc<dyn Plugin>>, Vec<Arc<dyn Plugin>>);
+
 pub(crate) struct EffectiveWsSizeLimits {
     pub(crate) max_frame_bytes: usize,
     pub(crate) max_message_bytes: usize,
@@ -10879,7 +10882,7 @@ pub(crate) struct EffectiveWsSizeLimits {
 pub(crate) fn collect_websocket_relay_plugins(
     plugins: &[Arc<dyn Plugin>],
     requires_websocket_framing: bool,
-) -> (Vec<Arc<dyn Plugin>>, Vec<Arc<dyn Plugin>>) {
+) -> WebSocketRelayPluginLists {
     if !requires_websocket_framing {
         return (Vec::new(), Vec::new());
     }
