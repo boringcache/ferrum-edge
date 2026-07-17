@@ -1809,6 +1809,7 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "X-Auth-Token"}),
         json!({"header_name": "X-CSRF-Token"}),
         json!({"header_name": "X-Forwarded-Authorization"}),
+        json!({"header_name": "X-Forwarded-For"}),
         json!({"header_name": "X-Goog-API-Key"}),
         json!({"header_name": "X-XSRF-Token"}),
     ] {
