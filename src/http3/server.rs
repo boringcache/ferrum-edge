@@ -160,7 +160,6 @@ async fn finalize_h3_terminal_body_read_rejection(
         false,
     )
     .await;
-    *plugin_execution_ns += rejection_hook_start.elapsed().as_nanos() as u64;
     let http_status = StatusCode::from_u16(response_status).unwrap_or(status);
     run_h3_reject_response_committed_hooks(
         plugins,
@@ -172,6 +171,7 @@ async fn finalize_h3_terminal_body_read_rejection(
         &headers,
     )
     .await;
+    *plugin_execution_ns += rejection_hook_start.elapsed().as_nanos() as u64;
     let log_status =
         h3_reject_log_status_and_metadata(ctx, http_flavor, http_status, &body, &headers);
     log_rejected_request_with_path(
@@ -2329,35 +2329,17 @@ async fn handle_h3_request(
     let has_contextual_final_body_hook =
         capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
     let (
-        plugin_needs_request_buffering,
-        final_body_before_backend_dispatch,
-        needs_ctx_headers_for_body_hooks,
-    ) = if request_may_need_plugin_buffering
-        && (has_terminal_body_dispatch || has_contextual_final_body_hook)
-    {
-        let mut needs_buffering = false;
-        let mut terminal_dispatch = false;
-        let mut needs_final_context = false;
-        for plugin in plugins.iter() {
-            if plugin.should_buffer_request_body(&ctx) {
-                needs_buffering = true;
-                terminal_dispatch |= plugin.requires_final_request_body_before_backend_dispatch();
-                needs_final_context |= plugin.needs_final_request_body_context();
-            }
-        }
-        (needs_buffering, terminal_dispatch, needs_final_context)
-    } else if request_may_need_plugin_buffering {
-        (
-            plugins
-                .iter()
-                .any(|plugin| plugin.should_buffer_request_body(&ctx)),
-            false,
-            false,
-        )
-    } else {
-        (false, false, false)
-    };
-    let before_proxy_body_requirements = if plugin_needs_request_buffering
+        initial_plugin_needs_request_buffering,
+        initial_final_body_before_backend_dispatch,
+        initial_needs_ctx_headers_for_body_hooks,
+    ) = crate::proxy::final_request_body_requirements(
+        &plugins,
+        &ctx,
+        request_may_need_plugin_buffering,
+        has_terminal_body_dispatch,
+        has_contextual_final_body_hook,
+    );
+    let before_proxy_body_requirements = if initial_plugin_needs_request_buffering
         && capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
     {
         crate::proxy::request_body_requirements_before_before_proxy(&plugins, &ctx)
@@ -2734,6 +2716,33 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.headers = tmp_headers;
     }
+
+    // Keep H3 body-plugin applicability aligned with the H1/H2 path: a
+    // before_proxy header transformer can expose a JSON request that a
+    // terminal provider plugin must own. Swap maps temporarily so the
+    // request-time predicates see the effective headers without another clone.
+    let (
+        plugin_needs_request_buffering,
+        final_body_before_backend_dispatch,
+        needs_ctx_headers_for_body_hooks,
+    ) = if let Some(transformed_headers) = owned_proxy_headers.as_mut() {
+        std::mem::swap(&mut ctx.headers, transformed_headers);
+        let requirements = crate::proxy::final_request_body_requirements(
+            &plugins,
+            &ctx,
+            request_may_need_plugin_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+        );
+        std::mem::swap(&mut ctx.headers, transformed_headers);
+        requirements
+    } else {
+        (
+            initial_plugin_needs_request_buffering,
+            initial_final_body_before_backend_dispatch,
+            initial_needs_ctx_headers_for_body_hooks,
+        )
+    };
     // Reserved consumer-identity headers are gateway-asserted. Strip any
     // client- OR plugin-supplied value UNCONDITIONALLY before backend dispatch,
     // then inject the authenticated value when a principal resolved. `materialize_headers`
@@ -3045,6 +3054,7 @@ async fn handle_h3_request(
                     return Ok(());
                 };
                 let mut headers = reject.headers;
+                let rejection_hook_start = std::time::Instant::now();
                 crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
                     &plugins,
                     &mut ctx,
@@ -3067,6 +3077,7 @@ async fn handle_h3_request(
                     &headers,
                 )
                 .await;
+                plugin_execution_ns += rejection_hook_start.elapsed().as_nanos() as u64;
                 let log_status_code = h3_reject_log_status_and_metadata(
                     &mut ctx,
                     http_flavor,

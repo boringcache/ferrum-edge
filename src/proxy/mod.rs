@@ -2483,6 +2483,46 @@ pub(crate) fn request_body_requirements_before_before_proxy(
     requirements
 }
 
+/// Resolve request-time body buffering and terminal-dispatch applicability.
+///
+/// Callers run this once against the client headers for phases that precede
+/// `before_proxy`, then again against the effective header map when a plugin
+/// transformed headers. This keeps a header transformer that exposes a JSON AI
+/// request from accidentally bypassing terminal federation dispatch.
+pub(crate) fn final_request_body_requirements(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    request_may_need_buffering: bool,
+    has_terminal_body_dispatch: bool,
+    has_contextual_final_body_hook: bool,
+) -> (bool, bool, bool) {
+    if request_may_need_buffering
+        && (has_terminal_body_dispatch || has_contextual_final_body_hook)
+    {
+        let mut requires_buffering = false;
+        let mut terminal_dispatch = false;
+        let mut needs_final_context = false;
+        for plugin in plugins {
+            if plugin.should_buffer_request_body(ctx) {
+                requires_buffering = true;
+                terminal_dispatch |= plugin.requires_final_request_body_before_backend_dispatch();
+                needs_final_context |= plugin.needs_final_request_body_context();
+            }
+        }
+        (requires_buffering, terminal_dispatch, needs_final_context)
+    } else if request_may_need_buffering {
+        (
+            plugins
+                .iter()
+                .any(|plugin| plugin.should_buffer_request_body(ctx)),
+            false,
+            false,
+        )
+    } else {
+        (false, false, false)
+    }
+}
+
 pub(crate) fn request_body_requirements_before_authenticate(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
@@ -17279,35 +17319,17 @@ async fn handle_proxy_request_inner(
     let has_contextual_final_body_hook =
         capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
     let (
-        requires_request_body_buffering,
-        final_body_before_backend_dispatch,
-        needs_final_request_body_context,
-    ) = if request_may_need_buffering
-        && (has_terminal_body_dispatch || has_contextual_final_body_hook)
-    {
-        let mut requires_buffering = false;
-        let mut terminal_dispatch = false;
-        let mut needs_final_context = false;
-        for plugin in plugins.iter() {
-            if plugin.should_buffer_request_body(&ctx) {
-                requires_buffering = true;
-                terminal_dispatch |= plugin.requires_final_request_body_before_backend_dispatch();
-                needs_final_context |= plugin.needs_final_request_body_context();
-            }
-        }
-        (requires_buffering, terminal_dispatch, needs_final_context)
-    } else if request_may_need_buffering {
-        (
-            plugins
-                .iter()
-                .any(|plugin| plugin.should_buffer_request_body(&ctx)),
-            false,
-            false,
-        )
-    } else {
-        (false, false, false)
-    };
-    let before_proxy_body_requirements = if requires_request_body_buffering
+        initial_requires_request_body_buffering,
+        initial_final_body_before_backend_dispatch,
+        initial_needs_final_request_body_context,
+    ) = final_request_body_requirements(
+        &plugins,
+        &ctx,
+        request_may_need_buffering,
+        has_terminal_body_dispatch,
+        has_contextual_final_body_hook,
+    );
+    let before_proxy_body_requirements = if initial_requires_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
     {
         request_body_requirements_before_before_proxy(&plugins, &ctx)
@@ -17551,6 +17573,33 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.headers = tmp_headers;
     }
+
+    // A header-transforming before_proxy hook can change the applicability of
+    // body plugins (for example, text/plain -> application/json). Re-evaluate
+    // against the effective outbound headers before choosing terminal versus
+    // backend dispatch. Swap maps temporarily to avoid another full clone.
+    let (
+        requires_request_body_buffering,
+        final_body_before_backend_dispatch,
+        needs_final_request_body_context,
+    ) = if let Some(transformed_headers) = owned_proxy_headers.as_mut() {
+        std::mem::swap(&mut ctx.headers, transformed_headers);
+        let requirements = final_request_body_requirements(
+            &plugins,
+            &ctx,
+            request_may_need_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+        );
+        std::mem::swap(&mut ctx.headers, transformed_headers);
+        requirements
+    } else {
+        (
+            initial_requires_request_body_buffering,
+            initial_final_body_before_backend_dispatch,
+            initial_needs_final_request_body_context,
+        )
+    };
 
     // HBONE CONNECT short-circuits the rest of the dispatch ladder: the relay
     // is a transparent TCP tunnel, so identity-header injection, egress

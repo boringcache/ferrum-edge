@@ -570,7 +570,7 @@ struct ProviderCircuitConfig {
 struct ProviderCircuit {
     config: ProviderCircuitConfig,
     consecutive_failures: AtomicU32,
-    open_until_epoch_ms: AtomicU64,
+    open_until_monotonic_ms: AtomicU64,
     metrics_open: AtomicBool,
     half_open_in_flight: AtomicBool,
     half_open_successes: AtomicU32,
@@ -628,7 +628,7 @@ impl ProviderCircuit {
         Self {
             config,
             consecutive_failures: AtomicU32::new(0),
-            open_until_epoch_ms: AtomicU64::new(0),
+            open_until_monotonic_ms: AtomicU64::new(0),
             metrics_open: AtomicBool::new(false),
             half_open_in_flight: AtomicBool::new(false),
             half_open_successes: AtomicU32::new(0),
@@ -636,11 +636,11 @@ impl ProviderCircuit {
     }
 
     fn admit(&self) -> CircuitAdmission {
-        let open_until = self.open_until_epoch_ms.load(Ordering::Acquire);
+        let open_until = self.open_until_monotonic_ms.load(Ordering::Acquire);
         if open_until == 0 {
             return CircuitAdmission::Closed;
         }
-        if epoch_millis() < open_until {
+        if circuit_monotonic_millis() < open_until {
             return CircuitAdmission::Open;
         }
         if self
@@ -656,9 +656,10 @@ impl ProviderCircuit {
     }
 
     fn may_admit(&self) -> bool {
-        let open_until = self.open_until_epoch_ms.load(Ordering::Acquire);
+        let open_until = self.open_until_monotonic_ms.load(Ordering::Acquire);
         open_until == 0
-            || (epoch_millis() >= open_until && !self.half_open_in_flight.load(Ordering::Acquire))
+            || (circuit_monotonic_millis() >= open_until
+                && !self.half_open_in_flight.load(Ordering::Acquire))
     }
 
     fn record_success(&self, provider_name: &str, admission: CircuitAdmission) {
@@ -672,7 +673,7 @@ impl ProviderCircuit {
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
         if successes >= self.config.success_threshold {
-            self.open_until_epoch_ms.store(0, Ordering::Release);
+            self.open_until_monotonic_ms.store(0, Ordering::Release);
             self.half_open_successes.store(0, Ordering::Release);
             if self.metrics_open.swap(false, Ordering::AcqRel) {
                 super::prometheus_metrics::global_registry().record_ai_federation_circuit_closed();
@@ -682,8 +683,8 @@ impl ProviderCircuit {
                 "ai_federation: provider circuit closed after successful half-open probe"
             );
         } else {
-            self.open_until_epoch_ms
-                .store(epoch_millis(), Ordering::Release);
+            self.open_until_monotonic_ms
+                .store(circuit_monotonic_millis(), Ordering::Release);
         }
         self.half_open_in_flight.store(false, Ordering::Release);
     }
@@ -711,8 +712,8 @@ impl ProviderCircuit {
 
     fn open(&self, provider_name: &str, reason: &'static str) {
         let cooldown_ms = self.config.cooldown.as_millis().min(u128::from(u64::MAX)) as u64;
-        self.open_until_epoch_ms.store(
-            epoch_millis().saturating_add(cooldown_ms),
+        self.open_until_monotonic_ms.store(
+            circuit_monotonic_millis().saturating_add(cooldown_ms),
             Ordering::Release,
         );
         self.consecutive_failures.store(0, Ordering::Release);
@@ -738,12 +739,11 @@ impl Drop for ProviderCircuit {
     }
 }
 
-fn epoch_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
+fn circuit_monotonic_millis() -> u64 {
+    // Reserve zero as the circuit's closed-state sentinel. The shared clock is
+    // backed by `Instant`, so cooldown admission cannot be extended or
+    // shortened by NTP corrections or an operator changing the wall clock.
+    crate::socket_opts::monotonic_now_ms().saturating_add(1)
 }
 
 fn add_external_io_elapsed(accumulator: &AtomicU64, started: std::time::Instant) {
@@ -6229,8 +6229,8 @@ pub mod test_helpers {
         circuit.record_failure("test", second);
         states.push(circuit_admission_label(circuit.admit()));
         circuit
-            .open_until_epoch_ms
-            .store(epoch_millis().saturating_sub(1), Ordering::Release);
+            .open_until_monotonic_ms
+            .store(circuit_monotonic_millis(), Ordering::Release);
         let probe = circuit.admit();
         states.push(circuit_admission_label(probe));
         circuit.record_success("test", probe);
@@ -6247,8 +6247,8 @@ pub mod test_helpers {
             success_threshold: 1,
         });
         circuit
-            .open_until_epoch_ms
-            .store(epoch_millis().saturating_sub(1), Ordering::Release);
+            .open_until_monotonic_ms
+            .store(circuit_monotonic_millis(), Ordering::Release);
         {
             let admission = circuit.admit();
             if admission != CircuitAdmission::HalfOpenProbe {
@@ -6269,8 +6269,8 @@ pub mod test_helpers {
             success_threshold: 2,
         });
         circuit
-            .open_until_epoch_ms
-            .store(epoch_millis().saturating_sub(1), Ordering::Release);
+            .open_until_monotonic_ms
+            .store(circuit_monotonic_millis(), Ordering::Release);
 
         let first_admission = circuit.admit();
         if first_admission != CircuitAdmission::HalfOpenProbe {

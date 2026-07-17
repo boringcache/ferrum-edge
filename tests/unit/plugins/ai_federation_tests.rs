@@ -3816,6 +3816,23 @@ fn provider_circuit_threshold_cooldown_and_half_open_recovery_are_deterministic(
 }
 
 #[test]
+fn provider_circuit_cooldown_uses_the_process_monotonic_clock() {
+    let src = include_str!("../../../src/plugins/ai_federation.rs");
+    let circuit = src
+        .split("struct ProviderCircuit {")
+        .nth(1)
+        .expect("provider circuit implementation")
+        .split("fn add_external_io_elapsed(")
+        .next()
+        .expect("bounded provider circuit implementation");
+    assert!(circuit.contains("open_until_monotonic_ms"));
+    assert!(circuit.contains("crate::socket_opts::monotonic_now_ms()"));
+    assert!(circuit.contains("saturating_add(1)"));
+    assert!(!circuit.contains("SystemTime"));
+    assert!(!circuit.contains("UNIX_EPOCH"));
+}
+
+#[test]
 fn cancelled_half_open_provider_attempt_releases_probe_slot() {
     assert!(test_helpers::cancelled_half_open_probe_is_released_for_test());
 }

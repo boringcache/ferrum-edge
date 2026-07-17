@@ -35,8 +35,9 @@ fn h3_final_body_rejects_use_complete_synthetic_response_pipeline() {
         .find("if final_body_before_backend_dispatch {")
         .expect("H3 terminal final-body dispatch gate must remain present");
     let applicability = &src[request_scoped_gate..early_dispatch];
-    assert!(applicability.contains("plugin.should_buffer_request_body(&ctx)"));
-    assert!(applicability.contains("plugin.requires_final_request_body_before_backend_dispatch()"));
+    assert!(applicability.contains("if let Some(transformed_headers)"));
+    assert!(applicability.contains("std::mem::swap(&mut ctx.headers, transformed_headers)"));
+    assert!(applicability.contains("crate::proxy::final_request_body_requirements("));
 
     let early_start = src
         .find("let raw_request_body_bytes = body_data.len() as u64;")
@@ -49,6 +50,20 @@ fn h3_final_body_rejects_use_complete_synthetic_response_pipeline() {
     assert!(early.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
     assert!(!early.contains("apply_replaceable_after_proxy_hooks_to_rejection("));
     assert!(early.contains("matches!(http_flavor, HttpFlavor::Grpc)"));
+    let terminal_reject = early
+        .split("let rejection_hook_start = std::time::Instant::now();")
+        .nth(1)
+        .expect("H3 terminal rejection latency timer must remain present");
+    let commit = terminal_reject
+        .find("run_h3_reject_response_committed_hooks(")
+        .expect("H3 terminal rejection commit hook");
+    let account = terminal_reject
+        .find("plugin_execution_ns += rejection_hook_start.elapsed().as_nanos() as u64;")
+        .expect("H3 terminal rejection hook latency accounting");
+    let log = terminal_reject
+        .find("log_rejected_request_with_path(")
+        .expect("H3 terminal rejection log");
+    assert!(commit < account && account < log);
 
     let late_start = src
         .find("// Skip the per-plugin context-aware dispatch")
@@ -98,13 +113,16 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
     let commit = finalizer
         .find("run_h3_reject_response_committed_hooks(")
         .expect("terminal rejection commit");
+    let account = finalizer
+        .find("*plugin_execution_ns += rejection_hook_start.elapsed().as_nanos() as u64;")
+        .expect("terminal rejection hook latency accounting");
     let log = finalizer
         .find("log_rejected_request_with_path(")
         .expect("terminal rejection log");
     let metric = finalizer
         .find("record_request(state,")
         .expect("terminal rejection metric");
-    assert!(decorate < commit && commit < log && log < metric);
+    assert!(decorate < commit && commit < account && account < log && log < metric);
     assert!(finalizer.contains("FinalizedH3TerminalBodyRejection {"));
     assert!(finalizer.contains("http_status,\n        headers,\n        body,"));
 

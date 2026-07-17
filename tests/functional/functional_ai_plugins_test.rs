@@ -199,6 +199,7 @@ proxies:
       half_open_max_requests: 1
       trip_on_connection_errors: true
     plugins:
+      - plugin_config_id: "federation-content-type-transformer"
       - plugin_config_id: "federation-isolation-plugin"
 
 consumers: []
@@ -217,6 +218,17 @@ upstreams:
         healthy_after_seconds: 0
 
 plugin_configs:
+  - id: "federation-content-type-transformer"
+    proxy_id: "federation-isolation"
+    plugin_name: "request_transformer"
+    scope: "proxy"
+    enabled: true
+    config:
+      rules:
+        - operation: "update"
+          target: "header"
+          key: "content-type"
+          value: "application/json"
   - id: "federation-isolation-plugin"
     proxy_id: "federation-isolation"
     plugin_name: "ai_federation"
@@ -251,11 +263,14 @@ plugin_configs:
 
     let provider_response = client
         .post(gateway.proxy_url("/federation-isolation/chat"))
-        .header("content-type", "application/json")
-        .json(&serde_json::json!({
-            "model": "gpt-4o",
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
+        .header("content-type", "text/plain")
+        .body(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .expect("serialize federated request"),
+        )
         .send()
         .await
         .expect("send federated request");
@@ -312,11 +327,14 @@ plugin_configs:
 
     let passthrough_response = client
         .post(gateway.proxy_url("/federation-isolation/chat"))
-        .header("content-type", "application/json")
-        .json(&serde_json::json!({
-            "model": "local-only",
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
+        .header("content-type", "text/plain")
+        .body(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "local-only",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .expect("serialize unmatched pass-through request"),
+        )
         .send()
         .await
         .expect("send unmatched pass-through request");

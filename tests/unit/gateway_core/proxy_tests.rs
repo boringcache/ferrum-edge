@@ -33,8 +33,18 @@ fn terminal_final_body_dispatch_precedes_backend_breaker_and_transport() {
         .expect("backend transport function must remain present");
 
     let applicability = &src[request_scoped_gate..terminal_dispatch];
-    assert!(applicability.contains("plugin.should_buffer_request_body(&ctx)"));
-    assert!(applicability.contains("plugin.requires_final_request_body_before_backend_dispatch()"));
+    assert!(applicability.contains("if let Some(transformed_headers)"));
+    assert!(applicability.contains("std::mem::swap(&mut ctx.headers, transformed_headers)"));
+    assert!(applicability.contains("final_request_body_requirements("));
+    let helper = src
+        .split("pub(crate) fn final_request_body_requirements(")
+        .nth(1)
+        .expect("shared final-body applicability helper must remain present")
+        .split("pub(crate) fn request_body_requirements_before_authenticate(")
+        .next()
+        .expect("shared final-body applicability helper must remain bounded");
+    assert!(helper.contains("plugin.should_buffer_request_body(ctx)"));
+    assert!(helper.contains("plugin.requires_final_request_body_before_backend_dispatch()"));
     assert!(provider_hook < synthetic_pipeline);
     assert!(request_scoped_gate < terminal_dispatch);
     assert!(terminal_dispatch < breaker);
