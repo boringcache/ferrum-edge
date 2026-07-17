@@ -363,6 +363,33 @@ async fn start_test_cp_server(
     (addr, update_tx, handle)
 }
 
+/// Start a CP whose correlation/client-attribution ownership contract requires
+/// one effective real-IP header on every subscribing DP.
+async fn start_test_cp_server_with_real_ip_header(
+    config: GatewayConfig,
+    real_ip_header: &str,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    let (server, _update_tx) =
+        CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
+            .real_ip_header(Some(real_ip_header.to_string()))
+            .build();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .expect("gRPC server failed");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dp_receives_initial_config_from_cp() {
     // Start CP server with 2 proxies
@@ -1186,6 +1213,7 @@ async fn test_cp_rejects_token_missing_required_claims() {
         node_id: "missing-claims-node".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let result = client.subscribe(request).await;
@@ -1274,6 +1302,7 @@ async fn test_cp_accepts_token_with_matching_issuer() {
         node_id: "iss-good".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let result = client.subscribe(request).await;
@@ -1282,6 +1311,69 @@ async fn test_cp_accepts_token_with_matching_issuer() {
         "CP should accept token with matching issuer, got: {:?}",
         result.err()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_enforces_real_ip_header_ownership_contract_before_distribution() {
+    let (addr, server_handle) =
+        start_test_cp_server_with_real_ip_header(create_test_config(1), "cf-connecting-ip").await;
+    let token = dp_client::generate_dp_jwt_with_issuer(
+        TEST_JWT_SECRET,
+        "real-ip-owner",
+        TEST_DEFAULT_ISSUER,
+    )
+    .unwrap();
+    let mut client = connect_client_with_token!(addr, token);
+
+    for (advertised, expected_message) in [
+        (None, "did not advertise"),
+        (Some("x-real-ip"), "does not match"),
+    ] {
+        let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+            node_id: "real-ip-owner".to_string(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            namespace: "ferrum".to_string(),
+            real_ip_header: advertised.map(str::to_string),
+        });
+        let status = client.subscribe(request).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains(expected_message), "got: {status}");
+    }
+
+    let full_config_status = client
+        .get_full_config(tonic::Request::new(
+            ferrum_edge::grpc::proto::FullConfigRequest {
+                node_id: "real-ip-owner".to_string(),
+                ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                namespace: "ferrum".to_string(),
+                real_ip_header: Some("x-real-ip".to_string()),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        full_config_status.code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert!(full_config_status.message().contains("does not match"));
+
+    let accepted = client
+        .subscribe(tonic::Request::new(
+            ferrum_edge::grpc::proto::SubscribeRequest {
+                node_id: "real-ip-owner".to_string(),
+                ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                namespace: "ferrum".to_string(),
+                real_ip_header: Some("CF-CONNECTING-IP".to_string()),
+            },
+        ))
+        .await;
+    assert!(
+        accepted.is_ok(),
+        "case-insensitively matching DP ownership must be admitted: {:?}",
+        accepted.err()
+    );
+
+    server_handle.abort();
 }
 
 /// Verify that the CP rejects a DP token whose `iss` claim does not match
@@ -1303,6 +1395,7 @@ async fn test_cp_rejects_token_with_wrong_issuer() {
         node_id: "iss-bad".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let result = client.subscribe(request).await;
@@ -1396,6 +1489,7 @@ async fn test_cp_rejects_token_with_no_issuer_claim() {
         node_id: "iss-missing".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let result = client.subscribe(request).await;
@@ -1435,6 +1529,7 @@ async fn test_cp_still_rejects_token_signed_with_wrong_secret() {
         node_id: "iss-wrong-key".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let result = client.subscribe(request).await;
@@ -1493,6 +1588,7 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
         node_id: "custom-good".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
     assert!(
         good_client.subscribe(good_req).await.is_ok(),
@@ -1509,6 +1605,7 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
         node_id: "custom-bad".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
     let stale_result = stale_client.subscribe(stale_req).await;
     assert!(
@@ -2718,6 +2815,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
         node_id: "test-dp".to_string(),
         ferrum_version: "99.99.0".to_string(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let result = client.subscribe(request).await;
@@ -2735,6 +2833,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
         node_id: "test-dp".to_string(),
         ferrum_version: "99.99.0".to_string(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let result = client.get_full_config(request).await;
@@ -2746,6 +2845,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
         node_id: "test-dp-good".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let result = client.subscribe(request).await;
@@ -2802,6 +2902,7 @@ async fn test_cp_rejects_dp_with_empty_version() {
         node_id: "old-dp".to_string(),
         ferrum_version: String::new(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let result = client.subscribe(request).await;
@@ -3579,6 +3680,7 @@ async fn test_cp_rejects_dp_with_mismatched_namespace_subscribe() {
         node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "staging".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let result = client.subscribe(request).await;
@@ -3674,6 +3776,7 @@ async fn test_cp_rejects_dp_with_mismatched_namespace_get_full_config() {
         node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "staging".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let result = client.get_full_config(request).await;
@@ -3721,6 +3824,7 @@ async fn test_get_full_config_returns_gateway_trust_bundles_side_channel() {
         node_id: "test-dp".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let response = client
@@ -3775,6 +3879,7 @@ async fn test_cp_accepts_dp_with_matching_namespace() {
         node_id: "test-dp-good".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "production".to_string(),
+        real_ip_header: Some(String::new()),
     });
 
     let mut stream = client

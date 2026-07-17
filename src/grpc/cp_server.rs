@@ -392,6 +392,10 @@ pub struct CpGrpcServer {
     /// requested namespace must be in it. `Set` and `All` scopes enforce the
     /// same rule automatically even when this flag is `false`.
     require_ns_claim: bool,
+    /// Effective CP-side `FERRUM_REAL_IP_HEADER`. Every DP must advertise the
+    /// same value before receiving configuration, making this an enforced
+    /// cluster ownership contract rather than a CP-local assumption.
+    real_ip_header: Option<String>,
 }
 
 impl CpGrpcServer {
@@ -500,7 +504,34 @@ impl CpGrpcServer {
             expected_issuer: DEFAULT_CP_DP_JWT_ISSUER.to_string(),
             scope: CpScope::Single(default_namespace()),
             require_ns_claim: false,
+            real_ip_header: None,
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn check_real_ip_header_compatibility(
+        &self,
+        advertised: Option<&str>,
+    ) -> Result<(), Status> {
+        let Some(advertised) = advertised else {
+            return Err(Status::failed_precondition(
+                "DP did not advertise its effective FERRUM_REAL_IP_HEADER; upgrade or restart the DP with the current CP/DP ownership contract",
+            ));
+        };
+        let advertised = (!advertised.is_empty()).then_some(advertised);
+        let matches = match (self.real_ip_header.as_deref(), advertised) {
+            (None, None) => true,
+            (Some(expected), Some(actual)) => expected.eq_ignore_ascii_case(actual),
+            _ => false,
+        };
+        if matches {
+            return Ok(());
+        }
+
+        Err(Status::failed_precondition(format!(
+            "DP effective FERRUM_REAL_IP_HEADER ({advertised:?}) does not match the CP cluster ownership contract ({:?}); configure the same value on every CP and DP",
+            self.real_ip_header.as_deref()
+        )))
     }
 
     /// Resolve the bearer's allowed namespace set, then check whether the
@@ -1409,6 +1440,7 @@ pub struct CpGrpcServerBuilder {
     expected_issuer: String,
     scope: CpScope,
     require_ns_claim: bool,
+    real_ip_header: Option<String>,
 }
 
 impl CpGrpcServerBuilder {
@@ -1435,6 +1467,11 @@ impl CpGrpcServerBuilder {
     #[allow(dead_code)]
     pub fn require_ns_claim(mut self, require: bool) -> Self {
         self.require_ns_claim = require;
+        self
+    }
+
+    pub fn real_ip_header(mut self, real_ip_header: Option<String>) -> Self {
+        self.real_ip_header = real_ip_header;
         self
     }
 
@@ -1489,6 +1526,7 @@ impl CpGrpcServerBuilder {
                 registry,
                 scope: self.scope,
                 require_ns_claim: self.require_ns_claim,
+                real_ip_header: self.real_ip_header,
             },
             primary_tx,
         )
@@ -1526,6 +1564,18 @@ impl ConfigSync for CpGrpcServer {
 
         // Reject DPs with incompatible versions before streaming any config.
         Self::check_version_compatibility(&dp_version)?;
+        if let Err(status) =
+            self.check_real_ip_header_compatibility(inner.real_ip_header.as_deref())
+        {
+            Self::audit_tenant_subscription(
+                "ConfigSync.Subscribe",
+                &node_id,
+                &dp_namespace,
+                "failure",
+                status.message(),
+            );
+            return Err(status);
+        }
         // Reject DPs whose namespace fails the JWT `ns` claim or CP scope
         // check. The returned sender is the per-namespace broadcast channel
         // — DPs in different namespaces are guaranteed to receive only their
@@ -1686,6 +1736,18 @@ impl ConfigSync for CpGrpcServer {
         let req = request.get_ref();
         let dp_version = &req.ferrum_version;
         Self::check_version_compatibility(dp_version)?;
+        if let Err(status) =
+            self.check_real_ip_header_compatibility(req.real_ip_header.as_deref())
+        {
+            Self::audit_tenant_subscription(
+                "ConfigSync.GetFullConfig",
+                &req.node_id,
+                &req.namespace,
+                "failure",
+                status.message(),
+            );
+            return Err(status);
+        }
         // Same cross-namespace guard as `Subscribe` — without it
         // `GetFullConfig` would leak the wrong namespace's snapshot. We
         // discard the returned sender; `GetFullConfig` is unary.
