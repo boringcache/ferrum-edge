@@ -858,7 +858,10 @@ async fn buffered_deadline_keeps_only_provenance_owned_gateway_headers() {
 
     for (correlation_config, correlation_name) in [
         (json!({}), "x-request-id"),
-        (json!({ "header_name": "x-custom-request-id" }), "x-custom-request-id"),
+        (
+            json!({ "header_name": "x-custom-request-id" }),
+            "x-custom-request-id",
+        ),
     ] {
         for grpc_web_content_type in [
             None,
@@ -880,11 +883,8 @@ async fn buffered_deadline_keeps_only_provenance_owned_gateway_headers() {
                     "gateway-output".to_string(),
                 )]),
             });
-            let after_proxy_plugins = vec![
-                Arc::clone(&correlation),
-                Arc::clone(&security),
-                decorator,
-            ];
+            let after_proxy_plugins =
+                vec![Arc::clone(&correlation), Arc::clone(&security), decorator];
             let initial_policy_plugins = vec![Arc::clone(&security)];
             let transform_plugins: Vec<Arc<dyn Plugin>> =
                 vec![Arc::new(StalledResponseTransformer)];
@@ -915,7 +915,10 @@ async fn buffered_deadline_keeps_only_provenance_owned_gateway_headers() {
                     "strict-transport-security".to_string(),
                     "max-age=backend".to_string(),
                 ),
-                ("x-internal-secret".to_string(), "backend-secret".to_string()),
+                (
+                    "x-internal-secret".to_string(),
+                    "backend-secret".to_string(),
+                ),
                 ("authorization".to_string(), "Bearer backend".to_string()),
                 ("cookie".to_string(), "request=secret".to_string()),
                 ("set-cookie".to_string(), "session=secret".to_string()),
@@ -935,13 +938,8 @@ async fn buffered_deadline_keeps_only_provenance_owned_gateway_headers() {
                 ("vary".to_string(), "Accept-Encoding, Origin".to_string()),
             ]);
             assert!(
-                !run_after_proxy_hooks_for_test(
-                    &after_proxy_plugins,
-                    &mut ctx,
-                    200,
-                    &mut headers,
-                )
-                .await,
+                !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers,)
+                    .await,
                 "trusted decorators must not reject the buffered response"
             );
             set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
@@ -1045,20 +1043,15 @@ async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
         Arc::new(StalledResponseNormalizer),
     ];
     let mut ctx = create_grpc_context_with_timeout(None);
-    ctx.headers.insert(
-        "x-correlation-id".to_string(),
-        "request-123".to_string(),
-    );
+    ctx.headers
+        .insert("x-correlation-id".to_string(), "request-123".to_string());
     assert_continue(correlation_plugin.on_request_received(&mut ctx).await);
     assert_continue(
         ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
     );
     let mut headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
-        (
-            "x-correlation-id".to_string(),
-            "backend-spoof".to_string(),
-        ),
+        ("x-correlation-id".to_string(), "backend-spoof".to_string()),
     ]);
     assert!(
         !run_after_proxy_hooks_for_test(&plugins, &mut ctx, 200, &mut headers).await,
@@ -1067,16 +1060,15 @@ async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut body = b"backend response".to_vec();
 
-    let normalized =
-        normalize_response_body_for_inspection(
-            &plugins,
-            &mut ctx,
-            200,
-            &mut headers,
-            &mut body,
-            &[],
-        )
-        .await;
+    let normalized = normalize_response_body_for_inspection(
+        &plugins,
+        &mut ctx,
+        200,
+        &mut headers,
+        &mut body,
+        &[],
+    )
+    .await;
 
     assert!(normalized);
     assert_eq!(

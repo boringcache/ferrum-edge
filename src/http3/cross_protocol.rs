@@ -2781,10 +2781,7 @@ where
                         response_body = transformed;
                         plugin.on_response_body_transformed(ctx, &mut response_headers);
                     }
-                    ctx.record_deadline_response_header_plugin(
-                        plugin.as_ref(),
-                        &response_headers,
-                    );
+                    ctx.record_deadline_response_header_plugin(plugin.as_ref(), &response_headers);
                 }
 
                 for plugin in plugins {

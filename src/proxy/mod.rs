@@ -14000,9 +14000,7 @@ async fn run_after_proxy_hooks_on_rejection(
         if terminal_gateway_deadline {
             ctx.mark_gateway_deadline_response_selected();
         }
-        if matches!(&result, PluginResult::Continue)
-            || !plugin.may_replace_rejection_response()
-        {
+        if matches!(&result, PluginResult::Continue) || !plugin.may_replace_rejection_response() {
             ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
         }
         match result {
@@ -14111,12 +14109,7 @@ async fn run_after_proxy_hooks_on_rejection(
             .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
     {
         ctx.mark_gateway_deadline_response_selected();
-        replace_rejection_with_gateway_deadline(
-            ctx,
-            status_code,
-            response_body,
-            response_headers,
-        );
+        replace_rejection_with_gateway_deadline(ctx, status_code, response_body, response_headers);
     }
 
     restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);

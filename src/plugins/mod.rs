@@ -1587,10 +1587,7 @@ impl RequestContext {
         &mut self,
         response_headers: &HashMap<String, String>,
     ) {
-        if let Some(state) = self
-            .buffered_deadline_response_header_provenance
-            .as_mut()
-        {
+        if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
             Arc::make_mut(state).record_gateway_mutations(&[], response_headers);
         }
     }
@@ -1600,10 +1597,7 @@ impl RequestContext {
         plugin: &dyn Plugin,
         response_headers: &HashMap<String, String>,
     ) {
-        if self
-            .buffered_deadline_response_header_provenance
-            .is_none()
-        {
+        if self.buffered_deadline_response_header_provenance.is_none() {
             return;
         }
         let plugin_owned_headers = response_headers
@@ -1611,12 +1605,8 @@ impl RequestContext {
             .filter(|name| plugin.owns_deadline_response_header(self, name))
             .map(|name| name.to_ascii_lowercase())
             .collect::<Vec<_>>();
-        if let Some(state) = self
-            .buffered_deadline_response_header_provenance
-            .as_mut()
-        {
-            Arc::make_mut(state)
-                .record_gateway_mutations(&plugin_owned_headers, response_headers);
+        if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
+            Arc::make_mut(state).record_gateway_mutations(&plugin_owned_headers, response_headers);
         }
     }
 
@@ -1626,10 +1616,7 @@ impl RequestContext {
         &mut self,
         response_headers: &mut HashMap<String, String>,
     ) {
-        if let Some(state) = self
-            .buffered_deadline_response_header_provenance
-            .as_mut()
-        {
+        if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
             Arc::make_mut(state).retain_gateway_output(response_headers);
             return;
         }
@@ -1649,10 +1636,7 @@ impl RequestContext {
         &mut self,
         response_headers: &HashMap<String, String>,
     ) {
-        if let Some(state) = self
-            .buffered_deadline_response_header_provenance
-            .as_mut()
-        {
+        if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
             Arc::make_mut(state).sync_terminal_headers(response_headers);
         }
     }

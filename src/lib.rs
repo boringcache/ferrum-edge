@@ -1244,14 +1244,9 @@ pub mod _test_support {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> bool {
-        crate::proxy::run_after_proxy_hooks(
-            plugins,
-            ctx,
-            response_status,
-            response_headers,
-        )
-        .await
-        .is_some()
+        crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
+            .await
+            .is_some()
     }
 
     pub async fn transform_buffered_response_body_with_deadline_for_test(
