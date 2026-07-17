@@ -146,8 +146,8 @@ fn ai_metadata_usage<'a>(
             continue;
         }
 
-        let Some(provider) = prefixed_metadata_value(metadata, prefix, "_provider")
-            .and_then(ai_provider_label)
+        let Some(provider) =
+            prefixed_metadata_value(metadata, prefix, "_provider").and_then(ai_provider_label)
         else {
             continue;
         };
