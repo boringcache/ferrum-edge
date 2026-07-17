@@ -3479,10 +3479,72 @@ jobs:
           name: binary-${{ matrix.target }}
           path: release-assets/
 
-  latest-release:
-    name: Update Latest Release
+  main-publish-gate:
+    name: Main Publish Gate
     needs: [test, build-binaries]
     if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for dedicated release checks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          required_workflows=(
+            "Coverage"
+            "Gateway API Conformance"
+            "Mesh E2E Sidecar Live Datapath"
+          )
+
+          for attempt in $(seq 1 180); do
+            runs="$({
+              gh api --paginate \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${REPOSITORY}/actions/runs?head_sha=${HEAD_SHA}&event=push&per_page=100" \
+                --jq '.workflow_runs[] | [.name, .status, (.conclusion // "")] | @tsv'
+            })"
+            pending=0
+
+            for workflow in "${required_workflows[@]}"; do
+              run="$(awk -F '\t' -v name="$workflow" '$1 == name { print; exit }' <<<"$runs")"
+              if [ -z "$run" ]; then
+                echo "Waiting for ${workflow} to start for ${HEAD_SHA}."
+                pending=1
+                continue
+              fi
+
+              IFS=$'\t' read -r _ status conclusion <<<"$run"
+              if [ "$status" != "completed" ]; then
+                echo "Waiting for ${workflow}: ${status}."
+                pending=1
+              elif [ "$conclusion" != "success" ]; then
+                echo "::error::${workflow} concluded ${conclusion} for ${HEAD_SHA}."
+                exit 1
+              else
+                echo "${workflow} passed."
+              fi
+            done
+
+            if [ "$pending" -eq 0 ]; then
+              exit 0
+            fi
+            sleep 30
+          done
+
+          echo "::error::Timed out waiting for dedicated release checks for ${HEAD_SHA}."
+          exit 1
+
+  latest-release:
+    name: Update Latest Release
+    needs: [main-publish-gate, build-binaries]
+    if: always() && needs.main-publish-gate.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -3553,8 +3615,8 @@ jobs:
 
   docker:
     name: Docker (${{ matrix.platform }})
-    needs: [test, build-binaries]
-    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [main-publish-gate, build-binaries]
+    if: always() && needs.main-publish-gate.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read

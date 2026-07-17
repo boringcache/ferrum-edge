@@ -120,6 +120,12 @@ DEDICATED_REQUIRED_CHECKS = {
     },
 }
 
+MAIN_PUBLISH_WORKFLOWS = {
+    "Coverage",
+    "Gateway API Conformance",
+    "Mesh E2E Sidecar Live Datapath",
+}
+
 
 def extract_test_needs(ci_yml: str) -> set[str]:
     match = re.search(r"(?ms)^  test:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", ci_yml)
@@ -217,6 +223,28 @@ def main() -> int:
             planner_errors.append(f"jobs.{job} must remain removed from ci.yml")
     if "(CI mirror)" in ci_yml:
         planner_errors.append("ci.yml must not contain runner-holding CI mirror jobs")
+
+    publish_gate_body = extract_job_body(ci_yml, "main-publish-gate")
+    if not all(
+        job_needs(publish_gate_body, dependency)
+        for dependency in ("test", "build-binaries")
+    ):
+        planner_errors.append(
+            "jobs.main-publish-gate must depend on Tests and build-binaries"
+        )
+    for workflow in sorted(MAIN_PUBLISH_WORKFLOWS):
+        if f'            "{workflow}"' not in publish_gate_body:
+            planner_errors.append(
+                f"jobs.main-publish-gate must wait for `{workflow}`"
+            )
+    for job in ("latest-release", "docker"):
+        body = extract_job_body(ci_yml, job)
+        if not job_needs(body, "main-publish-gate"):
+            planner_errors.append(f"jobs.{job} must depend on main-publish-gate")
+        if "needs.main-publish-gate.result == 'success'" not in body:
+            planner_errors.append(
+                f"jobs.{job} must require a successful main-publish-gate"
+            )
 
     for job in sorted(DIRECT_FULL_CI_JOBS):
         body = extract_job_body(ci_yml, job)
