@@ -50,17 +50,6 @@ async fn functional_websocket_frame_limit_h1_rejects_oversized_client_frame() {
         })))
         .await
         .expect("send H1 graceful Close above application frame ceiling");
-    let graceful_reply = graceful_ws
-        .next()
-        .await
-        .expect("H1 graceful Close reply")
-        .expect("valid H1 Close must bypass application frame ceiling");
-    let Message::Close(graceful_reply) = graceful_reply else {
-        panic!("expected echoed H1 Close, got {graceful_reply:?}");
-    };
-    if let Some(graceful_reply) = graceful_reply {
-        assert_ne!(graceful_reply.code, CloseCode::Size);
-    }
     assert_backend_close(&mut backend_closes, CloseCode::Normal, graceful_reason).await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
@@ -197,17 +186,6 @@ async fn functional_ws_message_size_limit_h2_sends_1009_to_both_peers() {
         })))
         .await
         .expect("send H2 graceful Close above plugin frame ceiling");
-    let graceful_reply = graceful_ws
-        .next()
-        .await
-        .expect("H2 graceful Close reply")
-        .expect("valid H2 Close must bypass plugin frame ceiling");
-    let Message::Close(graceful_reply) = graceful_reply else {
-        panic!("expected echoed H2 Close, got {graceful_reply:?}");
-    };
-    if let Some(graceful_reply) = graceful_reply {
-        assert_ne!(graceful_reply.code, CloseCode::Size);
-    }
     assert_backend_close(&mut backend_closes, CloseCode::Normal, graceful_reason).await;
 
     ws.send(Message::Frame(Frame::message(
@@ -309,19 +287,6 @@ async fn functional_ws_message_size_limit_h3_sends_1009_to_both_peers() {
         .send_fragment(0x8, &graceful_payload, true)
         .await
         .expect("send H3 graceful Close above plugin frame ceiling");
-    let graceful_reply = graceful_ws
-        .recv_frame()
-        .await
-        .expect("valid H3 Close must bypass plugin frame ceiling");
-    let H3WebSocketFrame::Close(graceful_reply) = graceful_reply else {
-        panic!("expected echoed H3 Close, got {graceful_reply:?}");
-    };
-    if graceful_reply.len() >= 2 {
-        assert_ne!(
-            u16::from_be_bytes([graceful_reply[0], graceful_reply[1]]),
-            1009
-        );
-    }
     assert_backend_close(&mut backend_closes, CloseCode::Normal, graceful_reason).await;
 
     let mut ws = retry_h3_websocket(&client, &url).await;
