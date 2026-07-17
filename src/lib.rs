@@ -83,7 +83,10 @@ pub mod _test_support {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    use futures_util::Sink;
     use hyper::StatusCode;
+    use tokio_tungstenite::tungstenite::Error as WsError;
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
@@ -429,6 +432,64 @@ pub mod _test_support {
         )
     }
 
+    pub fn validate_transaction_log_schema_graph_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(), Vec<String>> {
+        crate::plugins::transaction_log_schema::validate_config_graph(
+            config,
+            &crate::plugins::PluginHttpClient::default(),
+            true,
+        )
+    }
+
+    pub fn intervening_clear_recovery_candidate_for_test(
+        snapshot: crate::config::types::GatewayConfig,
+        current: crate::config::types::GatewayConfig,
+    ) -> crate::config::types::GatewayConfig {
+        crate::admin::intervening_clear_recovery_candidate_for_test(snapshot, current)
+    }
+
+    pub fn collect_rejecting_runtime_config_errors_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Vec<String> {
+        crate::config::validation_pipeline::collect_rejecting_runtime_config_errors(config)
+    }
+
+    pub async fn lock_namespace_config_admission_for_test(
+        namespace: &str,
+    ) -> tokio::sync::MutexGuard<'static, ()> {
+        crate::admin::crud::lock_local_namespace_config_admission(namespace).await
+    }
+
+    pub fn validate_plugin_configs_fatal_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<(), String> {
+        crate::config::validation_pipeline::ValidationPipeline::new(config)
+            .validate_plugin_configs(
+                backend_allow_ips,
+                crate::config::validation_pipeline::ValidationAction::FatalCount(
+                    "Validation failed with {} errors",
+                ),
+            )
+            .run()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn collect_plugin_config_errors_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<Vec<String>, String> {
+        crate::config::validation_pipeline::ValidationPipeline::new(config)
+            .validate_plugin_configs(
+                backend_allow_ips,
+                crate::config::validation_pipeline::ValidationAction::Collect,
+            )
+            .run()
+            .map_err(|error| error.to_string())
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)
@@ -581,12 +642,49 @@ pub mod _test_support {
             None,
             &crls,
             65_536,
+            262_144,
             4_096,
             None,
             None,
         )
         .await?;
         Ok(handshake.stream)
+    }
+
+    /// Exercise the production bounded WebSocket close/queued-echo path.
+    pub async fn send_bounded_ws_close_for_test<S>(sink: &mut S, close: Option<CloseFrame>)
+    where
+        S: Sink<Message, Error = WsError> + Unpin,
+    {
+        crate::proxy::send_bounded_ws_close(sink, close).await;
+    }
+
+    /// Exercise synchronous policy-close publication and cancellation.
+    pub fn publish_ws_policy_close_for_test(
+        policy_close: &std::sync::OnceLock<CloseFrame>,
+        cancel: &tokio_util::sync::CancellationToken,
+        close: Option<CloseFrame>,
+    ) -> Option<CloseFrame> {
+        crate::proxy::publish_ws_policy_close(policy_close, cancel, close)
+    }
+
+    /// Report the production parser-policy and post-reassembly hook lists.
+    pub fn websocket_relay_plugin_names_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        requires_websocket_framing: bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let (framing_plugins, frame_plugins) =
+            crate::proxy::collect_websocket_relay_plugins(plugins, requires_websocket_framing);
+        (
+            framing_plugins
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+            frame_plugins
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+        )
     }
 
     /// Variant of `connect_websocket_backend_for_test` that returns the
@@ -626,6 +724,7 @@ pub mod _test_support {
             None,
             &crls,
             65_536,
+            262_144,
             4_096,
             None,
             None,
@@ -944,6 +1043,12 @@ pub mod _test_support {
         config: &crate::config::types::GatewayConfig,
     ) -> bool {
         config.has_effective_mtls_dns_identity_policy()
+    }
+
+    pub fn validate_tcp_connection_throttle_attachments(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(), Vec<String>> {
+        crate::plugin_cache::validate_tcp_connection_throttle_attachments(config)
     }
 
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {

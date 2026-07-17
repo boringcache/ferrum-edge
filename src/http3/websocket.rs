@@ -571,7 +571,7 @@ pub(crate) async fn handle_h3_websocket(
     backend_url: String,
     query_string: String,
     proxy_headers: HashMap<String, String>,
-    requires_ws_frame_hooks: bool,
+    requires_websocket_framing: bool,
     is_early_data: bool,
     strip_len: usize,
     backend_path_is_policy_bound: bool,
@@ -701,6 +701,10 @@ pub(crate) async fn handle_h3_websocket(
     // setup failures when `retry_on_connect_failure` is enabled, and rotate
     // upstream targets through the same load-balancer cache. Backend-side
     // upgrade rejections are post-wire and must not be replayed.
+    let ws_size_limits = crate::proxy::EffectiveWsSizeLimits::from_plugins(
+        state.max_websocket_frame_size_bytes,
+        &plugins,
+    );
     let mut current_backend_url = backend_url;
     let mut current_target = upstream_target;
     let mut current_cb_target_key = cb_target_key;
@@ -910,7 +914,8 @@ pub(crate) async fn handle_h3_websocket(
             &client_headers,
             state.tls_policy.as_deref(),
             &state.crls,
-            state.max_websocket_frame_size_bytes,
+            ws_size_limits.max_frame_bytes,
+            ws_size_limits.max_message_bytes,
             state.websocket_write_buffer_size,
             ws_idle_tracker.clone(),
             Some(&state.dns_cache),
@@ -1388,16 +1393,9 @@ pub(crate) async fn handle_h3_websocket(
         }
     }));
 
-    // ── Collect WebSocket frame and disconnect plugin lists ─────────
-    let ws_frame_plugins: Vec<Arc<dyn Plugin>> = if requires_ws_frame_hooks {
-        plugins
-            .iter()
-            .filter(|p| p.requires_ws_frame_hooks())
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // ── Collect parsed-relay and disconnect plugin lists ────────────
+    let (ws_framing_plugins, ws_frame_plugins) =
+        crate::proxy::collect_websocket_relay_plugins(&plugins, requires_websocket_framing);
     let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = plugins
         .iter()
         .filter(|p| p.requires_ws_disconnect_hooks())
@@ -1432,6 +1430,7 @@ pub(crate) async fn handle_h3_websocket(
         backend_ws_stream,
         &proxy_id_for_relay,
         ws_conn_id,
+        ws_framing_plugins,
         ws_frame_plugins,
         ws_disconnect_plugins,
         session_meta,

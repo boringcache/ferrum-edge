@@ -26,9 +26,12 @@ publish = false
 # `vendor/tokio-tungstenite-0.29.0-ferrum-patched/`. They backport
 # snapview/tungstenite-rs#556 and snapview/tokio-tungstenite#380 so the
 # WebSocket tunnel fast path can take over the raw backend stream without
-# dropping bytes buffered during the 101 response parse. To run their tests
-# directly:
+# dropping bytes buffered during the 101 response parse. The tungstenite copy
+# also retains a distinct pre-reservation frame-limit error origin; see the
+# governed deliberate-fork record in docs/upstream-tungstenite-patches/. To run
+# their tests directly:
 # `cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer`
+# `cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit`
 # and
 # `cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer`.
 
@@ -387,10 +390,11 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # loses backend bytes coalesced with the 101 response because plain
 # `into_inner()` drops tungstenite's internal read buffer.
 #
-# Retirement plan: when both upstream changes ship in compatible published
-# releases consumed by ferrum-edge, remove both `[patch.crates-io]` lines, drop
-# the two vendor directories, bump dependency versions/lockfile normally, and
-# keep the gateway call site using the same upstream API. See
+# Retirement plan: when both upstream changes and equivalent frame/message
+# capacity attribution ship in compatible published releases consumed by
+# ferrum-edge, remove both `[patch.crates-io]` lines, drop the two vendor
+# directories, bump dependency versions/lockfile normally, and keep the gateway
+# call site using the same upstream API. See
 # `docs/upstream-tungstenite-patches/README.md`.
 [patch.crates-io]
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }

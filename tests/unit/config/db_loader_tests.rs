@@ -3,10 +3,12 @@ use ferrum_edge::_test_support::{
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
     db_wrap_mysql_isolation_read_error, is_config_validation_rejection,
     mysql_mtls_dns_admission_lock_insert_sql, parse_auth_mode, parse_scheme, statement_timeout_sql,
+    validate_tcp_connection_throttle_attachments,
 };
 use ferrum_edge::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, is_incremental_full_reload_required,
     is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
+    tcp_connection_throttle_attachment_conflict,
 };
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
@@ -119,6 +121,47 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         acl_groups: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+    }
+}
+
+fn make_http_proxy(id: &str) -> Proxy {
+    serde_json::from_value(json!({
+        "id": id,
+        "namespace": "ferrum",
+        "hosts": [format!("{id}.test")],
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .unwrap()
+}
+
+fn make_tcp_proxy(id: &str, listen_port: u16) -> Proxy {
+    serde_json::from_value(json!({
+        "id": id,
+        "namespace": "ferrum",
+        "backend_scheme": "tcp",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9000,
+        "listen_port": listen_port
+    }))
+    .unwrap()
+}
+
+fn make_global_tcp_throttle(id: &str) -> PluginConfig {
+    let now = chrono::Utc::now();
+    PluginConfig {
+        id: id.to_string(),
+        plugin_name: "tcp_connection_throttle".to_string(),
+        namespace: "ferrum".to_string(),
+        config: json!({"max_connections_per_key": 10}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
     }
 }
 
@@ -677,6 +720,139 @@ async fn independent_sqlite_stores_serialize_mtls_dns_consumer_admission() {
     loaded
         .validate_unique_mtls_dns_identities()
         .expect("the persisted winner must remain unambiguous");
+}
+
+#[tokio::test]
+async fn deleting_last_tcp_proxy_rolls_back_authoritative_plugin_graph_candidate() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tcp_throttle_delete_candidate.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    store
+        .create_proxy(&make_tcp_proxy("tcp", 19001))
+        .await
+        .unwrap();
+    store.create_proxy(&make_http_proxy("http")).await.unwrap();
+    store
+        .create_plugin_config(&make_global_tcp_throttle("global-throttle"))
+        .await
+        .expect("a mixed global graph with a supported TCP target is valid");
+
+    let update_error = store
+        .update_proxy(&make_http_proxy("tcp"))
+        .await
+        .expect_err("changing the final TCP target to HTTP must be rejected");
+    assert!(
+        tcp_connection_throttle_attachment_conflict(&update_error).is_some(),
+        "unexpected proxy update rejection: {update_error:#}"
+    );
+    assert!(
+        store
+            .get_proxy("ferrum", "tcp")
+            .await
+            .unwrap()
+            .is_some_and(|proxy| matches!(proxy.effective_scheme(), BackendScheme::Tcp)),
+        "the rejected update must retain the TCP proxy shape"
+    );
+
+    let error = store
+        .delete_proxy("ferrum", "tcp")
+        .await
+        .expect_err("deleting the final supported target must be rejected before commit");
+    assert!(
+        tcp_connection_throttle_attachment_conflict(&error).is_some(),
+        "unexpected delete rejection: {error:#}"
+    );
+    assert!(
+        store.get_proxy("ferrum", "tcp").await.unwrap().is_some(),
+        "the rejected transaction must retain the TCP proxy"
+    );
+    let candidate = store.load_namespace_snapshot("ferrum").await.unwrap();
+    validate_tcp_connection_throttle_attachments(&candidate)
+        .expect("the committed graph must remain runtime-valid");
+}
+
+#[tokio::test]
+async fn enabling_global_tcp_throttle_rolls_back_for_unsupported_only_graph() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join("tcp_throttle_plugin_update_candidate.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    store.create_proxy(&make_http_proxy("http")).await.unwrap();
+    let mut throttle = make_global_tcp_throttle("global-throttle");
+    throttle.enabled = false;
+    store.create_plugin_config(&throttle).await.unwrap();
+
+    throttle.enabled = true;
+    let error = store
+        .update_plugin_config(&throttle)
+        .await
+        .expect_err("enabling a global throttle with only HTTP targets must be rejected");
+    assert!(
+        tcp_connection_throttle_attachment_conflict(&error).is_some(),
+        "unexpected plugin update rejection: {error:#}"
+    );
+    assert!(
+        !store
+            .get_plugin_config("ferrum", "global-throttle")
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled,
+        "the rejected plugin update must roll back"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_sqlite_stores_serialize_tcp_throttle_and_proxy_graph_admission() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("tcp_throttle_cross_process_graph.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store_a =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    let store_b =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    let http_proxy = make_http_proxy("http");
+    let throttle = make_global_tcp_throttle("global-throttle");
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let barrier_a = barrier.clone();
+    let barrier_b = barrier.clone();
+    let (proxy_result, plugin_result) = tokio::join!(
+        async {
+            barrier_a.wait().await;
+            store_a.create_proxy(&http_proxy).await
+        },
+        async {
+            barrier_b.wait().await;
+            store_b.create_plugin_config(&throttle).await
+        }
+    );
+
+    assert_ne!(
+        proxy_result.is_ok(),
+        plugin_result.is_ok(),
+        "the namespace lock must permit only the first individually-valid mutation"
+    );
+    let conflict = proxy_result.err().or_else(|| plugin_result.err()).unwrap();
+    assert!(
+        tcp_connection_throttle_attachment_conflict(&conflict).is_some(),
+        "unexpected losing mutation: {conflict:#}"
+    );
+    let candidate = store_a.load_namespace_snapshot("ferrum").await.unwrap();
+    validate_tcp_connection_throttle_attachments(&candidate)
+        .expect("cross-store admission must never commit the invalid aggregate graph");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

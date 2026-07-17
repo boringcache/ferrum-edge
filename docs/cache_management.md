@@ -226,13 +226,13 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### TCP Connection Throttle
 
-**What it stores:** Active TCP connection counts per consumer or client IP.
+**What it stores:** Active TCP/TCP+TLS connection counts per consumer or canonical client IP. Accounting is process-local, and the map uses the normalized `FERRUM_POOL_SHARD_AMOUNT`. Every replica has an independent map, so aggregate deployment capacity is the configured per-key limit multiplied by the number of replicas receiving that key's connections.
 
 **Default limit:** No hard entry cap -- bounded by unique clients with active connections.
 
-**Config field:** `max_connections_per_key` (required, controls the per-key connection limit, not the map size).
+**Config fields:** `max_connections_per_key` (required, controls the per-key connection limit, not the map size) and `cleanup_interval_seconds` (default `60`, `0` disables only the residual sweep).
 
-**Cleanup mechanism:** Entries use `Arc<AtomicU64>` counters decremented on connection close. Zero-count entries remain in the map but consume minimal memory (a DashMap entry with an atomic counter).
+**Cleanup mechanism:** Each admission owns an opaque permit bound to the exact counter entry it incremented. Permit release decrements and removes a zero-count entry inline while holding the same DashMap entry guard used by admission. A configurable background sweep removes only residual zero-count entries; it cannot repair a missed positive decrement. `cleanup_interval_seconds: 0` disables only that residual sweep, not inline release/removal. Accounting state is shared across compatible cache generations by plugin namespace/config ID. Removing the policy stops its sweep and removes the state from the cache registry; old connection permits retain only that retired state until they release.
 
 ### API Chargeback
 

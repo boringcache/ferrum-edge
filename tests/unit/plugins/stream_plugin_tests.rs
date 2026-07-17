@@ -273,6 +273,7 @@ async fn test_ip_restriction_stream_connect_allowed() {
         authenticated_identity: None,
         auth_method: None,
         metadata: None,
+        admission_permits: Vec::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
@@ -307,6 +308,7 @@ async fn test_ip_restriction_stream_connect_denied() {
         authenticated_identity: None,
         auth_method: None,
         metadata: None,
+        admission_permits: Vec::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
@@ -342,6 +344,7 @@ fn make_stream_ctx() -> StreamConnectionContext {
         authenticated_identity: None,
         auth_method: None,
         metadata: None,
+        admission_permits: Vec::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
@@ -689,12 +692,18 @@ fn test_ws_only_plugins() {
             "Plugin {} must NOT support UDP",
             name
         );
-        // All WS frame plugins must opt into frame hooks
+        // Every WebSocket policy must select the framed relay. Size limiting
+        // is parser-only; logging/rate limiting use post-reassembly hooks.
         assert!(
-            plugin.requires_ws_frame_hooks(),
-            "Plugin {} must return true from requires_ws_frame_hooks()",
+            plugin.requires_websocket_framing(),
+            "Plugin {} must require WebSocket framing",
             name
         );
+        if name == "ws_message_size_limiting" {
+            assert!(!plugin.requires_ws_frame_hooks());
+        } else {
+            assert!(plugin.requires_ws_frame_hooks());
+        }
     }
 }
 

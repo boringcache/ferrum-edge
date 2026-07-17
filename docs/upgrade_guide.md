@@ -111,6 +111,37 @@ TLS and HTTP/2 or HTTP/3 handshakes. Operators who previously sized this field
 assuming it applied only to the TCP SYN phase should validate cold-connection
 latency during rollout.
 
+### TCP Connection Throttle Validation Hardening
+
+Upgrades now fail closed when persisted `tcp_connection_throttle` configuration
+would claim protection that the runtime cannot provide or contains an invalid
+plugin shape. In particular, config load is rejected when:
+
+- an enabled global throttle has a nonempty effective target set containing
+  only HTTP-family, UDP, or DTLS proxies (a mixed target set remains valid when
+  it includes at least one TCP/TCP+TLS proxy)
+- a proxy- or proxy-group-scoped throttle is attached to a non-TCP protocol
+- the plugin `config` contains fields other than `max_connections_per_key` and
+  `cleanup_interval_seconds`
+- `cleanup_interval_seconds` exceeds 86400 seconds
+
+This is intentional fail-closed behavior; the upgrade does not ignore unknown
+fields or preserve unsupported attachments through a compatibility shim.
+Database, control-plane, and data-plane publication rejects invalid attachment
+graphs, and a DP keeps its last accepted snapshot. Runtime plugin-cache staging
+also rejects the invalid plugin shape or cleanup interval. File-mode startup or
+reload likewise rejects the invalid file.
+
+Before cutover, inspect every enabled `tcp_connection_throttle` in the cloned
+database or staging config. Remove misspelled/obsolete fields, set the cleanup
+interval to `0..=86400`, and either attach scoped policies only to TCP/TCP+TLS
+proxies or add a supported TCP target for an enabled global policy. If the new
+binary cannot accept the initial database snapshot, repair the row through the
+old version's Admin API (preferably against the cloned database first), then
+restart validation. For file mode, edit the YAML/JSON copy and run the staged
+validation step again. Do not bypass the check by adding placeholder HTTP/UDP
+targets; disable or remove a policy that has no TCP listener to protect.
+
 ### Chargeback Scrape Authentication
 
 `GET /charges` now requires an admin JWT. Update Prometheus or external billing

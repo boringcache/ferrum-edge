@@ -177,6 +177,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
         authenticated_identity: None,
         auth_method: None,
         metadata: None,
+        admission_permits: Vec::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         // Populated above for opaque-TLS captures; `None` for raw-TCP streams.
@@ -198,6 +199,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
 
     for plugin in plugins.iter() {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
+            stream_ctx.release_admission_permits();
             debug!(
                 service = %entry.service_fqdn,
                 orig_dst = %orig_dst,
@@ -486,10 +488,9 @@ async fn relay_to_loopback(
 }
 
 /// Build the `StreamTransactionSummary` and run the `on_stream_disconnect`
-/// chain. Mirrors `tcp_proxy`'s accept-loop disconnect path so stateful plugins
-/// (throttle active counts, span emission, byte-based metrics) release/flush per
-/// connection, and so RST/transaction runtime metrics are recorded for captured
-/// inbound streams too.
+/// chain. Mirrors `tcp_proxy`'s accept-loop disconnect path so admission permits
+/// release before observers run, stateful observers flush per connection, and
+/// RST/transaction runtime metrics are recorded for captured inbound streams too.
 #[allow(clippy::too_many_arguments)]
 async fn emit_disconnect(
     plugins: &[Arc<dyn crate::plugins::Plugin>],
@@ -506,6 +507,9 @@ async fn emit_disconnect(
     disconnect_direction: Option<crate::plugins::Direction>,
     disconnect_cause: Option<DisconnectCause>,
 ) {
+    // The relay (or setup attempt) has ended. Do not retain admission capacity
+    // while asynchronous disconnect observers flush logs and metrics.
+    stream_ctx.release_admission_permits();
     let disconnected_wall_at = chrono::Utc::now();
     let summary = StreamTransactionSummary {
         namespace: proxy.namespace.clone(),
