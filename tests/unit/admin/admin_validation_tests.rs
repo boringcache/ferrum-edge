@@ -13,6 +13,10 @@ fn test_proxy_and_plugin_writes_run_plugin_graph_candidate_validation() {
         "cross-resource plugin checks must share one candidate graph"
     );
     assert!(
+        source.contains("validate_plugin_composition_candidate(candidate, http_client)"),
+        "admin candidates must enforce HMAC and correlation-ID composition"
+    );
+    assert!(
         source.contains("validate_tcp_connection_throttle_attachments(candidate)"),
         "admin candidates must reject unsupported TCP-throttle attachments"
     );

@@ -6,8 +6,8 @@
 use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, HTTP_FAMILY_AND_STREAM_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS,
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
-    StreamTransactionSummary, TCP_ONLY_PROTOCOLS, create_plugin,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, REQUEST_ID_METADATA_KEY,
+    StreamConnectionContext, StreamTransactionSummary, TCP_ONLY_PROTOCOLS, create_plugin,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -260,28 +260,15 @@ async fn test_ip_restriction_stream_connect_allowed() {
     )
     .unwrap();
 
-    let mut ctx = StreamConnectionContext {
-        client_ip: "10.1.2.3".to_string(),
-        direct_client_ip: "10.1.2.3".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "test-proxy".to_string(),
-        proxy_name: Some("Test Proxy".to_string()),
-        listen_port: 5432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: empty_consumer_index(),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    let mut ctx = StreamConnectionContext::new(
+        "10.1.2.3".to_string(),
+        "10.1.2.3".to_string(),
+        "test-proxy".to_string(),
+        Some("Test Proxy".to_string()),
+        5432,
+        BackendScheme::Tcp,
+        empty_consumer_index(),
+    );
 
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert!(matches!(result, PluginResult::Continue));
@@ -295,28 +282,15 @@ async fn test_ip_restriction_stream_connect_denied() {
     )
     .unwrap();
 
-    let mut ctx = StreamConnectionContext {
-        client_ip: "192.168.1.1".to_string(),
-        direct_client_ip: "192.168.1.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "test-proxy".to_string(),
-        proxy_name: Some("Test Proxy".to_string()),
-        listen_port: 5432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: empty_consumer_index(),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    let mut ctx = StreamConnectionContext::new(
+        "192.168.1.1".to_string(),
+        "192.168.1.1".to_string(),
+        "test-proxy".to_string(),
+        Some("Test Proxy".to_string()),
+        5432,
+        BackendScheme::Tcp,
+        empty_consumer_index(),
+    );
 
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert!(matches!(
@@ -331,28 +305,15 @@ async fn test_ip_restriction_stream_connect_denied() {
 // ---- Stream hook behavior tests ----
 
 fn make_stream_ctx() -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: "10.1.2.3".to_string(),
-        direct_client_ip: "10.1.2.3".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "test-proxy".to_string(),
-        proxy_name: Some("Test Proxy".to_string()),
-        listen_port: 5432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: empty_consumer_index(),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    StreamConnectionContext::new(
+        "10.1.2.3".to_string(),
+        "10.1.2.3".to_string(),
+        "test-proxy".to_string(),
+        Some("Test Proxy".to_string()),
+        5432,
+        BackendScheme::Tcp,
+        empty_consumer_index(),
+    )
 }
 
 fn make_stream_summary() -> StreamTransactionSummary {
@@ -645,6 +606,257 @@ async fn test_stream_metadata_flows_from_connect_to_disconnect() {
     );
 }
 
+#[tokio::test]
+async fn stream_correlation_ids_survive_public_client_ip_cache_replacement() {
+    let first = make_plugin(
+        "correlation_id",
+        json!({"header_name": "x-internal-request-id"}),
+    )
+    .unwrap();
+    let second = make_plugin(
+        "correlation_id",
+        json!({"header_name": "x-external-request-id"}),
+    )
+    .unwrap();
+    let mut ctx = make_stream_ctx();
+    ctx.insert_metadata(
+        REQUEST_ID_METADATA_KEY.to_string(),
+        "pre-correlation-custom-value".to_string(),
+    );
+    ctx.insert_metadata(
+        "correlation_id.instance.spoofed-custom-value".to_string(),
+        "attacker-metadata".to_string(),
+    );
+
+    assert!(matches!(
+        first.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let metadata = ctx.metadata.as_ref().expect("metadata allocated");
+    let internal = metadata
+        .get("correlation_id.instance.x-internal-request-id")
+        .expect("internal instance ID");
+    let external = metadata
+        .get("correlation_id.instance.x-external-request-id")
+        .expect("external instance ID");
+    assert!(uuid::Uuid::parse_str(internal).is_ok());
+    assert!(uuid::Uuid::parse_str(external).is_ok());
+    assert_ne!(internal, external);
+    assert_eq!(metadata.get(REQUEST_ID_METADATA_KEY), Some(internal));
+    assert!(
+        !metadata.contains_key("correlation_id.canonical_owner"),
+        "correlation ownership bookkeeping must not enter stream summaries"
+    );
+
+    let expected_internal = internal.clone();
+    let expected_external = external.clone();
+    assert_eq!(
+        ctx.canonical_client_ip().map(|ip| ip.to_string()),
+        Some("10.1.2.3".to_string())
+    );
+
+    // Model a later custom plugin changing the public client identity and
+    // invalidating the typed-IP cache before poisoning public compatibility
+    // metadata. Correlation ownership must remain independent of both writes.
+    ctx.client_ip = "192.0.2.44".to_string();
+    ctx.canonical_client_ip = Default::default();
+    assert!(!ctx.canonical_client_ip_is_initialized());
+    assert_eq!(
+        ctx.canonical_client_ip().map(|ip| ip.to_string()),
+        Some("192.0.2.44".to_string()),
+        "resetting the public cache must reparse the changed client IP"
+    );
+    ctx.insert_metadata(
+        REQUEST_ID_METADATA_KEY.to_string(),
+        "poisoned-canonical-id".to_string(),
+    );
+    ctx.insert_metadata(
+        "correlation_id.instance.x-internal-request-id".to_string(),
+        "poisoned-internal-id".to_string(),
+    );
+    ctx.insert_metadata(
+        "correlation_id.instance.x-external-request-id".to_string(),
+        "poisoned-external-id".to_string(),
+    );
+    ctx.insert_metadata(
+        "custom.unrelated".to_string(),
+        "survives-cache-reset".to_string(),
+    );
+    let metadata = ctx.take_metadata();
+    assert_eq!(
+        metadata.get(REQUEST_ID_METADATA_KEY),
+        Some(&expected_internal)
+    );
+    assert_eq!(
+        metadata.get("correlation_id.instance.x-internal-request-id"),
+        Some(&expected_internal)
+    );
+    assert_eq!(
+        metadata.get("correlation_id.instance.x-external-request-id"),
+        Some(&expected_external)
+    );
+    assert_eq!(
+        metadata.get("custom.unrelated").map(String::as_str),
+        Some("survives-cache-reset")
+    );
+}
+
+#[tokio::test]
+async fn udp_and_dtls_restore_correlation_after_public_cache_and_metadata_mutation() {
+    let first = make_plugin(
+        "correlation_id",
+        json!({"header_name": "x-internal-request-id"}),
+    )
+    .unwrap();
+    let second = make_plugin(
+        "correlation_id",
+        json!({"header_name": "x-external-request-id"}),
+    )
+    .unwrap();
+    let mut ctx = make_stream_ctx();
+    ctx.insert_metadata(
+        "stream_connect_metadata".to_string(),
+        "connect-value".to_string(),
+    );
+
+    assert!(matches!(
+        first.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let connect_metadata = ctx.metadata.as_ref().expect("metadata allocated");
+    let expected_canonical = connect_metadata
+        .get(REQUEST_ID_METADATA_KEY)
+        .expect("canonical correlation ID")
+        .clone();
+    let expected_internal = connect_metadata
+        .get("correlation_id.instance.x-internal-request-id")
+        .expect("internal instance correlation ID")
+        .clone();
+    let expected_external = connect_metadata
+        .get("correlation_id.instance.x-external-request-id")
+        .expect("external instance correlation ID")
+        .clone();
+
+    assert_eq!(
+        ctx.canonical_client_ip().map(|ip| ip.to_string()),
+        Some("10.1.2.3".to_string())
+    );
+    ctx.client_ip = "198.51.100.23".to_string();
+    ctx.canonical_client_ip = Default::default();
+    assert!(!ctx.canonical_client_ip_is_initialized());
+    assert_eq!(
+        ctx.canonical_client_ip().map(|ip| ip.to_string()),
+        Some("198.51.100.23".to_string()),
+        "UDP/DTLS client-IP cache invalidation must be independent"
+    );
+    ctx.insert_metadata(
+        REQUEST_ID_METADATA_KEY.to_string(),
+        "connect-poisoned-canonical".to_string(),
+    );
+    ctx.insert_metadata(
+        "correlation_id.instance.x-internal-request-id".to_string(),
+        "connect-poisoned-internal".to_string(),
+    );
+    ctx.insert_metadata(
+        "correlation_id.instance.x-external-request-id".to_string(),
+        "connect-poisoned-external".to_string(),
+    );
+    ctx.insert_metadata(
+        "post_connect_metadata".to_string(),
+        "post-connect-value".to_string(),
+    );
+
+    let datagram_metadata = HashMap::from([
+        (
+            REQUEST_ID_METADATA_KEY.to_string(),
+            "datagram-poisoned-canonical".to_string(),
+        ),
+        (
+            "correlation_id.instance.x-internal-request-id".to_string(),
+            "datagram-poisoned-internal".to_string(),
+        ),
+        (
+            "correlation_id.instance.x-external-request-id".to_string(),
+            "datagram-poisoned-external".to_string(),
+        ),
+        (
+            "datagram_metadata".to_string(),
+            "retained-value".to_string(),
+        ),
+    ]);
+    let (udp_metadata, dtls_metadata) =
+        ferrum_edge::_test_support::udp_dtls_disconnect_metadata_after_datagram_metadata_for_test(
+            &mut ctx,
+            datagram_metadata,
+        );
+    let mut udp_summary = make_stream_summary();
+    udp_summary.protocol = "udp".to_string();
+    udp_summary.metadata = udp_metadata;
+    let mut dtls_summary = make_stream_summary();
+    dtls_summary.protocol = "dtls".to_string();
+    dtls_summary.metadata = dtls_metadata;
+
+    for summary in [&udp_summary, &dtls_summary] {
+        assert_eq!(
+            summary.metadata.get(REQUEST_ID_METADATA_KEY),
+            Some(&expected_canonical),
+            "{} summary must restore canonical correlation ownership",
+            summary.protocol
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .get("correlation_id.instance.x-internal-request-id"),
+            Some(&expected_internal),
+            "{} summary must restore the internal instance correlation ID",
+            summary.protocol
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .get("correlation_id.instance.x-external-request-id"),
+            Some(&expected_external),
+            "{} summary must restore the external instance correlation ID",
+            summary.protocol
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .get("stream_connect_metadata")
+                .map(String::as_str),
+            Some("connect-value")
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .get("datagram_metadata")
+                .map(String::as_str),
+            Some("retained-value")
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .get("post_connect_metadata")
+                .map(String::as_str),
+            Some("post-connect-value")
+        );
+    }
+    assert!(
+        ctx.take_metadata().is_empty(),
+        "UDP/DTLS finalization must take authoritative correlation state exactly once"
+    );
+}
+
 // ---- WebSocket-only frame plugins ----
 
 #[test]
@@ -777,7 +989,6 @@ fn test_http_grpc_plugins_complete_coverage() {
     // configs with no policies, so we configure max_messages to satisfy
     // its no-op rejection check.
     let plugins = vec![
-        ("ai_token_metrics", json!({})),
         ("ai_request_guard", json!({"max_messages": 100})),
         ("ai_rate_limiter", json!({"token_limit": 1000})),
         ("ai_prompt_shield", json!({})),
@@ -814,6 +1025,7 @@ fn test_http_only_plugins_complete_coverage() {
     let plugins = vec![
         ("response_caching", json!({"ttl_seconds": 60})),
         ("graphql", json!({"max_depth": 100})),
+        ("ai_token_metrics", json!({})),
         (
             "ai_semantic_firewall",
             json!({

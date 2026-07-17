@@ -22,7 +22,10 @@ checks then pass through the request/header phases in strict order. Buffered
 responses run the body phases before logging; streamed non-buffered responses
 skip the buffered body phases and run a terminal stream hook before logging.
 WebSocket connections optionally enter a frame phase after the HTTP upgrade
-completes. Plugins only run in the phases they implement:
+completes. Successful H1/H2/H3 WebSocket handshakes run a synchronous,
+non-rejecting response-header decoration boundary in configured priority order
+before transport-owned handshake fields are restored. Plugins only run in the
+phases they implement:
 
 ```
 Request In
@@ -239,7 +242,7 @@ Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_va
 
 `waf` request metadata inspection (path, query, headers, cookies, and method) runs in the `authorize` phase at priority 2930, after authentication and earlier authorization plugins such as `access_control`, `mesh_authz`, `opa`, and consumer-aware `rate_limiting`. Authenticated proxies that reject during auth/authz therefore avoid WAF scan cost, while public/no-auth proxies still run WAF before backend dispatch. WAF request-body inspection remains on the final backend-visible request body.
 
-**Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS and UDP+DTLS listeners it runs after the frontend TLS/DTLS handshake and before the backend connection/session is opened, so plugins can inspect the client certificate without spending upstream capacity first. Frontend TLS/DTLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection/session immediately and do not dial the backend. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`. Built-in admission plugins can instead attach opaque connection permits; TCP runners release all permits in reverse order immediately when a later plugin rejects, and normal connection teardown releases any remaining permits exactly once.
+**Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS and UDP+DTLS listeners it runs after the frontend TLS/DTLS handshake and before the backend connection/session is opened, so plugins can inspect the client certificate without spending upstream capacity first. Frontend TLS/DTLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection/session immediately and do not dial the backend. Plugins can also insert metadata (e.g., trace IDs) into `ctx.metadata`, which is carried through to `on_stream_disconnect`. Built-in correlation IDs remain in private lifecycle state and are authoritatively projected into terminal metadata after plugin-writable merges. Built-in admission plugins can instead attach opaque connection permits; TCP runners release all permits in reverse order immediately when a later plugin rejects, and normal connection teardown releases any remaining permits exactly once.
 
 **Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or a UDP/DTLS session expires, is cleaned up, or otherwise ends). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
 
@@ -284,6 +287,15 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 ## WebSocket Frame Lifecycle (`on_ws_frame`)
 
 WebSocket connections go through the normal HTTP plugin pipeline during the upgrade handshake — authentication, authorization, rate limiting, and all other HTTP phases execute before the connection is upgraded. Once the WebSocket upgrade completes, parser policies and message-level hooks kick in.
+
+Successful upgrade responses do not run the general asynchronous `after_proxy`
+chain. They run the ordered `apply_websocket_handshake_response_headers`
+boundary instead, with status 101 for H1 and 200 for H2/H3. The hook cannot
+reject or perform I/O after the backend has accepted the session. Ferrum then
+strips connection/framing/WebSocket transport fields, adds the authoritative
+H1 Upgrade fields or Extended CONNECT response, preserves the verified backend
+subprotocol, and appends any gateway-owned sticky cookie. `correlation_id`
+uses this boundary to echo generated and preserved IDs consistently.
 
 Plugins that opt into `on_ws_disconnect` receive exactly one terminal callback
 after both relay directions finish, including clean closes, typed errors, drain
@@ -433,7 +445,7 @@ Given all built-in plugins enabled, the execution order is:
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
 | 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect |
-| 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, on_stream_connect |
+| 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 3 | `cors` | 100 | on_request_received, after_proxy |
 | 4 | `request_termination` | 125 | on_request_received |
 | 5 | `mesh_outbound_registry` | 130 | on_request_received |
@@ -600,8 +612,8 @@ The AI plugins are ordered to compose correctly:
 6. **`ai_semantic_cache` (2980)** runs after guardrails but before provider routing, so exact and semantic cache hits observe the accepted backend-visible prompt and can short-circuit before outbound provider dispatch.
 7. **`ai_stream_router` (2984)** claims streaming OpenAI Chat Completions requests (`"stream": true`) before non-streaming federation. It rewrites the route for provider-native streaming and normalizes provider SSE where needed without full-response buffering.
 8. **`ai_prompt_compressor` (4055)** runs after the guard, semantic cache, and `compression` request decompression. It boundedly shortens prompt text only for admitted OpenAI Chat/Text Completions representations (`messages[].content` for configured roles, plus legacy `prompt`). In `auto`, standard operation paths and body shapes must agree; the original incoming classification path is kept in one private per-request snapshot so a later routing rewrite cannot change eligibility, while fixed-family config is the explicit custom-path opt-in. Its request-time buffering gate stages plaintext `ctx.metadata["request_body"]` rewrites for compatible direct dispatch, privately reuses transformed bodies of at most 65,536 bytes when the wire source is unchanged, and otherwise recomputes against the final pre-compressor wire representation (including opt-in decompression) under the same work budget. Larger prompts therefore retain no second transformed-body copy across provider latency. Final wire counters replace provisional counters and remain instance-scoped before aggregation. Matching-backtick code, URLs, Unicode numbers, common identifiers, nested preserve text, and negations survive; successful changes intentionally reserialize the complete JSON body. Configured preserve markers use a separate non-queuing bounded sanitation lane and representation-preserving fallback when statistical work is saturated/over budget or output would overflow; the context-aware final hook rejects decoded bodies that exceed the hard sanitation bound or cannot enter the sanitation lane. Federation consumes the same final transformed body.
-9. **`ai_federation` (4060)** is HTTP-only and handles non-streaming provider routing from the final request body, after all request transforms and final request validators. It translates OpenAI-format requests to the matched provider, normalizes bounded non-streaming responses, and returns via `RejectBinary` before backend egress/admission/transport. Matched requests with `"stream": true` are rejected with `501` unless `ai_stream_router` already claimed the request via `ai_stream_router_claimed=true`. Successful synthetic federation responses pass through the response-side body hooks before the client receives them, including `ai_semantic_firewall`, `ai_response_guard`, response transforms, final-response hooks, and committed observers when configured. `ai_token_metrics` is the deliberate exception: it skips synthetic short-circuit bodies, so `ai_federation` writes token metadata directly into `ctx.metadata`.
-10. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses the LLM response body to extract token usage (prompt, completion, total, model) and writes it to `ctx.metadata`. This metadata flows into `TransactionSummary` for all downstream logging plugins. It is observability-only and never enforces budget policy. When `ai_federation` is active, `ai_federation` writes the same metadata keys directly (so accounting is correct even if the synthetic-body hooks are skipped), and `ai_rate_limiter` reconciles usage from that metadata on the rejection path.
+9. **`ai_federation` (4060)** is HTTP-only and handles non-streaming provider routing from the final request body, after all request transforms and final request validators. It translates OpenAI-format requests to the matched provider, normalizes bounded non-streaming responses, and returns via `RejectBinary` before backend egress/admission/transport. Matched requests with `"stream": true` are rejected with `501` unless `ai_stream_router` already claimed the request via `ai_stream_router_claimed=true`. Successful synthetic federation responses pass through the response-side body hooks before the client receives them, including `ai_semantic_firewall`, `ai_response_guard`, response transforms, final-response hooks, and committed observers when configured. `ai_token_metrics` is the deliberate exception: it skips synthetic short-circuit bodies, so `ai_federation` writes token metadata and a trusted typed usage snapshot directly.
+10. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses supported HTTP JSON/SSE provider usage (prompt, completion, total, model) and writes it to `ctx.metadata`. Native gRPC protobuf messages are explicitly unsupported because no generic method/schema contract exists. Provider normalization runs before inspection; origin `gzip`/`br` coding chains are decoded only into a bounded inspection copy, leaving the encoded client response and headers unchanged. Public metadata flows into `TransactionSummary` for downstream logging, while bounded-label `prometheus_metrics` token/cost counters consume a separate typed usage snapshot that backend/operator metadata cannot mint. When several token-metrics instances publish different prefixes, Prometheus selects one most-complete token snapshot and at most one independently selected trusted cost per request instead of summing duplicates. It is observability-only and never enforces budget policy. When `ai_federation` is active, `ai_federation` publishes the same authoritative usage representation directly, and `ai_rate_limiter` reconciles usage from the public metadata on the rejection path.
 11. **`ai_rate_limiter` (4200)** reserves estimated token usage before proxying JSON `POST` requests, based on output-token caps plus estimated prompt tokens. It runs after `ai_token_metrics` on the response body path, reconciles the reservation to actual usage when usage metadata is available, and keeps/rejects/releases unmetered 2xx responses according to `on_unmetered_response`. Synthetic short-circuit bodies (cache/dedup/mock/etc.) are never charged or released — the limiter exempts them via the internal `ferrum:synthetic_short_circuit` marker. When `ai_federation` is active, the rate limiter uses `applies_after_proxy_on_reject()` to reconcile token usage from federation metadata on the rejection path (the sole federation charger, scoped per limiter instance).
 
 ### Streaming AI: ai_stream_router (2984) claims `stream: true`, ai_federation (4060) owns the rest
@@ -631,7 +643,7 @@ Request transformers run after authentication and authorization, so they only mo
 
 ### Compression runs after response transformation (4050)
 
-The `compression` plugin runs at priority 4050 — after `response_transformer` (4000) so it compresses the final transformed response body, before `ai_prompt_compressor` (4055) so opt-in request decompression exposes plaintext prompt JSON before prompt compression, and before `ai_token_metrics` (4100) and `ai_rate_limiter` (4200) so AI plugins see the uncompressed body. In `before_proxy`, it optionally strips `Accept-Encoding` from the backend request so the backend sends uncompressed responses for the gateway to compress. Response body buffering is required when this plugin is enabled.
+The `compression` plugin runs at priority 4050 — after `response_transformer` (4000) so it compresses the final transformed response body, before `ai_prompt_compressor` (4055) so opt-in request decompression exposes plaintext prompt JSON before prompt compression, and before `ai_token_metrics` (4100) and `ai_rate_limiter` (4200). Gateway-owned compression therefore presents normalized bytes to the later AI hooks. If an origin nevertheless returns an encoded JSON/SSE body, `ai_token_metrics` performs its own bounded inspection-only decoding without normalizing the client-visible bytes or headers. In `before_proxy`, compression can strip `Accept-Encoding` from the backend request so the backend sends uncompressed responses for the gateway to compress. Response body buffering is required when this plugin is enabled.
 
 ### Logging runs last (9000+)
 
@@ -812,7 +824,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `mcp_gateway` | ✓ | ✓ | | | | Parses MCP JSON-RPC, emits `mcp.*` metadata, routes namespaced MCP tools/resources/prompts, and reverse-maps routed JSON results |
 | `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
-| `ai_token_metrics` | ✓ | ✓ | | | | Parses JSON response bodies for token usage |
+| `ai_token_metrics` | ✓ | | | | | HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract |
 | `ai_rate_limiter` | ✓ | ✓ | | | | Parses JSON response bodies for token counts |
 | `ws_message_size_limiting` | | | ✓ | | | Enforces actual-frame and bounded-reassembly limits on WebSocket connections |
 | `ws_rate_limiting` | | | ✓ | | | Per-connection frame rate limiting for WebSocket |

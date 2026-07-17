@@ -39,6 +39,7 @@ const DEFAULT_ALLOWED_HEADERS: &[&str] = &[
     "Origin",
     "X-Requested-With",
 ];
+const ACCESS_CONTROL_HEADER_PREFIX: &[u8] = b"access-control-";
 
 pub(crate) const CORS_FINALIZER_NAME: &str = "__cors_finalizer";
 
@@ -219,7 +220,11 @@ pub struct CorsPlugin {
 
 impl CorsPlugin {
     fn remove_access_control_headers(response_headers: &mut HashMap<String, String>) {
-        response_headers.retain(|k, _| !k.to_ascii_lowercase().starts_with("access-control-"));
+        response_headers.retain(|key, _| {
+            !key.as_bytes()
+                .get(..ACCESS_CONTROL_HEADER_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(ACCESS_CONTROL_HEADER_PREFIX))
+        });
     }
 
     pub fn new(config: &Value) -> Result<Self, String> {
@@ -603,6 +608,10 @@ impl Plugin for CorsPlugin {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        // Record policy ownership before checking Origin. A participating
+        // translated Istio policy owns every Access-Control-* response field
+        // even when Origin is absent, preventing a shared-cache replay from
+        // widening the gateway policy.
         if self.unmatched_preflights == UnmatchedPreflights::Reject {
             ctx.cors_state.native_policy_seen = true;
         } else {
@@ -624,9 +633,10 @@ impl Plugin for CorsPlugin {
         if !is_preflight {
             if !origin_allowed {
                 ctx.cors_state.response_allowed = false;
-                // Istio/Envoy forwards unmatched actual requests and leaves
-                // them without CORS response fields. Native direct-plugin
-                // policy retains its historical fail-closed 403.
+                // Istio/Envoy forwards unmatched actual requests. Ferrum
+                // preserves the upstream status/body but removes upstream
+                // CORS authorization fields. Native direct-plugin policy
+                // retains its historical fail-closed 403.
                 if self.unmatched_preflights != UnmatchedPreflights::Reject {
                     return self.maybe_finalize_request(ctx);
                 }
@@ -887,13 +897,18 @@ fn finalize_cors_response(
         .get(crate::proxy::REJECTION_RESPONSE_METADATA_KEY)
         .is_some_and(|value| value == "true");
 
-    // Native CORS retains its established sanitization of every backend
-    // response. A matching translated Istio policy also owns the response
-    // fields. Pure Istio unmatched/no-Origin forwarding is different: Envoy
-    // leaves the upstream response untouched, so preserve that source
-    // behavior instead of silently taking ownership.
-    let should_sanitize = ctx.cors_state.native_policy_seen || ctx.cors_state.sanitize_response;
-    if should_sanitize && !(is_rejection_path && ctx.cors_state.policy_count == 0) {
+    // A configured gateway CORS policy must remain authoritative even when an
+    // Istio policy forwards an unmatched request. Otherwise a permissive
+    // backend could re-authorize a disallowed origin with its own CORS fields.
+    let should_sanitize = ctx.cors_state.sanitize_response
+        || ctx.cors_state.native_policy_seen
+        || ctx.cors_state.istio_policy_seen;
+    // Synthetic responses belong to translated Istio policy as soon as its
+    // request hook participates, including the no-Origin early return where no
+    // policy is counted. Native no-Origin short-circuits retain direct-plugin
+    // semantics; native requests with an Origin have a counted policy.
+    let policy_owns_rejection = ctx.cors_state.policy_count > 0 || ctx.cors_state.istio_policy_seen;
+    if should_sanitize && (!is_rejection_path || policy_owns_rejection) {
         CorsPlugin::remove_access_control_headers(response_headers);
     }
     if ctx.cors_state.policy_count == 0 || !ctx.cors_state.response_allowed {

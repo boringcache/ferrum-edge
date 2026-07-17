@@ -4759,9 +4759,13 @@ fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClien
             // still carries the configured backend IP policy, so a plugin whose
             // endpoint resolves to a denied literal IP is rejected at the admin
             // boundary instead of being accepted here and rejected later by DPs.
+            // The real-IP header is also safe to resolve from this CP: ConfigSync
+            // rejects every DP that does not advertise the same effective value
+            // before any snapshot can be distributed.
             plugins::PluginHttpClient::default_with_backend_allow_ips(
                 state.backend_allow_ips.clone(),
             )
+            .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
         })
 }
 

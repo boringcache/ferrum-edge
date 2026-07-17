@@ -785,6 +785,7 @@ fn build_plain_request_builder(
     effective_host: &str,
     client_ip: &str,
     xff_append_ip: &str,
+    request_is_secure: bool,
     is_early_data: bool,
 ) -> reqwest::RequestBuilder {
     let mut req_builder = client.request(req_method, backend_url);
@@ -831,8 +832,9 @@ fn build_plain_request_builder(
         xff_append_ip,
         &state.trusted_proxies,
     );
+    let request_scheme = if request_is_secure { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
-    req_builder = req_builder.header("X-Forwarded-Proto", "https");
+    req_builder = req_builder.header("X-Forwarded-Proto", request_scheme);
     if let Some(host) = original_host_header {
         req_builder = req_builder.header("X-Forwarded-Host", host);
     }
@@ -842,7 +844,7 @@ fn build_plain_request_builder(
     if state.add_forwarded_header {
         req_builder = req_builder.header(
             "Forwarded",
-            crate::proxy::build_forwarded_value(client_ip, "https", original_host_header),
+            crate::proxy::build_forwarded_value(client_ip, request_scheme, original_host_header),
         );
     }
     // RFC 8470 §5.2: signal to the origin that this request was carried
@@ -1708,6 +1710,7 @@ where
                             effective_host,
                             client_ip,
                             xff_append_ip,
+                            ctx.request_is_secure,
                             ctx.is_early_data,
                         )
                         .body(buffered_body.clone())
@@ -2157,6 +2160,7 @@ where
                     effective_host,
                     client_ip,
                     xff_append_ip,
+                    ctx.request_is_secure,
                     ctx.is_early_data,
                 );
 
@@ -3210,6 +3214,7 @@ fn build_h3_grpc_backend_headers(
     proxy_headers: &HashMap<String, String>,
     client_ip: &str,
     xff_append_ip: &str,
+    request_is_secure: bool,
     is_early_data: bool,
 ) -> HeaderMap {
     let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
@@ -3245,9 +3250,11 @@ fn build_h3_grpc_backend_headers(
     if let Ok(val) = HeaderValue::from_str(&xff_val) {
         hmap.insert("x-forwarded-for", val);
     }
-    // `x-forwarded-proto=https` is identical across H3 requests (H3 is
-    // always TLS) — use `from_static` to skip the header-value parse.
-    hmap.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    let request_scheme = if request_is_secure { "https" } else { "http" };
+    hmap.insert(
+        "x-forwarded-proto",
+        HeaderValue::from_static(request_scheme),
+    );
     if let Some(host) = original_host_header
         && let Ok(val) = HeaderValue::from_str(host)
     {
@@ -3259,7 +3266,8 @@ fn build_h3_grpc_backend_headers(
         hmap.insert(hyper::header::VIA, val);
     }
     if state.add_forwarded_header {
-        let fwd = crate::proxy::build_forwarded_value(client_ip, "https", original_host_header);
+        let fwd =
+            crate::proxy::build_forwarded_value(client_ip, request_scheme, original_host_header);
         if let Ok(val) = HeaderValue::from_str(&fwd) {
             hmap.insert(hyper::header::FORWARDED, val);
         }
@@ -4026,6 +4034,7 @@ where
         proxy_headers,
         client_ip,
         xff_append_ip,
+        ctx.request_is_secure,
         ctx.is_early_data,
     );
 
@@ -5134,6 +5143,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         proxy_headers,
         client_ip,
         xff_append_ip,
+        ctx.request_is_secure,
         ctx.is_early_data,
     );
 
@@ -7171,7 +7181,7 @@ mod tests {
 
     use super::{
         apply_buffered_grpc_plugin_reject, apply_buffered_plain_plugin_reject,
-        apply_h3_grpc_reject_metadata, build_plain_request_builder,
+        apply_h3_grpc_reject_metadata, build_h3_grpc_backend_headers, build_plain_request_builder,
         cross_protocol_header_write_disconnect_outcome, inspected_emitted_response_limit_exceeded,
         normalize_h3_grpc_reject, record_cross_protocol_client_acquire_failure,
         record_cross_protocol_connection_start, reject_body_as_h3_grpc_message,
@@ -8194,6 +8204,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn h3_cross_protocol_forwarding_uses_effective_request_scheme() {
+        let mut state = minimal_proxy_state();
+        state.add_forwarded_header = true;
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+        let headers = HashMap::from([("host".to_string(), "api.example".to_string())]);
+
+        let request = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            "203.0.113.1",
+            /* request_is_secure = */ false,
+            /* is_early_data = */ false,
+        )
+        .build()
+        .expect("request should build");
+        assert_eq!(
+            header_value(&request, "x-forwarded-proto"),
+            Some(&b"http"[..])
+        );
+        assert_eq!(
+            header_value(&request, "forwarded"),
+            Some(&b"for=203.0.113.1;proto=http;host=api.example"[..])
+        );
+
+        let grpc_headers = build_h3_grpc_backend_headers(
+            &state,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            /* request_is_secure = */ false,
+            /* is_early_data = */ false,
+        );
+        assert_eq!(
+            grpc_headers
+                .get("x-forwarded-proto")
+                .map(|value| value.as_bytes()),
+            Some(&b"http"[..])
+        );
+        assert_eq!(
+            grpc_headers.get("forwarded").map(|value| value.as_bytes()),
+            Some(&b"for=203.0.113.1;proto=http;host=api.example"[..])
+        );
+    }
+
+    #[tokio::test]
     async fn build_plain_request_builder_injects_early_data_header_when_zero_rtt() {
         let state = minimal_proxy_state();
         let proxy = minimal_proxy();
@@ -8212,6 +8274,7 @@ mod tests {
             "backend.example",
             "203.0.113.1",
             "203.0.113.1",
+            /* request_is_secure = */ true,
             /* is_early_data = */ true,
         );
 
@@ -8247,6 +8310,7 @@ mod tests {
             "backend.example",
             "203.0.113.1",
             "203.0.113.1",
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -8280,6 +8344,7 @@ mod tests {
             "backend.example",
             "203.0.113.1",
             "203.0.113.1",
+            /* request_is_secure = */ true,
             /* is_early_data = */ true,
         );
 
@@ -8319,6 +8384,7 @@ mod tests {
             "backend.example",
             "203.0.113.1",
             "203.0.113.1",
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -8354,6 +8420,7 @@ mod tests {
             "backend.example",
             "198.51.100.7", // resolved client (already in the chain)
             "10.0.0.7",     // immediate QUIC peer (the LB)
+            true,
             false,
         )
         .build()
@@ -8377,6 +8444,7 @@ mod tests {
             "backend.example",
             "203.0.113.9", // resolved from FERRUM_REAL_IP_HEADER
             "10.0.0.7",    // immediate QUIC peer (the LB)
+            true,
             false,
         )
         .build()
@@ -8398,6 +8466,7 @@ mod tests {
             "backend.example",
             "203.0.113.1",
             "203.0.113.1",
+            true,
             false,
         )
         .build()
