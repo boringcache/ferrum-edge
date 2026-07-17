@@ -72,7 +72,7 @@ struct AiMetadataUsage<'a> {
     cost_microunits: Option<u64>,
 }
 
-impl AiMetadataUsage {
+impl AiMetadataUsage<'_> {
     fn completeness(&self) -> usize {
         usize::from(self.prompt_tokens.is_some())
             + usize::from(self.completion_tokens.is_some())
