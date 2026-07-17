@@ -1062,6 +1062,8 @@ async fn handle_h3_request(
 
     // Build request context (client_ip resolved below after headers are parsed)
     let mut ctx = RequestContext::new(socket_ip.to_owned(), method.clone(), path.clone());
+    let mut request_scheme = "https";
+    ctx.request_is_secure = true;
     ctx.metadata
         .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
     if let Some(content_type) = grpc_web_response_content_type.as_deref() {
@@ -1306,6 +1308,13 @@ async fn handle_h3_request(
     // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
     if !state.trusted_proxies.is_empty() {
         let socket_addr: std::net::IpAddr = remote_addr.ip();
+        if let Some(forwarded_scheme) = crate::proxy::apply_trusted_forwarded_request_scheme(
+            &mut ctx,
+            &socket_addr,
+            &state.trusted_proxies,
+        ) {
+            request_scheme = forwarded_scheme;
+        }
         let real_ip_header_val =
             state
                 .env_config
@@ -1412,7 +1421,7 @@ async fn handle_h3_request(
         None => None,
     };
     let request_authority = raw_host.and_then(|authority| {
-        crate::proxy::normalize_request_authority_for_signing(authority, Some("https"))
+        crate::proxy::normalize_request_authority_for_signing(authority, Some(request_scheme))
     });
     ctx.request_authority = request_authority;
 
@@ -4029,6 +4038,12 @@ async fn handle_h3_request(
         }
 
         let requires_websocket_framing = plugin_cache_view.requires_ws_frame_hooks();
+        crate::proxy::apply_effective_backend_scheme_headers(
+            &mut proxy_headers,
+            &ctx.client_ip,
+            ctx.request_is_secure,
+            state.add_forwarded_header,
+        );
         // Transfer request-side accounting to the H3 WebSocket bridge. The
         // bridge starts its long-lived `ConnectionGuard` before dropping this
         // `RequestGuard`, so backend handshakes stay visible to overload
@@ -4413,6 +4428,7 @@ async fn handle_h3_request(
             error_class: outcome.error_class,
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
         };
         if !outcome.rejection_logged {
             crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -4467,6 +4483,7 @@ async fn handle_h3_request(
             &client_ip_owned,
             socket_ip,
             &state,
+            ctx.request_is_secure,
             ctx.is_early_data,
         );
         let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(&proxy);
@@ -4701,6 +4718,7 @@ async fn handle_h3_request(
                     error_class: Some(h3_error_class),
                     bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
                     metadata: crate::proxy::clone_log_metadata(&ctx),
+                    ai_usage_export: ctx.ai_usage_export.clone(),
                     ..TransactionSummary::default()
                 };
                 crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -4870,6 +4888,7 @@ async fn handle_h3_request(
                 },
                 mirror: false,
                 metadata: crate::proxy::clone_log_metadata(&ctx),
+                ai_usage_export: ctx.ai_usage_export.clone(),
             };
             crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
             record_request(&state, reject.status_code);
@@ -5343,6 +5362,7 @@ async fn handle_h3_request(
             bytes_received: bytes_streamed,
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
         };
 
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -5924,6 +5944,7 @@ async fn handle_h3_request(
             bytes_received: h3_stream_result.bytes_streamed,
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
         };
 
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -5987,6 +6008,7 @@ async fn handle_h3_request(
                         &ctx.client_ip,
                         socket_ip,
                         current_target.as_deref(),
+                        ctx.request_is_secure,
                         ctx.is_early_data,
                     )
                     .await
@@ -6176,6 +6198,7 @@ async fn handle_h3_request(
                     &ctx.client_ip,
                     socket_ip,
                     current_target.as_deref(),
+                    ctx.request_is_secure,
                     ctx.is_early_data,
                 )
                 .await;
@@ -6214,6 +6237,7 @@ async fn handle_h3_request(
                 &ctx.client_ip,
                 socket_ip,
                 upstream_target.as_deref(),
+                ctx.request_is_secure,
                 ctx.is_early_data,
             )
             .await;
@@ -6662,6 +6686,7 @@ async fn handle_h3_request(
             bytes_sent: raw_request_body_bytes,
             bytes_received,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
             ..TransactionSummary::default()
         };
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -7019,6 +7044,7 @@ fn build_h3_backend_url_for_flavor(
 /// backends reject and that breaks virtual-host routing on the upstream.
 /// Falls back to `proxy.backend_host` only when no upstream selection is
 /// available (single-target proxies).
+#[allow(clippy::too_many_arguments)]
 fn build_h3_backend_headers(
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
@@ -7026,6 +7052,7 @@ fn build_h3_backend_headers(
     client_ip: &str,
     xff_append_ip: &str,
     state: &ProxyState,
+    request_is_secure: bool,
     is_early_data: bool,
 ) -> Vec<(http::header::HeaderName, http::header::HeaderValue)> {
     let mut h3_headers = Vec::with_capacity(headers.len() + 5);
@@ -7106,10 +7133,12 @@ fn build_h3_backend_headers(
         ));
     }
 
+    let request_scheme = if request_is_secure { "https" } else { "http" };
+
     // X-Forwarded-Proto
     h3_headers.push((
         http::header::HeaderName::from_static("x-forwarded-proto"),
-        http::header::HeaderValue::from_static("https"),
+        http::header::HeaderValue::from_static(request_scheme),
     ));
 
     // X-Forwarded-Host
@@ -7135,7 +7164,7 @@ fn build_h3_backend_headers(
             .get("host")
             .or_else(|| headers.get(":authority"))
             .map(|s| s.as_str());
-        let fwd = crate::proxy::build_forwarded_value(client_ip, "https", host);
+        let fwd = crate::proxy::build_forwarded_value(client_ip, request_scheme, host);
         if let Ok(val) = http::header::HeaderValue::from_str(&fwd) {
             h3_headers.push((http::header::HeaderName::from_static("forwarded"), val));
         }
@@ -7445,6 +7474,7 @@ async fn proxy_to_backend_h3_refined_response(
         client_ip,
         xff_append_ip,
         state,
+        ctx.request_is_secure,
         is_early_data,
     );
     let body = Bytes::from(body_bytes);
@@ -8233,6 +8263,7 @@ async fn dispatch_grpc_native_h3(
         client_ip,
         xff_append_ip,
         state,
+        ctx.request_is_secure,
         is_early_data,
     );
     // Re-add `te: trailers`. `build_h3_backend_headers` strips `te` as a
@@ -9605,6 +9636,7 @@ async fn log_h3_grpc_transaction(
         error_class,
         mirror: false,
         metadata: crate::proxy::clone_log_metadata(ctx),
+        ai_usage_export: ctx.ai_usage_export.clone(),
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
 }
@@ -9643,6 +9675,7 @@ async fn proxy_to_backend_h3_streaming(
         client_ip,
         xff_append_ip,
         state,
+        ctx.request_is_secure,
         ctx.is_early_data,
     );
     let body = bytes::Bytes::from(body_bytes);
@@ -10125,6 +10158,7 @@ async fn proxy_to_backend_h3(
     client_ip: &str,
     xff_append_ip: &str,
     upstream_target: Option<&UpstreamTarget>,
+    request_is_secure: bool,
     is_early_data: bool,
 ) -> H3BufferedDispatchResult {
     let h3_headers = build_h3_backend_headers(
@@ -10134,6 +10168,7 @@ async fn proxy_to_backend_h3(
         client_ip,
         xff_append_ip,
         state,
+        request_is_secure,
         is_early_data,
     );
     let body = bytes::Bytes::copy_from_slice(body_bytes);
@@ -12279,6 +12314,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -12287,10 +12323,26 @@ mod build_h3_backend_headers_tests {
             Some(&b"https"[..]),
             "X-Forwarded-Proto must carry the URI scheme, not the H3 ALPN token"
         );
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &state,
+            /* request_is_secure = */ false,
+            /* is_early_data = */ false,
+        );
+        assert_eq!(
+            header_value(&out, "x-forwarded-proto").map(|v| v.as_bytes()),
+            Some(&b"http"[..]),
+            "a trusted original HTTP scheme must override the H3 transport scheme"
+        );
     }
 
     #[tokio::test]
-    async fn native_h3_forwarded_header_uses_https_scheme() {
+    async fn native_h3_forwarded_header_uses_effective_request_scheme() {
         let mut state = minimal_proxy_state();
         state.add_forwarded_header = true;
         let proxy = minimal_proxy();
@@ -12304,6 +12356,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -12311,6 +12364,22 @@ mod build_h3_backend_headers_tests {
             header_value(&out, "forwarded").and_then(|v| v.to_str().ok()),
             Some("for=203.0.113.1;proto=https;host=api.example"),
             "Forwarded proto must be the URI scheme, not the H3 ALPN token"
+        );
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &state,
+            /* request_is_secure = */ false,
+            /* is_early_data = */ false,
+        );
+        assert_eq!(
+            header_value(&out, "forwarded").and_then(|v| v.to_str().ok()),
+            Some("for=203.0.113.1;proto=http;host=api.example"),
+            "Forwarded must carry a trusted original HTTP scheme"
         );
     }
 
@@ -12328,6 +12397,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ true,
         );
 
@@ -12356,6 +12426,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -12382,6 +12453,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ true,
         );
 
@@ -12418,6 +12490,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -12447,6 +12520,7 @@ mod build_h3_backend_headers_tests {
             "198.51.100.7", // resolved client (already in the chain)
             "10.0.0.7",     // immediate QUIC peer (the LB)
             &state,
+            true,
             false,
         );
         assert_eq!(
@@ -12465,6 +12539,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.9", // resolved from FERRUM_REAL_IP_HEADER
             "10.0.0.7",    // immediate QUIC peer (the LB)
             &state,
+            true,
             false,
         );
         assert_eq!(
@@ -12481,6 +12556,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            true,
             false,
         );
         assert_eq!(

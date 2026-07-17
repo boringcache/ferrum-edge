@@ -1449,28 +1449,16 @@ async fn condition_not_values_on_jwt_claim_allows_absent_attribute() {
 /// running the `on_stream_connect` chain (mesh-inbound direction, the captured
 /// APP port as the authorization destination).
 fn inbound_stream_ctx(listen_port: u16, peer_spiffe: &str) -> StreamConnectionContext {
-    let mut ctx = StreamConnectionContext {
-        client_ip: "10.0.0.7".to_string(),
-        direct_client_ip: "10.0.0.7".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "__mesh-in-tcp-relay-default-redis-6379".to_string(),
-        proxy_name: Some("mesh raw-tcp inbound".to_string()),
+    let mut ctx = StreamConnectionContext::new(
+        "10.0.0.7".to_string(),
+        "10.0.0.7".to_string(),
+        "__mesh-in-tcp-relay-default-redis-6379".to_string(),
+        Some("mesh raw-tcp inbound".to_string()),
         listen_port,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ConsumerIndex::new(&[] as &[Consumer])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: Some(MeshTrafficDirection::Inbound),
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+        BackendScheme::Tcp,
+        Arc::new(ConsumerIndex::new(&[] as &[Consumer])),
+    );
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
     // `mesh_authz`'s stream path reads the source principal from the
     // `peer_spiffe_id` metadata key (parity with the HBONE/HTTP path).
     ctx.insert_metadata("peer_spiffe_id".to_string(), peer_spiffe.to_string());
