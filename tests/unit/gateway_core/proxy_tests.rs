@@ -1,7 +1,6 @@
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    apply_effective_backend_scheme_headers_for_test,
-    collect_forwardable_websocket_headers_for_test,
+    apply_effective_backend_scheme_headers_for_test, collect_forwardable_websocket_headers_for_test,
 };
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, UpstreamTarget,
@@ -2673,9 +2672,7 @@ async fn test_trusted_forwarded_http_overrides_tls_cookie_and_authority_scope() 
         true,
     );
     assert_eq!(
-        backend_headers
-            .get("x-forwarded-proto")
-            .map(String::as_str),
+        backend_headers.get("x-forwarded-proto").map(String::as_str),
         Some("http")
     );
     assert_eq!(
@@ -2752,12 +2749,7 @@ fn test_effective_scheme_headers_remove_case_variants_for_websocket_and_grpc_col
         ("Forwarded".to_string(), "for=plugin".to_string()),
         ("fOrWaRdEd".to_string(), "for=stale".to_string()),
     ]);
-    apply_effective_backend_scheme_headers_for_test(
-        &mut proxy_headers,
-        "203.0.113.8",
-        true,
-        true,
-    );
+    apply_effective_backend_scheme_headers_for_test(&mut proxy_headers, "203.0.113.8", true, true);
 
     assert_eq!(
         proxy_headers
@@ -2793,10 +2785,7 @@ fn test_effective_scheme_headers_remove_case_variants_for_websocket_and_grpc_col
         collect_forwardable_websocket_headers_for_test(&raw_headers, &proxy_headers);
     for (name, expected) in [
         ("x-forwarded-proto", "https"),
-        (
-            "forwarded",
-            "for=203.0.113.8;proto=https;host=api.example",
-        ),
+        ("forwarded", "for=203.0.113.8;proto=https;host=api.example"),
     ] {
         let matching: Vec<&str> = websocket_headers
             .iter()
