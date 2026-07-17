@@ -983,6 +983,101 @@ async fn preserve_marker_cleanup_never_rewrites_json_member_names() {
 
 #[tokio::test]
 #[serial(ai_prompt_compressor_budget)]
+async fn preserve_marker_cleanup_preserves_member_name_bytes_across_json_shapes() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let raw = br#"{
+  "messages" : [{"role":"user","content":"say \"<keep>short</keep>\\done"}],
+  "tool<keep>s" : {
+    "quote\"<keep>key" : "<keep>one</keep>",
+    "slash\\<keep>key": "\u003ckeep\u003etwo\u003c\/keep\u003e",
+    "\u006bey\u003ckeep\u003e": [
+      {"nested<keep>" : "<keep>three</keep>"},
+      "<keep>array</keep>"
+    ]
+  },
+  "dup<keep>" : "first<keep>value</keep>",
+  "dup<keep>" : "second</keep>"
+}"#;
+    let output = plugin
+        .transform_request_body(raw, Some("application/json"), &json_headers())
+        .await
+        .expect("every JSON string value must be sanitized");
+
+    assert_eq!(
+        output,
+        br#"{
+  "messages" : [{"role":"user","content":"say \"short\\done"}],
+  "tool<keep>s" : {
+    "quote\"<keep>key" : "one",
+    "slash\\<keep>key": "two",
+    "\u006bey\u003ckeep\u003e": [
+      {"nested<keep>" : "three"},
+      "array"
+    ]
+  },
+  "dup<keep>" : "firstvalue",
+  "dup<keep>" : "second"
+}"#,
+        "keys, duplicate members, escapes, whitespace, and nesting must remain byte-exact"
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn preserve_markers_in_member_names_alone_do_not_trigger_a_rewrite() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let raw = br#"{"messages":[{"role":"user","content":"plain"}],"only<keep>key":1,"\u003ckeep\u003e":2}"#;
+
+    assert!(
+        plugin
+            .transform_request_body(raw, Some("application/json"), &json_headers())
+            .await
+            .is_none(),
+        "markers confined to member names must leave the original representation untouched"
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn malformed_or_truncated_json_never_reaches_member_name_sanitation() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let malformed: &[&[u8]] = &[
+        br#"{"messages":[{"role":"user","content":"<keep>value</keep>"}],"unterminated<keep>:"#,
+        br#"{"messages":[{"role":"user","content":"<keep>value</keep>"}],"escape\<keep>":"x"}"#,
+        br#"{"messages":[{"role":"user","content":"<keep>value</keep>"}],"unicode\u003":"x"}"#,
+        br#"{"messages":[{"role":"user","content":"<keep>value</keep>"}],"key":"unterminated<keep>}"#,
+        br#"{"messages":[{"role":"user","content":"<keep>value</keep>"}]"#,
+    ];
+
+    for raw in malformed {
+        assert!(
+            plugin
+                .transform_request_body(raw, Some("application/json"), &json_headers())
+                .await
+                .is_none(),
+            "malformed input must remain an unchanged passthrough: {:?}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn exponent_growth_within_hard_output_cap_keeps_successful_compression() {
     let plugin = compressor(5, 0.5);
     let padding = std::iter::repeat_n("1e8", 10_000)

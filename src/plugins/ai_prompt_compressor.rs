@@ -21,8 +21,8 @@
 //! ratio is met. Hard body/text/token/field/output and concurrent-work budgets
 //! bound the algorithm; it uses no model files or network calls. When a
 //! `preserve_tag` is configured, a separate bounded sanitation lane removes
-//! markers from admitted JSON even when statistical work is over budget or
-//! saturated.
+//! markers from admitted JSON string values even when statistical work is over
+//! budget or saturated. Object member names are never sanitized.
 //!
 //! The transformation is intentionally lossy (extractive compression removes
 //! filler words), so it only runs on roles the operator opts into and only on
@@ -36,7 +36,7 @@
 //! value. Non-target decoded values are semantically retained, but lexical
 //! whitespace, escapes, duplicate members, numeric spelling, and member-byte
 //! order are not preserved. Marker-only bounded fallbacks instead preserve
-//! every unrelated source byte.
+//! every unrelated source byte, including member names.
 //!
 //! # Request flow
 //!
@@ -57,7 +57,8 @@
 //!   path captured before routing can rewrite the backend path.
 //! * `on_final_request_body_with_context` fails closed if a decoded body exceeds
 //!   the immutable sanitation bound or the bounded sanitation worker cannot
-//!   complete. This keeps configured preserve markers off the provider wire.
+//!   complete. This keeps configured preserve markers in string values off the
+//!   provider wire without changing the request schema.
 //!   Compression is gated to POST requests: the context-aware variant checks
 //!   `ctx.method` (H1/H2 and the H3 cross-protocol bridge), and the no-context
 //!   compatibility variant requires explicit `:method` and `:path` pseudo-
@@ -1086,11 +1087,21 @@ fn strip_markers_from_json_strings(body: &[u8], tags: &(String, String)) -> Opti
 }
 
 fn json_string_end(body: &[u8], mut cursor: usize) -> Option<usize> {
+    // Each call advances monotonically to one string boundary, and the caller
+    // then advances past that string. Value contents are scanned once more for
+    // marker matches whose length is bounded by MAX_PRESERVE_TAG_NAME_BYTES
+    // plus fixed delimiters, so the complete sanitation pass remains linear in
+    // the bounded input size.
     while cursor < body.len() {
         if body[cursor] == b'"' {
             return Some(cursor);
         }
-        cursor = json_string_scalar_end(body, cursor)?;
+        // Validate escapes while locating the boundary even though callers
+        // already require a successfully parsed JSON representation. This
+        // keeps the lexical helper fail-closed on malformed or truncated input
+        // and prevents an invalid escape from being accepted as part of a key.
+        let (_, end) = decode_json_string_ascii(body, cursor)?;
+        cursor = end;
     }
     None
 }
