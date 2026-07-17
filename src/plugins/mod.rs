@@ -818,6 +818,14 @@ pub struct RequestContext {
     /// non-default port is retained. HTTP frontends populate this after
     /// Host/`:authority` validation and before authentication.
     pub request_authority: Option<String>,
+    /// Whether the browser-facing request used a cryptographic transport.
+    /// HTTP/1.1, HTTP/2, and HTTP/3 initialize this from the accepted frontend
+    /// transport, then a direct peer in `FERRUM_TRUSTED_PROXIES` may override it
+    /// with a valid singleton overwrite or XFF-correlated appended
+    /// `X-Forwarded-Proto: http` or `https` value. Cookie storage checks combine
+    /// this with `request_authority` because browsers also trust HTTP localhost
+    /// and loopback origins.
+    pub request_is_secure: bool,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
     /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
@@ -1297,6 +1305,7 @@ impl RequestContext {
             method,
             path,
             request_authority: None,
+            request_is_secure: false,
             frontend_listen_port: None,
             frontend_sni_hostname: None,
             lb_generation: 1,
@@ -1607,6 +1616,7 @@ impl RequestContext {
             method: self.method.clone(),
             path: self.path.clone(),
             request_authority: self.request_authority.clone(),
+            request_is_secure: self.request_is_secure,
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             lb_generation: self.lb_generation,
@@ -2120,6 +2130,20 @@ impl RequestContext {
             .iter()
             .flat_map(move |headers| headers.get_all(name).iter())
             .filter_map(|value| value.to_str().ok())
+    }
+
+    /// Iterate every raw field-line value as bytes, including values that are
+    /// not valid UTF-8. Security decisions that depend on the final field line
+    /// must use this instead of silently skipping an unparseable value.
+    #[inline]
+    pub fn raw_header_value_bytes<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a [u8]> + 'a {
+        self.raw_headers
+            .iter()
+            .flat_map(move |headers| headers.get_all(name).iter())
+            .map(|value| value.as_bytes())
     }
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,

@@ -1,10 +1,11 @@
-# Client IP Resolution
+# Client IP And Original Scheme Resolution
 
-When Ferrum Edge sits behind load balancers, CDNs, or reverse proxies, the TCP socket address is the proxy's IP -- not the real client's. This guide explains how to configure the gateway to accurately and securely resolve the originating client IP.
+When Ferrum Edge sits behind load balancers, CDNs, or reverse proxies, the TCP socket address and transport scheme describe the nearest proxy hop rather than necessarily describing the browser-facing request. This guide explains how to configure the gateway to resolve the originating client IP and original HTTP-family scheme accurately and securely.
 
 ## Table of Contents
 
 - [How It Works](#how-it-works)
+- [Original Request Scheme](#original-request-scheme)
 - [Configuration](#configuration)
 - [Security Model](#security-model)
 - [Deployment Examples](#deployment-examples)
@@ -34,11 +35,21 @@ X-Forwarded-For: 1.1.1.1, <real-client-ip>
 
 Only the **rightmost** entries -- those appended by your own infrastructure -- are trustworthy. Walking right-to-left and skipping known proxies ensures you find the first IP that wasn't added by your own infrastructure.
 
+## Original Request Scheme
+
+Ferrum also accepts an original browser-facing `http` or `https` scheme from `X-Forwarded-Proto`, but only when the direct peer is in `FERRUM_TRUSTED_PROXIES`:
+
+- A singleton value is an overwrite-only assertion from the direct trusted proxy.
+- A comma-separated or multi-field value is a safely appended chain. Ferrum accepts it only when its entry count matches `X-Forwarded-For`, validates the trusted XFF suffix, and selects the scheme aligned with the first untrusted XFF entry. This chooses the browser-facing value rather than the scheme of the hop nearest Ferrum.
+- A missing, malformed, unrecognized, or misaligned chain is ignored, preserving the scheme of Ferrum's accepted frontend transport.
+
+For example, `X-Forwarded-For: 203.0.113.50, 172.16.1.1` and `X-Forwarded-Proto: http, https` received from trusted `10.0.0.1` resolve to original scheme `http`: the rightmost `https` describes the CDN-to-LB hop, not the browser request. The accepted original scheme drives authentication URLs, secure-cookie ownership, request-authority default-port normalization, and the canonical `X-Forwarded-Proto` and RFC 7239 `Forwarded` metadata regenerated for backends.
+
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `FERRUM_TRUSTED_PROXIES` | *(empty)* | Comma-separated list of trusted proxy CIDRs and/or IPs |
+| `FERRUM_TRUSTED_PROXIES` | *(empty)* | Comma-separated trusted proxy CIDRs/IPs for client IP and original-scheme resolution |
 | `FERRUM_REAL_IP_HEADER` | *(none)* | Optional authoritative header name for client IP |
 
 ### `FERRUM_TRUSTED_PROXIES`
@@ -56,7 +67,7 @@ FERRUM_TRUSTED_PROXIES="10.0.1.50,10.0.1.51"
 FERRUM_TRUSTED_PROXIES="10.0.0.0/8,fd00::/8,::1"
 ```
 
-**When this is empty (default)**, the `X-Forwarded-For` header is completely ignored and the TCP socket IP is always used. This is the secure default for edge deployments where the gateway faces the internet directly.
+**When this is empty (default)**, `X-Forwarded-For` and `X-Forwarded-Proto` are ignored. The TCP socket IP and Ferrum's accepted frontend transport remain authoritative. This is the secure default for edge deployments where the gateway faces the internet directly.
 
 ### `FERRUM_REAL_IP_HEADER`
 
@@ -92,6 +103,8 @@ The client IP resolution follows these security principles:
 
 4. **Authoritative header gated on trust**: The `FERRUM_REAL_IP_HEADER` is only honored when the connection comes from a trusted proxy. If the configured header is present but rejected, the socket IP remains the source of truth.
 
+5. **Forwarded scheme is correlated or overwritten**: A trusted proxy may overwrite `X-Forwarded-Proto` with one original value. If proxies append values, the scheme list must align with the validated XFF chain; Ferrum rejects malformed or misaligned chains instead of guessing from the nearest hop.
+
 ### Attack Scenarios Handled
 
 | Scenario | Behavior |
@@ -103,6 +116,9 @@ The client IP resolution follows these security principles:
 | Trusted proxy sends empty, malformed, or comma-separated real-IP header | Socket IP used |
 | All XFF entries are trusted proxy IPs | Falls back to socket IP |
 | XFF contains unparseable garbage entries | Stops at the first unparseable entry (conservative) |
+| Trusted proxy overwrites XFP with one `http` or `https` value | Value becomes the original request scheme |
+| Trusted proxies append aligned XFF `client, proxy` and XFP `http, https` | Original scheme resolves to `http` at the client boundary |
+| Appended XFP is malformed or does not align with XFF | Forwarded scheme ignored; accepted frontend transport scheme retained |
 
 ## Deployment Examples
 
