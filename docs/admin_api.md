@@ -777,6 +777,12 @@ Deletes the spec and cascades:
 - If the cascade would leave an invalid aggregate plugin graph, the API returns
   422 with validation failures and no resources are deleted. Direct proxy or
   plugin-config deletion reports the equivalent precondition failure as 400.
+- If namespace admission is lost after the delete commits, SQL backends and
+  replica-set MongoDB restore the upstream, proxy, all spec-owned and hand-owned
+  plugins removed by the cascade, associations, spec row, and config-change
+  records in one transaction. Standalone MongoDB cannot provide that boundary,
+  so compensation fails before writing and leaves the route deleted rather than
+  publishing a partially protected proxy.
 
 ### Cascade and ownership summary
 

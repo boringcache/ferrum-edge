@@ -217,16 +217,6 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     );
     assert!(api_spec_source.contains("enum ApiSpecLateWriteRecovery"));
     assert!(api_spec_source.contains("ApiSpecLateWriteRecovery::Retained"));
-    assert!(api_spec_source.contains(
-        "db.restore_api_spec_bundle(&previous_bundle, &previous_spec, &additional_plugins)"
-    ));
-    assert!(!api_spec_source.contains("base_bundle.proxy.plugins.retain("));
-    assert!(!api_spec_source.contains("db.update_proxy(&previous_bundle.proxy)"));
-    let sql_store_source = include_str!("../../../src/config/db_loader.rs");
-    assert!(sql_store_source.contains("pub async fn restore_api_spec_bundle("));
-    assert!(
-        sql_store_source.contains(".chain(additional_plugins.iter().map(|plugin| (plugin, None)))")
-    );
     let post_lock = api_spec_source
         .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .expect("POST admission guard");

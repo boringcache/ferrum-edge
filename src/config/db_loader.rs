@@ -1148,6 +1148,31 @@ impl DatabaseStore {
             .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
     }
 
+    /// Validate the exact proxy/plugin graph produced by an API-spec restore.
+    /// This is intentionally stricter than the shared admission validator:
+    /// compensation must never attach a restored proxy to a pre-existing
+    /// global, cross-proxy, cross-namespace, or otherwise wrong plugin row.
+    async fn validate_api_spec_restore_candidate_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<(), anyhow::Error> {
+        let candidate = self
+            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .await?;
+        Self::reject_invalid_gateway_plugin_references("restore_api_spec_bundle", &candidate)?;
+        Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
+        let Some(candidate) = self
+            .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+            .await?
+        else {
+            return Ok(());
+        };
+        candidate
+            .validate_unique_mtls_dns_identities()
+            .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
+    }
+
     async fn mtls_dns_identity_conflicts_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -6380,7 +6405,8 @@ impl DatabaseStore {
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
-        self.restore_api_spec_bundle(bundle, spec, &[]).await
+        self.restore_api_spec_bundle_inner(bundle, spec, &[], false)
+            .await
     }
 
     pub async fn restore_api_spec_bundle(
@@ -6389,7 +6415,25 @@ impl DatabaseStore {
         spec: &crate::config::types::ApiSpec,
         additional_plugins: &[crate::config::types::PluginConfig],
     ) -> Result<(), anyhow::Error> {
+        self.restore_api_spec_bundle_inner(bundle, spec, additional_plugins, true)
+            .await
+    }
+
+    async fn restore_api_spec_bundle_inner(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+        additional_plugins: &[crate::config::types::PluginConfig],
+        compensation_restore: bool,
+    ) -> Result<(), anyhow::Error> {
         use crate::config::types::{AuthMode, ResponseBodyMode};
+
+        crate::config::db_backend::validate_api_spec_restore_inputs(
+            bundle,
+            spec,
+            additional_plugins,
+            compensation_restore,
+        )?;
 
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace)
@@ -6627,7 +6671,7 @@ impl DatabaseStore {
 
         // 4. INSERT api_specs row.
         self.insert_api_spec_tx(&mut tx, spec).await?;
-        self.validate_namespace_admission_tx(&mut tx, &spec.namespace)
+        self.validate_api_spec_restore_candidate_tx(&mut tx, &spec.namespace)
             .await?;
         if let Some(u) = &bundle.upstream {
             self.record_config_change_tx(&mut tx, &u.namespace, "upstream", &u.id, "upsert")

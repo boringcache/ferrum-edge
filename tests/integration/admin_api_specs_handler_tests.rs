@@ -1859,6 +1859,68 @@ async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
 }
 
 #[tokio::test]
+async fn api_spec_delete_rejects_foreign_owned_cascade_plugin_without_retagging() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("foreign-owned-cascade-proxy");
+    let spec = minimal_json_spec(&proxy_id);
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id")
+        .to_string();
+    let plugin_id = uid("foreign-owned-cascade-plugin");
+    let plugin = manual_proxy_plugin(&plugin_id, &proxy_id, "stdout_logging", json!({}));
+    attach_manual_proxy_plugin(&store, &proxy_id, &plugin).await;
+
+    let foreign_spec_id = uid("foreign-api-spec-owner");
+    sqlx::query("UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?")
+        .bind(&foreign_spec_id)
+        .bind("ferrum")
+        .bind(&plugin_id)
+        .execute(&store.pool())
+        .await
+        .expect("inject foreign API-spec ownership");
+
+    let delete_status = client.delete(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "foreign-owned cascade plugin must block API-spec deletion"
+    );
+    assert!(
+        store
+            .get_api_spec("ferrum", &spec_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "rejected delete must preserve the API spec"
+    );
+    assert!(
+        store
+            .get_proxy("ferrum", &proxy_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "rejected delete must preserve the proxy"
+    );
+    let preserved_plugin = store
+        .get_plugin_config("ferrum", &plugin_id)
+        .await
+        .unwrap()
+        .expect("rejected delete must preserve the plugin");
+    assert_eq!(
+        preserved_plugin.api_spec_id.as_deref(),
+        Some(foreign_spec_id.as_str()),
+        "rejected delete must not retag foreign ownership"
+    );
+}
+
+#[tokio::test]
 async fn post_rejects_hmac_request_body_transformer_composition() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;

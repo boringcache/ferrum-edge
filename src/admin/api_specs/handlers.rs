@@ -3344,7 +3344,7 @@ pub async fn handle_delete_api_spec(
         .flat_map(|proxy| proxy.plugins.iter())
         .map(|association| association.plugin_config_id.as_str())
         .collect();
-    let additional_plugins = deletion_snapshot
+    let additional_plugin_ids = deletion_snapshot
         .plugin_configs
         .iter()
         .filter(|plugin| !owned_plugin_ids.contains(plugin.id.as_str()))
@@ -3354,8 +3354,65 @@ pub async fn handle_delete_api_spec(
                     && proxy_plugin_ids.contains(plugin.id.as_str())
                     && !other_proxy_plugin_ids.contains(plugin.id.as_str()))
         })
-        .cloned()
+        .map(|plugin| plugin.id.clone())
         .collect::<Vec<_>>();
+    let additional_plugin_id_set: HashSet<&str> = additional_plugin_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut additional_plugins = Vec::with_capacity(additional_plugin_ids.len());
+    for plugin_id in &additional_plugin_ids {
+        if !proxy_plugin_ids.contains(plugin_id.as_str()) {
+            return Ok(error_response(ApiSpecError::Unprocessable(format!(
+                "API spec '{}' cannot delete proxy '{}': cascade plugin '{}' is not present in the proxy association graph",
+                existing.id, existing.proxy_id, plugin_id
+            ))));
+        }
+        match db.get_plugin_config(namespace, plugin_id).await {
+            Ok(Some(plugin)) if plugin.api_spec_id.is_none() => additional_plugins.push(plugin),
+            Ok(Some(plugin)) => {
+                return Ok(error_response(ApiSpecError::Unprocessable(format!(
+                    "API spec '{}' cannot delete proxy '{}': plugin '{}' is owned by API spec '{}'",
+                    existing.id,
+                    existing.proxy_id,
+                    plugin.id,
+                    plugin.api_spec_id.as_deref().unwrap_or("<unknown>")
+                ))));
+            }
+            Ok(None) => {
+                return Ok(error_response(ApiSpecError::Internal(format!(
+                    "API spec '{}' delete snapshot lost plugin '{}' before persistence",
+                    existing.id, plugin_id
+                ))));
+            }
+            Err(error) => return Ok(error_response(classify_db_error(error))),
+        }
+    }
+    for association in &existing_proxy.plugins {
+        let plugin_id = association.plugin_config_id.as_str();
+        if owned_plugin_ids.contains(plugin_id) || additional_plugin_id_set.contains(plugin_id) {
+            continue;
+        }
+        match db.get_plugin_config(namespace, plugin_id).await {
+            Ok(Some(plugin)) if plugin.api_spec_id.is_none() => {}
+            Ok(Some(plugin)) => {
+                return Ok(error_response(ApiSpecError::Unprocessable(format!(
+                    "API spec '{}' cannot delete proxy '{}': associated plugin '{}' is owned by API spec '{}'",
+                    existing.id,
+                    existing.proxy_id,
+                    plugin.id,
+                    plugin.api_spec_id.as_deref().unwrap_or("<unknown>")
+                ))));
+            }
+            Ok(None) => {
+                return Ok(error_response(ApiSpecError::Internal(format!(
+                    "API spec '{}' delete snapshot lost associated plugin '{}' before persistence",
+                    existing.id, plugin_id
+                ))));
+            }
+            Err(error) => return Ok(error_response(classify_db_error(error))),
+        }
+    }
     let previous_bundle = ExtractedBundle {
         proxy: existing_proxy,
         upstream: existing_upstream,

@@ -30,13 +30,12 @@
 //!   differences (VARCHAR vs TEXT, TINYINT vs INTEGER) do not affect query
 //!   semantics; they are covered by `sql_dialect.rs` unit tests.
 //!
-//! - **MongoDB**: `MongoStore` methods (`submit_api_spec_bundle`,
-//!   `replace_api_spec_bundle`, `delete_api_spec`, `list_api_specs`) are
-//!   byte-for-byte mirrors of their SQL counterparts where possible, diverging
-//!   only for native array membership queries (`has_tag`) and transaction style
-//!   (replica-set vs best-effort).  A future `#[ignore]` test file with a
-//!   `MONGO_URL` env-gated harness would close this gap.  See Round 8 P2
-//!   documenting comment for context on why this is deferred.
+//! - **MongoDB**: `MongoStore` mirrors the SQL API-spec operations where
+//!   possible. Atomic late-delete restore is implemented only with a replica
+//!   set transaction; standalone MongoDB rejects it before writing. A future
+//!   `#[ignore]` test file with a `MONGO_URL` env-gated harness would close the
+//!   live-backend gap. See Round 8 P2 documenting comment for context on why
+//!   this is deferred.
 
 use ferrum_edge::{
     ExtractedBundle, GatewayConfig,
@@ -51,7 +50,10 @@ use ferrum_edge::{
         },
     },
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tempfile::TempDir;
 
 /// Build a default list filter with just limit/offset (for existing pagination tests).
@@ -412,6 +414,398 @@ async fn submit_bundle_rollback_on_duplicate_proxy() {
         .expect("get_api_spec failed")
         .expect("spec1 not found after failed second submit");
     assert_eq!(fetched1.id, spec_id_1);
+}
+
+// ---------------------------------------------------------------------------
+// restore_api_spec_bundle — atomic late-delete compensation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn restore_bundle_preserves_complete_owned_and_hand_added_graph() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-proxy");
+    let upstream_id = uid("restore-upstream");
+    let spec_plugin_id = uid("restore-owned-plugin");
+    let additional_plugin_id = uid("restore-hand-plugin");
+    let spec_id = uid("restore-spec");
+    let created_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+        .unwrap()
+        .to_utc();
+    let updated_at = chrono::DateTime::parse_from_rfc3339("2026-02-03T04:05:06Z")
+        .unwrap()
+        .to_utc();
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.upstream_id = Some(upstream_id.clone());
+    proxy.created_at = created_at;
+    proxy.updated_at = updated_at;
+    proxy.plugins = vec![
+        PluginAssociation {
+            plugin_config_id: spec_plugin_id.clone(),
+        },
+        PluginAssociation {
+            plugin_config_id: additional_plugin_id.clone(),
+        },
+    ];
+
+    let mut upstream = make_upstream(&upstream_id, ns);
+    upstream.api_spec_id = Some(spec_id.clone());
+    upstream.created_at = created_at;
+    upstream.updated_at = updated_at;
+
+    let mut spec_plugin = make_plugin(&spec_plugin_id, &proxy_id, ns, Some(&spec_id));
+    spec_plugin.priority_override = Some(7);
+    spec_plugin.created_at = created_at;
+    spec_plugin.updated_at = updated_at;
+    let mut additional_plugin = make_plugin(&additional_plugin_id, &proxy_id, ns, None);
+    additional_plugin.enabled = false;
+    additional_plugin.priority_override = Some(41);
+    additional_plugin.created_at = created_at;
+    additional_plugin.updated_at = updated_at;
+
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: Some(upstream),
+        plugins: vec![spec_plugin],
+    };
+    let mut spec = make_spec(&spec_id, &proxy_id, ns, b"restored API spec");
+    spec.created_at = created_at;
+    spec.updated_at = updated_at;
+
+    store
+        .restore_api_spec_bundle(&bundle, &spec, std::slice::from_ref(&additional_plugin))
+        .await
+        .expect("atomic API-spec restore failed");
+
+    let restored_proxy = store
+        .get_proxy(ns, &proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("restored proxy missing");
+    assert_eq!(restored_proxy.api_spec_id.as_deref(), Some(spec_id.as_str()));
+    assert_eq!(restored_proxy.created_at, created_at);
+    assert_eq!(restored_proxy.updated_at, updated_at);
+    let association_ids: HashSet<&str> = restored_proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    assert_eq!(
+        association_ids,
+        HashSet::from([spec_plugin_id.as_str(), additional_plugin_id.as_str()])
+    );
+
+    let restored_upstream = store
+        .get_upstream(ns, &upstream_id)
+        .await
+        .expect("get_upstream failed")
+        .expect("restored upstream missing");
+    assert_eq!(
+        restored_upstream.api_spec_id.as_deref(),
+        Some(spec_id.as_str())
+    );
+    assert_eq!(restored_upstream.created_at, created_at);
+    assert_eq!(restored_upstream.updated_at, updated_at);
+
+    let restored_owned = store
+        .get_plugin_config(ns, &spec_plugin_id)
+        .await
+        .expect("get owned plugin failed")
+        .expect("restored owned plugin missing");
+    assert_eq!(restored_owned.api_spec_id.as_deref(), Some(spec_id.as_str()));
+    assert_eq!(restored_owned.scope, PluginScope::Proxy);
+    assert_eq!(restored_owned.proxy_id.as_deref(), Some(proxy_id.as_str()));
+    assert!(restored_owned.enabled);
+    assert_eq!(restored_owned.priority_override, Some(7));
+    assert_eq!(restored_owned.config, bundle.plugins[0].config);
+    assert_eq!(restored_owned.created_at, created_at);
+    assert_eq!(restored_owned.updated_at, updated_at);
+
+    let restored_additional = store
+        .get_plugin_config(ns, &additional_plugin_id)
+        .await
+        .expect("get hand-owned plugin failed")
+        .expect("restored hand-owned plugin missing");
+    assert!(restored_additional.api_spec_id.is_none());
+    assert_eq!(restored_additional.scope, PluginScope::Proxy);
+    assert_eq!(
+        restored_additional.proxy_id.as_deref(),
+        Some(proxy_id.as_str())
+    );
+    assert!(!restored_additional.enabled);
+    assert_eq!(restored_additional.priority_override, Some(41));
+    assert_eq!(restored_additional.config, additional_plugin.config);
+    assert_eq!(restored_additional.created_at, created_at);
+    assert_eq!(restored_additional.updated_at, updated_at);
+
+    let restored_spec = store
+        .get_api_spec(ns, &spec_id)
+        .await
+        .expect("get_api_spec failed")
+        .expect("restored API spec missing");
+    assert_eq!(restored_spec.created_at, created_at);
+    assert_eq!(restored_spec.updated_at, updated_at);
+
+    let changes: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT resource_type, resource_id, operation FROM config_changes \
+         WHERE namespace = ? ORDER BY sequence",
+    )
+    .bind(ns)
+    .fetch_all(&store.pool())
+    .await
+    .expect("load restore config changes failed");
+    assert_eq!(changes.len(), 4);
+    assert_eq!(
+        changes.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([
+            ("upstream".to_string(), upstream_id, "upsert".to_string()),
+            ("proxy".to_string(), proxy_id, "upsert".to_string()),
+            (
+                "plugin_config".to_string(),
+                spec_plugin_id,
+                "upsert".to_string()
+            ),
+            (
+                "plugin_config".to_string(),
+                additional_plugin_id,
+                "upsert".to_string()
+            ),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn restore_bundle_rolls_back_resources_associations_spec_and_changes_on_late_failure() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = "restore-failure-proxy";
+    let upstream_id = "restore-failure-upstream";
+    let spec_plugin_id = "restore-failure-owned-plugin";
+    let additional_plugin_id = "restore-failure-hand-plugin";
+    let spec_id = "restore-failure-spec";
+
+    sqlx::query(
+        "CREATE TRIGGER fail_api_spec_restore_change BEFORE INSERT ON config_changes \
+         WHEN NEW.resource_id = 'restore-failure-hand-plugin' \
+         BEGIN SELECT RAISE(ABORT, 'injected late API-spec restore failure'); END",
+    )
+    .execute(&store.pool())
+    .await
+    .expect("install API-spec restore fault trigger failed");
+
+    let mut proxy = make_proxy(proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.to_string());
+    proxy.upstream_id = Some(upstream_id.to_string());
+    proxy.plugins = vec![
+        PluginAssociation {
+            plugin_config_id: spec_plugin_id.to_string(),
+        },
+        PluginAssociation {
+            plugin_config_id: additional_plugin_id.to_string(),
+        },
+    ];
+    let mut upstream = make_upstream(upstream_id, ns);
+    upstream.api_spec_id = Some(spec_id.to_string());
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: Some(upstream),
+        plugins: vec![make_plugin(spec_plugin_id, proxy_id, ns, Some(spec_id))],
+    };
+    let spec = make_spec(spec_id, proxy_id, ns, b"fault-injected restore");
+    let additional = make_plugin(additional_plugin_id, proxy_id, ns, None);
+
+    let result = store
+        .restore_api_spec_bundle(&bundle, &spec, &[additional])
+        .await;
+    assert!(result.is_err(), "fault-injected restore must fail");
+
+    assert!(store.get_proxy(ns, proxy_id).await.unwrap().is_none());
+    assert!(store.get_upstream(ns, upstream_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_plugin_config(ns, spec_plugin_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_plugin_config(ns, additional_plugin_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get_api_spec(ns, spec_id).await.unwrap().is_none());
+
+    let association_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proxy_plugins WHERE proxy_id = ?")
+            .bind(proxy_id)
+            .fetch_one(&store.pool())
+            .await
+            .expect("count proxy associations failed");
+    assert_eq!(association_count, 0);
+    let change_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM config_changes WHERE namespace = ?")
+            .bind(ns)
+            .fetch_one(&store.pool())
+            .await
+            .expect("count config changes failed");
+    assert_eq!(change_count, 0);
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_overlapping_ids_and_foreign_ownership_before_writing() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    for (suffix, additional_owner, expected_error) in [
+        ("overlap", None, "overlapping plugin id"),
+        ("foreign", Some("different-api-spec"), "owned by an API spec"),
+    ] {
+        let proxy_id = format!("restore-input-{suffix}-proxy");
+        let plugin_id = format!("restore-input-{suffix}-plugin");
+        let additional_id = if suffix == "overlap" {
+            plugin_id.clone()
+        } else {
+            format!("restore-input-{suffix}-additional")
+        };
+        let spec_id = format!("restore-input-{suffix}-spec");
+        let mut proxy = make_proxy(&proxy_id, ns);
+        proxy.api_spec_id = Some(spec_id.clone());
+        proxy.plugins = vec![PluginAssociation {
+            plugin_config_id: plugin_id.clone(),
+        }];
+        if plugin_id != additional_id {
+            proxy.plugins.push(PluginAssociation {
+                plugin_config_id: additional_id.clone(),
+            });
+        }
+        let bundle = ExtractedBundle {
+            proxy,
+            upstream: None,
+            plugins: vec![make_plugin(&plugin_id, &proxy_id, ns, Some(&spec_id))],
+        };
+        let spec = make_spec(&spec_id, &proxy_id, ns, b"invalid restore input");
+        let additional = make_plugin(&additional_id, &proxy_id, ns, additional_owner);
+
+        let error = store
+            .restore_api_spec_bundle(&bundle, &spec, &[additional])
+            .await
+            .expect_err("invalid restore input must fail");
+        assert!(
+            error.to_string().contains(expected_error),
+            "unexpected restore validation error: {error:#}"
+        );
+        assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+        assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_wrong_preexisting_plugin_instance_and_rolls_back() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-wrong-instance-proxy");
+    let external_plugin_id = uid("restore-wrong-instance-plugin");
+    let spec_id = uid("restore-wrong-instance-spec");
+
+    let mut global = make_plugin(&external_plugin_id, &proxy_id, ns, None);
+    global.scope = PluginScope::Global;
+    global.proxy_id = None;
+    store
+        .create_plugin_config(&global)
+        .await
+        .expect("seed global plugin failed");
+    let baseline_changes: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM config_changes WHERE namespace = ?")
+            .bind(ns)
+            .fetch_one(&store.pool())
+            .await
+            .expect("count baseline changes failed");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: external_plugin_id.clone(),
+    }];
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"wrong plugin instance restore");
+    let error = store
+        .restore_api_spec_bundle(&bundle, &spec, &[])
+        .await
+        .expect_err("global plugin association must fail closed");
+    assert!(
+        error.to_string().contains("invalid proxy/plugin associations"),
+        "unexpected wrong-instance error: {error:#}"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_plugin_config(ns, &external_plugin_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "pre-existing plugin must survive the rolled-back restore"
+    );
+    let final_changes: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM config_changes WHERE namespace = ?")
+            .bind(ns)
+            .fetch_one(&store.pool())
+            .await
+            .expect("count final changes failed");
+    assert_eq!(final_changes, baseline_changes);
+}
+
+#[tokio::test]
+async fn restore_bundle_preserves_preexisting_proxy_when_later_insert_conflicts() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-existing-proxy");
+    let upstream_id = uid("restore-conflict-upstream");
+    let spec_id = uid("restore-conflict-spec");
+    let existing = make_proxy(&proxy_id, ns);
+    store
+        .create_proxy(&existing)
+        .await
+        .expect("seed existing proxy failed");
+
+    let mut restore_proxy = existing.clone();
+    restore_proxy.api_spec_id = Some(spec_id.clone());
+    let mut restore_upstream = make_upstream(&upstream_id, ns);
+    restore_upstream.api_spec_id = Some(spec_id.clone());
+    let bundle = ExtractedBundle {
+        proxy: restore_proxy,
+        upstream: Some(restore_upstream),
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"pre-existing proxy conflict");
+    assert!(
+        store
+            .restore_api_spec_bundle(&bundle, &spec, &[])
+            .await
+            .is_err()
+    );
+
+    let preserved = store
+        .get_proxy(ns, &proxy_id)
+        .await
+        .unwrap()
+        .expect("pre-existing proxy was lost");
+    assert_eq!(preserved.id, existing.id);
+    assert!(store.get_upstream(ns, &upstream_id).await.unwrap().is_none());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
 }
 
 // ---------------------------------------------------------------------------

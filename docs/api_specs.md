@@ -231,7 +231,7 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 |---|---|
 | `POST /api-specs` | Resources tagged with the new `api_spec_id`. New proxy, optional upstream, and plugins are inserted. |
 | `PUT /api-specs/{id}` | Idempotent if the bundle is unchanged (see "PUT semantics" below). When changed, all resources with `api_spec_id = {id}` are deleted and re-inserted from the new document. Resources on the same proxy with `api_spec_id = null` (manually added) are untouched. |
-| `DELETE /api-specs/{id}` | Spec-owned proxy is deleted → FK cascade removes all of its plugins (including manually-added ones). Spec-owned upstream is deleted explicitly. Non-spec upstreams survive. The spec row is deleted. If the cascade would leave an invalid aggregate plugin graph, the operation returns 422 and rolls back. |
+| `DELETE /api-specs/{id}` | Spec-owned proxy is deleted → FK cascade removes all of its plugins (including manually-added ones). Spec-owned upstream is deleted explicitly. Non-spec upstreams survive. The spec row is deleted. If the cascade would leave an invalid aggregate plugin graph, the operation returns 422 and rolls back. If namespace admission is lost after the delete commits, compensation restores the complete prior graph atomically or leaves it deleted. |
 | `DELETE /proxies/{id}` | The database `ON DELETE CASCADE` on `api_specs.proxy_id → proxies(id)` removes the spec row automatically. The spec-owned upstream is NOT automatically cleaned up in this case. |
 
 ## Mode behaviour
@@ -245,9 +245,13 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 
 ## Atomicity and retries
 
-**SQL backends (PostgreSQL, MySQL, SQLite)**: `POST /api-specs` and `PUT /api-specs/{id}` execute within a single database transaction. Either all resources are created/replaced or none are (full rollback on error).
+**SQL backends (PostgreSQL, MySQL, SQLite)**: `POST /api-specs` and `PUT /api-specs/{id}` execute within a single database transaction. Either all resources are created/replaced or none are (full rollback on error). Late `DELETE` compensation uses the same transaction boundary for the upstream, proxy, spec-owned plugins, hand-owned plugins removed by the proxy cascade, proxy/plugin junction rows, API-spec row, and every runtime config-change record.
 
-**MongoDB without a replica set**: atomicity is limited to single-document operations. Multi-resource submissions use a best-effort approach with compensating deletes on failure. In the event of an infrastructure fault mid-submission, orphaned resources are possible. Use a MongoDB replica set for production deployments that require atomic multi-document writes.
+**MongoDB with a replica set**: late `DELETE` compensation uses one multi-document transaction with the same all-or-nothing graph and config-change boundary as SQL.
+
+**MongoDB without a replica set**: atomicity is limited to single-document operations. Normal multi-resource submissions retain their best-effort approach with compensating deletes on failure. In the event of an infrastructure fault mid-submission, orphaned resources are possible. Late `DELETE` compensation is stricter: it fails closed before writing anything because a partially restored proxy could publish without its security plugins. The already-committed delete therefore remains in place until an operator retries on a replica-set deployment or re-submits the spec. Use a MongoDB replica set for production deployments that require atomic multi-document writes or automatic late-delete recovery.
+
+Before deletion, Ferrum re-reads every plugin that the proxy cascade would remove through an ownership-preserving admin query. A plugin tagged to another API spec, a cascade plugin missing from the proxy association graph, or another malformed partial graph rejects the delete instead of being retagged or restored as the wrong instance.
 
 ### Detecting and cleaning up orphans (MongoDB non-RS)
 
