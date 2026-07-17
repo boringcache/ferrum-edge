@@ -5490,15 +5490,17 @@ fn test_third_party_correlation_capability_cannot_claim_reserved_header() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin {
         claim: " AuThOrIzAtIoN ",
     })];
-    let error =
-        ferrum_edge::_test_support::validate_correlation_id_composition_for_test(&plugins)
-            .expect_err("third-party reserved header ownership must fail closed");
+    let error = ferrum_edge::_test_support::validate_correlation_id_composition_for_test(&plugins)
+        .expect_err("third-party reserved header ownership must fail closed");
 
     assert!(
         error.contains("effective header_name \"authorization\""),
         "got: {error}"
     );
-    assert!(error.contains("plugin \"raw_correlation_claim\""), "got: {error}");
+    assert!(
+        error.contains("plugin \"raw_correlation_claim\""),
+        "got: {error}"
+    );
     assert!(error.contains("protocol Http"), "got: {error}");
     assert!(
         error.contains("reserved protocol-managed or security-sensitive header ownership"),
