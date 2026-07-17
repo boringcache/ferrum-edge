@@ -879,8 +879,7 @@ type RequestBufferingMap = HashMap<String, bool>;
 type WsFrameMap = HashMap<String, bool>;
 /// Map from proxy_group plugin_config_id to its shared plugin instance.
 type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
-type CompositionPluginMap<'a> =
-    HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
+type CompositionPluginMap<'a> = HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct AdaptiveConcurrencyPolicyId {

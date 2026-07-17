@@ -4693,11 +4693,7 @@ fn test_duplicate_effective_correlation_headers_are_rejected() {
     );
     second.priority_override = Some(75);
     let config = make_config(
-        vec![make_proxy(
-            "p1",
-            "/api",
-            vec!["corr-first", "corr-second"],
-        )],
+        vec![make_proxy("p1", "/api", vec!["corr-first", "corr-second"])],
         vec![first, second],
     );
 
