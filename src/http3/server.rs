@@ -11296,6 +11296,8 @@ mod h3_request_body_timeout_tests {
             ("x-correlation-id".to_string(), "request-123".to_string()),
         ]);
         let mut body = b"backend response".to_vec();
+        ctx.mark_gateway_deadline_response_selected();
+        ctx.begin_rejection_deadline_response_header_provenance(&headers);
 
         let status = super::replace_buffered_h3_response_with_grpc_deadline(
             &mut ctx,
