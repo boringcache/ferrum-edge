@@ -684,6 +684,17 @@ pub(crate) struct CorrelationIdState {
     instances: HashMap<String, String>,
 }
 
+impl CorrelationIdState {
+    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        for (key, value) in &self.instances {
+            metadata.insert(key.clone(), value.clone());
+        }
+        if let Some(request_id) = &self.canonical {
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.clone());
+        }
+    }
+}
+
 impl CanonicalClientIpCache {
     fn get_or_parse(&self, client_ip: &str) -> Option<IpAddr> {
         *self
@@ -723,13 +734,8 @@ impl CanonicalClientIpCache {
         self.correlation_ids.canonical.as_deref()
     }
 
-    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
-        for (key, value) in &self.correlation_ids.instances {
-            metadata.insert(key.clone(), value.clone());
-        }
-        if let Some(request_id) = &self.correlation_ids.canonical {
-            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.clone());
-        }
+    fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        self.correlation_ids.project_correlation_ids(metadata);
     }
 }
 
