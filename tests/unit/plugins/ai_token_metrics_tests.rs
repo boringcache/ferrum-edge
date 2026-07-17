@@ -2,9 +2,11 @@
 
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, ai_token_metrics::AiTokenMetrics,
+    utils::content_encoding::{DecodeLimits, decode_content_encoding},
     validate_plugin_config,
 };
 use serde_json::json;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -38,6 +40,21 @@ fn brotli(body: &[u8]) -> Vec<u8> {
     )
     .unwrap();
     encoded
+}
+
+#[test]
+fn content_decoding_borrows_when_no_transform_is_required() {
+    let body = b"plain provider response";
+    let limits = DecodeLimits {
+        max_decoded_bytes: 4 * 1024 * 1024,
+        max_cumulative_bytes: 8 * 1024 * 1024,
+        max_codings: 4,
+    };
+    for header in [None, Some("identity")] {
+        let decoded = decode_content_encoding(header, body, limits).unwrap();
+        assert_eq!(decoded.as_ptr(), body.as_ptr());
+        assert!(matches!(decoded, Cow::Borrowed(_)));
+    }
 }
 
 fn ctx_with_content_type(method: &str, content_type: &str) -> RequestContext {
@@ -413,22 +430,14 @@ async fn test_explicit_provider_openai() {
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "15");
 }
 
-#[tokio::test]
-async fn test_explicit_provider_is_case_insensitive() {
-    let plugin = AiTokenMetrics::new(&json!({"provider": " OpenAI "})).unwrap();
-    let mut ctx = create_test_context();
-    let headers = json_headers();
-    let body = serde_json::to_vec(&json!({
-        "model": "gpt-4",
-        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-    }))
-    .unwrap();
-
-    plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
-        .await;
-    assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "openai");
-    assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "15");
+#[test]
+fn explicit_provider_requires_the_documented_lowercase_enum_spelling() {
+    for provider in ["OpenAI", " openai", "openai ", "OPENAI"] {
+        let err = AiTokenMetrics::new(&json!({"provider": provider}))
+            .err()
+            .expect("non-canonical provider spelling must be rejected");
+        assert!(err.contains("unknown 'provider' value"), "got: {err}");
+    }
 }
 
 #[tokio::test]
@@ -773,6 +782,20 @@ fn test_zero_cost_accepted() {
             "cost_per_completion_token": 0.0
         }))
         .is_ok()
+    );
+}
+
+#[test]
+fn cost_rate_maximum_matches_the_openapi_contract() {
+    assert!(
+        AiTokenMetrics::new(&json!({
+            "cost_per_prompt_token": 18_446_744_073_709.55,
+            "cost_per_completion_token": 18_446_744_073_709.55
+        }))
+        .is_ok()
+    );
+    assert!(
+        AiTokenMetrics::new(&json!({"cost_per_prompt_token": 18_446_744_073_710.0})).is_err()
     );
 }
 

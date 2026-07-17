@@ -707,6 +707,32 @@ fn parse_ipv4_client_ip_literal(client_ip: &str) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(ipv4))
 }
 
+/// AI usage that was produced by a built-in accounting path.
+///
+/// This is deliberately carried outside [`RequestContext::metadata`]. Backend
+/// responses and operator-configured metadata writers can populate arbitrary
+/// public metadata keys, so those keys are not authoritative provenance for
+/// Prometheus token or cost export.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiUsageExport {
+    pub prefix: Arc<str>,
+    pub provider: &'static str,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cost_microunits: Option<u64>,
+}
+
+impl AiUsageExport {
+    fn completeness(&self) -> usize {
+        usize::from(self.prompt_tokens.is_some())
+            + usize::from(self.completion_tokens.is_some())
+            + usize::from(self.total_tokens.is_some())
+            + usize::from(self.cost_microunits.is_some())
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -816,6 +842,10 @@ pub struct RequestContext {
     gateway_deadline_response_selected: bool,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Most complete built-in AI usage snapshot for Prometheus export.
+    /// Kept outside public metadata so backend/operator metadata cannot mint or
+    /// overwrite trusted token and cost series.
+    pub(crate) ai_usage_export: Option<AiUsageExport>,
     /// Aggregate CORS policy state staged across every attached CORS instance
     /// and consumed by the cache-inserted CORS finalizer. Kept outside public
     /// metadata so policy details never enter transaction logs.
@@ -1221,6 +1251,7 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             metadata: HashMap::new(),
+            ai_usage_export: None,
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
@@ -1288,6 +1319,28 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
+    }
+
+    pub(crate) fn stage_ai_usage_export(&mut self, candidate: AiUsageExport) {
+        if candidate.completeness() == 0 {
+            return;
+        }
+        let replace = self.ai_usage_export.as_ref().is_none_or(|current| {
+            candidate.completeness() > current.completeness()
+                || (candidate.completeness() == current.completeness()
+                    && candidate.prefix.as_ref() < current.prefix.as_ref())
+        });
+        if replace {
+            self.ai_usage_export = Some(candidate);
+        }
+    }
+
+    /// Return the typed built-in usage snapshot carried to transaction logs.
+    /// Public only for external contract tests; runtime metadata producers
+    /// cannot access or populate this path.
+    #[doc(hidden)]
+    pub fn authoritative_ai_usage_export(&self) -> Option<AiUsageExport> {
+        self.ai_usage_export.clone()
     }
 
     /// Return the one absolute gRPC deadline established for this request.
@@ -1456,6 +1509,7 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            ai_usage_export: self.ai_usage_export.clone(),
             // Final request-body hooks cannot observe or mutate the real CORS
             // aggregate. CORS has no body hook, and only metadata is copied
             // back from this compatibility context.
@@ -2956,6 +3010,13 @@ pub struct TransactionSummary {
         serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
     )]
     pub metadata: HashMap<String, String>,
+    /// Built-in AI usage provenance for Prometheus. This is intentionally not
+    /// serialized into transaction logs; the operator-visible usage metadata
+    /// remains in `metadata` while trust stays typed and private to the request
+    /// pipeline.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub ai_usage_export: Option<AiUsageExport>,
 }
 
 impl TransactionSummary {

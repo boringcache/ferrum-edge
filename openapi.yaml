@@ -16492,7 +16492,7 @@ components:
           type: string
           default: auto
           enum: [auto, openai, anthropic, google, cohere, mistral, bedrock]
-          description: "LLM provider format (auto, openai, anthropic, google, cohere, mistral, bedrock)"
+          description: "Exact lowercase LLM provider format; surrounding whitespace and alternate casing are rejected"
         include_model:
           type: boolean
           default: true
@@ -16517,13 +16517,13 @@ components:
           format: double
           minimum: 0
           maximum: 18446744073709.55
-          description: Calculate estimated cost per request (prompt tokens)
+          description: Calculate estimated cost per request from prompt tokens; maximum 18446744073709.55
         cost_per_completion_token:
           type: number
           format: double
           minimum: 0
           maximum: 18446744073709.55
-          description: Calculate estimated cost per request (completion tokens)
+          description: Calculate estimated cost per request from completion tokens; maximum 18446744073709.55
 
     AiRequestGuardConfig:
       type: object

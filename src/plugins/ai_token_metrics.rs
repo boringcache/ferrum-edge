@@ -3,8 +3,8 @@
 //! Parses LLM response bodies to extract token usage metadata (prompt tokens,
 //! completion tokens, total tokens, model name) and writes the data to
 //! `RequestContext.metadata` so it flows into `TransactionSummary` for
-//! downstream logging/observability plugins (stdout_logging, http_logging,
-//! prometheus_metrics, otel_tracing).
+//! downstream logging plugins. Prometheus receives the same usage through a
+//! private typed snapshot rather than trusting public metadata provenance.
 //!
 //! Supports OpenAI, Anthropic, Google Gemini, Cohere, Mistral, and AWS Bedrock
 //! response formats. Auto-detection inspects the JSON structure to determine
@@ -29,7 +29,8 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use std::sync::Arc;
+use tracing::debug;
 
 use super::utils::ai_providers::{
     AiProvider, AiTokenUsage, detect_response_provider, detect_sse_provider,
@@ -38,7 +39,7 @@ use super::utils::ai_providers::{
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::sse::is_sse_request;
-use super::{Plugin, PluginResult, RequestContext};
+use super::{AiUsageExport, Plugin, PluginResult, RequestContext};
 
 pub struct AiTokenMetrics {
     provider: String,
@@ -51,7 +52,7 @@ pub struct AiTokenMetrics {
     model_key: String,
     estimated_cost_key: String,
     streaming_key: String,
-    prometheus_export_key: String,
+    metadata_prefix: Arc<str>,
     buffer_streaming_responses: bool,
     cost_per_prompt_token: Option<f64>,
     cost_per_completion_token: Option<f64>,
@@ -70,9 +71,7 @@ const MAX_METADATA_PREFIX_LEN: usize = 64;
 const MAX_INSPECTION_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CUMULATIVE_DECODED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONTENT_CODINGS: usize = 4;
-const MAX_COST_RATE: f64 = u64::MAX as f64 / 1_000_000.0;
-pub(crate) const PROMETHEUS_EXPORT_SUFFIX: &str = "_usage_export";
-pub(crate) const DEFAULT_PROMETHEUS_EXPORT_KEY: &str = "ai_usage_export";
+const MAX_COST_RATE: f64 = 18_446_744_073_709.55;
 
 impl AiTokenMetrics {
     pub fn new(config: &Value) -> Result<Self, String> {
@@ -97,11 +96,10 @@ impl AiTokenMetrics {
 
         let provider = match optional_string(config, "provider")? {
             Some(raw) => {
-                let provider = raw.trim();
-                if provider.is_empty() {
+                if raw.is_empty() {
                     return Err("ai_token_metrics: 'provider' must not be empty".to_string());
                 }
-                provider.to_ascii_lowercase()
+                raw.to_string()
             }
             None => "auto".to_string(),
         };
@@ -116,12 +114,11 @@ impl AiTokenMetrics {
         let include_token_details = optional_bool(config, "include_token_details")?.unwrap_or(true);
         let metadata_prefix = match optional_string(config, "metadata_prefix")? {
             Some(raw) => {
-                let prefix = raw.trim();
-                if prefix.is_empty() {
+                if raw.is_empty() {
                     return Err("ai_token_metrics: 'metadata_prefix' must not be empty".to_string());
                 }
-                if prefix.len() > MAX_METADATA_PREFIX_LEN
-                    || !prefix.bytes().all(|byte| {
+                if raw.len() > MAX_METADATA_PREFIX_LEN
+                    || !raw.bytes().all(|byte| {
                         byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
                     })
                 {
@@ -129,7 +126,7 @@ impl AiTokenMetrics {
                         "ai_token_metrics: 'metadata_prefix' must be 1-{MAX_METADATA_PREFIX_LEN} ASCII letters, digits, '.', '_' or '-'"
                     ));
                 }
-                prefix.to_string()
+                raw.to_string()
             }
             None => "ai".to_string(),
         };
@@ -163,9 +160,8 @@ impl AiTokenMetrics {
         let model_key = metadata_key(&metadata_prefix, "model");
         let estimated_cost_key = metadata_key(&metadata_prefix, "estimated_cost");
         let streaming_key = metadata_key(&metadata_prefix, "streaming");
-        let prometheus_export_key = format!("{metadata_prefix}{PROMETHEUS_EXPORT_SUFFIX}");
 
-        warn!("ai_token_metrics is HTTP-only; native gRPC protobuf responses are not inspected");
+        debug!("ai_token_metrics is HTTP-only; native gRPC protobuf responses are not inspected");
 
         Ok(Self {
             provider,
@@ -178,7 +174,7 @@ impl AiTokenMetrics {
             model_key,
             estimated_cost_key,
             streaming_key,
-            prometheus_export_key,
+            metadata_prefix: Arc::from(metadata_prefix),
             buffer_streaming_responses,
             cost_per_prompt_token,
             cost_per_completion_token,
@@ -282,28 +278,32 @@ impl AiTokenMetrics {
         final_usage
     }
     /// Write extracted token usage into the request context metadata.
-    fn write_metadata(&self, metadata: &mut HashMap<String, String>, usage: &AiTokenUsage) {
+    fn write_metadata(&self, ctx: &mut RequestContext, usage: &AiTokenUsage) {
         if let Some(provider) = usage.provider {
-            metadata.insert(self.provider_key.clone(), provider.as_str().to_string());
+            ctx.metadata
+                .insert(self.provider_key.clone(), provider.as_str().to_string());
         }
 
         if let Some(total) = usage.total_tokens {
-            metadata.insert(self.total_tokens_key.clone(), total.to_string());
+            ctx.metadata
+                .insert(self.total_tokens_key.clone(), total.to_string());
         }
 
         if self.include_token_details {
             if let Some(prompt) = usage.prompt_tokens {
-                metadata.insert(self.prompt_tokens_key.clone(), prompt.to_string());
+                ctx.metadata
+                    .insert(self.prompt_tokens_key.clone(), prompt.to_string());
             }
             if let Some(completion) = usage.completion_tokens {
-                metadata.insert(self.completion_tokens_key.clone(), completion.to_string());
+                ctx.metadata
+                    .insert(self.completion_tokens_key.clone(), completion.to_string());
             }
         }
 
         if self.include_model
             && let Some(ref model) = usage.model
         {
-            metadata.insert(self.model_key.clone(), model.clone());
+            ctx.metadata.insert(self.model_key.clone(), model.clone());
         }
 
         // Calculate estimated cost only from components that are both present
@@ -316,17 +316,51 @@ impl AiTokenMetrics {
             .completion_tokens
             .zip(self.cost_per_completion_token)
             .map(|(tokens, rate)| tokens as f64 * rate);
+        let mut cost_microunits = None;
         if prompt_cost.is_some() || completion_cost.is_some() {
             let total_cost = prompt_cost.unwrap_or(0.0) + completion_cost.unwrap_or(0.0);
             if total_cost.is_finite() && total_cost <= MAX_COST_RATE {
-                metadata.insert(
-                    self.estimated_cost_key.clone(),
-                    format!("{:.6}", total_cost),
-                );
+                let formatted = format!("{:.6}", total_cost);
+                cost_microunits = parse_cost_microunits(&formatted);
+                ctx.metadata
+                    .insert(self.estimated_cost_key.clone(), formatted);
             }
         }
-        metadata.insert(self.prometheus_export_key.clone(), "v1".to_string());
+        if let Some(provider) = usage.provider {
+            ctx.stage_ai_usage_export(AiUsageExport {
+                prefix: Arc::clone(&self.metadata_prefix),
+                provider: provider.as_str(),
+                prompt_tokens: if self.include_token_details {
+                    usage.prompt_tokens
+                } else {
+                    None
+                },
+                completion_tokens: if self.include_token_details {
+                    usage.completion_tokens
+                } else {
+                    None
+                },
+                total_tokens: usage.total_tokens,
+                cost_microunits,
+            });
+        }
     }
+}
+
+fn parse_cost_microunits(value: &str) -> Option<u64> {
+    let (whole, fraction) = value.split_once('.')?;
+    if fraction.len() != 6
+        || whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    whole
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1_000_000)?
+        .checked_add(fraction.parse::<u64>().ok()?)
 }
 
 fn metadata_key(prefix: &str, suffix: &str) -> String {
@@ -525,7 +559,7 @@ impl Plugin for AiTokenMetrics {
         if is_event_stream_content_type(content_type) {
             debug!("ai_token_metrics: parsing SSE streaming response");
             if let Some(usage) = self.extract_from_sse(&inspection_body) {
-                self.write_metadata(&mut ctx.metadata, &usage);
+                self.write_metadata(ctx, &usage);
                 ctx.metadata
                     .insert(self.streaming_key.clone(), "true".to_string());
             } else {
@@ -583,7 +617,7 @@ impl Plugin for AiTokenMetrics {
             debug!("ai_token_metrics: provider response contained no valid usage fields");
             return PluginResult::Continue;
         }
-        self.write_metadata(&mut ctx.metadata, &usage);
+        self.write_metadata(ctx, &usage);
 
         PluginResult::Continue
     }

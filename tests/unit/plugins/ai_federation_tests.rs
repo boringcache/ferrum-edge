@@ -2182,10 +2182,14 @@ async fn multimodal_reject_provider_falls_through_to_translate_provider() {
         other => panic!("expected fallback provider response (200), got {other:?}"),
     }
 
-    assert_eq!(
-        ctx.metadata.get("ai_usage_export").map(String::as_str),
-        Some("v1")
-    );
+    assert!(!ctx.metadata.contains_key("ai_usage_export"));
+    let export = ctx
+        .authoritative_ai_usage_export()
+        .expect("federation usage has typed export provenance");
+    assert_eq!(export.provider, "openai");
+    assert_eq!(export.prompt_tokens, Some(10));
+    assert_eq!(export.completion_tokens, Some(5));
+    assert_eq!(export.total_tokens, Some(15));
     assert_eq!(
         ctx.metadata.get("ai_provider").map(String::as_str),
         Some("openai")

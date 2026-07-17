@@ -50,7 +50,7 @@ use url::{Host, Url};
 
 use super::utils::aws_sigv4;
 use super::utils::body_transform::is_json_content_type;
-use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::{AiUsageExport, Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -3224,10 +3224,14 @@ impl AiFederation {
             "ai_federation_provider".to_string(),
             provider_name.to_string(),
         );
-        ctx.metadata.insert(
-            super::ai_token_metrics::DEFAULT_PROMETHEUS_EXPORT_KEY.to_string(),
-            "v1".to_string(),
-        );
+        ctx.stage_ai_usage_export(AiUsageExport {
+            prefix: Arc::from("ai"),
+            provider: provider_type.as_str(),
+            prompt_tokens: tokens.prompt_tokens,
+            completion_tokens: tokens.completion_tokens,
+            total_tokens: tokens.total_tokens,
+            cost_microunits: None,
+        });
     }
 
     fn write_multimodal_text_only_metadata(

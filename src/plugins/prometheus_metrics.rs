@@ -62,25 +62,6 @@ pub struct AiUsageKey {
     pub provider: &'static str,
 }
 
-#[derive(Debug)]
-struct AiMetadataUsage<'a> {
-    prefix: &'a str,
-    provider: &'static str,
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    total_tokens: Option<u64>,
-    cost_microunits: Option<u64>,
-}
-
-impl AiMetadataUsage<'_> {
-    fn completeness(&self) -> usize {
-        usize::from(self.prompt_tokens.is_some())
-            + usize::from(self.completion_tokens.is_some())
-            + usize::from(self.total_tokens.is_some())
-            + usize::from(self.cost_microunits.is_some())
-    }
-}
-
 fn ai_provider_label(value: &str) -> Option<&'static str> {
     match value {
         "openai" | "azure_openai" | "xai" | "deepseek" | "meta_llama" | "hugging_face" => {
@@ -93,91 +74,6 @@ fn ai_provider_label(value: &str) -> Option<&'static str> {
         "bedrock" | "aws_bedrock" => Some("bedrock"),
         _ => None,
     }
-}
-
-fn parse_canonical_u64(value: &str) -> Option<u64> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    value.parse().ok()
-}
-
-/// Parse the plugin's fixed six-decimal configured-currency representation to
-/// integer micro-units. Exponents, signs, excess precision, and overflow fail.
-fn parse_cost_microunits(value: &str) -> Option<u64> {
-    let (whole, fraction) = value.split_once('.')?;
-    if fraction.len() != 6 {
-        return None;
-    }
-    let whole = parse_canonical_u64(whole)?;
-    let fraction = parse_canonical_u64(fraction)?;
-    whole.checked_mul(1_000_000)?.checked_add(fraction)
-}
-
-/// Find a marked-prefix field without concatenating or copying keys on the
-/// per-request transaction-recording path.
-fn prefixed_metadata_value<'a>(
-    metadata: &'a std::collections::HashMap<String, String>,
-    prefix: &str,
-    suffix: &str,
-) -> Option<&'a str> {
-    metadata.iter().find_map(|(key, value)| {
-        key.strip_prefix(prefix)
-            .filter(|remainder| *remainder == suffix)
-            .map(|_| value.as_str())
-    })
-}
-
-fn ai_metadata_usage<'a>(
-    metadata: &'a std::collections::HashMap<String, String>,
-) -> Option<AiMetadataUsage<'a>> {
-    let mut selected: Option<AiMetadataUsage<'a>> = None;
-
-    for (marker_key, marker_value) in metadata {
-        if marker_value != "v1" {
-            continue;
-        }
-        let Some(prefix) =
-            marker_key.strip_suffix(super::ai_token_metrics::PROMETHEUS_EXPORT_SUFFIX)
-        else {
-            continue;
-        };
-        if prefix.is_empty() {
-            continue;
-        }
-
-        let Some(provider) =
-            prefixed_metadata_value(metadata, prefix, "_provider").and_then(ai_provider_label)
-        else {
-            continue;
-        };
-        let candidate = AiMetadataUsage {
-            prefix,
-            provider,
-            prompt_tokens: prefixed_metadata_value(metadata, prefix, "_prompt_tokens")
-                .and_then(parse_canonical_u64),
-            completion_tokens: prefixed_metadata_value(metadata, prefix, "_completion_tokens")
-                .and_then(parse_canonical_u64),
-            total_tokens: prefixed_metadata_value(metadata, prefix, "_total_tokens")
-                .and_then(parse_canonical_u64),
-            cost_microunits: prefixed_metadata_value(metadata, prefix, "_estimated_cost")
-                .and_then(parse_cost_microunits),
-        };
-        if candidate.completeness() == 0 {
-            continue;
-        }
-
-        let replace = selected.as_ref().is_none_or(|current| {
-            candidate.completeness() > current.completeness()
-                || (candidate.completeness() == current.completeness()
-                    && candidate.prefix < current.prefix)
-        });
-        if replace {
-            selected = Some(candidate);
-        }
-    }
-
-    selected
 }
 
 /// Composite key for stream connection counter: (proxy_id, protocol).
@@ -1144,10 +1040,12 @@ impl MetricsRegistry {
             .or_insert_with(|| HistogramBuckets::new(self.epoch))
             .observe(summary.latency_gateway_overhead_ms, self.epoch);
 
-        if let Some(usage) = ai_metadata_usage(&summary.metadata) {
+        if let Some(usage) = summary.ai_usage_export.as_ref()
+            && let Some(provider) = ai_provider_label(usage.provider)
+        {
             let key = AiUsageKey {
                 proxy_id: Arc::clone(&proxy_id),
-                provider: usage.provider,
+                provider,
             };
             if let Some(value) = usage.prompt_tokens {
                 self.ai_prompt_tokens_counter

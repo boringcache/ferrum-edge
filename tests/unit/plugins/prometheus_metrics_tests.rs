@@ -8,8 +8,8 @@ use ferrum_edge::plugins::prometheus_metrics::{
     global_registry,
 };
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Direction, Plugin, RequestContext, StreamTransactionSummary, TransactionSummary,
-    WsDisconnectContext, ai_token_metrics::AiTokenMetrics,
+    ALL_PROTOCOLS, AiUsageExport, Direction, Plugin, RequestContext, StreamTransactionSummary,
+    TransactionSummary, WsDisconnectContext, ai_token_metrics::AiTokenMetrics,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
@@ -55,6 +55,7 @@ fn make_summary(
         bytes_received: 0,
         mirror: false,
         metadata: HashMap::new(),
+        ai_usage_export: None,
     }
 }
 
@@ -1427,6 +1428,7 @@ async fn ai_token_metadata_records_and_renders_bounded_prometheus_families() {
     let registry = MetricsRegistry::new();
     registry.configure(0, 3600, 0, "tenant-a");
     let mut summary = make_summary("ai-proxy", "POST", 200, 10.0, 8.0);
+    summary.ai_usage_export = ctx.authoritative_ai_usage_export();
     summary.metadata = ctx.metadata;
     registry.record(&summary);
     let output = registry.render_uncached();
@@ -1463,11 +1465,14 @@ fn federation_provider_aliases_use_bounded_ai_metric_families() {
 
     for (index, (raw_provider, _)) in aliases.iter().enumerate() {
         let mut summary = make_summary(&format!("federation-{index}"), "POST", 200, 1.0, 1.0);
-        summary.metadata = HashMap::from([
-            ("ai_usage_export".to_string(), "v1".to_string()),
-            ("ai_provider".to_string(), (*raw_provider).to_string()),
-            ("ai_total_tokens".to_string(), "1".to_string()),
-        ]);
+        summary.ai_usage_export = Some(AiUsageExport {
+            prefix: Arc::from("ai"),
+            provider: *raw_provider,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: Some(1),
+            cost_microunits: None,
+        });
         registry.record(&summary);
     }
 
@@ -1502,6 +1507,7 @@ async fn multiple_ai_token_instances_select_one_complete_snapshot_without_double
 
     let registry = MetricsRegistry::new();
     let mut summary = make_summary("multi-ai", "POST", 200, 1.0, 1.0);
+    summary.ai_usage_export = ctx.authoritative_ai_usage_export();
     summary.metadata = ctx.metadata;
     registry.record(&summary);
     let output = registry.render_uncached();
@@ -1518,7 +1524,7 @@ async fn multiple_ai_token_instances_select_one_complete_snapshot_without_double
 }
 
 #[test]
-fn malformed_or_unproven_ai_metadata_is_ignored_safely() {
+fn spoofed_backend_custom_and_malformed_ai_metadata_cannot_export_usage() {
     let registry = MetricsRegistry::new();
     let cases = [
         HashMap::from([
@@ -1536,6 +1542,27 @@ fn malformed_or_unproven_ai_metadata_is_ignored_safely() {
                 "18446744073709551616".to_string(),
             ),
             ("bad_estimated_cost".to_string(), "NaN".to_string()),
+        ]),
+        HashMap::from([
+            ("ai_usage_export".to_string(), "v1".to_string()),
+            ("ai_provider".to_string(), "openai".to_string()),
+            ("ai_total_tokens".to_string(), "999".to_string()),
+            ("ai_estimated_cost".to_string(), "999.000000".to_string()),
+        ]),
+        HashMap::from([
+            ("serverless_ai_usage_export".to_string(), "v1".to_string()),
+            ("serverless_ai_provider".to_string(), "openai".to_string()),
+            ("serverless_ai_total_tokens".to_string(), "999".to_string()),
+            (
+                "serverless_ai_estimated_cost".to_string(),
+                "999.000000".to_string(),
+            ),
+        ]),
+        HashMap::from([
+            ("custom.export".to_string(), "v1".to_string()),
+            ("custom.provider".to_string(), "openai".to_string()),
+            ("custom.total_tokens".to_string(), "999".to_string()),
+            ("custom.estimated_cost".to_string(), "999.000000".to_string()),
         ]),
         HashMap::from([
             ("raw_provider".to_string(), "openai".to_string()),
@@ -1557,7 +1584,6 @@ fn ai_usage_recording_is_concurrent_reload_safe_and_invalidates_render_cache() {
     let registry = Arc::new(MetricsRegistry::new());
     registry.configure(3600, 3600, 0, "before-reload");
     let metadata = HashMap::from([
-        ("ai_usage_export".to_string(), "v1".to_string()),
         ("ai_provider".to_string(), "anthropic".to_string()),
         ("ai_prompt_tokens".to_string(), "2".to_string()),
         ("ai_completion_tokens".to_string(), "1".to_string()),
@@ -1573,6 +1599,14 @@ fn ai_usage_recording_is_concurrent_reload_safe_and_invalidates_render_cache() {
                 for _ in 0..100 {
                     let mut summary = make_summary("concurrent-ai", "POST", 200, 1.0, 1.0);
                     summary.metadata = metadata.clone();
+                    summary.ai_usage_export = Some(AiUsageExport {
+                        prefix: Arc::from("ai"),
+                        provider: "anthropic",
+                        prompt_tokens: Some(2),
+                        completion_tokens: Some(1),
+                        total_tokens: Some(3),
+                        cost_microunits: Some(1),
+                    });
                     registry.record(&summary);
                 }
             });

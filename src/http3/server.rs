@@ -4059,6 +4059,7 @@ async fn handle_h3_request(
             error_class: outcome.error_class,
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
         };
         if !outcome.rejection_logged {
             crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -4347,6 +4348,7 @@ async fn handle_h3_request(
                     error_class: Some(h3_error_class),
                     bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
                     metadata: crate::proxy::clone_log_metadata(&ctx),
+                    ai_usage_export: ctx.ai_usage_export.clone(),
                     ..TransactionSummary::default()
                 };
                 crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -4516,6 +4518,7 @@ async fn handle_h3_request(
                 },
                 mirror: false,
                 metadata: crate::proxy::clone_log_metadata(&ctx),
+                ai_usage_export: ctx.ai_usage_export.clone(),
             };
             crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
             record_request(&state, reject.status_code);
@@ -4989,6 +4992,7 @@ async fn handle_h3_request(
             bytes_received: bytes_streamed,
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
         };
 
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -5568,6 +5572,7 @@ async fn handle_h3_request(
             bytes_received: h3_stream_result.bytes_streamed,
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
         };
 
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -6306,6 +6311,7 @@ async fn handle_h3_request(
             bytes_sent: raw_request_body_bytes,
             bytes_received,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
             ..TransactionSummary::default()
         };
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -9250,6 +9256,7 @@ async fn log_h3_grpc_transaction(
         error_class,
         mirror: false,
         metadata: crate::proxy::clone_log_metadata(ctx),
+        ai_usage_export: ctx.ai_usage_export.clone(),
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
 }
