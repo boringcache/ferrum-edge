@@ -1100,6 +1100,7 @@ pub mod _test_support {
         body: &[u8],
         headers: &HashMap<String, String>,
     ) -> bool {
+        ctx.begin_rejection_deadline_response_header_provenance(headers);
         crate::http3::server::run_h3_reject_response_committed_hooks(
             plugins,
             ctx,
