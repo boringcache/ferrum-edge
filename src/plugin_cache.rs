@@ -255,27 +255,33 @@ fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> R
 }
 
 /// A correlation header names one trust-domain value. Allowing two instances
-/// to own the same normalized header would make their instance-scoped metadata
-/// and stream-generated IDs contradictory. Equal priorities would make the
-/// canonical owner depend on storage/load order, so reject either ambiguity
-/// before the chain is published.
+/// that can execute for the same protocol to own the same normalized header
+/// would make their instance-scoped metadata and stream-generated IDs
+/// contradictory. Equal priorities would make the canonical owner depend on
+/// storage/load order. Reject either ambiguity before the chain is published,
+/// while allowing disjoint protocol owners that can never contend at runtime.
 fn validate_correlation_id_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
-    let mut headers = HashSet::new();
-    let mut priorities = HashSet::new();
-    for plugin in plugins {
-        let Some(header_name) = plugin.correlation_id_header_name() else {
-            continue;
-        };
-        if !headers.insert(header_name) {
-            return Err(format!(
-                "correlation_id: duplicate effective header_name {header_name:?} on the same plugin chain; each correlation trust domain must use a distinct header"
-            ));
-        }
-        let priority = plugin.priority();
-        if !priorities.insert(priority) {
-            return Err(format!(
-                "correlation_id: duplicate effective priority {priority} on the same plugin chain; configure distinct effective priorities with priority_override so canonical ownership is deterministic"
-            ));
+    for protocol in ALL_PROXY_PROTOCOLS {
+        let mut headers = HashSet::new();
+        let mut priorities = HashSet::new();
+        for plugin in plugins
+            .iter()
+            .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+        {
+            let Some(header_name) = plugin.correlation_id_header_name() else {
+                continue;
+            };
+            if !headers.insert(header_name) {
+                return Err(format!(
+                    "correlation_id: duplicate effective header_name {header_name:?} for protocol {protocol:?} on the same plugin chain; each overlapping correlation trust domain must use a distinct header"
+                ));
+            }
+            let priority = plugin.priority();
+            if !priorities.insert(priority) {
+                return Err(format!(
+                    "correlation_id: duplicate effective priority {priority} for protocol {protocol:?} on the same plugin chain; configure distinct effective priorities with priority_override so canonical ownership is deterministic"
+                ));
+            }
         }
     }
     Ok(())

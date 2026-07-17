@@ -3,7 +3,7 @@
 use ferrum_edge::custom_plugins::{create_custom_plugin, custom_plugin_names};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
-    RequestContext, plugin_failure_policy, validate_plugin_config,
+    RequestContext, TCP_ONLY_PROTOCOLS, plugin_failure_policy, validate_plugin_config,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -174,6 +174,29 @@ fn constructor_rejects_non_object_wrong_type_unknown_and_invalid_header_configs(
         let error = rejected_config(config);
         assert!(error.contains("correlation_header_name"), "got: {error}");
     }
+
+    for config in [
+        json!({"protocol": null}),
+        json!({"protocol": 7}),
+        json!({"protocol": "udp"}),
+    ] {
+        let error = rejected_config(config);
+        assert!(error.contains("protocol"), "got: {error}");
+    }
+}
+
+#[test]
+fn protocol_declaration_can_select_tcp_only() {
+    if !example_plugin_registered() {
+        return;
+    }
+
+    let plugin = create_example_plugin(&json!({
+        "protocol": "tcp",
+        "correlation_header_name": "x-stream-correlation-id"
+    }))
+    .expect("valid TCP-only example config");
+    assert_eq!(plugin.supported_protocols(), TCP_ONLY_PROTOCOLS);
 }
 
 #[test]

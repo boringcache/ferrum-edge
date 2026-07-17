@@ -1,5 +1,6 @@
 //! Tests for ws_frame_logging plugin
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ferrum_edge::plugins::correlation_id::CorrelationId;
@@ -107,6 +108,28 @@ fn preview_plugin(preview_bytes: u64) -> WsFrameLogging {
 fn install_ws_log_capture(capture: &WsLogCapture) -> tracing::subscriber::DefaultGuard {
     let subscriber = tracing_subscriber::registry().with(capture.layer());
     tracing::subscriber::set_default(subscriber)
+}
+
+fn disconnect_context(metadata: HashMap<String, String>) -> WsDisconnectContext {
+    WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "ws-proxy".to_string(),
+        proxy_name: Some("websocket".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        backend_target: "ws://127.0.0.1:9001/socket".to_string(),
+        listen_port: 8000,
+        duration_ms: 1.0,
+        frames_client_to_backend: 1,
+        frames_backend_to_client: 1,
+        bytes_client_to_backend: 4,
+        bytes_backend_to_client: 4,
+        direction: None,
+        io_side: None,
+        error_class: None,
+        consumer_username: None,
+        auth_method: None,
+        metadata,
+    }
 }
 
 async fn log_frame(plugin: &WsFrameLogging, connection_id: u64, message: &Message) {
@@ -260,25 +283,7 @@ async fn correlation_id_composition_reaches_generated_and_preserved_disconnect_l
         assert_ne!(expected, "attacker-controlled-alias");
 
         logger
-            .on_ws_disconnect(&WsDisconnectContext {
-                namespace: "ferrum".to_string(),
-                proxy_id: "ws-proxy".to_string(),
-                proxy_name: Some("websocket".to_string()),
-                client_ip: "127.0.0.1".to_string(),
-                backend_target: "ws://127.0.0.1:9001/socket".to_string(),
-                listen_port: 8000,
-                duration_ms: 1.0,
-                frames_client_to_backend: 1,
-                frames_backend_to_client: 1,
-                bytes_client_to_backend: 4,
-                bytes_backend_to_client: 4,
-                direction: None,
-                io_side: None,
-                error_class: None,
-                consumer_username: None,
-                auth_method: None,
-                metadata: request_ctx.metadata.clone(),
-            })
+            .on_ws_disconnect(&disconnect_context(request_ctx.metadata.clone()))
             .await;
 
         let event = capture
@@ -292,6 +297,50 @@ async fn correlation_id_composition_reaches_generated_and_preserved_disconnect_l
             assert!(uuid::Uuid::parse_str(&expected).is_ok());
         }
     }
+}
+
+#[tokio::test]
+async fn disconnect_log_falls_back_to_legacy_custom_correlation_metadata() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let logger = WsFrameLogging::new(&json!({})).expect("valid WebSocket logger config");
+
+    logger
+        .on_ws_disconnect(&disconnect_context(HashMap::from([(
+            "correlation_id".to_string(),
+            "legacy-custom-id".to_string(),
+        )])))
+        .await;
+
+    let event = capture
+        .events()
+        .into_iter()
+        .find(|event| event.event.as_deref() == Some("disconnect"))
+        .expect("disconnect log event");
+    assert_eq!(event.correlation_id.as_deref(), Some("legacy-custom-id"));
+
+    logger
+        .on_ws_disconnect(&disconnect_context(HashMap::from([
+            (
+                "request_id".to_string(),
+                "canonical-request-id".to_string(),
+            ),
+            (
+                "correlation_id".to_string(),
+                "legacy-custom-id".to_string(),
+            ),
+        ])))
+        .await;
+    let event = capture
+        .events()
+        .into_iter()
+        .rev()
+        .find(|event| event.event.as_deref() == Some("disconnect"))
+        .expect("disconnect log event");
+    assert_eq!(
+        event.correlation_id.as_deref(),
+        Some("canonical-request-id")
+    );
 }
 
 // === on_ws_frame always returns None (never transforms) ===

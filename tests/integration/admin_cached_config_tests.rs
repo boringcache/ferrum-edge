@@ -2910,6 +2910,77 @@ async fn admin_rejects_custom_only_correlation_collision_before_persistence() {
 }
 
 #[tokio::test]
+async fn admin_allows_custom_correlation_owners_on_disjoint_protocols() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let batch = json!({
+        "proxies": [{
+            "id": "disjoint-correlation-proxy",
+            "listen_path": "/disjoint-correlation",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "disjoint-correlation-http"},
+                {"plugin_config_id": "disjoint-correlation-tcp"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "disjoint-correlation-http",
+                "plugin_name": "example_plugin",
+                "scope": "proxy",
+                "proxy_id": "disjoint-correlation-proxy",
+                "enabled": true,
+                "config": {"correlation_header_name": "x-custom-correlation-id"}
+            },
+            {
+                "id": "disjoint-correlation-tcp",
+                "plugin_name": "example_plugin",
+                "scope": "proxy",
+                "proxy_id": "disjoint-correlation-proxy",
+                "enabled": true,
+                "config": {
+                    "correlation_header_name": " X-Custom-Correlation-ID ",
+                    "protocol": "tcp"
+                }
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(
+        status, 201,
+        "disjoint custom correlation owners were rejected: {body:?}"
+    );
+    for id in ["disjoint-correlation-http", "disjoint-correlation-tcp"] {
+        let (status, _, _) = admin_get(&base_url, &format!("/plugins/config/{id}"), &token).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "admitted custom correlation config {id} was not persisted"
+        );
+    }
+    let (status, _, _) = admin_get(
+        &base_url,
+        "/proxies/disjoint-correlation-proxy",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "admitted custom correlation proxy was not persisted"
+    );
+}
+
+#[tokio::test]
 async fn restore_rejects_hmac_request_body_transformer_before_delete() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

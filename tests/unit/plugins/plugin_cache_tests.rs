@@ -5380,6 +5380,54 @@ fn test_custom_only_duplicate_effective_correlation_headers_are_rejected() {
 }
 
 #[test]
+fn test_custom_correlation_owners_on_disjoint_protocols_are_allowed() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let http_owner = make_plugin_config_with_json(
+        "custom-corr-http",
+        "example_plugin",
+        json!({"correlation_header_name": "x-custom-correlation-id"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let tcp_owner = make_plugin_config_with_json(
+        "custom-corr-tcp",
+        "example_plugin",
+        json!({
+            "correlation_header_name": " X-Custom-Correlation-ID ",
+            "protocol": "tcp"
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["custom-corr-http", "custom-corr-tcp"],
+        )],
+        vec![http_owner, tcp_owner],
+    );
+
+    let cache = PluginCache::new(&config)
+        .expect("disjoint protocol owners cannot contend for correlation ownership");
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("p1", ProxyProtocol::Http)
+            .len(),
+        1
+    );
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("p1", ProxyProtocol::Tcp)
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn test_modifies_request_headers_flag_false_when_no_plugin_modifies() {
     // stdout_logging does not modify request headers
     let config = make_config(

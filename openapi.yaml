@@ -10831,7 +10831,7 @@ components:
     CorrelationIdConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: correlation_id — Preserves a non-empty inbound ID only when it is at most 256 bytes and matches [A-Za-z0-9._-]+; every missing or rejected value is replaced (never truncated) with UUID v4. Multiple instances retain independent authoritative values in private typed request/session state. The first instance in priority order owns the canonical request_id, while every instance forwards and echoes only its own private value, including on successful H1/H2/H3 WebSocket handshakes. Public request_id and correlation_id.instance.* metadata are compatibility projections; later plugin writes cannot change authoritative forwarding, echo, or logged values. Effective instances on one proxy chain must normalize to distinct header_name values and have distinct effective priorities; use priority_override to make canonical ownership deterministic. Admission and reload reject either ambiguous composition. The top-level config must be an object; null fields select defaults."
+      description: "Plugin: correlation_id — Preserves a non-empty inbound ID only when it is at most 256 bytes and matches [A-Za-z0-9._-]+; every missing or rejected value is replaced (never truncated) with UUID v4. Multiple instances retain independent authoritative values in private typed request/session state. The first instance in priority order owns the canonical request_id, while every instance forwards and echoes only its own private value, including on successful H1/H2/H3 WebSocket handshakes. Public request_id and correlation_id.instance.* metadata are compatibility projections; later plugin writes cannot change authoritative forwarding, echo, or logged values. Effective instances on one proxy chain that overlap on any supported protocol must normalize to distinct header_name values and have distinct effective priorities; use priority_override to make canonical ownership deterministic. Disjoint protocol owners do not conflict. Admission and reload reject either overlapping ambiguous composition. The top-level config must be an object; null fields select defaults."
       properties:
         header_name:
           type: [string, "null"]
@@ -10844,7 +10844,7 @@ components:
           allOf:
             - not:
                 type: string
-                pattern: "^\\s*(?:[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Hh][Oo][Ss][Tt]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Pp][Rr][Oo][Tt][Oo])\\s*$"
+                pattern: "^\\s*(?:[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]|[Vv][Ii][Aa]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Hh][Oo][Ss][Tt]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Pp][Rr][Oo][Tt][Oo])\\s*$"
           description: "Header name (surrounding whitespace trimmed and lowercased internally). Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, gRPC status, and WebSocket handshake names, plus security-sensitive credential/authentication names, are rejected case-insensitively. Null selects x-request-id."
         echo_downstream:
           type: [boolean, "null"]

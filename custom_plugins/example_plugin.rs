@@ -5,8 +5,8 @@
 //!
 //! This plugin adds a custom `X-Custom-Gateway` header to every request
 //! before it is proxied to the backend, and echoes it back in the response.
-//! Optional `request_body_prefix` and `correlation_header_name` fields
-//! demonstrate capability metadata used by core composition validation.
+//! Optional `request_body_prefix`, `correlation_header_name`, and `protocol`
+//! fields demonstrate capability metadata used by core composition validation.
 //!
 //! The `create_plugin` function at the bottom is the only required entry
 //! point — the build script discovers this file automatically.
@@ -17,12 +17,16 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext, TransactionSummary};
+use crate::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
+    StreamConnectionContext, TCP_ONLY_PROTOCOLS, TransactionSummary,
+};
 
 pub struct ExamplePlugin {
     header_value: String,
     request_body_prefix: Option<Vec<u8>>,
     correlation_header_name: Option<String>,
+    supported_protocols: &'static [ProxyProtocol],
 }
 
 const DEFAULT_HEADER_VALUE: &str = "ferrum-custom";
@@ -37,10 +41,10 @@ impl ExamplePlugin {
         for key in config.keys() {
             if !matches!(
                 key.as_str(),
-                "header_value" | "request_body_prefix" | "correlation_header_name"
+                "header_value" | "request_body_prefix" | "correlation_header_name" | "protocol"
             ) {
                 return Err(format!(
-                    "example_plugin config contains unknown key '{key}'; expected only 'header_value', 'request_body_prefix', and 'correlation_header_name'"
+                    "example_plugin config contains unknown key '{key}'; expected only 'header_value', 'request_body_prefix', 'correlation_header_name', and 'protocol'"
                 ));
             }
         }
@@ -99,6 +103,19 @@ impl ExamplePlugin {
                 );
             }
         };
+        let supported_protocols = match config.get("protocol") {
+            None => HTTP_ONLY_PROTOCOLS,
+            Some(Value::String(value)) if value == "http" => HTTP_ONLY_PROTOCOLS,
+            Some(Value::String(value)) if value == "tcp" => TCP_ONLY_PROTOCOLS,
+            Some(Value::String(value)) => {
+                return Err(format!(
+                    "example_plugin.protocol must be 'http' or 'tcp', got '{value}'"
+                ));
+            }
+            Some(_) => {
+                return Err("example_plugin.protocol must be a string when present".to_string());
+            }
+        };
         Ok(Self {
             // Read configuration from the plugin's JSON config.
             // In the gateway config, this would look like:
@@ -106,6 +123,7 @@ impl ExamplePlugin {
             header_value,
             request_body_prefix,
             correlation_header_name,
+            supported_protocols,
         })
     }
 }
@@ -119,6 +137,10 @@ impl Plugin for ExamplePlugin {
 
     fn correlation_id_header_name(&self) -> Option<&str> {
         self.correlation_header_name.as_deref()
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        self.supported_protocols
     }
 
     /// Execution priority. See `src/plugins/mod.rs` for the priority band guide:
@@ -181,6 +203,14 @@ impl Plugin for ExamplePlugin {
         transformed.extend_from_slice(prefix);
         transformed.extend_from_slice(body);
         Some(transformed)
+    }
+
+    async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        if let Some(header_name) = &self.correlation_header_name {
+            ctx.metadata
+                .insert(header_name.clone(), self.header_value.clone());
+        }
+        PluginResult::Continue
     }
 
     /// Called after the backend response is received.

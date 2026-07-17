@@ -1202,7 +1202,7 @@ ferrum-edge/
 ├── build.rs                   # Auto-discovers plugins + migrations at compile time
 ├── custom_plugins/            # YOUR PLUGINS GO HERE — just drop .rs files
 │   ├── mod.rs                 # Thin shim (includes build-script-generated code)
-│   ├── example_plugin.rs      # Working example — header/body transforms (can be removed)
+│   ├── example_plugin.rs      # Working example — protocol-scoped header/body/correlation capabilities (can be removed)
 │   ├── example_audit_plugin.rs # Working example — database migrations (can be removed)
 │   ├── my_header_injector.rs  # Your plugin
 │   └── my_custom_auth.rs      # Your plugin

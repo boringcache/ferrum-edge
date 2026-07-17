@@ -361,6 +361,12 @@ impl Plugin for WsFrameLogging {
             .as_ref()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "none".to_string());
+        let correlation_id = ctx
+            .metadata
+            .get(super::REQUEST_ID_METADATA_KEY)
+            .or_else(|| ctx.metadata.get("correlation_id"))
+            .map(String::as_str)
+            .unwrap_or("-");
 
         // Pick a tracing macro at the plugin's configured level so that log
         // targets routed by `ws_frame_log` match the frame output volume.
@@ -380,7 +386,7 @@ impl Plugin for WsFrameLogging {
                 error_class = %error_class_label,
                 consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
                 auth_method = ctx.auth_method.unwrap_or("-"),
-                correlation_id = ctx.metadata.get(super::REQUEST_ID_METADATA_KEY).map(String::as_str).unwrap_or("-"),
+                correlation_id = %correlation_id,
                 event = "disconnect",
                 "WebSocket session ended"
             ),
@@ -399,7 +405,7 @@ impl Plugin for WsFrameLogging {
                 error_class = %error_class_label,
                 consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
                 auth_method = ctx.auth_method.unwrap_or("-"),
-                correlation_id = ctx.metadata.get(super::REQUEST_ID_METADATA_KEY).map(String::as_str).unwrap_or("-"),
+                correlation_id = %correlation_id,
                 event = "disconnect",
                 "WebSocket session ended"
             ),
@@ -418,7 +424,7 @@ impl Plugin for WsFrameLogging {
                 error_class = %error_class_label,
                 consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
                 auth_method = ctx.auth_method.unwrap_or("-"),
-                correlation_id = ctx.metadata.get(super::REQUEST_ID_METADATA_KEY).map(String::as_str).unwrap_or("-"),
+                correlation_id = %correlation_id,
                 event = "disconnect",
                 "WebSocket session ended"
             ),
