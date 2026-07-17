@@ -271,9 +271,14 @@ fn validate_correlation_id_composition(plugins: &[Arc<dyn Plugin>]) -> Result<()
             let Some(header_name) = plugin.correlation_id_header_name() else {
                 continue;
             };
-            if !headers.insert(header_name) {
+            // Custom plugins are expected to normalize this capability, but
+            // composition admission must not trust third-party implementations
+            // to do so. This allocation happens only while building/validating a
+            // cache generation, never on the request hot path.
+            let normalized_header_name = header_name.to_ascii_lowercase();
+            if !headers.insert(normalized_header_name.clone()) {
                 return Err(format!(
-                    "correlation_id: duplicate effective header_name {header_name:?} for protocol {protocol:?} on the same plugin chain; each overlapping correlation trust domain must use a distinct header"
+                    "correlation_id: duplicate effective header_name {normalized_header_name:?} for protocol {protocol:?} on the same plugin chain; each overlapping correlation trust domain must use a distinct header"
                 ));
             }
             let priority = plugin.priority();

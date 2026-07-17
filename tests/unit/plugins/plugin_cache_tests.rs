@@ -5348,6 +5348,10 @@ fn test_custom_only_duplicate_effective_correlation_headers_are_rejected() {
         return;
     }
 
+    // The example plugin retains configured casing at the capability boundary,
+    // modeling a third-party implementation that did not pre-normalize its
+    // correlation_id_header_name() result. Core validation must still compare
+    // these two claims case-insensitively.
     let first = make_plugin_config_with_json(
         "custom-corr-first",
         "example_plugin",

@@ -26,6 +26,7 @@ pub struct ExamplePlugin {
     header_value: String,
     request_body_prefix: Option<Vec<u8>>,
     correlation_header_name: Option<String>,
+    correlation_header_claim: Option<String>,
     supported_protocols: &'static [ProxyProtocol],
 }
 
@@ -79,8 +80,10 @@ impl ExamplePlugin {
                 );
             }
         };
-        let correlation_header_name = match config.get("correlation_header_name") {
-            None => None,
+        let (correlation_header_name, correlation_header_claim) = match config
+            .get("correlation_header_name")
+        {
+            None => (None, None),
             Some(Value::String(value)) => {
                 let value = value.trim();
                 if value.is_empty() {
@@ -94,7 +97,10 @@ impl ExamplePlugin {
                         "example_plugin.correlation_header_name must be a valid HTTP header name: {error}"
                     )
                 })?;
-                Some(header_name.as_str().to_string())
+                (
+                    Some(header_name.as_str().to_string()),
+                    Some(value.to_string()),
+                )
             }
             Some(_) => {
                 return Err(
@@ -123,6 +129,7 @@ impl ExamplePlugin {
             header_value,
             request_body_prefix,
             correlation_header_name,
+            correlation_header_claim,
             supported_protocols,
         })
     }
@@ -136,7 +143,11 @@ impl Plugin for ExamplePlugin {
     }
 
     fn correlation_id_header_name(&self) -> Option<&str> {
-        self.correlation_header_name.as_deref()
+        // Keep the configured spelling at this capability boundary so the core
+        // validator remains defensive against third-party plugins that do not
+        // pre-normalize. Runtime header writes still use the validated,
+        // lowercase `correlation_header_name` above.
+        self.correlation_header_claim.as_deref()
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
