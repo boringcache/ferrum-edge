@@ -3360,12 +3360,6 @@ pub async fn handle_delete_api_spec(
         additional_plugin_ids.iter().map(String::as_str).collect();
     let mut additional_plugins = Vec::with_capacity(additional_plugin_ids.len());
     for plugin_id in &additional_plugin_ids {
-        if !proxy_plugin_ids.contains(plugin_id.as_str()) {
-            return Ok(error_response(ApiSpecError::Unprocessable(format!(
-                "API spec '{}' cannot delete proxy '{}': cascade plugin '{}' is not present in the proxy association graph",
-                existing.id, existing.proxy_id, plugin_id
-            ))));
-        }
         match db.get_plugin_config(namespace, plugin_id).await {
             Ok(Some(plugin)) if plugin.api_spec_id.is_none() => additional_plugins.push(plugin),
             Ok(Some(plugin)) => {

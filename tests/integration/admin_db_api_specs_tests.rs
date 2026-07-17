@@ -584,6 +584,55 @@ async fn restore_bundle_preserves_complete_owned_and_hand_added_graph() {
 }
 
 #[tokio::test]
+async fn restore_bundle_preserves_unattached_proxy_config_during_late_delete_compensation() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-unattached-proxy");
+    let spec_id = uid("restore-unattached-spec");
+    let plugin_id = uid("restore-unattached-plugin");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    assert!(proxy.plugins.is_empty());
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"unattached plugin compensation");
+    let mut unattached = make_plugin(&plugin_id, &proxy_id, ns, None);
+    unattached.enabled = false;
+    unattached.priority_override = Some(19);
+
+    store
+        .restore_api_spec_bundle(&bundle, &spec, std::slice::from_ref(&unattached))
+        .await
+        .expect("late-delete compensation must restore an unattached proxy config");
+
+    let restored_proxy = store
+        .get_proxy(ns, &proxy_id)
+        .await
+        .expect("get restored proxy failed")
+        .expect("restored proxy missing");
+    assert!(
+        restored_proxy.plugins.is_empty(),
+        "compensation must not invent a reverse proxy association"
+    );
+    let restored_plugin = store
+        .get_plugin_config(ns, &plugin_id)
+        .await
+        .expect("get restored unattached plugin failed")
+        .expect("unattached proxy config was not restored");
+    assert_eq!(restored_plugin.scope, PluginScope::Proxy);
+    assert_eq!(restored_plugin.proxy_id.as_deref(), Some(proxy_id.as_str()));
+    assert!(restored_plugin.api_spec_id.is_none());
+    assert!(!restored_plugin.enabled);
+    assert_eq!(restored_plugin.priority_override, Some(19));
+    assert_eq!(restored_plugin.config, unattached.config);
+}
+
+#[tokio::test]
 async fn restore_bundle_rolls_back_resources_associations_spec_and_changes_on_late_failure() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;

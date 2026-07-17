@@ -173,18 +173,6 @@ pub(crate) fn validate_api_spec_restore_inputs(
             );
         }
     }
-    if compensation_restore
-        && let Some(unassociated) = inserted_plugin_ids
-            .iter()
-            .find(|plugin_id| !association_ids.contains(*plugin_id))
-    {
-        anyhow::bail!(
-            "API-spec restore plugin '{}' is not associated with proxy '{}'",
-            unassociated,
-            bundle.proxy.id
-        );
-    }
-
     Ok(())
 }
 

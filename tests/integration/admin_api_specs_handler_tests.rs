@@ -1859,6 +1859,61 @@ async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
 }
 
 #[tokio::test]
+async fn api_spec_delete_accepts_unattached_proxy_scoped_cascade_plugin() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("unattached-cascade-proxy");
+    let spec = minimal_json_spec(&proxy_id);
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id")
+        .to_string();
+    let plugin_id = uid("unattached-cascade-plugin");
+    store
+        .create_plugin_config(&manual_proxy_plugin(
+            &plugin_id,
+            &proxy_id,
+            "stdout_logging",
+            json!({}),
+        ))
+        .await
+        .expect("create unattached proxy-scoped plugin");
+
+    let proxy = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .expect("get API-spec proxy")
+        .expect("API-spec proxy missing");
+    assert!(
+        proxy
+            .plugins
+            .iter()
+            .all(|association| association.plugin_config_id != plugin_id),
+        "test plugin must remain unattached"
+    );
+
+    let delete_status = client.delete(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::NO_CONTENT,
+        "valid unattached proxy-scoped config must not block API-spec deletion"
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", &plugin_id)
+            .await
+            .expect("read cascade-deleted unattached plugin")
+            .is_none(),
+        "proxy deletion must cascade the unattached proxy-scoped config"
+    );
+}
+
+#[tokio::test]
 async fn api_spec_delete_rejects_foreign_owned_cascade_plugin_without_retagging() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;

@@ -251,7 +251,7 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 
 **MongoDB without a replica set**: atomicity is limited to single-document operations. Normal multi-resource submissions retain their best-effort approach with compensating deletes on failure. In the event of an infrastructure fault mid-submission, orphaned resources are possible. Late `DELETE` compensation is stricter: it fails closed before writing anything because a partially restored proxy could publish without its security plugins. The already-committed delete therefore remains in place until an operator retries on a replica-set deployment or re-submits the spec. Use a MongoDB replica set for production deployments that require atomic multi-document writes or automatic late-delete recovery.
 
-Before deletion, Ferrum re-reads every plugin that the proxy cascade would remove through an ownership-preserving admin query. A plugin tagged to another API spec, a cascade plugin missing from the proxy association graph, or another malformed partial graph rejects the delete instead of being retagged or restored as the wrong instance.
+Before deletion, Ferrum re-reads every plugin that the proxy cascade would remove through an ownership-preserving admin query. Proxy-scoped configs remain valid without a reverse entry in `proxy.plugins`; compensation restores those configs in the same transaction while preserving their unattached state. A cascade plugin tagged to another API spec or another malformed partial graph rejects the delete instead of being retagged or restored as the wrong instance.
 
 ### Detecting and cleaning up orphans (MongoDB non-RS)
 

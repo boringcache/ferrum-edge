@@ -780,9 +780,11 @@ Deletes the spec and cascades:
 - If namespace admission is lost after the delete commits, SQL backends and
   replica-set MongoDB restore the upstream, proxy, all spec-owned and hand-owned
   plugins removed by the cascade, associations, spec row, and config-change
-  records in one transaction. Standalone MongoDB cannot provide that boundary,
-  so compensation fails before writing and leaves the route deleted rather than
-  publishing a partially protected proxy.
+  records in one transaction. Valid proxy-scoped configs without a reverse
+  proxy association are restored in that same transaction and remain
+  unattached. Standalone MongoDB cannot provide that boundary, so compensation
+  fails before writing and leaves the route deleted rather than publishing a
+  partially protected proxy.
 
 ### Cascade and ownership summary
 
