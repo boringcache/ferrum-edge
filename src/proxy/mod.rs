@@ -175,7 +175,7 @@ pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
 /// One-shot handoff for requester-owned auth session state that changed before
 /// authentication attempts rejected. Distinct cookie storage keys are
 /// newline-joined; a later attempt replaces an earlier candidate with the same
-/// exact name/domain/host-only/path/partitioned scope. The authentication phase
+/// exact name/effective-domain/path/partitioned scope. The authentication phase
 /// removes this key on every exit: it attaches the cookies only to the final
 /// rejection and discards them when a later credential succeeds. The key
 /// contains "cookie" so metadata serialization still redacts the sealed values
@@ -15907,7 +15907,9 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     PluginResult::Continue
 }
 
-/// Return the RFC 6265 cookie-name from a browser-comparable leading
+const MAX_SET_COOKIE_NAME_VALUE_BYTES: usize = 4096;
+
+/// Return the RFC 10025 cookie-name from a browser-comparable leading
 /// cookie-pair. Keep the existing strict producer grammar for names, but use
 /// the user-agent value boundary: browsers accept non-control value syntax
 /// that producers are discouraged from emitting, including spaces, commas,
@@ -15921,7 +15923,11 @@ fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     // cookie-pair before validating its name and value.
     let name = name.trim_matches([' ', '\t']);
     let value = value.trim_matches([' ', '\t']);
-    if name.is_empty()
+    // RFC 10025 rejects a cookie when its trimmed name and value total more
+    // than 4096 octets. Such a line cannot own and suppress a valid staged
+    // cleanup cookie that the browser can actually store.
+    if name.len().saturating_add(value.len()) > MAX_SET_COOKIE_NAME_VALUE_BYTES
+        || name.is_empty()
         || !name.bytes().all(|byte| {
             matches!(
                 byte,
@@ -16068,21 +16074,20 @@ struct SetCookieStorageKey<'a> {
     name: &'a str,
     domain: Option<CanonicalSetCookieDomain<'a>>,
     path: &'a str,
-    host_only: bool,
     partitioned: bool,
 }
 
-/// Return the effective RFC 6265 cookie storage key. All compared lines belong
-/// to one response, so host-only cookies share the same request host without
-/// copying it into the key. Omitted, empty, or non-absolute Path attributes use
-/// the request path's default directory. Host-only and Partitioned cookies
-/// remain independent from otherwise equivalent domain and unpartitioned
-/// cookies.
+/// Return the effective RFC 10025 cookie storage key. Omitted Domain resolves
+/// to the exact validated request host used for browser cookie comparison, so
+/// host-only and explicit same-host Domain cookies compare by their effective
+/// domain. Omitted, empty, or non-absolute Path attributes use the request
+/// path's default directory. Partitioned cookies remain independent from
+/// otherwise equivalent unpartitioned cookies.
 fn set_cookie_storage_key<'a>(
     set_cookie: &'a str,
     default_path: &'a str,
     request_is_secure: bool,
-    request_host: Option<&str>,
+    request_host: Option<&'a str>,
     request_host_ip: Option<IpAddr>,
 ) -> Option<SetCookieStorageKey<'a>> {
     let name = set_cookie_name(set_cookie)?;
@@ -16138,14 +16143,14 @@ fn set_cookie_storage_key<'a>(
     // exact-IP Domain as a host cookie and reject a nonmatching IP Domain.
     // An invalid Path value falls back to the request's default path.
     let (domain, host_only) = match domain_attribute {
-        None => (None, true),
+        None => (request_host.and_then(canonical_set_cookie_domain), true),
         Some(domain) => {
             let domain = canonical_set_cookie_domain(domain)?;
             if let Some(domain_ip) = canonical_set_cookie_domain_ip(&domain) {
                 if request_host_ip != Some(domain_ip) {
                     return None;
                 }
-                (None, true)
+                (Some(domain), true)
             } else {
                 // RFC 6265bis public-suffix handling is storage-key-visible:
                 // a Domain equal to the request host is converted to a
@@ -16160,7 +16165,7 @@ fn set_cookie_storage_key<'a>(
                     if !request_host.is_some_and(|host| host.eq_ignore_ascii_case(domain_text)) {
                         return None;
                     }
-                    (None, true)
+                    (Some(domain), true)
                 } else {
                     (Some(domain), false)
                 }
@@ -16207,7 +16212,6 @@ fn set_cookie_storage_key<'a>(
         name,
         domain,
         path,
-        host_only,
         partitioned,
     })
 }
@@ -16241,7 +16245,6 @@ fn set_cookie_same_storage_key(
 
     existing_key.name == candidate_key.name
         && existing_key.path == candidate_key.path
-        && existing_key.host_only == candidate_key.host_only
         && existing_key.partitioned == candidate_key.partitioned
         && match (existing_key.domain, candidate_key.domain) {
             (
@@ -16258,7 +16261,7 @@ fn set_cookie_same_storage_key(
 }
 
 /// Add newline-joined `Set-Cookie` lines in encounter order, replacing an
-/// earlier line only when a later line owns the same RFC 6265 storage key.
+/// earlier line only when a later line owns the same RFC 10025 storage key.
 /// Invalid cookie-pairs can only replace byte-identical lines.
 fn collect_later_set_cookies(
     cookies: &mut Vec<String>,

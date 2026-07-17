@@ -2394,12 +2394,63 @@ async fn test_auth_rejection_cookie_storage_key_rejects_nonmatching_public_suffi
 }
 
 #[tokio::test]
-async fn test_auth_rejection_cookie_storage_key_preserves_host_only_state() {
+async fn test_auth_rejection_cookie_storage_key_compares_host_only_by_effective_request_domain() {
+    for (authority, staged_cookie, selected_cookie) in [
+        (
+            "example.com",
+            "session=staged; Path=/",
+            "session=selected; Domain=example.com; Path=/",
+        ),
+        (
+            "example.com:8443",
+            "session=staged; Domain=.EXAMPLE.COM; Path=/",
+            "session=selected; Path=/",
+        ),
+    ] {
+        let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+            cookies: staged_cookie,
+        });
+        let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+            cookies: selected_cookie,
+        });
+        let auth_plugins = [staged, selected];
+        let consumer_index = ConsumerIndex::new(&[]);
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/cookie-scope".to_string(),
+        );
+        ctx.request_authority = Some(authority.to_string());
+
+        let (_, _, headers) =
+            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+                .await
+                .expect("both auth attempts must reject");
+
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some(selected_cookie),
+            "host-only and explicit request-host Domain cookies must share the effective domain regardless of Domain case, a leading dot, or an authority port"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_rejects_oversized_selected_cookie_pair() {
+    let boundary_name = "boundary";
+    let boundary_value = "b".repeat(4096 - boundary_name.len());
+    let boundary_cookie = format!("{boundary_name}={boundary_value}; Path=/");
+    let oversized_name = "oversized";
+    let oversized_value = "o".repeat(4097 - oversized_name.len());
+    let oversized_cookie = format!("{oversized_name}={oversized_value}; Path=/");
+    let selected_cookies: &'static str =
+        Box::leak(format!("{oversized_cookie}\n{boundary_cookie}").into_boxed_str());
+
     let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
-        cookies: "session=staged; Path=/",
+        cookies: "oversized=; Max-Age=0; Path=/\nboundary=staged; Path=/",
     });
     let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
-        cookies: "session=selected; Domain=example.com; Path=/",
+        cookies: selected_cookies,
     });
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
@@ -2408,14 +2459,21 @@ async fn test_auth_rejection_cookie_storage_key_preserves_host_only_state() {
         "GET".to_string(),
         "/cookie-scope".to_string(),
     );
+    ctx.request_authority = Some("example.com".to_string());
+
     let (_, _, headers) =
         run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
             .await
             .expect("both auth attempts must reject");
+    let emitted = headers["set-cookie"].split('\n').collect::<Vec<_>>();
 
-    assert_eq!(
-        headers.get("set-cookie").map(String::as_str),
-        Some("session=selected; Domain=example.com; Path=/\nsession=staged; Path=/")
+    assert_eq!(emitted.len(), 3);
+    assert_eq!(emitted[0], oversized_cookie);
+    assert_eq!(emitted[1], boundary_cookie);
+    assert_eq!(emitted[2], "oversized=; Max-Age=0; Path=/");
+    assert!(
+        !emitted.contains(&"boundary=staged; Path=/"),
+        "a 4096-octet selected name/value pair remains comparable"
     );
 }
 
