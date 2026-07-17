@@ -45,7 +45,25 @@ jobs:
         run: python3 .github/scripts/pr_ci_plan.py --self-test
 
       - name: Verify ARM64 cross-build command policy
-        run: python3 .github/scripts/verify_cross_build_policy.py --self-test
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          verifier=".github/scripts/verify_cross_build_policy.py"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base_ref="origin/${BASE_REF}"
+            trusted_verifier="$RUNNER_TEMP/verify_cross_build_policy.py"
+            # After the bootstrap PR, always enforce the base branch's policy
+            # so a PR cannot weaken the verifier alongside Cross.toml.
+            if git cat-file -e "${base_ref}:${verifier}" 2>/dev/null; then
+              git show "${base_ref}:${verifier}" > "$trusted_verifier"
+              verifier="$trusted_verifier"
+            fi
+          fi
+
+          python3 "$verifier" --self-test --config Cross.toml
 
       - name: Check PR diff hygiene
         if: github.event_name == 'pull_request'
