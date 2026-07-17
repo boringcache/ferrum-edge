@@ -1388,6 +1388,64 @@ async fn test_auth_rejection_cookie_storage_key_rejects_nonmatching_ip_domain() 
 }
 
 #[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_normalizes_matching_public_suffix_domain() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "session=staged; Path=/",
+    });
+    let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+        cookies: "session=selected; Domain=github.io; Path=/",
+    });
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cookie-scope".to_string(),
+    );
+    ctx.request_authority = Some("github.io".to_string());
+
+    let (_, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("both auth attempts must reject");
+
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("session=selected; Domain=github.io; Path=/"),
+        "a public-suffix Domain equal to the request host becomes host-only and owns the staged host cookie"
+    );
+}
+
+#[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_rejects_nonmatching_public_suffix_domain() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "session=staged; Path=/",
+    });
+    let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+        cookies: "session=selected; Domain=github.io; Path=/",
+    });
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cookie-scope".to_string(),
+    );
+    ctx.request_authority = Some("app.github.io".to_string());
+
+    let (_, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("both auth attempts must reject");
+
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("session=selected; Domain=github.io; Path=/\nsession=staged; Path=/"),
+        "a public-suffix Domain that differs from the request host is rejected and cannot suppress a storable staged cookie"
+    );
+}
+
+#[tokio::test]
 async fn test_auth_rejection_cookie_storage_key_preserves_host_only_state() {
     let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
         cookies: "session=staged; Path=/",

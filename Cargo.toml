@@ -160,6 +160,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }
 base64 = "0.22"
 url = "2"
+# Mozilla Public Suffix List for browser-equivalent Set-Cookie Domain handling.
+psl = "2"
 percent-encoding = "2"
 socket2 = { version = "0.6.3", features = ["all"] }
 tokio-util = { version = "0.7.18", default-features = false }

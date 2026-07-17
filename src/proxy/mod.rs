@@ -3212,6 +3212,30 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
     val
 }
 
+/// Replace proxy-managed scheme metadata with the effective browser-facing
+/// request scheme. Direct gRPC and WebSocket dispatch start from a sanitized
+/// request map instead of the canonical HTTP backend builders, so normalize
+/// these fields before those protocol-specific paths merge or forward it.
+pub(crate) fn apply_effective_backend_scheme_headers(
+    headers: &mut HashMap<String, String>,
+    client_ip: &str,
+    request_is_secure: bool,
+    add_forwarded_header: bool,
+) {
+    let scheme = if request_is_secure { "https" } else { "http" };
+    let forwarded = add_forwarded_header.then(|| {
+        build_forwarded_value(
+            client_ip,
+            scheme,
+            headers.get("host").map(String::as_str),
+        )
+    });
+    headers.insert("x-forwarded-proto".to_string(), scheme.to_string());
+    if let Some(forwarded) = forwarded {
+        headers.insert("forwarded".to_string(), forwarded);
+    }
+}
+
 fn push_forwarded_param_value(buf: &mut String, value: &str) {
     if is_forwarded_token(value) {
         buf.push_str(value);
@@ -14611,13 +14635,22 @@ fn canonical_set_cookie_domain_ip(domain: &CanonicalSetCookieDomain<'_>) -> Opti
     }
 }
 
-fn set_cookie_request_host_ip(authority: Option<&str>) -> Option<IpAddr> {
-    let (host, _) = split_request_authority(authority?)?;
+fn set_cookie_request_host(authority: Option<&str>) -> Option<&str> {
+    split_request_authority(authority?).map(|(host, _)| host)
+}
+
+fn set_cookie_request_host_ip(request_host: Option<&str>) -> Option<IpAddr> {
+    let host = request_host?;
     host.strip_prefix('[')
         .and_then(|content| content.strip_suffix(']'))
         .unwrap_or(host)
         .parse()
         .ok()
+}
+
+fn set_cookie_domain_is_public_suffix(domain: &str) -> bool {
+    let lowercase_domain = domain.to_ascii_lowercase();
+    psl::suffix_str(&lowercase_domain).is_some_and(|suffix| suffix == lowercase_domain.as_str())
 }
 
 fn valid_set_cookie_path(path: &str) -> bool {
@@ -14690,6 +14723,7 @@ fn set_cookie_storage_key<'a>(
     set_cookie: &'a str,
     default_path: &'a str,
     request_is_secure: bool,
+    request_host: Option<&str>,
     request_host_ip: Option<IpAddr>,
 ) -> Option<SetCookieStorageKey<'a>> {
     let name = set_cookie_name(set_cookie)?;
@@ -14754,7 +14788,25 @@ fn set_cookie_storage_key<'a>(
                 }
                 (None, true)
             } else {
-                (Some(domain), false)
+                // RFC 6265bis public-suffix handling is storage-key-visible:
+                // a Domain equal to the request host is converted to a
+                // host-only cookie, while any other public-suffix Domain is
+                // rejected. Use the current Mozilla PSL (including private
+                // suffixes such as github.io) so Ferrum compares the same key
+                // a browser will actually store.
+                let CanonicalSetCookieDomain::Text(domain_text) = &domain else {
+                    return None;
+                };
+                if set_cookie_domain_is_public_suffix(domain_text) {
+                    if !request_host
+                        .is_some_and(|host| host.eq_ignore_ascii_case(domain_text))
+                    {
+                        return None;
+                    }
+                    (None, true)
+                } else {
+                    (Some(domain), false)
+                }
             }
         }
     };
@@ -14805,15 +14857,26 @@ fn set_cookie_same_storage_key(
     candidate: &str,
     default_path: &str,
     request_is_secure: bool,
+    request_host: Option<&str>,
     request_host_ip: Option<IpAddr>,
 ) -> bool {
-    let Some(existing_key) =
-        set_cookie_storage_key(existing, default_path, request_is_secure, request_host_ip)
+    let Some(existing_key) = set_cookie_storage_key(
+        existing,
+        default_path,
+        request_is_secure,
+        request_host,
+        request_host_ip,
+    )
     else {
         return false;
     };
-    let Some(candidate_key) =
-        set_cookie_storage_key(candidate, default_path, request_is_secure, request_host_ip)
+    let Some(candidate_key) = set_cookie_storage_key(
+        candidate,
+        default_path,
+        request_is_secure,
+        request_host,
+        request_host_ip,
+    )
     else {
         return false;
     };
@@ -14844,6 +14907,7 @@ fn collect_later_set_cookies(
     joined: &str,
     default_path: &str,
     request_is_secure: bool,
+    request_host: Option<&str>,
     request_host_ip: Option<IpAddr>,
 ) {
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
@@ -14854,6 +14918,7 @@ fn collect_later_set_cookies(
                     candidate,
                     default_path,
                     request_is_secure,
+                    request_host,
                     request_host_ip,
                 )
         }) {
@@ -14868,6 +14933,7 @@ fn set_cookie_conflicts(
     candidate: &str,
     default_path: &str,
     request_is_secure: bool,
+    request_host: Option<&str>,
     request_host_ip: Option<IpAddr>,
 ) -> bool {
     cookies.iter().any(|existing| {
@@ -14877,6 +14943,7 @@ fn set_cookie_conflicts(
                 candidate,
                 default_path,
                 request_is_secure,
+                request_host,
                 request_host_ip,
             )
     })
@@ -14887,7 +14954,8 @@ fn set_cookie_conflicts(
 pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
     let default_path = default_set_cookie_path(&ctx.path);
     let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
-    let request_host_ip = set_cookie_request_host_ip(ctx.request_authority.as_deref());
+    let request_host = set_cookie_request_host(ctx.request_authority.as_deref());
+    let request_host_ip = set_cookie_request_host_ip(request_host);
     let mut staged = Vec::new();
     if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
         collect_later_set_cookies(
@@ -14895,6 +14963,7 @@ pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: 
             existing,
             default_path,
             can_store_secure_cookie,
+            request_host,
             request_host_ip,
         );
     }
@@ -14903,6 +14972,7 @@ pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: 
         &cookie,
         default_path,
         can_store_secure_cookie,
+        request_host,
         request_host_ip,
     );
 
@@ -14925,7 +14995,8 @@ fn attach_auth_rejection_set_cookie(
     };
     let default_path = default_set_cookie_path(&ctx.path);
     let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
-    let request_host_ip = set_cookie_request_host_ip(ctx.request_authority.as_deref());
+    let request_host = set_cookie_request_host(ctx.request_authority.as_deref());
+    let request_host_ip = set_cookie_request_host_ip(request_host);
 
     // A custom plugin can return multiple case variants because rejection
     // headers use a String-keyed HashMap. Sort the variants by their exact key
@@ -14947,6 +15018,7 @@ fn attach_auth_rejection_set_cookie(
             &value,
             default_path,
             can_store_secure_cookie,
+            request_host,
             request_host_ip,
         );
     }
@@ -14957,6 +15029,7 @@ fn attach_auth_rejection_set_cookie(
         &staged,
         default_path,
         can_store_secure_cookie,
+        request_host,
         request_host_ip,
     );
     for candidate in staged_cookies {
@@ -14968,6 +15041,7 @@ fn attach_auth_rejection_set_cookie(
             &candidate,
             default_path,
             can_store_secure_cookie,
+            request_host,
             request_host_ip,
         ) {
             merged.push(candidate);
@@ -17314,9 +17388,6 @@ async fn handle_proxy_request_inner(
             bodyless => bodyless,
         };
     }
-    let proxy_headers: &HashMap<String, String> =
-        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
-
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
     // (plaintext `http` or TLS `https`) can serve WebSocket upgrades; the
@@ -17371,7 +17442,16 @@ async fn handle_proxy_request_inner(
             }
         };
         let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
-        let websocket_proxy_headers = proxy_headers.clone();
+        let mut websocket_proxy_headers = owned_proxy_headers
+            .as_ref()
+            .unwrap_or(&ctx.headers)
+            .clone();
+        apply_effective_backend_scheme_headers(
+            &mut websocket_proxy_headers,
+            &ctx.client_ip,
+            ctx.request_is_secure,
+            state.add_forwarded_header,
+        );
         return handle_websocket_request_authenticated(
             request,
             state,
@@ -17462,6 +17542,17 @@ async fn handle_proxy_request_inner(
             )
         });
     if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
+        let grpc_proxy_headers = owned_proxy_headers
+            .as_mut()
+            .unwrap_or(&mut ctx.headers);
+        apply_effective_backend_scheme_headers(
+            grpc_proxy_headers,
+            &ctx.client_ip,
+            ctx.request_is_secure,
+            state.add_forwarded_header,
+        );
+        let proxy_headers: &HashMap<String, String> = grpc_proxy_headers;
+
         // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
         // branch cannot dispatch over its secured transport (issue #2003):
         //   * CROSS-CLUSTER east-west targets (Ambient `mesh.hbone` or Sidecar
@@ -19898,6 +19989,9 @@ async fn handle_proxy_request_inner(
         }
     }
 
+    let proxy_headers: &HashMap<String, String> =
+        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+
     // Build backend URL (using upstream target if available)
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
         (target.host.as_str(), target.port)
@@ -20216,7 +20310,7 @@ async fn handle_proxy_request_inner(
             request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
-            is_tls,
+            ctx.request_is_secure,
             false,
             false,
             current_dispatch_h3,
@@ -20544,7 +20638,7 @@ async fn handle_proxy_request_inner(
                     &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
-                    is_tls,
+                    ctx.request_is_secure,
                     inbound_version,
                 )
                 .await
@@ -20562,7 +20656,7 @@ async fn handle_proxy_request_inner(
                     &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
-                    is_tls,
+                    ctx.request_is_secure,
                     inbound_version,
                 )
                 .await
@@ -20610,7 +20704,7 @@ async fn handle_proxy_request_inner(
             request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
-            is_tls,
+            ctx.request_is_secure,
             current_dispatch_hbone,
             current_dispatch_mesh_mtls,
             current_dispatch_h3,
@@ -22347,7 +22441,7 @@ pub(crate) async fn proxy_to_backend_retry(
     request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
     // Honor DestinationRule per-port `connect_timeout_ms` overrides for this
@@ -22482,7 +22576,7 @@ pub(crate) async fn proxy_to_backend_retry(
         xff_append_ip,
         &state.trusted_proxies,
     );
-    let proto_str = if is_tls { "https" } else { "http" };
+    let proto_str = if request_is_secure { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
@@ -23055,7 +23149,7 @@ async fn proxy_to_backend(
     request_body_prepared: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     dispatch_hbone: bool,
     dispatch_mesh_mtls: bool,
     dispatch_h3: bool,
@@ -23181,7 +23275,7 @@ async fn proxy_to_backend(
             stream_response,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
         )
@@ -23266,7 +23360,7 @@ async fn proxy_to_backend(
             stream_response,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
         )
@@ -23335,7 +23429,7 @@ async fn proxy_to_backend(
             upstream_target,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             inbound_version,
             stream_request_body,
             retain_request_body,
@@ -23560,7 +23654,7 @@ async fn proxy_to_backend(
                         stream_response,
                         client_ip,
                         xff_append_ip,
-                        is_tls,
+                        request_is_secure,
                         resolved_ip,
                         ctx_bytes_sent_observed,
                     )
@@ -23720,7 +23814,7 @@ async fn proxy_to_backend(
         xff_append_ip,
         &state.trusted_proxies,
     );
-    let proto_str = if is_tls { "https" } else { "http" };
+    let proto_str = if request_is_secure { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
@@ -25403,7 +25497,7 @@ async fn proxy_to_backend_hbone(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (
@@ -25836,7 +25930,7 @@ async fn proxy_to_backend_hbone(
         "hbone",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -25859,7 +25953,7 @@ async fn proxy_to_backend_hbone(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -26101,7 +26195,7 @@ async fn proxy_to_backend_mesh_mtls(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (
@@ -26705,7 +26799,7 @@ async fn proxy_to_backend_mesh_mtls(
         "mesh_mtls",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -26728,7 +26822,7 @@ async fn proxy_to_backend_mesh_mtls(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -27102,7 +27196,7 @@ async fn proxy_to_backend_http2(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     // Shared counter for request body bytes. The H2 direct pool forwards
     // the body via hyper without the reqwest adapter layer, so we wrap
@@ -27240,7 +27334,7 @@ async fn proxy_to_backend_http2(
         "direct_h2",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -27263,7 +27357,7 @@ async fn proxy_to_backend_http2(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -27428,7 +27522,7 @@ struct Http3BackendHeaderContext<'a> {
     client_ip: &'a str,
     xff_append_ip: &'a str,
     effective_host: &'a str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
     content_length: Option<&'a str>,
 }
@@ -27501,7 +27595,11 @@ fn build_http3_backend_headers(
     if let Ok(v) = xff.parse() {
         http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
     }
-    let proto = if ctx.is_tls { "https" } else { "http" };
+    let proto = if ctx.request_is_secure {
+        "https"
+    } else {
+        "http"
+    };
     if let Ok(v) = proto.parse() {
         http3_headers.push((
             hyper::header::HeaderName::from_static("x-forwarded-proto"),
@@ -27557,7 +27655,7 @@ async fn proxy_to_backend_http3(
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
     stream_request_body: bool,
     retain_request_body: bool,
@@ -27654,7 +27752,7 @@ async fn proxy_to_backend_http3(
                         client_ip,
                         xff_append_ip,
                         effective_host,
-                        is_tls,
+                        request_is_secure,
                         inbound_version,
                         content_length: headers.get("content-length").map(String::as_str),
                     },
@@ -27989,7 +28087,7 @@ async fn proxy_to_backend_http3(
             client_ip,
             xff_append_ip,
             effective_host,
-            is_tls,
+            request_is_secure,
             inbound_version,
             content_length: request_content_length.as_deref(),
         },
@@ -28617,7 +28715,7 @@ async fn proxy_to_backend_http3_retry(
     request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
     // reqwest dispatch receives `upstream_target` separately, so it only
@@ -28665,7 +28763,7 @@ async fn proxy_to_backend_http3_retry(
             client_ip,
             xff_append_ip,
             effective_host,
-            is_tls,
+            request_is_secure,
             inbound_version,
             content_length: None,
         },
@@ -32024,7 +32122,7 @@ mod tests {
                 false, // request_body_prepared
                 "127.0.0.1",
                 "127.0.0.1",
-                false, // is_tls
+                false, // request_is_secure
                 false, // dispatch_hbone
                 false, // dispatch_mesh_mtls
                 false, // dispatch_h3
@@ -32209,7 +32307,7 @@ mod tests {
                 client_ip: "203.0.113.44",
                 xff_append_ip: "127.0.0.1",
                 effective_host: "backend.internal",
-                is_tls: false,
+                request_is_secure: false,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,
             },
@@ -32257,7 +32355,7 @@ mod tests {
                 client_ip: "203.0.113.9",
                 xff_append_ip: "10.0.0.7",
                 effective_host: "h3-backend.example",
-                is_tls: true,
+                request_is_secure: true,
                 inbound_version: hyper::Version::HTTP_2,
                 content_length: None,
             },
