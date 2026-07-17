@@ -2,15 +2,13 @@
 //!
 //! Operators ship runtime knobs through the mesh xDS client; every accepted
 //! slice runs through [`apply_overlay`] before the snapshot is published so
-//! plugin hot paths can read the current value off a process-global
-//! `ArcSwap` instead of walking the overlay on every request.
+//! process-wide consumers can publish their current value without walking the
+//! overlay on every request. Fault injection is deliberately absent: its
+//! values are captured during plugin-cache construction and atomically
+//! published with the request epoch whose config they modify.
 //!
 //! Consumer dispatch is by reserved key namespace:
 //!
-//! - `ferrum.fault_injection.<scope>.abort_percent` /
-//!   `ferrum.fault_injection.<scope>.delay_percent` — drive the
-//!   [`fault_injection`](crate::plugins::fault_injection) plugin via
-//!   [`crate::plugins::fault_injection::runtime_overlay`].
 //! - `ferrum.log.level` — rebuild the tracing `EnvFilter` via the global
 //!   reload handle installed at startup (`crate::logging::reload_layer`).
 //! - `ferrum.request_transformer.<scope>.enabled` /
@@ -45,7 +43,6 @@ pub fn test_lock() -> MutexGuard<'static, ()> {
 /// Cold path; allocations are bounded by the number of `ferrum.*` keys in
 /// the overlay. No-op when none are present.
 pub fn apply_overlay(overlay: &MeshRuntimeOverlay) {
-    crate::plugins::fault_injection::runtime_overlay::apply_overlay(overlay);
     crate::plugins::request_transformer::runtime_overlay::apply_overlay(overlay);
     crate::plugins::response_transformer::runtime_overlay::apply_overlay(overlay);
     crate::logging::runtime_overlay::apply_overlay(overlay);

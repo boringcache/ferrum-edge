@@ -347,6 +347,8 @@ fn both_directions_transferred(c2b_bytes: &AtomicU64, b2c_bytes: &AtomicU64) -> 
 pub(crate) const STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED: &str = "Frontend TLS handshake failed";
 pub(crate) const STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED: &str = "Backend TLS handshake failed";
 pub(crate) const STREAM_ERR_REJECTED_BY_PLUGIN: &str = "rejected by plugin";
+pub(crate) const STREAM_ERR_CLIENT_DISCONNECTED_DURING_ADMISSION: &str =
+    "client disconnected during plugin admission";
 pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
 pub(crate) const STREAM_ERR_CIRCUIT_BREAKER_OPEN: &str = "circuit breaker open";
 pub(crate) const STREAM_ERR_BACKEND_MAX_CONNECTIONS: &str = "Backend maxConnections reached";
@@ -1386,6 +1388,7 @@ async fn run_tcp_accept_loop(
                         // `direct_client_ip` is always the raw socket peer. When PROXY
                         // protocol is active `client_ip` may differ (forwarded source IP).
                         direct_client_ip: direct_client_ip.clone(),
+                        canonical_client_ip: Default::default(),
                         proxy_id: proxy_id.to_string(),
                         proxy_name: base_proxy.and_then(|p| p.name.clone()),
                         listen_port: port,
@@ -1885,13 +1888,27 @@ async fn handle_tcp_connection(
 async fn run_tcp_stream_connect_plugins(
     plugins: &[Arc<dyn Plugin>],
     stream_ctx: &mut StreamConnectionContext,
+    client_stream: &TcpStream,
     proxy_id: &str,
     client_ip: IpAddr,
     connection_label: &'static str,
     rejection_detail: &'static str,
 ) -> Result<(), anyhow::Error> {
     for plugin in plugins {
-        if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
+        let result = if plugin.name() == "fault_injection" {
+            tokio::select! {
+                result = plugin.on_stream_connect(stream_ctx) => result,
+                () = wait_for_tcp_peer_reset(client_stream) => {
+                    return Err(StreamSetupError::new(
+                        StreamSetupKind::ClientDisconnectedDuringAdmission,
+                        connection_label,
+                    ).into());
+                }
+            }
+        } else {
+            plugin.on_stream_connect(stream_ctx).await
+        };
+        if let PluginResult::Reject { .. } = result {
             debug!(
                 proxy_id = %proxy_id,
                 client = %client_ip,
@@ -1904,6 +1921,57 @@ async fn run_tcp_stream_connect_plugins(
         }
     }
     Ok(())
+}
+
+/// Wait until the accepted TCP peer resets or the socket reports a transport
+/// error without consuming any application bytes. A read-half FIN is
+/// deliberately not treated as cancellation: request/response protocols may
+/// validly send their complete request and then half-close while continuing to
+/// wait for the response.
+pub(crate) async fn wait_for_tcp_peer_reset(client_stream: &TcpStream) {
+    let mut retry_backoff = TcpFaultAdmissionRetryBackoff::new();
+    loop {
+        // Readiness may be spurious, and readiness polling itself may fail.
+        // Neither is evidence that the peer disconnected: only a concrete
+        // socket error cancels admission. A bounded increasing retry interval
+        // prevents a persistent HUP/error readiness bit from spinning while
+        // keeping reset cancellation within 50 ms and preserving cancel safety
+        // in the surrounding `select!`.
+        let readiness = client_stream.ready(tokio::io::Interest::ERROR).await;
+        let socket_error = client_stream.take_error();
+        if tcp_fault_admission_should_cancel(&readiness, &socket_error) {
+            return;
+        }
+        tokio::time::sleep(retry_backoff.next_delay()).await;
+    }
+}
+
+const TCP_FAULT_ADMISSION_RETRY_INITIAL_MS: u64 = 1;
+const TCP_FAULT_ADMISSION_RETRY_MAX_MS: u64 = 50;
+
+pub(crate) struct TcpFaultAdmissionRetryBackoff {
+    next_ms: u64,
+}
+
+impl TcpFaultAdmissionRetryBackoff {
+    pub(crate) fn new() -> Self {
+        Self {
+            next_ms: TCP_FAULT_ADMISSION_RETRY_INITIAL_MS,
+        }
+    }
+
+    pub(crate) fn next_delay(&mut self) -> Duration {
+        let delay = Duration::from_millis(self.next_ms);
+        self.next_ms = (self.next_ms * 2).min(TCP_FAULT_ADMISSION_RETRY_MAX_MS);
+        delay
+    }
+}
+
+pub(crate) fn tcp_fault_admission_should_cancel(
+    _readiness: &std::io::Result<tokio::io::Ready>,
+    socket_error: &std::io::Result<Option<std::io::Error>>,
+) -> bool {
+    matches!(socket_error, Ok(Some(_)))
 }
 
 /// Maximum number of opening client bytes captured for stream first-bytes
@@ -2225,21 +2293,16 @@ async fn handle_tcp_connection_inner(
 
         // Run on_stream_connect plugins (they see SNI but not decrypted data).
         if !plugins.is_empty() {
-            for plugin in plugins.iter() {
-                if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
-                    debug!(
-                        proxy_id = %proxy_id,
-                        client = %remote_addr.ip(),
-                        sni = ?stream_ctx.sni_hostname,
-                        "TCP passthrough connection rejected by plugin"
-                    );
-                    return Err(StreamSetupError::new(
-                        StreamSetupKind::RejectedByPlugin,
-                        "(passthrough)",
-                    )
-                    .into());
-                }
-            }
+            run_tcp_stream_connect_plugins(
+                plugins.as_ref(),
+                stream_ctx,
+                &client_stream,
+                proxy_id,
+                remote_addr.ip(),
+                "TCP passthrough",
+                "(passthrough)",
+            )
+            .await?;
         }
 
         // Circuit breaker check — reject before DNS resolution or backend
@@ -2610,6 +2673,7 @@ async fn handle_tcp_connection_inner(
             run_tcp_stream_connect_plugins(
                 plugins.as_ref(),
                 stream_ctx,
+                tls_stream.get_ref().0,
                 proxy_id,
                 remote_addr.ip(),
                 "TCP/TLS",
@@ -2635,6 +2699,7 @@ async fn handle_tcp_connection_inner(
             run_tcp_stream_connect_plugins(
                 plugins.as_ref(),
                 stream_ctx,
+                &client_stream,
                 proxy_id,
                 remote_addr.ip(),
                 "TCP",
@@ -7937,6 +8002,19 @@ mod cause_direction_tests {
     #[test]
     fn typed_plugin_reject_maps_to_recv_error_and_client_direction() {
         let e = err(StreamSetupKind::RejectedByPlugin);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::RequestError),
+            DisconnectCause::RecvError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
+            Direction::ClientToBackend
+        );
+    }
+
+    #[test]
+    fn typed_admission_disconnect_maps_to_recv_error_and_client_direction() {
+        let e = err(StreamSetupKind::ClientDisconnectedDuringAdmission);
         assert_eq!(
             pre_copy_disconnect_cause(&e, &ErrorClass::RequestError),
             DisconnectCause::RecvError

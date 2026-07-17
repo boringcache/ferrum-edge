@@ -426,7 +426,7 @@ async fn test_plugin_creation_all_plugins() {
                 "ldap_url": "ldaps://ldap.example.com:636",
                 "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
             }),
-            "cors" => json!({"origins": ["*"]}),
+            "cors" => json!({"allowed_origins": ["*"]}),
             "response_caching" => json!({"ttl_seconds": 60}),
             "spec_expose" => json!({"spec_url": "https://example.com/openapi.yaml"}),
             "spiffe_identity" => json!({}),

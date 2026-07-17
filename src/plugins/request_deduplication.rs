@@ -39,6 +39,7 @@ use tracing::debug;
 /// a backward NTP/VM/manual clock step suppress periodic cleanup until the wall
 /// clock caught back up. See finding #57.
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Default minimum seconds between full local-cache cleanup scans. The scan
 /// takes write locks across all `DashMap` shards, so it must run at most once
@@ -122,7 +123,10 @@ fn decrement_atomic(value: &AtomicUsize) -> usize {
 use super::utils::body_transform::is_event_stream_content_type;
 use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
-use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::{
+    EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, Plugin, PluginHttpClient, PluginResult,
+    RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
+};
 
 /// A cached response stored for deduplication replay.
 #[derive(Debug, Clone)]
@@ -219,8 +223,16 @@ enum LocalCompletionAction {
         inflight_count: usize,
         reason: CompletionSkipReason,
         redis_candidate: Option<CachedResponse>,
+        retained_inflight: bool,
     },
     Stale,
+}
+
+struct LocalCompletionInput<'a> {
+    status_code: u16,
+    headers: HashMap<String, String>,
+    body: &'a [u8],
+    retain_inflight_on_skip: bool,
 }
 
 enum CompletionSkipReason {
@@ -233,7 +245,19 @@ enum CompletionSkipReason {
     },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RequestDeduplicationRequestState {
+    key: String,
+    fingerprint: String,
+    local_inflight_owner_token: String,
+    redis_lock_token: Option<String>,
+}
+
 pub struct RequestDeduplication {
+    /// Process-unique identity used only to correlate this plugin's hooks on a
+    /// request. Configured plugin IDs are not passed to constructors, and an
+    /// atomic identity remains stable for the lifetime of the shared instance.
+    instance_id: u64,
     /// Header name to read the idempotency key from.
     header_name: String,
     /// Time-to-live for cached responses.
@@ -321,6 +345,7 @@ impl RequestDeduplication {
             });
 
         Ok(Self {
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             header_name,
             ttl,
             inflight_ttl,
@@ -841,10 +866,14 @@ impl RequestDeduplication {
         key: &str,
         fingerprint: &str,
         owner_token: &str,
-        status_code: u16,
-        headers: HashMap<String, String>,
-        body: &[u8],
+        input: LocalCompletionInput<'_>,
     ) -> LocalCompletionAction {
+        let LocalCompletionInput {
+            status_code,
+            headers,
+            body,
+            retain_inflight_on_skip,
+        } = input;
         let entry_size = cached_response_retained_size(body.len(), &headers);
         let _guard = self.accounting_guard();
         let mut entry = match self.local_cache.entry(key.to_string()) {
@@ -862,12 +891,17 @@ impl RequestDeduplication {
         }
 
         if entry_size > self.max_entry_size_bytes {
-            entry.remove();
-            let inflight_count = decrement_atomic(&self.inflight_count);
+            let inflight_count = if retain_inflight_on_skip {
+                self.inflight_count.load(Ordering::Relaxed)
+            } else {
+                entry.remove();
+                decrement_atomic(&self.inflight_count)
+            };
             return LocalCompletionAction::Skipped {
                 inflight_count,
                 reason: CompletionSkipReason::EntryTooLarge { entry_size },
                 redis_candidate: None,
+                retained_inflight: retain_inflight_on_skip,
             };
         }
 
@@ -880,11 +914,14 @@ impl RequestDeduplication {
                     body: Bytes::copy_from_slice(body),
                     inserted_at: Instant::now(),
                 })
+            } else if retain_inflight_on_skip {
+                None
             } else {
                 entry.remove();
                 None
             };
-            let inflight_count = if redis_candidate.is_some() {
+            let retained_inflight = redis_candidate.is_some() || retain_inflight_on_skip;
+            let inflight_count = if retained_inflight {
                 self.inflight_count.load(Ordering::Relaxed)
             } else {
                 decrement_atomic(&self.inflight_count)
@@ -896,6 +933,7 @@ impl RequestDeduplication {
                     current_total,
                 },
                 redis_candidate,
+                retained_inflight,
             };
         }
 
@@ -1548,7 +1586,8 @@ impl Plugin for RequestDeduplication {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        ctx.metadata.contains_key(DEDUP_KEY_METADATA)
+        ctx.request_deduplication_state
+            .contains_key(&self.instance_id)
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1768,7 +1807,17 @@ impl Plugin for RequestDeduplication {
             LocalDeduplicationAction::Fresh => {}
         }
 
-        // Store the key in metadata so on_final_response_body can cache the response
+        ctx.request_deduplication_state.insert(
+            self.instance_id,
+            RequestDeduplicationRequestState {
+                key: key.clone(),
+                fingerprint: fingerprint.clone(),
+                local_inflight_owner_token: local_inflight_owner_token.clone(),
+                redis_lock_token: redis_lock_token.clone(),
+            },
+        );
+        // Retain the legacy metadata projection for compatibility. Lifecycle
+        // correctness uses the private instance-keyed state above.
         ctx.metadata.insert(DEDUP_KEY_METADATA.to_string(), key);
         ctx.metadata
             .insert(DEDUP_FINGERPRINT_METADATA.to_string(), fingerprint);
@@ -1811,18 +1860,17 @@ impl Plugin for RequestDeduplication {
             return;
         }
 
-        let Some(key) = ctx.metadata.get(DEDUP_KEY_METADATA) else {
+        let Some(state) = ctx.request_deduplication_state.get(&self.instance_id) else {
             return;
         };
-        let Some(fingerprint) = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) else {
-            return;
-        };
-
-        if let Some(owner_token) = ctx.metadata.get(DEDUP_LOCAL_INFLIGHT_TOKEN_METADATA) {
-            self.remove_matching_local_inflight(key, fingerprint, owner_token);
-        }
-        if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
-            self.redis_release_inflight(key, fingerprint, token).await;
+        self.remove_matching_local_inflight(
+            &state.key,
+            &state.fingerprint,
+            &state.local_inflight_owner_token,
+        );
+        if let Some(token) = state.redis_lock_token.as_deref() {
+            self.redis_release_inflight(&state.key, &state.fingerprint, token)
+                .await;
         }
     }
 
@@ -1833,31 +1881,24 @@ impl Plugin for RequestDeduplication {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Only cache if we have a dedup key from before_proxy
-        let key = match ctx.metadata.get(DEDUP_KEY_METADATA) {
-            Some(k) => k.clone(),
-            None => return PluginResult::Continue,
+        // Only cache if this exact plugin instance acquired request ownership.
+        let Some(state) = ctx
+            .request_deduplication_state
+            .get(&self.instance_id)
+            .cloned()
+        else {
+            return PluginResult::Continue;
         };
-        let fingerprint = match ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) {
-            Some(fingerprint) => fingerprint.clone(),
-            None => return PluginResult::Continue,
-        };
-        let local_inflight_owner_token = match ctx.metadata.get(DEDUP_LOCAL_INFLIGHT_TOKEN_METADATA)
-        {
-            Some(token) => token.clone(),
-            None => {
-                if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
-                    self.redis_release_inflight(&key, &fingerprint, token).await;
-                }
-                return PluginResult::Continue;
-            }
-        };
+        let key = state.key;
+        let fingerprint = state.fingerprint;
+        let local_inflight_owner_token = state.local_inflight_owner_token;
+        let redis_lock_token = state.redis_lock_token;
 
         // Synthetic short-circuit guard. When a *fresh* request that this plugin
-        // marked in-flight is then short-circuited by a LATER `before_proxy`
+        // marked in-flight is then short-circuited by a later request-phase
         // plugin (e.g. a 2xx `fault_injection`/`mesh_route_dispatch` abort,
         // `response_mock`, `serverless` terminate, `request_termination`, an
-        // `ai_federation` synthetic response, or an `ai_semantic_cache` hit), the
+        // `ai_federation` final-body response, or an `ai_semantic_cache` hit), the
         // synthetic body now flows back through the response-body hooks (the
         // generic 2xx short-circuit path) and would otherwise be cached and
         // replayed (`x-idempotent-replayed: true`) under the idempotency key for
@@ -1867,13 +1908,23 @@ impl Plugin for RequestDeduplication {
         // (mirroring `response_caching`'s served-from-cache guard) but still
         // RELEASE the in-flight locks so the marker transitions to a clean state
         // instead of dangling until `inflight_ttl`, which keeps duplicate
-        // detection accurate once the synthetic short-circuit returns.
+        // detection accurate once the synthetic short-circuit returns. A later
+        // plugin that actually performed an external operation is the exception:
+        // retain ownership here and publish a non-replayable completed tombstone
+        // from `on_response_committed`, after every response guard/transform has
+        // reached its final client-visible decision.
         if ctx
             .metadata
             .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
         {
+            if ctx
+                .metadata
+                .contains_key(EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)
+            {
+                return PluginResult::Continue;
+            }
             self.remove_matching_local_inflight(&key, &fingerprint, &local_inflight_owner_token);
-            if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+            if let Some(token) = redis_lock_token.as_deref() {
                 self.redis_release_inflight(&key, &fingerprint, token).await;
             }
             return PluginResult::Continue;
@@ -1888,14 +1939,20 @@ impl Plugin for RequestDeduplication {
         // pinned-stale-cookie vector. Mirrors `ai_semantic_cache`'s
         // sanitization on store. See [`super::utils::cache_headers`].
         let safe_headers = sanitize_cached_headers(response_headers);
+        let retain_inflight_on_skip = ctx
+            .metadata
+            .contains_key(EXTERNAL_OPERATION_COMPLETED_METADATA_KEY);
 
         let (cached, completed, inflight) = match self.local_publish_completed(
             &key,
             &fingerprint,
             &local_inflight_owner_token,
-            response_status,
-            safe_headers,
-            body,
+            LocalCompletionInput {
+                status_code: response_status,
+                headers: safe_headers,
+                body,
+                retain_inflight_on_skip,
+            },
         ) {
             LocalCompletionAction::Published {
                 cached,
@@ -1906,6 +1963,7 @@ impl Plugin for RequestDeduplication {
                 inflight_count,
                 reason,
                 redis_candidate,
+                retained_inflight,
             } => {
                 match reason {
                     CompletionSkipReason::EntryTooLarge { entry_size } => {
@@ -1931,16 +1989,27 @@ impl Plugin for RequestDeduplication {
                 }
                 if let Some(cached) = redis_candidate {
                     match self.redis_set(&key, &fingerprint, &cached).await {
-                        RedisStoreAction::Stored | RedisStoreAction::SkippedSize => {
+                        RedisStoreAction::Stored => {
                             self.remove_matching_local_inflight(
                                 &key,
                                 &fingerprint,
                                 &local_inflight_owner_token,
                             );
-                            if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                            if let Some(token) = redis_lock_token.as_deref() {
                                 self.redis_release_inflight(&key, &fingerprint, token).await;
                             }
                         }
+                        RedisStoreAction::SkippedSize if !retain_inflight_on_skip => {
+                            self.remove_matching_local_inflight(
+                                &key,
+                                &fingerprint,
+                                &local_inflight_owner_token,
+                            );
+                            if let Some(token) = redis_lock_token.as_deref() {
+                                self.redis_release_inflight(&key, &fingerprint, token).await;
+                            }
+                        }
+                        RedisStoreAction::SkippedSize => {}
                         // Nothing was retained locally. If Redis publication
                         // fails too, keep both in-flight locks until
                         // `inflight_ttl` so retries cannot immediately re-run a
@@ -1949,13 +2018,13 @@ impl Plugin for RequestDeduplication {
                     }
                     return PluginResult::Continue;
                 }
-                if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                if !retained_inflight && let Some(token) = redis_lock_token.as_deref() {
                     self.redis_release_inflight(&key, &fingerprint, token).await;
                 }
                 return PluginResult::Continue;
             }
             LocalCompletionAction::Stale => {
-                if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                if let Some(token) = redis_lock_token.as_deref() {
                     self.redis_release_inflight(&key, &fingerprint, token).await;
                 }
                 return PluginResult::Continue;
@@ -1968,16 +2037,77 @@ impl Plugin for RequestDeduplication {
         // cannot miss both the lock and the replayable response.
         if self.redis_client.is_some() {
             match self.redis_set(&key, &fingerprint, &cached).await {
-                RedisStoreAction::Stored | RedisStoreAction::SkippedSize => {
-                    if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                RedisStoreAction::Stored => {
+                    if let Some(token) = redis_lock_token.as_deref() {
                         self.redis_release_inflight(&key, &fingerprint, token).await;
                     }
                 }
+                RedisStoreAction::SkippedSize if !retain_inflight_on_skip => {
+                    if let Some(token) = redis_lock_token.as_deref() {
+                        self.redis_release_inflight(&key, &fingerprint, token).await;
+                    }
+                }
+                RedisStoreAction::SkippedSize => {}
                 RedisStoreAction::Failed => {}
             }
         }
 
         PluginResult::Continue
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        if ctx
+            .metadata
+            .contains_key(EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)
+        {
+            // A synthetic response produced after a billable/side-effecting
+            // operation cannot safely be cached: replay would run response body
+            // transforms a second time, while storing it before the last guard could
+            // replay a representation that was rejected on the first request.
+            // Publish a small completed 409 tombstone instead. The original request
+            // still receives its final response, but an identical retry cannot issue
+            // the external operation again. If configured cache limits are too small
+            // even for the tombstone, `local_publish_completed` retains the local and
+            // Redis in-flight locks until their bounded expiry rather than failing
+            // open to an immediate duplicate.
+            let headers = HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("cache-control".to_string(), "no-store".to_string()),
+            ]);
+            let body = br#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
+            let _ = self.on_final_response_body(ctx, 409, &headers, body).await;
+            return;
+        }
+
+        if !ctx
+            .metadata
+            .contains_key(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY)
+        {
+            return;
+        }
+
+        let Some(state) = ctx.request_deduplication_state.get(&self.instance_id) else {
+            return;
+        };
+        self.remove_matching_local_inflight(
+            &state.key,
+            &state.fingerprint,
+            &state.local_inflight_owner_token,
+        );
+        if let Some(token) = state.redis_lock_token.as_deref() {
+            self.redis_release_inflight(&state.key, &state.fingerprint, token)
+                .await;
+        }
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {

@@ -335,13 +335,11 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_configs: Vec<MeshExtensionConfig>,
     /// xDS RTDS (`envoy.service.runtime.v3.Runtime`) overlay merged across
-    /// all subscribed layers. Slice install fans the overlay out to live
-    /// consumers (fault-injection percentages, request/response transformer
-    /// gates, tracing log level) via
-    /// `runtime_overlay_consumers::apply_overlay`. Empty unless RTDS layers
-    /// arrived on the stream. Accepted slices fan this overlay out to live
-    /// consumers; received-but-rejected slices stay visible only on the raw
-    /// runtime snapshot.
+    /// all subscribed layers. Fault-injection values are captured in the
+    /// accepted request epoch's plugin cache; transformer gates and tracing
+    /// level are published by `runtime_overlay_consumers::apply_overlay`.
+    /// Received-but-rejected slices stay visible only on the raw runtime
+    /// snapshot and never reach either live surface.
     #[serde(default, skip_serializing_if = "MeshRuntimeOverlay::is_empty")]
     pub runtime_overlay: MeshRuntimeOverlay,
 }
@@ -1293,11 +1291,9 @@ impl MeshSlice {
             outbound_traffic_policy: mesh.outbound_traffic_policy,
             sidecar_egress_scope,
             extension_configs,
-            // GAP-3E: the canonical `MeshConfig` does not (yet) carry a
-            // declarative RTDS overlay surface. xDS callers populate this
-            // through `reverse_translate`; native MeshSubscribe deployments
-            // leave it empty until the protocol gains an RTDS-equivalent
-            // field.
+            // The canonical GatewayConfig has no declarative RTDS surface.
+            // xDS reverse translation populates this field directly; native
+            // MeshSubscribe configs leave it empty.
             runtime_overlay: MeshRuntimeOverlay::default(),
         }
     }

@@ -1,7 +1,7 @@
 use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::{
     HTTP_GRPC_PROTOCOLS, MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult,
-    RequestContext, TransactionSummary, log_with_mirror, priority,
+    RequestContext, TransactionSummary, create_plugin, log_with_mirror, priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -103,6 +103,33 @@ async fn test_mirror_result_logging_is_detached_from_primary_path() {
     assert!(!summaries[0].mirror);
     assert!(summaries[1].mirror);
     assert_eq!(summaries[1].response_status_code, 204);
+}
+
+#[tokio::test]
+async fn expired_grpc_deadline_does_not_suppress_transaction_logging() {
+    let deadline_plugin = create_plugin("grpc_deadline", &json!({ "default_deadline_ms": 1 }))
+        .unwrap()
+        .unwrap();
+    let logger = Arc::new(CapturingMirrorLogger {
+        summaries: Mutex::new(Vec::new()),
+    });
+    let plugins: Vec<Arc<dyn Plugin>> = vec![deadline_plugin, logger.clone()];
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(matches!(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
+        PluginResult::Continue
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    log_with_mirror(&plugins, &TransactionSummary::default(), &ctx).await;
+
+    assert_eq!(
+        logger.summaries.lock().unwrap().len(),
+        1,
+        "client-visible deadline expiry must not suppress the gateway audit record"
+    );
 }
 
 // ---------------------------------------------------------------------------

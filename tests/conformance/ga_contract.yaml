@@ -54,8 +54,8 @@ capabilities:
     # Live-backed via the mesh slice's `virtual_service_cors_policies`
     # carriage (issue #1973): the client sidecar synthesizes the `cors`
     # plugin onto its materialized outbound route, and the suite proves an
-    # allowed Origin reflected, a sidecar-answered 204 preflight, and a
-    # disallowed Origin rejected 403 by the plugin itself.
+    # allowed Origin reflected, a sidecar-answered Istio 200 preflight, and
+    # unmatched actual/preflight requests forwarded without gateway ACAO.
     live_assertions:
       - sidecar.virtual_service.cors_policy
     platform_profile: kind-spire-sidecar

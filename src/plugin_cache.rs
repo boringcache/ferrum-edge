@@ -51,8 +51,53 @@ struct PriorityOverridePlugin {
     priority: u16,
 }
 
+/// Per-chain CORS wrapper. It avoids mutating a shared plugin instance when a
+/// proxy-group or global CORS policy participates in a multiple-instance chain
+/// for only some proxies.
+struct DeferredCorsPlugin {
+    inner: Arc<dyn Plugin>,
+}
+
+#[async_trait]
+impl Plugin for DeferredCorsPlugin {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn priority(&self) -> u16 {
+        self.inner.priority()
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        self.inner.supported_protocols()
+    }
+
+    async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        ctx.cors_state.defer_finalization = true;
+        self.inner.on_request_received(ctx).await
+    }
+
+    fn is_deferred_cors_wrapper(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut std::collections::HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        false
+    }
+}
+
 const MESH_ROUTE_DISPATCH_NAME: &str = "mesh_route_dispatch";
 const MESH_ROUTE_DISPATCH_FINALIZER_NAME: &str = "__mesh_route_dispatch_finalizer";
+const CORS_NAME: &str = "cors";
 
 /// Cache-internal sentinel placed immediately after the last route-dispatch
 /// instance. Individual instances stage fail-closed misses on `RequestContext`;
@@ -135,6 +180,50 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
     Ok(())
 }
 
+/// Install one aggregate CORS boundary after every attached CORS instance has
+/// evaluated the request. The chain must remain contiguous so an intervening
+/// short-circuit plugin cannot bypass a later CORS policy.
+fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), String> {
+    plugins.retain(|plugin| plugin.name() != crate::plugins::cors::CORS_FINALIZER_NAME);
+    let Some(first_index) = plugins.iter().position(|plugin| plugin.name() == CORS_NAME) else {
+        return Ok(());
+    };
+    let Some(last_index) = plugins
+        .iter()
+        .rposition(|plugin| plugin.name() == CORS_NAME)
+    else {
+        return Err("cors cache invariant lost its first instance".to_string());
+    };
+    if first_index == last_index {
+        return Ok(());
+    }
+    if plugins[first_index..=last_index].iter().any(|plugin| {
+        plugin.name() != CORS_NAME
+            && plugin
+                .supported_protocols()
+                .iter()
+                .any(|protocol| crate::plugins::HTTP_GRPC_PROTOCOLS.contains(protocol))
+    }) {
+        return Err(
+            "cors instances must remain contiguous in HTTP/gRPC chains so their origin and preflight method/header policies can be intersected before any request short-circuits; remove priority overrides that interleave another HTTP/gRPC plugin"
+                .to_string(),
+        );
+    }
+    for plugin in &mut plugins[first_index..=last_index] {
+        if plugin.name() == CORS_NAME && !plugin.is_deferred_cors_wrapper() {
+            *plugin = Arc::new(DeferredCorsPlugin {
+                inner: Arc::clone(plugin),
+            });
+        }
+    }
+    let priority = plugins[last_index].priority();
+    plugins.insert(
+        last_index + 1,
+        Arc::new(crate::plugins::cors::CorsFinalizer::new(priority)),
+    );
+    Ok(())
+}
+
 /// HMAC authenticates the exact client-visible request body and digest. A later
 /// body transform would make the backend-visible bytes disagree with the
 /// signed `Digest`/`Content-Digest` and `Authorization` fields. Reject that
@@ -171,6 +260,12 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn priority(&self) -> u16 {
         self.priority
+    }
+    fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
+        self.inner.prepare_grpc_deadline(ctx)
+    }
+    fn requires_grpc_deadline_preflight(&self) -> bool {
+        self.inner.requires_grpc_deadline_preflight()
     }
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         self.inner.on_request_received(ctx).await
@@ -336,6 +431,12 @@ impl Plugin for PriorityOverridePlugin {
     fn applies_after_proxy_on_reject(&self) -> bool {
         self.inner.applies_after_proxy_on_reject()
     }
+    fn may_replace_rejection_response(&self) -> bool {
+        self.inner.may_replace_rejection_response()
+    }
+    fn warn_on_rejection_response_replacement(&self) -> bool {
+        self.inner.warn_on_rejection_response_replacement()
+    }
     fn requires_response_body_buffering(&self) -> bool {
         self.inner.requires_response_body_buffering()
     }
@@ -482,6 +583,10 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn needs_final_request_body_context(&self) -> bool {
         self.inner.needs_final_request_body_context()
+    }
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+        self.inner
+            .requires_final_request_body_before_backend_dispatch()
     }
     async fn transform_response_body(
         &self,
@@ -787,7 +892,7 @@ struct AdaptiveConcurrencyInstance {
     proxy_id: Option<String>,
     route_definition: AdaptiveConcurrencyRouteDefinition,
     generation: u64,
-    drain_older_generation: bool,
+    reset_tracking_space: bool,
 }
 
 type AdaptiveConcurrencyInstanceMap =
@@ -1547,10 +1652,11 @@ fn adaptive_concurrency_has_zero_target_sentinel(keys: &[AdaptiveConcurrencyRout
 }
 
 /// Existing target keys keep their counters during strict scale-out. Any
-/// retirement/replacement still drains, as do expansions involving the
-/// zero-target sentinel because it identifies a route source rather than a
-/// concrete limiter key and can collide across sources sharing one scope.
-fn adaptive_concurrency_key_space_requires_drain(
+/// retirement/replacement requires an independent tracking space, as do
+/// expansions involving the zero-target sentinel because it identifies a route
+/// source rather than a concrete limiter key and can collide across sources
+/// sharing one scope.
+fn adaptive_concurrency_key_space_requires_reset(
     current: &[AdaptiveConcurrencyRouteKey],
     replacement: &[AdaptiveConcurrencyRouteKey],
 ) -> bool {
@@ -1567,7 +1673,7 @@ fn adaptive_concurrency_key_space_requires_drain(
         .all(|key| replacement.binary_search(key).is_ok())
 }
 
-fn adaptive_concurrency_route_definition_requires_drain(
+fn adaptive_concurrency_route_definition_requires_reset(
     current: &AdaptiveConcurrencyRouteDefinition,
     replacement: &AdaptiveConcurrencyRouteDefinition,
 ) -> bool {
@@ -1602,7 +1708,7 @@ fn adaptive_concurrency_route_definition_requires_drain(
     {
         return true;
     }
-    adaptive_concurrency_key_space_requires_drain(&current.keys, &replacement.keys)
+    adaptive_concurrency_key_space_requires_reset(&current.keys, &replacement.keys)
 }
 
 fn adaptive_concurrency_lb_key_space_changed(
@@ -1613,7 +1719,7 @@ fn adaptive_concurrency_lb_key_space_changed(
     let current_keys = adaptive_concurrency_effective_lb_keys(&instance.route_definition, current);
     let replacement_keys =
         adaptive_concurrency_effective_lb_keys(&instance.route_definition, replacement);
-    adaptive_concurrency_key_space_requires_drain(&current_keys, &replacement_keys)
+    adaptive_concurrency_key_space_requires_reset(&current_keys, &replacement_keys)
 }
 
 fn retained_adaptive_concurrency_states(
@@ -1738,8 +1844,7 @@ fn create_adaptive_concurrency_plugin(
         )));
     }
 
-    let (limiter, generation, drain_older_generation) = if let Some(existing) =
-        current.get(&identity)
+    let (limiter, generation, reset_tracking_space) = if let Some(existing) = current.get(&identity)
     {
         let generation = existing.generation.checked_add(1).ok_or_else(|| {
             format!(
@@ -1747,18 +1852,19 @@ fn create_adaptive_concurrency_plugin(
                 pc.namespace, pc.id
             )
         })?;
-        (
-            Arc::clone(&existing.limiter),
-            generation,
-            existing.config.key_by != parsed.key_by
-                || parsed.max_tracked_keys < existing.config.max_tracked_keys
-                || existing.scope != pc.scope
-                || existing.proxy_id != pc.proxy_id
-                || adaptive_concurrency_route_definition_requires_drain(
-                    &existing.route_definition,
-                    &route_definition,
-                ),
-        )
+        let structural_change = existing.config.key_by != parsed.key_by
+            || parsed.max_tracked_keys < existing.config.max_tracked_keys
+            || existing.scope != pc.scope
+            || existing.proxy_id != pc.proxy_id
+            || adaptive_concurrency_route_definition_requires_reset(
+                &existing.route_definition,
+                &route_definition,
+            );
+        // Keep the generation lifecycle shared so pinned retired cache views
+        // are rejected after a structural cutover. The limiter rotates its
+        // target-tracking space at commit, allowing permits from the detached
+        // space to finish without blocking or training the replacement.
+        (Arc::clone(&existing.limiter), generation, structural_change)
     } else {
         (
             Arc::new(AdaptiveConcurrencyLimiter::new(
@@ -1784,7 +1890,7 @@ fn create_adaptive_concurrency_plugin(
             proxy_id: pc.proxy_id.clone(),
             route_definition,
             generation,
-            drain_older_generation,
+            reset_tracking_space,
         },
     );
     Ok(Some(Arc::new(plugin)))
@@ -1951,6 +2057,7 @@ impl PluginCapabilities {
     pub const HAS_BODY_BEFORE_AUTHORIZE: u16 = 1 << 10;
     pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
     pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
+    pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -1962,6 +2069,8 @@ impl PluginCapabilities {
 /// Built at config reload time so the hot path does zero filtering or allocation.
 #[derive(Clone)]
 pub struct PluginPhaseData {
+    /// gRPC deadline-policy plugins only, in configured priority order.
+    pub grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Auth plugins only (pre-filtered from the protocol plugin list).
     pub auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Authorization plugins only (pre-filtered from the protocol plugin list).
@@ -1977,6 +2086,8 @@ pub struct PluginPhaseData {
     pub initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Unique canonical field names touched by initial-response policy.
     pub initial_response_header_policy_names: Arc<Vec<String>>,
+    /// Final committed-response observers only, in configured priority order.
+    pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
 }
@@ -1985,13 +2096,18 @@ pub struct PluginPhaseData {
 fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut caps = 0u16;
     let mut auth = Vec::new();
+    let mut grpc_deadline = Vec::new();
     let mut authorize = Vec::new();
     let mut backend_admission = Vec::new();
     let mut backend_path = Vec::new();
     let mut request_headers_to_redact = Vec::new();
     let mut initial_response_header_policy_plugins = Vec::new();
     let mut initial_response_header_policy_names = Vec::new();
+    let mut response_committed = Vec::new();
     for p in plugins {
+        if p.requires_grpc_deadline_preflight() {
+            grpc_deadline.push(Arc::clone(p));
+        }
         if p.is_auth_plugin() {
             caps |= PluginCapabilities::HAS_AUTH_PLUGINS;
             auth.push(Arc::clone(p));
@@ -2049,14 +2165,19 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         if p.needs_final_request_body_context() {
             caps |= PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT;
         }
+        if p.requires_final_request_body_before_backend_dispatch() {
+            caps |= PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH;
+        }
         if p.requires_response_committed_hook() {
             caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;
+            response_committed.push(Arc::clone(p));
         }
         if p.requires_response_stream_hooks() {
             caps |= PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS;
         }
     }
     PluginPhaseData {
+        grpc_deadline_plugins: Arc::new(grpc_deadline),
         auth_plugins: Arc::new(auth),
         authorize_plugins: Arc::new(authorize),
         backend_admission_plugins: Arc::new(backend_admission),
@@ -2064,6 +2185,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         request_headers_to_redact: Arc::new(request_headers_to_redact),
         initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
+        response_committed_plugins: Arc::new(response_committed),
         capabilities: PluginCapabilities(caps),
     }
 }
@@ -2101,6 +2223,11 @@ struct ProtocolSnapshot {
     proxy: HashMap<String, HashMap<ProxyProtocol, ProtocolEntry>>,
     /// Global fallback: protocol → ProtocolEntry
     global: HashMap<ProxyProtocol, ProtocolEntry>,
+    /// HTTP plugin view plus the two native-gRPC policies that are compatible
+    /// with recognized H3 gRPC-Web requests.
+    grpc_web_proxy: HashMap<String, ProtocolEntry>,
+    /// Global fallback for the composed H3 gRPC-Web view.
+    grpc_web_global: ProtocolEntry,
 }
 
 const ALL_PROXY_PROTOCOLS: [ProxyProtocol; 5] = [
@@ -2120,18 +2247,42 @@ fn build_protocol_entry(plugins: &[Arc<dyn Plugin>], proto: ProxyProtocol) -> Pr
     }
 }
 
+const H3_GRPC_WEB_NATIVE_POLICY_PLUGINS: [&str; 2] = ["grpc_method_router", "grpc_deadline"];
+
+fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
+    // The merged proxy list is already in configured priority/config order.
+    // Filtering it once preserves that order, retains every ordinary HTTP
+    // guardrail, and includes each compatible native-gRPC policy instance at
+    // most once even if a future implementation supports both protocols.
+    let plugins = Arc::new(
+        plugins
+            .iter()
+            .filter(|plugin| {
+                plugin.supported_protocols().contains(&ProxyProtocol::Http)
+                    || (H3_GRPC_WEB_NATIVE_POLICY_PLUGINS.contains(&plugin.name())
+                        && plugin.supported_protocols().contains(&ProxyProtocol::Grpc))
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let phase = build_phase_data(&plugins);
+    ProtocolEntry { plugins, phase }
+}
+
 /// Build the full protocol snapshot from the plugin map + global fallback.
 fn build_protocol_snapshot(
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
 ) -> ProtocolSnapshot {
     let mut proxy = HashMap::with_capacity(proxy_map.len());
+    let mut grpc_web_proxy = HashMap::with_capacity(proxy_map.len());
     for (proxy_id, plugins) in proxy_map {
         let mut inner = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
         for &proto in &ALL_PROXY_PROTOCOLS {
             inner.insert(proto, build_protocol_entry(plugins, proto));
         }
         proxy.insert(proxy_id.clone(), inner);
+        grpc_web_proxy.insert(proxy_id.clone(), build_grpc_web_protocol_entry(plugins));
     }
 
     let mut global = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
@@ -2139,7 +2290,14 @@ fn build_protocol_snapshot(
         global.insert(proto, build_protocol_entry(globals, proto));
     }
 
-    ProtocolSnapshot { proxy, global }
+    let grpc_web_global = build_grpc_web_protocol_entry(globals);
+
+    ProtocolSnapshot {
+        proxy,
+        global,
+        grpc_web_proxy,
+        grpc_web_global,
+    }
 }
 
 /// Collect all JWKS URIs actively referenced by `jwks_auth` plugin instances
@@ -2253,7 +2411,7 @@ impl PluginCacheInner {
         for instance in self.adaptive_concurrency_instances.values() {
             instance
                 .limiter
-                .prepare_policy_generation(instance.generation, instance.drain_older_generation);
+                .prepare_policy_generation(instance.generation, instance.reset_tracking_space);
         }
     }
 
@@ -2262,7 +2420,7 @@ impl PluginCacheInner {
             instance.limiter.commit_policy_generation(
                 instance.generation,
                 Arc::clone(&instance.config),
-                instance.drain_older_generation,
+                instance.reset_tracking_space,
             );
         }
     }
@@ -2274,11 +2432,11 @@ impl PluginCacheInner {
         replacement: &crate::load_balancer::LoadBalancerCacheInner,
     ) {
         for instance in self.adaptive_concurrency_instances.values() {
-            let drain_older_generation =
+            let reset_tracking_space =
                 adaptive_concurrency_lb_key_space_changed(instance, current, replacement);
             instance
                 .limiter
-                .prepare_lb_generation(generation, drain_older_generation);
+                .prepare_lb_generation(generation, reset_tracking_space);
         }
     }
 
@@ -2289,11 +2447,11 @@ impl PluginCacheInner {
         replacement: &crate::load_balancer::LoadBalancerCacheInner,
     ) {
         for instance in self.adaptive_concurrency_instances.values() {
-            let drain_older_generation =
+            let reset_tracking_space =
                 adaptive_concurrency_lb_key_space_changed(instance, current, replacement);
             instance
                 .limiter
-                .commit_lb_generation(generation, drain_older_generation);
+                .commit_lb_generation(generation, reset_tracking_space);
         }
     }
 
@@ -2330,6 +2488,16 @@ impl PluginCacheInner {
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
         self.protocol_entry(proxy_id, protocol)
             .map(|entry| Arc::clone(&entry.phase.auth_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    pub(crate) fn get_grpc_deadline_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.grpc_deadline_plugins))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
@@ -2393,6 +2561,16 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    pub(crate) fn get_response_committed_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.response_committed_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub(crate) fn get_capabilities(
         &self,
         proxy_id: &str,
@@ -2435,6 +2613,7 @@ impl PluginCacheInner {
             .then(|| self.get_backend_path_plugins(proxy_id, protocol));
         PluginCacheRequestView {
             plugins: self.get_plugins_for_protocol(proxy_id, protocol),
+            grpc_deadline_plugins: self.get_grpc_deadline_plugins(proxy_id, protocol),
             auth_plugins: self.get_auth_plugins(proxy_id, protocol),
             authorize_plugins: self.get_authorize_plugins(proxy_id, protocol),
             backend_admission_plugins: self.get_backend_admission_plugins(proxy_id, protocol),
@@ -2444,6 +2623,39 @@ impl PluginCacheInner {
                 .get_initial_response_header_policy_plugins(proxy_id, protocol),
             initial_response_header_policy_names: self
                 .get_initial_response_header_policy_names(proxy_id, protocol),
+            response_committed_plugins: self.get_response_committed_plugins(proxy_id, protocol),
+            capabilities,
+            requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
+            requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
+            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_id),
+        }
+    }
+
+    pub(crate) fn grpc_web_request_view(&self, proxy_id: &str) -> PluginCacheRequestView {
+        let entry = self
+            .protocol_snapshot
+            .grpc_web_proxy
+            .get(proxy_id)
+            .unwrap_or(&self.protocol_snapshot.grpc_web_global);
+        let capabilities = entry.phase.capabilities;
+        let backend_path_plugins = capabilities
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+            .then(|| Arc::clone(&entry.phase.backend_path_plugins));
+        PluginCacheRequestView {
+            plugins: Arc::clone(&entry.plugins),
+            grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
+            auth_plugins: Arc::clone(&entry.phase.auth_plugins),
+            authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
+            backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
+            backend_path_plugins,
+            request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
+            initial_response_header_policy_plugins: Arc::clone(
+                &entry.phase.initial_response_header_policy_plugins,
+            ),
+            initial_response_header_policy_names: Arc::clone(
+                &entry.phase.initial_response_header_policy_names,
+            ),
+            response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
             capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
@@ -2460,6 +2672,7 @@ impl PluginCacheInner {
 #[derive(Clone)]
 pub struct PluginCacheRequestView {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -2467,6 +2680,7 @@ pub struct PluginCacheRequestView {
     request_headers_to_redact: Arc<Vec<String>>,
     initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     initial_response_header_policy_names: Arc<Vec<String>>,
+    response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
@@ -2477,6 +2691,11 @@ impl PluginCacheRequestView {
     /// Get pre-resolved protocol-filtered plugins from this request view.
     pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.plugins)
+    }
+
+    /// Get the pre-filtered synchronous gRPC deadline-policy chain.
+    pub fn grpc_deadline_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.grpc_deadline_plugins.as_slice()
     }
 
     /// Get pre-computed auth plugins from this request view.
@@ -2515,6 +2734,11 @@ impl PluginCacheRequestView {
     /// Get canonical field names touched by initial-response policy.
     pub fn initial_response_header_policy_names(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.initial_response_header_policy_names)
+    }
+
+    /// Get the pre-filtered committed-response observer chain.
+    pub fn response_committed_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.response_committed_plugins.as_slice()
     }
 
     /// Get pre-computed capability bitset from this request view.
@@ -2811,6 +3035,9 @@ impl PluginCache {
                 }
             }
             global_plugins.sort_by_key(|p| p.priority());
+            if let Err(e) = install_cors_finalizer(&mut global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
@@ -2851,6 +3078,9 @@ impl PluginCache {
                 }
             }
             global_plugins.sort_by_key(|plugin| plugin.priority());
+            if let Err(e) = install_cors_finalizer(&mut global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
@@ -3053,6 +3283,9 @@ impl PluginCache {
             }
 
             merged.sort_by_key(|p| p.priority());
+            if let Err(e) = install_cors_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
@@ -3117,8 +3350,10 @@ impl PluginCache {
         // Rebuild protocol snapshot (plugins + phase data) for changed proxies.
         // Clone-and-patch from the current snapshot so unchanged proxies are preserved.
         let mut new_proxy_proto = current.protocol_snapshot.proxy.clone();
+        let mut new_grpc_web_proxy = current.protocol_snapshot.grpc_web_proxy.clone();
         for id in removed_proxy_ids {
             new_proxy_proto.remove(id);
+            new_grpc_web_proxy.remove(id);
         }
         for proxy in &config.proxies {
             if proxy_ids_to_rebuild.contains(&proxy.id)
@@ -3129,6 +3364,7 @@ impl PluginCache {
                     inner.insert(proto, build_protocol_entry(plugins, proto));
                 }
                 new_proxy_proto.insert(proxy.id.clone(), inner);
+                new_grpc_web_proxy.insert(proxy.id.clone(), build_grpc_web_protocol_entry(plugins));
             }
         }
         let new_global_proto = if global_plugins_changed {
@@ -3139,6 +3375,11 @@ impl PluginCache {
             g
         } else {
             current.protocol_snapshot.global.clone()
+        };
+        let new_grpc_web_global = if global_plugins_changed {
+            build_grpc_web_protocol_entry(&new_globals)
+        } else {
+            current.protocol_snapshot.grpc_web_global.clone()
         };
 
         let new_global_requires_buffering = if global_plugins_changed {
@@ -3178,6 +3419,8 @@ impl PluginCache {
             ProtocolSnapshot {
                 proxy: new_proxy_proto,
                 global: new_global_proto,
+                grpc_web_proxy: new_grpc_web_proxy,
+                grpc_web_global: new_grpc_web_global,
             },
             new_ws_frame,
             new_global_requires_ws_frame,
@@ -3584,6 +3827,9 @@ impl PluginCache {
 
             // Sort by priority so execution order is deterministic
             merged.sort_by_key(|p| p.priority());
+            if let Err(e) = install_cors_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
@@ -3609,6 +3855,9 @@ impl PluginCache {
         // Sort and validate the global fallback list before committing the
         // staged registry so ordering errors reject the whole cache build.
         global_plugins.sort_by_key(|p| p.priority());
+        if let Err(e) = install_cors_finalizer(&mut global_plugins) {
+            plugin_errors.push(format!("global plugins: {e}"));
+        }
         if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }

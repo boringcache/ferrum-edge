@@ -230,13 +230,19 @@ or `Content-Range`) follow the same bounded encoded-body decision as complete
 responses: decodable governed content remains inspectable, while malformed
 fragments follow the configured uninspectable-body policy. Unencoded JSON
 partials also remain subject to normal inspection. Unencoded unrelated event
-streams also keep streaming;
-complete origin-encoded event streams stay buffered for bounded decode because
-stream inspectors cannot parse compressed wire bytes. No encoding (or an
+streams also keep streaming; complete origin-encoded event streams stay buffered
+for bounded decode because stream inspectors cannot parse compressed wire bytes.
+After decoding, an SSE media type keeps SSE frame parsing unless the complete
+payload is a valid standalone JSON document; this preserves later `data:` frames
+after JSON-looking SSE preludes while still inspecting bare JSON mislabeled as
+SSE. Once an encoded event stream is governed, every assembled non-empty,
+non-`[DONE]` `data:` payload must parse as JSON; one unparseable frame makes the
+decoded representation uninspectable and routes the whole response through
+`on_error` instead of inspecting only its parseable subset. No encoding (or an
 identity-only encoding list) still lets ordinary non-AI text stream, and a
 gateway-planned compression transform is not mistaken for already-encoded
-origin bytes, including when a later header hook switches between supported
-gzip and Brotli output.
+origin bytes, including when a later header hook switches between supported gzip
+and Brotli output.
 
 **Protocol coverage.** The downgrade applies on the HTTP/1.1 + HTTP/2 (reqwest),
 direct-HTTP/2, HBONE, native-HTTP/3 header-first, and HTTP/3 cross-protocol
@@ -376,8 +382,11 @@ Helper constructors:
 Use `response_body_mode: buffer` when:
 
 - A plugin needs to inspect or transform the **response body** (not just headers)
-- You are debugging response content with `transaction_debugger` and `log_response_body: true`
 - Your responses are small and the latency difference is negligible
+
+`transaction_debugger` does not capture payloads and does not require buffer
+mode. It reports final body completion, byte counts, disconnects, and typed
+streaming errors from the terminal transaction summary instead.
 
 Note: response body size limits are now enforced via `SizeLimitedStreamingResponse` even when Content-Length is absent — explicit buffer mode is no longer required for size enforcement.
 

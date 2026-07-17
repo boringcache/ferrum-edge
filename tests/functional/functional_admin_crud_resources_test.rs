@@ -1063,7 +1063,7 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
         backend_port,
         plugin_id: &validator_plugin_id,
         plugin_name: "cors",
-        plugin_config: json!({}),
+        plugin_config: json!({"allowed_origins": ["*"]}),
         validate: false,
     });
     let validator_spec_created =

@@ -335,8 +335,10 @@ impl MeshRuntimeState {
     /// Publish a slice after the mesh proxy runtime accepts it.
     pub fn record_applied_slice(&self, slice: &MeshSlice) {
         // GAP-3E: refresh RTDS-driven consumers only after proxy config
-        // acceptance. Rejected slices must not mutate live fault/log/transformer
+        // acceptance. Rejected slices must not mutate live log/transformer
         // state while the proxy keeps serving the previous accepted config.
+        // Fault percentages are already bound to the candidate plugin cache
+        // and request epoch before this post-accept fanout runs.
         #[cfg(test)]
         let _overlay_guard = crate::modes::mesh::runtime_overlay_consumers::test_lock();
         crate::modes::mesh::runtime_overlay_consumers::apply_overlay(&slice.runtime_overlay);

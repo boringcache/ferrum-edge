@@ -13,7 +13,11 @@ use uuid::Uuid;
 use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
-use crate::config::db_backend::{DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult};
+use crate::config::db_backend::{
+    BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
+    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_admission_unavailable,
+    is_mtls_dns_identity_conflict,
+};
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, RetryConfig, Upstream,
@@ -52,6 +56,7 @@ pub(crate) enum WriteAction<'a> {
 
 pub(crate) enum AfterValidateError {
     BadRequest(Vec<String>),
+    Conflict(Vec<String>),
     Db(anyhow::Error),
     Response(Box<Response<Full<Bytes>>>),
 }
@@ -91,18 +96,17 @@ pub(crate) enum BatchPreparationError {
 const MTLS_ADMISSION_LOCK_SHARDS: usize = 64;
 static MTLS_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
 
-/// Best-effort serialization of mTLS-sensitive admin mutations for a namespace
+/// Same-process serialization of mTLS-sensitive admin mutations for a namespace
 /// from candidate validation through persistence. A bounded process-global
 /// lock set covers every `AdminState` served by this process without retaining
 /// attacker-chosen namespace strings indefinitely.
 ///
-/// The datastore's exact mTLS credential index remains the authoritative
-/// cross-process backstop for exact identities. The additional ASCII-folded
-/// `san_dns` constraint is conditional on effective plugin associations, so it
-/// cannot use an unconditional case-folded unique index without rejecting valid
-/// case variants used by exact-match policies. Fully serializing that dynamic
-/// check across SQL and MongoDB writers requires backend-specific transactions;
-/// this lock deliberately does not claim to coordinate separate admin processes.
+/// SQL transactions and MongoDB leases provide the authoritative cross-process
+/// backstop. The additional ASCII-folded `san_dns` constraint is conditional on
+/// effective plugin associations, so it cannot use an unconditional case-folded
+/// unique index without rejecting valid case variants used by exact-match
+/// policies. This lock avoids redundant same-process candidate work while the
+/// backend serialization covers separate admin processes.
 /// Every credential mutation takes this lock, even for non-mTLS types, because
 /// those endpoints persist the complete `Consumer` and could otherwise replay
 /// stale `mtls_auth` entries loaded before a concurrent mTLS mutation.
@@ -157,18 +161,16 @@ async fn validate_mtls_auth_candidate(
     {
         return Ok(());
     }
-    let mut errors = config
+    let compatibility_errors = config
         .validate_mtls_auth_compatibility()
         .err()
         .unwrap_or_default();
-    if let Err(credential_errors) = config.validate_unique_mtls_credentials() {
-        errors.extend(credential_errors);
+    if !compatibility_errors.is_empty() {
+        return Err(AfterValidateError::BadRequest(compatibility_errors));
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(AfterValidateError::BadRequest(errors))
-    }
+    config
+        .validate_unique_mtls_credentials()
+        .map_err(AfterValidateError::Conflict)
 }
 
 pub(crate) async fn validate_hmac_request_transform_candidates(
@@ -465,6 +467,9 @@ pub(crate) trait AdminResource:
         error: &anyhow::Error,
         _action: WriteAction<'_>,
     ) -> Response<Full<Bytes>> {
+        if is_mtls_dns_admission_unavailable(error) {
+            return super::mtls_dns_admission_unavailable_response();
+        }
         // Unique-constraint violations at persist time are conflicts, not
         // server faults: the admission prechecks are namespace-scoped and
         // raceable, so the DB constraint is the authoritative backstop (e.g.
@@ -473,7 +478,7 @@ pub(crate) trait AdminResource:
         // Surface the constraint message (it names the conflicting key);
         // everything else stays a redacted 500.
         let message = error.to_string();
-        if super::is_unique_constraint_violation(&message) {
+        if is_mtls_dns_identity_conflict(error) || super::is_unique_constraint_violation(&message) {
             super::json_response(StatusCode::CONFLICT, &json!({ "error": message }))
         } else {
             super::json_response(
@@ -484,10 +489,16 @@ pub(crate) trait AdminResource:
     }
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
-        super::json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &super::db_error_response(error),
-        )
+        if is_mtls_dns_admission_unavailable(error) {
+            super::mtls_dns_admission_unavailable_response()
+        } else if is_mtls_dns_identity_conflict(error) {
+            super::json_response(StatusCode::CONFLICT, &json!({"error": error.to_string()}))
+        } else {
+            super::json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &super::db_error_response(error),
+            )
+        }
     }
 
     fn allow_cached_read_fallback(_error: &anyhow::Error) -> bool {
@@ -791,7 +802,11 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     if config_update_target_was_not_found(error) {
         return not_found_response::<Consumer>();
     }
-    let unique_conflict = super::is_unique_constraint_violation(&error.to_string());
+    if is_mtls_dns_admission_unavailable(error) {
+        return super::mtls_dns_admission_unavailable_response();
+    }
+    let unique_conflict = is_mtls_dns_identity_conflict(error)
+        || super::is_unique_constraint_violation(&error.to_string());
     let message = consumer_persist_error_message(error);
     let status = if unique_conflict {
         StatusCode::CONFLICT
@@ -806,7 +821,11 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
 /// values; callers need the conflict disposition, never credential or index
 /// metadata.
 pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
-    if super::is_unique_constraint_violation(&error.to_string()) {
+    if is_mtls_dns_admission_unavailable(error) {
+        MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
+    } else if is_mtls_dns_identity_conflict(error) {
+        error.to_string()
+    } else if super::is_unique_constraint_violation(&error.to_string()) {
         "Consumer identity or credential conflicts with another Consumer in the namespace"
             .to_string()
     } else {
@@ -1430,8 +1449,57 @@ fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
     let mut body = json!(resource);
     if let Some(config) = body.get_mut("config") {
         redact_sensitive_plugin_config_fields(config);
+        if resource.plugin_name == "loki_logging" {
+            redact_loki_logging_config_projection(config);
+        }
     }
     body
+}
+
+fn redact_loki_logging_config_projection(config: &mut Value) {
+    let marker = crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER;
+    let Some(config) = config.as_object_mut() else {
+        *config = json!(marker);
+        return;
+    };
+
+    if let Some(endpoint) = config.get_mut("endpoint_url")
+        && !endpoint.is_null()
+    {
+        *endpoint = match endpoint
+            .as_str()
+            .and_then(|value| url::Url::parse(value).ok())
+        {
+            Some(endpoint) => {
+                json!(crate::plugins::loki_logging::redacted_endpoint_url(
+                    &endpoint
+                ))
+            }
+            None => json!(marker),
+        };
+    }
+    if let Some(authorization) = config.get_mut("authorization_header")
+        && !authorization.is_null()
+    {
+        *authorization = json!(marker);
+    }
+    if let Some(custom_headers) = config.get_mut("custom_headers") {
+        redact_loki_custom_header_values(custom_headers, marker);
+    }
+}
+
+fn redact_loki_custom_header_values(value: &mut Value, marker: &str) {
+    match value {
+        Value::Object(headers) => {
+            for value in headers.values_mut() {
+                if !value.is_null() {
+                    *value = json!(marker);
+                }
+            }
+        }
+        Value::Null => {}
+        _ => *value = json!(marker),
+    }
 }
 
 fn upstream_audit_body(resource: &Upstream) -> Value {
@@ -1480,6 +1548,7 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
         || normalized.contains("client_secret")
         || normalized.contains("credential")
         || normalized.contains("private_key")
+        || normalized.contains("service_account_json")
         || normalized.contains("webhook")
 }
 
@@ -1647,6 +1716,9 @@ impl AdminResource for Upstream {
     }
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+        if is_mtls_dns_admission_unavailable(error) {
+            return super::mtls_dns_admission_unavailable_response();
+        }
         let error_text = error.to_string();
         if error_text.contains("referenced by one or more proxies")
             || error_text.contains("referenced by mesh_route_dispatch plugin_config")
@@ -2341,6 +2413,9 @@ impl AdminResource for Proxy {
         error: &anyhow::Error,
         _action: WriteAction<'_>,
     ) -> Response<Full<Bytes>> {
+        if is_mtls_dns_admission_unavailable(error) {
+            return super::mtls_dns_admission_unavailable_response();
+        }
         let message = error.to_string();
         if message.contains(PROXY_ROUTE_CONFLICT_ERROR) {
             return super::json_response(
@@ -2348,7 +2423,7 @@ impl AdminResource for Proxy {
                 &json!({"error": PROXY_ROUTE_CONFLICT_ERROR}),
             );
         }
-        if super::is_unique_constraint_violation(&message) {
+        if is_mtls_dns_identity_conflict(error) || super::is_unique_constraint_violation(&message) {
             return super::json_response(StatusCode::CONFLICT, &json!({ "error": message }));
         }
 
@@ -2685,7 +2760,8 @@ impl AdminResource for Consumer {
     }
 
     async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool> {
-        db.update_consumer(resource).await
+        db.update_consumer(resource, &BatchConfigWriteMode::Admission)
+            .await
     }
 
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
@@ -2757,6 +2833,9 @@ fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
 fn map_after_validate_error<R: AdminResource>(error: AfterValidateError) -> Response<Full<Bytes>> {
     match error {
         AfterValidateError::BadRequest(field_errors) => R::map_after_validate_errors(&field_errors),
+        AfterValidateError::Conflict(errors) => {
+            super::json_response(StatusCode::CONFLICT, &json!({"error": errors.join("; ")}))
+        }
         AfterValidateError::Db(error) => R::map_precheck_db_error(&error),
         AfterValidateError::Response(response) => *response,
     }

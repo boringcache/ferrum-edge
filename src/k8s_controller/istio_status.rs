@@ -67,8 +67,8 @@ use tracing::warn;
 
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    service_entry_port_protocol_is_udp, sidecar_selector_from_istio,
-    translate_k8s_objects_with_filter, workload_selector_from_istio,
+    route_local_fault_delay_for_rule, service_entry_port_protocol_is_udp,
+    sidecar_selector_from_istio, translate_k8s_objects_with_filter, workload_selector_from_istio,
 };
 
 /// Field manager used on every `patch_status` call. Kubernetes uses this
@@ -794,15 +794,22 @@ fn virtual_service_status(
     match result {
         Ok(_translation) => {
             let deferred = virtual_service_deferred_fields(&object.spec);
-            let message = if deferred.is_empty() {
+            let clamped = virtual_service_clamped_fields(&object.spec);
+            let message = if deferred.is_empty() && clamped.is_empty() {
                 format!(
                     "Ferrum accepted this VirtualService ({host_count} host(s), {http_route_count} HTTP route(s))"
                 )
             } else {
+                let mut notes = Vec::new();
+                if !deferred.is_empty() {
+                    notes.push(format!("deferred fields: {}", deferred.join(", ")));
+                }
+                if !clamped.is_empty() {
+                    notes.push(format!("clamped fields: {}", clamped.join(", ")));
+                }
                 format!(
-                    "Ferrum accepted this VirtualService ({host_count} host(s), {http_route_count} HTTP route(s)); \
-                     deferred fields: {}",
-                    deferred.join(", ")
+                    "Ferrum accepted this VirtualService ({host_count} host(s), {http_route_count} HTTP route(s)); {}",
+                    notes.join("; ")
                 )
             };
             let detail = json!({
@@ -810,6 +817,7 @@ fn virtual_service_status(
                     "hosts": host_count,
                     "http_routes_translated": http_route_count,
                     "deferred_fields": deferred,
+                    "clamped_fields": clamped,
                 }
             });
             accepted_status(object, true, "Accepted", &message, Some(detail))
@@ -832,8 +840,8 @@ fn virtual_service_status(
 /// projects. `tcp` / `tls` route arrays are not listed here: they are
 /// translated to stream proxies (unsupported matches / weighted splitting
 /// surface via the `Invalid` arm, not as deferred). `corsPolicy` is translated
-/// to a `cors` plugin when its origins are representable; it is deferred only
-/// when they are not.
+/// to a `cors` plugin when the complete source combination is representable;
+/// otherwise it is deferred.
 fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     let mut deferred: Vec<&'static str> = Vec::new();
     // `spec.tcp[]` / `spec.tls[]` are NOT listed as deferred: the translator
@@ -843,11 +851,12 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
     // origins are representable — `allowOrigins[]` `exact`/`prefix`/`regex`
     // `StringMatch` (regex must compile) or the legacy `allowOrigin` exact
-    // list, plus a parseable maxAge. It remains a deferred field only when an
-    // origin matcher is malformed/unknown, a `regex` does not compile, or
-    // `maxAge` is unparseable, in which case the translator leaves it
-    // unprojected. The shared `cors_policy_translatable` predicate keeps the
-    // translator and this report in lockstep.
+    // list, plus a parseable maxAge. It remains a deferred field when an origin
+    // matcher is malformed/unknown, a `regex` does not compile, maxAge is
+    // unparseable, or credentials are combined with exact `*` (the native
+    // wildcard representation cannot preserve that source behavior). The
+    // shared `cors_policy_translatable` predicate keeps the translator and this
+    // report in lockstep.
     let http_routes = spec.get("http").and_then(Value::as_array);
     if http_routes.is_some_and(|routes| {
         routes.iter().any(|route| {
@@ -857,11 +866,32 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
         })
     }) {
         deferred.push(
-            "http[].corsPolicy with an unrepresentable origin matcher \
+            "http[].corsPolicy with an unrepresentable policy combination \
              (not projected; use the cors plugin)",
         );
     }
     deferred
+}
+
+/// VirtualService values that are valid in Istio but exceed a Ferrum runtime
+/// limit and are therefore translated with an operator-visible clamp.
+fn virtual_service_clamped_fields(spec: &Value) -> Vec<&'static str> {
+    let has_clamped_fault_delay =
+        spec.get("http")
+            .and_then(Value::as_array)
+            .is_some_and(|routes| {
+                routes.iter().any(|route| {
+                    route
+                        .get("fault")
+                        .and_then(route_local_fault_delay_for_rule)
+                        .is_some_and(|delay| delay.was_clamped())
+                })
+            });
+    if has_clamped_fault_delay {
+        vec!["http[].fault.delay.fixedDelay above 60s (clamped to 60s)"]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Status for `ServiceEntry`. Reports the resolved `resolution`/`location`
@@ -2375,6 +2405,49 @@ mod tests {
     }
 
     #[test]
+    fn virtual_service_clamped_fault_delay_is_operator_visible() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "slow-vs",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [{
+                    "route": [{
+                        "destination": {
+                            "host": "reviews.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }
+                    }],
+                    "fault": {
+                        "delay": {
+                            "fixedDelay": "61s",
+                            "percentage": {"value": 100.0}
+                        }
+                    }
+                }]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        assert_eq!(updates.len(), 1);
+        let condition = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(condition["status"].as_str(), Some("True"));
+        assert_eq!(condition["reason"].as_str(), Some("Accepted"));
+        assert!(condition["message"].as_str().is_some_and(|message| {
+            message.contains("clamped fields") && message.contains("fixedDelay")
+        }));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["clamped_fields"],
+            json!(["http[].fault.delay.fixedDelay above 60s (clamped to 60s)"])
+        );
+        assert_eq!(detail["translation"]["deferred_fields"], json!([]));
+    }
+
+    #[test]
     fn virtual_service_missing_destination_host_is_rejected() {
         // A route with a destination but no host fails translation.
         let obj = object(
@@ -2578,6 +2651,44 @@ mod tests {
         assert!(
             deferred.iter().any(|f| f.contains("corsPolicy")),
             "uncompilable-regex http[].corsPolicy should still be flagged as deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_cors_policy_credentialed_wildcard_is_deferred() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "cors-vs-credentialed-star",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "corsPolicy": {
+                            "allowOrigins": [ { "exact": "*" } ],
+                            "allowCredentials": true
+                        }
+                    }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("corsPolicy")),
+            "credentialed wildcard http[].corsPolicy must remain deferred, got {deferred:?}"
         );
     }
 

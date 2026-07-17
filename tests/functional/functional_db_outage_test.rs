@@ -308,12 +308,12 @@ async fn test_db_outage_proxy_continues_with_plugins() {
             "proxy_id": "outage-proxy",
             "enabled": true,
             "config": {
-                "origins": ["https://example.com"],
-                "methods": ["GET", "POST"],
-                "headers": ["Content-Type", "Authorization"],
+                "allowed_origins": ["https://example.com"],
+                "allowed_methods": ["GET", "POST"],
+                "allowed_headers": ["Content-Type", "Authorization"],
                 "exposed_headers": ["X-Custom-Header"],
                 "max_age": 3600,
-                "credentials": true
+                "allow_credentials": true
             }
         }),
     ];

@@ -332,14 +332,14 @@ Plugins for AI and agent gateway use cases — transcript audit, cost visibility
 - **`ai_request_guard`** — Enforce model whitelists, token limits, and request policy
 - **`ai_rate_limiter`** — Enforce token budgets with pre-request reservation and response reconciliation (supports centralized Redis mode; compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, Garnet)
 - **`ai_prompt_shield`** — Scan for PII and reject, redact, or warn
-- **`ai_prompt_compressor`** — Shorten LLM prompts to cut token usage/cost with a model-free statistical filter (no external models or services); preserves code, URLs, numbers, identifiers, and negations
+- **`ai_prompt_compressor`** — Bounded model-free compression for admitted OpenAI Chat/Text Completions requests (no external models or services); preserves matching-backtick code, URLs, Unicode numbers, common identifiers, and negations, with bounded fail-safe `preserve_tag` marker cleanup
 - **`ai_semantic_firewall`** — Semantic prompt/response firewall for prompt injection, jailbreaks, data exfiltration intent, tool abuse, and topic allow/deny policy
 - **`ai_semantic_cache`** — LLM response caching with normalized exact-match keys, optional embedding-based semantic similarity, and local or Redis exact-response storage
 - **`ai_response_guard`** — Output-side content guardrails: PII detection, blocked phrases, response format validation
 - **`ai_tool_governor`** — Deterministic allow/deny/redact/approval policy for AI tool/function calls by name, arguments, JSON Schema, regex, risk, and identity; screens request tool definitions, buffered and streaming response tool calls (held until cleared, then released or cut), and optional MCP/A2A methods, with an optional approval webhook
 - **`ai_transcript_audit`** — Controlled AI payload capture for compliance: redacted request/response excerpts, canonical hashes, model/provider, token/guardrail/tool/cache metadata, sampling, and async batched HTTP export; never blocks the hot path unless configured fail-closed
 - **`ai_stream_router`** — Streaming counterpart to `ai_federation`: claims `"stream": true` OpenAI Chat Completions, route-overrides to the matched provider, and normalizes provider-native SSE (e.g. Anthropic) to OpenAI `chat.completion.chunk` SSE without buffering
-- **`ai_federation`** — Universal AI gateway routing non-streaming Chat Completions requests to 11+ providers with model-based routing and priority fallback; matched `"stream": true` requests return `501`
+- **`ai_federation`** — HTTP-only AI gateway routing final transformed, non-streaming Chat Completions JSON to supported providers with bounded responses, replay-safe fallback, strict endpoint policy, and provider-native tool/content normalization; matched `"stream": true` requests return `501`
 - **`mcp_gateway`** — MCP / Agent Tool Gateway for HTTP JSON-RPC MCP traffic: transparent proxying, aggregate discovery, namespaced tool/resource/prompt routing, session mediation, tool argument validation, and `mcp.*` metadata for downstream Ferrum plugins
 - **`a2a_gateway`** — Transparent Agent-to-Agent gateway for HTTP/HTTPS JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs traffic: method detection, lightweight method policy, HTTP Agent Card URL rewriting, streaming-safe pass-through, and `a2a.*` metadata
 

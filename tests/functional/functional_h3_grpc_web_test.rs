@@ -185,7 +185,12 @@ fn reject_config(backend_port: u16) -> Value {
             proxy(
                 "h3-grpc-web-received",
                 "/received",
-                &["grpc-web-received", "grpc-web-cors", "received-reject"],
+                &[
+                    "grpc-web-received",
+                    "grpc-web-cors",
+                    "grpc-web-cors-narrow",
+                    "received-reject",
+                ],
             ),
             proxy(
                 "h3-grpc-web-authenticate",
@@ -230,6 +235,20 @@ fn reject_config(backend_port: u16) -> Value {
                 "proxy_id": "h3-grpc-web-received",
                 "enabled": true,
                 "config": {"allowed_origins": ["https://app.example"]},
+            },
+            {
+                "id": "grpc-web-cors-narrow",
+                "plugin_name": "cors",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-received",
+                "enabled": true,
+                "config": {
+                    "allowed_origins": ["https://app.example"],
+                    "allowed_methods": [],
+                    "allowed_headers": [],
+                    "exposed_headers": [],
+                    "unmatched_preflights": "forward"
+                },
             },
             {
                 "id": "received-reject",
@@ -360,6 +379,9 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
         grpc_web(Method::POST).header("origin", "https://app.example"),
     )
     .await;
+    // The second CORS instance carries Istio's omitted method/header lists.
+    // Those empty preflight lists must not reject this actual gRPC-Web POST or
+    // its Content-Type header before request_termination shapes the response.
     assert_grpc_web_error(&received, "13", "application/grpc-web+proto");
     assert_eq!(
         received
@@ -404,7 +426,7 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
     let method_policy = request_with_retry(
         &client,
         &format!("https://127.0.0.1:{https_port}/method-policy/pkg.Service/Denied"),
-        grpc_web(Method::POST),
+        grpc_web(Method::POST).header("grpc-timeout", "5S"),
     )
     .await;
     assert_grpc_web_error(&method_policy, "7", "application/grpc-web+proto");
@@ -423,6 +445,7 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
         GetOptions::default()
             .method(Method::POST)
             .header("content-type", "application/grpc")
+            .header("grpc-timeout", "5S")
             .body(Bytes::from(grpc_frame(b"ping"))),
     )
     .await;
@@ -625,6 +648,100 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
     let received = String::from_utf8_lossy(&backend.received_bytes().await).to_ascii_lowercase();
     assert!(received.starts_with("post /echo.echo/unary http/1.1\r\n"));
     assert!(received.contains("content-type: application/grpc-web+proto\r\n"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn streaming_h3_grpc_web_deadline_cancels_withheld_backend_headers() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled pass-through backend");
+    let backend_port = backend_listener.local_addr().expect("backend addr").port();
+    let backend_ca = TestCa::new("h3-grpc-web-deadline-stall").expect("backend CA");
+    let (backend_cert, backend_key) = backend_ca.valid().expect("backend leaf");
+    let backend = ScriptedTlsBackend::builder(
+        backend_listener,
+        TlsConfig::new(backend_cert, backend_key).with_alpn(vec![b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    // Withhold response headers while continuing to read. The sentinel cannot
+    // occur in this request, so the step exits only when deadline cancellation
+    // closes the backend transport.
+    .step(TcpStep::ReadUntil(
+        b"ferrum-grpc-deadline-backend-never-sends-response".to_vec(),
+    ))
+    .spawn()
+    .expect("spawn stalled pass-through backend");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "h3-grpc-web-deadline-stall",
+            "listen_path": "/deadline-stall",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [{"plugin_config_id": "grpc-deadline-stall"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "grpc-deadline-stall",
+            "plugin_name": "grpc_deadline",
+            "scope": "proxy",
+            "proxy_id": "h3-grpc-web-deadline-stall",
+            "enabled": true,
+            "config": {"max_deadline_ms": 1000},
+        }],
+    });
+    let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
+    let client = Http3Client::insecure().expect("H3 client");
+    let started_at = Instant::now();
+    let response = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/deadline-stall/echo.Echo/Unary"),
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "application/grpc-web+proto")
+            .header("grpc-timeout", "100m")
+            .body(Bytes::from(grpc_frame(b"ping"))),
+    )
+    .await;
+
+    assert_grpc_web_error(&response, "4", "application/grpc-web+proto");
+    assert!(
+        started_at.elapsed() < Duration::from_secs(3),
+        "the absolute RPC deadline must win before the five-second backend read timeout"
+    );
+    let released_connections = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let accepted = backend.accepted_connections();
+            let errors = backend.step_errors().await;
+            if accepted > 0 && errors.len() >= accepted as usize {
+                return (accepted, errors);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let (backend_connections, _release_errors) = match released_connections {
+        Ok(released) => released,
+        Err(_) => panic!(
+            "deadline dispatch did not promptly release every backend connection: {} accepted, \
+             errors: {:?}",
+            backend.accepted_connections(),
+            backend.step_errors().await,
+        ),
+    };
+    assert!(
+        backend_connections >= 1,
+        "the withheld-response-header backend path must be reached"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
