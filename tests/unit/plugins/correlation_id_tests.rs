@@ -735,6 +735,10 @@ async fn assert_isolated_instances(external_first: bool) {
         REQUEST_ID_METADATA_KEY.to_string(),
         "pre-correlation-custom-value".to_string(),
     );
+    ctx.metadata.insert(
+        "correlation_id.instance.spoofed-custom-value".to_string(),
+        "attacker-metadata".to_string(),
+    );
     ctx.headers.insert(
         "x-external-correlation-id".to_string(),
         "attacker-preserved-id".to_string(),

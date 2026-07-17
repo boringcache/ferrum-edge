@@ -655,9 +655,12 @@ pub struct WsDisconnectContext {
 /// IPv4-mapped IPv6, and publishes the result here. Every later plugin instance
 /// performs only the lock-free `OnceLock::get_or_init` fast path. `None` is
 /// cached as well, preserving fail-closed behavior for malformed identities.
+/// The same private typed state also records one-time correlation ownership;
+/// plugin-writable transaction metadata is deliberately not authoritative.
 #[derive(Debug, Clone, Default)]
 pub struct CanonicalClientIpCache {
     value: OnceLock<Option<IpAddr>>,
+    correlation_id_canonical_owner: OnceLock<()>,
 }
 
 impl CanonicalClientIpCache {
@@ -675,6 +678,10 @@ impl CanonicalClientIpCache {
     #[doc(hidden)]
     pub fn is_initialized(&self) -> bool {
         self.value.get().is_some()
+    }
+
+    fn claim_canonical_correlation_id(&self) -> bool {
+        self.correlation_id_canonical_owner.set(()).is_ok()
     }
 }
 
@@ -1297,6 +1304,10 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
+    }
+
+    pub(crate) fn claim_canonical_correlation_id(&self) -> bool {
+        self.canonical_client_ip.claim_canonical_correlation_id()
     }
 
     /// Return the one absolute gRPC deadline established for this request.
@@ -3136,7 +3147,8 @@ pub struct StreamConnectionContext {
     /// `mesh_authz` to populate Istio's `source.ip` principal (socket peer)
     /// separately from `remote.ip` (forwarded/resolved address).
     pub direct_client_ip: String,
-    /// Shared typed-client-IP cache for stream policy instances.
+    /// Shared typed plugin lifecycle state for stream policy instances.
+    /// Its fields and correlation ownership transition remain crate-private.
     #[doc(hidden)]
     pub canonical_client_ip: CanonicalClientIpCache,
     pub proxy_id: String,
@@ -3208,6 +3220,10 @@ impl StreamConnectionContext {
     #[doc(hidden)]
     pub fn canonical_client_ip_is_initialized(&self) -> bool {
         self.canonical_client_ip.is_initialized()
+    }
+
+    pub(crate) fn claim_canonical_correlation_id(&self) -> bool {
+        self.canonical_client_ip.claim_canonical_correlation_id()
     }
 
     /// Return the stable authenticated identity for stream policies. A mapped
@@ -3524,6 +3540,13 @@ pub enum BackendAdmissionDecision {
 pub trait Plugin: Send + Sync {
     /// Returns the plugin name.
     fn name(&self) -> &str;
+
+    /// Return the normalized correlation header owned by this instance.
+    /// Plugin-cache admission uses this to reject ambiguous duplicate writers.
+    #[doc(hidden)]
+    fn correlation_id_header_name(&self) -> Option<&str> {
+        None
+    }
 
     /// Returns the execution priority (lower = runs first).
     ///

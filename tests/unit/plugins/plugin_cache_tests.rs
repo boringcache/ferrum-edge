@@ -4676,6 +4676,67 @@ fn test_hmac_auth_allows_header_only_request_transformer() {
 }
 
 #[test]
+fn test_duplicate_effective_correlation_headers_are_rejected() {
+    let first = make_plugin_config_with_json(
+        "corr-first",
+        "correlation_id",
+        json!({}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let mut second = make_plugin_config_with_json(
+        "corr-second",
+        "correlation_id",
+        json!({"header_name": " X-Request-ID "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second.priority_override = Some(75);
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["corr-first", "corr-second"],
+        )],
+        vec![first, second],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("duplicate normalized correlation headers must fail closed");
+    assert!(error.contains("duplicate effective header_name \"x-request-id\""));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
+fn test_same_correlation_header_on_disjoint_proxy_chains_is_allowed() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/one", vec!["corr-one"]),
+            make_proxy("p2", "/two", vec!["corr-two"]),
+        ],
+        vec![
+            make_plugin_config(
+                "corr-one",
+                "correlation_id",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "corr-two",
+                "correlation_id",
+                PluginScope::Proxy,
+                Some("p2"),
+                true,
+            ),
+        ],
+    );
+
+    assert!(PluginCache::new(&config).is_ok());
+}
+
+#[test]
 fn test_modifies_request_headers_flag_false_when_no_plugin_modifies() {
     // stdout_logging does not modify request headers
     let config = make_config(

@@ -119,17 +119,14 @@ impl CorrelationId {
         })
     }
 
-    fn publish_request_id(&self, metadata: &mut HashMap<String, String>, request_id: String) {
-        // The instance-scoped entries are the correlation lifecycle state. Use
-        // their presence to identify the first correlation instance instead of
-        // adding a private bookkeeping key to public transaction metadata.
-        // Generic metadata may already contain `request_id` from a custom
-        // plugin; the first correlation instance intentionally replaces it.
-        let canonical_unclaimed = !metadata
-            .keys()
-            .any(|key| key.starts_with(INSTANCE_METADATA_PREFIX));
+    fn publish_request_id(
+        &self,
+        metadata: &mut HashMap<String, String>,
+        request_id: String,
+        publish_canonical: bool,
+    ) {
         metadata.insert(self.instance_metadata_key.clone(), request_id.clone());
-        if canonical_unclaimed {
+        if publish_canonical {
             metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
         }
     }
@@ -180,6 +177,10 @@ impl Plugin for CorrelationId {
         "correlation_id"
     }
 
+    fn correlation_id_header_name(&self) -> Option<&str> {
+        Some(&self.header_name)
+    }
+
     fn priority(&self) -> u16 {
         super::priority::CORRELATION_ID
     }
@@ -197,8 +198,9 @@ impl Plugin for CorrelationId {
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
         let id = Uuid::new_v4().to_string();
+        let publish_canonical = ctx.claim_canonical_correlation_id();
         let metadata = ctx.metadata.get_or_insert_with(HashMap::new);
-        self.publish_request_id(metadata, id);
+        self.publish_request_id(metadata, id, publish_canonical);
         super::PluginResult::Continue
     }
 
@@ -231,7 +233,8 @@ impl Plugin for CorrelationId {
         // first instance in configured lifecycle order also publishes the one
         // canonical consumer-facing request ID; later trust domains cannot
         // overwrite it.
-        self.publish_request_id(&mut ctx.metadata, request_id);
+        let publish_canonical = ctx.claim_canonical_correlation_id();
+        self.publish_request_id(&mut ctx.metadata, request_id, publish_canonical);
 
         PluginResult::Continue
     }

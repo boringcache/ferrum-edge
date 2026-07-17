@@ -1936,6 +1936,58 @@ async fn test_admin_create_rejects_malformed_correlation_id_configs() {
 }
 
 #[tokio::test]
+async fn batch_admission_rejects_duplicate_effective_correlation_headers() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let candidate = json!({
+        "proxies": [{
+            "id": "duplicate-correlation-proxy",
+            "listen_path": "/duplicate-correlation",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "duplicate-correlation-first"},
+                {"plugin_config_id": "duplicate-correlation-second"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "duplicate-correlation-first",
+                "plugin_name": "correlation_id",
+                "scope": "proxy",
+                "proxy_id": "duplicate-correlation-proxy",
+                "enabled": true,
+                "config": {}
+            },
+            {
+                "id": "duplicate-correlation-second",
+                "plugin_name": "correlation_id",
+                "scope": "proxy",
+                "proxy_id": "duplicate-correlation-proxy",
+                "enabled": true,
+                "priority_override": 75,
+                "config": {"header_name": " X-Request-ID "}
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &candidate).await;
+
+    assert_eq!(
+        status, 400,
+        "duplicate correlation writers were admitted: {body}"
+    );
+    assert!(
+        body.to_string().contains("duplicate effective header_name"),
+        "unexpected duplicate-correlation admission response: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

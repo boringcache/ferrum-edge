@@ -659,6 +659,10 @@ async fn test_multiple_correlation_instances_keep_stream_ids_isolated() {
         REQUEST_ID_METADATA_KEY.to_string(),
         "pre-correlation-custom-value".to_string(),
     );
+    ctx.insert_metadata(
+        "correlation_id.instance.spoofed-custom-value".to_string(),
+        "attacker-metadata".to_string(),
+    );
 
     assert!(matches!(
         first.on_stream_connect(&mut ctx).await,

@@ -555,7 +555,7 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn correlation_id_malformed_reload_keeps_last_known_good_plugin_generation() {
+async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation() {
     let state = empty_proxy_state();
     let mut internal = test_plugin_config("internal-request-id-policy", true);
     internal.plugin_name = "correlation_id".to_string();
@@ -582,7 +582,7 @@ async fn correlation_id_malformed_reload_keeps_last_known_good_plugin_generation
         ConfigApplyOutcome::Applied
     );
 
-    let mut invalid = valid;
+    let mut invalid = valid.clone();
     invalid.plugin_configs[0].config = serde_json::json!({
         "header_name": "x-must-not-publish",
         "echo_downsteam": false
@@ -596,6 +596,27 @@ async fn correlation_id_malformed_reload_keeps_last_known_good_plugin_generation
             .iter()
             .any(|error| { error.contains("correlation_id") && error.contains("echo_downsteam") })
     );
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["header_name"],
+        "x-stable-request-id"
+    );
+    assert_eq!(
+        state.config.load().plugin_configs[1].config["header_name"],
+        "x-external-correlation-id"
+    );
+
+    let mut duplicate = valid;
+    duplicate.plugin_configs[1].config = serde_json::json!({
+        "header_name": " X-Stable-Request-ID ",
+        "echo_downstream": true
+    });
+    duplicate.plugin_configs[1].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(duplicate) else {
+        panic!("duplicate effective correlation header must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("correlation_id") && error.contains("duplicate effective header_name")
+    }));
     assert_eq!(
         state.config.load().plugin_configs[0].config["header_name"],
         "x-stable-request-id"

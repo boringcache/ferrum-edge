@@ -509,11 +509,11 @@ fn test_redact_consumer_entry_without_target_field_unchanged() {
 }
 
 #[test]
-fn cp_full_and_incremental_rejection_share_hmac_composition_validation() {
+fn cp_full_and_incremental_rejection_share_plugin_composition_validation() {
     let shared = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(
-        shared.contains("validate_hmac_request_transform_candidate("),
-        "the shared rejecting contract must include HMAC composition"
+        shared.contains("validate_plugin_composition_candidate("),
+        "the shared rejecting contract must include plugin composition"
     );
 
     let control_plane = include_str!("../../../src/modes/control_plane.rs");

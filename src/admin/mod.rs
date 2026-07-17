@@ -4655,7 +4655,7 @@ async fn handle_batch_create(
     }
 
     if !batch.proxies.is_empty() || !batch.plugin_configs.is_empty() {
-        match crud::validate_hmac_request_transform_candidates(
+        match crud::validate_plugin_composition_candidates(
             db.as_ref(),
             state,
             namespace,
@@ -5294,7 +5294,7 @@ async fn handle_restore(
                 }
             }
         }
-        match crud::validate_hmac_request_transform_restore_candidate(state, &temp_config) {
+        match crud::validate_plugin_composition_restore_candidate(state, &temp_config) {
             Ok(()) => {}
             Err(
                 crud::AfterValidateError::BadRequest(errors)

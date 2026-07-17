@@ -1732,7 +1732,7 @@ async fn validate_bundle(
 
     if failures.is_empty() {
         let validation_result = if let Some(put_ctx) = put_ctx.as_ref() {
-            crate::admin::crud::validate_hmac_request_transform_api_spec_replacement_candidate(
+            crate::admin::crud::validate_plugin_composition_api_spec_replacement_candidate(
                 db,
                 state,
                 namespace,
@@ -1742,7 +1742,7 @@ async fn validate_bundle(
             )
             .await
         } else {
-            crate::admin::crud::validate_hmac_request_transform_candidates(
+            crate::admin::crud::validate_plugin_composition_candidates(
                 db,
                 state,
                 namespace,

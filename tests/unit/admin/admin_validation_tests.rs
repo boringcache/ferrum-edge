@@ -6,11 +6,11 @@
 use serde_json::json;
 
 #[test]
-fn test_proxy_and_plugin_writes_run_hmac_transform_candidate_validation() {
+fn test_proxy_and_plugin_writes_run_plugin_composition_candidate_validation() {
     let source = include_str!("../../../src/admin/crud.rs");
     assert!(
         source
-            .matches("validate_hmac_request_transform_candidates(")
+            .matches("validate_plugin_composition_candidates(")
             .count()
             >= 3,
         "the helper definition plus Proxy and PluginConfig admission calls must exist"
@@ -20,7 +20,7 @@ fn test_proxy_and_plugin_writes_run_hmac_transform_candidate_validation() {
         "both resource write paths must overlay their candidate"
     );
     let validation = source
-        .rfind("validate_hmac_request_transform_candidates(")
+        .rfind("validate_plugin_composition_candidates(")
         .expect("candidate validation call must exist");
     let persistence = source
         .rfind("resource.prepare_for_write()")
@@ -32,10 +32,10 @@ fn test_proxy_and_plugin_writes_run_hmac_transform_candidate_validation() {
 }
 
 #[test]
-fn test_batch_writes_run_hmac_transform_candidate_validation() {
+fn test_batch_writes_run_plugin_composition_candidate_validation() {
     let source = include_str!("../../../src/admin/mod.rs");
     assert!(
-        source.contains("crud::validate_hmac_request_transform_candidates("),
+        source.contains("crud::validate_plugin_composition_candidates("),
         "batch Proxy and PluginConfig admission must validate the candidate chain"
     );
     assert!(source.contains("&batch.proxies,"));

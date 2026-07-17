@@ -1104,6 +1104,8 @@ Generates and propagates correlation IDs for request tracing across services. An
 
 The first configured `correlation_id` instance in lifecycle/priority order publishes the canonical `ctx.metadata["request_id"]` consumed by built-in approval, chargeback, transaction, and WebSocket logging plugins. Every instance also retains its resolved value in an instance-scoped `correlation_id.instance.<lowercase-header-name>` metadata slot and uses only that slot for backend forwarding and downstream echo. Multiple headers therefore remain independent trust domains: a later client-preserved value cannot overwrite an earlier gateway-generated ID. Priority overrides explicitly select which instance owns the canonical `request_id` without collapsing the other headers.
 
+Canonical ownership is private request/session lifecycle state, not inferred from plugin-writable metadata. An earlier custom plugin therefore cannot claim ownership by pre-populating either `request_id` or the documented instance namespace. Two effective instances on the same proxy chain may not normalize to the same `header_name`; admission and reload reject that ambiguous composition. The same header remains valid on disjoint proxy chains.
+
 `api_chargeback_sink` reads canonical `request_id` first. Its older `x-request-id` and `correlation_id` metadata spellings remain fallback-only for compatibility with custom plugins that predate the canonical contract; built-in producers and consumers use `request_id`.
 
 **Priority:** 50
