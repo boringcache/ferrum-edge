@@ -2496,8 +2496,7 @@ pub(crate) fn final_request_body_requirements(
     has_terminal_body_dispatch: bool,
     has_contextual_final_body_hook: bool,
 ) -> (bool, bool, bool) {
-    if request_may_need_buffering
-        && (has_terminal_body_dispatch || has_contextual_final_body_hook)
+    if request_may_need_buffering && (has_terminal_body_dispatch || has_contextual_final_body_hook)
     {
         let mut requires_buffering = false;
         let mut terminal_dispatch = false;
