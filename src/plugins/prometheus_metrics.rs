@@ -344,6 +344,12 @@ impl TimestampedCounter {
     }
 
     fn add(&self, value: u64, epoch: Instant) {
+        self.value.fetch_add(value, Ordering::Relaxed);
+        self.last_updated
+            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn saturating_add(&self, value: u64, epoch: Instant) {
         let _ = self
             .value
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -366,6 +372,7 @@ impl TimestampedCounter {
 pub struct TimestampedCostCounter {
     pub microunits: CachePadded<AtomicU64>,
     pub submicrounits: CachePadded<AtomicU64>,
+    published_microunits: CachePadded<AtomicU64>,
     pub last_updated: CachePadded<AtomicU64>,
 }
 
@@ -374,6 +381,7 @@ impl TimestampedCostCounter {
         Self {
             microunits: CachePadded::new(AtomicU64::new(0)),
             submicrounits: CachePadded::new(AtomicU64::new(0)),
+            published_microunits: CachePadded::new(AtomicU64::new(0)),
             last_updated: CachePadded::new(AtomicU64::new(epoch.elapsed().as_nanos() as u64)),
         }
     }
@@ -406,6 +414,18 @@ impl TimestampedCostCounter {
                 self.add_microunits(1);
             }
         }
+        // Whole and fractional updates are deliberately split so the full
+        // supported whole-cost range remains available. Publish only after
+        // both parts have settled, and advance the scrape-facing value with
+        // one monotonic atomic so a concurrent carry gap can only delay an
+        // increase, never expose a counter decrease.
+        let whole = self.microunits.load(Ordering::Relaxed);
+        let remainder = self.submicrounits.load(Ordering::Relaxed);
+        let rounded = whole.saturating_add(u64::from(
+            remainder >= AI_COST_SUBMICRO_SCALE / 2,
+        ));
+        self.published_microunits
+            .fetch_max(rounded, Ordering::Release);
         self.last_updated
             .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
@@ -417,9 +437,7 @@ impl TimestampedCostCounter {
     }
 
     fn rounded_microunits(&self) -> u64 {
-        let whole = self.microunits.load(Ordering::Relaxed);
-        let remainder = self.submicrounits.load(Ordering::Relaxed);
-        whole.saturating_add(u64::from(remainder >= AI_COST_SUBMICRO_SCALE / 2))
+        self.published_microunits.load(Ordering::Acquire)
     }
 }
 
@@ -1172,19 +1190,19 @@ impl MetricsRegistry {
                 self.ai_prompt_tokens_counter
                     .entry(key.clone())
                     .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                    .add(value, self.epoch);
+                    .saturating_add(value, self.epoch);
             }
             if let Some(value) = usage.completion_tokens {
                 self.ai_completion_tokens_counter
                     .entry(key.clone())
                     .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                    .add(value, self.epoch);
+                    .saturating_add(value, self.epoch);
             }
             if let Some(value) = usage.total_tokens {
                 self.ai_total_tokens_counter
                     .entry(key.clone())
                     .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                    .add(value, self.epoch);
+                    .saturating_add(value, self.epoch);
             }
             if let Some(value) = usage.cost.as_ref() {
                 self.ai_estimated_cost_counter

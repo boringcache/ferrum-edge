@@ -1511,41 +1511,76 @@ fn federation_provider_aliases_use_bounded_ai_metric_families() {
 }
 
 #[tokio::test]
-async fn multiple_ai_token_instances_select_one_complete_snapshot_without_double_counting() {
-    let sparse = AiTokenMetrics::new(&json!({
+async fn multiple_ai_token_instances_preserve_one_trusted_cost_without_double_counting() {
+    let priced_sparse = AiTokenMetrics::new(&json!({
         "metadata_prefix": "alpha",
-        "include_token_details": false
+        "include_token_details": false,
+        "cost_per_prompt_token": 0.1,
+        "cost_per_completion_token": 0.2
     }))
     .unwrap();
-    let complete = AiTokenMetrics::new(&json!({"metadata_prefix": "zeta"})).unwrap();
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/chat".to_string(),
-    );
+    let detailed = AiTokenMetrics::new(&json!({"metadata_prefix": "zeta"})).unwrap();
     let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = br#"{"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#;
-    sparse.on_response_body(&mut ctx, 200, &headers, body).await;
-    complete
-        .on_response_body(&mut ctx, 200, &headers, body)
-        .await;
 
     let registry = MetricsRegistry::new();
-    let mut summary = make_summary("multi-ai", "POST", 200, 1.0, 1.0);
-    summary.ai_usage_export = ctx.authoritative_ai_usage_export();
-    summary.metadata = ctx.metadata;
-    registry.record(&summary);
+    for (proxy_id, priced_first) in [
+        ("multi-ai-priced-first", true),
+        ("multi-ai-detailed-first", false),
+    ] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/chat".to_string(),
+        );
+        ctx.metadata
+            .insert("ai_estimated_cost".to_string(), "999.000000".to_string());
+        let instances = if priced_first {
+            [&priced_sparse, &detailed]
+        } else {
+            [&detailed, &priced_sparse]
+        };
+        for instance in instances {
+            instance
+                .on_response_body(&mut ctx, 200, &headers, body)
+                .await;
+        }
+
+        let export = ctx
+            .authoritative_ai_usage_export()
+            .expect("built-in instances must retain typed usage provenance");
+        assert_eq!(export.prefix.as_ref(), "alpha");
+        assert_eq!(export.prompt_tokens, Some(7));
+        assert_eq!(export.completion_tokens, Some(3));
+        assert_eq!(export.total_tokens, Some(10));
+        assert_eq!(
+            export.cost.as_ref().map(|cost| cost.microunits),
+            Some(1_300_000)
+        );
+
+        let mut summary = make_summary(proxy_id, "POST", 200, 1.0, 1.0);
+        summary.ai_usage_export = Some(export);
+        summary.metadata = ctx.metadata;
+        registry.record(&summary);
+    }
+
     let output = registry.render_uncached();
-    assert!(
-        output
-            .contains("ferrum_ai_prompt_tokens_total{proxy_id=\"multi-ai\",provider=\"openai\"} 7")
-    );
-    assert!(
-        output.contains("ferrum_ai_tokens_total{proxy_id=\"multi-ai\",provider=\"openai\"} 10")
-    );
-    assert!(
-        !output.contains("ferrum_ai_tokens_total{proxy_id=\"multi-ai\",provider=\"openai\"} 20")
-    );
+    for proxy_id in ["multi-ai-priced-first", "multi-ai-detailed-first"] {
+        assert!(output.contains(&format!(
+            "ferrum_ai_prompt_tokens_total{{proxy_id=\"{proxy_id}\",provider=\"openai\"}} 7"
+        )));
+        assert!(output.contains(&format!(
+            "ferrum_ai_completion_tokens_total{{proxy_id=\"{proxy_id}\",provider=\"openai\"}} 3"
+        )));
+        assert!(output.contains(&format!(
+            "ferrum_ai_tokens_total{{proxy_id=\"{proxy_id}\",provider=\"openai\"}} 10"
+        )));
+        assert!(output.contains(&format!(
+            "ferrum_ai_estimated_cost_currency_units_total{{proxy_id=\"{proxy_id}\",provider=\"openai\"}} 1.300000"
+        )));
+    }
+    assert!(!output.contains(" 999.000000"));
+    assert!(!output.contains(" 2.600000"));
 }
 
 #[test]
@@ -1715,6 +1750,100 @@ async fn submicro_request_costs_accumulate_before_aggregate_rounding() {
     let output = registry.render_uncached();
     assert!(output.contains(
         "ferrum_ai_estimated_cost_currency_units_total{proxy_id=\"submicro-ai\",provider=\"openai\"} 0.000004"
+    ));
+}
+
+#[test]
+fn split_cost_carry_gap_cannot_decrease_rendered_counter() {
+    let registry = MetricsRegistry::new();
+    let mut summary = make_summary("carry-ai", "POST", 200, 1.0, 1.0);
+    summary.ai_usage_export = Some(AiUsageExport {
+        prefix: Arc::from("ai"),
+        provider: "openai",
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        cost: Some(AiCost {
+            microunits: 0,
+            submicrounits: 800_000_000_000,
+        }),
+    });
+    registry.record(&summary);
+    assert!(registry.render_uncached().contains(
+        "ferrum_ai_estimated_cost_currency_units_total{proxy_id=\"carry-ai\",provider=\"openai\"} 0.000001"
+    ));
+
+    // Deterministically model the split update window: the remainder has
+    // wrapped from 0.8 to 0.2 micro-units, but the whole-unit carry has not yet
+    // landed. Scrapes must retain the last atomically published rounded value.
+    {
+        let counter = registry
+            .ai_estimated_cost_counter
+            .iter()
+            .next()
+            .expect("cost counter must exist");
+        counter
+            .submicrounits
+            .store(200_000_000_000, Ordering::Relaxed);
+    }
+    assert!(registry.render_uncached().contains(
+        "ferrum_ai_estimated_cost_currency_units_total{proxy_id=\"carry-ai\",provider=\"openai\"} 0.000001"
+    ));
+
+    let counter = registry
+        .ai_estimated_cost_counter
+        .iter()
+        .next()
+        .expect("cost counter must exist");
+    counter.microunits.store(1, Ordering::Relaxed);
+    drop(counter);
+    assert!(registry.render_uncached().contains(
+        "ferrum_ai_estimated_cost_currency_units_total{proxy_id=\"carry-ai\",provider=\"openai\"} 0.000001"
+    ));
+}
+
+#[test]
+fn ordinary_request_increment_uses_fetch_add_while_ai_tokens_saturate() {
+    let registry = MetricsRegistry::new();
+    let summary = make_summary("ordinary-hot-path", "GET", 200, 1.0, 1.0);
+    registry.record(&summary);
+    {
+        let counter = registry
+            .request_counter
+            .iter()
+            .next()
+            .expect("request counter must exist");
+        counter.value.store(u64::MAX, Ordering::Relaxed);
+    }
+
+    registry.record(&summary);
+
+    let counter = registry
+        .request_counter
+        .iter()
+        .next()
+        .expect("request counter must exist");
+    assert_eq!(
+        counter.value.load(Ordering::Relaxed),
+        0,
+        "ordinary increments must keep the single fetch_add path; saturation is reserved for untrusted token additions"
+    );
+    drop(counter);
+
+    for total_tokens in [u64::MAX, 1] {
+        let mut summary = make_summary("untrusted-ai-total", "POST", 200, 1.0, 1.0);
+        summary.ai_usage_export = Some(AiUsageExport {
+            prefix: Arc::from("ai"),
+            provider: "openai",
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: Some(total_tokens),
+            cost: None,
+        });
+        registry.record(&summary);
+    }
+    assert!(registry.render_uncached().contains(
+        "ferrum_ai_tokens_total{proxy_id=\"untrusted-ai-total\",provider=\"openai\"} 18446744073709551615"
     ));
 }
 

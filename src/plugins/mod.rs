@@ -779,11 +779,14 @@ pub struct AiUsageExport {
 }
 
 impl AiUsageExport {
-    fn completeness(&self) -> usize {
+    fn token_completeness(&self) -> usize {
         usize::from(self.prompt_tokens.is_some())
             + usize::from(self.completion_tokens.is_some())
             + usize::from(self.total_tokens.is_some())
-            + usize::from(self.cost.is_some())
+    }
+
+    fn completeness(&self) -> usize {
+        self.token_completeness() + usize::from(self.cost.is_some())
     }
 }
 
@@ -900,6 +903,12 @@ pub struct RequestContext {
     /// Kept outside public metadata so backend/operator metadata cannot mint or
     /// overwrite trusted token and cost series.
     pub(crate) ai_usage_export: Option<AiUsageExport>,
+    /// Prefix that supplied the selected token fields. Cost is selected
+    /// independently, so its provenance cannot distort later token tie-breaks.
+    ai_usage_export_token_prefix: Option<Arc<str>>,
+    /// Prefix that supplied the selected trusted cost. This remains private so
+    /// public metadata cannot influence deterministic multi-instance pricing.
+    ai_usage_export_cost_prefix: Option<Arc<str>>,
     /// Per-request ownership state for each live request-deduplication plugin
     /// instance. Multiple instances may coexist on one proxy; keeping their
     /// correlation state in a private instance-keyed map prevents one hook
@@ -1312,6 +1321,8 @@ impl RequestContext {
             gateway_deadline_response_selected: false,
             metadata: HashMap::new(),
             ai_usage_export: None,
+            ai_usage_export_token_prefix: None,
+            ai_usage_export_cost_prefix: None,
             request_deduplication_state: HashMap::new(),
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
@@ -1382,18 +1393,78 @@ impl RequestContext {
         }
     }
 
+    fn replace_ai_usage_export(&mut self, candidate: AiUsageExport) {
+        self.ai_usage_export_token_prefix = (candidate.token_completeness() != 0)
+            .then(|| Arc::clone(&candidate.prefix));
+        self.ai_usage_export_cost_prefix = candidate
+            .cost
+            .as_ref()
+            .map(|_| Arc::clone(&candidate.prefix));
+        self.ai_usage_export = Some(candidate);
+    }
+
     pub(crate) fn stage_ai_usage_export(&mut self, candidate: AiUsageExport) {
         if candidate.completeness() == 0 {
             return;
         }
-        let replace = self.ai_usage_export.as_ref().is_none_or(|current| {
-            candidate.completeness() > current.completeness()
+        let Some(mut current) = self.ai_usage_export.take() else {
+            self.replace_ai_usage_export(candidate);
+            return;
+        };
+
+        // Different providers must never be combined. Preserve the existing
+        // whole-snapshot selection rule for that defensive edge case.
+        if candidate.provider != current.provider {
+            let replace = candidate.completeness() > current.completeness()
                 || (candidate.completeness() == current.completeness()
-                    && candidate.prefix.as_ref() < current.prefix.as_ref())
-        });
-        if replace {
-            self.ai_usage_export = Some(candidate);
+                    && candidate.prefix.as_ref() < current.prefix.as_ref());
+            if replace {
+                self.replace_ai_usage_export(candidate);
+            } else {
+                self.ai_usage_export = Some(current);
+            }
+            return;
         }
+
+        // Token detail and trusted cost are independent dimensions. A detailed
+        // unpriced instance must not discard a cost from a less-detailed priced
+        // instance, and neither dimension may be counted more than once.
+        let candidate_token_completeness = candidate.token_completeness();
+        let current_token_completeness = current.token_completeness();
+        let current_token_prefix = self
+            .ai_usage_export_token_prefix
+            .as_deref()
+            .unwrap_or(current.prefix.as_ref());
+        let replace_tokens = candidate_token_completeness > current_token_completeness
+            || (candidate_token_completeness != 0
+                && candidate_token_completeness == current_token_completeness
+                && candidate.prefix.as_ref() < current_token_prefix);
+        if replace_tokens {
+            current.prompt_tokens = candidate.prompt_tokens;
+            current.completion_tokens = candidate.completion_tokens;
+            current.total_tokens = candidate.total_tokens;
+            self.ai_usage_export_token_prefix = Some(Arc::clone(&candidate.prefix));
+        }
+
+        if let Some(candidate_cost) = candidate.cost {
+            let replace_cost = self
+                .ai_usage_export_cost_prefix
+                .as_ref()
+                .is_none_or(|prefix| candidate.prefix.as_ref() < prefix.as_ref());
+            if replace_cost {
+                current.cost = Some(candidate_cost);
+                self.ai_usage_export_cost_prefix = Some(Arc::clone(&candidate.prefix));
+            }
+        }
+
+        if let Some(prefix) = self
+            .ai_usage_export_cost_prefix
+            .as_ref()
+            .or(self.ai_usage_export_token_prefix.as_ref())
+        {
+            current.prefix = Arc::clone(prefix);
+        }
+        self.ai_usage_export = Some(current);
     }
 
     /// Return the typed built-in usage snapshot carried to transaction logs.
@@ -1571,6 +1642,8 @@ impl RequestContext {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             ai_usage_export: self.ai_usage_export.clone(),
+            ai_usage_export_token_prefix: self.ai_usage_export_token_prefix.clone(),
+            ai_usage_export_cost_prefix: self.ai_usage_export_cost_prefix.clone(),
             // Deduplication has no final request-body hook, and the caller only
             // copies selected hook results back. Keep ownership solely on the
             // live context instead of cloning request keys and tokens here.
