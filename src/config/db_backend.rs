@@ -1014,6 +1014,18 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         spec: &ApiSpec,
     ) -> Result<(), anyhow::Error>;
 
+    /// Atomically restore a deleted API spec together with non-spec-owned plugins
+    /// that were removed by the proxy delete cascade.
+    async fn restore_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &ApiSpec,
+        additional_plugins: &[PluginConfig],
+    ) -> Result<(), anyhow::Error> {
+        let _ = (bundle, spec, additional_plugins);
+        anyhow::bail!("atomic API-spec restore is not supported by this database backend")
+    }
+
     /// Atomically replace an existing api spec identified by `spec.id`.
     ///
     /// Deletes the spec-owned resources (those whose `api_spec_id = spec.id`),

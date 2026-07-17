@@ -480,28 +480,8 @@ async fn compensate_late_api_spec_delete(
             anyhow::bail!("late API-spec delete compensation validation returned an HTTP response")
         }
     }
-    let additional_plugin_ids = additional_plugins
-        .iter()
-        .map(|plugin| plugin.id.clone())
-        .collect::<HashSet<_>>();
-    let mut base_bundle = previous_bundle.clone();
-    base_bundle.proxy.plugins.retain(|association| {
-        !additional_plugin_ids.contains(association.plugin_config_id.as_str())
-    });
-    db.submit_api_spec_bundle(&base_bundle, &previous_spec)
+    db.restore_api_spec_bundle(&previous_bundle, &previous_spec, &additional_plugins)
         .await?;
-    for plugin in additional_plugins {
-        if db
-            .get_plugin_config(&previous_spec.namespace, &plugin.id)
-            .await?
-            .is_none()
-        {
-            db.create_plugin_config(&plugin).await?;
-        }
-    }
-    if !additional_plugin_ids.is_empty() && !db.update_proxy(&previous_bundle.proxy).await? {
-        anyhow::bail!("late API-spec delete compensation could not restore proxy associations");
-    }
     Ok(ApiSpecLateWriteRecovery::NotRetained)
 }
 

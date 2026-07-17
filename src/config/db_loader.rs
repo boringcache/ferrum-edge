@@ -6380,6 +6380,15 @@ impl DatabaseStore {
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
+        self.restore_api_spec_bundle(bundle, spec, &[]).await
+    }
+
+    pub async fn restore_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+        additional_plugins: &[crate::config::types::PluginConfig],
+    ) -> Result<(), anyhow::Error> {
         use crate::config::types::{AuthMode, ResponseBodyMode};
 
         let mut tx = self.pool().begin().await?;
@@ -6570,7 +6579,12 @@ impl DatabaseStore {
         }
 
         // 3. INSERT plugin_configs, tagged with api_spec_id.
-        for pc in &bundle.plugins {
+        for (pc, api_spec_id) in bundle
+            .plugins
+            .iter()
+            .map(|plugin| (plugin, Some(spec.id.as_str())))
+            .chain(additional_plugins.iter().map(|plugin| (plugin, None)))
+        {
             let config_json = serde_json::to_string(&pc.config)?;
             let scope_str = match pc.scope {
                 crate::config::types::PluginScope::Proxy => "proxy",
@@ -6589,7 +6603,7 @@ impl DatabaseStore {
             .bind(&pc.proxy_id)
             .bind(if pc.enabled { 1i32 } else { 0 })
             .bind(pc.priority_override.map(|v| v as i32))
-            .bind(&spec.id)
+            .bind(api_spec_id)
             .bind(pc.created_at.to_rfc3339())
             .bind(pc.updated_at.to_rfc3339())
             .execute(&mut *tx)
@@ -6627,7 +6641,7 @@ impl DatabaseStore {
             "upsert",
         )
         .await?;
-        for pc in &bundle.plugins {
+        for pc in bundle.plugins.iter().chain(additional_plugins) {
             self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
                 .await?;
         }
@@ -8462,6 +8476,15 @@ impl DatabaseBackend for DatabaseStore {
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
         DatabaseStore::submit_api_spec_bundle(self, bundle, spec).await
+    }
+
+    async fn restore_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+        additional_plugins: &[crate::config::types::PluginConfig],
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::restore_api_spec_bundle(self, bundle, spec, additional_plugins).await
     }
 
     async fn replace_api_spec_bundle(
