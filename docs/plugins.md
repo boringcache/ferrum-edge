@@ -2319,6 +2319,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 - Streamed non-buffered responses, including `text/event-stream`, keep the in-flight marker while the stream is active. On a clean completion the marker is released without retaining a replayable response, so the next matching request re-executes normally. If the stream is interrupted — a client disconnect or mid-stream error — the marker is instead retained until `inflight_ttl_seconds`, so an immediate retry of the same idempotency key cannot re-run a side-effecting backend operation that has no replay/tombstone protection
 - Stale in-flight markers (request died after `before_proxy` but before `on_final_response_body` or a clean streamed completion — e.g., backend timeout, downstream plugin reject, process crash — plus interrupted streams that deliberately retain their marker) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
 - Completed response storage is bounded by `max_entry_size_bytes` and `max_total_size_bytes`. Size-skipped responses still return to the original client, but no replayable response is retained. In local mode, skipped responses clear the in-flight marker so a later retry can execute normally; in Redis mode, a local-total-cap skip keeps local and distributed locks until `inflight_ttl_seconds` if Redis publication fails
+- A completed `ai_federation` provider call is treated as a protected external operation rather than an ordinary synthetic response. The first request receives the final guarded response; the deduplicator stores a small `409` completed tombstone instead of replaying a body that could be transformed twice or cached before a later response guard rejects it. An identical key/fingerprint retry therefore cannot issue another billable provider call during `ttl_seconds`. If the configured retention limits cannot hold even the tombstone, local and distributed in-flight ownership is retained until `inflight_ttl_seconds` rather than released immediately. This provenance contract currently covers federation calls only; other externally executed synthetic plugins must define their own completion provenance
 - LRU eviction under `max_entries` pressure only evicts completed entries. Active (non-stale) in-flight markers are never evicted — evicting a live marker would release the in-flight lock while the original request is still executing. As a result, `max_entries` can be temporarily exceeded if the cache is saturated with active in-flight work; correctness is preferred over the memory cap
 - GET/HEAD/OPTIONS/DELETE requests are ignored unless explicitly added to `applicable_methods`
 - `scope_by_consumer: true` isolates keys per authenticated identity so different consumers can use the same idempotency key independently
@@ -3591,55 +3592,19 @@ config:
 
 ### `ai_federation`
 
-Universal AI gateway that routes requests in OpenAI Chat Completions format to any of 11 supported AI providers, translating requests to native provider format and normalizing responses back to OpenAI format. Uses the "terminate and respond" pattern — makes its own HTTP call to the matched provider and returns the response directly, bypassing the normal proxy dispatch.
+HTTP-family AI gateway that routes OpenAI Chat Completions JSON to supported providers, translates native request/response shapes, and returns an OpenAI-shaped synthetic response. Provider dispatch runs from the final request-body hook, after request decompression, body transforms, and final request policy checks. Native gRPC is deliberately unsupported rather than advertised with an inert pass-through.
 
 **Streaming is not supported.** Because of the terminate-and-respond design, the plugin buffers the full provider response and re-serializes it as a single JSON object. A request that asks for a streamed response (`"stream": true`) and matches a configured provider is rejected with HTTP `501` and an OpenAI-shaped error body rather than being silently downgraded to a buffered response or forwarded as a stream the gateway cannot relay. There is no streaming opt-in knob; config fields named `stream`, `streaming`, `streaming_enabled`, or `enable_streaming` are rejected during plugin validation so operators do not get a false sense that provider streaming is enabled.
 
-**Model routing fails closed by default.** JSON POST requests with no buffered body, malformed JSON, or no top-level string `model` field are rejected with an OpenAI-shaped `400`. Requests whose `model` does not match any provider are rejected with an OpenAI-shaped `404`. Set `fail_on_missing_model: false` or `fail_on_no_matching_provider: false` only when intentional pass-through to the normal backend is required. Pass-through can bypass AI gateway policy enforced by `ai_federation` provider routing, fallback, translation, token metadata, and any downstream assumptions that federation will short-circuit the request.
+**Model routing fails closed by default.** JSON POST requests with no final body, malformed/non-UTF-8 JSON, malformed supported tool/stop shapes, or no top-level string `model` field are rejected with an OpenAI-shaped `400`. Model identifiers are limited to 256 ASCII bytes and the characters used by ordinary provider IDs (`A-Z`, `a-z`, digits, `.`, `_`, `-`, `:`, `/`, `+`); traversal, URL userinfo/query/fragment syntax, whitespace, and controls are rejected. Requests whose valid `model` does not match any provider are rejected with an OpenAI-shaped `404`. Set `fail_on_missing_model: false` or `fail_on_no_matching_provider: false` only when intentional pass-through to the normal backend is required.
 
-**The fail-closed guarantee is scoped to JSON POSTs.** `before_proxy` only inspects requests whose method is `POST` and whose `Content-Type` is `application/json` (or a `*+json` suffix); every other request returns `Continue` and reaches the backend uninspected. Even with the fail-closed defaults, a client can therefore bypass federation entirely by sending the same body with a non-JSON content type (for example `Content-Type: text/plain`) or a different method. `ai_federation` is not an authorization boundary — the backend it fronts must remain independently protected (auth, rate limiting, and any AI gateway policy) regardless of these flags.
+**The fail-closed guarantee is scoped to HTTP JSON POSTs.** Other methods and non-JSON content types continue to the backend; native gRPC is outside the plugin's protocol set. `ai_federation` is therefore not an authorization boundary, and the backend must remain independently protected.
 
-**Fail-closed defaults make `ai_federation` greedy in the `before_proxy` chain.** With the defaults, an instance claims every `POST` + `application/json` request on its proxy — the resulting `RejectBinary` from `before_proxy` returns immediately and short-circuits normal backend dispatch, later `before_proxy` plugins, and any second federation/router instance scoped to a different model family. Mixed-traffic proxies that need normal backend pass-through for other JSON POSTs should use the `fail_on_missing_model: false` / `fail_on_no_matching_provider: false` opt-outs, or isolate AI traffic on a dedicated proxy.
+**Final-body dispatch preserves admission ordering.** All `before_proxy` admission hooks and configured request-body transforms run before federation makes provider I/O. A `RejectBinary` from the final hook still replaces normal backend dispatch. Mixed-traffic proxies should use the explicit pass-through flags or isolate AI traffic on a dedicated proxy.
 
 **Response guardrails still apply.** Successful synthetic responses returned by `ai_federation` are passed through the normal buffered response-side hooks before reaching the client. This means response-side `ai_semantic_firewall`, `ai_response_guard`, response body transforms, and final-response hooks inspect the normalized provider body. `ai_federation` still writes token metadata directly, and `ai_rate_limiter` records those tokens through its rejection-path `after_proxy` hook.
 
-**Token metering and strict-metering configuration.** `ai_federation`
-(`before_proxy` priority `4060`) runs *before* `ai_rate_limiter`
-(`after_proxy`-band priority `4200`) in the default order. On a successful
-provider call it writes `ai_total_tokens` / `ai_prompt_tokens` /
-`ai_completion_tokens` (plus `ai_federation_provider` / `ai_federation_status`)
-into request metadata, and `ai_rate_limiter` charges those tokens post-hoc via
-its rejection-path `after_proxy` hook. This has two consequences you must plan
-for in production:
-
-- **Usage-less federated 2xx are not charged in default order.** Because
-  `ai_rate_limiter`'s `before_proxy` never runs for a federated request (the
-  request is terminated by `ai_federation` first), there is no pre-reservation
-  and no AI-request marker. Only *metered* federation responses — those where
-  the provider returned a `usage` block that `ai_federation` translated into the
-  metadata above — are charged. A provider/response that omits usage is neither
-  charged nor rejected by the `on_unmetered_response` policy.
-- **No up-front reservation in default order.** With no pre-reservation, a burst
-  of concurrent federated requests can overshoot the window before any charge
-  lands (post-hoc reconciliation still corrects the total).
-
-To meter federated traffic **strictly** — pre-reserve every federated request
-and apply the `on_unmetered_response` policy (`charge_estimate` / `reject` /
-`warn`) to usage-less 2xx responses — set a `priority_override` **below `4060`**
-on the `ai_rate_limiter` instance so it runs *ahead* of `ai_federation`. It then
-pre-reserves an estimate, sets the AI-request marker, and reconciles against the
-provider's original status recorded in `ai_federation_status`:
-
-```yaml
-# Strict federated-token metering: ai_rate_limiter pre-reserves ahead of ai_federation.
-plugin_name: ai_rate_limiter
-config:
-  token_limit: 500000
-  window_seconds: 3600
-  limit_by: consumer
-  on_unmetered_response: reject   # federated 2xx without provider usage → 502
-priority_override: 2900           # < 4060 so before_proxy runs before ai_federation
-```
+**Token metering.** Federation's provider dispatch occurs after the normal `before_proxy` admission phase, so an `ai_rate_limiter` on the same proxy can pre-reserve before any provider call without a priority override. Successful provider usage is written to `ai_total_tokens`, `ai_prompt_tokens`, and `ai_completion_tokens`; the rejection-path `after_proxy` hook reconciles that reservation using the original `ai_federation_status`. `charge_estimate` and `warn` work for usage-less federation responses; the synthetic rejection-path limitation for `on_unmetered_response: reject` is documented under `ai_rate_limiter` below.
 
 **Provider usage-metadata expectations.** Metering accuracy depends on the
 provider returning a usage object that `ai_federation` / `ai_rate_limiter` can
@@ -3647,9 +3612,7 @@ read: OpenAI-shaped `usage.{prompt,completion,total}_tokens`, Anthropic
 `usage.{input,output}_tokens`, Google/Gemini
 `usageMetadata.{prompt,candidates,total}TokenCount`, Bedrock Converse
 `usage.{input,output,total}Tokens`, and Cohere v2 `usage.tokens.{input,output}`.
-When usage is absent, the request falls to `on_unmetered_response` (only when a
-pre-reservation exists — see the strict-metering recipe above and the detailed
-`ai_rate_limiter` notes below). For streamed clients that are metered directly
+When usage is absent, the request falls to `on_unmetered_response`. For streamed clients that are metered directly
 by `ai_rate_limiter` (not via `ai_federation`, which rejects streaming — see
 above), configure OpenAI-compatible callers with `stream_options.include_usage:
 true` so a final usage signal is emitted.
@@ -3670,6 +3633,14 @@ Multimodal capability is provider-specific, so a per-provider multimodal rejecti
 
 **Priority:** 4060
 
+**Provider result and fallback contract.** Provider and OAuth response bodies are collected with explicit bounds (8 MiB per provider by default, 64 KiB for OAuth); provider-native request serialization is capped at 64 MiB, and normalized JSON serialization is held to the per-provider response limit so translation/escaping cannot create an unbounded body. Redirects are never followed, and provider `3xx` status codes are preserved when final. Successful `2xx` bodies must match the selected provider's documented shape; malformed success responses fail with `502` and may fall through when `fallback_on_protocol_errors` is enabled. Safe `Retry-After`, request-ID, and rate-limit headers are forwarded within count/value bounds; cookie, credential, location, hop-by-hop, and unrecognized headers are removed.
+
+Transport fallback is replay-safe by default. DNS, connect, and TLS failures proven to occur before the POST reached the wire may fall through. Timeouts, resets, and response-stream failures are ambiguous and return `502` without another model invocation. `fallback_on_ambiguous_errors: true` is an explicit duplicate-call/duplicate-charge opt-in. Oversized responses are never retried.
+
+**Tool calls, candidates, and stop values.** Supported assistant tool calls and tool-result messages are mapped to Anthropic `tool_use`/`tool_result`, Gemini `functionCall`/`functionResponse`, and Bedrock `toolUse`/`toolResult`; native tool responses normalize back to OpenAI `tool_calls`. All supported text blocks are concatenated in provider order, parallel tool calls retain their relative order in `message.tool_calls`, and every Gemini candidate becomes a stable-index OpenAI choice. Cross-type text/tool interleaving is represented by Chat Completions' separate `content` and `tool_calls` fields rather than discarded. Unsupported or malformed blocks fail explicitly. A scalar OpenAI `stop` becomes a one-element array only in native array-only fields; arrays are preserved, with at most four non-empty sequences of at most 1024 characters. Bedrock cannot represent `tool_choice: none` and rejects it with `400`.
+
+Gemini function calls do not carry an OpenAI call ID in the native response shape, so federation generates a response-local OpenAI ID. A later `role: tool` message is mapped back to the Gemini function name by finding that ID in the assistant transcript supplied by the client. Anthropic, Bedrock, and Cohere preserve provider call IDs directly. Parallel calls are retained for every native adapter.
+
 **Supported providers:**
 - **OpenAI-compatible** (send OpenAI format directly): OpenAI, Mistral, xAI (Grok), DeepSeek, Meta Llama, Hugging Face, Azure OpenAI
 - **Requires translation**: Anthropic (Messages API), Google Gemini, Google Vertex AI (OAuth2), AWS Bedrock (Converse API, SigV4), Cohere v2
@@ -3687,12 +3658,15 @@ Multimodal capability is provider-specific, so a per-provider multimodal rejecti
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `providers` | Array | _(required)_ | Array of provider configurations (see below) |
+| `providers` | Array | _(required)_ | Array of provider configurations (see below; maximum 128) |
 | `fallback_enabled` | Boolean | `true` | Try next provider on failure |
 | `fallback_on_status_codes` | Array | `[429, 500, 502, 503]` | HTTP status codes that trigger fallback |
-| `fallback_on_network_errors` | Boolean | `true` | TCP/TLS failures trigger fallback |
+| `fallback_on_network_errors` | Boolean | `true` | Proven pre-wire DNS/connect/TLS failures trigger fallback |
+| `fallback_on_protocol_errors` | Boolean | `true` | Malformed success responses and redirects may fall through |
+| `fallback_on_ambiguous_errors` | Boolean | `false` | Explicitly allow duplicate-prone replay after an ambiguous POST outcome |
 | `fail_on_missing_model` | Boolean | `true` | Reject JSON POST requests whose body cannot be inspected as JSON or lacks a top-level string `model` field. Set to `false` only to explicitly pass such requests through to the normal backend |
 | `fail_on_no_matching_provider` | Boolean | `true` | Reject requests whose `model` does not match any provider. Set to `false` only to explicitly pass unsupported models through to the normal backend |
+| `max_concurrent_requests` | Integer | `64` | Maximum simultaneous provider chains; excess requests fail with `503` |
 
 **Provider configuration fields:**
 
@@ -3702,13 +3676,16 @@ Multimodal capability is provider-specific, so a per-provider multimodal rejecti
 | `provider_type` | String | _(required)_ | One of: `openai`, `anthropic`, `google_gemini`, `google_vertex`, `azure_openai`, `aws_bedrock`, `mistral`, `cohere`, `xai`, `deepseek`, `meta_llama`, `hugging_face` |
 | `api_key` | String | _(required for most)_ | API key for authentication |
 | `priority` | Integer | _(index + 1)_ | Lower = tried first |
-| `model_patterns` | Array | `[]` (catch-all) | Glob patterns to match model names (e.g., `["claude-*"]`) |
-| `model_mapping` | Object | `{}` | Map client model names to provider-native names |
+| `model_patterns` | Array | `[]` (catch-all) | Up to 128 bounded model globs (e.g., `["claude-*"]`) |
+| `model_mapping` | Object | `{}` | Up to 1024 valid client model IDs mapped to provider-native names |
 | `default_model` | String | _(none)_ | Default model when no mapping matches |
 | `multimodal_mode` | String | Provider-specific | One of `reject`, `translate`, `text_only_with_warning`; controls handling of non-text OpenAI content parts |
 | `connect_timeout_seconds` | Integer | `5` | Per-provider TCP + TLS handshake timeout for outbound provider calls |
 | `read_timeout_seconds` | Integer | `60` | Overall per-request deadline for outbound provider calls |
-| `base_url` | String | _(provider default)_ | Custom endpoint URL (for self-hosted or proxy endpoints) |
+| `max_response_body_bytes` | Integer | `8388608` | Bounded provider response collection (maximum `67108864`) |
+| `base_url` | String | _(provider default)_ | Custom endpoint with an explicit lowercase `https://` or `http://` scheme; userinfo, query, and fragment are rejected |
+| `allow_plaintext` | Boolean | `false` | Permit an explicit `http://` base URL; HTTPS remains the safe default |
+| `circuit_breaker` | Object | _(disabled)_ | Optional passive circuit with `failure_threshold` (3), `cooldown_seconds` (30), and `success_threshold` (1) |
 
 **Azure OpenAI additional fields:** `azure_resource`, `azure_deployment`, `azure_api_version` (default `"2024-06-01"`).
 
@@ -3733,6 +3710,11 @@ plugins:
             claude-4-sonnet: "claude-sonnet-4-20250514"
           default_model: "claude-sonnet-4-20250514"
           read_timeout_seconds: 90
+          max_response_body_bytes: 8388608
+          circuit_breaker:
+            failure_threshold: 3
+            cooldown_seconds: 30
+            success_threshold: 1
         - name: openai-fallback
           provider_type: openai
           api_key: "sk-..."
@@ -3748,6 +3730,9 @@ plugins:
             bedrock-claude: "anthropic.claude-3-sonnet-20240229-v1:0"
       fallback_enabled: true
       fallback_on_status_codes: [429, 500, 502, 503]
+      fallback_on_protocol_errors: true
+      fallback_on_ambiguous_errors: false
+      max_concurrent_requests: 64
       fail_on_missing_model: true
       fail_on_no_matching_provider: true
 ```
@@ -3774,13 +3759,17 @@ Use this only when the normal backend has equivalent authentication, model allow
 - `ai_transcript_audit` (2924) stages transcript capture before guardrails; `ai_prompt_shield` (2925) scans/redacts PII before federation
 - `ai_semantic_firewall` (2968) blocks semantic prompt injection, exfiltration, tool-abuse, and topic-policy violations before semantic cache or federation
 - `ai_request_guard` (2975) validates model, tokens, temperature before federation
-- `ai_prompt_compressor` (4055) boundedly shortens admitted OpenAI Chat/Text Completions plaintext, stages compatible direct-dispatch metadata while limiting private wire-result reuse to 65,536 bytes, records authoritative standard wire stats after request decompression, and uses a bounded representation-preserving fallback so configured preserve markers cannot bypass sanitation; successful compression rewrites reserialize the complete JSON body
-- `ai_federation` (4060) routes to provider, writes token metadata to `ctx.metadata`
+- `ai_prompt_compressor` (4055) boundedly shortens admitted OpenAI Chat/Text Completions plaintext, stages compatible metadata while limiting private wire-result reuse to 65,536 bytes, records authoritative wire stats after request decompression, and uses a bounded representation-preserving fallback so configured preserve markers cannot bypass sanitation; successful compression rewrites reserialize the complete JSON body
+- `ai_federation` (4060) routes that final transformed body to a provider before backend dispatch and writes token metadata to `ctx.metadata`
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
 
-**Metadata keys written:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, `ai_federation_provider` — same keys as `ai_token_metrics` for downstream compatibility. When `multimodal_mode: text_only_with_warning` drops non-text parts, the plugin also writes `ai_federation_multimodal_mode`, `ai_federation_multimodal_dropped_parts`, `ai_federation_multimodal_dropped_types`, `ai_federation_multimodal_dropped_roles`, and `ai_federation_multimodal_provider`.
+**Metadata and metrics:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, and `ai_federation_provider` use the same transaction keys as `ai_token_metrics`. Circuit observations use `ai_federation_circuit_last_provider`, `ai_federation_circuit_last_state`, `ai_federation_circuit_open_skips`, and `ai_federation_circuit_half_open_probes`. `/metrics` exposes the provider-name-free `ferrum_ai_federation_circuits_open` gauge and `ferrum_ai_federation_circuits_{opened,closed}_total`, `ferrum_ai_federation_circuit_half_open_probes_total`, and `ferrum_ai_federation_circuit_open_skips_total` counters. Removing/reloading an open configured circuit decrements the gauge; transition/probe logs carry only the restricted provider name, never an endpoint or credential. When `multimodal_mode: text_only_with_warning` drops non-text parts, the plugin also writes `ai_federation_multimodal_mode`, `ai_federation_multimodal_dropped_parts`, `ai_federation_multimodal_dropped_types`, `ai_federation_multimodal_dropped_roles`, and `ai_federation_multimodal_provider`.
 
 **TLS trust chain:** Because this plugin bypasses the normal proxy dispatch and makes outbound HTTP calls via the shared `PluginHttpClient`, it uses **global TLS settings only** — `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides (`backend_tls_server_ca_cert_path`, `backend_tls_client_cert_path`, `backend_tls_verify_server_cert`) and CRL checking do not apply. For providers behind private endpoints (e.g., Azure Private Link, VPC endpoints), add the internal CA to the global CA bundle PEM file. Note that when `FERRUM_TLS_CA_BUNDLE_PATH` is set, webpki/system roots are excluded (CA exclusivity) — include public root CAs in the bundle if some providers are public and others use internal CAs.
+
+`base_url` requires HTTPS by default. Set `allow_plaintext: true` only for an explicitly trusted cleartext endpoint; this does not enable redirect following. URL userinfo, queries, and fragments are rejected so credentials remain in dedicated fields. Azure resource/deployment/API-version, Vertex region/project, AWS region, and request-selected path models use strict component grammars. Google service-account OAuth is pinned to `https://oauth2.googleapis.com/token`. Logs use redacted endpoint placeholders, and every shared-client construction path disables ambient HTTP proxy discovery, including the policy-preserving fallback builders. The repository-wide ambient-proxy advisory remains open for dedicated plugin clients outside this shared client.
+
+Federation parses the authoritative final JSON once and serializes that canonical value into every provider request. Duplicate object names therefore cannot leave one parser-evaluated representation for policy while sending a different raw representation to the provider; malformed provider success shapes are likewise rejected before a client response is committed.
 
 **URL template caching:** Each provider's request URL is pre-computed at config-load time. URLs that are fully static for the provider (Azure OpenAI deployment URL, OpenAI default base URL) are cached as a single `Arc<str>`; URLs that embed the request model (Gemini, Vertex AI, Bedrock) are cached as `prefix + model + suffix` so the per-request hot path performs one `String` concatenation rather than the multi-allocation `format!()` machinery.
 
@@ -3824,7 +3813,7 @@ config:
 
 **Endpoint URLs.** An endpoint that carries its own query string (e.g. an Azure-style `?api-version=…`) is preserved: the endpoint query and the client's own query are merged with `&` into the forwarded URL (the client's parameters are marked as consumed so the dispatch path does not append a second `?`). IPv6 literal hosts are bracketed in the forwarded authority/`Host`. By default an `https` endpoint is verified against the system trust store; set `inherit_backend_tls: true` on a provider to keep the proxy's own resolved backend TLS (custom CA bundle, SNI/SAN policy, backend mTLS client certificate) for internal `openai_compatible` endpoints behind private PKI.
 
-**Composition with `ai_federation`.** Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`. `ai_federation` checks this at the top of its `before_proxy` and immediately `Continue`s, so the two plugins compose on the same proxy: `stream: true` is served by `ai_stream_router`, `stream: false` by `ai_federation`. Claimed requests also set the shared `ai_request_streaming` marker so response-side plugins (`ai_response_guard`, `ai_token_metrics`, …) keep the provider SSE on the streaming path even when the client did not send `Accept: text/event-stream`.
+**Composition with `ai_federation`.** Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`. `ai_federation` checks this at the top of its final request-body hook and immediately `Continue`s, so the two plugins compose on the same proxy: `stream: true` is served by `ai_stream_router`, `stream: false` by `ai_federation`. Claimed requests also set the shared `ai_request_streaming` marker so response-side plugins (`ai_response_guard`, `ai_token_metrics`, …) keep the provider SSE on the streaming path even when the client did not send `Accept: text/event-stream`.
 
 **Metadata keys written:** `ai_stream_router.enabled`, `ai_stream_router.claimed`, `ai_stream_router_claimed`, `ai_request_streaming`, `suppress_backend_consumer_identity_headers`, `ai_stream_router.provider`, `ai_stream_router.provider_type`, `ai_stream_router.model`, `ai_stream_router.normalized_response_stream`, and `ai_stream_router.fallback_attempts`.
 
@@ -4310,7 +4299,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 
 > **Reconciliation is best-effort; window/TTL is the backstop.** A successful pre-reservation is reconciled to actual usage after the response, but several paths reserve without ever reconciling — a fail-closed early error (e.g. a `502` before the body is read), a client disconnect before the buffered response, or another plugin rejecting the response so post-response accounting never runs. In those cases the *estimate* stays charged against the window until the sliding window (local mode) or Redis key TTL (centralized mode) expires it. A burst of aborted requests can thus transiently over-count usage and 429 later legitimate requests until the window rolls; the window/TTL expiry is the intentional self-healing mechanism. Choose `window_seconds` (and thus the Redis TTL, `2 × window_seconds + 1`) with this recovery latency in mind.
 >
-> When the backend returns a successful (2xx) response but a **later plugin rejects it** — either a response-body plugin (for example `ai_response_guard` blocking the completion) or a lower-priority `after_proxy` plugin (for example `response_size_limiting` rejecting an oversized 200 by `Content-Length`, before `ai_rate_limiter` runs) — the provider call has already consumed tokens, so `ai_rate_limiter` deliberately **keeps the reservation charged** rather than releasing it — the rejected-but-served generation is not free. The original backend status is captured before the `after_proxy` chain runs, so this holds even when the rejecting plugin runs before `ai_rate_limiter`. The same protection covers an `ai_federation` provider response **only when `ai_rate_limiter` is configured to run before `ai_federation`** (a `priority_override` below 4060) so that it actually pre-reserves: federation delivers its 2xx through the rejection pipeline, so if a response-body guardrail then rejects it, reconciliation uses the federation provider's **original** status (recorded in `ai_federation_status`, not the guardrail's 5xx) — a usage-less federated 2xx is then reconciled via `on_unmetered_response` and a metered one is charged to actual usage, rather than the reservation being released as if the provider were never called. In the **default** order (`ai_federation` 4060 runs before `ai_rate_limiter` 4200), the limiter's `before_proxy` never runs for a federated request, so there is no pre-reservation and no AI-request marker; a usage-less federated 2xx is then neither charged nor rejected by the unmetered policy — only metered federation responses are charged (from the metadata `ai_federation` writes), consistent with the federation limitation noted below. (A genuine gateway rejection that never produced a backend response, e.g. a failed auth check, still releases the reservation.)
+> When a successful model response is later rejected by a response guardrail, the provider call has already consumed tokens, so `ai_rate_limiter` keeps the reservation charged. Federation now makes provider I/O from the final request-body phase, after the limiter's normal `before_proxy` reservation. Reconciliation uses `ai_federation_status` (the provider's original status), so a later synthetic-body rejection cannot make a consumed generation appear free. A genuine gateway rejection before provider dispatch still releases the reservation.
 
 > **Pre-reservation uses the pre-transform request body.** The estimate is computed in `before_proxy` from the inbound (buffered) request body. If a `request_transformer` body rule runs later in the pipeline and *raises* an output cap (`max_tokens` / `max_completion_tokens` / `max_output_tokens`) or appends prompt content, the backend-visible request can be larger than what was reserved, so concurrent transformed requests can briefly oversubscribe the budget. Post-response reconciliation corrects the charge to actual usage, so this is a bounded, self-correcting window rather than a persistent bypass. If exact up-front reservation matters for a proxy that inflates the body in a transform, set the final cap before `ai_rate_limiter` (e.g. via `ai_request_guard`'s `default_max_tokens`) so the inbound body already reflects it. The limiter only counts text-bearing fields for the prompt estimate and **excludes inline binary payloads** (base64 `image_url`/`inline_data`/`input_audio` data, binary `source` blocks, and any well-formed `data:` URL — `data:[<mediatype>][;base64],<payload>`), so multimodal/vision requests are not falsely rejected by oversized image bytes. An Anthropic **text** document block (`source: {type: "text", media_type: "text/plain", data: …}`) is the exception — its prose is real prompt input the provider bills, so it **is** counted, while binary image/PDF `source` blocks are still skipped. Ordinary prose that merely begins with `data:` (e.g. a chat message `"data: my notes"`) lacks the structural `,` separator and is still counted as text.
 
@@ -4388,7 +4377,7 @@ Request buffering is only enabled for matching JSON `POST` requests without a no
 
 The filter scores each word by stop-word membership, length, in-document rarity, and a proper-noun signal, then drops the lowest-scoring words until `target_ratio` is met. Fenced code blocks, inline code, URLs, numbers, `snake_case`/identifier tokens, uppercase acronyms, and negations (`not`, `never`, `cannot`, …) are always preserved. Token counts are estimated (~4 characters per token); no model tokenizer is embedded.
 
-Runs after `compression` so opt-in request decompression exposes plaintext prompt JSON before this plugin rewrites the standard backend-dispatch body. Its per-request gate buffers candidate JSON `POST` bodies; `before_proxy` rewrites `ctx.metadata["request_body"]` for already-plaintext direct dispatch and stores bounded private stage state; `transform_request_body_with_context` owns the authoritative upstream bytes and counters; and `on_final_request_body_with_context` rejects an unsanitizable decoded marker-bearing surface before dispatch. Direct `ai_federation` dispatch can consume the metadata rewrite for plaintext uploads; compressed client uploads must use the standard backend-dispatch path because federation returns before request-body transforms run. Only `messages[].content` and the legacy `prompt` are compressed; embeddings `input` and Anthropic top-level `system` are deliberately left intact. When a field is statistically rewritten, it records `ai_prompt_compressor.original_tokens`, `.compressed_tokens`, `.tokens_saved`, and `.fields_compressed` metadata for logging. See [`ai_prompt_compressor.md`](ai_prompt_compressor.md) for the full reference.
+Runs after `compression` so opt-in request decompression exposes plaintext prompt JSON before this plugin rewrites the authoritative request body. Its per-request gate buffers candidate JSON `POST` bodies; `before_proxy` rewrites `ctx.metadata["request_body"]` for already-plaintext compatibility and stores bounded private stage state; `transform_request_body_with_context` owns the authoritative upstream bytes and counters; and `on_final_request_body_with_context` rejects an unsanitizable decoded marker-bearing surface before dispatch. `ai_federation` consumes that final body after the transform, so plaintext and opt-in compressed uploads use the same governed representation. Only `messages[].content` and the legacy `prompt` are compressed; embeddings `input` and Anthropic top-level `system` are deliberately left intact. When a field is statistically rewritten, it records `ai_prompt_compressor.original_tokens`, `.compressed_tokens`, `.tokens_saved`, and `.fields_compressed` metadata for logging. See [`ai_prompt_compressor.md`](ai_prompt_compressor.md) for the full reference.
 
 ```yaml
 plugin_name: ai_prompt_compressor
@@ -4526,7 +4515,7 @@ plugins:
 
 > **Note:** `ai_federation` short-circuits normal backend dispatch via `RejectBinary`, but successful buffered synthetic bodies still run through response-body hooks: `ai_response_guard` inspects/transforms the normalized provider body, and `ai_semantic_cache` can participate through its synthetic hit re-serving/final-response behavior. `ai_token_metrics` is the deliberate exception and does not inspect federation's synthetic response; federation writes the same token metadata keys directly. Separately, `ai_rate_limiter` records federation token usage through `applies_after_proxy_on_reject` on the rejection path.
 
-> **Limitation — `on_unmetered_response: "reject"` does not apply to federated responses.** Because `ai_federation` delivers the provider response through the proxy's *rejection* pipeline (`RejectBinary` from `before_proxy`), `ai_rate_limiter` runs its reconciliation via `apply_after_proxy_hooks_to_rejection`, which intentionally ignores any `Reject` an after-proxy-on-reject hook returns (the gateway is already committed to emitting that response and only logs a warning). As a result, a federated 2xx response **missing token-usage metadata is always returned to the client even under `reject` mode** — the policy only takes effect for normally backend-proxied responses. `charge_estimate` and `warn` still behave correctly for federation (the reservation accounting is applied; only the *reject* outcome is swallowed). If you need fail-closed behavior for unmetered federated responses, enforce it upstream of federation (e.g. require usage reporting at the provider) rather than relying on `on_unmetered_response`. For federation, `ai_rate_limiter`'s `before_proxy` never runs (federation rejects at an earlier priority), so there is no pre-reservation either — federated requests are charged purely by post-response reconciliation of the metadata `ai_federation` writes.
+> **Limitation — `on_unmetered_response: "reject"` cannot replace a federated response.** Federation dispatches from the final request-body phase, so `ai_rate_limiter` performs its normal pre-reservation before provider I/O. The response still travels through the synthetic rejection pipeline, whose reconciliation hook cannot replace an already selected response. `charge_estimate` and `warn` therefore reconcile correctly, but `reject` records the violation without substituting a 502. If fail-closed unmetered responses are required, require provider usage during federation normalization or enforce it upstream.
 
 ---
 

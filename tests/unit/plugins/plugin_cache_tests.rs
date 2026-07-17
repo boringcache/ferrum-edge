@@ -4748,6 +4748,38 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
 }
 
 #[test]
+fn test_ai_federation_sets_terminal_final_body_dispatch_capability() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "ai_federation",
+        json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "api_key": "sk-test-key",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    // Exercise the priority wrapper too: it must forward the terminal dispatch
+    // contract or the proxy would run federation inside backend accounting.
+    plugin_config.priority_override = Some(2099);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        caps.has(PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH),
+        "AI federation must finalize and dispatch before backend-only preflights and accounting"
+    );
+}
+
+#[test]
 fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["ps1"])],

@@ -10,6 +10,28 @@ use ferrum_edge::plugins::{Plugin, RequestContext, TransactionSummary};
 use http::StatusCode;
 
 #[test]
+fn h3_terminal_final_body_dispatch_precedes_backend_selection_and_breaker() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let terminal_gate = source
+        .find("if final_body_before_backend_dispatch {")
+        .expect("H3 terminal final-body dispatch gate must remain present");
+    let selection = source[terminal_gate..]
+        .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .map(|offset| terminal_gate + offset)
+        .expect("H3 backend selection must remain present");
+    let breaker = source[selection..]
+        .find("check_circuit_breaker(")
+        .map(|offset| selection + offset)
+        .expect("H3 backend circuit-breaker gate must remain present");
+    let terminal_path = &source[terminal_gate..selection];
+
+    assert!(terminal_path.contains("run_final_request_body_hooks("));
+    assert!(terminal_path.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
+    assert!(terminal_gate < selection);
+    assert!(selection < breaker);
+}
+
+#[test]
 fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
     let source = include_str!("../../../src/http3/server.rs");
     let selection = source
@@ -663,10 +685,50 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
     let plugin_reject_sends = source
         .matches("send_h3_plugin_reject_flavor_aware(")
         .count();
+    let terminal_finalizer = source
+        .split("async fn finalize_h3_terminal_body_read_rejection(")
+        .nth(1)
+        .expect("shared terminal-body rejection finalizer")
+        .split("/// Optional HTTP/3 listener settings")
+        .next()
+        .expect("bounded terminal-body rejection finalizer");
+    let shared_terminal_commit_definitions = terminal_finalizer
+        .matches("run_h3_reject_response_committed_hooks(")
+        .count();
     assert_eq!(
-        committed_boundaries,
+        shared_terminal_commit_definitions, 1,
+        "the terminal-body finalizer must own exactly one committed boundary"
+    );
+
+    // The terminal provider path shares one finalizer across three writable
+    // rejection exits. Expand that shared boundary when comparing call sites,
+    // and exclude the separate final-body plugin rejection which commits before
+    // a non-plugin-aware sender.
+    let shared_terminal_reject_sends = source
+        .matches("let rejection = finalize_h3_terminal_body_read_rejection(")
+        .count();
+    assert_eq!(shared_terminal_reject_sends, 3);
+    let terminal_dispatch = source
+        .split("let raw_request_body_bytes = body_data.len() as u64;")
+        .nth(1)
+        .expect("terminal provider dispatch")
+        .split("// --- Upstream target selection and circuit breaker ---")
+        .next()
+        .expect("bounded terminal provider dispatch");
+    let non_plugin_terminal_boundaries = terminal_dispatch
+        .matches("run_h3_reject_response_committed_hooks(")
+        .count();
+    assert_eq!(
+        non_plugin_terminal_boundaries, 1,
+        "the terminal final-body plugin rejection has its own committed boundary"
+    );
+    let effective_plugin_committed_boundaries =
+        committed_boundaries - shared_terminal_commit_definitions - non_plugin_terminal_boundaries
+            + shared_terminal_reject_sends;
+    assert_eq!(
+        effective_plugin_committed_boundaries,
         plugin_reject_sends + 1,
-        "every plugin-aware reject send needs one committed boundary; the extra count is the second helper definition"
+        "every plugin-aware reject send needs one direct or shared committed boundary; the extra count is the second helper definition"
     );
 
     for (start_marker, end_marker, phase) in [

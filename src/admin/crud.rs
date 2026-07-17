@@ -1548,6 +1548,7 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
         || normalized.contains("client_secret")
         || normalized.contains("credential")
         || normalized.contains("private_key")
+        || normalized.contains("service_account_json")
         || normalized.contains("webhook")
 }
 

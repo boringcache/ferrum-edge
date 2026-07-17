@@ -71,6 +71,21 @@ fn post_ctx(body: &Value) -> RequestContext {
     ctx
 }
 
+async fn run_federation_final_body(
+    plugin: &AiFederation,
+    ctx: &mut RequestContext,
+    headers: &HashMap<String, String>,
+) -> PluginResult {
+    let body = ctx
+        .metadata
+        .get("request_body")
+        .cloned()
+        .unwrap_or_default();
+    plugin
+        .on_final_request_body_with_context(ctx, headers, body.as_bytes())
+        .await
+}
+
 fn reject_status(r: &PluginResult) -> Option<u16> {
     match r {
         PluginResult::Reject { status_code, .. } => Some(*status_code),
@@ -1314,8 +1329,8 @@ async fn test_ai_federation_rejects_streaming_without_marker() {
     let body =
         json!({"model": "gpt-4o", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
     let mut ctx = post_ctx(&body);
-    let mut headers = json_headers();
-    let res = fed.before_proxy(&mut ctx, &mut headers).await;
+    let headers = json_headers();
+    let res = run_federation_final_body(&fed, &mut ctx, &headers).await;
     assert_eq!(reject_status(&res), Some(501));
 }
 
@@ -1329,8 +1344,8 @@ async fn test_ai_federation_defers_to_claimed_stream_router_request() {
     let mut ctx = post_ctx(&body);
     ctx.metadata
         .insert("ai_stream_router_claimed".to_string(), "true".to_string());
-    let mut headers = json_headers();
-    let res = fed.before_proxy(&mut ctx, &mut headers).await;
+    let headers = json_headers();
+    let res = run_federation_final_body(&fed, &mut ctx, &headers).await;
     assert!(
         matches!(res, PluginResult::Continue),
         "ai_federation should defer to ai_stream_router"
@@ -1346,8 +1361,8 @@ async fn test_ai_federation_defers_to_stream_router_pass_through() {
         "ai_stream_router_pass_through".to_string(),
         "true".to_string(),
     );
-    let mut headers = json_headers();
-    let res = fed.before_proxy(&mut ctx, &mut headers).await;
+    let headers = json_headers();
+    let res = run_federation_final_body(&fed, &mut ctx, &headers).await;
     assert!(
         matches!(res, PluginResult::Continue),
         "ai_federation should defer to explicit ai_stream_router pass-through"
@@ -1376,12 +1391,12 @@ async fn test_end_to_end_composition_streaming_vs_non_streaming() {
         Some("true")
     );
     assert!(matches!(
-        fed.before_proxy(&mut ctx, &mut headers).await,
+        run_federation_final_body(&fed, &mut ctx, &headers).await,
         PluginResult::Continue
     ));
 
-    // stream:false → NOT claimed by ai_stream_router; ai_federation handles it
-    // (rejects here because there is no live provider, proving it took ownership).
+    // stream:false → NOT claimed by ai_stream_router and therefore remains
+    // eligible for ai_federation's later final-body phase.
     let non_streaming = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
     let mut ctx2 = post_ctx(&non_streaming);
     let mut headers2 = json_headers();

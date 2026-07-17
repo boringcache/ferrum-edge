@@ -188,10 +188,10 @@ routing rewrites the backend path, so staged reuse, recomputation, and the
 65,536-byte threshold cannot change eligibility. The path snapshot is one
 private typed value per request, shared by all compressor instances rather than
 stored in public metadata. Opt-in gzip/brotli decompression therefore compresses
-and measures the resulting plaintext on the standard path. Compressed client
-uploads cannot be compressed for direct `ai_federation` dispatch because
-federation returns before request-body transforms run; use the standard
-backend-dispatch path for that combination.
+and measures the resulting plaintext on the standard path. `ai_federation`
+consumes the authoritative final request body after decompression and the
+context-aware transform, so provider dispatch uses that same compressed
+representation for plaintext and opt-in compressed uploads.
 
 The final context-aware body hook is the fail-closed backstop for decoded
 representations. For example, if request decompression produces more than the

@@ -108,8 +108,9 @@ use crate::modes::mesh::node_waypoint::{
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
-    PluginResult, ProxyProtocol, RequestContext, TransactionSummary, WebSocketFrameDirection,
-    is_builtin_plugin_name, mesh_route_dispatch::MeshRouteDispatchConfig,
+    PluginResult, ProxyProtocol, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
+    TransactionSummary, WebSocketFrameDirection, is_builtin_plugin_name,
+    mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
 use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
@@ -2480,6 +2481,45 @@ pub(crate) fn request_body_requirements_before_before_proxy(
         }
     }
     requirements
+}
+
+/// Resolve request-time body buffering and terminal-dispatch applicability.
+///
+/// Callers run this once against the client headers for phases that precede
+/// `before_proxy`, then again against the effective header map when a plugin
+/// transformed headers. This keeps a header transformer that exposes a JSON AI
+/// request from accidentally bypassing terminal federation dispatch.
+pub(crate) fn final_request_body_requirements(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    request_may_need_buffering: bool,
+    has_terminal_body_dispatch: bool,
+    has_contextual_final_body_hook: bool,
+) -> (bool, bool, bool) {
+    if request_may_need_buffering && (has_terminal_body_dispatch || has_contextual_final_body_hook)
+    {
+        let mut requires_buffering = false;
+        let mut terminal_dispatch = false;
+        let mut needs_final_context = false;
+        for plugin in plugins {
+            if plugin.should_buffer_request_body(ctx) {
+                requires_buffering = true;
+                terminal_dispatch |= plugin.requires_final_request_body_before_backend_dispatch();
+                needs_final_context |= plugin.needs_final_request_body_context();
+            }
+        }
+        (requires_buffering, terminal_dispatch, needs_final_context)
+    } else if request_may_need_buffering {
+        (
+            plugins
+                .iter()
+                .any(|plugin| plugin.should_buffer_request_body(ctx)),
+            false,
+            false,
+        )
+    } else {
+        (false, false, false)
+    }
 }
 
 pub(crate) fn request_body_requirements_before_authenticate(
@@ -13844,9 +13884,10 @@ async fn run_after_proxy_hooks_on_rejection(
                 // reject hooks run), so a hook cannot replace it here — it is
                 // ignored and only logged. Known consequence: `ai_rate_limiter`'s
                 // `on_unmetered_response: "reject"` is best-effort for synthetic
-                // `before_proxy` responses such as `ai_federation`'s — a federated
-                // 2xx missing usage metadata is still returned to the client. See
-                // docs/plugins.md (ai_rate_limiter federation limitation).
+                // responses such as `ai_federation`'s final-request-body
+                // short-circuit — a federated 2xx missing usage metadata is still
+                // returned to the client. See docs/plugins.md (ai_rate_limiter
+                // federation limitation).
                 warn!(
                     rejecting_plugin = plugin.name(),
                     attempted_reject_status = reject_status,
@@ -15350,6 +15391,50 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     );
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
     normalize_reject_response(status, &response_body, &headers, is_grpc_request)
+}
+
+/// Finalize a terminal request-body read failure before any external operation
+/// or backend dispatch could start. The committed-response hook owns cleanup of
+/// exact local/distributed in-flight tokens, so every failure shape must pass
+/// through the same rejection pipeline exactly once.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_terminal_request_body_read_rejection(
+    state: &ProxyState,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    body: &[u8],
+    is_grpc_request: bool,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    request_path: &str,
+) -> Response<ProxyBody> {
+    ctx.metadata.insert(
+        RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let normalized = finalize_reject_response_with_after_proxy_hooks(
+        plugins,
+        ctx,
+        status,
+        body,
+        HashMap::new(),
+        is_grpc_request,
+    )
+    .await;
+    apply_grpc_reject_metadata(ctx, &normalized);
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        normalized.http_status.as_u16(),
+        start_time,
+        "on_final_request_body",
+        plugin_execution_ns,
+        Some(request_path),
+    )
+    .await;
+    record_request(state, normalized.http_status.as_u16());
+    build_response_from_normalized_reject(normalized)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -17225,13 +17310,25 @@ async fn handle_proxy_request_inner(
     // HBONE CONNECT requests must keep hyper's upgrade handle in the streaming
     // body (see `handle_hbone_request`), so pre-`before_proxy` buffering is
     // skipped — same reason as the pre-authenticate buffering guard above.
-    let requires_request_body_buffering = !is_hbone_connect_any
+    let request_may_need_buffering = !is_hbone_connect_any
         && allows_request_body_buffering
-        && maybe_requires_request_body_buffering
-        && plugins
-            .iter()
-            .any(|plugin| plugin.should_buffer_request_body(&ctx));
-    let before_proxy_body_requirements = if requires_request_body_buffering
+        && maybe_requires_request_body_buffering;
+    let has_terminal_body_dispatch = capabilities
+        .has(crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH);
+    let has_contextual_final_body_hook =
+        capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    let (
+        initial_requires_request_body_buffering,
+        initial_final_body_before_backend_dispatch,
+        initial_needs_final_request_body_context,
+    ) = final_request_body_requirements(
+        &plugins,
+        &ctx,
+        request_may_need_buffering,
+        has_terminal_body_dispatch,
+        has_contextual_final_body_hook,
+    );
+    let before_proxy_body_requirements = if initial_requires_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
     {
         request_body_requirements_before_before_proxy(&plugins, &ctx)
@@ -17476,6 +17573,33 @@ async fn handle_proxy_request_inner(
         ctx.headers = tmp_headers;
     }
 
+    // A header-transforming before_proxy hook can change the applicability of
+    // body plugins (for example, text/plain -> application/json). Re-evaluate
+    // against the effective outbound headers before choosing terminal versus
+    // backend dispatch. Swap maps temporarily to avoid another full clone.
+    let (
+        requires_request_body_buffering,
+        final_body_before_backend_dispatch,
+        needs_final_request_body_context,
+    ) = if let Some(transformed_headers) = owned_proxy_headers.as_mut() {
+        std::mem::swap(&mut ctx.headers, transformed_headers);
+        let requirements = final_request_body_requirements(
+            &plugins,
+            &ctx,
+            request_may_need_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+        );
+        std::mem::swap(&mut ctx.headers, transformed_headers);
+        requirements
+    } else {
+        (
+            initial_requires_request_body_buffering,
+            initial_final_body_before_backend_dispatch,
+            initial_needs_final_request_body_context,
+        )
+    };
+
     // HBONE CONNECT short-circuits the rest of the dispatch ladder: the relay
     // is a transparent TCP tunnel, so identity-header injection, egress
     // baggage strip on `owned_proxy_headers`, the WS/gRPC branches, and the
@@ -17562,11 +17686,14 @@ async fn handle_proxy_request_inner(
         && requires_request_body_buffering
         && (maybe_requires_response_body_buffering || stream_hooks_enabled);
     let mut request_body_prepared = false;
-    // Pre-computed at config reload (see `PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT`)
-    // so the proxy hot path does not re-scan the plugin list per request.
-    let needs_final_request_body_context = requires_request_body_buffering
-        && capabilities
-            .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    // The config-time capability above avoids a full scan when no contextual
+    // final-body hook is configured. The request-time value also requires that
+    // same plugin's body-applicability predicate to match, avoiding an unrelated
+    // body plugin triggering a context clone.
+    // Provider-dispatch plugins synthesize the complete response from the
+    // finalized request body. The config-time bit above avoids extra work when
+    // none are configured; the request-time value is true only when that same
+    // terminal plugin's `should_buffer_request_body` matched this request.
     let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
@@ -17838,6 +17965,179 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
+    // A terminal final-body plugin (currently `ai_federation`) owns its own
+    // external dispatch and returns the complete response. Finalize and invoke
+    // it after inbound transport policy, but before the placeholder route's
+    // backend circuit breaker and every backend-only preflight. Besides
+    // preventing an unrelated backend policy from suppressing provider calls,
+    // returning here keeps synthetic provider outcomes out of backend health,
+    // breaker, and latency accounting.
+    if final_body_before_backend_dispatch {
+        let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &hook_headers,
+                    state.max_request_body_size_bytes,
+                    proxy.backend_read_timeout_ms,
+                    ctx.grpc_deadline_at(),
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        return Ok(finalize_terminal_request_body_read_rejection(
+                            &state,
+                            &plugins,
+                            &mut ctx,
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            br#"{"error":"Request body exceeds maximum size"}"#,
+                            is_grpc_request,
+                            start_time,
+                            plugin_execution_ns,
+                            &original_request_path,
+                        )
+                        .await);
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while finalizing terminal request body before backend dispatch"
+                        );
+                        return Ok(finalize_terminal_request_body_read_rejection(
+                            &state,
+                            &plugins,
+                            &mut ctx,
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            br#"{"error":"Client disconnected"}"#,
+                            is_grpc_request,
+                            start_time,
+                            plugin_execution_ns,
+                            &original_request_path,
+                        )
+                        .await);
+                    }
+                    Err(RequestBodyBufferError::TimedOut) => {
+                        return Ok(finalize_terminal_request_body_read_rejection(
+                            &state,
+                            &plugins,
+                            &mut ctx,
+                            StatusCode::REQUEST_TIMEOUT,
+                            br#"{"error":"Request body read timed out"}"#,
+                            is_grpc_request,
+                            start_time,
+                            plugin_execution_ns,
+                            &original_request_path,
+                        )
+                        .await);
+                    }
+                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                        ctx.metadata.insert(
+                            RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
+                            "true".to_string(),
+                        );
+                        return Ok(finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_terminal_request_body",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            grpc_web_response_content_type,
+                        )
+                        .await);
+                    }
+                }
+            }
+            buffered => buffered,
+        };
+
+        client_request_body = match client_request_body {
+            ClientRequestBody::Buffered(body) => {
+                ctx.bytes_sent_observed
+                    .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                let mut body_hook_ctx = needs_final_request_body_context
+                    .then(|| ctx.clone_for_final_request_body_hooks());
+                let terminal_hook_start = Instant::now();
+                let grpc_deadline_at = ctx.grpc_deadline_at();
+                let transformed = apply_request_body_plugins_with_context(
+                    &plugins,
+                    body_hook_ctx.as_mut(),
+                    grpc_deadline_at,
+                    &hook_headers,
+                    body,
+                )
+                .await;
+                let final_body_result = run_final_request_body_hooks(
+                    &plugins,
+                    body_hook_ctx.as_mut(),
+                    grpc_deadline_at,
+                    &hook_headers,
+                    &transformed,
+                )
+                .await;
+                plugin_execution_ns += terminal_hook_start.elapsed().as_nanos() as u64;
+                if let Some(body_hook_ctx) = body_hook_ctx {
+                    let request_body = ctx.metadata.remove("request_body");
+                    ctx.metadata = body_hook_ctx.metadata;
+                    if let Some(body) = request_body {
+                        ctx.metadata.insert("request_body".to_string(), body);
+                    }
+                    ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                    ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
+                    ctx.waf_score = body_hook_ctx.waf_score;
+                }
+                match final_body_result {
+                    PluginResult::Continue => {
+                        request_body_prepared = true;
+                        ClientRequestBody::Buffered(transformed)
+                    }
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            record_request(&state, 500);
+                            return Ok(build_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                r#"{"error":"Internal error"}"#,
+                            ));
+                        };
+                        let status = StatusCode::from_u16(reject.status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let normalized = finalize_reject_response_with_after_proxy_hooks(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            &reject.body,
+                            reject.headers,
+                            is_grpc_request,
+                        )
+                        .await;
+                        apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        log_rejected_request_with_path(
+                            &plugins,
+                            &ctx,
+                            normalized.http_status.as_u16(),
+                            start_time,
+                            "on_final_request_body",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await;
+                        record_request(&state, normalized.http_status.as_u16());
+                        return Ok(build_response_from_normalized_reject(normalized));
+                    }
+                }
+            }
+            bodyless => bodyless,
+        };
+    }
+
     let upstream_balancer = selection.balancer;
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
@@ -17894,15 +18194,17 @@ async fn handle_proxy_request_inner(
             }
         };
 
-    // Finalize the body only after fail-fast routing and breaker gates have
-    // admitted the request. This preserves the open-breaker behavior (no slow
-    // upload drain or body-plugin I/O before the immediate 503) while still
-    // updating response buffering and transport preference before dispatch.
+    // For ordinary response-policy reevaluation, finalize the body only after
+    // fail-fast routing and breaker gates have admitted the request. This
+    // preserves the open-breaker behavior (no slow upload drain or body-plugin
+    // I/O before the immediate 503). Terminal dispatch plugins were finalized
+    // above and skip this second pass via `request_body_prepared`.
     let preparation_backend_host = upstream_target
         .as_deref()
         .map(|target| target.host.as_str())
         .unwrap_or(proxy.backend_host.as_str());
-    let preparation_requires_direct_h2_for_sni = reevaluate_response_policy_after_request_body
+    let preparation_requires_direct_h2_for_sni = !request_body_prepared
+        && reevaluate_response_policy_after_request_body
         && resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref())
             .resolved_tls
             .sni
@@ -17916,7 +18218,10 @@ async fn handle_proxy_request_inner(
         .is_some()
         || backend_dispatch::direct_http_mesh_transport_refusal(upstream_target.as_deref())
             .is_some();
-    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_dispatch_policy {
+    if reevaluate_response_policy_after_request_body
+        && !request_body_prepared
+        && !preparation_blocked_by_dispatch_policy
+    {
         if !backend_admission_plugins.is_empty() {
             let admission_proxy =
                 resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
@@ -32430,10 +32735,12 @@ mod tests {
             "model": "gpt-test",
             "messages": [{"role": "user", "content": "hello"}]
         });
+        let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
         let mut ctx = request_ctx_with_ai_body(request_body);
-        let mut headers =
-            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let synthetic = plugins[0].before_proxy(&mut ctx, &mut headers).await;
+        let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let synthetic = plugins[0]
+            .on_final_request_body_with_context(&mut ctx, &headers, &request_body_bytes)
+            .await;
 
         let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
 
