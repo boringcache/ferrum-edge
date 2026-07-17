@@ -5348,10 +5348,10 @@ fn test_custom_only_duplicate_effective_correlation_headers_are_rejected() {
         return;
     }
 
-    // The example plugin retains configured casing at the capability boundary,
-    // modeling a third-party implementation that did not pre-normalize its
-    // correlation_id_header_name() result. Core validation must still compare
-    // these two claims case-insensitively.
+    // The example plugin retains configured whitespace and casing at the
+    // capability boundary, modeling a third-party implementation that did not
+    // pre-normalize its correlation_id_header_name() result. Core validation
+    // must still trim and compare these two claims case-insensitively.
     let first = make_plugin_config_with_json(
         "custom-corr-first",
         "example_plugin",
@@ -5378,7 +5378,7 @@ fn test_custom_only_duplicate_effective_correlation_headers_are_rejected() {
 
     let error = PluginCache::new(&config)
         .err()
-        .expect("custom-only duplicate correlation headers must fail closed");
+        .expect("mixed-whitespace/case correlation claims must fail closed");
     assert!(error.contains("duplicate effective header_name \"x-custom-correlation-id\""));
     assert!(error.contains("proxy_id=p1"));
 }

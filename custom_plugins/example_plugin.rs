@@ -85,13 +85,13 @@ impl ExamplePlugin {
         {
             None => (None, None),
             Some(Value::String(value)) => {
-                let value = value.trim();
-                if value.is_empty() {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
                     return Err(
                         "example_plugin.correlation_header_name must not be empty".to_string(),
                     );
                 }
-                let normalized = value.to_ascii_lowercase();
+                let normalized = trimmed.to_ascii_lowercase();
                 let header_name = HeaderName::from_bytes(normalized.as_bytes()).map_err(|error| {
                     format!(
                         "example_plugin.correlation_header_name must be a valid HTTP header name: {error}"
@@ -99,7 +99,7 @@ impl ExamplePlugin {
                 })?;
                 (
                     Some(header_name.as_str().to_string()),
-                    Some(value.to_string()),
+                    Some(value.clone()),
                 )
             }
             Some(_) => {
@@ -143,10 +143,10 @@ impl Plugin for ExamplePlugin {
     }
 
     fn correlation_id_header_name(&self) -> Option<&str> {
-        // Keep the configured spelling at this capability boundary so the core
-        // validator remains defensive against third-party plugins that do not
-        // pre-normalize. Runtime header writes still use the validated,
-        // lowercase `correlation_header_name` above.
+        // Keep the configured whitespace and spelling at this capability
+        // boundary so the core validator remains defensive against third-party
+        // plugins that do not pre-normalize. Runtime header writes still use
+        // the validated, lowercase `correlation_header_name` above.
         self.correlation_header_claim.as_deref()
     }
 

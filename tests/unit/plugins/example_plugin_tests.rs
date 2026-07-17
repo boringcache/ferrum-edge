@@ -62,8 +62,8 @@ async fn valid_config_exercises_request_and_response_hooks() {
     assert_eq!(plugin.name(), "example_plugin");
     assert_eq!(
         plugin.correlation_id_header_name(),
-        Some("X-Custom-Correlation-ID"),
-        "the example retains configured casing at the capability boundary so core validation must compare claims case-insensitively",
+        Some(" X-Custom-Correlation-ID "),
+        "the example retains configured whitespace and casing at the capability boundary so core validation must trim and compare claims case-insensitively",
     );
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(plugin.modifies_request_headers());
@@ -92,7 +92,8 @@ async fn valid_config_exercises_request_and_response_hooks() {
         request_headers
             .get("x-custom-correlation-id")
             .map(String::as_str),
-        Some("edge-a")
+        Some("edge-a"),
+        "runtime writes use the validated normalized lowercase header",
     );
     assert_eq!(
         plugin
@@ -116,7 +117,8 @@ async fn valid_config_exercises_request_and_response_hooks() {
         response_headers
             .get("x-custom-correlation-id")
             .map(String::as_str),
-        Some("edge-a")
+        Some("edge-a"),
+        "runtime writes use the validated normalized lowercase header",
     );
 }
 
