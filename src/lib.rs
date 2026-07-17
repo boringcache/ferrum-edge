@@ -114,6 +114,34 @@ pub mod _test_support {
         )
     }
 
+    pub fn udp_dtls_disconnect_metadata_after_datagram_metadata_for_test(
+        ctx: &mut crate::plugins::StreamConnectionContext,
+        datagram_metadata: HashMap<String, String>,
+    ) -> (HashMap<String, String>, HashMap<String, String>) {
+        let (connect_metadata, correlation_ids) = ctx.take_metadata_with_correlation_ids();
+
+        let udp_metadata = std::sync::Mutex::new(connect_metadata.clone());
+        crate::plugins::UdpMetadataSink::new(&udp_metadata).update(|metadata| {
+            metadata.extend(datagram_metadata.clone());
+        });
+        let udp_metadata = crate::proxy::udp_proxy::finalize_stream_summary_metadata(
+            udp_metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            &correlation_ids,
+        );
+
+        let mut dtls_metadata = connect_metadata;
+        dtls_metadata.extend(datagram_metadata);
+        let dtls_metadata = crate::proxy::udp_proxy::finalize_stream_summary_metadata(
+            dtls_metadata,
+            &correlation_ids,
+        );
+
+        (udp_metadata, dtls_metadata)
+    }
+
     pub fn plugin_cache_with_real_ip_header_for_test(
         config: &crate::config::types::GatewayConfig,
         real_ip_header: Option<&str>,

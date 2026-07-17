@@ -721,6 +721,111 @@ async fn test_multiple_correlation_instances_keep_stream_ids_isolated() {
     );
 }
 
+#[tokio::test]
+async fn udp_and_dtls_disconnect_summaries_restore_correlation_after_datagram_metadata() {
+    let first = make_plugin(
+        "correlation_id",
+        json!({"header_name": "x-internal-request-id"}),
+    )
+    .unwrap();
+    let second = make_plugin(
+        "correlation_id",
+        json!({"header_name": "x-external-request-id"}),
+    )
+    .unwrap();
+    let mut ctx = make_stream_ctx();
+    ctx.insert_metadata(
+        "stream_connect_metadata".to_string(),
+        "connect-value".to_string(),
+    );
+
+    assert!(matches!(
+        first.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let connect_metadata = ctx.metadata.as_ref().expect("metadata allocated");
+    let expected_canonical = connect_metadata
+        .get(REQUEST_ID_METADATA_KEY)
+        .expect("canonical correlation ID")
+        .clone();
+    let expected_internal = connect_metadata
+        .get("correlation_id.instance.x-internal-request-id")
+        .expect("internal instance correlation ID")
+        .clone();
+    let expected_external = connect_metadata
+        .get("correlation_id.instance.x-external-request-id")
+        .expect("external instance correlation ID")
+        .clone();
+
+    let datagram_metadata = HashMap::from([
+        (
+            REQUEST_ID_METADATA_KEY.to_string(),
+            "datagram-poisoned-canonical".to_string(),
+        ),
+        (
+            "correlation_id.instance.x-internal-request-id".to_string(),
+            "datagram-poisoned-internal".to_string(),
+        ),
+        (
+            "correlation_id.instance.x-external-request-id".to_string(),
+            "datagram-poisoned-external".to_string(),
+        ),
+        (
+            "datagram_metadata".to_string(),
+            "retained-value".to_string(),
+        ),
+    ]);
+    let (udp_metadata, dtls_metadata) =
+        ferrum_edge::_test_support::udp_dtls_disconnect_metadata_after_datagram_metadata_for_test(
+            &mut ctx,
+            datagram_metadata,
+        );
+    let mut udp_summary = make_stream_summary();
+    udp_summary.protocol = "udp".to_string();
+    udp_summary.metadata = udp_metadata;
+    let mut dtls_summary = make_stream_summary();
+    dtls_summary.protocol = "dtls".to_string();
+    dtls_summary.metadata = dtls_metadata;
+
+    for summary in [&udp_summary, &dtls_summary] {
+        assert_eq!(
+            summary.metadata.get(REQUEST_ID_METADATA_KEY),
+            Some(&expected_canonical),
+            "{} summary must restore canonical correlation ownership",
+            summary.protocol
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .get("correlation_id.instance.x-internal-request-id"),
+            Some(&expected_internal),
+            "{} summary must restore the internal instance correlation ID",
+            summary.protocol
+        );
+        assert_eq!(
+            summary
+                .metadata
+                .get("correlation_id.instance.x-external-request-id"),
+            Some(&expected_external),
+            "{} summary must restore the external instance correlation ID",
+            summary.protocol
+        );
+        assert_eq!(
+            summary.metadata.get("stream_connect_metadata").map(String::as_str),
+            Some("connect-value")
+        );
+        assert_eq!(
+            summary.metadata.get("datagram_metadata").map(String::as_str),
+            Some("retained-value")
+        );
+    }
+}
+
 // ---- WebSocket-only frame plugins ----
 
 #[test]

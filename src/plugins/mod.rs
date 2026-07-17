@@ -679,7 +679,7 @@ pub struct CanonicalClientIpCache {
 }
 
 #[derive(Debug, Clone, Default)]
-struct CorrelationIdState {
+pub(crate) struct CorrelationIdState {
     canonical: Option<String>,
     instances: HashMap<String, String>,
 }
@@ -723,7 +723,7 @@ impl CanonicalClientIpCache {
         self.correlation_ids.canonical.as_deref()
     }
 
-    fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
         for (key, value) in &self.correlation_ids.instances {
             metadata.insert(key.clone(), value.clone());
         }
@@ -3563,6 +3563,22 @@ impl StreamConnectionContext {
         self.canonical_client_ip
             .project_correlation_ids(&mut metadata);
         metadata
+    }
+
+    /// Transfer plugin-writable metadata and private correlation ownership to a
+    /// session that can receive additional metadata before its terminal summary.
+    ///
+    /// UDP and DTLS keep the correlation state immutable after admission, then
+    /// re-project it after all per-datagram metadata has been merged. This avoids
+    /// cloning correlation values per datagram while preventing those hooks from
+    /// replacing the authoritative terminal values.
+    pub(crate) fn take_metadata_with_correlation_ids(
+        &mut self,
+    ) -> (HashMap<String, String>, CorrelationIdState) {
+        (
+            self.metadata.take().unwrap_or_default(),
+            std::mem::take(&mut self.canonical_client_ip.correlation_ids),
+        )
     }
 
     pub(crate) fn add_admission_permit(&mut self, permit: StreamAdmissionPermit) {

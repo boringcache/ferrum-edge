@@ -30,9 +30,9 @@ use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
-    Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
-    StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
-    UdpMetadataSink,
+    CorrelationIdState, Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind,
+    StreamConnectionContext, StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection,
+    UdpDatagramVerdict, UdpMetadataSink,
 };
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
@@ -98,6 +98,10 @@ struct UdpSession {
     auth_method: Option<&'static str>,
     /// Plugin metadata from on_stream_connect, carried to on_stream_disconnect.
     metadata: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Immutable authoritative correlation ownership captured after admission.
+    /// Per-datagram hooks mutate only `metadata`; disconnect-summary construction
+    /// re-projects this state after cloning that final writable map.
+    correlation_ids: CorrelationIdState,
     /// Plugins and proxy metadata resolved from the RequestEpoch used to create this session.
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     datagram_plugins: Arc<[Arc<dyn Plugin>]>,
@@ -590,14 +594,28 @@ fn rfc3339_from_epoch_millis(ms: u64) -> String {
         .unwrap_or_default()
 }
 
+/// Restore private correlation ownership after every plugin-writable metadata
+/// merge and immediately before the disconnect summary becomes observable.
+pub(crate) fn finalize_stream_summary_metadata(
+    mut metadata: std::collections::HashMap<String, String>,
+    correlation_ids: &CorrelationIdState,
+) -> std::collections::HashMap<String, String> {
+    correlation_ids.project_correlation_ids(&mut metadata);
+    metadata
+}
+
 fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransactionSummary {
     let created_ms = context.session.created_at.load(Ordering::Relaxed);
-    let metadata = context
+    let writable_metadata = context
         .session
         .metadata
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let metadata = finalize_stream_summary_metadata(
+        writable_metadata,
+        &context.session.correlation_ids,
+    );
 
     StreamTransactionSummary {
         namespace: context.namespace.to_string(),
@@ -662,9 +680,13 @@ struct DtlsDisconnectContext<'a> {
     disconnect_direction: Option<crate::plugins::Direction>,
     disconnect_cause: Option<crate::plugins::DisconnectCause>,
     metadata: &'a std::collections::HashMap<String, String>,
+    correlation_ids: &'a CorrelationIdState,
 }
 
 fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransactionSummary {
+    let metadata =
+        finalize_stream_summary_metadata(context.metadata.clone(), context.correlation_ids);
+
     StreamTransactionSummary {
         namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
@@ -686,7 +708,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         timestamp_connected: context.connected_at.to_rfc3339(),
         timestamp_disconnected: context.disconnected_at.to_rfc3339(),
         sni_hostname: None,
-        metadata: context.metadata.clone(),
+        metadata,
     }
 }
 
@@ -2410,8 +2432,8 @@ async fn start_dtls_frontend_listener(
                     None
                 };
                 let handler_auth_method = stream_ctx.auth_method;
-                let handler_metadata = if handler_has_plugins {
-                    stream_ctx.take_metadata()
+                let (handler_metadata, handler_correlation_ids) = if handler_has_plugins {
+                    stream_ctx.take_metadata_with_correlation_ids()
                 } else {
                     Default::default()
                 };
@@ -2509,6 +2531,7 @@ async fn start_dtls_frontend_listener(
                             disconnect_direction,
                             disconnect_cause,
                             metadata: &merged_metadata,
+                            correlation_ids: &handler_correlation_ids,
                         });
                         crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
 
@@ -3473,6 +3496,7 @@ async fn create_session(
     let datagram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_string());
     let datagram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let datagram_proxy_name: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
+    let (metadata, correlation_ids) = stream_ctx.take_metadata_with_correlation_ids();
     let session = Arc::new(UdpSession {
         backend_socket: backend_socket.clone(),
         dtls_conn: dtls_conn.clone(),
@@ -3487,7 +3511,8 @@ async fn create_session(
         sni_hostname: stream_ctx.sni_hostname.clone(),
         consumer_username,
         auth_method,
-        metadata: std::sync::Mutex::new(stream_ctx.take_metadata()),
+        metadata: std::sync::Mutex::new(metadata),
+        correlation_ids,
         local_addr: std::sync::OnceLock::new(),
         plugins: Arc::clone(&plugins),
         datagram_plugins: Arc::clone(&datagram_plugins),
@@ -4360,6 +4385,7 @@ mod tests {
                 "request_id".to_string(),
                 "stream-123".to_string(),
             )])),
+            correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
@@ -4501,6 +4527,7 @@ backend_tls_verify_server_cert: false
         let connected_at = chrono::Utc::now() - chrono::TimeDelta::milliseconds(750);
         let disconnected_at = chrono::Utc::now();
         let metadata = HashMap::from([("request_id".to_string(), "dtls-123".to_string())]);
+        let correlation_ids = Default::default();
 
         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
             namespace: "ferrum",
@@ -4522,6 +4549,7 @@ backend_tls_verify_server_cert: false
             disconnect_direction: None,
             disconnect_cause: Some(crate::plugins::DisconnectCause::RecvError),
             metadata: &metadata,
+            correlation_ids: &correlation_ids,
         });
 
         assert_eq!(summary.proxy_id, "dtls-proxy");
@@ -4976,6 +5004,7 @@ backend_tls_verify_server_cert: false
             consumer_username: None,
             auth_method: None,
             metadata: std::sync::Mutex::new(HashMap::new()),
+            correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
