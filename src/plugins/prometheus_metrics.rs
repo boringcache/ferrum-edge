@@ -83,8 +83,9 @@ impl AiMetadataUsage {
 
 fn ai_provider_label(value: &str) -> Option<&'static str> {
     match value {
-        "openai" | "azure_openai" | "xai" | "deepseek" | "meta_llama"
-        | "hugging_face" => Some("openai"),
+        "openai" | "azure_openai" | "xai" | "deepseek" | "meta_llama" | "hugging_face" => {
+            Some("openai")
+        }
         "anthropic" => Some("anthropic"),
         "google" | "google_gemini" | "google_vertex" => Some("google"),
         "cohere" => Some("cohere"),

@@ -1462,13 +1462,7 @@ fn federation_provider_aliases_use_bounded_ai_metric_families() {
     ];
 
     for (index, (raw_provider, _)) in aliases.iter().enumerate() {
-        let mut summary = make_summary(
-            &format!("federation-{index}"),
-            "POST",
-            200,
-            1.0,
-            1.0,
-        );
+        let mut summary = make_summary(&format!("federation-{index}"), "POST", 200, 1.0, 1.0);
         summary.metadata = HashMap::from([
             ("ai_usage_export".to_string(), "v1".to_string()),
             ("ai_provider".to_string(), (*raw_provider).to_string()),

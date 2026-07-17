@@ -2195,9 +2195,7 @@ async fn multimodal_reject_provider_falls_through_to_translate_provider() {
         Some("10")
     );
     assert_eq!(
-        ctx.metadata
-            .get("ai_completion_tokens")
-            .map(String::as_str),
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
         Some("5")
     );
     assert_eq!(
