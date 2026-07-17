@@ -266,6 +266,115 @@ pub struct BufferedInitialResponseHeaderPolicyState {
     pre_policy_application_trailers: HashMap<String, Option<String>>,
 }
 
+/// Header provenance for an uncommitted response that may be replaced by the
+/// request's absolute gRPC deadline.
+///
+/// The pristine map is captured before response hooks run. Completed gateway
+/// hooks then advance `observed_headers` and record only fields they added or
+/// changed. Deadline replacement rebuilds from that gateway-owned output rather
+/// than trusting a backend value merely because its name resembles a known
+/// decorator. This state exists only for deadline-bound buffered responses.
+#[derive(Debug, Clone)]
+struct BufferedDeadlineResponseHeaderProvenance {
+    observed_headers: HashMap<String, String>,
+    gateway_headers: HashMap<String, String>,
+}
+
+impl BufferedDeadlineResponseHeaderProvenance {
+    fn backend_response(headers: &HashMap<String, String>) -> Self {
+        Self {
+            observed_headers: Self::canonical_snapshot(headers),
+            gateway_headers: HashMap::new(),
+        }
+    }
+
+    /// Rejection headers are gateway/plugin output rather than backend
+    /// metadata. Their provenance is already known; later non-replacing hooks
+    /// are tracked by mutation like buffered responses.
+    fn gateway_rejection(headers: &HashMap<String, String>) -> Self {
+        let observed_headers = Self::canonical_snapshot(headers);
+        let gateway_headers = observed_headers.clone();
+        Self {
+            observed_headers,
+            gateway_headers,
+        }
+    }
+
+    fn canonical_snapshot(headers: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut entries = headers.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let mut canonical = HashMap::with_capacity(entries.len());
+        for (name, value) in entries {
+            let lowercase = name.to_ascii_lowercase();
+            if name == &lowercase || !canonical.contains_key(&lowercase) {
+                canonical.insert(lowercase, value.clone());
+            }
+        }
+        canonical
+    }
+
+    fn record_gateway_mutations(
+        &mut self,
+        plugin_owned_headers: &[String],
+        headers: &HashMap<String, String>,
+    ) {
+        let current = Self::canonical_snapshot(headers);
+        for (name, value) in &current {
+            if self.observed_headers.get(name) != Some(value)
+                || plugin_owned_headers.iter().any(|owned| owned == name)
+            {
+                self.gateway_headers.insert(name.clone(), value.clone());
+            }
+        }
+        for name in self.observed_headers.keys() {
+            if !current.contains_key(name) {
+                self.gateway_headers.remove(name);
+            }
+        }
+        self.observed_headers = current;
+    }
+
+    fn retain_gateway_output(&mut self, headers: &mut HashMap<String, String>) {
+        let preserve_origin_vary = headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("vary")
+                && value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("origin"))
+        });
+
+        *headers = self.gateway_headers.clone();
+        headers.retain(|name, _| {
+            ![
+                "authorization",
+                "content-digest",
+                "content-encoding",
+                "content-length",
+                "content-md5",
+                "content-range",
+                "content-type",
+                "cookie",
+                "etag",
+                "last-modified",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "repr-digest",
+                "set-cookie",
+                "www-authenticate",
+                "vary",
+            ]
+            .contains(&name.as_str())
+        });
+        if preserve_origin_vary {
+            headers.insert("vary".to_string(), "Origin".to_string());
+        }
+        self.observed_headers = Self::canonical_snapshot(headers);
+    }
+
+    fn sync_terminal_headers(&mut self, headers: &HashMap<String, String>) {
+        self.observed_headers = Self::canonical_snapshot(headers);
+    }
+}
+
 impl BufferedInitialResponseHeaderPolicyState {
     /// Build state from cache-prefiltered policy names. Returns `None` when no
     /// initial-response policy is configured, leaving ordinary buffered paths
@@ -856,6 +965,10 @@ pub struct RequestContext {
     /// cheap; the live request uses `Arc::make_mut` after the clone is dropped.
     buffered_initial_response_header_policy_state:
         Option<Arc<BufferedInitialResponseHeaderPolicyState>>,
+    /// Backend/gateway response-header provenance used only when an absolute
+    /// gRPC deadline can replace an uncommitted buffered response.
+    buffered_deadline_response_header_provenance:
+        Option<Arc<BufferedDeadlineResponseHeaderProvenance>>,
     /// Client-visible HTTP flavor classified before any plugin hook can mutate
     /// request headers. Fault rejection shaping consults this fixed value so a
     /// transformer cannot add or remove native-gRPC semantics mid-pipeline.
@@ -1247,6 +1360,7 @@ impl RequestContext {
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
             buffered_initial_response_header_policy_state: None,
+            buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
             websocket_response_boundary: false,
             ai_semantic_cache_embedding: None,
@@ -1427,6 +1541,122 @@ impl RequestContext {
         self.buffered_initial_response_header_policy_state.take()
     }
 
+    /// Capture the pristine backend header map before trusted response hooks
+    /// execute. No state is allocated for requests without an absolute RPC
+    /// deadline.
+    pub(crate) fn begin_buffered_deadline_response_header_provenance(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        self.buffered_deadline_response_header_provenance = (self.grpc_deadline_at.is_some()
+            || self.gateway_deadline_response_selected)
+            .then(|| {
+                Arc::new(BufferedDeadlineResponseHeaderProvenance::backend_response(
+                    response_headers,
+                ))
+            });
+    }
+
+    pub(crate) fn ensure_buffered_deadline_response_header_provenance(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        if self.buffered_deadline_response_header_provenance.is_none() {
+            self.begin_buffered_deadline_response_header_provenance(response_headers);
+        }
+    }
+
+    /// Start a rejection response at the gateway provenance boundary. The
+    /// response did not come from a backend, so its plugin-produced fields are
+    /// provenance-known gateway output.
+    pub(crate) fn begin_rejection_deadline_response_header_provenance(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        self.buffered_deadline_response_header_provenance = (self.grpc_deadline_at.is_some()
+            || self.gateway_deadline_response_selected)
+            .then(|| {
+                Arc::new(BufferedDeadlineResponseHeaderProvenance::gateway_rejection(
+                    response_headers,
+                ))
+            });
+    }
+
+    /// Record the header result of one completed trusted gateway phase.
+    pub(crate) fn record_deadline_response_header_mutations(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        if let Some(state) = self
+            .buffered_deadline_response_header_provenance
+            .as_mut()
+        {
+            Arc::make_mut(state).record_gateway_mutations(&[], response_headers);
+        }
+    }
+
+    pub(crate) fn record_deadline_response_header_plugin(
+        &mut self,
+        plugin: &dyn Plugin,
+        response_headers: &HashMap<String, String>,
+    ) {
+        if self
+            .buffered_deadline_response_header_provenance
+            .is_none()
+        {
+            return;
+        }
+        let plugin_owned_headers = response_headers
+            .keys()
+            .filter(|name| plugin.owns_deadline_response_header(self, name))
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if let Some(state) = self
+            .buffered_deadline_response_header_provenance
+            .as_mut()
+        {
+            Arc::make_mut(state)
+                .record_gateway_mutations(&plugin_owned_headers, response_headers);
+        }
+    }
+
+    /// Rebuild a terminal deadline header map from provenance-known gateway
+    /// output plus the narrow `Vary: Origin` compatibility contract.
+    pub(crate) fn retain_deadline_response_gateway_headers(
+        &mut self,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if let Some(state) = self
+            .buffered_deadline_response_header_provenance
+            .as_mut()
+        {
+            Arc::make_mut(state).retain_gateway_output(response_headers);
+            return;
+        }
+        let preserve_origin_vary = response_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("vary")
+                && value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("origin"))
+        });
+        response_headers.clear();
+        if preserve_origin_vary {
+            response_headers.insert("vary".to_string(), "Origin".to_string());
+        }
+    }
+
+    pub(crate) fn sync_deadline_response_terminal_headers(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        if let Some(state) = self
+            .buffered_deadline_response_header_provenance
+            .as_mut()
+        {
+            Arc::make_mut(state).sync_terminal_headers(response_headers);
+        }
+    }
+
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
     /// transforms. The compressor's private staged representation and incoming
@@ -1492,6 +1722,7 @@ impl RequestContext {
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
             buffered_initial_response_header_policy_state: None,
+            buffered_deadline_response_header_provenance: None,
             request_http_flavor: self.request_http_flavor,
             websocket_response_boundary: self.websocket_response_boundary,
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
@@ -2548,7 +2779,9 @@ pub async fn normalize_response_body_for_inspection(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Vec<u8>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
+    ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
     let content_type = response_headers.get("content-type").cloned();
     let mut normalized = false;
     for plugin in plugins {
@@ -2574,7 +2807,7 @@ pub async fn normalize_response_body_for_inspection(
                     grpc_web_response_content_type,
                     response_headers,
                     response_body,
-                    &[],
+                    initial_response_header_policy_plugins,
                 );
                 normalized = true;
                 break;
@@ -2585,6 +2818,7 @@ pub async fn normalize_response_body_for_inspection(
             *response_body = body;
             normalized = true;
         }
+        ctx.record_deadline_response_header_mutations(response_headers);
     }
     normalized
 }
@@ -3870,6 +4104,14 @@ pub trait Plugin: Send + Sync {
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Return whether this hook authoritatively owns a response field even
+    /// when it writes the same bytes the backend supplied. Most plugins rely
+    /// on mutation tracking; request-aware decorators with configurable names
+    /// should opt in so an exact backend spoof cannot hide their write.
+    fn owns_deadline_response_header(&self, _ctx: &RequestContext, _name: &str) -> bool {
+        false
     }
 
     /// Returns `true` when this plugin defines deterministic response-header

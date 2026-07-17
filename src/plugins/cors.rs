@@ -734,6 +734,16 @@ impl Plugin for CorsPlugin {
     fn applies_after_proxy_on_reject(&self) -> bool {
         true
     }
+
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        !ctx.cors_state.defer_finalization
+            && ctx.cors_state.policy_count > 0
+            && ctx.cors_state.response_allowed
+            && ctx.metadata.contains_key("cors_origin")
+            && name
+                .get(.."access-control-".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("access-control-"))
+    }
 }
 
 /// Cache-internal boundary after a contiguous set of CORS instances.
@@ -776,6 +786,15 @@ impl Plugin for CorsFinalizer {
 
     fn applies_after_proxy_on_reject(&self) -> bool {
         true
+    }
+
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        ctx.cors_state.policy_count > 0
+            && ctx.cors_state.response_allowed
+            && ctx.metadata.contains_key("cors_origin")
+            && name
+                .get(.."access-control-".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("access-control-"))
     }
 }
 

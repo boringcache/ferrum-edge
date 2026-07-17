@@ -1155,10 +1155,17 @@ pub mod _test_support {
             "POST".to_string(),
             "/test.Service/Call".to_string(),
         );
+        ctx.set_grpc_deadline_budget(Some(1_000));
         let mut headers = HashMap::from([
             ("content-type".to_string(), "application/json".to_string()),
-            ("x-correlation-id".to_string(), "request-123".to_string()),
+            ("tracestate".to_string(), "backend=spoof".to_string()),
+            ("x-backend-secret".to_string(), "secret".to_string()),
+            ("set-cookie".to_string(), "session=secret".to_string()),
+            ("vary".to_string(), "Accept-Encoding, Origin".to_string()),
         ]);
+        ctx.begin_buffered_deadline_response_header_provenance(&headers);
+        headers.insert("x-correlation-id".to_string(), "request-123".to_string());
+        ctx.record_deadline_response_header_mutations(&headers);
         let mut body = b"backend response".to_vec();
         let http_status = crate::http3::server::replace_buffered_h3_response_with_grpc_deadline(
             &mut ctx,
@@ -1181,7 +1188,8 @@ pub mod _test_support {
 
     pub fn buffered_grpc_deadline_replacement_for_test(
         grpc_web_response_content_type: Option<&str>,
-        mut headers: HashMap<String, String>,
+        mut backend_headers: HashMap<String, String>,
+        gateway_headers: HashMap<String, String>,
         mut body: Vec<u8>,
     ) -> NormalizedRejectResponse {
         let mut ctx = crate::plugins::RequestContext::new(
@@ -1189,16 +1197,20 @@ pub mod _test_support {
             "POST".to_string(),
             "/test.Service/Call".to_string(),
         );
+        ctx.set_grpc_deadline_budget(Some(1_000));
+        ctx.begin_buffered_deadline_response_header_provenance(&backend_headers);
+        backend_headers.extend(gateway_headers);
+        ctx.record_deadline_response_header_mutations(&backend_headers);
         let http_status = crate::proxy::replace_buffered_grpc_response_with_deadline(
             &mut ctx,
             grpc_web_response_content_type,
-            &mut headers,
+            &mut backend_headers,
             &mut body,
             &[],
         );
         NormalizedRejectResponse {
             http_status,
-            headers,
+            headers: backend_headers,
             body,
             grpc_status: ctx
                 .metadata
@@ -1226,6 +1238,22 @@ pub mod _test_support {
         .await
     }
 
+    pub async fn run_after_proxy_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::run_after_proxy_hooks(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+        )
+        .await
+        .is_some()
+    }
+
     pub async fn transform_buffered_response_body_with_deadline_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -1234,7 +1262,7 @@ pub mod _test_support {
         response_body: &mut Vec<u8>,
         grpc_web_response_content_type: Option<&str>,
     ) -> bool {
-        crate::proxy::transform_buffered_response_body_with_deadline(
+        transform_buffered_response_body_with_deadline_and_policy_for_test(
             plugins,
             ctx,
             response_status,
@@ -1242,6 +1270,27 @@ pub mod _test_support {
             response_body,
             grpc_web_response_content_type,
             &[],
+        )
+        .await
+    }
+
+    pub async fn transform_buffered_response_body_with_deadline_and_policy_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut Vec<u8>,
+        grpc_web_response_content_type: Option<&str>,
+        initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    ) -> bool {
+        crate::proxy::transform_buffered_response_body_with_deadline(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            grpc_web_response_content_type,
+            initial_response_header_policy_plugins,
         )
         .await
         .0

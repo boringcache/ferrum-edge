@@ -13698,39 +13698,8 @@ pub(crate) async fn log_rejected_request_with_path(
     crate::plugins::log_with_mirror_before_buffered_response(plugins, summary, ctx).await;
 }
 
-/// Keep only known-safe response decorators when replacing an uncommitted
-/// response. The input can contain backend headers, so retaining unknown fields
-/// would risk forwarding sensitive metadata from the discarded response.
-/// `Vary: Origin` is retained explicitly as part of the CORS contract.
-fn retain_deadline_response_decorators(response_headers: &mut HashMap<String, String>) {
-    let preserve_origin_vary = response_headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("vary"))
-        .is_some_and(|(_, value)| {
-            value
-                .split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("origin"))
-        });
-    response_headers.retain(|name, _| {
-        [
-            "access-control-allow-credentials",
-            "access-control-allow-origin",
-            "access-control-expose-headers",
-            "strict-transport-security",
-            "timing-allow-origin",
-            "traceparent",
-            "tracestate",
-            "x-correlation-id",
-        ]
-        .iter()
-        .any(|decorator| name.eq_ignore_ascii_case(decorator))
-    });
-    if preserve_origin_vary {
-        response_headers.insert("vary".to_string(), "Origin".to_string());
-    }
-}
-
 fn replace_rejection_with_gateway_deadline(
+    ctx: &mut RequestContext,
     status_code: &mut u16,
     response_body: Option<&mut Vec<u8>>,
     response_headers: &mut HashMap<String, String>,
@@ -13739,16 +13708,14 @@ fn replace_rejection_with_gateway_deadline(
     if let Some(body) = response_body {
         body.clear();
     }
-    retain_deadline_response_decorators(response_headers);
-    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
-    response_headers.insert(
-        "grpc-status".to_string(),
-        GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER.to_string(),
+    ctx.retain_deadline_response_gateway_headers(response_headers);
+    grpc_proxy::finalize_grpc_error_response_headers(
+        response_headers,
+        grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+        GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+        &[],
     );
-    response_headers.insert(
-        "grpc-message".to_string(),
-        GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
-    );
+    ctx.sync_deadline_response_terminal_headers(response_headers);
 }
 
 const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -13852,6 +13819,7 @@ fn spawn_detached_rejection_cleanup(
             } = pending_hook.await;
             ctx.mark_gateway_deadline_response_selected();
             replace_rejection_with_gateway_deadline(
+                &mut ctx,
                 &mut status_code,
                 response_body.as_mut(),
                 &mut response_headers,
@@ -13889,6 +13857,7 @@ async fn run_after_proxy_hooks_on_rejection(
     mut response_body: Option<&mut Vec<u8>>,
     response_headers: &mut HashMap<String, String>,
 ) {
+    ctx.begin_rejection_deadline_response_header_provenance(response_headers);
     let previous_replaceable_marker = if response_body.is_some() {
         ctx.metadata.insert(
             REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY.to_string(),
@@ -13910,6 +13879,7 @@ async fn run_after_proxy_hooks_on_rejection(
     if initial_terminal_gateway_deadline {
         ctx.mark_gateway_deadline_response_selected();
         replace_rejection_with_gateway_deadline(
+            ctx,
             status_code,
             response_body.as_deref_mut(),
             response_headers,
@@ -13926,6 +13896,7 @@ async fn run_after_proxy_hooks_on_rejection(
         if terminal_gateway_deadline {
             ctx.mark_gateway_deadline_response_selected();
             replace_rejection_with_gateway_deadline(
+                ctx,
                 status_code,
                 response_body.as_deref_mut(),
                 response_headers,
@@ -13991,6 +13962,7 @@ async fn run_after_proxy_hooks_on_rejection(
                 () = &mut deadline_sleep => {
                     ctx.mark_gateway_deadline_response_selected();
                     replace_rejection_with_gateway_deadline(
+                        ctx,
                         status_code,
                         response_body.as_deref_mut(),
                         response_headers,
@@ -14027,6 +13999,11 @@ async fn run_after_proxy_hooks_on_rejection(
         };
         if terminal_gateway_deadline {
             ctx.mark_gateway_deadline_response_selected();
+        }
+        if matches!(&result, PluginResult::Continue)
+            || !plugin.may_replace_rejection_response()
+        {
+            ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
         }
         match result {
             PluginResult::Continue => {}
@@ -14090,6 +14067,7 @@ async fn run_after_proxy_hooks_on_rejection(
                             })
                             .or_insert_with(|| "Origin".to_string());
                     }
+                    ctx.record_deadline_response_header_mutations(response_headers);
                     if plugin.warn_on_rejection_response_replacement() {
                         warn!(
                             rejecting_plugin = plugin.name(),
@@ -14133,7 +14111,12 @@ async fn run_after_proxy_hooks_on_rejection(
             .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
     {
         ctx.mark_gateway_deadline_response_selected();
-        replace_rejection_with_gateway_deadline(status_code, response_body, response_headers);
+        replace_rejection_with_gateway_deadline(
+            ctx,
+            status_code,
+            response_body,
+            response_headers,
+        );
     }
 
     restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
@@ -14508,7 +14491,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             };
             if !terminal_gateway_deadline {
                 ctx.mark_gateway_deadline_response_selected();
-                replace_rejection_with_gateway_deadline(status, Some(body), headers);
+                replace_rejection_with_gateway_deadline(ctx, status, Some(body), headers);
             }
             spawn_detached_response_committed_hooks(
                 pending_hook,
@@ -14534,6 +14517,10 @@ pub(crate) async fn run_after_proxy_hooks(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
 ) -> Option<AfterProxyReject> {
+    // Establish backend provenance before the first trusted response hook can
+    // mutate the map. A later deadline replacement retains only mutations from
+    // hooks that completed, never backend fields selected by header name.
+    ctx.begin_buffered_deadline_response_header_provenance(response_headers);
     // Capture the genuine backend status BEFORE any after_proxy hook can reject
     // and replace the response. If a hook at a lower priority rejects a 2xx
     // backend response (e.g. `response_size_limiting` at 3490 rejecting an
@@ -14606,6 +14593,7 @@ pub(crate) async fn run_after_proxy_hooks(
                     plugin.as_ref(),
                     response_headers,
                 );
+                ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let RejectedResponseParts {
@@ -15093,7 +15081,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
     ctx.mark_gateway_deadline_response_selected();
-    retain_deadline_response_decorators(response_headers);
+    ctx.retain_deadline_response_gateway_headers(response_headers);
     if let Some(content_type) = grpc_web_response_content_type {
         let mut response = crate::plugins::grpc_web::error_response_for_content_type(
             content_type,
@@ -15117,6 +15105,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
         );
         response_body.clear();
     }
+    ctx.sync_deadline_response_terminal_headers(response_headers);
     insert_grpc_error_metadata(
         &mut ctx.metadata,
         grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -15137,6 +15126,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     grpc_web_response_content_type: Option<&str>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> (bool, bool) {
+    ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
     let content_type = response_headers.get("content-type").cloned();
     let content_type = content_type.as_deref();
     let mut body_transformed = false;
@@ -15171,6 +15161,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
             plugin.on_response_body_transformed(ctx, response_headers);
             body_transformed = true;
         }
+        ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
     }
     (false, body_transformed)
 }
@@ -20749,6 +20740,7 @@ async fn handle_proxy_request_inner(
                         response_status,
                         &mut plugin_response_headers,
                         &mut response_body,
+                        initial_response_header_policy_plugins.as_ref(),
                     )
                     .await;
                     for plugin in plugins.iter() {
@@ -22439,6 +22431,7 @@ async fn handle_proxy_request_inner(
             response_status,
             &mut response_headers,
             data,
+            initial_response_header_policy_plugins.as_ref(),
         )
         .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;

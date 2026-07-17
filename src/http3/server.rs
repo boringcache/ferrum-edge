@@ -6313,6 +6313,7 @@ async fn handle_h3_request(
                 response_status,
                 &mut response_headers,
                 &mut response_body,
+                initial_response_header_policy_plugins.as_ref(),
             )
             .await
             {

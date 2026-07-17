@@ -200,6 +200,16 @@ so policy replay cannot remove or replace it. This is also the path used after
 gRPC-Web binary or text response framing, so security policy cannot disappear
 with the native trailer map.
 
+When an absolute deadline instead replaces an uncommitted buffered response,
+the H3 native and cross-protocol paths use the same gateway-header provenance
+boundary as H1/H2. The pristine backend view is captured before response hooks;
+only output from completed gateway hooks (including configurable correlation
+fields), plus exact `Vary: Origin`, can cross into the terminal response.
+Backend-supplied safe-looking trace/CORS names, arbitrary metadata, cookies,
+credentials, and discarded-representation fields do not become trusted by
+name. Native gRPC and binary/text gRPC-Web framing are regenerated after this
+sanitation, then deterministic initial-response policy is reapplied.
+
 After route resolution, HTTP/3 method-filter errors and native-gRPC gateway
 errors (including request deadlines, size limits, backend unavailability, and
 mesh fail-closed responses) also apply the route's precomputed initial-response

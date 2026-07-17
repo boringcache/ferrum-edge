@@ -2741,6 +2741,7 @@ where
                     response_status,
                     &mut response_headers,
                     &mut response_body,
+                    initial_response_header_policy_plugins,
                 )
                 .await;
                 for plugin in plugins {
@@ -2780,6 +2781,10 @@ where
                         response_body = transformed;
                         plugin.on_response_body_transformed(ctx, &mut response_headers);
                     }
+                    ctx.record_deadline_response_header_plugin(
+                        plugin.as_ref(),
+                        &response_headers,
+                    );
                 }
 
                 for plugin in plugins {
@@ -4469,6 +4474,7 @@ where
                 response_status,
                 &mut plugin_response_headers,
                 &mut response_body,
+                initial_response_header_policy_plugins,
             )
             .await
             {
@@ -4554,6 +4560,10 @@ where
                     response_body = transformed;
                     plugin.on_response_body_transformed(ctx, &mut plugin_response_headers);
                 }
+                ctx.record_deadline_response_header_plugin(
+                    plugin.as_ref(),
+                    &plugin_response_headers,
+                );
             }
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
                 Arc::make_mut(policy_state)
