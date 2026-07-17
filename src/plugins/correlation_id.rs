@@ -44,6 +44,8 @@ const RESERVED_HEADER_NAMES: &[&str] = &[
     "x-csrf-token",
     "x-forwarded-authorization",
     "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
     "x-goog-api-key",
     "x-xsrf-token",
 ];

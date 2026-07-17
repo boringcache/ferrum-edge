@@ -2840,6 +2840,79 @@ async fn admin_rejects_custom_request_body_transformer_beside_hmac() {
 }
 
 #[tokio::test]
+async fn admin_rejects_custom_only_correlation_collision_before_persistence() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let batch = json!({
+        "proxies": [{
+            "id": "custom-correlation-proxy",
+            "listen_path": "/custom-correlation",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "custom-correlation-first"},
+                {"plugin_config_id": "custom-correlation-second"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "custom-correlation-first",
+                "plugin_name": "example_plugin",
+                "scope": "proxy",
+                "proxy_id": "custom-correlation-proxy",
+                "enabled": true,
+                "config": {"correlation_header_name": "x-custom-correlation-id"}
+            },
+            {
+                "id": "custom-correlation-second",
+                "plugin_name": "example_plugin",
+                "scope": "proxy",
+                "proxy_id": "custom-correlation-proxy",
+                "enabled": true,
+                "priority_override": 5001,
+                "config": {"correlation_header_name": " X-Custom-Correlation-ID "}
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+
+    assert_eq!(status, 400, "custom correlation collision was admitted: {body:?}");
+    assert!(
+        body.to_string()
+            .contains("duplicate effective header_name \"x-custom-correlation-id\""),
+        "unexpected custom correlation admission response: {body:?}"
+    );
+    for id in ["custom-correlation-first", "custom-correlation-second"] {
+        let (status, _, _) =
+            admin_get(&base_url, &format!("/plugins/config/{id}"), &token).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::NOT_FOUND,
+            "rejected custom correlation config {id} was persisted"
+        );
+    }
+    let (status, _, _) = admin_get(
+        &base_url,
+        "/proxies/custom-correlation-proxy",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "rejected custom correlation proxy was persisted"
+    );
+}
+
+#[tokio::test]
 async fn restore_rejects_hmac_request_body_transformer_before_delete() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

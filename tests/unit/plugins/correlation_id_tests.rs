@@ -118,6 +118,8 @@ fn test_constructor_rejects_protocol_managed_and_security_sensitive_header_names
         "X-CSRF-Token",
         "X-Forwarded-Authorization",
         "X-Forwarded-For",
+        "X-Forwarded-Host",
+        "X-Forwarded-Proto",
         "X-Goog-API-Key",
         "X-XSRF-Token",
     ] {

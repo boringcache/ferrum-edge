@@ -1803,6 +1803,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "Proxy-Authentication-Info"}),
         json!({"header_name": "Proxy-Authorization"}),
         json!({"header_name": "Proxy-Connection"}),
+        json!({"header_name": "X-Forwarded-Host"}),
+        json!({"header_name": " x-FORWARDED-proto "}),
         json!({"header_name": "Sec-WebSocket-Accept"}),
         json!({"header_name": "Sec-WebSocket-Extensions"}),
         json!({"header_name": "Sec-WebSocket-Key"}),

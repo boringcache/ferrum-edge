@@ -2155,13 +2155,18 @@ pub(crate) fn validate_plugin_composition_candidate(
         .plugin_configs
         .iter()
         .any(|plugin| plugin.enabled && plugin.plugin_name == "correlation_id");
-    if !has_hmac && !has_correlation {
+    let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
+    // A custom plugin's composition capabilities are known only after its
+    // registered factory constructs the Plugin implementation.
+    let has_custom_composition_candidate = config.plugin_configs.iter().any(|plugin| {
+        plugin.enabled && custom_plugin_names.contains(&plugin.plugin_name.as_str())
+    });
+    if !has_hmac && !has_correlation && !has_custom_composition_candidate {
         return Ok(());
     }
     let mut errors = Vec::new();
     let mut global_plugins = Vec::new();
     let mut scoped_plugins: CompositionPluginMap<'_> = HashMap::new();
-    let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let current_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();

@@ -5343,6 +5343,43 @@ fn test_same_correlation_header_on_disjoint_proxy_chains_is_allowed() {
 }
 
 #[test]
+fn test_custom_only_duplicate_effective_correlation_headers_are_rejected() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let first = make_plugin_config_with_json(
+        "custom-corr-first",
+        "example_plugin",
+        json!({"correlation_header_name": "x-custom-correlation-id"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let mut second = make_plugin_config_with_json(
+        "custom-corr-second",
+        "example_plugin",
+        json!({"correlation_header_name": " X-Custom-Correlation-ID "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second.priority_override = Some(5001);
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["custom-corr-first", "custom-corr-second"],
+        )],
+        vec![first, second],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("custom-only duplicate correlation headers must fail closed");
+    assert!(error.contains("duplicate effective header_name \"x-custom-correlation-id\""));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
 fn test_modifies_request_headers_flag_false_when_no_plugin_modifies() {
     // stdout_logging does not modify request headers
     let config = make_config(
