@@ -187,6 +187,17 @@ Use `FERRUM_DP_CP_GRPC_URLS` for both single-CP and multi-CP deployments.
 
 For multi-region high-availability patterns using this feature, see [Multi-Region High Availability](multi_region_ha.md).
 
+### Shared real-IP header ownership
+
+`FERRUM_REAL_IP_HEADER` is a cluster ownership setting in CP/DP deployments.
+Configure the same effective value on every CP and DP, including leaving it
+unset everywhere when no authoritative header is used. A DP advertises its
+effective value on `ConfigSync.Subscribe` and `GetFullConfig`; the CP rejects a
+missing or mismatched advertisement before returning configuration. This keeps
+CP admin admission for `correlation_id.header_name` aligned with the serving
+DP's client-attribution ownership and prevents partial fleet reloads. All CPs
+in a failover set must use the same value.
+
 ## Environment Variables
 
 ### Control Plane
@@ -204,6 +215,7 @@ For multi-region high-availability patterns using this feature, see [Multi-Regio
 | `FERRUM_DB_TYPE` | Yes | Database type (`postgres`, `mysql`, `sqlite`, or `mongodb`) |
 | `FERRUM_DB_URL` | Yes | Database connection URL |
 | `FERRUM_DB_POLL_INTERVAL` | No | Config poll interval in seconds (default: 30) |
+| `FERRUM_REAL_IP_HEADER` | No | Cluster-wide authoritative client-IP header; must match every DP and peer CP |
 
 ### Data Plane
 
@@ -221,6 +233,7 @@ For multi-region high-availability patterns using this feature, see [Multi-Regio
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the read-only Admin API |
 | `FERRUM_PROXY_HTTP_PORT` | No | HTTP proxy port (default: 8000). Set to `0` to disable the plaintext HTTP proxy listener |
 | `FERRUM_PROXY_HTTPS_PORT` | No | HTTPS proxy port (default: 8443) |
+| `FERRUM_REAL_IP_HEADER` | No | Cluster-wide authoritative client-IP header; must match every CP and peer DP |
 
 ## Example Deployment
 

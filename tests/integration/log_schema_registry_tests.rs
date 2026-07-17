@@ -52,6 +52,7 @@ fn fully_populated_http() -> TransactionSummary {
         bytes_received: 200,
         mirror: true,
         metadata: HashMap::from([("trace_id".to_string(), "abc".to_string())]),
+        ai_usage_export: None,
     }
 }
 

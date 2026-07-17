@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use ferrum_edge::plugins::ai_federation;
 use ferrum_edge::plugins::ai_federation::test_helpers;
+use ferrum_edge::plugins::ai_token_metrics::AiTokenMetrics;
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use ferrum_edge::{
@@ -4199,10 +4200,118 @@ async fn multimodal_reject_provider_falls_through_to_translate_provider() {
         other => panic!("expected fallback provider response (200), got {other:?}"),
     }
 
+    assert!(!ctx.metadata.contains_key("ai_usage_export"));
+    let export = ctx
+        .authoritative_ai_usage_export()
+        .expect("federation usage has typed export provenance");
+    assert_eq!(export.provider, "openai");
+    assert_eq!(export.prompt_tokens, Some(10));
+    assert_eq!(export.completion_tokens, Some(5));
+    assert_eq!(export.total_tokens, Some(15));
+    assert_eq!(
+        ctx.metadata.get("ai_provider").map(String::as_str),
+        Some("openai")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("10")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("15")
+    );
+
     // The image part was passed through to the openai-compatible provider.
     let outbound = first_received_json(&server).await;
     let content = outbound["messages"][0]["content"].as_array().unwrap();
     assert_eq!(content[1]["type"], "image_url");
+}
+
+#[tokio::test]
+async fn configured_token_metrics_rates_price_trusted_federation_usage_deterministically() {
+    let server = MockServer::start().await;
+    mount_openai_success(&server).await;
+    let federation = ai_federation::AiFederation::new(
+        &json!({"providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"],
+            "base_url": server.uri(),
+            "allow_plaintext": true
+        }]}),
+        create_test_http_client(),
+    )
+    .unwrap();
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let mut ctx = post_json_ctx(&request);
+    let result = run_federation_final_body(&federation, &mut ctx, &json_headers()).await;
+    let response_body = match result {
+        PluginResult::RejectBinary {
+            status_code: 200,
+            body,
+            ..
+        } => body,
+        other => panic!("expected federated success, got {other:?}"),
+    };
+
+    let zeta = AiTokenMetrics::new(&json!({
+        "metadata_prefix": "zeta",
+        "cost_per_prompt_token": 0.02,
+        "cost_per_completion_token": 0.04
+    }))
+    .unwrap();
+    let alpha = AiTokenMetrics::new(&json!({
+        "metadata_prefix": "alpha",
+        "cost_per_prompt_token": 0.01,
+        "cost_per_completion_token": 0.02
+    }))
+    .unwrap();
+    let mismatched = AiTokenMetrics::new(&json!({
+        "provider": "anthropic",
+        "metadata_prefix": "mismatched",
+        "cost_per_prompt_token": 1.0,
+        "cost_per_completion_token": 1.0
+    }))
+    .unwrap();
+    ctx.metadata.insert(
+        "ferrum:synthetic_short_circuit".to_string(),
+        "true".to_string(),
+    );
+    for metrics in [&zeta, &mismatched, &alpha] {
+        metrics
+            .on_response_body(&mut ctx, 200, &json_headers(), &response_body)
+            .await;
+    }
+
+    assert_eq!(
+        ctx.metadata.get("zeta_estimated_cost").map(String::as_str),
+        Some("0.400000")
+    );
+    assert_eq!(
+        ctx.metadata.get("alpha_estimated_cost").map(String::as_str),
+        Some("0.200000")
+    );
+    assert!(!ctx.metadata.contains_key("mismatched_estimated_cost"));
+    let export = ctx
+        .authoritative_ai_usage_export()
+        .expect("federation usage must remain typed and priceable");
+    assert_eq!(export.prefix.as_ref(), "alpha");
+    assert_eq!(export.provider, "openai");
+    assert_eq!(export.prompt_tokens, Some(10));
+    assert_eq!(export.completion_tokens, Some(5));
+    let cost = export
+        .cost
+        .expect("configured rates must price federation usage");
+    assert_eq!(cost.microunits, 200_000);
+    assert_eq!(cost.submicrounits, 0);
 }
 
 #[tokio::test]
