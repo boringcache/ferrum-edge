@@ -31,8 +31,12 @@ fn h3_final_body_rejects_use_complete_synthetic_response_pipeline() {
     let request_scoped_gate = src
         .find("let has_terminal_body_dispatch = capabilities")
         .expect("H3 terminal dispatch must retain a request-scoped applicability gate");
-    let early_dispatch = src
+    let dispatch_marker = src
+        .find("// Terminal final-body hooks may perform provider egress.")
+        .expect("H3 terminal final-body dispatch boundary must remain present");
+    let early_dispatch = src[dispatch_marker..]
         .find("if final_body_before_backend_dispatch {")
+        .map(|offset| dispatch_marker + offset)
         .expect("H3 terminal final-body dispatch gate must remain present");
     let applicability = &src[request_scoped_gate..early_dispatch];
     assert!(applicability.contains("if let Some(transformed_headers)"));
@@ -43,7 +47,7 @@ fn h3_final_body_rejects_use_complete_synthetic_response_pipeline() {
         .find("let raw_request_body_bytes = body_data.len() as u64;")
         .expect("H3 early request-body finalization must remain present");
     let early_end = src[early_start..]
-        .find("// --- Upstream target selection and circuit breaker ---")
+        .find("let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();")
         .map(|offset| early_start + offset)
         .expect("H3 early finalization boundary must remain present");
     let early = &src[early_start..early_end];
@@ -145,10 +149,10 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
     assert!(content_length_fast_path.contains("&rejection.headers"));
 
     let terminal_dispatch = src
-        .split("// Provider-dispatch plugins synthesize the complete response")
+        .split("// Terminal final-body hooks may perform provider egress.")
         .nth(1)
         .expect("H3 terminal provider dispatch must remain present")
-        .split("// --- Upstream target selection and circuit breaker ---")
+        .split("let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();")
         .next()
         .expect("H3 terminal provider dispatch must remain bounded");
     assert!(terminal_dispatch.contains("collect_h3_request_body_with_deadline("));

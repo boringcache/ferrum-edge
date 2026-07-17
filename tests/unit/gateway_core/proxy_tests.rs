@@ -10,7 +10,7 @@ use ferrum_edge::router_cache::RouterCache;
 use std::collections::HashMap;
 
 #[test]
-fn terminal_final_body_dispatch_precedes_backend_breaker_and_transport() {
+fn terminal_final_body_dispatch_follows_path_policy_and_precedes_backend_breaker() {
     let src = include_str!("../../../src/proxy/mod.rs");
     let request_scoped_gate = src
         .find("let has_terminal_body_dispatch = capabilities")
@@ -18,6 +18,21 @@ fn terminal_final_body_dispatch_precedes_backend_breaker_and_transport() {
     let terminal_dispatch = src
         .find("if final_body_before_backend_dispatch {")
         .expect("terminal final-body dispatch gate must remain present");
+    let selection = src
+        .find("let selection = backend_dispatch::select_upstream_target(")
+        .expect("selected-target lookup must remain present");
+    let path_policy = src[selection..]
+        .find("if backend_path_is_policy_bound {")
+        .map(|offset| selection + offset)
+        .expect("selected backend-path policy must remain present");
+    let routing_deferred = src[path_policy..terminal_dispatch]
+        .find("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .map(|offset| path_policy + offset)
+        .expect("routing-header deferred pass must remain present");
+    let remaining_deferred = src[routing_deferred..terminal_dispatch]
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .map(|offset| routing_deferred + offset)
+        .expect("remaining deferred pass must remain present");
     let breaker = src[terminal_dispatch..]
         .find("// Circuit breaker check")
         .map(|offset| terminal_dispatch + offset)
@@ -47,6 +62,10 @@ fn terminal_final_body_dispatch_precedes_backend_breaker_and_transport() {
     assert!(helper.contains("plugin.requires_final_request_body_before_backend_dispatch()"));
     assert!(provider_hook < synthetic_pipeline);
     assert!(request_scoped_gate < terminal_dispatch);
+    assert!(selection < path_policy);
+    assert!(path_policy < routing_deferred);
+    assert!(routing_deferred < remaining_deferred);
+    assert!(remaining_deferred < terminal_dispatch);
     assert!(terminal_dispatch < breaker);
     assert!(breaker < backend_transport);
 }
@@ -474,26 +493,36 @@ fn test_final_request_body_rejects_are_gateway_local_terminal_outcomes() {
 #[test]
 fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     let source = include_str!("../../../src/proxy/mod.rs");
-    let path_policy = source
-        .rfind("if let Some(response) = run_backend_path_plugins_or_build_reject(")
+    let handler_start = source
+        .find("async fn handle_proxy_request_inner(")
+        .expect("H1/H2 request handler must remain present");
+    let handler = &source[handler_start..];
+    let path_policy = handler
+        .find("if let Some(response) = run_backend_path_plugins_or_build_reject(")
         .expect("backend-path policy hook must remain present");
-    let deferred = source
+    let deferred = handler
         .find("// Hooks that can dispatch external work or synthesize a terminal response")
         .expect("deferred before_proxy pass must remain present");
     assert!(path_policy < deferred);
     assert!(source.contains("BackendPathBeforeProxyPass::RoutingHeaderDeferred"));
-    assert!(source.contains("BackendPathPolicyPhase::Preview"));
-    assert!(source.contains("BackendPathPolicyPhase::Enforce"));
     assert!(
         !source.contains("backend_dispatch::upstream_selection_hash_key("),
-        "an external deferred hook must not reselect an unpreviewed target"
+        "an external deferred hook must not reselect a different target"
     );
     assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
+    let routing_hook = handler
+        .find("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .expect("routing-header hook must remain present");
+    assert_eq!(
+        handler[path_policy..routing_hook]
+            .matches("run_backend_path_plugins_or_build_reject(")
+            .count(),
+        1,
+        "H1/H2 must enforce policy exactly once on the pinned path"
+    );
     assert!(
-        !source.contains(
-            "if !matches!(deferred_result, PluginResult::Continue) {\n            break;"
-        ),
-        "a deferred routing-hook rejection must still reach final method enforcement"
+        path_policy < routing_hook,
+        "stateful path policy must reject before deferred external work"
     );
 
     let mirror = include_str!("../../../src/plugins/request_mirror.rs");
@@ -624,7 +653,7 @@ fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
     );
     assert!(
         !after_routing_hook[..remaining_hook].contains("select_upstream_target("),
-        "deferred headers must not steer the request to an unpreviewed target"
+        "deferred headers must not steer the request to a different target"
     );
 
     let remaining_hook = routing_hook + remaining_hook;

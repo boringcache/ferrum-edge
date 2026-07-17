@@ -38,9 +38,9 @@ use crate::plugins::{
 // ---------------------------------------------------------------------------
 
 use crate::plugins::{
-    BackendPathPolicyPhase, PluginResult, RequestContext, ResponseStreamInspector,
-    StreamConnectionContext, StreamTransactionSummary, TransactionSummary, UdpDatagramContext,
-    UdpDatagramVerdict, WebSocketFrameDirection,
+    PluginResult, RequestContext, ResponseStreamInspector, StreamConnectionContext,
+    StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
+    WebSocketFrameDirection,
 };
 use async_trait::async_trait;
 
@@ -348,11 +348,8 @@ impl Plugin for PriorityOverridePlugin {
         &self,
         ctx: &mut RequestContext,
         backend_path: &str,
-        phase: BackendPathPolicyPhase,
     ) -> PluginResult {
-        self.inner
-            .on_backend_path_resolved(ctx, backend_path, phase)
-            .await
+        self.inner.on_backend_path_resolved(ctx, backend_path).await
     }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();

@@ -2,8 +2,8 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → backend-path policy preview → deferred routing-header hooks →
-//! final backend-path enforcement → remaining deferred `before_proxy` hooks →
+//! `before_proxy` → backend-path policy enforcement →
+//! deferred routing-header hooks → remaining deferred `before_proxy` hooks →
 //! `transform_request_body` →
 //! `on_final_request_body` → `backend_admission` → `after_proxy` →
 //! `normalize_response_body` → `on_response_body` →
@@ -164,19 +164,6 @@ pub enum ProxyProtocol {
     Tcp,
     /// Raw UDP datagram proxy (includes DTLS termination/origination)
     Udp,
-}
-
-/// Whether a backend-effective path policy hook is validating a provisional
-/// selection or enforcing the final selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendPathPolicyPhase {
-    /// Validate access rules before a deferred routing hook performs external
-    /// work. Stateful policy such as rate limiting must not be charged here.
-    Preview,
-    /// Enforce the settled backend-effective path immediately before the
-    /// remaining deferred hooks, a deferred-hook rejection, or backend
-    /// dispatch. Stateful policy is committed exactly once in this phase.
-    Enforce,
 }
 
 /// All protocol variants, for plugins that support every protocol.
@@ -3750,9 +3737,9 @@ pub trait Plugin: Send + Sync {
 
     /// Returns `true` when a deferred `before_proxy` hook can mutate headers
     /// that normally participate in upstream target selection. The gateway
-    /// runs these hooks in a separate deferred subphase after an access preview
-    /// and pins that previewed target across the external call; the returned
-    /// headers cannot steer this request onto an unpreviewed path.
+    /// runs these hooks in a separate deferred subphase after backend-path
+    /// enforcement and pins the authorized target across the external call;
+    /// the returned headers cannot steer this request onto a different path.
     fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
         false
     }
@@ -3768,17 +3755,14 @@ pub trait Plugin: Send + Sync {
 
     /// Called after the backend-effective path has been assembled from the
     /// route override, listen-path stripping, proxy/backend path, and selected
-    /// upstream target path, but before any backend is dialed.
-    ///
-    /// When a deferred hook can mutate routing headers, `Preview` runs before
-    /// that hook and `Enforce` runs afterward against the same pinned target.
-    /// Otherwise only `Enforce` runs. Implementations must keep `Preview` free
-    /// of state-consuming effects such as rate-limit charges.
+    /// upstream target path. The selected target is pinned and this hook runs
+    /// exactly once before deferred external/synthetic hooks or backend dial,
+    /// so implementations may safely commit stateful policy such as rate-limit
+    /// charges here.
     async fn on_backend_path_resolved(
         &self,
         _ctx: &mut RequestContext,
         _backend_path: &str,
-        _phase: BackendPathPolicyPhase,
     ) -> PluginResult {
         PluginResult::Continue
     }
@@ -4232,7 +4216,9 @@ pub trait Plugin: Send + Sync {
 
     /// Returns true when the final request-body hook is a terminal dispatch
     /// boundary and must run before backend-only circuit-breaker, egress,
-    /// admission, pool, or TLS work.
+    /// admission, pool, or TLS work. When backend-path policy is active, the
+    /// selected path is authorized and deferred `before_proxy` hooks finish
+    /// before this terminal hook may perform external dispatch.
     ///
     /// This is narrower than [`Plugin::needs_final_request_body_context`]. It
     /// is intended for plugins such as provider federators that consume the
