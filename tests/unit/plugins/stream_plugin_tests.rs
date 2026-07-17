@@ -816,11 +816,17 @@ async fn udp_and_dtls_disconnect_summaries_restore_correlation_after_datagram_me
             summary.protocol
         );
         assert_eq!(
-            summary.metadata.get("stream_connect_metadata").map(String::as_str),
+            summary
+                .metadata
+                .get("stream_connect_metadata")
+                .map(String::as_str),
             Some("connect-value")
         );
         assert_eq!(
-            summary.metadata.get("datagram_metadata").map(String::as_str),
+            summary
+                .metadata
+                .get("datagram_metadata")
+                .map(String::as_str),
             Some("retained-value")
         );
     }

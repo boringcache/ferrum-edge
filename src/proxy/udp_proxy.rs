@@ -612,10 +612,8 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let metadata = finalize_stream_summary_metadata(
-        writable_metadata,
-        &context.session.correlation_ids,
-    );
+    let metadata =
+        finalize_stream_summary_metadata(writable_metadata, &context.session.correlation_ids);
 
     StreamTransactionSummary {
         namespace: context.namespace.to_string(),
