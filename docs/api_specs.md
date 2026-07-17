@@ -245,7 +245,7 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 
 ## Atomicity and retries
 
-**SQL backends (PostgreSQL, MySQL, SQLite)**: `POST /api-specs` and `PUT /api-specs/{id}` execute within a single database transaction. Either all resources are created/replaced or none are (full rollback on error). Late `DELETE` compensation uses the same transaction boundary for the upstream, proxy, spec-owned plugins, hand-owned plugins removed by the proxy cascade, proxy/plugin junction rows, API-spec row, and every runtime config-change record.
+**SQL backends (PostgreSQL, MySQL, SQLite)**: `POST /api-specs` and `PUT /api-specs/{id}` execute within a single database transaction. Either all resources are created/replaced or none are (full rollback on error). Normal submissions retain the shared namespace admission contract used by ordinary resource writes, so unrelated invalid-but-present plugin associations do not block an otherwise valid spec submission needed for in-band repair. Late `DELETE` compensation uses the same transaction boundary for the upstream, proxy, spec-owned plugins, hand-owned plugins removed by the proxy cascade, proxy/plugin junction rows, API-spec row, and every runtime config-change record, and additionally validates the complete restored proxy/plugin graph before commit.
 
 **MongoDB with a replica set**: late `DELETE` compensation uses one multi-document transaction with the same all-or-nothing graph and config-change boundary as SQL.
 

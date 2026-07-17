@@ -6671,8 +6671,20 @@ impl DatabaseStore {
 
         // 4. INSERT api_specs row.
         self.insert_api_spec_tx(&mut tx, spec).await?;
-        self.validate_api_spec_restore_candidate_tx(&mut tx, &spec.namespace)
-            .await?;
+        if compensation_restore {
+            self.validate_api_spec_restore_candidate_tx(&mut tx, &spec.namespace)
+                .await?;
+        } else {
+            // Preserve the normal submission contract: ordinary API-spec
+            // writes run the same guarded admission checks as the other
+            // resource writers, but must remain available to repair an
+            // unrelated invalid-but-present plugin graph. Compensation is
+            // stricter because it must prove that the graph being restored
+            // cannot publish the recovered proxy with the wrong plugin
+            // instance or association.
+            self.validate_namespace_admission_tx(&mut tx, &spec.namespace)
+                .await?;
+        }
         if let Some(u) = &bundle.upstream {
             self.record_config_change_tx(&mut tx, &u.namespace, "upstream", &u.id, "upsert")
                 .await?;

@@ -358,6 +358,71 @@ async fn submit_bundle_proxy_only() {
     assert_eq!(fetched.proxy_id, proxy_id);
 }
 
+#[tokio::test]
+async fn submit_bundle_remains_available_with_unrelated_malformed_plugin_association() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let plugin_target_proxy_id = uid("submit-repair-target");
+    let wrong_association_proxy_id = uid("submit-repair-wrong-association");
+    let malformed_plugin_id = uid("submit-repair-plugin");
+
+    store
+        .create_proxy(&make_proxy(&plugin_target_proxy_id, ns))
+        .await
+        .expect("seed plugin target proxy failed");
+    store
+        .create_proxy(&make_proxy(&wrong_association_proxy_id, ns))
+        .await
+        .expect("seed wrongly associated proxy failed");
+    store
+        .create_plugin_config(&make_plugin(
+            &malformed_plugin_id,
+            &plugin_target_proxy_id,
+            ns,
+            None,
+        ))
+        .await
+        .expect("seed proxy-scoped plugin failed");
+    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
+        .bind(&wrong_association_proxy_id)
+        .bind(&malformed_plugin_id)
+        .execute(&store.pool())
+        .await
+        .expect("seed out-of-band malformed association failed");
+
+    let proxy_id = uid("submit-repair-new-proxy");
+    let spec_id = uid("submit-repair-new-spec");
+    let bundle = ExtractedBundle {
+        proxy: make_proxy(&proxy_id, ns),
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        b"valid submission beside malformed plugin state",
+    );
+
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("ordinary API-spec submit must remain available for in-band repair");
+
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_some());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_some());
+    let malformed_association_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?",
+    )
+    .bind(&wrong_association_proxy_id)
+    .bind(&malformed_plugin_id)
+    .fetch_one(&store.pool())
+    .await
+    .expect("count malformed association failed");
+    assert_eq!(malformed_association_count, 1);
+}
+
 // ---------------------------------------------------------------------------
 // submit_api_spec_bundle — rollback on duplicate
 // ---------------------------------------------------------------------------
