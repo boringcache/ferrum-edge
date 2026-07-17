@@ -1467,7 +1467,7 @@ fn federation_provider_aliases_use_bounded_ai_metric_families() {
         let mut summary = make_summary(&format!("federation-{index}"), "POST", 200, 1.0, 1.0);
         summary.ai_usage_export = Some(AiUsageExport {
             prefix: Arc::from("ai"),
-            provider: *raw_provider,
+            provider: raw_provider,
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: Some(1),
