@@ -571,7 +571,7 @@ pub(crate) async fn handle_h3_websocket(
     backend_url: String,
     query_string: String,
     proxy_headers: HashMap<String, String>,
-    requires_ws_frame_hooks: bool,
+    requires_websocket_framing: bool,
     is_early_data: bool,
     strip_len: usize,
     backend_path_is_policy_bound: bool,
@@ -1394,15 +1394,8 @@ pub(crate) async fn handle_h3_websocket(
     }));
 
     // ── Collect parsed-relay and disconnect plugin lists ────────────
-    let ws_frame_plugins: Vec<Arc<dyn Plugin>> = if requires_ws_frame_hooks {
-        plugins
-            .iter()
-            .filter(|p| p.requires_websocket_framing())
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let (ws_framing_plugins, ws_frame_plugins) =
+        crate::proxy::collect_websocket_relay_plugins(&plugins, requires_websocket_framing);
     let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = plugins
         .iter()
         .filter(|p| p.requires_ws_disconnect_hooks())
@@ -1437,6 +1430,7 @@ pub(crate) async fn handle_h3_websocket(
         backend_ws_stream,
         &proxy_id_for_relay,
         ws_conn_id,
+        ws_framing_plugins,
         ws_frame_plugins,
         ws_disconnect_plugins,
         session_meta,

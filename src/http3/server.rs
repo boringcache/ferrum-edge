@@ -3674,7 +3674,7 @@ async fn handle_h3_request(
             }
         }
 
-        let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
+        let requires_websocket_framing = plugin_cache_view.requires_ws_frame_hooks();
         // Transfer request-side accounting to the H3 WebSocket bridge. The
         // bridge starts its long-lived `ConnectionGuard` before dropping this
         // `RequestGuard`, so backend handshakes stay visible to overload
@@ -3705,7 +3705,7 @@ async fn handle_h3_request(
             backend_url,
             effective_query_string.to_string(),
             proxy_headers,
-            requires_ws_frame_hooks,
+            requires_websocket_framing,
             is_early_data,
             strip_len,
             backend_path_is_policy_bound,

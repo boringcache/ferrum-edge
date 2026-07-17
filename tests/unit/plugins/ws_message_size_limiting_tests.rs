@@ -5,6 +5,7 @@ use ferrum_edge::plugins::{
     Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection, priority,
 };
 use serde_json::json;
+use std::sync::Arc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 #[test]
@@ -53,6 +54,23 @@ fn test_supported_protocols_and_frame_parser_opt_in() {
         "parser policy must not require the post-reassembly message hook"
     );
     assert!(plugin.requires_websocket_framing());
+}
+
+#[test]
+fn test_parser_only_plugin_is_excluded_from_message_hook_list() {
+    let plugin: Arc<dyn Plugin> = Arc::new(
+        WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 1024})).unwrap(),
+    );
+    let (framing_plugins, frame_plugins) =
+        ferrum_edge::_test_support::websocket_relay_plugin_names_for_test(&[plugin], true);
+    assert_eq!(
+        framing_plugins,
+        vec!["ws_message_size_limiting".to_string()]
+    );
+    assert!(
+        frame_plugins.is_empty(),
+        "parser-only policy must not enter the per-message hook loop"
+    );
 }
 
 #[test]

@@ -610,6 +610,27 @@ pub mod _test_support {
         crate::proxy::publish_ws_policy_close(policy_close, cancel, close)
     }
 
+    /// Report the production parser-policy and post-reassembly hook lists.
+    pub fn websocket_relay_plugin_names_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        requires_websocket_framing: bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let (framing_plugins, frame_plugins) = crate::proxy::collect_websocket_relay_plugins(
+            plugins,
+            requires_websocket_framing,
+        );
+        (
+            framing_plugins
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+            frame_plugins
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+        )
+    }
+
     /// Variant of `connect_websocket_backend_for_test` that returns the
     /// negotiated `Sec-WebSocket-Protocol` value alongside the stream so
     /// tests can assert that the backend's chosen subprotocol survives the

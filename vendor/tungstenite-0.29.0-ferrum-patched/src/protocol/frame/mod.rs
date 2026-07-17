@@ -212,7 +212,7 @@ impl FrameCodec {
                     if len > max_size
                         && !matches!(header.opcode, OpCode::Control(Control::Close))
                     {
-                        return Err(Error::Capacity(CapacityError::MessageTooLong {
+                        return Err(Error::Capacity(CapacityError::FrameTooLong {
                             size: len,
                             max_size,
                         }));
@@ -392,7 +392,7 @@ mod tests {
         let mut sock = FrameSocket::new(raw);
         assert!(matches!(
             sock.read(Some(5)),
-            Err(Error::Capacity(CapacityError::MessageTooLong { size: 7, max_size: 5 }))
+            Err(Error::Capacity(CapacityError::FrameTooLong { size: 7, max_size: 5 }))
         ));
     }
 }

@@ -116,7 +116,7 @@ b3f8369b474af3e73ae544dae200e5634c45f84a62788c7d6ce50d2eefc8dd1e  vendor/tokio-t
 1a3c9595145c913a4b29a7ff3fc8caaea171b1946e96243edb280986b6eb6172  vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/stream.rs
 ede833940750523f43aecad570e38d9b21de8e4128c8efc3f5e8900116d7c211  vendor/tokio-tungstenite-0.29.0-ferrum-patched/src/tls.rs
 6a87c272eaced3a6db1d4a1b1f63bbfe9052ff5a0e8dc52aec3765b65c7dfc38  vendor/tokio-tungstenite-0.29.0-ferrum-patched/tests/into_inner_with_read_buffer.rs
-371199a4bc591b335922dab6adb05aa69969dcde6eb474608b53a35d0882f46a  vendor/tungstenite-0.29.0-ferrum-patched/CHANGELOG.md
+d79ec062426dba999ee37bd09ffac1e8fd2b3f11de6b0bc59406495ab82cecd6  vendor/tungstenite-0.29.0-ferrum-patched/CHANGELOG.md
 71403686d95f9b517c04a3c7d50434613bcab363303fce427b1064184e597811  vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml
 a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2  vendor/tungstenite-0.29.0-ferrum-patched/LICENSE-APACHE
 7fea0ee51a4ca5d5cea7464135fd55e8b09caf3a61da3d451ac8a22af95c033f  vendor/tungstenite-0.29.0-ferrum-patched/LICENSE-MIT
@@ -133,7 +133,7 @@ fe732374176dfe4e5d1f36a3fa09d6d6e3cc95885e920480ef5bcd94206835e0  vendor/tungste
 77a9fcbf8f7e97d45407c10848772e7aeca86430ade6458485977adda4ca127c  vendor/tungstenite-0.29.0-ferrum-patched/examples/srv_accept_unmasked_frames.rs
 0b3b99d4c041fbeca72d1cf41706cd07ca9f7bd4caa37acf524f2cd6ba156c30  vendor/tungstenite-0.29.0-ferrum-patched/src/buffer.rs
 b8623d8132368d49b6f0ea0cfaf27f6141bb5c6c70132ab5928c8c56e7113637  vendor/tungstenite-0.29.0-ferrum-patched/src/client.rs
-f735a45a876d30212274cb92ee8239ccd8dda644737e0c026464f31c2150dda4  vendor/tungstenite-0.29.0-ferrum-patched/src/error.rs
+582e05e0a09e1f13e79b2b8f255c55f426a515185f44442a2751539db8b0cabd  vendor/tungstenite-0.29.0-ferrum-patched/src/error.rs
 de10261830df421a9a624633c8858eef054c52969b1b2e60f04ed79425003dd5  vendor/tungstenite-0.29.0-ferrum-patched/src/handshake/client.rs
 0e6d3e15faa8b82bd2a239f5094335368e578acef2f17ee74825de606f529b75  vendor/tungstenite-0.29.0-ferrum-patched/src/handshake/headers.rs
 54a82a2643682e2ae17a98e69dcfa8ad10761919ea42f696551970057a428420  vendor/tungstenite-0.29.0-ferrum-patched/src/handshake/machine.rs
@@ -143,7 +143,7 @@ fe625e5455a1dfd2f8f83fb67cc791094c59969331655cab01633c204fd94eb0  vendor/tungste
 88b62c0bbce91edc9aea625889cfcb15b7e7c9b3fae00a31cbdae5b6aae1dde6  vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/frame/coding.rs
 36897ee772b3bf527614751c43d19ee94e95b32fb644cf4e1409587c021ee15a  vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/frame/frame.rs
 60347b95fd65e369d8376c98d62f1e80232e83be1341e2d30c1fad0ead0278f6  vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/frame/mask.rs
-a57725fe0d17d271c39a793067f0d1e71982346b8a8b08d3589f07c1652d2530  vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/frame/mod.rs
+3f5b484053cac7ca0208429a58bc3a4a6a182242c4690a2ccaf170f21a667dfb  vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/frame/mod.rs
 99f032fefcbf8a823bcef910cf66bcb7288bf7e7844b1610127c1f32ea35a886  vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/frame/utf8.rs
 0d6b0b03d61e3c9add69d83874eb9fb7e4222bd880cf34b02391f74e6c3bd45b  vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/message.rs
 4cc30dded48da89ca446fbb8070d53e24c35020473e39d354e6edd892f9a16a9  vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs

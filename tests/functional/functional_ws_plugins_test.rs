@@ -31,17 +31,21 @@ async fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// Start a WebSocket echo server on the given port.
+async fn bind_ws_backend_listener() -> (u16, TcpListener) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind WS backend");
+    let port = listener.local_addr().expect("WS backend local address").port();
+    (port, listener)
+}
+
+/// Start a WebSocket echo server on an already-bound listener.
 // The `Message::Ping(data)` arm consumes `data` (a `Bytes`) when forwarding
 // to `Message::Pong(data)`. Collapsing into a match guard is rejected by the
 // borrow checker (E0507) because variables bound in patterns cannot be moved
 // from inside a pattern guard.
 #[allow(clippy::collapsible_match)]
-async fn start_ws_echo_server(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .expect("Failed to bind WS echo server");
-
+async fn start_ws_echo_server(listener: TcpListener) {
     loop {
         if let Ok((stream, _addr)) = listener.accept().await {
             tokio::spawn(async move {
@@ -81,13 +85,9 @@ async fn start_ws_echo_server(port: u16) {
 }
 
 async fn start_ws_echo_server_recording_close(
-    port: u16,
+    listener: TcpListener,
     close_tx: mpsc::UnboundedSender<(CloseCode, String)>,
 ) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .expect("Failed to bind WS echo server");
-
     loop {
         let Ok((stream, _addr)) = listener.accept().await else {
             continue;
@@ -326,14 +326,13 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn test_ws_message_size_limiting_e2e() {
-    let backend_port = free_port().await;
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
 
     let (backend_close_tx, mut backend_close_rx) = mpsc::unbounded_channel();
     let echo_handle = tokio::spawn(start_ws_echo_server_recording_close(
-        backend_port,
+        backend_listener,
         backend_close_tx,
     ));
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -456,13 +455,12 @@ async fn test_ws_message_size_limiting_e2e() {
 #[ignore]
 #[tokio::test]
 async fn test_ws_message_size_limiting_backend_direction_and_instances_e2e() {
-    let backend_port = free_port().await;
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
     let (backend_close_tx, mut backend_close_rx) = mpsc::unbounded_channel();
     let echo_handle = tokio::spawn(start_ws_echo_server_recording_close(
-        backend_port,
+        backend_listener,
         backend_close_tx,
     ));
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -528,13 +526,12 @@ async fn test_ws_message_size_limiting_backend_direction_and_instances_e2e() {
 #[ignore]
 #[tokio::test]
 async fn test_ws_message_size_limiting_reassembly_bound_e2e() {
-    let backend_port = free_port().await;
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
     let (backend_close_tx, mut backend_close_rx) = mpsc::unbounded_channel();
     let echo_handle = tokio::spawn(start_ws_echo_server_recording_close(
-        backend_port,
+        backend_listener,
         backend_close_tx,
     ));
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -568,6 +565,37 @@ async fn test_ws_message_size_limiting_reassembly_bound_e2e() {
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("connect WebSocket");
+
+    // Equal numeric ceilings must still retain the parser check that fired.
+    // A single oversized wire frame uses the frame policy and its reason.
+    ws.send(Message::Frame(Frame::message(
+        vec![4u8; 51],
+        OpCode::Data(Data::Binary),
+        true,
+    )))
+    .await
+    .expect("send oversized single frame");
+    let close = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("frame-policy client close timed out")
+        .expect("client stream ended before frame-policy close")
+        .expect("frame-policy client close read failed");
+    let Message::Close(Some(close)) = close else {
+        panic!("client did not receive frame-policy close");
+    };
+    assert_eq!(close.code, CloseCode::Size);
+    assert_eq!(close.reason.as_str(), "frame limit");
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_close_rx.recv())
+            .await
+            .expect("frame-policy backend close timed out")
+            .expect("frame-policy backend close channel ended");
+    assert_eq!(backend_code, CloseCode::Size);
+    assert_eq!(backend_reason, "frame limit");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("reconnect WebSocket for reassembly policy");
 
     for (opcode, final_fragment) in [
         (OpCode::Data(Data::Binary), false),
@@ -614,10 +642,9 @@ async fn test_ws_message_size_limiting_reassembly_bound_e2e() {
 #[ignore]
 #[tokio::test]
 async fn test_ws_frame_logging_e2e() {
-    let backend_port = free_port().await;
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
 
-    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -675,10 +702,9 @@ async fn test_ws_frame_logging_e2e() {
 #[ignore]
 #[tokio::test]
 async fn test_ws_rate_limiting_e2e() {
-    let backend_port = free_port().await;
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
 
-    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -782,10 +808,9 @@ async fn test_ws_rate_limiting_e2e() {
 #[ignore]
 #[tokio::test]
 async fn test_ws_combined_plugins_e2e() {
-    let backend_port = free_port().await;
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
 
-    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");

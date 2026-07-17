@@ -8456,7 +8456,7 @@ async fn handle_websocket_request_authenticated(
     mesh_inbound_pre_handshake_app_port: Option<u16>,
     cb_target_key: Option<String>,
     cb_is_half_open_probe: bool,
-    requires_ws_frame_hooks: bool,
+    requires_websocket_framing: bool,
     query_string: String,
     strip_len: usize,
     backend_path_is_policy_bound: bool,
@@ -9375,19 +9375,11 @@ async fn handle_websocket_request_authenticated(
             response
         });
 
-    // Collect plugins that require the parsed relay for parser policy or
-    // post-reassembly hooks. `plugins` was resolved from the request's
-    // plugin-cache snapshot, so the upgrade path does not reload the cache
-    // and risk mixing generations.
-    let ws_frame_plugins: Vec<Arc<dyn Plugin>> = if requires_ws_frame_hooks {
-        plugins
-            .iter()
-            .filter(|p| p.requires_websocket_framing())
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Keep parser-policy plugins out of the post-reassembly hook loop. The
+    // lists come from the same request-cache snapshot, so neither path reloads
+    // the cache or risks mixing generations.
+    let (ws_framing_plugins, ws_frame_plugins) =
+        collect_websocket_relay_plugins(&plugins, requires_websocket_framing);
     // Collect disconnect-hook plugins separately. These fire exactly once at
     // session end instead of per-frame, so keeping them in their own list
     // avoids the per-frame filter cost paid by the frame-hook path.
@@ -9492,6 +9484,7 @@ async fn handle_websocket_request_authenticated(
                             handshake.stream,
                             &proxy_id,
                             ws_conn_id,
+                            ws_framing_plugins,
                             ws_frame_plugins,
                             ws_disconnect_plugins,
                             session_meta,
@@ -9517,6 +9510,7 @@ async fn handle_websocket_request_authenticated(
                             handshake.stream,
                             &proxy_id,
                             ws_conn_id,
+                            ws_framing_plugins,
                             ws_frame_plugins,
                             ws_disconnect_plugins,
                             session_meta,
@@ -10806,9 +10800,11 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 }
 
 /// `connection_id` — unique per-connection identifier for stateful frame plugins.
-/// `ws_frame_plugins` — plugins that require parsing for a parser-level policy
-/// or post-reassembly hook. Pass an empty `Vec` for zero-overhead forwarding
-/// when no plugin on this proxy needs WebSocket framing.
+/// `ws_framing_plugins` — plugins that require parsing for a parser-level
+/// policy or post-reassembly hook. Pass an empty `Vec` for zero-overhead
+/// forwarding when no plugin on this proxy needs WebSocket framing.
+/// `ws_frame_plugins` — the subset that opted into post-reassembly hooks.
+/// Parser-policy-only plugins must not enter the per-message loop.
 /// `ws_disconnect_plugins` — plugins that opted into end-of-session hooks by
 /// returning `true` from `requires_ws_disconnect_hooks()`. Pass an empty `Vec`
 /// to skip disconnect bookkeeping entirely.
@@ -10838,6 +10834,26 @@ pub(crate) struct EffectiveWsSizeLimits {
     pub(crate) max_message_bytes: usize,
     plugin_frame: Option<WsSizeLimitRule>,
     plugin_message: Option<WsSizeLimitRule>,
+}
+
+pub(crate) fn collect_websocket_relay_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    requires_websocket_framing: bool,
+) -> (Vec<Arc<dyn Plugin>>, Vec<Arc<dyn Plugin>>) {
+    if !requires_websocket_framing {
+        return (Vec::new(), Vec::new());
+    }
+    let framing_plugins: Vec<_> = plugins
+        .iter()
+        .filter(|plugin| plugin.requires_websocket_framing())
+        .cloned()
+        .collect();
+    let frame_plugins = framing_plugins
+        .iter()
+        .filter(|plugin| plugin.requires_ws_frame_hooks())
+        .cloned()
+        .collect();
+    (framing_plugins, frame_plugins)
 }
 
 impl EffectiveWsSizeLimits {
@@ -10899,33 +10915,24 @@ impl EffectiveWsSizeLimits {
         &self,
         error: &tokio_tungstenite::tungstenite::Error,
     ) -> Option<(CloseFrame, &'static str, usize, usize)> {
-        let (size, max_size) = match error {
-            tokio_tungstenite::tungstenite::Error::Capacity(
-                tokio_tungstenite::tungstenite::error::CapacityError::MessageTooLong {
-                    size,
-                    max_size,
-                },
-            ) => (*size, *max_size),
+        use tokio_tungstenite::tungstenite::Error;
+        use tokio_tungstenite::tungstenite::error::CapacityError;
+
+        let (size, max_size, rule, kind) = match error {
+            Error::Capacity(CapacityError::FrameTooLong { size, max_size }) => {
+                let rule = self.plugin_frame.as_ref().filter(|rule| {
+                    self.max_frame_bytes == *max_size && rule.max_bytes == *max_size
+                })?;
+                (*size, *max_size, rule, "frame")
+            }
+            Error::Capacity(CapacityError::MessageTooLong { size, max_size }) => {
+                let rule = self.plugin_message.as_ref().filter(|rule| {
+                    self.max_message_bytes == *max_size && rule.max_bytes == *max_size
+                })?;
+                (*size, *max_size, rule, "message")
+            }
             _ => return None,
         };
-        // Tungstenite reports both its pre-reservation frame check and its
-        // continuation-accumulation check through MessageTooLong. Prefer the
-        // active message rule when the effective ceilings are numerically
-        // equal: a frame exceeding that shared ceiling also violates the
-        // message policy, while valid bounded fragments can violate only the
-        // cumulative message rule. Inactive plugin rules were removed above,
-        // so a global-only rejection cannot inherit an unrelated reason.
-        let (rule, kind) = self
-            .plugin_message
-            .as_ref()
-            .filter(|rule| self.max_message_bytes == max_size && rule.max_bytes == max_size)
-            .map(|rule| (rule, "message"))
-            .or_else(|| {
-                self.plugin_frame
-                    .as_ref()
-                    .filter(|rule| self.max_frame_bytes == max_size && rule.max_bytes == max_size)
-                    .map(|rule| (rule, "frame"))
-            })?;
         Some((
             CloseFrame {
                 code: CloseCode::Size,
@@ -11260,6 +11267,7 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     backend_ws_stream: WebSocketStream<B>,
     proxy_id: &str,
     connection_id: u64,
+    ws_framing_plugins: Vec<Arc<dyn Plugin>>,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
     ws_disconnect_plugins: Vec<Arc<dyn Plugin>>,
     session_meta: WsSessionMeta,
@@ -11298,13 +11306,13 @@ where
     );
     let websocket_idle_timeout = ws_idle_tracker.as_ref().map(|tracker| tracker.timeout);
 
-    // When tunnel mode is enabled and no plugins need frame-level hooks, bypass
+    // When tunnel mode is enabled and no plugins need parsed framing, bypass
     // WebSocket frame parsing entirely and do raw TCP bidirectional copy. This
     // avoids per-frame header parsing, masking validation, and opcode dispatch —
     // critical for large frames (9 MB+). Trade-off: FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES
     // is not enforced, but data streams through a fixed-size copy buffer so there
     // is no large-allocation DoS risk.
-    if websocket_tunnel_mode && ws_frame_plugins.is_empty() {
+    if websocket_tunnel_mode && ws_framing_plugins.is_empty() {
         debug!(
             proxy_id = %proxy_id,
             connection_id,
@@ -11446,7 +11454,7 @@ where
 
     let effective_size_limits = Arc::new(EffectiveWsSizeLimits::from_plugins(
         max_websocket_frame_size_bytes,
-        &ws_frame_plugins,
+        &ws_framing_plugins,
     ));
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(effective_size_limits.max_frame_bytes);
@@ -18441,7 +18449,7 @@ async fn handle_proxy_request_inner(
                 ));
             }
         };
-        let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
+        let requires_websocket_framing = plugin_cache_view.requires_ws_frame_hooks();
         let websocket_proxy_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
         return handle_websocket_request_authenticated(
             request,
@@ -18465,7 +18473,7 @@ async fn handle_proxy_request_inner(
             mesh_inbound_pre_handshake_app_port,
             cb_target_key,
             cb_is_half_open_probe,
-            requires_ws_frame_hooks,
+            requires_websocket_framing,
             effective_query_string.to_string(),
             strip_len,
             backend_path_is_policy_bound,
