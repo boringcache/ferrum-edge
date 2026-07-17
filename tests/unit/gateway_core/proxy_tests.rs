@@ -1,8 +1,13 @@
 use chrono::Utc;
+use ferrum_edge::_test_support::{
+    apply_effective_backend_scheme_headers_for_test,
+    collect_forwardable_websocket_headers_for_test,
+};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, UpstreamTarget,
 };
 use ferrum_edge::proxy::client_ip::TrustedProxies;
+use ferrum_edge::proxy::headers::merge_proxy_headers_and_strip_for_grpc;
 use ferrum_edge::proxy::{
     apply_trusted_forwarded_request_scheme, build_backend_effective_path, build_backend_url,
     build_backend_url_with_target, normalize_request_authority_for_signing,
@@ -2583,8 +2588,12 @@ async fn test_auth_rejection_cookie_storage_key_allows_trusted_tls_termination()
     ctx.metadata
         .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
     let mut raw_headers = http::HeaderMap::new();
-    raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("http"));
+    raw_headers.append(
+        "x-forwarded-for",
+        http::HeaderValue::from_static("203.0.113.10, 10.0.0.7"),
+    );
     raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("https"));
+    raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("http"));
     ctx.set_raw_headers(raw_headers);
 
     let forwarded_scheme = apply_trusted_forwarded_request_scheme(&mut ctx, &socket_peer, &trusted);
@@ -2633,7 +2642,14 @@ async fn test_trusted_forwarded_http_overrides_tls_cookie_and_authority_scope() 
     ctx.metadata
         .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
     let mut raw_headers = http::HeaderMap::new();
-    raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("http"));
+    raw_headers.append(
+        "x-forwarded-for",
+        http::HeaderValue::from_static("203.0.113.10, 10.0.0.7"),
+    );
+    raw_headers.append(
+        "x-forwarded-proto",
+        http::HeaderValue::from_static("http, https"),
+    );
     ctx.set_raw_headers(raw_headers);
 
     let forwarded_scheme = apply_trusted_forwarded_request_scheme(&mut ctx, &socket_peer, &trusted);
@@ -2648,6 +2664,23 @@ async fn test_trusted_forwarded_http_overrides_tls_cookie_and_authority_scope() 
     assert_eq!(
         normalize_request_authority_for_signing("EXAMPLE.COM:80", forwarded_scheme),
         Some("example.com".to_string())
+    );
+    let mut backend_headers = HashMap::from([("host".to_string(), "example.com".to_string())]);
+    apply_effective_backend_scheme_headers_for_test(
+        &mut backend_headers,
+        "203.0.113.10",
+        ctx.request_is_secure,
+        true,
+    );
+    assert_eq!(
+        backend_headers
+            .get("x-forwarded-proto")
+            .map(String::as_str),
+        Some("http")
+    );
+    assert_eq!(
+        backend_headers.get("forwarded").map(String::as_str),
+        Some("for=203.0.113.10;proto=http;host=example.com")
     );
 
     let (_, _, headers) =
@@ -2707,6 +2740,89 @@ fn test_trusted_tls_termination_fails_closed_on_invalid_final_proto_field() {
             .get("ferrum.frontend_scheme")
             .map(String::as_str),
         Some("https")
+    );
+}
+
+#[test]
+fn test_effective_scheme_headers_remove_case_variants_for_websocket_and_grpc_collectors() {
+    let mut proxy_headers = HashMap::from([
+        ("host".to_string(), "api.example".to_string()),
+        ("X-Forwarded-Proto".to_string(), "plugin".to_string()),
+        ("x-FoRwArDeD-pRoTo".to_string(), "stale".to_string()),
+        ("Forwarded".to_string(), "for=plugin".to_string()),
+        ("fOrWaRdEd".to_string(), "for=stale".to_string()),
+    ]);
+    apply_effective_backend_scheme_headers_for_test(
+        &mut proxy_headers,
+        "203.0.113.8",
+        true,
+        true,
+    );
+
+    assert_eq!(
+        proxy_headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("x-forwarded-proto"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        proxy_headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("forwarded"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        proxy_headers.get("x-forwarded-proto").map(String::as_str),
+        Some("https")
+    );
+    assert_eq!(
+        proxy_headers.get("forwarded").map(String::as_str),
+        Some("for=203.0.113.8;proto=https;host=api.example")
+    );
+
+    let mut raw_headers = http::HeaderMap::new();
+    raw_headers.insert(
+        "x-forwarded-proto",
+        http::HeaderValue::from_static("raw-stale"),
+    );
+    raw_headers.insert("forwarded", http::HeaderValue::from_static("for=raw-stale"));
+
+    let websocket_headers =
+        collect_forwardable_websocket_headers_for_test(&raw_headers, &proxy_headers);
+    for (name, expected) in [
+        ("x-forwarded-proto", "https"),
+        (
+            "forwarded",
+            "for=203.0.113.8;proto=https;host=api.example",
+        ),
+    ] {
+        let matching: Vec<&str> = websocket_headers
+            .iter()
+            .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(matching, vec![expected], "WebSocket collector {name}");
+    }
+
+    let mut grpc_headers = raw_headers;
+    merge_proxy_headers_and_strip_for_grpc(&mut grpc_headers, &proxy_headers);
+    assert_eq!(
+        grpc_headers
+            .get_all("x-forwarded-proto")
+            .iter()
+            .map(|value| value.to_str().expect("valid generated gRPC XFP"))
+            .collect::<Vec<_>>(),
+        vec!["https"]
+    );
+    assert_eq!(
+        grpc_headers
+            .get_all("forwarded")
+            .iter()
+            .map(|value| value.to_str().expect("valid generated gRPC Forwarded"))
+            .collect::<Vec<_>>(),
+        vec!["for=203.0.113.8;proto=https;host=api.example"]
     );
 }
 

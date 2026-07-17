@@ -4,8 +4,8 @@
 //! TCP socket address (`remote_addr`) is the proxy's IP — not the real client's.
 //! This module resolves the true originating client IP from `X-Forwarded-For`
 //! (XFF) and recognizes the original HTTP or HTTPS scheme from
-//! `X-Forwarded-Proto`,
-//! but only when the direct peer belongs to the trusted-proxy set.
+//! `X-Forwarded-Proto`, but only when the direct peer belongs to the
+//! trusted-proxy set.
 //!
 //! # Security model
 //!
@@ -121,41 +121,85 @@ impl TrustedProxies {
     }
 }
 
-/// Return the HTTP-family client-facing scheme reported by a trusted direct
-/// proxy through `X-Forwarded-Proto`.
+/// Return the original HTTP-family client-facing scheme reported through a
+/// trusted proxy chain.
 ///
-/// The rightmost value represents the proxy nearest Ferrum when multiple
-/// field lines or comma-separated values are present. Empty, non-UTF-8, or
-/// unrecognized final values return `None`. Callers must never use this result
-/// for an untrusted socket peer because the header may then be client-controlled.
-pub fn trusted_forwarded_request_scheme<'a>(
+/// A singleton `X-Forwarded-Proto` value is the overwrite-only contract: the
+/// directly connected trusted proxy vouches for that original scheme. A
+/// multi-value list is accepted only when it has the same cardinality as the
+/// `X-Forwarded-For` list. Its scheme is selected at the first untrusted XFF
+/// entry found after walking the validated trusted suffix from right to left,
+/// so safely appended chains preserve the browser-facing value instead of the
+/// nearest hop's value. Malformed or misaligned trusted suffixes return `None`.
+/// Callers must never use this result for an untrusted socket peer because the
+/// headers may then be client-controlled.
+pub fn trusted_forwarded_request_scheme<'a, 'b>(
     socket_addr: &IpAddr,
-    forwarded_proto_values: impl IntoIterator<Item = &'a [u8]>,
+    forwarded_for_values: impl IntoIterator<Item = &'a [u8]>,
+    forwarded_proto_values: impl IntoIterator<Item = &'b [u8]>,
     trusted_proxies: &TrustedProxies,
 ) -> Option<&'static str> {
     if !trusted_proxies.contains(socket_addr) {
         return None;
     }
 
-    let mut nearest_proto = None;
-    for value in forwarded_proto_values {
-        // A field line containing obs-text or controls is not a valid scheme
-        // list. Record an invalid nearest value instead of skipping the line;
-        // a later valid field line can still supersede it.
-        if value
-            .iter()
-            .any(|byte| !matches!(*byte, b'\t' | 0x20..=0x7e))
-        {
-            nearest_proto = Some(&value[..0]);
-            continue;
-        }
-        for proto in value.split(|byte| *byte == b',') {
-            nearest_proto = Some(trim_header_ows(proto));
+    // Track the rightmost non-trusted XFF entry without allocating a temporary
+    // vector. Any malformed entry clears the candidate; a later untrusted
+    // entry restores it because that later entry is the boundary reached first
+    // by the canonical right-to-left trust walk.
+    let mut forwarded_for_count = 0usize;
+    let mut client_boundary = None;
+    for value in forwarded_for_values {
+        for entry in value.split(|byte| *byte == b',') {
+            let index = forwarded_for_count;
+            forwarded_for_count += 1;
+            let entry = trim_header_ows(entry);
+            client_boundary = match std::str::from_utf8(entry)
+                .ok()
+                .and_then(|entry| entry.parse::<IpAddr>().ok())
+            {
+                Some(ip) if trusted_proxies.contains(&ip) => client_boundary,
+                Some(_) => Some(index),
+                None => None,
+            };
         }
     }
-    match nearest_proto {
-        Some(proto) if proto.eq_ignore_ascii_case(b"http") => Some("http"),
-        Some(proto) if proto.eq_ignore_ascii_case(b"https") => Some("https"),
+
+    let mut forwarded_proto_count = 0usize;
+    let mut singleton_proto = None;
+    let mut boundary_proto = None;
+    let mut trusted_proto_suffix_valid = true;
+    for value in forwarded_proto_values {
+        for proto in value.split(|byte| *byte == b',') {
+            let index = forwarded_proto_count;
+            forwarded_proto_count += 1;
+            let proto = recognized_forwarded_proto(trim_header_ows(proto));
+            if index == 0 {
+                singleton_proto = proto;
+            }
+            if client_boundary.is_some_and(|boundary| index >= boundary) && proto.is_none() {
+                trusted_proto_suffix_valid = false;
+            }
+            if client_boundary == Some(index) {
+                boundary_proto = proto;
+            }
+        }
+    }
+
+    if forwarded_proto_count == 1 {
+        return singleton_proto;
+    }
+    if forwarded_proto_count == forwarded_for_count && trusted_proto_suffix_valid {
+        boundary_proto
+    } else {
+        None
+    }
+}
+
+fn recognized_forwarded_proto(value: &[u8]) -> Option<&'static str> {
+    match value {
+        proto if proto.eq_ignore_ascii_case(b"http") => Some("http"),
+        proto if proto.eq_ignore_ascii_case(b"https") => Some("https"),
         _ => None,
     }
 }

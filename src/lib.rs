@@ -1113,6 +1113,27 @@ pub mod _test_support {
     }
 
     // ── proxy/mod ────────────────────────────────────────────────────────────
+    pub fn apply_effective_backend_scheme_headers_for_test(
+        headers: &mut HashMap<String, String>,
+        client_ip: &str,
+        request_is_secure: bool,
+        add_forwarded_header: bool,
+    ) {
+        crate::proxy::apply_effective_backend_scheme_headers(
+            headers,
+            client_ip,
+            request_is_secure,
+            add_forwarded_header,
+        );
+    }
+
+    pub fn collect_forwardable_websocket_headers_for_test(
+        raw_headers: &hyper::HeaderMap,
+        proxy_headers: &HashMap<String, String>,
+    ) -> Vec<(String, String)> {
+        crate::proxy::collect_forwardable_websocket_headers(raw_headers, proxy_headers)
+    }
+
     pub struct NormalizedRejectResponse {
         pub http_status: StatusCode,
         pub headers: HashMap<String, String>,

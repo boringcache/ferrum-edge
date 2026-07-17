@@ -3351,6 +3351,8 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
 /// request scheme. Direct gRPC and WebSocket dispatch start from a sanitized
 /// request map instead of the canonical HTTP backend builders, so normalize
 /// these fields before those protocol-specific paths merge or forward it.
+/// Remove every case-insensitive variant first because this string-keyed map
+/// does not otherwise provide HTTP header-name equality.
 pub(crate) fn apply_effective_backend_scheme_headers(
     headers: &mut HashMap<String, String>,
     client_ip: &str,
@@ -3360,6 +3362,10 @@ pub(crate) fn apply_effective_backend_scheme_headers(
     let scheme = if request_is_secure { "https" } else { "http" };
     let forwarded = add_forwarded_header
         .then(|| build_forwarded_value(client_ip, scheme, headers.get("host").map(String::as_str)));
+    headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("x-forwarded-proto")
+            && (!add_forwarded_header || !name.eq_ignore_ascii_case("forwarded"))
+    });
     headers.insert("x-forwarded-proto".to_string(), scheme.to_string());
     if let Some(forwarded) = forwarded {
         headers.insert("forwarded".to_string(), forwarded);
@@ -9659,7 +9665,7 @@ fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(
 /// handshake-equivalent repeated headers such as multiple
 /// `Sec-WebSocket-Protocol` values, while still honoring plugin-driven strips
 /// and rewrites reflected in `proxy_headers`.
-fn collect_forwardable_websocket_headers(
+pub(crate) fn collect_forwardable_websocket_headers(
     raw_headers: &hyper::HeaderMap,
     proxy_headers: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
@@ -16532,7 +16538,8 @@ pub async fn run_authentication_phase(
 }
 
 /// Apply the original HTTP-family scheme reported by a directly connected
-/// trusted proxy. The same accepted fact drives browser cookie storage checks,
+/// trusted proxy through either a singleton overwrite or an XFF-correlated
+/// appended chain. The same accepted fact drives browser cookie storage checks,
 /// authority normalization, and canonical frontend URL metadata consumed by
 /// authentication plugins.
 pub fn apply_trusted_forwarded_request_scheme(
@@ -16542,6 +16549,7 @@ pub fn apply_trusted_forwarded_request_scheme(
 ) -> Option<&'static str> {
     let forwarded_scheme = client_ip::trusted_forwarded_request_scheme(
         socket_addr,
+        ctx.raw_header_value_bytes("x-forwarded-for"),
         ctx.raw_header_value_bytes("x-forwarded-proto"),
         trusted_proxies,
     );

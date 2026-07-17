@@ -131,7 +131,7 @@ fn parse_strict_rejects_empty_comma_segments() {
 }
 
 #[test]
-fn forwarded_scheme_requires_a_recognized_nearest_value_from_a_trusted_peer() {
+fn forwarded_scheme_accepts_overwrite_or_correlated_append_from_a_trusted_peer() {
     let trusted = TrustedProxies::parse("10.0.0.0/8");
     let trusted_peer = "10.0.0.8".parse().expect("valid trusted peer IP");
     let untrusted_peer = "203.0.113.8".parse().expect("valid untrusted peer IP");
@@ -139,33 +139,77 @@ fn forwarded_scheme_requires_a_recognized_nearest_value_from_a_trusted_peer() {
     assert_eq!(
         trusted_forwarded_request_scheme(
             &trusted_peer,
-            [b"http".as_slice(), b" HTTPS\t".as_slice()],
+            std::iter::empty(),
+            [b" HTTPS\t".as_slice()],
             &trusted,
         ),
         Some("https")
     );
     assert_eq!(
-        trusted_forwarded_request_scheme(&trusted_peer, [b"https, http".as_slice()], &trusted,),
+        trusted_forwarded_request_scheme(
+            &trusted_peer,
+            [b"203.0.113.8, 10.0.0.7".as_slice()],
+            [b"http, https".as_slice()],
+            &trusted,
+        ),
         Some("http")
-    );
-    assert_eq!(
-        trusted_forwarded_request_scheme(&trusted_peer, [b"https,".as_slice()], &trusted),
-        None
-    );
-    assert_eq!(
-        trusted_forwarded_request_scheme(&trusted_peer, [b"https".as_slice(), &[0x80]], &trusted,),
-        None
     );
     assert_eq!(
         trusted_forwarded_request_scheme(
             &trusted_peer,
-            [b"https".as_slice(), b"\x80, https".as_slice()],
+            [
+                b"198.51.100.1, 203.0.113.8".as_slice(),
+                b"10.0.0.7".as_slice(),
+            ],
+            [b"attacker, http".as_slice(), b"https".as_slice()],
+            &trusted,
+        ),
+        Some("http")
+    );
+    assert_eq!(
+        trusted_forwarded_request_scheme(
+            &trusted_peer,
+            [b"203.0.113.8, 10.0.0.7".as_slice()],
+            [b"https".as_slice()],
+            &trusted,
+        ),
+        Some("https"),
+        "a singleton value is the trusted proxy's overwrite-only contract"
+    );
+    assert_eq!(
+        trusted_forwarded_request_scheme(
+            &trusted_peer,
+            [b"203.0.113.8, 10.0.0.7".as_slice()],
+            [b"http, https, https".as_slice()],
             &trusted,
         ),
         None
     );
     assert_eq!(
-        trusted_forwarded_request_scheme(&untrusted_peer, [b"https".as_slice()], &trusted),
+        trusted_forwarded_request_scheme(
+            &trusted_peer,
+            [b"203.0.113.8, not-an-ip, 10.0.0.7".as_slice()],
+            [b"http, https, https".as_slice()],
+            &trusted,
+        ),
+        None
+    );
+    assert_eq!(
+        trusted_forwarded_request_scheme(
+            &trusted_peer,
+            [b"203.0.113.8, 10.0.0.7".as_slice()],
+            [b"http".as_slice(), &[0x80]],
+            &trusted,
+        ),
+        None
+    );
+    assert_eq!(
+        trusted_forwarded_request_scheme(
+            &untrusted_peer,
+            [b"203.0.113.8".as_slice()],
+            [b"https".as_slice()],
+            &trusted,
+        ),
         None
     );
 }
