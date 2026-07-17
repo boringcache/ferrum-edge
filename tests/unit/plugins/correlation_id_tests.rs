@@ -94,6 +94,7 @@ fn test_constructor_rejects_protocol_managed_and_security_sensitive_header_names
         "Content-Encoding",
         "Content-Length",
         "Cookie",
+        "Early-Data",
         "Expect",
         "Forwarded",
         "Grpc-Message",
@@ -120,11 +121,13 @@ fn test_constructor_rejects_protocol_managed_and_security_sensitive_header_names
         "X-API-Key",
         "X-Auth-Token",
         "X-CSRF-Token",
+        "X-Ferrum-Original-Content-Encoding",
         "X-Forwarded-Authorization",
         "X-Forwarded-For",
         "X-Forwarded-Host",
         "X-Forwarded-Proto",
         "X-Goog-API-Key",
+        "X-Grpc-Web-Mode",
         "X-XSRF-Token",
     ] {
         let err = CorrelationId::new(&json!({"header_name": header_name}))

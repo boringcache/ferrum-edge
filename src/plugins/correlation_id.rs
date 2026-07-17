@@ -20,6 +20,7 @@ const RESERVED_HEADER_NAMES: &[&str] = &[
     "content-encoding",
     "content-length",
     "cookie",
+    "early-data",
     "expect",
     "forwarded",
     "grpc-message",
@@ -46,11 +47,13 @@ const RESERVED_HEADER_NAMES: &[&str] = &[
     "x-api-key",
     "x-auth-token",
     "x-csrf-token",
+    "x-ferrum-original-content-encoding",
     "x-forwarded-authorization",
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-proto",
     "x-goog-api-key",
+    "x-grpc-web-mode",
     "x-xsrf-token",
 ];
 

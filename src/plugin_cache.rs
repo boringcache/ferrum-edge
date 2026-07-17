@@ -260,7 +260,9 @@ fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> R
 /// contradictory. Equal priorities would make the canonical owner depend on
 /// storage/load order. Reject either ambiguity before the chain is published,
 /// while allowing disjoint protocol owners that can never contend at runtime.
-fn validate_correlation_id_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
+pub(crate) fn validate_correlation_id_composition(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
     for protocol in ALL_PROXY_PROTOCOLS {
         let mut headers = HashSet::new();
         let mut priorities = HashSet::new();
@@ -276,7 +278,14 @@ fn validate_correlation_id_composition(plugins: &[Arc<dyn Plugin>]) -> Result<()
             // to trim or case-fold it. This allocation happens only while
             // building/validating a cache generation, never on the request hot
             // path.
-            let normalized_header_name = header_name.trim().to_ascii_lowercase();
+            let trimmed_header_name = header_name.trim();
+            if trimmed_header_name.is_empty() {
+                return Err(format!(
+                    "correlation_id: plugin {:?} returned an empty correlation_id_header_name capability claim for protocol {protocol:?}; return None when the plugin does not own a correlation header",
+                    plugin.name()
+                ));
+            }
+            let normalized_header_name = trimmed_header_name.to_ascii_lowercase();
             if !headers.insert(normalized_header_name.clone()) {
                 return Err(format!(
                     "correlation_id: duplicate effective header_name {normalized_header_name:?} for protocol {protocol:?} on the same plugin chain; each overlapping correlation trust domain must use a distinct header"

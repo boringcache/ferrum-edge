@@ -3875,8 +3875,9 @@ pub trait Plugin: Send + Sync {
     /// Returns the plugin name.
     fn name(&self) -> &str;
 
-    /// Return the normalized correlation header owned by this instance.
-    /// Plugin-cache admission uses this to reject ambiguous duplicate writers.
+    /// Return the non-empty correlation header owned by this instance, or
+    /// `None` when it owns no correlation header. Plugin-cache admission trims
+    /// and ASCII-case-folds claims before rejecting empty or ambiguous writers.
     #[doc(hidden)]
     fn correlation_id_header_name(&self) -> Option<&str> {
         None

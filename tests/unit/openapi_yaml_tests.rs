@@ -1795,6 +1795,7 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "Content-Encoding"}),
         json!({"header_name": "Content-Length"}),
         json!({"header_name": "Cookie"}),
+        json!({"header_name": " eARLY-dATA "}),
         json!({"header_name": " eXPECT "}),
         json!({"header_name": " fORWARDED "}),
         json!({"header_name": "Grpc-Message"}),
@@ -1823,9 +1824,11 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "X-API-Key"}),
         json!({"header_name": "X-Auth-Token"}),
         json!({"header_name": "X-CSRF-Token"}),
+        json!({"header_name": "X-Ferrum-Original-Content-Encoding"}),
         json!({"header_name": "X-Forwarded-Authorization"}),
         json!({"header_name": "X-Forwarded-For"}),
         json!({"header_name": "X-Goog-API-Key"}),
+        json!({"header_name": "x-gRPC-wEB-mODE"}),
         json!({"header_name": "X-XSRF-Token"}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
@@ -1833,6 +1836,28 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
             CorrelationId::new(&invalid).is_err(),
             "schema-invalid config unexpectedly passed runtime: {invalid}"
         );
+    }
+
+    let header_name_schema = spec
+        .pointer("/components/schemas/CorrelationIdConfig/properties/header_name")
+        .expect("correlation header_name schema exists");
+    for exclusion_pointer in ["/not", "/allOf/0/not"] {
+        let exclusion = header_name_schema
+            .pointer(exclusion_pointer)
+            .unwrap_or_else(|| panic!("correlation exclusion {exclusion_pointer} exists"));
+        let validator = jsonschema::draft202012::options()
+            .build(exclusion)
+            .unwrap_or_else(|error| panic!("correlation exclusion compiles: {error}"));
+        for reserved in [
+            json!(" Early-Data "),
+            json!("X-Ferrum-Original-Content-Encoding"),
+            json!("x-gRPC-wEB-mODE"),
+        ] {
+            assert!(
+                validator.validate(&reserved).is_ok(),
+                "correlation exclusion {exclusion_pointer} missed {reserved}"
+            );
+        }
     }
 }
 

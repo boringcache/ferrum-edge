@@ -2176,6 +2176,21 @@ async fn test_admin_create_rejects_malformed_correlation_id_configs() {
             "correlation_id: 'header_name' is protocol-managed",
         ),
         (
+            "correlation-internal-grpc-web-marker",
+            json!({"header_name": "X-Grpc-Web-Mode"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+        (
+            "correlation-internal-compression-marker",
+            json!({"header_name": "X-Ferrum-Original-Content-Encoding"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+        (
+            "correlation-early-data-marker",
+            json!({"header_name": "Early-Data"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+        (
             "correlation-credential-header",
             json!({"header_name": "Authorization"}),
             "correlation_id: 'header_name' is protocol-managed or security-sensitive",
