@@ -1573,6 +1573,7 @@ async fn emit_successful_upgrade_summary(
         latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: proxy_headers.get("user-agent").cloned(),
         metadata: crate::proxy::clone_log_metadata(ctx),
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
@@ -1655,6 +1656,7 @@ async fn emit_failed_upgrade_summary(
         request_user_agent: proxy_headers.get("user-agent").cloned(),
         error_class: Some(error_class),
         metadata,
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;

@@ -9175,6 +9175,7 @@ async fn handle_websocket_request_authenticated(
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
                             error_class: Some(ws_error_class),
                             metadata,
+                            ai_usage_export: ctx.ai_usage_export.clone(),
                             ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror_before_buffered_response(
@@ -9336,6 +9337,7 @@ async fn handle_websocket_request_authenticated(
         latency_gateway_overhead_ms: ws_gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         metadata: clone_log_metadata(&ctx),
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
 
@@ -13692,6 +13694,7 @@ pub(crate) async fn log_rejected_request_with_path(
         // is typically small and flowing through the main handler's buffered
         // arm, which populates `bytes_received` separately. Leave 0 here.
         metadata,
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
 
@@ -18614,6 +18617,7 @@ async fn handle_proxy_request_inner(
                     }
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
+                    ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
                     if let Some(body) = request_body {
                         ctx.metadata.insert("request_body".to_string(), body);
                     }
@@ -19194,6 +19198,7 @@ async fn handle_proxy_request_inner(
                 // it). Disjoint field assignments avoid a whole-`ctx` borrow.
                 let request_body = ctx.metadata.remove("request_body");
                 ctx.metadata = body_hook_ctx.metadata;
+                ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
                 if let Some(body) = request_body {
                     ctx.metadata.insert("request_body".to_string(), body);
                 }
@@ -20378,6 +20383,7 @@ async fn handle_proxy_request_inner(
                         error_class: final_error_class,
                         bytes_sent,
                         metadata,
+                        ai_usage_export: ctx.ai_usage_export.clone(),
                         ..TransactionSummary::default()
                     };
                     if body_exceeded {
@@ -21145,6 +21151,7 @@ async fn handle_proxy_request_inner(
                         bytes_sent,
                         bytes_received,
                         metadata: clone_log_metadata(&ctx),
+                        ai_usage_export: ctx.ai_usage_export.clone(),
                         ..TransactionSummary::default()
                     };
                     crate::plugins::log_with_mirror_before_buffered_response(
@@ -21327,6 +21334,7 @@ async fn handle_proxy_request_inner(
                             error_class: Some(grpc_error_class),
                             bytes_sent,
                             metadata,
+                            ai_usage_export: ctx.ai_usage_export.clone(),
                             ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror_before_buffered_response(
@@ -21711,6 +21719,7 @@ async fn handle_proxy_request_inner(
             // Disjoint field assignments avoid a whole-`ctx` borrow.
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
             if let Some(body) = request_body {
                 ctx.metadata.insert("request_body".to_string(), body);
             }
@@ -22119,6 +22128,7 @@ async fn handle_proxy_request_inner(
             // Disjoint field assignments avoid a whole-`ctx` borrow.
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
             if let Some(body) = request_body {
                 ctx.metadata.insert("request_body".to_string(), body);
             }
@@ -22759,6 +22769,7 @@ async fn handle_proxy_request_inner(
                 bytes_sent,
                 bytes_received: bytes_received_buffered,
                 metadata: clone_log_metadata(&ctx),
+                ai_usage_export: ctx.ai_usage_export.clone(),
                 ..TransactionSummary::default()
             };
 

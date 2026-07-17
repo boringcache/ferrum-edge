@@ -722,6 +722,74 @@ fn parse_ipv4_client_ip_literal(client_ip: &str) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(ipv4))
 }
 
+/// AI usage that was produced by a built-in accounting path.
+///
+/// This is deliberately carried outside [`RequestContext::metadata`]. Backend
+/// responses and operator-configured metadata writers can populate arbitrary
+/// public metadata keys, so those keys are not authoritative provenance for
+/// Prometheus token or cost export.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiCost {
+    /// Whole micro-units of configured currency.
+    pub microunits: u64,
+    /// Fractional micro-units at 10^-12 precision. Kept separate so the full
+    /// supported whole-cost range still fits in `u64`.
+    pub submicrounits: u64,
+}
+
+/// Number of fixed-point remainder units in one micro-unit.
+pub(crate) const AI_COST_SUBMICRO_SCALE: u64 = 1_000_000_000_000;
+
+impl AiCost {
+    pub(crate) fn from_currency_units(value: f64) -> Option<Self> {
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+
+        let scaled = value * 1_000_000.0;
+        if !scaled.is_finite() || scaled > u64::MAX as f64 {
+            return None;
+        }
+
+        let whole_microunits = scaled.floor();
+        let mut microunits = whole_microunits as u64;
+        let mut submicrounits =
+            ((scaled - whole_microunits) * AI_COST_SUBMICRO_SCALE as f64).round() as u64;
+        if submicrounits >= AI_COST_SUBMICRO_SCALE {
+            microunits = microunits.checked_add(1)?;
+            submicrounits -= AI_COST_SUBMICRO_SCALE;
+        }
+        Some(Self {
+            microunits,
+            submicrounits,
+        })
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiUsageExport {
+    pub prefix: Arc<str>,
+    pub provider: &'static str,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cost: Option<AiCost>,
+}
+
+impl AiUsageExport {
+    fn token_completeness(&self) -> usize {
+        usize::from(self.prompt_tokens.is_some())
+            + usize::from(self.completion_tokens.is_some())
+            + usize::from(self.total_tokens.is_some())
+    }
+
+    fn completeness(&self) -> usize {
+        self.token_completeness() + usize::from(self.cost.is_some())
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -831,6 +899,16 @@ pub struct RequestContext {
     gateway_deadline_response_selected: bool,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Most complete built-in AI usage snapshot for Prometheus export.
+    /// Kept outside public metadata so backend/operator metadata cannot mint or
+    /// overwrite trusted token and cost series.
+    pub(crate) ai_usage_export: Option<AiUsageExport>,
+    /// Prefix that supplied the selected token fields. Cost is selected
+    /// independently, so its provenance cannot distort later token tie-breaks.
+    ai_usage_export_token_prefix: Option<Arc<str>>,
+    /// Prefix that supplied the selected trusted cost. This remains private so
+    /// public metadata cannot influence deterministic multi-instance pricing.
+    ai_usage_export_cost_prefix: Option<Arc<str>>,
     /// Per-request ownership state for each live request-deduplication plugin
     /// instance. Multiple instances may coexist on one proxy; keeping their
     /// correlation state in a private instance-keyed map prevents one hook
@@ -1242,6 +1320,9 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             metadata: HashMap::new(),
+            ai_usage_export: None,
+            ai_usage_export_token_prefix: None,
+            ai_usage_export_cost_prefix: None,
             request_deduplication_state: HashMap::new(),
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
@@ -1310,6 +1391,88 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
+    }
+
+    fn replace_ai_usage_export(&mut self, candidate: AiUsageExport) {
+        self.ai_usage_export_token_prefix =
+            (candidate.token_completeness() != 0).then(|| Arc::clone(&candidate.prefix));
+        self.ai_usage_export_cost_prefix = candidate
+            .cost
+            .as_ref()
+            .map(|_| Arc::clone(&candidate.prefix));
+        self.ai_usage_export = Some(candidate);
+    }
+
+    pub(crate) fn stage_ai_usage_export(&mut self, candidate: AiUsageExport) {
+        if candidate.completeness() == 0 {
+            return;
+        }
+        let Some(mut current) = self.ai_usage_export.take() else {
+            self.replace_ai_usage_export(candidate);
+            return;
+        };
+
+        // Different providers must never be combined. Preserve the existing
+        // whole-snapshot selection rule for that defensive edge case.
+        if candidate.provider != current.provider {
+            let replace = candidate.completeness() > current.completeness()
+                || (candidate.completeness() == current.completeness()
+                    && candidate.prefix.as_ref() < current.prefix.as_ref());
+            if replace {
+                self.replace_ai_usage_export(candidate);
+            } else {
+                self.ai_usage_export = Some(current);
+            }
+            return;
+        }
+
+        // Token detail and trusted cost are independent dimensions. A detailed
+        // unpriced instance must not discard a cost from a less-detailed priced
+        // instance, and neither dimension may be counted more than once.
+        let candidate_token_completeness = candidate.token_completeness();
+        let current_token_completeness = current.token_completeness();
+        let current_token_prefix = self
+            .ai_usage_export_token_prefix
+            .as_deref()
+            .unwrap_or(current.prefix.as_ref());
+        let replace_tokens = candidate_token_completeness > current_token_completeness
+            || (candidate_token_completeness != 0
+                && candidate_token_completeness == current_token_completeness
+                && candidate.prefix.as_ref() < current_token_prefix);
+        if replace_tokens {
+            current.prompt_tokens = candidate.prompt_tokens;
+            current.completion_tokens = candidate.completion_tokens;
+            current.total_tokens = candidate.total_tokens;
+            self.ai_usage_export_token_prefix = Some(Arc::clone(&candidate.prefix));
+        }
+
+        if let Some(candidate_cost) = candidate.cost {
+            let replace_cost = self
+                .ai_usage_export_cost_prefix
+                .as_ref()
+                .is_none_or(|prefix| candidate.prefix.as_ref() < prefix.as_ref());
+            if replace_cost {
+                current.cost = Some(candidate_cost);
+                self.ai_usage_export_cost_prefix = Some(Arc::clone(&candidate.prefix));
+            }
+        }
+
+        if let Some(prefix) = self
+            .ai_usage_export_cost_prefix
+            .as_ref()
+            .or(self.ai_usage_export_token_prefix.as_ref())
+        {
+            current.prefix = Arc::clone(prefix);
+        }
+        self.ai_usage_export = Some(current);
+    }
+
+    /// Return the typed built-in usage snapshot carried to transaction logs.
+    /// Public only for external contract tests; runtime metadata producers
+    /// cannot access or populate this path.
+    #[doc(hidden)]
+    pub fn authoritative_ai_usage_export(&self) -> Option<AiUsageExport> {
+        self.ai_usage_export.clone()
     }
 
     /// Return the one absolute gRPC deadline established for this request.
@@ -1478,6 +1641,9 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            ai_usage_export: self.ai_usage_export.clone(),
+            ai_usage_export_token_prefix: self.ai_usage_export_token_prefix.clone(),
+            ai_usage_export_cost_prefix: self.ai_usage_export_cost_prefix.clone(),
             // Deduplication has no final request-body hook, and the caller only
             // copies selected hook results back. Keep ownership solely on the
             // live context instead of cloning request keys and tokens here.
@@ -2982,6 +3148,13 @@ pub struct TransactionSummary {
         serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
     )]
     pub metadata: HashMap<String, String>,
+    /// Built-in AI usage provenance for Prometheus. This is intentionally not
+    /// serialized into transaction logs; the operator-visible usage metadata
+    /// remains in `metadata` while trust stays typed and private to the request
+    /// pipeline.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub ai_usage_export: Option<AiUsageExport>,
 }
 
 impl TransactionSummary {
