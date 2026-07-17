@@ -806,6 +806,30 @@ async fn test_registry_rate_limit_counter() {
     assert!(output.contains("ferrum_rate_limit_exceeded_total 2"));
 }
 
+#[test]
+fn ai_federation_circuit_metrics_are_bounded_and_reload_safe() {
+    let registry = MetricsRegistry::new();
+    registry.record_ai_federation_circuit_opened();
+    registry.record_ai_federation_half_open_probe();
+    registry.record_ai_federation_open_skip();
+    registry.record_ai_federation_circuit_closed();
+
+    let output = registry.render_uncached();
+    assert!(output.contains("ferrum_ai_federation_circuits_open 0"));
+    assert!(output.contains("ferrum_ai_federation_circuits_opened_total 1"));
+    assert!(output.contains("ferrum_ai_federation_circuits_closed_total 1"));
+    assert!(output.contains("ferrum_ai_federation_circuit_half_open_probes_total 1"));
+    assert!(output.contains("ferrum_ai_federation_circuit_open_skips_total 1"));
+    assert!(!output.contains("provider="));
+
+    registry.record_ai_federation_circuit_opened();
+    registry.release_ai_federation_open_circuit();
+    let output = registry.render_uncached();
+    assert!(output.contains("ferrum_ai_federation_circuits_open 0"));
+    assert!(output.contains("ferrum_ai_federation_circuits_opened_total 2"));
+    assert!(output.contains("ferrum_ai_federation_circuits_closed_total 1"));
+}
+
 #[tokio::test]
 async fn test_registry_records_mesh_dns_upstream_id_exhaustion() {
     let registry = MetricsRegistry::new();

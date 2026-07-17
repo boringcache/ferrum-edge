@@ -1,12 +1,14 @@
 //! AI Federation Plugin
 //!
 //! Universal AI gateway that translates OpenAI Chat Completions format to any
-//! of 11 supported AI providers and normalizes responses back to OpenAI format.
+//! of the supported AI providers and normalizes responses back to OpenAI format.
 //!
-//! Uses the "terminate and respond" pattern: runs in `before_proxy` at priority
-//! 4060, makes its own HTTP call to the matched AI provider via a per-provider
-//! `reqwest::Client`, and returns `PluginResult::RejectBinary` with the
-//! normalized response. The normal proxy dispatch is skipped entirely.
+//! Uses the "terminate and respond" pattern: runs from the final HTTP request
+//! body hook after request transforms, makes its own HTTP call to the matched
+//! AI provider through the shared plugin client, and returns
+//! `PluginResult::RejectBinary` with the normalized response. The normal proxy
+//! dispatch is skipped entirely. Native gRPC is deliberately outside this
+//! OpenAI Chat Completions JSON contract.
 //! Streaming Chat Completions are intentionally unsupported by this buffered
 //! execution path: matched requests with `"stream": true` are rejected with a
 //! clear 501 error instead of being forwarded to an unimplemented SSE path.
@@ -43,14 +45,34 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 
 use super::utils::aws_sigv4;
 use super::utils::body_transform::is_json_content_type;
-use super::{AiUsageExport, Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
+use super::{
+    AiUsageExport, EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, Plugin, PluginHttpClient,
+    PluginResult, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
+};
+
+const DEFAULT_MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TRANSLATED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
+const MAX_CONCURRENT_REQUESTS: usize = 4096;
+const MAX_STOP_SEQUENCES: usize = 4;
+const MAX_STOP_SEQUENCE_CHARS: usize = 1024;
+const MAX_MODEL_IDENTIFIER_BYTES: usize = 256;
+const MAX_PROVIDERS: usize = 128;
+const MAX_MODEL_PATTERNS_PER_PROVIDER: usize = 128;
+const MAX_MODEL_MAPPINGS_PER_PROVIDER: usize = 1024;
+const MAX_FORWARDED_PROVIDER_HEADERS: usize = 32;
+const MAX_FORWARDED_PROVIDER_HEADER_VALUE_BYTES: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -88,7 +110,7 @@ impl ProviderType {
             "deepseek" => Ok(Self::DeepSeek),
             "meta_llama" => Ok(Self::MetaLlama),
             "hugging_face" => Ok(Self::HuggingFace),
-            other => Err(format!("ai_federation: unknown provider_type '{other}'")),
+            _ => Err("ai_federation: unknown provider_type".to_string()),
         }
     }
 
@@ -208,23 +230,81 @@ struct CachedToken {
     expires_at: std::time::Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthFailureImpact {
+    /// Local configuration, key parsing, or signing failed before any
+    /// provider-owned dependency was contacted.
+    CircuitNeutral,
+    /// The provider's OAuth dependency could not supply a usable token.
+    ProviderUnavailable,
+}
+
+struct AuthFailure {
+    impact: AuthFailureImpact,
+    message: String,
+}
+
+impl AuthFailure {
+    fn local(message: String) -> Self {
+        Self {
+            impact: AuthFailureImpact::CircuitNeutral,
+            message,
+        }
+    }
+
+    fn provider_unavailable(message: String) -> Self {
+        Self {
+            impact: AuthFailureImpact::ProviderUnavailable,
+            message,
+        }
+    }
+}
+
 /// Thread-safe OAuth2 token cache for Google Vertex AI.
 struct OAuth2Cache {
     cache: ArcSwapOption<CachedToken>,
     refresh_lock: Mutex<()>,
-    service_account_json: String,
+    client_email: String,
+    private_key_pem: String,
+    token_uri: String,
 }
 
 impl OAuth2Cache {
-    fn new(service_account_json: String) -> Self {
-        Self {
+    fn new(service_account_json: String) -> Result<Self, String> {
+        let service_account: Value = serde_json::from_str(&service_account_json)
+            .map_err(|e| format!("ai_federation: invalid service account JSON: {e}"))?;
+        let client_email = service_account["client_email"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or("ai_federation: service account JSON missing client_email")?
+            .to_string();
+        let private_key_pem = service_account["private_key"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or("ai_federation: service account JSON missing private_key")?
+            .to_string();
+        let token_uri = service_account["token_uri"]
+            .as_str()
+            .unwrap_or("https://oauth2.googleapis.com/token")
+            .to_string();
+        validate_google_token_uri(&token_uri)?;
+        jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
+            .map_err(|e| format!("ai_federation: invalid service account RSA private key: {e}"))?;
+
+        Ok(Self {
             cache: ArcSwapOption::empty(),
             refresh_lock: Mutex::new(()),
-            service_account_json,
-        }
+            client_email,
+            private_key_pem,
+            token_uri,
+        })
     }
 
-    async fn get_token(&self, http_client: &PluginHttpClient) -> Result<String, String> {
+    async fn get_token(
+        &self,
+        http_client: &PluginHttpClient,
+        latency_accumulator: &AtomicU64,
+    ) -> Result<String, AuthFailure> {
         // Hot path: lock-free cache read. Refresh coordination only happens
         // when the cached token is absent or close to expiry.
         if let Some(token) = self.cache.load_full()
@@ -242,40 +322,33 @@ impl OAuth2Cache {
             return Ok(token.token.clone());
         }
 
-        let token = self.refresh_token(http_client).await?;
+        let token = self.refresh_token(http_client, latency_accumulator).await?;
         let result = token.token.clone();
         self.cache.store(Some(Arc::new(token)));
         Ok(result)
     }
 
-    async fn refresh_token(&self, http_client: &PluginHttpClient) -> Result<CachedToken, String> {
-        let sa: Value = serde_json::from_str(&self.service_account_json)
-            .map_err(|e| format!("ai_federation: invalid service account JSON: {e}"))?;
-
-        let client_email = sa["client_email"]
-            .as_str()
-            .ok_or("ai_federation: service account JSON missing client_email")?;
-        let private_key_pem = sa["private_key"]
-            .as_str()
-            .ok_or("ai_federation: service account JSON missing private_key")?;
-        let token_uri = sa["token_uri"]
-            .as_str()
-            .unwrap_or("https://oauth2.googleapis.com/token");
-
+    async fn refresh_token(
+        &self,
+        http_client: &PluginHttpClient,
+        latency_accumulator: &AtomicU64,
+    ) -> Result<CachedToken, AuthFailure> {
         let now = Utc::now().timestamp();
         let claims = json!({
-            "iss": client_email,
+            "iss": self.client_email,
             "scope": "https://www.googleapis.com/auth/cloud-platform",
-            "aud": token_uri,
+            "aud": self.token_uri,
             "iat": now,
             "exp": now + 3600,
         });
 
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
-            .map_err(|e| format!("ai_federation: invalid RSA private key: {e}"))?;
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(self.private_key_pem.as_bytes())
+            .map_err(|e| {
+                AuthFailure::local(format!("ai_federation: invalid RSA private key: {e}"))
+            })?;
         let jwt = jsonwebtoken::encode(&header, &claims, &key)
-            .map_err(|e| format!("ai_federation: JWT signing failed: {e}"))?;
+            .map_err(|e| AuthFailure::local(format!("ai_federation: JWT signing failed: {e}")))?;
 
         let body = format!(
             "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={}",
@@ -284,36 +357,72 @@ impl OAuth2Cache {
 
         let req = http_client
             .get()
-            .post(token_uri)
+            .post(&self.token_uri)
             .header("content-type", "application/x-www-form-urlencoded")
             .body(body);
         let resp = http_client
-            .execute(req, "ai_federation_oauth2")
+            .execute_redacted_tracked(
+                req,
+                "ai_federation_oauth2",
+                "https://oauth2.googleapis.com/<redacted>",
+                latency_accumulator,
+            )
             .await
-            .map_err(|e| format!("ai_federation: OAuth2 token request failed: {e}"))?;
+            .map_err(|e| {
+                AuthFailure::provider_unavailable(format!(
+                    "ai_federation: OAuth2 token request failed: {e}"
+                ))
+            })?;
 
         let status = resp.status().as_u16();
-        let resp_body = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("ai_federation: OAuth2 response read failed: {e}"))?;
+        let body_read_started = std::time::Instant::now();
+        let body_result = read_response_body_bounded(resp, MAX_OAUTH_RESPONSE_BYTES).await;
+        add_external_io_elapsed(latency_accumulator, body_read_started);
+        let resp_body = body_result.map_err(|error| {
+            AuthFailure::provider_unavailable(match error {
+                BoundedReadError::LimitExceeded { .. } => format!(
+                    "ai_federation: OAuth2 response exceeded {MAX_OAUTH_RESPONSE_BYTES} byte limit"
+                ),
+                BoundedReadError::Stream(error) => format!(
+                    "ai_federation: OAuth2 response read failed: {}",
+                    crate::retry::classify_reqwest_error(&error)
+                ),
+            })
+        })?;
 
         if status != 200 {
-            return Err(format!(
-                "ai_federation: OAuth2 token endpoint returned {}: {}",
-                status,
-                String::from_utf8_lossy(&resp_body)
-            ));
+            return Err(AuthFailure::provider_unavailable(format!(
+                "ai_federation: OAuth2 token endpoint returned status {status}"
+            )));
         }
 
-        let token_resp: Value = serde_json::from_slice(&resp_body)
-            .map_err(|e| format!("ai_federation: OAuth2 response parse failed: {e}"))?;
+        let token_resp: Value = serde_json::from_slice(&resp_body).map_err(|e| {
+            AuthFailure::provider_unavailable(format!(
+                "ai_federation: OAuth2 response parse failed: {e}"
+            ))
+        })?;
 
         let access_token = token_resp["access_token"]
             .as_str()
-            .ok_or("ai_federation: OAuth2 response missing access_token")?
+            .filter(|value| !value.is_empty() && value.len() <= MAX_OAUTH_RESPONSE_BYTES)
+            .ok_or_else(|| {
+                AuthFailure::provider_unavailable(
+                    "ai_federation: OAuth2 response missing access_token".to_string(),
+                )
+            })?
             .to_string();
-        let expires_in = token_resp["expires_in"].as_u64().unwrap_or(3600);
+        let expires_in = match token_resp.get("expires_in") {
+            None => 3600,
+            Some(value) => value
+                .as_u64()
+                .filter(|seconds| (1..=86_400).contains(seconds))
+                .ok_or_else(|| {
+                    AuthFailure::provider_unavailable(
+                        "ai_federation: OAuth2 expires_in must be an integer between 1 and 86400"
+                            .to_string(),
+                    )
+                })?,
+        };
 
         Ok(CachedToken {
             token: access_token,
@@ -331,6 +440,97 @@ struct TokenCounts {
     model: Option<String>,
 }
 
+struct ProviderResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderCallFailureKind {
+    /// The request was proven not to have reached the provider and is safe to
+    /// replay on a fallback provider.
+    PreWire,
+    /// The provider may have processed the POST. Replaying is disabled unless
+    /// an operator explicitly accepts duplicate model invocations.
+    Ambiguous,
+    /// A response exceeded its configured bound. Never replay: the same or a
+    /// larger response from another provider would amplify attacker work.
+    ResponseTooLarge,
+}
+
+struct ProviderCallFailure {
+    kind: ProviderCallFailureKind,
+    error_class: crate::retry::ErrorClass,
+    headers: HashMap<String, String>,
+    circuit_failure: bool,
+}
+
+enum BoundedJsonSerializationError {
+    LimitExceeded,
+    Serialization,
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl BoundedJsonWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(8192)),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for BoundedJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "normalized provider response exceeded configured limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_json_bounded(
+    value: &Value,
+    limit: usize,
+) -> Result<Vec<u8>, BoundedJsonSerializationError> {
+    let mut writer = BoundedJsonWriter::new(limit);
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return if writer.exceeded {
+            Err(BoundedJsonSerializationError::LimitExceeded)
+        } else {
+            Err(BoundedJsonSerializationError::Serialization)
+        };
+    }
+    Ok(writer.bytes)
+}
+
+fn serialize_translated_request(value: &Value, provider: &str) -> Result<Vec<u8>, String> {
+    match serialize_json_bounded(value, MAX_TRANSLATED_REQUEST_BYTES) {
+        Ok(body) => Ok(body),
+        Err(BoundedJsonSerializationError::LimitExceeded) => Err(format!(
+            "ai_federation: translated {provider} request exceeded {MAX_TRANSLATED_REQUEST_BYTES} bytes"
+        )),
+        Err(BoundedJsonSerializationError::Serialization) => Err(format!(
+            "ai_federation: failed to serialize translated {provider} request"
+        )),
+    }
+}
+
 /// A pre-resolved provider ready for request dispatch.
 struct ResolvedProvider {
     name: String,
@@ -346,6 +546,8 @@ struct ResolvedProvider {
     connect_timeout: Duration,
     /// Overall per-request deadline applied via reqwest's `.timeout()`.
     read_timeout: Duration,
+    max_response_body_bytes: usize,
+    circuit: Option<ProviderCircuit>,
     /// Operator-supplied URL override. Used directly by Anthropic and Cohere
     /// dispatch paths that build their own URLs without going through
     /// `url_template`.
@@ -356,6 +558,197 @@ struct ResolvedProvider {
     /// google_*, aws_region, base_url) is consumed when this is built and
     /// then discarded — we don't need the raw fields at request time.
     url_template: UrlTemplate,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderCircuitConfig {
+    failure_threshold: u32,
+    cooldown: Duration,
+    success_threshold: u32,
+}
+
+struct ProviderCircuit {
+    config: ProviderCircuitConfig,
+    consecutive_failures: AtomicU32,
+    open_until_monotonic_ms: AtomicU64,
+    metrics_open: AtomicBool,
+    half_open_in_flight: AtomicBool,
+    half_open_successes: AtomicU32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitAdmission {
+    Closed,
+    HalfOpenProbe,
+    Open,
+}
+
+/// Cancellation-safe lease for a half-open probe. Provider dispatch awaits
+/// DNS, connect, response headers, and body reads; dropping that future must
+/// not leave the circuit's single probe slot permanently occupied.
+struct HalfOpenProbeGuard<'a> {
+    circuit: &'a ProviderCircuit,
+    release_on_drop: bool,
+}
+
+impl<'a> HalfOpenProbeGuard<'a> {
+    fn new(circuit: &'a ProviderCircuit) -> Self {
+        Self {
+            circuit,
+            release_on_drop: true,
+        }
+    }
+
+    /// An outcome was recorded by the circuit state machine, so dropping this
+    /// cancellation lease must not release a slot that a later probe acquired.
+    fn resolve(&mut self) {
+        self.release_on_drop = false;
+    }
+
+    /// Release an admitted probe that stopped before provider I/O produced a
+    /// circuit outcome, then disarm the cancellation fallback.
+    fn release(&mut self) {
+        if self.release_on_drop {
+            self.circuit.release_probe(CircuitAdmission::HalfOpenProbe);
+            self.release_on_drop = false;
+        }
+    }
+}
+
+impl Drop for HalfOpenProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.circuit.release_probe(CircuitAdmission::HalfOpenProbe);
+        }
+    }
+}
+
+impl ProviderCircuit {
+    fn new(config: ProviderCircuitConfig) -> Self {
+        Self {
+            config,
+            consecutive_failures: AtomicU32::new(0),
+            open_until_monotonic_ms: AtomicU64::new(0),
+            metrics_open: AtomicBool::new(false),
+            half_open_in_flight: AtomicBool::new(false),
+            half_open_successes: AtomicU32::new(0),
+        }
+    }
+
+    fn admit(&self) -> CircuitAdmission {
+        let open_until = self.open_until_monotonic_ms.load(Ordering::Acquire);
+        if open_until == 0 {
+            return CircuitAdmission::Closed;
+        }
+        if circuit_monotonic_millis() < open_until {
+            return CircuitAdmission::Open;
+        }
+        if self
+            .half_open_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            super::prometheus_metrics::global_registry().record_ai_federation_half_open_probe();
+            CircuitAdmission::HalfOpenProbe
+        } else {
+            CircuitAdmission::Open
+        }
+    }
+
+    fn may_admit(&self) -> bool {
+        let open_until = self.open_until_monotonic_ms.load(Ordering::Acquire);
+        open_until == 0
+            || (circuit_monotonic_millis() >= open_until
+                && !self.half_open_in_flight.load(Ordering::Acquire))
+    }
+
+    fn record_success(&self, provider_name: &str, admission: CircuitAdmission) {
+        self.consecutive_failures.store(0, Ordering::Release);
+        if admission != CircuitAdmission::HalfOpenProbe {
+            return;
+        }
+
+        let successes = self
+            .half_open_successes
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        if successes >= self.config.success_threshold {
+            self.open_until_monotonic_ms.store(0, Ordering::Release);
+            self.half_open_successes.store(0, Ordering::Release);
+            if self.metrics_open.swap(false, Ordering::AcqRel) {
+                super::prometheus_metrics::global_registry().record_ai_federation_circuit_closed();
+            }
+            info!(
+                provider = provider_name,
+                "ai_federation: provider circuit closed after successful half-open probe"
+            );
+        } else {
+            self.open_until_monotonic_ms
+                .store(circuit_monotonic_millis(), Ordering::Release);
+        }
+        self.half_open_in_flight.store(false, Ordering::Release);
+    }
+
+    fn record_failure(&self, provider_name: &str, admission: CircuitAdmission) {
+        if admission == CircuitAdmission::HalfOpenProbe {
+            self.open(provider_name, "half_open_probe_failed");
+            return;
+        }
+
+        let failures = self
+            .consecutive_failures
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        if failures >= self.config.failure_threshold {
+            self.open(provider_name, "failure_threshold_reached");
+        }
+    }
+
+    fn release_probe(&self, admission: CircuitAdmission) {
+        if admission == CircuitAdmission::HalfOpenProbe {
+            self.half_open_in_flight.store(false, Ordering::Release);
+        }
+    }
+
+    fn open(&self, provider_name: &str, reason: &'static str) {
+        let cooldown_ms = self.config.cooldown.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.open_until_monotonic_ms.store(
+            circuit_monotonic_millis().saturating_add(cooldown_ms),
+            Ordering::Release,
+        );
+        self.consecutive_failures.store(0, Ordering::Release);
+        self.half_open_successes.store(0, Ordering::Release);
+        self.half_open_in_flight.store(false, Ordering::Release);
+        if !self.metrics_open.swap(true, Ordering::AcqRel) {
+            super::prometheus_metrics::global_registry().record_ai_federation_circuit_opened();
+        }
+        warn!(
+            provider = provider_name,
+            reason,
+            cooldown_seconds = self.config.cooldown.as_secs(),
+            "ai_federation: provider circuit opened"
+        );
+    }
+}
+
+impl Drop for ProviderCircuit {
+    fn drop(&mut self) {
+        if self.metrics_open.load(Ordering::Acquire) {
+            super::prometheus_metrics::global_registry().release_ai_federation_open_circuit();
+        }
+    }
+}
+
+fn circuit_monotonic_millis() -> u64 {
+    // Reserve zero as the circuit's closed-state sentinel. The shared clock is
+    // backed by `Instant`, so cooldown admission cannot be extended or
+    // shortened by NTP corrections or an operator changing the wall clock.
+    crate::socket_opts::monotonic_now_ms().saturating_add(1)
+}
+
+fn add_external_io_elapsed(accumulator: &AtomicU64, started: std::time::Instant) {
+    let nanos = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+    accumulator.fetch_add(nanos, Ordering::Relaxed);
 }
 
 /// How a provider's request URL is assembled.
@@ -413,8 +806,13 @@ fn validate_base_url(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     let parsed = Url::parse(base_url).map_err(|e| {
-        format!("ai_federation: provider '{provider_name}' invalid base_url '{base_url}': {e}")
+        format!("ai_federation: provider '{provider_name}' has an invalid base_url: {e}")
     })?;
+    if !base_url.starts_with("https://") && !base_url.starts_with("http://") {
+        return Err(format!(
+            "ai_federation: provider '{provider_name}' base_url must use a lowercase explicit https:// or http:// scheme"
+        ));
+    }
 
     match parsed.scheme() {
         "https" => {}
@@ -434,13 +832,28 @@ fn validate_base_url(
 
     if !has_non_empty_authority(base_url) {
         return Err(format!(
-            "ai_federation: provider '{provider_name}' base_url '{base_url}' has no host"
+            "ai_federation: provider '{provider_name}' base_url has no host"
         ));
     }
 
-    let host = normalized_url_hostname(&parsed).ok_or_else(|| {
-        format!("ai_federation: provider '{provider_name}' base_url '{base_url}' has no host")
-    })?;
+    let host = normalized_url_hostname(&parsed)
+        .ok_or_else(|| format!("ai_federation: provider '{provider_name}' base_url has no host"))?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "ai_federation: provider '{provider_name}' base_url must not contain URL userinfo; use the provider's dedicated credential fields"
+        ));
+    }
+    if parsed.query().is_some() {
+        return Err(format!(
+            "ai_federation: provider '{provider_name}' base_url must not contain a query string; use dedicated provider fields instead"
+        ));
+    }
+    if parsed.fragment().is_some() {
+        return Err(format!(
+            "ai_federation: provider '{provider_name}' base_url must not contain a fragment"
+        ));
+    }
 
     // If the host is a literal IP, enforce the gateway IP policy at config
     // time. Hostnames are checked at runtime by `DnsCacheResolver`.
@@ -453,6 +866,34 @@ fn validate_base_url(
     }
 
     Ok(())
+}
+
+fn validate_google_token_uri(token_uri: &str) -> Result<(), String> {
+    let parsed = Url::parse(token_uri)
+        .map_err(|e| format!("ai_federation: service account token_uri is invalid: {e}"))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("oauth2.googleapis.com")
+        || parsed.port().is_some()
+        || parsed.path() != "/token"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(
+            "ai_federation: service account token_uri must be exactly https://oauth2.googleapis.com/token"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn redacted_endpoint_for_log(url: &str) -> &'static str {
+    if url.starts_with("http://") {
+        "http://<redacted>"
+    } else {
+        "https://<redacted>"
+    }
 }
 
 fn has_non_empty_authority(raw_url: &str) -> bool {
@@ -486,12 +927,28 @@ fn build_url_template(
     google_region: Option<&str>,
     google_project_id: Option<&str>,
     aws_region: Option<&str>,
-) -> UrlTemplate {
+) -> Result<UrlTemplate, String> {
+    if let Some(value) = azure_resource {
+        validate_dns_label("azure_resource", value, 2, 64)?;
+    }
+    if let Some(value) = azure_deployment {
+        validate_url_path_component("azure_deployment", value, 64)?;
+    }
+    validate_url_path_component("azure_api_version", azure_api_version, 64)?;
+    if let Some(value) = google_region {
+        validate_dns_label("google_region", value, 1, 63)?;
+    }
+    if let Some(value) = google_project_id {
+        validate_url_path_component("google_project_id", value, 128)?;
+    }
+    if let Some(value) = aws_region {
+        validate_dns_label("aws_region", value, 1, 63)?;
+    }
     if let Some(base) = base_url {
-        return UrlTemplate::Static(Arc::from(base));
+        return Ok(UrlTemplate::Static(Arc::from(base)));
     }
 
-    match provider_type {
+    let template = match provider_type {
         ProviderType::AzureOpenAi => {
             let resource = azure_resource.unwrap_or("default");
             let deployment = azure_deployment.unwrap_or("default");
@@ -530,7 +987,50 @@ fn build_url_template(
         }
 
         pt => UrlTemplate::Static(Arc::from(pt.default_base_url())),
+    };
+    Ok(template)
+}
+
+fn validate_dns_label(field: &str, value: &str, min: usize, max: usize) -> Result<(), String> {
+    let valid_length = value.len() >= min && value.len() <= max;
+    let valid_edges = value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric());
+    if !valid_length
+        || !valid_edges
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(format!(
+            "ai_federation: '{field}' must be an ASCII DNS label between {min} and {max} characters"
+        ));
     }
+    Ok(())
+}
+
+fn validate_url_path_component(field: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > max
+        || value.contains("..")
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || byte == b'.'
+                || byte == b'_'
+                || byte == b'-'
+                || byte == b':'
+        })
+    {
+        return Err(format!(
+            "ai_federation: '{field}' contains characters that are unsafe in a provider endpoint component"
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -542,8 +1042,11 @@ pub struct AiFederation {
     fallback_enabled: bool,
     fallback_status_codes: HashSet<u16>,
     fallback_on_network_errors: bool,
+    fallback_on_protocol_errors: bool,
+    fallback_on_ambiguous_errors: bool,
     fail_on_missing_model: bool,
     fail_on_no_matching_provider: bool,
+    request_slots: Semaphore,
     http_client: PluginHttpClient,
 }
 
@@ -553,11 +1056,11 @@ pub struct AiFederation {
 
 impl AiFederation {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("ai_federation: config must be an object".to_string());
-        }
-
+        let config_object = config
+            .as_object()
+            .ok_or_else(|| "ai_federation: config must be an object".to_string())?;
         reject_unsupported_streaming_config(config, "config")?;
+        reject_unknown_config_keys(config_object, "config", AI_FEDERATION_CONFIG_KEYS)?;
 
         let providers_val = config
             .get("providers")
@@ -567,22 +1070,53 @@ impl AiFederation {
         if providers_val.is_empty() {
             return Err("ai_federation: 'providers' array must not be empty".to_string());
         }
+        if providers_val.len() > MAX_PROVIDERS {
+            return Err(format!(
+                "ai_federation: 'providers' supports at most {MAX_PROVIDERS} entries"
+            ));
+        }
 
         let mut providers = Vec::with_capacity(providers_val.len());
+        let mut provider_names = HashSet::with_capacity(providers_val.len());
 
         // Use the already-resolved gateway IP allowlist policy so provider
         // validation honors CLI/env/conf/default precedence.
         let backend_allow_ips = http_client.backend_allow_ips().clone();
 
         for (i, pv) in providers_val.iter().enumerate() {
-            let name = pv["name"]
-                .as_str()
+            let provider_object = pv
+                .as_object()
+                .ok_or_else(|| format!("ai_federation: provider[{i}] must be an object"))?;
+            reject_unsupported_streaming_config(pv, &format!("provider[{i}]"))?;
+            reject_unknown_config_keys(
+                provider_object,
+                &format!("provider[{i}]"),
+                AI_FEDERATION_PROVIDER_KEYS,
+            )?;
+
+            let name = optional_str(pv, "name")?
                 .ok_or(format!("ai_federation: provider[{i}] missing 'name'"))?
                 .to_string();
 
-            reject_unsupported_streaming_config(pv, &format!("provider '{name}'"))?;
+            if name.is_empty()
+                || name.len() > 128
+                || !name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_' || byte == b'-'
+                })
+            {
+                return Err(format!(
+                    "ai_federation: provider[{i}] 'name' must contain 1 to 128 ASCII alphanumeric, dot, underscore, or hyphen characters"
+                ));
+            }
+            if !provider_names.insert(name.clone()) {
+                return Err(format!(
+                    "ai_federation: provider name '{name}' is duplicated"
+                ));
+            }
 
-            let provider_type_str = pv["provider_type"].as_str().ok_or(format!(
+            validate_provider_field_types(pv)?;
+
+            let provider_type_str = optional_str(pv, "provider_type")?.ok_or(format!(
                 "ai_federation: provider '{name}' missing 'provider_type'"
             ))?;
             let provider_type = ProviderType::from_str(provider_type_str)?;
@@ -592,22 +1126,70 @@ impl AiFederation {
                 .map_err(|_| format!("ai_federation: provider '{name}' priority is too large"))?;
 
             let model_patterns = optional_string_vec(pv, "model_patterns")?.unwrap_or_default();
+            if model_patterns.len() > MAX_MODEL_PATTERNS_PER_PROVIDER
+                || model_patterns
+                    .iter()
+                    .any(|pattern| !is_valid_model_pattern(pattern))
+            {
+                return Err(format!(
+                    "ai_federation: provider '{name}' model_patterns must contain at most {MAX_MODEL_PATTERNS_PER_PROVIDER} bounded model globs"
+                ));
+            }
 
             let model_mapping = optional_string_map(pv, "model_mapping")?.unwrap_or_default();
+            if model_mapping.len() > MAX_MODEL_MAPPINGS_PER_PROVIDER
+                || model_mapping
+                    .keys()
+                    .any(|model| !is_valid_model_identifier(model))
+            {
+                return Err(format!(
+                    "ai_federation: provider '{name}' model_mapping must contain at most {MAX_MODEL_MAPPINGS_PER_PROVIDER} valid client model identifiers"
+                ));
+            }
 
-            let default_model = pv["default_model"].as_str().map(String::from);
+            let default_model = optional_str(pv, "default_model")?.map(String::from);
+            if default_model
+                .as_deref()
+                .is_some_and(|model| !is_valid_model_identifier(model))
+                || model_mapping
+                    .values()
+                    .any(|model| !is_valid_model_identifier(model))
+            {
+                return Err(format!(
+                    "ai_federation: provider '{name}' has an invalid provider-native model identifier"
+                ));
+            }
+            if provider_embeds_model_in_url(provider_type)
+                && (default_model
+                    .as_deref()
+                    .is_some_and(|model| !is_valid_url_model_component(model))
+                    || model_mapping
+                        .values()
+                        .any(|model| !is_valid_url_model_component(model)))
+            {
+                return Err(format!(
+                    "ai_federation: provider '{name}' has a model identifier that is unsafe in its endpoint path"
+                ));
+            }
             let multimodal_mode = match optional_str(pv, "multimodal_mode")? {
                 Some(mode) => MultimodalMode::from_str(mode, &name)?,
                 None => MultimodalMode::default_for_provider(provider_type),
             };
 
-            let connect_timeout =
-                Duration::from_secs(optional_u64(pv, "connect_timeout_seconds")?.unwrap_or(5));
-            let read_timeout =
-                Duration::from_secs(optional_u64(pv, "read_timeout_seconds")?.unwrap_or(60));
+            let connect_timeout_seconds = optional_u64(pv, "connect_timeout_seconds")?.unwrap_or(5);
+            let read_timeout_seconds = optional_u64(pv, "read_timeout_seconds")?.unwrap_or(60);
+            if connect_timeout_seconds == 0 || read_timeout_seconds == 0 {
+                return Err(format!(
+                    "ai_federation: provider '{name}' timeout values must be greater than zero"
+                ));
+            }
+            let connect_timeout = Duration::from_secs(connect_timeout_seconds);
+            let read_timeout = Duration::from_secs(read_timeout_seconds);
+            let max_response_body_bytes = parse_provider_response_limit(pv, &name)?;
+            let circuit = parse_provider_circuit(pv, &name)?.map(ProviderCircuit::new);
 
-            let base_url = pv["base_url"].as_str().map(String::from);
-            let allow_plaintext = pv["allow_plaintext"].as_bool().unwrap_or(false);
+            let base_url = optional_str(pv, "base_url")?.map(String::from);
+            let allow_plaintext = optional_bool(pv, "allow_plaintext")?.unwrap_or(false);
 
             // SSRF guard: validate operator-supplied base_url before storing
             // it. Provider `default_base_url` literals are static `https://`
@@ -618,17 +1200,14 @@ impl AiFederation {
                 validate_base_url(&name, url, allow_plaintext, &backend_allow_ips)?;
             }
 
-            let auth = build_auth(provider_type, pv, &name)?;
-
-            let azure_resource = pv["azure_resource"].as_str().map(String::from);
-            let azure_deployment = pv["azure_deployment"].as_str().map(String::from);
-            let azure_api_version = pv["azure_api_version"]
-                .as_str()
+            let azure_resource = optional_str(pv, "azure_resource")?.map(String::from);
+            let azure_deployment = optional_str(pv, "azure_deployment")?.map(String::from);
+            let azure_api_version = optional_str(pv, "azure_api_version")?
                 .unwrap_or("2024-06-01")
                 .to_string();
 
-            let google_project_id = pv["google_project_id"].as_str().map(String::from);
-            let google_region = pv["google_region"].as_str().map(String::from);
+            let google_project_id = optional_str(pv, "google_project_id")?.map(String::from);
+            let google_region = optional_str(pv, "google_region")?.map(String::from);
             let aws_region = config_or_env_str(
                 pv,
                 "aws_region",
@@ -650,7 +1229,11 @@ impl AiFederation {
                 google_region.as_deref(),
                 google_project_id.as_deref(),
                 aws_region.as_deref(),
-            );
+            )?;
+            // Validate endpoint material before parsing or retaining
+            // credentials. Unsafe authorities therefore fail deterministically
+            // even when the same provider also has malformed auth material.
+            let auth = build_auth(provider_type, pv, &name)?;
 
             providers.push(ResolvedProvider {
                 name,
@@ -663,6 +1246,8 @@ impl AiFederation {
                 multimodal_mode,
                 connect_timeout,
                 read_timeout,
+                max_response_body_bytes,
+                circuit,
                 base_url,
                 url_template,
             });
@@ -678,21 +1263,187 @@ impl AiFederation {
 
         let fallback_on_network_errors =
             optional_bool(config, "fallback_on_network_errors")?.unwrap_or(true);
+        let fallback_on_protocol_errors =
+            optional_bool(config, "fallback_on_protocol_errors")?.unwrap_or(true);
+        let fallback_on_ambiguous_errors =
+            optional_bool(config, "fallback_on_ambiguous_errors")?.unwrap_or(false);
 
         let fail_on_missing_model = optional_bool(config, "fail_on_missing_model")?.unwrap_or(true);
         let fail_on_no_matching_provider =
             optional_bool(config, "fail_on_no_matching_provider")?.unwrap_or(true);
+        let max_concurrent_requests = usize::try_from(
+            optional_u64(config, "max_concurrent_requests")?
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS as u64),
+        )
+        .map_err(|_| "ai_federation: 'max_concurrent_requests' is too large".to_string())?;
+        if max_concurrent_requests == 0 || max_concurrent_requests > MAX_CONCURRENT_REQUESTS {
+            return Err(format!(
+                "ai_federation: 'max_concurrent_requests' must be between 1 and {MAX_CONCURRENT_REQUESTS}"
+            ));
+        }
 
         Ok(Self {
             providers,
             fallback_enabled,
             fallback_status_codes,
             fallback_on_network_errors,
+            fallback_on_protocol_errors,
+            fallback_on_ambiguous_errors,
             fail_on_missing_model,
             fail_on_no_matching_provider,
+            request_slots: Semaphore::new(max_concurrent_requests),
             http_client,
         })
     }
+}
+
+const AI_FEDERATION_CONFIG_KEYS: &[&str] = &[
+    "providers",
+    "fallback_enabled",
+    "fallback_on_status_codes",
+    "fallback_on_network_errors",
+    "fallback_on_protocol_errors",
+    "fallback_on_ambiguous_errors",
+    "fail_on_missing_model",
+    "fail_on_no_matching_provider",
+    "max_concurrent_requests",
+];
+
+const AI_FEDERATION_PROVIDER_KEYS: &[&str] = &[
+    "name",
+    "provider_type",
+    "api_key",
+    "priority",
+    "model_patterns",
+    "model_mapping",
+    "default_model",
+    "multimodal_mode",
+    "connect_timeout_seconds",
+    "read_timeout_seconds",
+    "max_response_body_bytes",
+    "base_url",
+    "allow_plaintext",
+    "azure_resource",
+    "azure_deployment",
+    "azure_api_version",
+    "google_project_id",
+    "google_region",
+    "google_service_account_json",
+    "aws_region",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_session_token",
+    "circuit_breaker",
+];
+
+const PROVIDER_CIRCUIT_KEYS: &[&str] =
+    &["failure_threshold", "cooldown_seconds", "success_threshold"];
+
+fn reject_unknown_config_keys(
+    object: &serde_json::Map<String, Value>,
+    scope: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let mut unknown = object
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort();
+    Err(format!(
+        "ai_federation: {scope} contains unknown field(s): {}; allowed fields: {}",
+        unknown.join(", "),
+        allowed.join(", ")
+    ))
+}
+
+fn validate_provider_field_types(provider: &Value) -> Result<(), String> {
+    for field in [
+        "api_key",
+        "base_url",
+        "azure_resource",
+        "azure_deployment",
+        "azure_api_version",
+        "google_project_id",
+        "google_region",
+        "google_service_account_json",
+        "aws_region",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    ] {
+        optional_str(provider, field)?;
+    }
+    optional_bool(provider, "allow_plaintext")?;
+    Ok(())
+}
+
+fn parse_provider_response_limit(provider: &Value, name: &str) -> Result<usize, String> {
+    let limit = usize::try_from(
+        optional_u64(provider, "max_response_body_bytes")?
+            .unwrap_or(DEFAULT_MAX_PROVIDER_RESPONSE_BYTES as u64),
+    )
+    .map_err(|_| {
+        format!("ai_federation: provider '{name}' max_response_body_bytes is too large")
+    })?;
+    if limit == 0 || limit > MAX_PROVIDER_RESPONSE_BYTES {
+        return Err(format!(
+            "ai_federation: provider '{name}' max_response_body_bytes must be between 1 and {MAX_PROVIDER_RESPONSE_BYTES}"
+        ));
+    }
+    Ok(limit)
+}
+
+fn parse_provider_circuit(
+    provider: &Value,
+    name: &str,
+) -> Result<Option<ProviderCircuitConfig>, String> {
+    let Some(value) = provider.get("circuit_breaker") else {
+        return Ok(None);
+    };
+    let object = value.as_object().ok_or_else(|| {
+        format!("ai_federation: provider '{name}' circuit_breaker must be an object")
+    })?;
+    reject_unknown_config_keys(
+        object,
+        &format!("provider '{name}' circuit_breaker"),
+        PROVIDER_CIRCUIT_KEYS,
+    )?;
+
+    let failure_threshold = u32::try_from(optional_u64(value, "failure_threshold")?.unwrap_or(3))
+        .map_err(|_| {
+        format!("ai_federation: provider '{name}' circuit failure_threshold is too large")
+    })?;
+    let cooldown_seconds = optional_u64(value, "cooldown_seconds")?.unwrap_or(30);
+    let success_threshold = u32::try_from(optional_u64(value, "success_threshold")?.unwrap_or(1))
+        .map_err(|_| {
+        format!("ai_federation: provider '{name}' circuit success_threshold is too large")
+    })?;
+
+    if failure_threshold == 0 || failure_threshold > 100 {
+        return Err(format!(
+            "ai_federation: provider '{name}' circuit failure_threshold must be between 1 and 100"
+        ));
+    }
+    if cooldown_seconds == 0 || cooldown_seconds > 86_400 {
+        return Err(format!(
+            "ai_federation: provider '{name}' circuit cooldown_seconds must be between 1 and 86400"
+        ));
+    }
+    if success_threshold == 0 || success_threshold > 100 {
+        return Err(format!(
+            "ai_federation: provider '{name}' circuit success_threshold must be between 1 and 100"
+        ));
+    }
+
+    Ok(Some(ProviderCircuitConfig {
+        failure_threshold,
+        cooldown: Duration::from_secs(cooldown_seconds),
+        success_threshold,
+    }))
 }
 
 fn reject_unsupported_streaming_config(config: &Value, scope: &str) -> Result<(), String> {
@@ -802,6 +1553,11 @@ fn optional_status_code_set(
         };
         let status = u16::try_from(value)
             .map_err(|_| format!("ai_federation: '{field}' status code {value} is too large"))?;
+        if !(100..=599).contains(&status) {
+            return Err(format!(
+                "ai_federation: '{field}' contains invalid HTTP status code {status}"
+            ));
+        }
         out.insert(status);
     }
     Ok(Some(out))
@@ -862,12 +1618,10 @@ fn build_auth(
             let sa_json = config_or_env_str(config, "google_service_account_json", None).ok_or(
                 format!("ai_federation: provider '{name}' missing 'google_service_account_json'"),
             )?;
-            // Validate the JSON is parseable
-            serde_json::from_str::<Value>(&sa_json).map_err(|e| {
-                format!("ai_federation: provider '{name}' invalid service account JSON: {e}")
-            })?;
             Ok(AuthMethod::GoogleOAuth2 {
-                cache: Arc::new(OAuth2Cache::new(sa_json)),
+                cache: Arc::new(OAuth2Cache::new(sa_json).map_err(|error| {
+                    format!("ai_federation: provider '{name}' OAuth configuration failed: {error}")
+                })?),
             })
         }
 
@@ -1065,6 +1819,25 @@ fn is_valid_url_model_component(model: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-' || b == b':')
 }
 
+fn is_valid_model_identifier(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= MAX_MODEL_IDENTIFIER_BYTES
+        && !model.contains("..")
+        && model.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/' | b'+')
+        })
+}
+
+fn is_valid_model_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern.len() <= MAX_MODEL_IDENTIFIER_BYTES
+        && !pattern.contains("..")
+        && pattern.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/' | b'+' | b'*')
+        })
+}
+
 /// Whether a provider embeds the resolved model directly in the URL path.
 ///
 /// Only these providers are vulnerable to URL injection via the `model`
@@ -1128,12 +1901,528 @@ type TranslatedRequest = (String, Vec<(String, String)>, Vec<u8>);
 ///     (Anthropic/Gemini/Bedrock) or can still request provider streaming
 ///     without a relay/normalization path (Cohere).
 ///
-/// Rather than break either way, `before_proxy` rejects streaming requests it
+/// Rather than break either way, the final-body hook rejects streaming requests it
 /// would otherwise intercept with a clear, OpenAI-shaped error. We only treat
-/// `stream: true` (a real boolean) as streaming; a stringly-typed `"true"` or a
-/// missing field is not streaming.
+/// `stream: true` (a real boolean) as streaming. A missing field requests the
+/// buffered path; any present non-boolean value is rejected by request-shape
+/// validation before provider I/O.
 fn request_wants_streaming(openai_body: &Value) -> bool {
     openai_body["stream"].as_bool() == Some(true)
+}
+
+fn validate_openai_request(
+    openai_body: &Value,
+    allow_dropped_non_text_parts: bool,
+) -> Result<(), String> {
+    let object = openai_body
+        .as_object()
+        .ok_or("ai_federation: request body must be a JSON object")?;
+    if object
+        .get("stream")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("ai_federation: 'stream' must be a boolean when present".to_string());
+    }
+    let messages = object
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or("ai_federation: request missing 'messages' array")?;
+    if messages.is_empty() {
+        return Err("ai_federation: 'messages' array must not be empty".to_string());
+    }
+
+    let mut tool_call_ids = HashSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        let message_object = message
+            .as_object()
+            .ok_or_else(|| format!("ai_federation: messages[{index}] must be an object"))?;
+        let role = message_object
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("ai_federation: messages[{index}] missing string role"))?;
+        if !matches!(role, "system" | "developer" | "user" | "assistant" | "tool") {
+            let role = bounded_error_value(role);
+            return Err(format!(
+                "ai_federation: messages[{index}] has unsupported role '{role}'"
+            ));
+        }
+
+        let has_tool_calls = message_object.get("tool_calls").is_some();
+        match message_object.get("content") {
+            Some(Value::String(_)) => {}
+            Some(content @ Value::Array(_)) => {
+                validate_openai_content_parts(content, index, allow_dropped_non_text_parts)?;
+            }
+            Some(Value::Null) | None if role == "assistant" && has_tool_calls => {}
+            _ => {
+                return Err(format!(
+                    "ai_federation: messages[{index}] content must be a string or content-parts array"
+                ));
+            }
+        }
+
+        if role == "assistant" {
+            for call in parse_openai_tool_calls(message, index)? {
+                if !tool_call_ids.insert(call.id) {
+                    return Err(format!(
+                        "ai_federation: messages[{index}] repeats a tool-call id"
+                    ));
+                }
+            }
+        } else if has_tool_calls {
+            return Err(format!(
+                "ai_federation: messages[{index}] tool_calls are only valid on assistant messages"
+            ));
+        }
+
+        if role == "tool" {
+            let tool_call_id = message_object
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!("ai_federation: messages[{index}] tool message missing tool_call_id")
+                })?;
+            if !tool_call_ids.contains(tool_call_id) {
+                return Err(format!(
+                    "ai_federation: messages[{index}] tool_call_id has no preceding assistant tool call"
+                ));
+            }
+            tool_result_text(message_object.get("content").unwrap_or(&Value::Null))?;
+        }
+    }
+
+    parse_openai_tools(openai_body)?;
+    validate_openai_tool_choice(openai_body)?;
+    normalized_stop_sequences(openai_body)?;
+    Ok(())
+}
+
+fn validate_openai_content_parts(
+    content: &Value,
+    message_index: usize,
+    allow_dropped_non_text_parts: bool,
+) -> Result<(), String> {
+    let parts = content.as_array().ok_or_else(|| {
+        format!("ai_federation: messages[{message_index}] content must be an array")
+    })?;
+    if parts.is_empty() {
+        return Err(format!(
+            "ai_federation: messages[{message_index}] content-parts array must not be empty"
+        ));
+    }
+    for (part_index, part) in parts.iter().enumerate() {
+        let part = part.as_object().ok_or_else(|| {
+            format!(
+                "ai_federation: messages[{message_index}].content[{part_index}] must be an object"
+            )
+        })?;
+        let part_type = part
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "ai_federation: messages[{message_index}].content[{part_index}] missing non-empty type"
+                )
+            })?;
+        if allow_dropped_non_text_parts && part_type != "text" {
+            continue;
+        }
+        match part_type {
+            "text" => {
+                if part.get("text").and_then(Value::as_str).is_none() {
+                    return Err(format!(
+                        "ai_federation: messages[{message_index}].content[{part_index}] text part missing string text"
+                    ));
+                }
+            }
+            "image_url" => {
+                if part
+                    .get("image_url")
+                    .and_then(Value::as_object)
+                    .and_then(|image| image.get("url"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    return Err(format!(
+                        "ai_federation: messages[{message_index}].content[{part_index}] image_url part missing non-empty image_url.url"
+                    ));
+                }
+            }
+            "input_audio" => {
+                let audio = part.get("input_audio").and_then(Value::as_object);
+                let has_data = audio
+                    .and_then(|audio| audio.get("data"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty());
+                let has_format = audio
+                    .and_then(|audio| audio.get("format"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty());
+                if !has_data || !has_format {
+                    return Err(format!(
+                        "ai_federation: messages[{message_index}].content[{part_index}] input_audio part requires non-empty input_audio.data and input_audio.format"
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "ai_federation: messages[{message_index}].content[{part_index}] has an unsupported content-part type"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ParsedToolCall {
+    id: String,
+    name: String,
+    arguments: Value,
+}
+
+struct ProviderToolCall<'a> {
+    id: &'a str,
+    name: &'a str,
+    arguments: &'a str,
+}
+
+fn parse_openai_tool_calls(
+    message: &Value,
+    message_index: usize,
+) -> Result<Vec<ParsedToolCall>, String> {
+    let Some(tool_calls_value) = message.get("tool_calls") else {
+        return Ok(Vec::new());
+    };
+    let tool_calls = tool_calls_value.as_array().ok_or_else(|| {
+        format!("ai_federation: messages[{message_index}].tool_calls must be an array")
+    })?;
+    if tool_calls.is_empty() {
+        return Err(format!(
+            "ai_federation: messages[{message_index}].tool_calls must not be empty"
+        ));
+    }
+
+    let mut parsed = Vec::with_capacity(tool_calls.len());
+    for (tool_index, call) in tool_calls.iter().enumerate() {
+        let call_object = call.as_object().ok_or_else(|| {
+            format!(
+                "ai_federation: messages[{message_index}].tool_calls[{tool_index}] must be an object"
+            )
+        })?;
+        if call_object.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(format!(
+                "ai_federation: messages[{message_index}].tool_calls[{tool_index}] must have type 'function'"
+            ));
+        }
+        let id = call_object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "ai_federation: messages[{message_index}].tool_calls[{tool_index}] missing id"
+                )
+            })?;
+        let function = call_object
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                format!(
+                    "ai_federation: messages[{message_index}].tool_calls[{tool_index}] missing function"
+                )
+            })?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_name(value))
+            .ok_or_else(|| {
+                format!(
+                    "ai_federation: messages[{message_index}].tool_calls[{tool_index}] has invalid function name"
+                )
+            })?;
+        let arguments = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "ai_federation: messages[{message_index}].tool_calls[{tool_index}] arguments must be a JSON string"
+                )
+            })?;
+        let arguments: Value = serde_json::from_str(arguments).map_err(|error| {
+            format!(
+                "ai_federation: messages[{message_index}].tool_calls[{tool_index}] arguments are not valid JSON: {error}"
+            )
+        })?;
+        if !arguments.is_object() {
+            return Err(format!(
+                "ai_federation: messages[{message_index}].tool_calls[{tool_index}] arguments must encode a JSON object"
+            ));
+        }
+        parsed.push(ParsedToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments,
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_provider_tool_calls<'a>(
+    message: &'a serde_json::Map<String, Value>,
+    choice_index: usize,
+    provider: &str,
+) -> Result<Vec<ProviderToolCall<'a>>, String> {
+    let Some(tool_calls_value) = message.get("tool_calls") else {
+        return Ok(Vec::new());
+    };
+    let tool_calls = tool_calls_value.as_array().ok_or_else(|| {
+        format!(
+            "ai_federation: {provider} choices[{choice_index}].message.tool_calls must be an array"
+        )
+    })?;
+    if tool_calls.is_empty() {
+        return Err(format!(
+            "ai_federation: {provider} choices[{choice_index}].message.tool_calls must not be empty"
+        ));
+    }
+
+    let mut parsed = Vec::with_capacity(tool_calls.len());
+    for (tool_index, call) in tool_calls.iter().enumerate() {
+        let scope = format!("{provider} choices[{choice_index}].message.tool_calls[{tool_index}]");
+        let call = call
+            .as_object()
+            .ok_or_else(|| format!("ai_federation: {scope} must be an object"))?;
+        if call.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(format!("ai_federation: {scope} must have type 'function'"));
+        }
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .ok_or_else(|| format!("ai_federation: {scope} has an invalid id"))?;
+        let function = call
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("ai_federation: {scope} missing function object"))?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_name(value))
+            .ok_or_else(|| format!("ai_federation: {scope} has an invalid function name"))?;
+        let arguments = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("ai_federation: {scope} arguments must be a string"))?;
+        parsed.push(ProviderToolCall {
+            id,
+            name,
+            // Provider output is generated text, not trusted request input.
+            // Preserve even partial or invalid JSON for the caller to validate.
+            arguments,
+        });
+    }
+    Ok(parsed)
+}
+
+fn valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn parse_openai_tools(openai_body: &Value) -> Result<Option<Vec<Value>>, String> {
+    let Some(value) = openai_body.get("tools") else {
+        return Ok(None);
+    };
+    let tools = value
+        .as_array()
+        .ok_or("ai_federation: 'tools' must be an array")?;
+    if tools.is_empty() {
+        return Err("ai_federation: 'tools' must not be empty when present".to_string());
+    }
+
+    let mut parsed = Vec::with_capacity(tools.len());
+    let mut names = HashSet::with_capacity(tools.len());
+    for (index, tool) in tools.iter().enumerate() {
+        let object = tool
+            .as_object()
+            .ok_or_else(|| format!("ai_federation: tools[{index}] must be an object"))?;
+        if object.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(format!(
+                "ai_federation: tools[{index}] must have type 'function'"
+            ));
+        }
+        let function = object
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("ai_federation: tools[{index}] missing function object"))?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_name(value))
+            .ok_or_else(|| format!("ai_federation: tools[{index}] has invalid function name"))?;
+        if !names.insert(name) {
+            return Err(format!(
+                "ai_federation: tools[{index}] repeats function name '{name}'"
+            ));
+        }
+        let description = match function.get("description") {
+            None => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(_) => {
+                return Err(format!(
+                    "ai_federation: tools[{index}].function.description must be a string"
+                ));
+            }
+        };
+        let parameters = function
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+        if !parameters.is_object() {
+            return Err(format!(
+                "ai_federation: tools[{index}].function.parameters must be an object"
+            ));
+        }
+        parsed.push(json!({
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        }));
+    }
+    Ok(Some(parsed))
+}
+
+fn validate_openai_tool_choice(openai_body: &Value) -> Result<(), String> {
+    let Some(choice) = openai_body.get("tool_choice") else {
+        return Ok(());
+    };
+    let named_choice = match choice {
+        Value::String(value) if matches!(value.as_str(), "none" | "auto" | "required") => Ok(None),
+        Value::Object(object) if object.get("type").and_then(Value::as_str) == Some("function") => {
+            let name = object
+                .get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .filter(|name| valid_tool_name(name))
+                .ok_or("ai_federation: named tool_choice has an invalid function name")?;
+            Ok(Some(name))
+        }
+        _ => Err(
+            "ai_federation: 'tool_choice' must be none, auto, required, or a named function"
+                .to_string(),
+        ),
+    }?;
+
+    let tools = parse_openai_tools(openai_body)?;
+    if choice.as_str() != Some("none") && tools.is_none() {
+        return Err("ai_federation: tool_choice requires a non-empty tools array".to_string());
+    }
+    if let Some(name) = named_choice
+        && !tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"].as_str() == Some(name)))
+    {
+        return Err(format!(
+            "ai_federation: named tool_choice '{name}' does not match any declared tool"
+        ));
+    }
+    Ok(())
+}
+
+fn tool_result_text(content: &Value) -> Result<String, String> {
+    if let Some(text) = content.as_str() {
+        return Ok(text.to_string());
+    }
+    let parts = content
+        .as_array()
+        .ok_or("ai_federation: tool message content must be a string or text-parts array")?;
+    let mut text = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            return Err(format!(
+                "ai_federation: tool message content[{index}] must be a text part"
+            ));
+        }
+        text.push_str(
+            part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                format!("ai_federation: tool message content[{index}] missing text")
+            })?,
+        );
+    }
+    Ok(text)
+}
+
+fn normalized_stop_sequences(openai_body: &Value) -> Result<Option<Value>, String> {
+    let Some(stop) = openai_body.get("stop") else {
+        return Ok(None);
+    };
+    if stop.is_null() {
+        return Ok(None);
+    }
+    let values = match stop {
+        Value::String(value) => vec![value.clone()],
+        Value::Array(values) => {
+            let mut strings = Vec::with_capacity(values.len());
+            for value in values {
+                strings.push(
+                    value
+                        .as_str()
+                        .ok_or("ai_federation: 'stop' array must contain only strings")?
+                        .to_string(),
+                );
+            }
+            strings
+        }
+        _ => {
+            return Err(
+                "ai_federation: 'stop' must be a string, an array of strings, or null".to_string(),
+            );
+        }
+    };
+    if values.len() > MAX_STOP_SEQUENCES {
+        return Err(format!(
+            "ai_federation: 'stop' supports at most {MAX_STOP_SEQUENCES} sequences"
+        ));
+    }
+    for value in &values {
+        if value.is_empty() || value.chars().count() > MAX_STOP_SEQUENCE_CHARS {
+            return Err(format!(
+                "ai_federation: every stop sequence must contain 1 to {MAX_STOP_SEQUENCE_CHARS} characters"
+            ));
+        }
+    }
+    if values.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Value::Array(
+            values.into_iter().map(Value::String).collect(),
+        )))
+    }
+}
+
+fn tool_names_by_id(messages: &[Value]) -> Result<HashMap<String, String>, String> {
+    let mut names = HashMap::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        for call in parse_openai_tool_calls(message, message_index)? {
+            if names.insert(call.id, call.name).is_some() {
+                return Err(format!(
+                    "ai_federation: messages[{message_index}] repeats a tool-call id"
+                ));
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// Translate an OpenAI Chat Completions request to the provider's native format.
@@ -1143,7 +2432,13 @@ fn translate_request(
     resolved_model: &str,
 ) -> Result<TranslatedRequest, String> {
     match provider.provider_type {
-        pt if pt.is_openai_compatible() => {
+        ProviderType::OpenAi
+        | ProviderType::AzureOpenAi
+        | ProviderType::Mistral
+        | ProviderType::Xai
+        | ProviderType::DeepSeek
+        | ProviderType::MetaLlama
+        | ProviderType::HuggingFace => {
             translate_openai_compatible(provider, openai_body, resolved_model)
         }
         ProviderType::Anthropic => translate_to_anthropic(provider, openai_body, resolved_model),
@@ -1152,8 +2447,6 @@ fn translate_request(
         }
         ProviderType::AwsBedrock => translate_to_bedrock(provider, openai_body, resolved_model),
         ProviderType::Cohere => translate_to_cohere(provider, openai_body, resolved_model),
-        // All variants covered above (is_openai_compatible catches the rest)
-        _ => unreachable!(),
     }
 }
 
@@ -1167,6 +2460,7 @@ fn translate_openai_compatible(
     } else {
         openai_body.clone()
     };
+    canonicalize_openai_tool_arguments(&mut body)?;
     body["model"] = Value::String(resolved_model.to_string());
 
     // For Azure, strip the model field — the deployment is in the URL
@@ -1178,10 +2472,55 @@ fn translate_openai_compatible(
 
     let url = build_provider_url(provider, resolved_model);
     let headers = vec![("content-type".to_string(), "application/json".to_string())];
-    let body_bytes = serde_json::to_vec(&body)
-        .map_err(|e| format!("ai_federation: failed to serialize request: {e}"))?;
+    let body_bytes = serialize_translated_request(&body, "OpenAI-compatible")?;
 
     Ok((url, headers, body_bytes))
+}
+
+/// Replace assistant tool-call argument strings with the JSON object Ferrum
+/// actually validated. This prevents duplicate object keys (or other alternate
+/// JSON spellings) from being interpreted one way by gateway policy and another
+/// way by an OpenAI-compatible provider.
+fn canonicalize_openai_tool_arguments(body: &mut Value) -> Result<(), String> {
+    let messages = body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .ok_or("ai_federation: request missing 'messages' array")?;
+
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant")
+            || message.get("tool_calls").is_none()
+        {
+            continue;
+        }
+
+        let parsed_calls = parse_openai_tool_calls(message, message_index)?;
+        let tool_calls = message
+            .get_mut("tool_calls")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                format!("ai_federation: messages[{message_index}].tool_calls must be an array")
+            })?;
+        for (tool_index, (tool_call, parsed)) in tool_calls.iter_mut().zip(parsed_calls).enumerate()
+        {
+            let function = tool_call
+                .get_mut("function")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    format!(
+                        "ai_federation: messages[{message_index}].tool_calls[{tool_index}] missing function"
+                    )
+                })?;
+            let arguments = serde_json::to_string(&parsed.arguments).map_err(|error| {
+                format!(
+                    "ai_federation: messages[{message_index}].tool_calls[{tool_index}] arguments could not be canonicalized: {error}"
+                )
+            })?;
+            function.insert("arguments".to_string(), Value::String(arguments));
+        }
+    }
+
+    Ok(())
 }
 
 /// OpenAI chat-completions messages accept `content` as either a plain
@@ -1494,7 +2833,8 @@ fn validate_openai_image_url(part: &Value) -> Result<(), String> {
     match parsed.scheme() {
         "https" | "http" => Ok(()),
         other => Err(format!(
-            "image_url.url scheme '{other}' is unsupported (expected https, http, or data)"
+            "image_url.url scheme '{}' is unsupported (expected https, http, or data)",
+            bounded_error_value(other)
         )),
     }
 }
@@ -1542,7 +2882,8 @@ fn parse_image_data_url(url: &str) -> Result<ParsedImageDataUrl<'_>, String> {
 
     if !media_type.starts_with("image/") {
         return Err(format!(
-            "image_url data URL media type '{media_type}' is not an image"
+            "image_url data URL media type '{}' is not an image",
+            bounded_error_value(media_type)
         ));
     }
     if data.is_empty() {
@@ -1774,7 +3115,8 @@ fn gemini_image_mime_type(media_type: &str) -> Result<&'static str, String> {
         "image/heic" => Ok("image/heic"),
         "image/heif" => Ok("image/heif"),
         other => Err(format!(
-            "ai_federation: unsupported Gemini image media type '{other}' (expected jpeg, png, webp, heic, or heif)"
+            "ai_federation: unsupported Gemini image media type '{}' (expected jpeg, png, webp, heic, or heif)",
+            bounded_error_value(other)
         )),
     }
 }
@@ -1814,7 +3156,8 @@ fn gemini_file_uri_mime_type(part: &Value, uri: &str) -> Result<&'static str, St
         Some("heic") => Ok("image/heic"),
         Some("heif") => Ok("image/heif"),
         _ => Err(format!(
-            "Gemini/Vertex image translation: cannot determine a supported image mimeType for fileData URI '{uri}' (add an explicit image_url.mime_type, or use a .jpg/.jpeg/.png/.webp/.heic/.heif extension)"
+            "Gemini/Vertex image translation: cannot determine a supported image mimeType for fileData URI '{}' (add an explicit image_url.mime_type, or use a .jpg/.jpeg/.png/.webp/.heic/.heif extension)",
+            bounded_error_value(uri)
         )),
     }
 }
@@ -1842,7 +3185,8 @@ fn bedrock_image_format(media_type: &str) -> Result<&'static str, String> {
         "image/gif" => Ok("gif"),
         "image/webp" => Ok("webp"),
         other => Err(format!(
-            "ai_federation: unsupported Bedrock image media type '{other}'"
+            "ai_federation: unsupported Bedrock image media type '{}'",
+            bounded_error_value(other)
         )),
     }
 }
@@ -1857,7 +3201,8 @@ fn anthropic_image_media_type(media_type: &str) -> Result<&'static str, String> 
         "image/gif" => Ok("image/gif"),
         "image/webp" => Ok("image/webp"),
         other => Err(format!(
-            "ai_federation: unsupported Anthropic image media type '{other}' (expected jpeg, png, gif, or webp)"
+            "ai_federation: unsupported Anthropic image media type '{}' (expected jpeg, png, gif, or webp)",
+            bounded_error_value(other)
         )),
     }
 }
@@ -1942,21 +3287,79 @@ fn translate_to_anthropic(
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Filter to user/assistant messages only
-    let filtered_messages: Vec<Value> = messages
-        .iter()
-        .filter(|m| {
-            let role = m["role"].as_str().unwrap_or("");
-            role == "user" || role == "assistant"
-        })
-        .map(|m| {
-            let role = m["role"].as_str().unwrap_or("user");
-            Ok(json!({
-                "role": role,
-                "content": openai_content_to_anthropic(&m["content"], provider.multimodal_mode)?
-            }))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let mut filtered_messages = Vec::with_capacity(messages.len());
+    let mut message_index = 0;
+    while message_index < messages.len() {
+        let message = &messages[message_index];
+        let role = message["role"].as_str().unwrap_or("");
+        if is_instruction_role(role) {
+            message_index += 1;
+            continue;
+        }
+        if role == "tool" {
+            let mut tool_results = Vec::new();
+            while message_index < messages.len()
+                && messages[message_index]["role"].as_str() == Some("tool")
+            {
+                let tool_message = &messages[message_index];
+                let tool_use_id = tool_message["tool_call_id"].as_str().ok_or_else(|| {
+                    format!(
+                        "ai_federation: messages[{message_index}] tool message missing tool_call_id"
+                    )
+                })?;
+                tool_results.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": tool_result_text(&tool_message["content"])?
+                }));
+                message_index += 1;
+            }
+            filtered_messages.push(json!({
+                "role": "user",
+                "content": tool_results
+            }));
+            continue;
+        }
+
+        let translated_content =
+            openai_content_to_anthropic(&message["content"], provider.multimodal_mode)?;
+        let tool_calls = if role == "assistant" {
+            parse_openai_tool_calls(message, message_index)?
+        } else {
+            Vec::new()
+        };
+        let content = if tool_calls.is_empty() {
+            let representable = match &translated_content {
+                Value::String(text) => !text.is_empty(),
+                Value::Array(blocks) => !blocks.is_empty(),
+                _ => false,
+            };
+            if !representable {
+                return Err(format!(
+                    "ai_federation: messages[{message_index}] has no Anthropic-representable content"
+                ));
+            }
+            // Anthropic accepts either a string or a content-block array. Keep
+            // the client's string shape when no tool block has to be appended.
+            translated_content
+        } else {
+            let mut content = anthropic_content_blocks(translated_content);
+            for call in tool_calls {
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                }));
+            }
+            Value::Array(content)
+        };
+        filtered_messages.push(json!({
+            "role": role,
+            "content": content,
+        }));
+        message_index += 1;
+    }
 
     let max_tokens = openai_body["max_tokens"]
         .as_u64()
@@ -1980,8 +3383,30 @@ fn translate_to_anthropic(
     if let Some(top_p) = openai_body.get("top_p") {
         body["top_p"] = top_p.clone();
     }
-    if let Some(stop) = openai_body.get("stop") {
-        body["stop_sequences"] = stop.clone();
+    if let Some(stop) = normalized_stop_sequences(openai_body)? {
+        body["stop_sequences"] = stop;
+    }
+    if let Some(tools) = parse_openai_tools(openai_body)? {
+        body["tools"] = Value::Array(
+            tools
+                .into_iter()
+                .map(|tool| {
+                    let mut native = serde_json::Map::new();
+                    native.insert("name".to_string(), tool["name"].clone());
+                    if let Some(description) = tool["description"].as_str() {
+                        native.insert(
+                            "description".to_string(),
+                            Value::String(description.to_string()),
+                        );
+                    }
+                    native.insert("input_schema".to_string(), tool["parameters"].clone());
+                    Value::Object(native)
+                })
+                .collect(),
+        );
+    }
+    if let Some(choice) = anthropic_tool_choice(openai_body)? {
+        body["tool_choice"] = choice;
     }
 
     let url = provider
@@ -1992,10 +3417,35 @@ fn translate_to_anthropic(
         ("content-type".to_string(), "application/json".to_string()),
         ("anthropic-version".to_string(), "2023-06-01".to_string()),
     ];
-    let body_bytes = serde_json::to_vec(&body)
-        .map_err(|e| format!("ai_federation: failed to serialize Anthropic request: {e}"))?;
+    let body_bytes = serialize_translated_request(&body, "Anthropic")?;
 
     Ok((url, headers, body_bytes))
+}
+
+fn anthropic_content_blocks(content: Value) -> Vec<Value> {
+    match content {
+        Value::String(text) if text.is_empty() => Vec::new(),
+        Value::String(text) => vec![json!({ "type": "text", "text": text })],
+        Value::Array(blocks) => blocks,
+        _ => Vec::new(),
+    }
+}
+
+fn anthropic_tool_choice(openai_body: &Value) -> Result<Option<Value>, String> {
+    let Some(choice) = openai_body.get("tool_choice") else {
+        return Ok(None);
+    };
+    let translated = match choice {
+        Value::String(value) if value == "none" => json!({ "type": "none" }),
+        Value::String(value) if value == "auto" => json!({ "type": "auto" }),
+        Value::String(value) if value == "required" => json!({ "type": "any" }),
+        Value::Object(object) => json!({
+            "type": "tool",
+            "name": object["function"]["name"],
+        }),
+        _ => return Err("ai_federation: unsupported Anthropic tool_choice".to_string()),
+    };
+    Ok(Some(translated))
 }
 
 fn translate_to_gemini(
@@ -2017,25 +3467,83 @@ fn translate_to_gemini(
         .map(|text| json!({ "text": text }))
         .collect();
 
-    // Map user/assistant messages → Gemini contents, preserving supported
-    // image_url parts when `multimodal_mode = translate`.
-    let contents: Vec<Value> = messages
-        .iter()
-        .filter(|m| {
-            let role = m["role"].as_str().unwrap_or("");
-            role == "user" || role == "assistant"
-        })
-        .map(|m| {
-            let role = match m["role"].as_str().unwrap_or("user") {
-                "assistant" => "model",
-                other => other,
-            };
-            Ok(json!({
-                "role": role,
-                "parts": openai_content_to_gemini_parts(&m["content"], provider.multimodal_mode)?
-            }))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let tool_names = tool_names_by_id(messages)?;
+    let mut contents = Vec::with_capacity(messages.len());
+    let mut message_index = 0;
+    while message_index < messages.len() {
+        let message = &messages[message_index];
+        let role = message["role"].as_str().unwrap_or("");
+        if is_instruction_role(role) {
+            message_index += 1;
+            continue;
+        }
+        if role == "tool" {
+            let mut parts = Vec::new();
+            while message_index < messages.len()
+                && messages[message_index]["role"].as_str() == Some("tool")
+            {
+                let tool_message = &messages[message_index];
+                let tool_call_id = tool_message["tool_call_id"].as_str().ok_or_else(|| {
+                    format!(
+                        "ai_federation: messages[{message_index}] tool message missing tool_call_id"
+                    )
+                })?;
+                let tool_name = tool_names.get(tool_call_id).ok_or_else(|| {
+                    format!(
+                        "ai_federation: messages[{message_index}] tool_call_id has no matching assistant tool call"
+                    )
+                })?;
+                let text = tool_result_text(&tool_message["content"])?;
+                let response = match serde_json::from_str::<Value>(&text) {
+                    Ok(Value::Object(object)) => Value::Object(object),
+                    Ok(value) => json!({ "output": value }),
+                    Err(_) => json!({ "output": text }),
+                };
+                parts.push(json!({
+                    "functionResponse": {
+                        "name": tool_name,
+                        "response": response,
+                    }
+                }));
+                message_index += 1;
+            }
+            contents.push(json!({
+                "role": "user",
+                "parts": parts
+            }));
+            continue;
+        }
+
+        let native_role = if role == "assistant" { "model" } else { role };
+        let mut parts =
+            openai_content_to_gemini_parts(&message["content"], provider.multimodal_mode)?;
+        let tool_calls = if role == "assistant" {
+            parse_openai_tool_calls(message, message_index)?
+        } else {
+            Vec::new()
+        };
+        if !tool_calls.is_empty()
+            && parts.len() == 1
+            && parts[0].get("text").and_then(Value::as_str) == Some("")
+        {
+            parts.clear();
+        }
+        for call in tool_calls {
+            parts.push(json!({
+                "functionCall": {
+                    "name": call.name,
+                    "args": call.arguments,
+                }
+            }));
+        }
+        if parts.is_empty() {
+            return Err(format!(
+                "ai_federation: messages[{message_index}] has no Gemini-representable content"
+            ));
+        }
+        contents.push(json!({ "role": native_role, "parts": parts }));
+        message_index += 1;
+    }
 
     let mut body = json!({ "contents": contents });
 
@@ -2057,19 +3565,57 @@ fn translate_to_gemini(
     if let Some(top_p) = openai_body.get("top_p") {
         gen_config.insert("topP".to_string(), top_p.clone());
     }
-    if let Some(stop) = openai_body.get("stop") {
-        gen_config.insert("stopSequences".to_string(), stop.clone());
+    if let Some(stop) = normalized_stop_sequences(openai_body)? {
+        gen_config.insert("stopSequences".to_string(), stop);
     }
     if !gen_config.is_empty() {
         body["generationConfig"] = Value::Object(gen_config);
     }
 
+    if let Some(tools) = parse_openai_tools(openai_body)? {
+        let declarations = tools
+            .into_iter()
+            .map(|tool| {
+                let mut declaration = serde_json::Map::new();
+                declaration.insert("name".to_string(), tool["name"].clone());
+                if let Some(description) = tool["description"].as_str() {
+                    declaration.insert(
+                        "description".to_string(),
+                        Value::String(description.to_string()),
+                    );
+                }
+                declaration.insert("parameters".to_string(), tool["parameters"].clone());
+                Value::Object(declaration)
+            })
+            .collect::<Vec<_>>();
+        body["tools"] = json!([{ "functionDeclarations": declarations }]);
+    }
+    if let Some(choice) = gemini_tool_choice(openai_body)? {
+        body["toolConfig"] = json!({ "functionCallingConfig": choice });
+    }
+
     let url = build_provider_url(provider, resolved_model);
     let headers = vec![("content-type".to_string(), "application/json".to_string())];
-    let body_bytes = serde_json::to_vec(&body)
-        .map_err(|e| format!("ai_federation: failed to serialize Gemini request: {e}"))?;
+    let body_bytes = serialize_translated_request(&body, "Gemini")?;
 
     Ok((url, headers, body_bytes))
+}
+
+fn gemini_tool_choice(openai_body: &Value) -> Result<Option<Value>, String> {
+    let Some(choice) = openai_body.get("tool_choice") else {
+        return Ok(None);
+    };
+    let translated = match choice {
+        Value::String(value) if value == "none" => json!({ "mode": "NONE" }),
+        Value::String(value) if value == "auto" => json!({ "mode": "AUTO" }),
+        Value::String(value) if value == "required" => json!({ "mode": "ANY" }),
+        Value::Object(object) => json!({
+            "mode": "ANY",
+            "allowedFunctionNames": [object["function"]["name"].clone()],
+        }),
+        _ => return Err("ai_federation: unsupported Gemini tool_choice".to_string()),
+    };
+    Ok(Some(translated))
 }
 
 fn translate_to_bedrock(
@@ -2091,21 +3637,76 @@ fn translate_to_bedrock(
         .map(|text| json!({ "text": text }))
         .collect();
 
-    // Map user/assistant messages to Bedrock Converse format, preserving
-    // supported data URL image_url parts when `multimodal_mode = translate`.
-    let bedrock_messages: Vec<Value> = messages
-        .iter()
-        .filter(|m| {
-            let role = m["role"].as_str().unwrap_or("");
-            role == "user" || role == "assistant"
-        })
-        .map(|m| {
-            Ok(json!({
-                "role": m["role"].as_str().unwrap_or("user"),
-                "content": openai_content_to_bedrock_blocks(&m["content"], provider.multimodal_mode)?
-            }))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let mut bedrock_messages = Vec::with_capacity(messages.len());
+    let mut message_index = 0;
+    while message_index < messages.len() {
+        let message = &messages[message_index];
+        let role = message["role"].as_str().unwrap_or("");
+        if is_instruction_role(role) {
+            message_index += 1;
+            continue;
+        }
+        if role == "tool" {
+            let mut tool_results = Vec::new();
+            while message_index < messages.len()
+                && messages[message_index]["role"].as_str() == Some("tool")
+            {
+                let tool_message = &messages[message_index];
+                let tool_use_id = tool_message["tool_call_id"].as_str().ok_or_else(|| {
+                    format!(
+                        "ai_federation: messages[{message_index}] tool message missing tool_call_id"
+                    )
+                })?;
+                let text = tool_result_text(&tool_message["content"])?;
+                let result_content = match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => json!([{ "json": value }]),
+                    Err(_) => json!([{ "text": text }]),
+                };
+                tool_results.push(json!({
+                    "toolResult": {
+                        "toolUseId": tool_use_id,
+                        "content": result_content,
+                    }
+                }));
+                message_index += 1;
+            }
+            bedrock_messages.push(json!({
+                "role": "user",
+                "content": tool_results
+            }));
+            continue;
+        }
+
+        let mut content =
+            openai_content_to_bedrock_blocks(&message["content"], provider.multimodal_mode)?;
+        let tool_calls = if role == "assistant" {
+            parse_openai_tool_calls(message, message_index)?
+        } else {
+            Vec::new()
+        };
+        if !tool_calls.is_empty()
+            && content.len() == 1
+            && content[0].get("text").and_then(Value::as_str) == Some("")
+        {
+            content.clear();
+        }
+        for call in tool_calls {
+            content.push(json!({
+                "toolUse": {
+                    "toolUseId": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                }
+            }));
+        }
+        if content.is_empty() {
+            return Err(format!(
+                "ai_federation: messages[{message_index}] has no Bedrock-representable content"
+            ));
+        }
+        bedrock_messages.push(json!({ "role": role, "content": content }));
+        message_index += 1;
+    }
 
     let mut body = json!({ "messages": bedrock_messages });
 
@@ -2127,19 +3728,75 @@ fn translate_to_bedrock(
     if let Some(top_p) = openai_body.get("top_p") {
         inference_config.insert("topP".to_string(), top_p.clone());
     }
-    if let Some(stop) = openai_body.get("stop") {
-        inference_config.insert("stopSequences".to_string(), stop.clone());
+    if let Some(stop) = normalized_stop_sequences(openai_body)? {
+        inference_config.insert("stopSequences".to_string(), stop);
     }
     if !inference_config.is_empty() {
         body["inferenceConfig"] = Value::Object(inference_config);
     }
 
+    let tool_choice = bedrock_tool_choice(openai_body)?;
+    match (parse_openai_tools(openai_body)?, tool_choice) {
+        (_, BedrockToolChoice::Disabled) => {}
+        (Some(tools), BedrockToolChoice::Enabled(choice)) => {
+            let native_tools = tools
+                .into_iter()
+                .map(|tool| {
+                    let mut spec = serde_json::Map::new();
+                    spec.insert("name".to_string(), tool["name"].clone());
+                    if let Some(description) = tool["description"].as_str() {
+                        spec.insert(
+                            "description".to_string(),
+                            Value::String(description.to_string()),
+                        );
+                    }
+                    spec.insert(
+                        "inputSchema".to_string(),
+                        json!({ "json": tool["parameters"].clone() }),
+                    );
+                    json!({ "toolSpec": Value::Object(spec) })
+                })
+                .collect::<Vec<_>>();
+            let mut tool_config = json!({ "tools": native_tools });
+            if let Some(choice) = choice {
+                tool_config["toolChoice"] = choice;
+            }
+            body["toolConfig"] = tool_config;
+        }
+        (None, BedrockToolChoice::Enabled(Some(_))) => {
+            return Err("ai_federation: Bedrock tool_choice requires tools".to_string());
+        }
+        (None, BedrockToolChoice::Enabled(None)) => {}
+    }
+
     let url = build_provider_url(provider, resolved_model);
     let headers = vec![("content-type".to_string(), "application/json".to_string())];
-    let body_bytes = serde_json::to_vec(&body)
-        .map_err(|e| format!("ai_federation: failed to serialize Bedrock request: {e}"))?;
+    let body_bytes = serialize_translated_request(&body, "Bedrock")?;
 
     Ok((url, headers, body_bytes))
+}
+
+enum BedrockToolChoice {
+    Disabled,
+    Enabled(Option<Value>),
+}
+
+fn bedrock_tool_choice(openai_body: &Value) -> Result<BedrockToolChoice, String> {
+    let Some(choice) = openai_body.get("tool_choice") else {
+        return Ok(BedrockToolChoice::Enabled(None));
+    };
+    let translated = match choice {
+        // Bedrock Converse has no native disabled choice. Omitting the entire
+        // toolConfig is the lossless representation: no tools are available.
+        Value::String(value) if value == "none" => return Ok(BedrockToolChoice::Disabled),
+        Value::String(value) if value == "auto" => json!({ "auto": {} }),
+        Value::String(value) if value == "required" => json!({ "any": {} }),
+        Value::Object(object) => json!({
+            "tool": { "name": object["function"]["name"].clone() }
+        }),
+        _ => return Err("ai_federation: unsupported Bedrock tool_choice".to_string()),
+    };
+    Ok(BedrockToolChoice::Enabled(Some(translated)))
 }
 
 fn translate_to_cohere(
@@ -2158,6 +3815,10 @@ fn translate_to_cohere(
     // Remove fields Cohere doesn't support
     if let Some(obj) = body.as_object_mut() {
         obj.remove("max_completion_tokens");
+        obj.remove("stop");
+    }
+    if let Some(stop) = normalized_stop_sequences(openai_body)? {
+        body["stop_sequences"] = stop;
     }
 
     let url = provider
@@ -2165,8 +3826,7 @@ fn translate_to_cohere(
         .clone()
         .unwrap_or_else(|| ProviderType::Cohere.default_base_url().to_string());
     let headers = vec![("content-type".to_string(), "application/json".to_string())];
-    let body_bytes = serde_json::to_vec(&body)
-        .map_err(|e| format!("ai_federation: failed to serialize Cohere request: {e}"))?;
+    let body_bytes = serialize_translated_request(&body, "Cohere")?;
 
     Ok((url, headers, body_bytes))
 }
@@ -2184,31 +3844,6 @@ fn build_provider_url(provider: &ResolvedProvider, model: &str) -> String {
 // ---------------------------------------------------------------------------
 // Response normalization
 // ---------------------------------------------------------------------------
-
-/// Maximum number of raw upstream-response bytes reflected back to the caller.
-///
-/// Both the error-passthrough path and the parse-failure path truncate the
-/// provider's body to this many bytes before lossy UTF-8 conversion. Slicing
-/// the raw bytes (not the lossy `String`) keeps the cut on a byte boundary, and
-/// `from_utf8_lossy` then repairs any code point split by the cut. Bounding the
-/// reflected text avoids forwarding an unbounded, provider-controlled error
-/// body to arbitrary downstream callers. See finding #52.
-const MAX_UPSTREAM_ERROR_BYTES: usize = 512;
-
-fn cap_upstream_error_body(body: Vec<u8>) -> Vec<u8> {
-    // Return a complete JSON error document even when the upstream body is
-    // truncated, so fallback exhaustion never sends malformed JSON with an
-    // application/json content type.
-    let error_text = String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)]);
-    openai_error_body(
-        &format!("Upstream provider error: {error_text}"),
-        "upstream_error",
-        None,
-        Some("upstream_error"),
-    )
-    .to_string()
-    .into_bytes()
-}
 
 /// Maximum number of characters of the client-supplied `model` reflected back
 /// in a no-match error body.
@@ -2257,13 +3892,13 @@ fn normalize_response(
     body: &[u8],
     resolved_model: &str,
 ) -> Result<(Value, TokenCounts), String> {
-    // For error responses, pass through the raw error (capped — the upstream
-    // body is provider-controlled and may be large or detail-rich).
-    if status >= 400 {
-        let error_text = String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)]);
+    // Only 2xx responses may enter a provider success normalizer. Redirects
+    // are never followed by PluginHttpClient and remain redirects; treating a
+    // JSON 3xx body as a completion would rewrite it into a false 200.
+    if !(200..300).contains(&status) {
         return Ok((
             openai_error_body(
-                &format!("Upstream provider returned {}: {}", status, error_text),
+                &format!("Upstream provider returned status {status}"),
                 "upstream_error",
                 None,
                 Some("upstream_error"),
@@ -2272,29 +3907,129 @@ fn normalize_response(
         ));
     }
 
-    let resp: Value = serde_json::from_slice(body).map_err(|e| {
-        format!(
-            "ai_federation: failed to parse provider response: {e} (body: {})",
-            String::from_utf8_lossy(&body[..body.len().min(MAX_UPSTREAM_ERROR_BYTES)])
-        )
-    })?;
+    let resp: Value = serde_json::from_slice(body)
+        .map_err(|e| format!("ai_federation: failed to parse provider response: {e}"))?;
 
-    if provider_type.is_openai_compatible() {
-        normalize_from_openai_compatible(&resp)
-    } else {
-        match provider_type {
-            ProviderType::Anthropic => normalize_from_anthropic(&resp, resolved_model),
-            ProviderType::GoogleGemini | ProviderType::GoogleVertex => {
-                normalize_from_gemini(&resp, resolved_model)
-            }
-            ProviderType::AwsBedrock => normalize_from_bedrock(&resp, resolved_model),
-            ProviderType::Cohere => normalize_from_cohere(&resp, resolved_model),
-            _ => unreachable!(),
+    let response_object = resp
+        .as_object()
+        .ok_or("ai_federation: provider success response must be a JSON object")?;
+    if response_object
+        .get("error")
+        .is_some_and(|error| !error.is_null())
+    {
+        return Err(
+            "ai_federation: provider returned an error envelope with a success status".to_string(),
+        );
+    }
+
+    match provider_type {
+        ProviderType::OpenAi
+        | ProviderType::AzureOpenAi
+        | ProviderType::Mistral
+        | ProviderType::Xai
+        | ProviderType::DeepSeek
+        | ProviderType::MetaLlama
+        | ProviderType::HuggingFace => normalize_from_openai_compatible(&resp),
+        ProviderType::Anthropic => normalize_from_anthropic(&resp, resolved_model),
+        ProviderType::GoogleGemini | ProviderType::GoogleVertex => {
+            normalize_from_gemini(&resp, resolved_model)
         }
+        ProviderType::AwsBedrock => normalize_from_bedrock(&resp, resolved_model),
+        ProviderType::Cohere => normalize_from_cohere(&resp, resolved_model),
     }
 }
 
 fn normalize_from_openai_compatible(resp: &Value) -> Result<(Value, TokenCounts), String> {
+    required_non_empty_string(resp, "id", "OpenAI-compatible response")?;
+    required_model_identifier(resp, "model", "OpenAI-compatible response")?;
+    if resp["object"].as_str() != Some("chat.completion") {
+        return Err(
+            "ai_federation: OpenAI-compatible response object must be 'chat.completion'"
+                .to_string(),
+        );
+    }
+    let choices = resp["choices"]
+        .as_array()
+        .filter(|choices| !choices.is_empty())
+        .ok_or("ai_federation: OpenAI-compatible response missing non-empty choices array")?;
+    for (index, choice) in choices.iter().enumerate() {
+        let choice_object = choice.as_object().ok_or_else(|| {
+            format!("ai_federation: OpenAI-compatible choices[{index}] must be an object")
+        })?;
+        if choice_object.get("index").and_then(Value::as_u64).is_none() {
+            return Err(format!(
+                "ai_federation: OpenAI-compatible choices[{index}] missing non-negative integer index"
+            ));
+        }
+        let message = choice_object
+            .get("message")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                format!("ai_federation: OpenAI-compatible choices[{index}] missing message object")
+            })?;
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            return Err(format!(
+                "ai_federation: OpenAI-compatible choices[{index}] message role must be assistant"
+            ));
+        }
+        let finish_reason = choice_object
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("ai_federation: OpenAI-compatible choices[{index}] missing finish_reason")
+            })?;
+        if !matches!(
+            finish_reason,
+            "stop" | "length" | "tool_calls" | "content_filter"
+        ) {
+            return Err(format!(
+                "ai_federation: OpenAI-compatible choices[{index}] has unsupported finish_reason"
+            ));
+        }
+        let tool_calls = parse_provider_tool_calls(message, index, "OpenAI-compatible")?;
+        let has_refusal = match message.get("refusal") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(refusal)) => !refusal.is_empty(),
+            Some(_) => {
+                return Err(format!(
+                    "ai_federation: OpenAI-compatible choices[{index}] refusal must be a string or null"
+                ));
+            }
+        };
+        let has_non_empty_content = match message.get("content") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(content)) => !content.is_empty(),
+            Some(_) => {
+                return Err(format!(
+                    "ai_federation: OpenAI-compatible choices[{index}] content must be a string or null"
+                ));
+            }
+        };
+        let has_filtered_content_shape = finish_reason == "content_filter"
+            && matches!(
+                message.get("content"),
+                None | Some(Value::Null) | Some(Value::String(_))
+            );
+        if !has_non_empty_content
+            && tool_calls.is_empty()
+            && !has_filtered_content_shape
+            && !has_refusal
+        {
+            return Err(format!(
+                "ai_federation: OpenAI-compatible choices[{index}] has neither text content, tool calls, nor refusal"
+            ));
+        }
+        if (finish_reason == "tool_calls") != !tool_calls.is_empty() {
+            return Err(format!(
+                "ai_federation: OpenAI-compatible choices[{index}] tool calls and finish_reason disagree"
+            ));
+        }
+    }
+
+    validate_optional_usage_object(
+        resp.get("usage"),
+        &["prompt_tokens", "completion_tokens", "total_tokens"],
+    )?;
     let tokens = TokenCounts {
         prompt_tokens: resp["usage"]["prompt_tokens"].as_u64(),
         completion_tokens: resp["usage"]["completion_tokens"].as_u64(),
@@ -2304,53 +4039,260 @@ fn normalize_from_openai_compatible(resp: &Value) -> Result<(Value, TokenCounts)
     Ok((resp.clone(), tokens))
 }
 
-fn normalize_from_anthropic(resp: &Value, model: &str) -> Result<(Value, TokenCounts), String> {
-    let content = resp["content"]
+fn validate_optional_usage_object(usage: Option<&Value>, fields: &[&str]) -> Result<(), String> {
+    let Some(usage) = usage.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let usage = usage
+        .as_object()
+        .ok_or("ai_federation: response usage must be an object")?;
+    for field in fields {
+        if usage.get(*field).is_some_and(|value| !value.is_u64()) {
+            return Err(format!(
+                "ai_federation: response usage.{field} must be a non-negative integer"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn required_non_empty_string<'a>(
+    value: &'a Value,
+    key: &str,
+    scope: &str,
+) -> Result<&'a str, String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("ai_federation: {scope} missing non-empty {key}"))
+}
+
+fn required_model_identifier<'a>(
+    value: &'a Value,
+    key: &str,
+    scope: &str,
+) -> Result<&'a str, String> {
+    let model = required_non_empty_string(value, key, scope)?;
+    if !is_valid_model_identifier(model) {
+        return Err(format!(
+            "ai_federation: {scope} contains an invalid model identifier"
+        ));
+    }
+    Ok(model)
+}
+
+fn required_tool_name<'a>(value: &'a Value, key: &str, scope: &str) -> Result<&'a str, String> {
+    let name = required_non_empty_string(value, key, scope)?;
+    if !valid_tool_name(name) {
+        return Err(format!(
+            "ai_federation: {scope} {key} must contain 1-64 alphanumeric, underscore, or hyphen characters"
+        ));
+    }
+    Ok(name)
+}
+
+fn openai_tool_call(id: &str, name: &str, arguments: &Value) -> Result<Value, String> {
+    if id.is_empty() || id.len() > 128 {
+        return Err(
+            "ai_federation: provider tool-call id must contain 1-128 characters".to_string(),
+        );
+    }
+    if !valid_tool_name(name) {
+        return Err(
+            "ai_federation: provider tool-call name contains unsupported characters".to_string(),
+        );
+    }
+    if !arguments.is_object() {
+        return Err("ai_federation: provider tool-call arguments must be an object".to_string());
+    }
+    let arguments = match serialize_json_bounded(arguments, MAX_PROVIDER_RESPONSE_BYTES) {
+        Ok(arguments) => String::from_utf8(arguments).map_err(|_| {
+            "ai_federation: tool-call arguments serialization produced invalid UTF-8".to_string()
+        })?,
+        Err(BoundedJsonSerializationError::LimitExceeded) => {
+            return Err(
+                "ai_federation: provider tool-call arguments exceeded the global response limit"
+                    .to_string(),
+            );
+        }
+        Err(BoundedJsonSerializationError::Serialization) => {
+            return Err("ai_federation: tool-call arguments serialization failed".to_string());
+        }
+    };
+    Ok(json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments,
+        }
+    }))
+}
+
+fn native_usage_pair(
+    usage: Option<&Value>,
+    input_key: &str,
+    output_key: &str,
+    provider: &str,
+) -> Result<(Option<u64>, Option<u64>), String> {
+    let Some(usage) = usage.filter(|value| !value.is_null()) else {
+        return Ok((None, None));
+    };
+    let usage = usage
+        .as_object()
+        .ok_or_else(|| format!("ai_federation: {provider} usage must be an object"))?;
+    for key in [input_key, output_key] {
+        if usage.get(key).is_some_and(|value| !value.is_u64()) {
+            return Err(format!(
+                "ai_federation: {provider} usage.{key} must be a non-negative integer"
+            ));
+        }
+    }
+    Ok((
+        usage.get(input_key).and_then(Value::as_u64),
+        usage.get(output_key).and_then(Value::as_u64),
+    ))
+}
+
+fn summed_usage(
+    input: Option<u64>,
+    output: Option<u64>,
+    provider: &str,
+) -> Result<Option<u64>, String> {
+    match (input, output) {
+        (Some(input), Some(output)) => input
+            .checked_add(output)
+            .map(Some)
+            .ok_or_else(|| format!("ai_federation: {provider} token usage total overflowed")),
+        _ => Ok(None),
+    }
+}
+
+fn insert_normalized_usage(
+    normalized: &mut Value,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+) {
+    let mut usage = serde_json::Map::new();
+    if let Some(value) = prompt_tokens {
+        usage.insert("prompt_tokens".to_string(), Value::from(value));
+    }
+    if let Some(value) = completion_tokens {
+        usage.insert("completion_tokens".to_string(), Value::from(value));
+    }
+    if let Some(value) = total_tokens {
+        usage.insert("total_tokens".to_string(), Value::from(value));
+    }
+    if !usage.is_empty() {
+        normalized["usage"] = Value::Object(usage);
+    }
+}
+
+fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenCounts), String> {
+    if resp["type"].as_str() != Some("message") || resp["role"].as_str() != Some("assistant") {
+        return Err(
+            "ai_federation: Anthropic success response must be an assistant message".to_string(),
+        );
+    }
+    let id = required_non_empty_string(resp, "id", "Anthropic response")?;
+    let resp_model = required_model_identifier(resp, "model", "Anthropic response")?;
+    let stop_reason = required_non_empty_string(resp, "stop_reason", "Anthropic response")?;
+    let content_blocks = resp["content"]
         .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|c| c["text"].as_str())
-        .unwrap_or("");
+        .filter(|blocks| !blocks.is_empty())
+        .ok_or("ai_federation: Anthropic response missing non-empty content array")?;
 
-    let finish_reason = match resp["stop_reason"].as_str() {
-        Some("end_turn") => "stop",
-        Some("max_tokens") => "length",
-        Some("stop_sequence") => "stop",
-        Some(other) => other,
-        None => "stop",
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for (index, block) in content_blocks.iter().enumerate() {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                text.push_str(block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    format!("ai_federation: Anthropic content[{index}] text block missing text")
+                })?)
+            }
+            Some("tool_use") => {
+                let tool_id = required_non_empty_string(
+                    block,
+                    "id",
+                    &format!("Anthropic content[{index}] tool_use"),
+                )?;
+                let tool_name = required_tool_name(
+                    block,
+                    "name",
+                    &format!("Anthropic content[{index}] tool_use"),
+                )?;
+                let input = block.get("input").filter(|value| value.is_object()).ok_or_else(|| {
+                    format!(
+                        "ai_federation: Anthropic content[{index}] tool_use input must be an object"
+                    )
+                })?;
+                tool_calls.push(openai_tool_call(tool_id, tool_name, input)?);
+            }
+            Some(_) => {
+                return Err(format!(
+                    "ai_federation: Anthropic content[{index}] has a block type that cannot be represented by Chat Completions"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "ai_federation: Anthropic content[{index}] missing block type"
+                ));
+            }
+        }
+    }
+    if text.is_empty() && tool_calls.is_empty() {
+        return Err(
+            "ai_federation: Anthropic response has no non-empty text or tool calls".to_string(),
+        );
+    }
+
+    if (stop_reason == "tool_use") != !tool_calls.is_empty() {
+        return Err(
+            "ai_federation: Anthropic tool_use content and stop_reason disagree".to_string(),
+        );
+    }
+    let finish_reason = match stop_reason {
+        "end_turn" | "stop_sequence" | "pause_turn" => "stop",
+        "max_tokens" => "length",
+        "tool_use" => "tool_calls",
+        "refusal" => "content_filter",
+        _ => {
+            return Err(
+                "ai_federation: Anthropic response has an unsupported stop_reason".to_string(),
+            );
+        }
     };
 
-    let input_tokens = resp["usage"]["input_tokens"].as_u64();
-    let output_tokens = resp["usage"]["output_tokens"].as_u64();
-    let total = match (input_tokens, output_tokens) {
-        (Some(i), Some(o)) => Some(i + o),
-        _ => None,
-    };
+    let (input_tokens, output_tokens) = native_usage_pair(
+        resp.get("usage"),
+        "input_tokens",
+        "output_tokens",
+        "Anthropic",
+    )?;
+    let total = summed_usage(input_tokens, output_tokens, "Anthropic")?;
 
-    let resp_model = resp["model"].as_str().unwrap_or(model);
-    let id = resp["id"]
-        .as_str()
-        .map(String::from)
-        .unwrap_or_else(|| format!("chatcmpl-fed-{}", generate_short_id()));
-
-    let normalized = json!({
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { Value::String(text) },
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+    let mut normalized = json!({
         "id": id,
         "object": "chat.completion",
         "created": Utc::now().timestamp(),
         "model": resp_model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content
-            },
+            "message": message,
             "finish_reason": finish_reason
-        }],
-        "usage": {
-            "prompt_tokens": input_tokens.unwrap_or(0),
-            "completion_tokens": output_tokens.unwrap_or(0),
-            "total_tokens": total.unwrap_or(0)
-        }
+        }]
     });
+    insert_normalized_usage(&mut normalized, input_tokens, output_tokens, total);
 
     let tokens = TokenCounts {
         prompt_tokens: input_tokens,
@@ -2362,57 +4304,224 @@ fn normalize_from_anthropic(resp: &Value, model: &str) -> Result<(Value, TokenCo
     Ok((normalized, tokens))
 }
 
+fn gemini_prompt_is_blocked(resp: &Value) -> Result<bool, String> {
+    let Some(feedback) = resp.get("promptFeedback") else {
+        return Ok(false);
+    };
+    let feedback = feedback
+        .as_object()
+        .ok_or("ai_federation: Gemini promptFeedback must be an object")?;
+    let Some(reason) = feedback.get("blockReason") else {
+        return Ok(false);
+    };
+    match reason.as_str() {
+        Some(
+            "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "MODEL_ARMOR" | "IMAGE_SAFETY"
+            | "JAILBREAK" | "OTHER",
+        ) => Ok(true),
+        Some("BLOCK_REASON_UNSPECIFIED" | "BLOCKED_REASON_UNSPECIFIED") => Ok(false),
+        _ => Err("ai_federation: Gemini promptFeedback has an unsupported blockReason".to_string()),
+    }
+}
+
 fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCounts), String> {
-    let content = resp["candidates"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|c| c["content"]["parts"].as_array())
-        .and_then(|parts| parts.first())
-        .and_then(|p| p["text"].as_str())
-        .unwrap_or("");
+    let prompt_is_blocked = gemini_prompt_is_blocked(resp)?;
+    let candidates: &[Value] = match resp.get("candidates") {
+        Some(Value::Array(candidates)) => candidates,
+        None if prompt_is_blocked => &[],
+        _ => return Err("ai_federation: Gemini response candidates must be an array".to_string()),
+    };
+    if candidates.is_empty() && !prompt_is_blocked {
+        return Err(
+            "ai_federation: Gemini response missing non-empty candidates array".to_string(),
+        );
+    }
+    let response_id = match resp.get("responseId") {
+        Some(Value::String(value)) if !value.is_empty() && value.len() <= 128 => value.clone(),
+        Some(_) => {
+            return Err(
+                "ai_federation: Gemini response contains an invalid responseId".to_string(),
+            );
+        }
+        None => format!("chatcmpl-fed-{}", generate_short_id()),
+    };
+    let call_id_prefix = generate_short_id();
+    let mut choices = Vec::with_capacity(candidates.len().max(1));
 
-    let finish_reason = resp["candidates"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|c| c["finishReason"].as_str())
-        .map(|r| match r {
-            "STOP" => "stop",
-            "MAX_TOKENS" => "length",
-            "SAFETY" => "content_filter",
-            other => other,
-        })
-        .unwrap_or("stop");
-
-    let prompt_tokens = resp["usageMetadata"]["promptTokenCount"].as_u64();
-    let completion_tokens = resp["usageMetadata"]["candidatesTokenCount"].as_u64();
-    let total = resp["usageMetadata"]["totalTokenCount"]
-        .as_u64()
-        .or_else(|| match (prompt_tokens, completion_tokens) {
-            (Some(p), Some(c)) => Some(p + c),
-            _ => None,
-        });
-
-    let resp_model = resp["modelVersion"].as_str().unwrap_or(model);
-
-    let normalized = json!({
-        "id": format!("chatcmpl-fed-{}", generate_short_id()),
-        "object": "chat.completion",
-        "created": Utc::now().timestamp(),
-        "model": resp_model,
-        "choices": [{
+    if candidates.is_empty() {
+        choices.push(json!({
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": content
+                "content": Value::Null,
             },
-            "finish_reason": finish_reason
-        }],
-        "usage": {
-            "prompt_tokens": prompt_tokens.unwrap_or(0),
-            "completion_tokens": completion_tokens.unwrap_or(0),
-            "total_tokens": total.unwrap_or(0)
+            "finish_reason": "content_filter",
+        }));
+    }
+
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let candidate = candidate.as_object().ok_or_else(|| {
+            format!("ai_federation: Gemini candidates[{candidate_index}] must be an object")
+        })?;
+        let native_finish = candidate
+            .get("finishReason")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("ai_federation: Gemini candidates[{candidate_index}] missing finishReason")
+            })?;
+        let base_finish_reason = match native_finish {
+            "STOP" | "OTHER" => "stop",
+            "MAX_TOKENS" => "length",
+            "SAFETY"
+            | "RECITATION"
+            | "LANGUAGE"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "SPII"
+            | "MODEL_ARMOR"
+            | "MALFORMED_FUNCTION_CALL"
+            | "IMAGE_SAFETY"
+            | "IMAGE_PROHIBITED_CONTENT"
+            | "IMAGE_OTHER"
+            | "NO_IMAGE"
+            | "IMAGE_RECITATION"
+            | "UNEXPECTED_TOOL_CALL" => "content_filter",
+            _ => {
+                return Err(
+                    "ai_federation: Gemini candidate has an unsupported finishReason".to_string(),
+                );
+            }
+        };
+        let parts: &[Value] = match candidate.get("content") {
+            Some(Value::Object(content)) => {
+                match content.get("role") {
+                    Some(Value::String(role)) if role == "model" => {}
+                    None if base_finish_reason == "content_filter" => {}
+                    _ => {
+                        return Err(format!(
+                            "ai_federation: Gemini candidates[{candidate_index}] content role must be model"
+                        ));
+                    }
+                }
+                match content.get("parts") {
+                    Some(Value::Array(parts)) if !parts.is_empty() => parts,
+                    Some(Value::Array(_)) | None if base_finish_reason == "content_filter" => &[],
+                    _ => {
+                        return Err(format!(
+                            "ai_federation: Gemini candidates[{candidate_index}] missing non-empty content.parts"
+                        ));
+                    }
+                }
+            }
+            None | Some(Value::Null) if base_finish_reason == "content_filter" => &[],
+            _ => {
+                return Err(format!(
+                    "ai_federation: Gemini candidates[{candidate_index}] missing content object"
+                ));
+            }
+        };
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        for (part_index, part) in parts.iter().enumerate() {
+            match (
+                part.get("text").and_then(Value::as_str),
+                part.get("functionCall"),
+            ) {
+                (Some(part_text), None) => text.push_str(part_text),
+                (None, Some(function_call)) => {
+                    let name = required_tool_name(
+                        function_call,
+                        "name",
+                        &format!(
+                            "Gemini candidates[{candidate_index}].parts[{part_index}].functionCall"
+                        ),
+                    )?;
+                    let args = function_call
+                        .get("args")
+                        .filter(|value| value.is_object())
+                        .ok_or_else(|| {
+                            format!(
+                                "ai_federation: Gemini candidates[{candidate_index}].parts[{part_index}] functionCall args must be an object"
+                            )
+                        })?;
+                    let call_id =
+                        format!("call_fed_{call_id_prefix}_{candidate_index}_{part_index}");
+                    tool_calls.push(openai_tool_call(&call_id, name, args)?);
+                }
+                _ => {
+                    return Err(format!(
+                        "ai_federation: Gemini candidates[{candidate_index}].parts[{part_index}] must contain exactly one supported text or functionCall value"
+                    ));
+                }
+            }
         }
+        let finish_reason = if !tool_calls.is_empty() {
+            if native_finish != "STOP" {
+                return Err(format!(
+                    "ai_federation: Gemini candidates[{candidate_index}] function calls and finishReason disagree"
+                ));
+            }
+            "tool_calls"
+        } else {
+            base_finish_reason
+        };
+        if text.is_empty() && tool_calls.is_empty() && finish_reason != "content_filter" {
+            return Err(format!(
+                "ai_federation: Gemini candidates[{candidate_index}] has no non-empty text or function calls"
+            ));
+        }
+        let mut message = json!({
+            "role": "assistant",
+            "content": if text.is_empty() { Value::Null } else { Value::String(text) },
+        });
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = Value::Array(tool_calls);
+        }
+        choices.push(json!({
+            "index": candidate_index,
+            "message": message,
+            "finish_reason": finish_reason,
+        }));
+    }
+
+    let (prompt_tokens, completion_tokens) = native_usage_pair(
+        resp.get("usageMetadata"),
+        "promptTokenCount",
+        "candidatesTokenCount",
+        "Gemini",
+    )?;
+    let total = match resp["usageMetadata"]["totalTokenCount"].as_u64() {
+        Some(total) => Some(total),
+        None => summed_usage(prompt_tokens, completion_tokens, "Gemini")?,
+    };
+
+    if resp
+        .get("usageMetadata")
+        .and_then(|usage| usage.get("totalTokenCount"))
+        .is_some_and(|value| !value.is_u64())
+    {
+        return Err(
+            "ai_federation: Gemini usageMetadata.totalTokenCount must be an integer".to_string(),
+        );
+    }
+    let resp_model = match resp.get("modelVersion") {
+        Some(Value::String(value)) if is_valid_model_identifier(value) => value.as_str(),
+        Some(_) => {
+            return Err(
+                "ai_federation: Gemini response contains an invalid modelVersion".to_string(),
+            );
+        }
+        None => model,
+    };
+
+    let mut normalized = json!({
+        "id": response_id,
+        "object": "chat.completion",
+        "created": Utc::now().timestamp(),
+        "model": resp_model,
+        "choices": choices,
     });
+    insert_normalized_usage(&mut normalized, prompt_tokens, completion_tokens, total);
 
     let tokens = TokenCounts {
         prompt_tokens,
@@ -2425,49 +4534,111 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
 }
 
 fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCounts), String> {
-    let content = resp["output"]["message"]["content"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|c| c["text"].as_str())
-        .unwrap_or("");
+    let message = resp["output"]["message"]
+        .as_object()
+        .ok_or("ai_federation: Bedrock response missing output.message")?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err("ai_federation: Bedrock output.message role must be assistant".to_string());
+    }
+    let blocks = message
+        .get("content")
+        .and_then(Value::as_array)
+        .filter(|blocks| !blocks.is_empty())
+        .ok_or("ai_federation: Bedrock response missing non-empty output.message.content")?;
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        match (
+            block.get("text").and_then(Value::as_str),
+            block.get("toolUse"),
+        ) {
+            (Some(block_text), None) => text.push_str(block_text),
+            (None, Some(tool_use)) => {
+                let tool_id = required_non_empty_string(
+                    tool_use,
+                    "toolUseId",
+                    &format!("Bedrock content[{index}].toolUse"),
+                )?;
+                let tool_name = required_tool_name(
+                    tool_use,
+                    "name",
+                    &format!("Bedrock content[{index}].toolUse"),
+                )?;
+                let input = tool_use
+                    .get("input")
+                    .filter(|value| value.is_object())
+                    .ok_or_else(|| {
+                        format!(
+                            "ai_federation: Bedrock content[{index}].toolUse input must be an object"
+                        )
+                    })?;
+                tool_calls.push(openai_tool_call(tool_id, tool_name, input)?);
+            }
+            _ => {
+                return Err(format!(
+                    "ai_federation: Bedrock content[{index}] must contain exactly one supported text or toolUse value"
+                ));
+            }
+        }
+    }
+    if text.is_empty() && tool_calls.is_empty() {
+        return Err(
+            "ai_federation: Bedrock response has no non-empty text or tool calls".to_string(),
+        );
+    }
 
-    let finish_reason = match resp["stopReason"].as_str() {
-        Some("end_turn") => "stop",
-        Some("max_tokens") => "length",
-        Some("stop_sequence") => "stop",
-        Some(other) => other,
-        None => "stop",
+    let stop_reason = required_non_empty_string(resp, "stopReason", "Bedrock response")?;
+    if (stop_reason == "tool_use") != !tool_calls.is_empty() {
+        return Err("ai_federation: Bedrock toolUse content and stopReason disagree".to_string());
+    }
+    let finish_reason = match stop_reason {
+        "end_turn" | "stop_sequence" => "stop",
+        "max_tokens" | "model_context_window_exceeded" => "length",
+        "guardrail_intervened"
+        | "content_filtered"
+        | "malformed_model_output"
+        | "malformed_tool_use" => "content_filter",
+        "tool_use" => "tool_calls",
+        _ => {
+            return Err(
+                "ai_federation: Bedrock response has an unsupported stopReason".to_string(),
+            );
+        }
     };
 
-    let input_tokens = resp["usage"]["inputTokens"].as_u64();
-    let output_tokens = resp["usage"]["outputTokens"].as_u64();
-    let total =
-        resp["usage"]["totalTokens"]
-            .as_u64()
-            .or_else(|| match (input_tokens, output_tokens) {
-                (Some(i), Some(o)) => Some(i + o),
-                _ => None,
-            });
+    let (input_tokens, output_tokens) =
+        native_usage_pair(resp.get("usage"), "inputTokens", "outputTokens", "Bedrock")?;
+    let total = match resp["usage"]["totalTokens"].as_u64() {
+        Some(total) => Some(total),
+        None => summed_usage(input_tokens, output_tokens, "Bedrock")?,
+    };
 
-    let normalized = json!({
+    if resp
+        .get("usage")
+        .and_then(|usage| usage.get("totalTokens"))
+        .is_some_and(|value| !value.is_u64())
+    {
+        return Err("ai_federation: Bedrock usage.totalTokens must be an integer".to_string());
+    }
+    let mut openai_message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { Value::String(text) },
+    });
+    if !tool_calls.is_empty() {
+        openai_message["tool_calls"] = Value::Array(tool_calls);
+    }
+    let mut normalized = json!({
         "id": format!("chatcmpl-fed-{}", generate_short_id()),
         "object": "chat.completion",
         "created": Utc::now().timestamp(),
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content
-            },
+            "message": openai_message,
             "finish_reason": finish_reason
-        }],
-        "usage": {
-            "prompt_tokens": input_tokens.unwrap_or(0),
-            "completion_tokens": output_tokens.unwrap_or(0),
-            "total_tokens": total.unwrap_or(0)
-        }
+        }]
     });
+    insert_normalized_usage(&mut normalized, input_tokens, output_tokens, total);
 
     let tokens = TokenCounts {
         prompt_tokens: input_tokens,
@@ -2480,48 +4651,100 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
 }
 
 fn normalize_from_cohere(resp: &Value, model: &str) -> Result<(Value, TokenCounts), String> {
-    let content = resp["message"]["content"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|c| c["text"].as_str())
-        .unwrap_or("");
+    let id = required_non_empty_string(resp, "id", "Cohere response")?;
+    let message = resp["message"]
+        .as_object()
+        .ok_or("ai_federation: Cohere response missing message object")?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err("ai_federation: Cohere response message role must be assistant".to_string());
+    }
+    let content_blocks = message
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or("ai_federation: Cohere response message.content must be an array")?;
+    let mut text = String::new();
+    for (index, block) in content_blocks.iter().enumerate() {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            return Err(format!(
+                "ai_federation: Cohere message.content[{index}] has unsupported block type"
+            ));
+        }
+        text.push_str(block.get("text").and_then(Value::as_str).ok_or_else(|| {
+            format!("ai_federation: Cohere message.content[{index}] missing text")
+        })?);
+    }
+    let tool_calls = parse_provider_tool_calls(message, 0, "Cohere")?;
+    if text.is_empty() && tool_calls.is_empty() {
+        return Err(
+            "ai_federation: Cohere response has no non-empty text or tool calls".to_string(),
+        );
+    }
 
-    let finish_reason = match resp["finish_reason"].as_str() {
-        Some("COMPLETE") => "stop",
-        Some("MAX_TOKENS") => "length",
-        Some("STOP_SEQUENCE") => "stop",
-        Some(other) => other,
-        None => "stop",
+    let native_finish_reason = required_non_empty_string(resp, "finish_reason", "Cohere response")?;
+    if (native_finish_reason == "TOOL_CALL") != !tool_calls.is_empty() {
+        return Err("ai_federation: Cohere tool calls and finish_reason disagree".to_string());
+    }
+    let finish_reason = match native_finish_reason {
+        "COMPLETE" | "STOP_SEQUENCE" => "stop",
+        "MAX_TOKENS" => "length",
+        "TOOL_CALL" => "tool_calls",
+        "ERROR" | "TIMEOUT" => "content_filter",
+        _ => {
+            return Err(
+                "ai_federation: Cohere response has an unsupported finish_reason".to_string(),
+            );
+        }
     };
 
-    let input_tokens = resp["usage"]["tokens"]["input_tokens"].as_u64();
-    let output_tokens = resp["usage"]["tokens"]["output_tokens"].as_u64();
-    let total = match (input_tokens, output_tokens) {
-        (Some(i), Some(o)) => Some(i + o),
-        _ => None,
+    let (input_tokens, output_tokens) = native_usage_pair(
+        resp.get("usage").and_then(|usage| usage.get("tokens")),
+        "input_tokens",
+        "output_tokens",
+        "Cohere",
+    )?;
+    let total = summed_usage(input_tokens, output_tokens, "Cohere")?;
+
+    let resp_model = match resp.get("model") {
+        Some(Value::String(value)) if is_valid_model_identifier(value) => value.as_str(),
+        Some(_) => {
+            return Err("ai_federation: Cohere response contains an invalid model".to_string());
+        }
+        None => model,
     };
 
-    let resp_model = resp["model"].as_str().unwrap_or(model);
-
-    let normalized = json!({
-        "id": resp["id"].as_str().map(String::from).unwrap_or_else(|| format!("chatcmpl-fed-{}", generate_short_id())),
+    let mut openai_message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { Value::String(text) },
+    });
+    if !tool_calls.is_empty() {
+        openai_message["tool_calls"] = Value::Array(
+            tool_calls
+                .into_iter()
+                .map(|call| {
+                    json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+    let mut normalized = json!({
+        "id": id,
         "object": "chat.completion",
         "created": Utc::now().timestamp(),
         "model": resp_model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content
-            },
+            "message": openai_message,
             "finish_reason": finish_reason
-        }],
-        "usage": {
-            "prompt_tokens": input_tokens.unwrap_or(0),
-            "completion_tokens": output_tokens.unwrap_or(0),
-            "total_tokens": total.unwrap_or(0)
-        }
+        }]
     });
+    insert_normalized_usage(&mut normalized, input_tokens, output_tokens, total);
 
     let tokens = TokenCounts {
         prompt_tokens: input_tokens,
@@ -2548,56 +4771,100 @@ fn generate_short_id() -> String {
 // ---------------------------------------------------------------------------
 
 impl AiFederation {
-    /// Call a provider and return (status, body_bytes).
+    /// Call a provider with bounded response collection and replay-safety
+    /// classification for this non-idempotent POST.
     async fn call_provider(
         &self,
         provider: &ResolvedProvider,
         url: &str,
         extra_headers: Vec<(String, String)>,
         body: &[u8],
-    ) -> Result<(u16, Vec<u8>), String> {
-        let auth_headers = self.build_auth_headers(provider, url, body).await?;
+        latency_accumulator: &AtomicU64,
+    ) -> Result<ProviderResponse, ProviderCallFailure> {
+        validate_dispatch_url(url).map_err(|_| ProviderCallFailure {
+            kind: ProviderCallFailureKind::PreWire,
+            error_class: crate::retry::ErrorClass::DispatchPolicyRejected,
+            headers: HashMap::new(),
+            circuit_failure: false,
+        })?;
+        let auth_headers = self
+            .build_auth_headers(provider, url, body, latency_accumulator)
+            .await
+            .map_err(|failure| {
+                debug!(
+                    provider = %provider.name,
+                    error = %failure.message,
+                    "ai_federation: provider authentication preparation failed"
+                );
+                ProviderCallFailure {
+                    kind: ProviderCallFailureKind::PreWire,
+                    error_class: crate::retry::ErrorClass::RequestError,
+                    headers: HashMap::new(),
+                    circuit_failure: failure.impact == AuthFailureImpact::ProviderUnavailable,
+                }
+            })?;
 
-        let req = self
+        let mut req = self
             .http_client
             .get()
             .post(url)
             .connect_timeout(provider.connect_timeout)
             .timeout(provider.read_timeout);
 
-        let mut req = req;
         for (k, v) in &auth_headers {
             req = req.header(k.as_str(), v.as_str());
         }
         for (k, v) in &extra_headers {
             req = req.header(k.as_str(), v.as_str());
         }
-        req = req.body(body.to_vec());
+        req = req.body(Bytes::copy_from_slice(body));
 
         let resp = self
             .http_client
-            .execute(req, "ai_federation")
+            .execute_redacted_tracked_classified(
+                req,
+                "ai_federation",
+                redacted_endpoint_for_log(url),
+                latency_accumulator,
+            )
             .await
-            .map_err(|e| {
-                format!(
-                    "ai_federation: provider '{}' request failed: {e}",
-                    provider.name
-                )
+            .map_err(|failure| ProviderCallFailure {
+                kind: if failure.request_reached_wire {
+                    ProviderCallFailureKind::Ambiguous
+                } else {
+                    ProviderCallFailureKind::PreWire
+                },
+                error_class: failure.error_class,
+                headers: HashMap::new(),
+                circuit_failure: failure.error_class
+                    != crate::retry::ErrorClass::DispatchPolicyRejected,
             })?;
 
         let status = resp.status().as_u16();
-        let resp_body = resp
-            .bytes()
-            .await
-            .map_err(|e| {
-                format!(
-                    "ai_federation: provider '{}' response read failed: {e}",
-                    provider.name
-                )
-            })?
-            .to_vec();
+        let headers = safe_provider_response_headers(resp.headers());
+        let body_read_started = std::time::Instant::now();
+        let body_result = read_response_body_bounded(resp, provider.max_response_body_bytes).await;
+        add_external_io_elapsed(latency_accumulator, body_read_started);
+        let resp_body = body_result.map_err(|error| match error {
+            BoundedReadError::LimitExceeded { .. } => ProviderCallFailure {
+                kind: ProviderCallFailureKind::ResponseTooLarge,
+                error_class: crate::retry::ErrorClass::ResponseBodyTooLarge,
+                headers: headers.clone(),
+                circuit_failure: true,
+            },
+            BoundedReadError::Stream(error) => ProviderCallFailure {
+                kind: ProviderCallFailureKind::Ambiguous,
+                error_class: crate::retry::classify_reqwest_error(&error),
+                headers: headers.clone(),
+                circuit_failure: true,
+            },
+        })?;
 
-        Ok((status, resp_body))
+        Ok(ProviderResponse {
+            status,
+            headers,
+            body: resp_body,
+        })
     }
 
     /// Build authentication headers for a provider.
@@ -2606,7 +4873,8 @@ impl AiFederation {
         provider: &ResolvedProvider,
         url: &str,
         payload: &[u8],
-    ) -> Result<Vec<(String, String)>, String> {
+        latency_accumulator: &AtomicU64,
+    ) -> Result<Vec<(String, String)>, AuthFailure> {
         match &provider.auth {
             AuthMethod::BearerToken { api_key } => Ok(vec![(
                 "authorization".to_string(),
@@ -2629,10 +4897,13 @@ impl AiFederation {
                     payload,
                     &now,
                 )
+                .map_err(AuthFailure::local)
             }
 
             AuthMethod::GoogleOAuth2 { cache } => {
-                let token = cache.get_token(&self.http_client).await?;
+                let token = cache
+                    .get_token(&self.http_client, latency_accumulator)
+                    .await?;
                 Ok(vec![(
                     "authorization".to_string(),
                     format!("Bearer {token}"),
@@ -2640,17 +4911,58 @@ impl AiFederation {
             }
         }
     }
+}
 
-    /// Determine if an error should trigger fallback.
-    fn should_fallback(&self, result: &Result<(u16, Vec<u8>), String>) -> bool {
-        if !self.fallback_enabled {
-            return false;
+fn validate_dispatch_url(url: &str) -> Result<(), String> {
+    let parsed = Url::parse(url)
+        .map_err(|_| "ai_federation: rendered provider endpoint is invalid".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("ai_federation: rendered provider endpoint violates URL policy".to_string());
+    }
+    Ok(())
+}
+
+fn safe_provider_response_headers(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
+    let mut safe = HashMap::new();
+    for (name, value) in headers {
+        let name = name.as_str();
+        if !is_safe_provider_response_header(name) {
+            continue;
         }
-        match result {
-            Err(_) => self.fallback_on_network_errors,
-            Ok((status, _)) => self.fallback_status_codes.contains(status),
+        if let Ok(value) = value.to_str() {
+            if value.len() > MAX_FORWARDED_PROVIDER_HEADER_VALUE_BYTES {
+                continue;
+            }
+            // These allowlisted fields are singular protocol/correlation
+            // metadata. Keep the first value and drop duplicates instead of
+            // creating an ambiguous comma-folded Retry-After or request ID.
+            if safe.len() < MAX_FORWARDED_PROVIDER_HEADERS {
+                safe.entry(name.to_string())
+                    .or_insert_with(|| value.to_string());
+            }
         }
     }
+    safe
+}
+
+fn is_safe_provider_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "retry-after"
+            | "request-id"
+            | "x-request-id"
+            | "x-ms-request-id"
+            | "x-goog-request-id"
+            | "anthropic-request-id"
+            | "openai-request-id"
+    ) || name.starts_with("x-ratelimit-")
+        || name.starts_with("ratelimit-")
+        || name.starts_with("anthropic-ratelimit-")
 }
 
 // ---------------------------------------------------------------------------
@@ -2668,10 +4980,18 @@ impl Plugin for AiFederation {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_GRPC_PROTOCOLS
+        super::HTTP_ONLY_PROTOCOLS
     }
 
-    fn requires_request_body_before_before_proxy(&self) -> bool {
+    fn requires_request_body_buffering(&self) -> bool {
+        true
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        true
+    }
+
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
         true
     }
 
@@ -2682,17 +5002,6 @@ impl Plugin for AiFederation {
         let Some(content_type) = ctx.headers.get("content-type") else {
             return false;
         };
-        // Mirror the native-gRPC pass-through in `before_proxy`: `is_json_content_type`
-        // accepts the `+json` suffix, so `application/grpc+json` would otherwise be
-        // buffered here — and this predicate is evaluated by the H1/H2 path in
-        // `src/proxy/mod.rs` *before* any `before_proxy` hook runs (via
-        // `requires_request_body_before_before_proxy`). Buffering a native gRPC
-        // request fully drains client-streaming / large bodies even though
-        // `before_proxy` then returns `Continue`, so the gRPC exclusion must apply
-        // to the buffering decision too, not just the hook.
-        if crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
-            return false;
-        }
         is_json_content_type(content_type)
     }
 
@@ -2711,10 +5020,11 @@ impl Plugin for AiFederation {
         hostnames
     }
 
-    async fn before_proxy(
+    async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
-        headers: &mut HashMap<String, String>,
+        headers: &HashMap<String, String>,
+        body: &[u8],
     ) -> PluginResult {
         // Coordinate with `ai_stream_router` (priority 2984, runs first). When it
         // claims a streaming request, or explicitly passes one through because
@@ -2747,35 +5057,25 @@ impl Plugin for AiFederation {
             return PluginResult::Continue;
         }
 
-        // Native gRPC bodies are length-prefixed framing (5-byte
-        // compression/length header + payload), not raw OpenAI JSON. Because
-        // this plugin advertises `HTTP_GRPC_PROTOCOLS` and `is_json_content_type`
-        // accepts the `+json` suffix, a `content-type: application/grpc+json`
-        // request would otherwise be buffered and reach the JSON parse below,
-        // which would reject the gRPC frame as malformed JSON under the
-        // fail-closed policy. gRPC model-routing is out of scope for this
-        // OpenAI-format gateway, so pass framed gRPC traffic through untouched —
-        // matching how `ai_token_metrics` opts native gRPC out of JSON parsing.
-        if crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
-            debug!(
-                "ai_federation: native gRPC content-type, passing through (gRPC model routing unsupported)"
-            );
-            return PluginResult::Continue;
-        }
+        // `request_deduplication` may already own an in-flight key because its
+        // before-proxy hook runs earlier. Until provider I/O commits, every
+        // federation rejection is safe to retry and must release that ownership
+        // from the final committed-response hook. A committed or ambiguous
+        // provider call replaces this marker with the non-replayable external
+        // operation marker below.
+        ctx.metadata.insert(
+            RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
 
-        // Read request body. `store_request_body_metadata()` in
-        // `src/proxy/mod.rs` only inserts `request_body` for UTF-8 bodies and
-        // removes the key for non-UTF-8 bodies, so this `None` branch covers
-        // both "no body was sent" and "a body was sent but isn't UTF-8". The
-        // message reflects both cases; either way a binary body cannot be JSON,
-        // so the 400 reject is the correct fail-closed outcome.
-        let body_str = match ctx.metadata.get("request_body") {
-            Some(b) => b.as_str(),
-            None => {
+        // Provider dispatch happens from the final-body hook so decompression,
+        // request transforms, and earlier AI policy hooks all inspect and
+        // produce the same representation that leaves the gateway.
+        let body_str = match std::str::from_utf8(body) {
+            Ok(value) if !value.is_empty() => value,
+            _ => {
                 if self.fail_on_missing_model {
-                    debug!(
-                        "ai_federation: rejecting JSON POST without a buffered UTF-8 request body"
-                    );
+                    debug!("ai_federation: rejecting JSON POST without a final UTF-8 request body");
                     return self.openai_error_response(
                         400,
                         "Request body is required and must be UTF-8 JSON for ai_federation model routing",
@@ -2785,8 +5085,9 @@ impl Plugin for AiFederation {
                     );
                 }
                 debug!(
-                    "ai_federation: no request_body in metadata, passing through by explicit opt-in"
+                    "ai_federation: final body is empty or non-UTF-8, passing through by explicit opt-in"
                 );
+                ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
         };
@@ -2807,6 +5108,7 @@ impl Plugin for AiFederation {
                 debug!(
                     "ai_federation: request body is not valid JSON, passing through by explicit opt-in: {e}"
                 );
+                ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
         };
@@ -2828,6 +5130,7 @@ impl Plugin for AiFederation {
                 debug!(
                     "ai_federation: request has non-string 'model' field, passing through by explicit opt-in"
                 );
+                ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
             None => {
@@ -2844,9 +5147,19 @@ impl Plugin for AiFederation {
                 debug!(
                     "ai_federation: request missing 'model' field, passing through by explicit opt-in"
                 );
+                ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
         };
+        if !is_valid_model_identifier(&model) {
+            return self.openai_error_response(
+                400,
+                "Invalid 'model' field: use a bounded provider model identifier without URL query, fragment, userinfo, traversal, whitespace, or control characters",
+                "invalid_request_error",
+                Some("model"),
+                Some("invalid_model"),
+            );
+        }
 
         // Find matching providers
         let matching_providers = self.find_providers_for_model(&model);
@@ -2869,6 +5182,7 @@ impl Plugin for AiFederation {
                 model = %model,
                 "ai_federation: no provider matches model, passing through by explicit opt-in"
             );
+            ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
             return PluginResult::Continue;
         }
 
@@ -2894,25 +5208,150 @@ impl Plugin for AiFederation {
             );
         }
 
+        let deferred_non_text_validation_error =
+            match validate_openai_request(&openai_body, false) {
+                Ok(()) => None,
+                Err(strict_message) => {
+                    if let Err(message) = validate_openai_request(&openai_body, true) {
+                        return self.openai_error_response(
+                            400,
+                            &message,
+                            "invalid_request_error",
+                            None,
+                            Some("invalid_request"),
+                        );
+                    }
+                    if !matching_providers.iter().any(|provider| {
+                        provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
+                    }) {
+                        return self.openai_error_response(
+                            400,
+                            &strict_message,
+                            "invalid_request_error",
+                            None,
+                            Some("invalid_request"),
+                        );
+                    }
+                    Some(strict_message)
+                }
+            };
+
+        let _request_permit = match self.request_slots.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return self.openai_error_response(
+                    503,
+                    "ai_federation provider concurrency limit reached",
+                    "server_error",
+                    None,
+                    Some("provider_concurrency_exhausted"),
+                );
+            }
+        };
+
         let multimodal_usage = analyze_multimodal_usage(&openai_body);
+        let mut last_client_rejection: Option<String> = None;
+        let mut last_failure_result: Option<PluginResult> = None;
+        let mut attempted_provider = false;
+        let mut skipped_open_circuit = false;
 
-        // Try providers in priority order with fallback
-        let mut last_error: Option<String> = None;
-        let mut last_status: Option<u16> = None;
-        let mut last_body: Option<Vec<u8>> = None;
-        // Multimodal capability is provider-SPECIFIC: a reject-mode (or a
-        // translate-mode provider that can't translate this particular part,
-        // e.g. Bedrock + an unsupported image format) provider failing the
-        // policy gate must not abort the whole fallback chain — a later
-        // provider may still serve the request. We record the last such
-        // rejection so that, if EVERY provider is exhausted on policy alone
-        // (no provider was ever dialed), we can return a clean 400 instead of
-        // a generic 502.
-        let mut last_multimodal_rejection: Option<String> = None;
-
-        let provider_count = matching_providers.len();
         for (idx, provider) in matching_providers.iter().enumerate() {
-            let is_last_provider = idx + 1 == provider_count;
+            let has_later_provider = matching_providers[idx + 1..].iter().any(|candidate| {
+                candidate
+                    .circuit
+                    .as_ref()
+                    .is_none_or(ProviderCircuit::may_admit)
+            });
+            let admission = provider
+                .circuit
+                .as_ref()
+                .map(ProviderCircuit::admit)
+                .unwrap_or(CircuitAdmission::Closed);
+            let mut half_open_probe_guard = match (provider.circuit.as_ref(), admission) {
+                (Some(circuit), CircuitAdmission::HalfOpenProbe) => {
+                    Some(HalfOpenProbeGuard::new(circuit))
+                }
+                _ => None,
+            };
+            if admission == CircuitAdmission::Open {
+                skipped_open_circuit = true;
+                super::prometheus_metrics::global_registry().record_ai_federation_open_skip();
+                let skips = ctx
+                    .metadata
+                    .get("ai_federation_circuit_open_skips")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                ctx.metadata.insert(
+                    "ai_federation_circuit_open_skips".to_string(),
+                    skips.to_string(),
+                );
+                ctx.metadata.insert(
+                    "ai_federation_circuit_last_provider".to_string(),
+                    provider.name.clone(),
+                );
+                ctx.metadata.insert(
+                    "ai_federation_circuit_last_state".to_string(),
+                    "open".to_string(),
+                );
+                debug!(
+                    provider = %provider.name,
+                    "ai_federation: skipping provider with open circuit"
+                );
+                if !self.fallback_enabled {
+                    return self.openai_error_response(
+                        503,
+                        "The selected AI provider circuit is open and fallback is disabled",
+                        "server_error",
+                        None,
+                        Some("provider_circuit_open"),
+                    );
+                }
+                continue;
+            }
+            if provider.multimodal_mode != MultimodalMode::TextOnlyWithWarning
+                && let Some(message) = &deferred_non_text_validation_error
+            {
+                if let Some(guard) = half_open_probe_guard.as_mut() {
+                    guard.release();
+                }
+                last_client_rejection = Some(message.clone());
+                if self.fallback_enabled && has_later_provider {
+                    continue;
+                }
+                break;
+            }
+            if provider.circuit.is_some() {
+                ctx.metadata.insert(
+                    "ai_federation_circuit_last_provider".to_string(),
+                    provider.name.clone(),
+                );
+                ctx.metadata.insert(
+                    "ai_federation_circuit_last_state".to_string(),
+                    match admission {
+                        CircuitAdmission::Closed => "closed",
+                        CircuitAdmission::HalfOpenProbe => "half_open_probe",
+                        CircuitAdmission::Open => "open",
+                    }
+                    .to_string(),
+                );
+                if admission == CircuitAdmission::HalfOpenProbe {
+                    let probes = ctx
+                        .metadata
+                        .get("ai_federation_circuit_half_open_probes")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    ctx.metadata.insert(
+                        "ai_federation_circuit_half_open_probes".to_string(),
+                        probes.to_string(),
+                    );
+                    info!(
+                        provider = %provider.name,
+                        "ai_federation: provider circuit admitted a half-open probe"
+                    );
+                }
+            }
             let resolved_model = Self::resolve_model(provider, &model);
 
             // Defense against URL injection via the user-controlled `model`
@@ -2928,10 +5367,12 @@ impl Plugin for AiFederation {
             if provider_embeds_model_in_url(provider.provider_type)
                 && !is_valid_url_model_component(&resolved_model)
             {
+                if let Some(guard) = half_open_probe_guard.as_mut() {
+                    guard.release();
+                }
                 warn!(
                     provider = %provider.name,
                     provider_type = %provider.provider_type.as_str(),
-                    model = %resolved_model,
                     "ai_federation: rejected request — resolved model contains characters not permitted in URL path"
                 );
                 return self.openai_error_response(
@@ -2951,17 +5392,13 @@ impl Plugin for AiFederation {
                     provider_type = %provider.provider_type.as_str(),
                     multimodal_mode = %provider.multimodal_mode.as_str(),
                     non_text_parts = multimodal_usage.non_text_parts,
-                    part_types = %multimodal_usage.types_csv(),
-                    roles = %multimodal_usage.roles_csv(),
                     "ai_federation: provider cannot serve multimodal request, trying fallback"
                 );
-                last_multimodal_rejection = Some(message);
-                // Per-provider policy rejection — fall through to the next
-                // provider exactly like a per-provider translation failure
-                // does, instead of aborting the whole chain. This lets a
-                // mixed list (e.g. a reject-mode provider followed by a
-                // translate-mode one) serve the image from the later provider.
-                if self.fallback_enabled && !is_last_provider {
+                if let Some(guard) = half_open_probe_guard.as_mut() {
+                    guard.release();
+                }
+                last_client_rejection = Some(message);
+                if self.fallback_enabled && has_later_provider {
                     continue;
                 }
                 break;
@@ -2980,8 +5417,6 @@ impl Plugin for AiFederation {
                     provider = %provider.name,
                     provider_type = %provider.provider_type.as_str(),
                     non_text_parts = multimodal_usage.non_text_parts,
-                    part_types = %multimodal_usage.types_csv(),
-                    roles = %multimodal_usage.roles_csv(),
                     "ai_federation: dropping non-text multimodal content by explicit text_only_with_warning policy"
                 );
             }
@@ -2991,11 +5426,13 @@ impl Plugin for AiFederation {
                 Err(e) => {
                     warn!(
                         provider = %provider.name,
-                        error = %e,
                         "ai_federation: request translation failed"
                     );
-                    last_error = Some(e);
-                    if self.fallback_enabled && !is_last_provider {
+                    if let Some(guard) = half_open_probe_guard.as_mut() {
+                        guard.release();
+                    }
+                    last_client_rejection = Some(e);
+                    if self.fallback_enabled && has_later_provider {
                         continue;
                     }
                     break;
@@ -3008,64 +5445,204 @@ impl Plugin for AiFederation {
                 provider = %provider.name,
                 provider_type = %provider.provider_type.as_str(),
                 model = %resolved_model,
-                url = %url,
+                endpoint = redacted_endpoint_for_log(&url),
                 "ai_federation: calling provider"
             );
 
-            let result = self
-                .call_provider(provider, &url, extra_headers, &body_bytes)
-                .await;
-
-            // Only fallback to the next provider if there is one remaining.
-            // On the last provider, fall through to process the response
-            // normally so normalization and token metadata writes still happen.
-            if self.should_fallback(&result) && !is_last_provider {
-                match &result {
-                    Err(e) => {
-                        warn!(
-                            provider = %provider.name,
-                            error = %e,
-                            "ai_federation: provider failed, trying fallback"
-                        );
-                        last_error = Some(e.clone());
-                    }
-                    Ok((status, body)) => {
-                        warn!(
-                            provider = %provider.name,
-                            status = %status,
-                            "ai_federation: provider returned fallback-eligible status"
-                        );
-                        last_status = Some(*status);
-                        last_body = Some(cap_upstream_error_body(body.clone()));
-                    }
+            attempted_provider = true;
+            let response = match self
+                .call_provider(
+                    provider,
+                    &url,
+                    extra_headers,
+                    &body_bytes,
+                    ctx.plugin_http_call_ns.as_ref(),
+                )
+                .await
+            {
+                Ok(response) => {
+                    // A provider returned response headers, so the billable
+                    // operation has a committed outcome even if its body or
+                    // schema later fails. Request deduplication consumes this
+                    // internal marker only after the final client-visible
+                    // response is committed and publishes a non-replayable
+                    // tombstone for an idempotency-key retry.
+                    ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+                    ctx.metadata.insert(
+                        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+                        "true".to_string(),
+                    );
+                    response
                 }
-                continue;
-            }
-
-            // No fallback needed — process the response
-            let (status, resp_body) = match result {
-                Ok(r) => r,
-                Err(e) => {
-                    return self.openai_error_response(
+                Err(failure) => {
+                    if failure.kind != ProviderCallFailureKind::PreWire {
+                        // Ambiguous writes may have completed remotely, and an
+                        // oversized body proves that response headers arrived.
+                        // Both must suppress an independent client retry under
+                        // the same idempotency key even when provider fallback
+                        // itself is disabled.
+                        ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+                        ctx.metadata.insert(
+                            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+                            "true".to_string(),
+                        );
+                    }
+                    if let Some(circuit) = &provider.circuit {
+                        if failure.circuit_failure {
+                            circuit.record_failure(&provider.name, admission);
+                            if let Some(guard) = half_open_probe_guard.as_mut() {
+                                guard.resolve();
+                            }
+                        } else if let Some(guard) = half_open_probe_guard.as_mut() {
+                            guard.release();
+                        }
+                    }
+                    warn!(
+                        provider = %provider.name,
+                        error_class = failure.error_class.as_str(),
+                        failure_kind = ?failure.kind,
+                        "ai_federation: provider request failed"
+                    );
+                    if failure.kind == ProviderCallFailureKind::ResponseTooLarge {
+                        return self.openai_error_response_with_headers(
+                            502,
+                            "Provider response exceeded the configured size limit",
+                            "server_error",
+                            None,
+                            Some("provider_response_too_large"),
+                            failure.headers,
+                        );
+                    }
+                    let fallback_allowed = self.fallback_enabled
+                        && has_later_provider
+                        && match failure.kind {
+                            ProviderCallFailureKind::PreWire => self.fallback_on_network_errors,
+                            ProviderCallFailureKind::Ambiguous => self.fallback_on_ambiguous_errors,
+                            ProviderCallFailureKind::ResponseTooLarge => false,
+                        };
+                    if fallback_allowed {
+                        let (message, code) = if failure.kind == ProviderCallFailureKind::Ambiguous
+                        {
+                            (
+                                "Provider request failed after the outcome became ambiguous; automatic replay was explicitly enabled",
+                                "ambiguous_provider_outcome",
+                            )
+                        } else {
+                            (
+                                "Provider request failed before a response was received",
+                                "provider_request_failed",
+                            )
+                        };
+                        last_failure_result = Some(self.openai_error_response_with_headers(
+                            502,
+                            message,
+                            "server_error",
+                            None,
+                            Some(code),
+                            failure.headers.clone(),
+                        ));
+                        continue;
+                    }
+                    let (message, code) = if failure.kind == ProviderCallFailureKind::Ambiguous {
+                        (
+                            "Provider request failed after the outcome became ambiguous; automatic replay was suppressed",
+                            "ambiguous_provider_outcome",
+                        )
+                    } else {
+                        (
+                            "Provider request failed before a response was received",
+                            "provider_request_failed",
+                        )
+                    };
+                    return self.openai_error_response_with_headers(
                         502,
-                        &format!("Provider '{}' request failed: {e}", provider.name),
+                        message,
                         "server_error",
                         None,
-                        Some("provider_request_failed"),
+                        Some(code),
+                        failure.headers,
                     );
                 }
             };
 
-            match normalize_response(provider.provider_type, status, &resp_body, &resolved_model) {
-                Ok((normalized, token_counts)) => {
-                    // Write token metadata for downstream plugins
-                    self.write_token_metadata(
-                        ctx,
-                        &token_counts,
-                        provider.provider_type,
-                        &provider.name,
-                        &resolved_model,
+            let status = response.status;
+            // Record provider provenance and its ORIGINAL status before
+            // normalization or bounded serialization can fail. In particular,
+            // `ai_rate_limiter` must treat a usage-less provider 2xx followed by
+            // a synthetic 502 as an unmetered provider success, not as a free
+            // gateway rejection that releases the pre-reservation.
+            ctx.metadata
+                .insert("ai_federation_provider".to_string(), provider.name.clone());
+            ctx.metadata
+                .insert("ai_federation_status".to_string(), status.to_string());
+            if self.fallback_status_codes.contains(&status) {
+                if let Some(circuit) = &provider.circuit {
+                    circuit.record_failure(&provider.name, admission);
+                    if let Some(guard) = half_open_probe_guard.as_mut() {
+                        guard.resolve();
+                    }
+                }
+                if self.fallback_enabled && has_later_provider {
+                    warn!(
+                        provider = %provider.name,
+                        status,
+                        "ai_federation: provider returned fallback-eligible status"
                     );
+                    last_failure_result = Some(self.openai_error_response_with_headers(
+                        status,
+                        &format!("Upstream provider returned status {status}"),
+                        "upstream_error",
+                        None,
+                        Some("upstream_error"),
+                        response.headers.clone(),
+                    ));
+                    continue;
+                }
+            } else if (300..400).contains(&status) {
+                if let Some(circuit) = &provider.circuit {
+                    circuit.record_failure(&provider.name, admission);
+                    if let Some(guard) = half_open_probe_guard.as_mut() {
+                        guard.resolve();
+                    }
+                }
+                if self.fallback_enabled && self.fallback_on_protocol_errors && has_later_provider {
+                    last_failure_result = Some(self.openai_error_response_with_headers(
+                        status,
+                        &format!("Upstream provider returned status {status}"),
+                        "upstream_error",
+                        None,
+                        Some("upstream_error"),
+                        response.headers.clone(),
+                    ));
+                    continue;
+                }
+            }
+
+            match normalize_response(
+                provider.provider_type,
+                status,
+                &response.body,
+                &resolved_model,
+            ) {
+                Ok((normalized, token_counts)) => {
+                    if let Some(circuit) = &provider.circuit
+                        && !self.fallback_status_codes.contains(&status)
+                        && !(300..400).contains(&status)
+                    {
+                        circuit.record_success(&provider.name, admission);
+                        if let Some(guard) = half_open_probe_guard.as_mut() {
+                            guard.resolve();
+                        }
+                    }
+                    if (200..300).contains(&status) {
+                        self.write_token_metadata(
+                            ctx,
+                            &token_counts,
+                            provider.provider_type,
+                            &provider.name,
+                            &resolved_model,
+                        );
+                    }
 
                     // Record the multimodal-drop audit/chargeback metadata only
                     // now that THIS provider has committed to serving the
@@ -3074,7 +5651,8 @@ impl Plugin for AiFederation {
                     // transaction log if a `text_only_with_warning` provider
                     // failed over to a later `translate` provider that preserved
                     // the image.
-                    if provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
+                    if (200..300).contains(&status)
+                        && provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
                         && !multimodal_usage.is_empty()
                     {
                         self.write_multimodal_text_only_metadata(ctx, provider, &multimodal_usage);
@@ -3088,100 +5666,110 @@ impl Plugin for AiFederation {
                         "ai_federation: request completed"
                     );
 
-                    let bytes_received = match serde_json::to_vec(&normalized) {
+                    let bytes_received = match serialize_json_bounded(
+                        &normalized,
+                        provider.max_response_body_bytes,
+                    ) {
                         Ok(b) => b,
-                        Err(e) => {
-                            // Practically unreachable: `normalized` is built from
-                            // `serde_json::json!()` macros over plain primitives,
-                            // so serialization cannot fail. Returning a 502 with
-                            // a structured error keeps callers from receiving an
-                            // empty-body 200 in the impossible case.
+                        Err(BoundedJsonSerializationError::LimitExceeded) => {
                             warn!(
                                 provider = %provider.name,
-                                error = %e,
+                                "ai_federation: normalized provider response exceeded configured size limit"
+                            );
+                            return self.openai_error_response_with_headers(
+                                502,
+                                "Normalized provider response exceeded the configured size limit",
+                                "server_error",
+                                None,
+                                Some("provider_response_too_large"),
+                                response.headers,
+                            );
+                        }
+                        Err(BoundedJsonSerializationError::Serialization) => {
+                            warn!(
+                                provider = %provider.name,
+                                error_class = "serialization_error",
                                 "ai_federation: failed to serialize normalized response"
                             );
-                            return self.openai_error_response(
+                            return self.openai_error_response_with_headers(
                                 502,
-                                &format!(
-                                    "Provider '{}' response serialization failed: {e}",
-                                    provider.name
-                                ),
+                                "Provider response serialization failed",
                                 "server_error",
                                 None,
                                 Some("response_serialization_failed"),
+                                response.headers,
                             );
                         }
                     };
-                    let mut resp_headers = HashMap::new();
+                    let mut resp_headers = response.headers;
                     resp_headers.insert("content-type".to_string(), "application/json".to_string());
 
-                    let status_code = if status >= 400 { status } else { 200 };
-                    // Record the synthetic response status alongside the token
-                    // metadata so `ai_rate_limiter` can reconcile a pre-reservation
-                    // against the provider's ORIGINAL status. This response is a
-                    // `before_proxy` short-circuit, so a later response-body
-                    // guardrail can replace it with a 5xx before `ai_rate_limiter`'s
-                    // after_proxy runs; without this signal a usage-less federation
-                    // response that gets guard-rejected would release the
-                    // reservation for a provider call that already consumed tokens.
-                    ctx.metadata
-                        .insert("ai_federation_status".to_string(), status_code.to_string());
-
                     return PluginResult::RejectBinary {
-                        status_code,
+                        status_code: status,
                         body: Bytes::from(bytes_received),
                         headers: resp_headers,
                     };
                 }
                 Err(e) => {
+                    if let Some(circuit) = &provider.circuit {
+                        circuit.record_failure(&provider.name, admission);
+                        if let Some(guard) = half_open_probe_guard.as_mut() {
+                            guard.resolve();
+                        }
+                    }
                     warn!(
                         provider = %provider.name,
                         error = %e,
                         "ai_federation: response normalization failed"
                     );
-                    return self.openai_error_response(
+                    if self.fallback_enabled
+                        && self.fallback_on_protocol_errors
+                        && has_later_provider
+                    {
+                        last_failure_result = Some(self.openai_error_response_with_headers(
+                            502,
+                            "Provider returned a malformed success response",
+                            "server_error",
+                            None,
+                            Some("response_normalization_failed"),
+                            response.headers,
+                        ));
+                        continue;
+                    }
+                    return self.openai_error_response_with_headers(
                         502,
-                        &format!(
-                            "Provider '{}' response normalization failed: {e}",
-                            provider.name
-                        ),
+                        "Provider returned a malformed success response",
                         "server_error",
                         None,
                         Some("response_normalization_failed"),
+                        response.headers,
                     );
                 }
             }
         }
 
-        // All providers exhausted
-        if let Some(body) = last_body {
-            // Return the last provider's capped error as valid JSON.
-            let status = last_status.unwrap_or(502);
-            let mut resp_headers = HashMap::new();
-            resp_headers.insert("content-type".to_string(), "application/json".to_string());
-            PluginResult::RejectBinary {
-                status_code: status,
-                body: Bytes::from(body),
-                headers: resp_headers,
-            }
-        } else if last_error.is_none()
-            && let Some(message) = last_multimodal_rejection
-        {
-            // No provider was ever dialed and no wire error occurred — every
-            // matching provider declined the multimodal request at the policy
-            // gate. This is purely a client-input problem, so return a clean
-            // 400 (preserving the single-provider behavior) rather than a
-            // generic 502.
-            self.error_response(400, &message)
+        if let Some(result) = last_failure_result {
+            result
+        } else if !attempted_provider && let Some(message) = last_client_rejection {
+            self.openai_error_response(
+                400,
+                &message,
+                "invalid_request_error",
+                None,
+                Some("provider_translation_failed"),
+            )
+        } else if !attempted_provider && skipped_open_circuit {
+            self.openai_error_response(
+                503,
+                "All matching AI provider circuits are open",
+                "server_error",
+                None,
+                Some("provider_circuit_open"),
+            )
         } else {
             self.openai_error_response(
                 502,
-                &format!(
-                    "All AI providers failed for model '{}': {}",
-                    model,
-                    last_error.unwrap_or_else(|| "unknown error".to_string())
-                ),
+                "All matching AI providers failed",
                 "server_error",
                 None,
                 Some("provider_error"),
@@ -3262,20 +5850,6 @@ impl AiFederation {
         );
     }
 
-    /// Build a JSON error response using the ai_federation error envelope.
-    fn error_response(&self, status: u16, message: &str) -> PluginResult {
-        self.json_reject_response(
-            status,
-            json!({
-                "error": {
-                    "message": message,
-                    "type": "ai_federation_error",
-                    "code": status
-                }
-            }),
-        )
-    }
-
     fn openai_error_response(
         &self,
         status: u16,
@@ -3287,7 +5861,32 @@ impl AiFederation {
         self.json_reject_response(status, openai_error_body(message, error_type, param, code))
     }
 
+    fn openai_error_response_with_headers(
+        &self,
+        status: u16,
+        message: &str,
+        error_type: &str,
+        param: Option<&str>,
+        code: Option<&str>,
+        headers: HashMap<String, String>,
+    ) -> PluginResult {
+        self.json_reject_response_with_headers(
+            status,
+            openai_error_body(message, error_type, param, code),
+            headers,
+        )
+    }
+
     fn json_reject_response(&self, status: u16, body: Value) -> PluginResult {
+        self.json_reject_response_with_headers(status, body, HashMap::new())
+    }
+
+    fn json_reject_response_with_headers(
+        &self,
+        status: u16,
+        body: Value,
+        mut headers: HashMap<String, String>,
+    ) -> PluginResult {
         // Serializing a `Value` built entirely from primitives cannot actually
         // fail, so this fallback is unreachable defensive code. If it ever does
         // fire we override the caller's status to 500 so the HTTP status line
@@ -3307,7 +5906,6 @@ impl AiFederation {
                 )
             }
         };
-        let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
         PluginResult::RejectBinary {
             status_code,
@@ -3326,6 +5924,103 @@ impl AiFederation {
 #[allow(dead_code)]
 pub mod test_helpers {
     use super::*;
+
+    /// Close the request semaphore so external regression tests can exercise
+    /// the deterministic pre-I/O concurrency rejection path.
+    pub fn close_request_slots_for_test(plugin: &AiFederation) {
+        plugin.request_slots.close();
+    }
+
+    /// Resource-bound constants used by external runtime/schema parity tests.
+    pub fn resource_bounds_for_test() -> (usize, usize, usize, usize) {
+        (
+            DEFAULT_MAX_PROVIDER_RESPONSE_BYTES,
+            MAX_PROVIDER_RESPONSE_BYTES,
+            MAX_TRANSLATED_REQUEST_BYTES,
+            MAX_OAUTH_RESPONSE_BYTES,
+        )
+    }
+
+    /// Resolved response bound for a configured provider.
+    pub fn provider_response_limit_for_test(plugin: &AiFederation, index: usize) -> Option<usize> {
+        plugin
+            .providers
+            .get(index)
+            .map(|provider| provider.max_response_body_bytes)
+    }
+
+    /// Exercise the real Vertex token refresh path against a test-controlled
+    /// endpoint. Production construction still pins token_uri to Google; this
+    /// helper only substitutes the first-hop endpoint after validating the
+    /// supplied service-account key.
+    pub async fn vertex_oauth_exchange_for_test(
+        service_account_json: String,
+        token_uri: String,
+        http_client: PluginHttpClient,
+    ) -> Result<String, (String, bool)> {
+        let mut cache =
+            OAuth2Cache::new(service_account_json).map_err(|message| (message, false))?;
+        cache.token_uri = token_uri;
+        let latency = AtomicU64::new(0);
+        cache
+            .get_token(&http_client, &latency)
+            .await
+            .map_err(|failure| {
+                (
+                    failure.message,
+                    failure.impact == AuthFailureImpact::ProviderUnavailable,
+                )
+            })
+    }
+
+    /// Force a post-construction local JWT key failure to verify that local
+    /// auth-build errors stay provider-circuit neutral.
+    pub async fn vertex_oauth_local_signing_failure_for_test(
+        service_account_json: String,
+        http_client: PluginHttpClient,
+    ) -> Result<String, (String, bool)> {
+        let mut cache =
+            OAuth2Cache::new(service_account_json).map_err(|message| (message, false))?;
+        cache.private_key_pem = "invalid-test-key".to_string();
+        let latency = AtomicU64::new(0);
+        cache
+            .get_token(&http_client, &latency)
+            .await
+            .map_err(|failure| {
+                (
+                    failure.message,
+                    failure.impact == AuthFailureImpact::ProviderUnavailable,
+                )
+            })
+    }
+
+    /// Lock the SigV4 classification: signer/build errors are local and must
+    /// never count as evidence that the remote provider is unavailable.
+    pub fn sigv4_local_failure_is_circuit_neutral_for_test() -> bool {
+        let config = aws_sigv4::AwsSigV4Config {
+            region: "us-east-1".to_string(),
+            access_key_id: "test-access-key".to_string(),
+            secret_access_key: "test-secret-key".to_string(),
+            session_token: None,
+        };
+        let result = aws_sigv4::sign_request(
+            &config,
+            "bedrock",
+            "POST",
+            "not a valid URL",
+            "application/json",
+            b"{}",
+            &Utc::now(),
+        )
+        .map_err(AuthFailure::local);
+        matches!(
+            result,
+            Err(AuthFailure {
+                impact: AuthFailureImpact::CircuitNeutral,
+                ..
+            })
+        )
+    }
 
     /// Expose glob matching for tests.
     pub fn glob_match(pattern: &str, input: &str) -> bool {
@@ -3359,24 +6054,12 @@ pub mod test_helpers {
         (usage.types_csv(), usage.roles_csv())
     }
 
-    /// Maximum raw upstream-error bytes reflected to callers (finding #52).
-    pub const MAX_UPSTREAM_ERROR_BYTES: usize = super::MAX_UPSTREAM_ERROR_BYTES;
-
-    pub fn cap_upstream_error_body(body: Vec<u8>) -> Vec<u8> {
-        super::cap_upstream_error_body(body)
-    }
-
     /// Maximum characters of the echoed `model` reflected in no-match errors.
     pub const MAX_ECHOED_MODEL_CHARS: usize = super::MAX_ECHOED_MODEL_CHARS;
 
     /// Expose the no-match `model` echo bounding helper for tests.
     pub fn truncate_model_for_error(model: &str) -> String {
         super::truncate_model_for_error(model)
-    }
-
-    /// Expose the native gRPC content-type classifier used to skip gRPC framing.
-    pub fn is_native_grpc_content_type(content_type: &str) -> bool {
-        crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
     }
 
     /// Expose request translation for tests.
@@ -3415,7 +6098,7 @@ pub mod test_helpers {
             google_region.as_deref(),
             google_project_id.as_deref(),
             aws_region.as_deref(),
-        );
+        )?;
 
         let provider = ResolvedProvider {
             name: "test".to_string(),
@@ -3430,6 +6113,8 @@ pub mod test_helpers {
             multimodal_mode,
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(60),
+            max_response_body_bytes: DEFAULT_MAX_PROVIDER_RESPONSE_BYTES,
+            circuit: None,
             base_url,
             url_template,
         };
@@ -3460,6 +6145,8 @@ pub mod test_helpers {
             multimodal_mode: MultimodalMode::Translate,
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(60),
+            max_response_body_bytes: DEFAULT_MAX_PROVIDER_RESPONSE_BYTES,
+            circuit: None,
             base_url: None,
             url_template: UrlTemplate::Static(Arc::from("https://example.test/")),
         };
@@ -3491,7 +6178,7 @@ pub mod test_helpers {
             google_region,
             google_project_id,
             aws_region,
-        );
+        )?;
         Ok(template.render(model))
     }
 
@@ -3530,5 +6217,92 @@ pub mod test_helpers {
             other => return Err(format!("invalid policy '{other}'")),
         };
         validate_base_url(provider_name, base_url, allow_plaintext, &policy)
+    }
+
+    /// Drive threshold/open/cooldown/half-open/close transitions without a
+    /// wall-clock sleep so external tests can verify the lock-free state
+    /// machine deterministically.
+    pub fn circuit_transition_sequence_for_test() -> Vec<&'static str> {
+        let circuit = ProviderCircuit::new(ProviderCircuitConfig {
+            failure_threshold: 2,
+            cooldown: Duration::from_secs(60),
+            success_threshold: 1,
+        });
+        let mut states = Vec::new();
+        let first = circuit.admit();
+        states.push(circuit_admission_label(first));
+        circuit.record_failure("test", first);
+        let second = circuit.admit();
+        states.push(circuit_admission_label(second));
+        circuit.record_failure("test", second);
+        states.push(circuit_admission_label(circuit.admit()));
+        circuit
+            .open_until_monotonic_ms
+            .store(circuit_monotonic_millis(), Ordering::Release);
+        let probe = circuit.admit();
+        states.push(circuit_admission_label(probe));
+        circuit.record_success("test", probe);
+        states.push(circuit_admission_label(circuit.admit()));
+        states
+    }
+
+    /// Simulate cancellation after half-open admission and verify the RAII
+    /// lease makes the probe slot immediately available again.
+    pub fn cancelled_half_open_probe_is_released_for_test() -> bool {
+        let circuit = ProviderCircuit::new(ProviderCircuitConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_secs(60),
+            success_threshold: 1,
+        });
+        circuit
+            .open_until_monotonic_ms
+            .store(circuit_monotonic_millis(), Ordering::Release);
+        {
+            let admission = circuit.admit();
+            if admission != CircuitAdmission::HalfOpenProbe {
+                return false;
+            }
+            let _cancelled_dispatch = HalfOpenProbeGuard::new(&circuit);
+        }
+        circuit.admit() == CircuitAdmission::HalfOpenProbe
+    }
+
+    /// Reproduce the completion/re-arm interleaving for a success threshold
+    /// greater than one. Once the second probe owns the slot, resolving the
+    /// first probe's guard must not allow a third concurrent probe.
+    pub fn completed_half_open_probe_does_not_release_successor_for_test() -> bool {
+        let circuit = ProviderCircuit::new(ProviderCircuitConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_secs(60),
+            success_threshold: 2,
+        });
+        circuit
+            .open_until_monotonic_ms
+            .store(circuit_monotonic_millis(), Ordering::Release);
+
+        let first_admission = circuit.admit();
+        if first_admission != CircuitAdmission::HalfOpenProbe {
+            return false;
+        }
+        let mut first_guard = HalfOpenProbeGuard::new(&circuit);
+        circuit.record_success("test", first_admission);
+
+        let second_admission = circuit.admit();
+        if second_admission != CircuitAdmission::HalfOpenProbe {
+            return false;
+        }
+        let _second_guard = HalfOpenProbeGuard::new(&circuit);
+
+        first_guard.resolve();
+        drop(first_guard);
+        circuit.admit() == CircuitAdmission::Open
+    }
+
+    fn circuit_admission_label(admission: CircuitAdmission) -> &'static str {
+        match admission {
+            CircuitAdmission::Closed => "closed",
+            CircuitAdmission::HalfOpenProbe => "half_open_probe",
+            CircuitAdmission::Open => "open",
+        }
     }
 }

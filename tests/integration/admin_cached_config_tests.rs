@@ -1485,6 +1485,272 @@ async fn admin_delete(base_url: &str, path: &str, token: &str) -> (u16, Value) {
     (status, body)
 }
 
+#[tokio::test]
+async fn transaction_log_schema_admin_rejects_unknown_closed_object_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (id, config, expected_path) in [
+        (
+            "unknown-outer",
+            json!({"schemas": {"audit": {}}, "strict": true}),
+            "config.strict",
+        ),
+        (
+            "unknown-derived",
+            json!({
+                "schemas": {"audit": {"derived_fields": [
+                    {"name": "outcome", "kind": "outcome", "from": "status"}
+                ]}}
+            }),
+            "derived_fields[0].from",
+        ),
+        (
+            "unknown-metadata",
+            json!({
+                "schemas": {"audit": {"metadata": {
+                    "mode": "flatten", "on_collison": "overwrite"
+                }}}
+            }),
+            "metadata.on_collison",
+        ),
+    ] {
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "transaction_log_schema",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+        assert_eq!(status, 400, "unknown key was admitted: {body:?}");
+        assert!(
+            body.to_string().contains(expected_path),
+            "error did not identify {expected_path}: {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn transaction_log_schema_crud_validates_the_prospective_database_graph() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let schema = json!({
+        "id": "schema-owner",
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schemas": {"audit": {"summary_type": "both"}}}
+    });
+    let logger = json!({
+        "id": "schema-consumer",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schema_ref": "audit"}
+    });
+
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &schema).await;
+    assert_eq!(status, 201, "schema create failed: {body:?}");
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &logger).await;
+    assert_eq!(
+        status, 201,
+        "the DB schema must resolve before any live-registry reload: {body:?}"
+    );
+
+    let duplicate = json!({
+        "id": "duplicate-schema-owner",
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schemas": {"audit": {}}}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &duplicate).await;
+    assert_eq!(status, 400, "duplicate schema name was admitted: {body:?}");
+    assert!(body.to_string().contains("registered more than once"));
+
+    let mut renamed = schema.clone();
+    renamed["config"] = json!({"schemas": {"renamed": {}}});
+    let (status, body) =
+        admin_put(&base_url, "/plugins/config/schema-owner", &token, &renamed).await;
+    assert_eq!(status, 400, "dangling rename was admitted: {body:?}");
+    assert!(body.to_string().contains("unknown schema 'audit'"));
+
+    let (status, body) = admin_delete(&base_url, "/plugins/config/schema-owner", &token).await;
+    assert_eq!(status, 400, "dangling delete was admitted: {body:?}");
+    assert!(body.to_string().contains("unknown schema 'audit'"));
+}
+
+#[tokio::test]
+async fn disabled_schema_graph_plugins_defer_graph_validation_but_not_egress_screening() {
+    let tc = TestConfig::default();
+    let (mut state, _dir) = create_db_admin_state(&tc).await;
+    state.backend_allow_ips = ferrum_edge::config::BackendEgressPolicy::from_env(
+        ferrum_edge::config::BackendAllowIps::Both,
+        "",
+        "",
+        true,
+    )
+    .expect("default deny policy is valid");
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let disabled = json!({
+        "id": "disabled-schema-ref-crud",
+        "plugin_name": "rate_limiting",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "window_seconds": 60,
+            "max_requests": 10,
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+            "schema_ref": "missing"
+        }
+    });
+
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &disabled).await;
+    assert_eq!(
+        status, 201,
+        "disabled direct CRUD must defer construction and graph validation: {body:?}"
+    );
+
+    let mut batch_plugin = disabled;
+    batch_plugin["id"] = json!("disabled-schema-ref-batch");
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({"plugin_configs": [batch_plugin]}),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "disabled batch config must defer construction and graph validation: {body:?}"
+    );
+
+    let denied = json!({
+        "id": "disabled-denied-egress-crud",
+        "plugin_name": "rate_limiting",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "window_seconds": 60,
+            "max_requests": 10,
+            "sync_mode": "redis",
+            "redis_url": "redis://169.254.169.254:6379/0",
+            "schema_ref": "missing"
+        }
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &denied).await;
+    assert_eq!(
+        status, 400,
+        "disabled direct CRUD must retain literal egress screening: {body:?}"
+    );
+    assert!(
+        body.to_string()
+            .contains("redis_url IP 169.254.169.254 denied"),
+        "unexpected direct CRUD denial: {body:?}"
+    );
+
+    let mut denied_batch = denied;
+    denied_batch["id"] = json!("disabled-denied-egress-batch");
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({"plugin_configs": [denied_batch]}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "disabled batch config must retain literal egress screening: {body:?}"
+    );
+    assert!(
+        body.to_string()
+            .contains("redis_url IP 169.254.169.254 denied"),
+        "unexpected batch denial: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn transaction_log_schema_batch_and_restore_are_definition_order_independent() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let logger = json!({
+        "id": "ordered-logger",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schema_ref": "ordered"}
+    });
+    let schema = json!({
+        "id": "ordered-schema",
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schemas": {"ordered": {}}}
+    });
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({"plugin_configs": [logger, schema]}),
+    )
+    .await;
+    assert_eq!(status, 201, "definition-last batch failed: {body:?}");
+
+    let restore_logger = json!({
+        "id": "restore-logger",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schema_ref": "restored"}
+    });
+    let restore_schema = json!({
+        "id": "restore-schema",
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schemas": {"restored": {}}}
+    });
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &json!({"plugin_configs": [restore_logger, restore_schema]}),
+    )
+    .await;
+    assert_eq!(status, 200, "definition-last restore failed: {body:?}");
+
+    let invalid_restore = json!({
+        "plugin_configs": [{
+            "id": "dangling-restore-logger",
+            "plugin_name": "stdout_logging",
+            "scope": "global",
+            "enabled": true,
+            "config": {"schema_ref": "missing"}
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &invalid_restore).await;
+    assert_eq!(status, 400, "dangling restore was admitted: {body:?}");
+    assert!(body.to_string().contains("unknown schema 'missing'"));
+
+    let (status, _, _) = admin_get(&base_url, "/plugins/config/restore-schema", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "invalid restore must leave the prior graph intact"
+    );
+}
+
 /// Create admin state with real SQLite DB and configurable db_available flag.
 async fn create_db_admin_state_with_availability(
     tc: &TestConfig,
@@ -5126,6 +5392,96 @@ async fn test_stream_proxy_admin_shape_preserved_across_get_and_backup() {
         "Backup stream proxy listen_path should be null, got {:?}",
         proxy_entry["listen_path"]
     );
+}
+
+#[tokio::test]
+async fn tcp_connection_throttle_admin_rejects_udp_attachment_before_persistence() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let proxy = json!({
+        "id": "udp-throttle-admin-proxy",
+        "backend_scheme": "udp",
+        "backend_host": "localhost",
+        "backend_port": 5353,
+        "listen_port": 19011
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create UDP proxy failed: {body:?}");
+
+    // A scoped definition is dormant until the proxy association exists.
+    let plugin = json!({
+        "id": "udp-throttle-admin-plugin",
+        "plugin_name": "tcp_connection_throttle",
+        "scope": "proxy",
+        "proxy_id": "udp-throttle-admin-proxy",
+        "enabled": true,
+        "config": {"max_connections_per_key": 1}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+    assert_eq!(status, 201, "Create dormant throttle failed: {body:?}");
+
+    let attached = json!({
+        "id": "udp-throttle-admin-proxy",
+        "backend_scheme": "udp",
+        "backend_host": "localhost",
+        "backend_port": 5353,
+        "listen_port": 19011,
+        "plugins": [{"plugin_config_id": "udp-throttle-admin-plugin"}]
+    });
+    let (status, body) = admin_put(
+        &base_url,
+        "/proxies/udp-throttle-admin-proxy",
+        &token,
+        &attached,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "UDP throttle attachment was persisted: {body:?}"
+    );
+    assert!(body.to_string().contains("only TCP/TCP+TLS is supported"));
+
+    let (status, persisted, _) =
+        admin_get(&base_url, "/proxies/udp-throttle-admin-proxy", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        persisted["plugins"]
+            .as_array()
+            .is_some_and(|plugins| plugins.is_empty()),
+        "rejected attachment changed the persisted proxy: {persisted:?}"
+    );
+}
+
+#[tokio::test]
+async fn tcp_connection_throttle_batch_rejects_udp_attachment() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let batch = json!({
+        "proxies": [{
+            "id": "udp-throttle-batch-proxy",
+            "backend_scheme": "udp",
+            "backend_host": "localhost",
+            "backend_port": 5354,
+            "listen_port": 19012,
+            "plugins": [{"plugin_config_id": "udp-throttle-batch-plugin"}]
+        }],
+        "plugin_configs": [{
+            "id": "udp-throttle-batch-plugin",
+            "plugin_name": "tcp_connection_throttle",
+            "scope": "proxy",
+            "proxy_id": "udp-throttle-batch-proxy",
+            "enabled": true,
+            "config": {"max_connections_per_key": 1}
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 400, "UDP throttle batch was persisted: {body:?}");
+    assert!(body.to_string().contains("only TCP/TCP+TLS is supported"));
 }
 
 // ============================================================================

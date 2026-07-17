@@ -1400,6 +1400,7 @@ async fn run_tcp_accept_loop(
                         authenticated_identity: None,
                         auth_method: None,
                         metadata: None,
+                        admission_permits: Vec::new(),
                         tls_client_cert_der: None,
                         tls_client_cert_chain_der: None,
                         sni_hostname: None,
@@ -1460,6 +1461,9 @@ async fn run_tcp_accept_loop(
                         mesh_enforcement_snapshot.as_ref(),
                     )
                     .await;
+                    // The transport has ended. Release admission capacity before
+                    // awaiting disconnect observers, which may perform network I/O.
+                    stream_ctx.release_admission_permits();
 
                     let duration_ms = connected_at.elapsed().as_millis() as f64;
                     let final_proxy_id = stream_ctx.proxy_id.clone();
@@ -1899,6 +1903,7 @@ async fn run_tcp_stream_connect_plugins(
             tokio::select! {
                 result = plugin.on_stream_connect(stream_ctx) => result,
                 () = wait_for_tcp_peer_reset(client_stream) => {
+                    stream_ctx.release_admission_permits();
                     return Err(StreamSetupError::new(
                         StreamSetupKind::ClientDisconnectedDuringAdmission,
                         connection_label,
@@ -1909,6 +1914,7 @@ async fn run_tcp_stream_connect_plugins(
             plugin.on_stream_connect(stream_ctx).await
         };
         if let PluginResult::Reject { .. } = result {
+            stream_ctx.release_admission_permits();
             debug!(
                 proxy_id = %proxy_id,
                 client = %client_ip,

@@ -99,13 +99,12 @@ impl V001SqlBuilder {
     /// rather than carried as upgrade migrations (see the project build-out
     /// policy). The migration runner skips V001 entirely once version 1 is
     /// recorded, so a table added to V001 here would never be created on an
-    /// already-initialized database — yet the proxy persistence path writes to
-    /// `proxy_route_locks` on every create/update/batch/API-spec proxy write.
-    /// Re-running this idempotent `CREATE TABLE IF NOT EXISTS` pass on every
-    /// startup guarantees the table exists regardless of whether V001 was
-    /// recorded before or after it was folded in. Every statement here must be
-    /// idempotent (no error on re-run) so the pass is safe on fresh databases
-    /// that have just applied V001 in full.
+    /// already-initialized database — yet persistence writes compatibility
+    /// tables such as `proxy_route_locks` and `config_admission_locks` on every
+    /// guarded mutation. Re-running this idempotent `CREATE TABLE IF NOT EXISTS`
+    /// pass on every startup guarantees those tables exist regardless of when
+    /// V001 was recorded. Every statement here must be idempotent (no error on
+    /// re-run) so the pass is safe on fresh databases that just applied V001.
     pub(super) async fn ensure_compatibility_tables(
         &self,
         connection: &mut AnyConnection,
@@ -114,6 +113,9 @@ impl V001SqlBuilder {
             .execute(&mut *connection)
             .await?;
         sqlx::query(self.create_config_change_locks_sql())
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query(self.create_config_admission_locks_sql())
             .execute(&mut *connection)
             .await?;
         sqlx::query(self.create_config_change_retention_sql())
@@ -152,6 +154,7 @@ impl V001SqlBuilder {
             self.create_plugin_configs_sql(),
             self.create_proxy_plugins_sql(),
             self.create_config_change_locks_sql(),
+            self.create_config_admission_locks_sql(),
             self.create_config_change_retention_sql(),
             self.create_config_changes_sql(),
             // api_specs must come AFTER proxies (api_specs.proxy_id FKs
@@ -750,6 +753,28 @@ impl V001SqlBuilder {
             CREATE TABLE IF NOT EXISTS config_change_locks (
                 lock_name TEXT PRIMARY KEY,
                 updated_at TEXT NOT NULL
+            )
+            "#
+        }
+    }
+
+    fn create_config_admission_locks_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS config_admission_locks (
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                owner VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                expires_at BIGINT NOT NULL,
+                generation BIGINT NOT NULL DEFAULT 1
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS config_admission_locks (
+                namespace TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                expires_at BIGINT NOT NULL,
+                generation BIGINT NOT NULL DEFAULT 1
             )
             "#
         }

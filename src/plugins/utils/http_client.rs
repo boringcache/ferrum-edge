@@ -11,6 +11,8 @@
 //! - **HTTP/2 multiplexing**: Multiple log/metric streams over one connection
 //! - **Idle timeout**: Stale connections cleaned up automatically
 //! - **DNS caching**: Uses the gateway's `DnsCache` for shared, warmed DNS
+//! - **No ambient proxy discovery**: standard client builders ignore
+//!   process-level proxy environment variables
 //! - **No redirect following**: outbound calls reach only the configured
 //!   endpoint; server-chosen 3xx targets (e.g. a cloud metadata IP) are never
 //!   followed — SSRF defense-in-depth
@@ -56,6 +58,18 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Sanitized failure from a redacted plugin HTTP request.
+///
+/// `request_reached_wire` is false for request-construction failures and for
+/// transport classes that prove no request bytes reached the destination. A
+/// caller sending a non-idempotent request can use this boundary to avoid
+/// replaying ambiguous outcomes.
+#[derive(Debug, Clone, Copy)]
+pub struct PluginHttpFailure {
+    pub error_class: ErrorClass,
+    pub request_reached_wire: bool,
+}
 
 /// Shared, pooled HTTP client for plugin outbound calls.
 ///
@@ -718,6 +732,39 @@ impl PluginHttpClient {
             .map_err(|e| {
                 let error_class = classify_reqwest_error(&e);
                 format!("{error_class} calling {redacted_url}")
+            })
+    }
+
+    /// Send a redacted, latency-tracked request while retaining a replay-safety
+    /// classification for non-idempotent callers.
+    pub async fn execute_redacted_tracked_classified(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+        redacted_url: &str,
+        accumulator: &AtomicU64,
+    ) -> Result<reqwest::Response, PluginHttpFailure> {
+        let request = request.build().map_err(|error| PluginHttpFailure {
+            error_class: classify_reqwest_error(&error),
+            request_reached_wire: false,
+        })?;
+        self.execute_request(request, label, Some(accumulator), Some(redacted_url))
+            .await
+            .map_err(|error| {
+                let error_class = classify_reqwest_error(&error);
+                PluginHttpFailure {
+                    error_class,
+                    // `DispatchPolicyRejected` is intentionally treated as a
+                    // post-wire class by the backend retry machinery so a
+                    // terminal route policy rejection is never amplified.
+                    // Here the caller needs the literal provider-I/O boundary:
+                    // a DnsCacheResolver egress denial happens before any dial,
+                    // so a non-idempotent provider request remains safe to send
+                    // to a configured fallback.
+                    request_reached_wire: error_class
+                        != crate::retry::ErrorClass::DispatchPolicyRejected
+                        && crate::retry::request_reached_wire(error_class),
+                }
             })
     }
 

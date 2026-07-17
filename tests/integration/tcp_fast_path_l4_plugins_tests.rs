@@ -14,11 +14,11 @@
 //! immediately.
 //!
 //! The tests use `tcp_connection_throttle` as the canary plugin
-//! because both lifecycle hooks are observable through its rejection
-//! behaviour: `on_stream_connect` increments the per-key counter (and
-//! rejects when it would exceed the limit), and `on_stream_disconnect`
-//! decrements it. With `max_connections_per_key: 1` we can probe both
-//! hooks via plain TCP connect-attempt observations — no plugin
+//! because admission and teardown are observable through its rejection
+//! behaviour: `on_stream_connect` acquires a per-key permit (and rejects
+//! when it would exceed the limit), while connection-context teardown
+//! drops that permit. With `max_connections_per_key: 1` we can probe both
+//! boundaries via plain TCP connect-attempt observations — no plugin
 //! introspection or counter-readback API required.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -538,7 +538,7 @@ async fn fast_path_invokes_on_stream_connect_to_reject_throttled_connection() {
 }
 
 #[tokio::test]
-async fn fast_path_invokes_on_stream_disconnect_to_release_throttle_slot() {
+async fn fast_path_releases_throttle_permit_on_connection_teardown() {
     // Backend echo server.
     let backend = reserve_port().await.expect("reserve backend port");
     let backend_port = backend.local_addr().expect("backend addr").port();
@@ -556,7 +556,7 @@ async fn fast_path_invokes_on_stream_disconnect_to_release_throttle_slot() {
     // post-drop "connection succeeds" check below would also pass if
     // the throttle never engaged in the first place (i.e. on_stream_connect
     // was silently bypassed) — the test would prove nothing about
-    // on_stream_disconnect's lifecycle invocation.
+    // connection-permit teardown.
     let mut blocked = TcpStream::connect(gateway_addr)
         .await
         .expect("kernel SYN/ACK still completes — gateway closes after accept");
@@ -564,16 +564,14 @@ async fn fast_path_invokes_on_stream_disconnect_to_release_throttle_slot() {
         is_closed_by_peer(&mut blocked).await,
         "while conn1 holds the throttle slot, a second connection must be \
          rejected by on_stream_connect — confirming the throttle is engaged \
-         before we test on_stream_disconnect's release"
+         before we test connection teardown release"
     );
     drop(blocked);
 
     // Drop the holding connection. The gateway's accept-loop spawns
-    // each connection in its own task; the disconnect cleanup
-    // (including `on_stream_disconnect` invocation) runs after the
-    // relay future returns. Wait for that with a short retry loop on
-    // a fresh connection — the throttle slot frees once the disconnect
-    // hook has actually fired.
+    // each connection in its own task. Once the relay future returns, the
+    // gateway releases the opaque throttle permit before disconnect logging.
+    // Wait for that with a short retry loop on a fresh connection.
     drop(conn1);
 
     let deadline = std::time::Instant::now() + TEST_TIMEOUT;
@@ -581,8 +579,8 @@ async fn fast_path_invokes_on_stream_disconnect_to_release_throttle_slot() {
     loop {
         if std::time::Instant::now() > deadline {
             panic!(
-                "throttle slot never released within {TEST_TIMEOUT:?}; on_stream_disconnect \
-                 likely did not fire on the fast path. Last attempt: {:?}",
+                "throttle slot never released within {TEST_TIMEOUT:?}; connection teardown \
+                 likely did not release the permit on the fast path. Last attempt: {:?}",
                 last_err
             );
         }

@@ -14,6 +14,35 @@ use std::collections::HashSet;
 pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
     "A proxy with overlapping hosts and listen_path already exists";
 
+/// Durable cross-process fence for namespace-scoped config admission.
+///
+/// Implementations atomically claim a namespace for `owner` and return the
+/// claim's persistent monotonic generation, renew only while that owner still
+/// holds the unexpired lease, and release only on an exact owner match. Admin
+/// validation keeps a process-local mutex as a cheap first tier, while this
+/// lease closes races between writable gateway instances that share the same
+/// datastore.
+#[async_trait]
+pub trait NamespaceConfigAdmissionLeaseBackend: Send + Sync {
+    async fn try_acquire_namespace_config_admission_lease(
+        &self,
+        namespace: &str,
+        owner: &str,
+    ) -> Result<Option<u64>, anyhow::Error>;
+
+    async fn renew_namespace_config_admission_lease(
+        &self,
+        namespace: &str,
+        owner: &str,
+    ) -> Result<bool, anyhow::Error>;
+
+    async fn release_namespace_config_admission_lease(
+        &self,
+        namespace: &str,
+        owner: &str,
+    ) -> Result<bool, anyhow::Error>;
+}
+
 /// Stable admin-facing message for a namespace mutation that could not enter
 /// the datastore-backed admission critical section. Backend/topology details
 /// stay in server logs and the chained error only.
@@ -48,7 +77,8 @@ pub(crate) fn mark_mtls_dns_admission_unavailable(error: anyhow::Error) -> anyho
 }
 
 /// Whether a batch owns its namespace admission guard and whether it runs
-/// normal mTLS DNS validation.
+/// normal namespace candidate validation (mTLS DNS plus guarded plugin-graph
+/// contracts).
 ///
 /// `RestoreRollbackReplay` is intentionally narrow: it may only replay the
 /// exact raw snapshot captured immediately before a destructive restore. That
@@ -106,6 +136,49 @@ pub fn is_mtls_dns_identity_conflict(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<MtlsDnsIdentityConflict>())
+}
+
+/// A datastore-serialized candidate would leave an enabled
+/// `tcp_connection_throttle` attached only to unsupported protocols (global
+/// scope) or directly attached to an unsupported proxy (proxy/proxy-group
+/// scope).
+///
+/// Persistence implementations carry this typed error through the namespace
+/// admission lock/lease so admin handlers can return the same validation
+/// response as their optimistic preflight without exposing database details.
+#[derive(Debug)]
+pub struct TcpConnectionThrottleAttachmentConflict {
+    errors: Vec<String>,
+}
+
+impl TcpConnectionThrottleAttachmentConflict {
+    pub fn new(errors: Vec<String>) -> Self {
+        Self { errors }
+    }
+
+    pub fn errors(&self) -> &[String] {
+        &self.errors
+    }
+}
+
+impl std::fmt::Display for TcpConnectionThrottleAttachmentConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tcp_connection_throttle attachment validation failed: {}",
+            self.errors.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for TcpConnectionThrottleAttachmentConflict {}
+
+pub fn tcp_connection_throttle_attachment_conflict(
+    error: &anyhow::Error,
+) -> Option<&TcpConnectionThrottleAttachmentConflict> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TcpConnectionThrottleAttachmentConflict>())
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +542,7 @@ impl std::error::Error for DeleteAllResourcesError {
 /// operations on an already-connected store.
 #[allow(dead_code)] // Some methods are only used through dyn dispatch or by MongoDB backend
 #[async_trait]
-pub trait DatabaseBackend: Send + Sync {
+pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     // -----------------------------------------------------------------------
     // Health & metadata
     // -----------------------------------------------------------------------

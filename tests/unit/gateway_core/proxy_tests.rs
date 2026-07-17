@@ -9,6 +9,67 @@ use ferrum_edge::proxy::{
 use ferrum_edge::router_cache::RouterCache;
 use std::collections::HashMap;
 
+#[test]
+fn terminal_final_body_dispatch_follows_path_policy_and_precedes_backend_breaker() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let request_scoped_gate = src
+        .find("let has_terminal_body_dispatch = capabilities")
+        .expect("terminal dispatch must retain a request-scoped applicability gate");
+    let terminal_dispatch = src
+        .find("if final_body_before_backend_dispatch {")
+        .expect("terminal final-body dispatch gate must remain present");
+    let selection = src
+        .find("let selection = backend_dispatch::select_upstream_target(")
+        .expect("selected-target lookup must remain present");
+    let path_policy = src[selection..]
+        .find("if backend_path_is_policy_bound {")
+        .map(|offset| selection + offset)
+        .expect("selected backend-path policy must remain present");
+    let routing_deferred = src[path_policy..terminal_dispatch]
+        .find("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .map(|offset| path_policy + offset)
+        .expect("routing-header deferred pass must remain present");
+    let remaining_deferred = src[routing_deferred..terminal_dispatch]
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .map(|offset| routing_deferred + offset)
+        .expect("remaining deferred pass must remain present");
+    let breaker = src[terminal_dispatch..]
+        .find("// Circuit breaker check")
+        .map(|offset| terminal_dispatch + offset)
+        .expect("backend circuit-breaker gate must remain present");
+    let provider_hook = src[terminal_dispatch..breaker]
+        .find("run_final_request_body_hooks(")
+        .expect("terminal final-body hook must run before the backend breaker");
+    let synthetic_pipeline = src[terminal_dispatch..breaker]
+        .find("finalize_reject_response_with_after_proxy_hooks(")
+        .expect("terminal response must use the synthetic response pipeline");
+    let backend_transport = src
+        .find("async fn proxy_to_backend(")
+        .expect("backend transport function must remain present");
+
+    let applicability = &src[request_scoped_gate..terminal_dispatch];
+    assert!(applicability.contains("if let Some(transformed_headers)"));
+    assert!(applicability.contains("std::mem::swap(&mut ctx.headers, transformed_headers)"));
+    assert!(applicability.contains("final_request_body_requirements("));
+    let helper = src
+        .split("pub(crate) fn final_request_body_requirements(")
+        .nth(1)
+        .expect("shared final-body applicability helper must remain present")
+        .split("pub(crate) fn request_body_requirements_before_authenticate(")
+        .next()
+        .expect("shared final-body applicability helper must remain bounded");
+    assert!(helper.contains("plugin.should_buffer_request_body(ctx)"));
+    assert!(helper.contains("plugin.requires_final_request_body_before_backend_dispatch()"));
+    assert!(provider_hook < synthetic_pipeline);
+    assert!(request_scoped_gate < terminal_dispatch);
+    assert!(selection < path_policy);
+    assert!(path_policy < routing_deferred);
+    assert!(routing_deferred < remaining_deferred);
+    assert!(remaining_deferred < terminal_dispatch);
+    assert!(terminal_dispatch < breaker);
+    assert!(breaker < backend_transport);
+}
+
 fn test_proxy() -> Proxy {
     Proxy {
         id: "test".into(),
@@ -432,26 +493,36 @@ fn test_final_request_body_rejects_are_gateway_local_terminal_outcomes() {
 #[test]
 fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     let source = include_str!("../../../src/proxy/mod.rs");
-    let path_policy = source
-        .rfind("if let Some(response) = run_backend_path_plugins_or_build_reject(")
+    let handler_start = source
+        .find("async fn handle_proxy_request_inner(")
+        .expect("H1/H2 request handler must remain present");
+    let handler = &source[handler_start..];
+    let path_policy = handler
+        .find("if let Some(response) = run_backend_path_plugins_or_build_reject(")
         .expect("backend-path policy hook must remain present");
-    let deferred = source
+    let deferred = handler
         .find("// Hooks that can dispatch external work or synthesize a terminal response")
         .expect("deferred before_proxy pass must remain present");
     assert!(path_policy < deferred);
     assert!(source.contains("BackendPathBeforeProxyPass::RoutingHeaderDeferred"));
-    assert!(source.contains("BackendPathPolicyPhase::Preview"));
-    assert!(source.contains("BackendPathPolicyPhase::Enforce"));
     assert!(
         !source.contains("backend_dispatch::upstream_selection_hash_key("),
-        "an external deferred hook must not reselect an unpreviewed target"
+        "an external deferred hook must not reselect a different target"
     );
     assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
+    let routing_hook = handler
+        .find("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .expect("routing-header hook must remain present");
+    assert_eq!(
+        handler[path_policy..routing_hook]
+            .matches("run_backend_path_plugins_or_build_reject(")
+            .count(),
+        1,
+        "H1/H2 must enforce policy exactly once on the pinned path"
+    );
     assert!(
-        !source.contains(
-            "if !matches!(deferred_result, PluginResult::Continue) {\n            break;"
-        ),
-        "a deferred routing-hook rejection must still reach final method enforcement"
+        path_policy < routing_hook,
+        "stateful path policy must reject before deferred external work"
     );
 
     let mirror = include_str!("../../../src/plugins/request_mirror.rs");
@@ -582,7 +653,7 @@ fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
     );
     assert!(
         !after_routing_hook[..remaining_hook].contains("select_upstream_target("),
-        "deferred headers must not steer the request to an unpreviewed target"
+        "deferred headers must not steer the request to a different target"
     );
 
     let remaining_hook = routing_hook + remaining_hook;
@@ -1791,6 +1862,18 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         finalization.contains("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
     );
     assert!(finalization.contains("build_grpc_web_reject_response("));
+    assert_eq!(
+        finalization
+            .matches("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        finalization
+            .matches("build_grpc_web_reject_response(")
+            .count(),
+        1
+    );
 
     let helper = source
         .split("async fn finalize_upload_deadline_rejection(")
@@ -1802,11 +1885,30 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
     assert!(helper.contains("build_finalized_upload_deadline_response("));
     assert!(helper.contains("log_rejected_request_with_path("));
     assert!(helper.contains("record_request(state,"));
+    assert_eq!(
+        helper
+            .matches("build_finalized_upload_deadline_response(")
+            .count(),
+        1
+    );
+    assert_eq!(helper.matches("log_rejected_request_with_path(").count(), 1);
+    assert_eq!(helper.matches("record_request(state,").count(), 1);
+    let finalize = helper
+        .find("build_finalized_upload_deadline_response(")
+        .expect("upload deadline finalization");
+    let log = helper
+        .find("log_rejected_request_with_path(")
+        .expect("upload deadline log");
+    let metric = helper
+        .find("record_request(state,")
+        .expect("upload deadline metric");
+    assert!(finalize < log && log < metric);
 
     for phase in [
         "grpc_deadline_upload_before_authenticate",
         "grpc_deadline_upload_before_authorize",
         "grpc_deadline_upload_before_before_proxy",
+        "grpc_deadline_terminal_request_body",
         "grpc_deadline_upload_before_dispatch",
         "grpc_deadline_buffered_grpc_upload",
     ] {
@@ -1819,8 +1921,8 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         source
             .matches("finalize_upload_deadline_rejection(")
             .count(),
-        7,
-        "the helper definition plus all six H1/H2 buffered upload exits must stay routed through cleanup"
+        8,
+        "the helper definition plus all seven H1/H2 buffered upload exits must stay routed through cleanup"
     );
 
     let grpc_collect_deadline_branches: Vec<&str> = source

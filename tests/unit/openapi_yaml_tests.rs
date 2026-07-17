@@ -137,6 +137,51 @@ fn assert_serde_component_field_parity<T>(
 }
 
 #[test]
+fn transaction_log_schema_closed_object_keys_match_openapi() {
+    use ferrum_edge::plugins::transaction_log_schema::TRANSACTION_LOG_SCHEMA_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::log_schema::{
+        DERIVED_FIELD_KEYS, METADATA_POLICY_KEYS, SUMMARY_LOG_SCHEMA_KEYS,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    for (label, pointer, runtime_keys) in [
+        (
+            "TransactionLogSchemaConfig",
+            "/components/schemas/TransactionLogSchemaConfig/properties",
+            TRANSACTION_LOG_SCHEMA_CONFIG_KEYS,
+        ),
+        (
+            "SummaryLogSchema",
+            "/components/schemas/SummaryLogSchema/properties",
+            SUMMARY_LOG_SCHEMA_KEYS,
+        ),
+        (
+            "SummaryLogSchema.derived_fields[]",
+            "/components/schemas/SummaryLogSchema/properties/derived_fields/items/properties",
+            DERIVED_FIELD_KEYS,
+        ),
+        (
+            "SummaryLogSchema.metadata",
+            "/components/schemas/SummaryLogSchema/properties/metadata/properties",
+            METADATA_POLICY_KEYS,
+        ),
+    ] {
+        let runtime: BTreeSet<String> = runtime_keys.iter().map(|key| (*key).to_string()).collect();
+        assert_eq!(runtime, schema_property_names(&spec, label, pointer));
+    }
+
+    for pointer in [
+        "/components/schemas/TransactionLogSchemaConfig/additionalProperties",
+        "/components/schemas/SummaryLogSchema/additionalProperties",
+        "/components/schemas/SummaryLogSchema/properties/derived_fields/items/additionalProperties",
+        "/components/schemas/SummaryLogSchema/properties/metadata/additionalProperties",
+    ] {
+        assert_eq!(spec.pointer(pointer), Some(&serde_json::Value::Bool(false)));
+    }
+}
+
+#[test]
 fn typed_component_properties_match_serde_field_inventories() {
     use ferrum_edge::config::types::{
         ActiveHealthCheck, BackendTlsConfig, CircuitBreakerConfig, ConsulConfig, Consumer,
@@ -975,6 +1020,68 @@ fn ldap_auth_schema_matches_runtime_invariants() {
 }
 
 #[test]
+fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiFederationConfig")
+        .expect("missing AiFederationConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiFederationConfig schema compiles");
+
+    let provider_properties = schema
+        .pointer("/properties/providers/items/properties")
+        .expect("missing provider properties");
+    assert_eq!(provider_properties["allow_plaintext"]["default"], false);
+    assert_eq!(
+        provider_properties["max_response_body_bytes"]["default"],
+        8_388_608
+    );
+    assert_eq!(provider_properties["max_response_body_bytes"]["minimum"], 1);
+    assert_eq!(
+        provider_properties["max_response_body_bytes"]["maximum"],
+        67_108_864
+    );
+    assert!(provider_properties.get("circuit_breaker").is_some());
+
+    let valid = json!({
+        "providers": [{
+            "name": "local-openai",
+            "provider_type": "openai",
+            "api_key": "test",
+            "base_url": "http://127.0.0.1:8080/v1/chat/completions",
+            "allow_plaintext": true,
+            "max_response_body_bytes": 1048576,
+            "circuit_breaker": {
+                "failure_threshold": 2,
+                "cooldown_seconds": 10,
+                "success_threshold": 1
+            }
+        }],
+        "fallback_on_protocol_errors": true,
+        "fallback_on_ambiguous_errors": false,
+        "max_concurrent_requests": 32
+    });
+    assert!(validator.validate(&valid).is_ok());
+
+    for invalid in [
+        json!({"providers": [{"name": "p", "provider_type": "openai"}], "fallback_on_netwrok_errors": true}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "model_paterns": []}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "circuit_breaker": {"failure_treshold": 2}}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "base_url": "http://127.0.0.1/v1/chat"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "model_mapping": {"gpt-../unsafe": "gpt-4o"}}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 0}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 67_108_865}]}),
+    ] {
+        assert!(
+            validator.validate(&invalid).is_err(),
+            "schema accepted {invalid}"
+        );
+    }
+}
+
+#[test]
 fn ldap_dial_policy_documentation_matches_openapi() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -1269,7 +1376,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         "plugin_name": "ws_message_size_limiting",
         "scope": "global",
         "enabled": true,
-        "config": {"max_frame_bytes": 1024}
+        "config": {"max_frame_bytes": 1024, "max_message_bytes": 4096}
     });
     assert!(validator.validate(&valid).is_ok(), "config should be valid");
 
@@ -1282,6 +1389,15 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     assert!(
         validator.validate(&invalid).is_err(),
         "ws_message_size_limiting should require max_frame_bytes through PluginConfig"
+    );
+
+    let invalid_message_limit = plugin_config(
+        "ws_message_size_limiting",
+        Some(json!({"max_frame_bytes": 1024, "max_message_bytes": 0})),
+    );
+    assert!(
+        validator.validate(&invalid_message_limit).is_err(),
+        "ws_message_size_limiting should reject a zero max_message_bytes"
     );
 
     for (plugin_name, config) in [
@@ -2883,6 +2999,51 @@ fn mtls_dns_admission_mutations_document_conflict_responses() {
 }
 
 #[test]
+fn plugin_graph_delete_rejections_have_openapi_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for pointer in [
+        "/paths/~1proxies~1{id}/delete/responses/400",
+        "/paths/~1plugins~1config~1{id}/delete/responses/400",
+    ] {
+        let response = spec
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("plugin-graph DELETE is missing 400 response: {pointer}"));
+        assert_eq!(
+            response["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/Error"
+        );
+        assert!(
+            response["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("plugin-composition"))
+        );
+    }
+
+    let api_spec_response = spec
+        .pointer("/paths/~1api-specs~1{id}/delete/responses/422")
+        .expect("API-spec DELETE is missing 422 response");
+    assert_eq!(
+        api_spec_response["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ApiSpecValidationError"
+    );
+    assert!(
+        api_spec_response["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("plugin-composition"))
+    );
+
+    let resource_types = spec
+        .pointer(
+            "/components/schemas/ApiSpecValidationError/properties/failures/items/properties/resource_type/enum",
+        )
+        .and_then(serde_json::Value::as_array)
+        .expect("API-spec validation resource types");
+    assert!(resource_types.contains(&json!("plugin_composition")));
+}
+
+#[test]
 fn namespace_admission_contention_is_documented_as_retryable() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -3204,6 +3365,70 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
     ] {
         assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
+}
+
+#[test]
+fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/TcpConnectionThrottleConfig")
+        .expect("TcpConnectionThrottleConfig component exists");
+    let schema_text = serde_json::to_string(schema).unwrap();
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let cache_docs = include_str!("../../docs/cache_management.md");
+    let source = include_str!("../../src/plugins/tcp_connection_throttle.rs");
+    let admin_source = include_str!("../../src/admin/mod.rs");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_intervl_seconds": 60}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 86401}),
+        false,
+    );
+    for text in [schema_text.as_str(), plugin_docs, cache_docs] {
+        assert!(
+            text.contains("process-local"),
+            "missing process-local scope"
+        );
+        assert!(
+            text.contains("residual"),
+            "missing residual sweep semantics"
+        );
+        assert!(text.contains("inline"), "missing inline removal semantics");
+    }
+    assert!(schema_text.contains("UDP/DTLS"));
+    assert!(plugin_docs.contains("attachment to any other protocol is rejected"));
+    assert!(source.contains("DashMap::with_shard_amount"));
+    assert!(source.contains("entry.remove()"));
+    assert!(!source.contains("tcp_connection_throttle.key"));
+    assert!(admin_source.contains(r#""enforcement_scope": "process_local""#));
+    assert!(admin_source.contains(r#""replica_limit_behavior": "configured_limit_per_replica""#));
+
+    let status_schema = spec
+        .pointer("/components/schemas/AdminMetricsTcpConnectionThrottle")
+        .expect("AdminMetricsTcpConnectionThrottle component exists");
+    assert_eq!(
+        status_schema["properties"]["enforcement_scope"]["enum"][0],
+        "process_local"
+    );
+    assert_eq!(
+        status_schema["properties"]["replica_limit_behavior"]["enum"][0],
+        "configured_limit_per_replica"
+    );
 }
 
 #[test]

@@ -41,7 +41,10 @@
 use ferrum_edge::{
     ExtractedBundle, GatewayConfig,
     config::{
-        db_backend::{ApiSpecListFilter, ApiSpecSortBy, SortOrder},
+        db_backend::{
+            ApiSpecListFilter, ApiSpecSortBy, SortOrder,
+            tcp_connection_throttle_attachment_conflict,
+        },
         db_loader::{DatabaseStore, DbPoolConfig},
         types::{
             ApiSpec, PluginAssociation, PluginConfig, PluginScope, Proxy, SpecFormat, Upstream,
@@ -1108,6 +1111,64 @@ async fn delete_api_spec_returns_false_for_missing_spec() {
         !deleted,
         "delete_api_spec must return false for missing spec"
     );
+}
+
+#[tokio::test]
+async fn delete_api_spec_rejects_removing_last_global_tcp_throttle_target() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let spec_id = uid("spec-tcp-delete-guard");
+    let tcp_proxy_id = uid("tcp-proxy");
+    let http_proxy_id = uid("http-proxy");
+    let tcp_proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": tcp_proxy_id,
+        "namespace": ns,
+        "backend_scheme": "tcp",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9000,
+        "listen_port": 19101
+    }))
+    .unwrap();
+    let bundle = ExtractedBundle {
+        proxy: tcp_proxy.clone(),
+        upstream: None,
+        plugins: Vec::new(),
+    };
+    let spec = make_spec(&spec_id, &tcp_proxy_id, ns, b"tcp spec");
+    store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
+    store
+        .create_proxy(&make_proxy(&http_proxy_id, ns))
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    store
+        .create_plugin_config(&PluginConfig {
+            id: uid("global-tcp-throttle"),
+            namespace: ns.to_string(),
+            plugin_name: "tcp_connection_throttle".to_string(),
+            config: serde_json::json!({"max_connections_per_key": 10}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("the mixed global graph has a supported TCP target");
+
+    let error = store
+        .delete_api_spec(ns, &spec_id)
+        .await
+        .expect_err("the API-spec cascade must not remove the final TCP target");
+    assert!(
+        tcp_connection_throttle_attachment_conflict(&error).is_some(),
+        "unexpected API-spec delete rejection: {error:#}"
+    );
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_some());
+    assert!(store.get_proxy(ns, &tcp_proxy_id).await.unwrap().is_some());
 }
 
 // ---------------------------------------------------------------------------

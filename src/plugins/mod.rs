@@ -2,8 +2,8 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → backend-path policy preview → deferred routing-header hooks →
-//! final backend-path enforcement → remaining deferred `before_proxy` hooks →
+//! `before_proxy` → backend-path policy enforcement →
+//! deferred routing-header hooks → remaining deferred `before_proxy` hooks →
 //! `transform_request_body` →
 //! `on_final_request_body` → `backend_admission` → `after_proxy` →
 //! `normalize_response_body` → `on_response_body` →
@@ -129,6 +129,19 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
 };
 
+/// Internal provenance marker set after a request-phase plugin has issued an
+/// external operation whose result must not be replayed from an ambiguous
+/// synthetic-response pipeline.
+pub(crate) const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str =
+    "ferrum:external_operation_completed";
+
+/// Internal marker set when a request is committed to a synthetic rejection
+/// before any external operation or backend dispatch could have started.
+/// Ownership plugins consume it from `on_response_committed` to release this
+/// request's exact local/distributed in-flight token safely.
+pub(crate) const RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY: &str =
+    "ferrum:release_dedup_inflight_on_commit";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JwtAuthAttributeValue {
     Scalar(String),
@@ -151,19 +164,6 @@ pub enum ProxyProtocol {
     Tcp,
     /// Raw UDP datagram proxy (includes DTLS termination/origination)
     Udp,
-}
-
-/// Whether a backend-effective path policy hook is validating a provisional
-/// selection or enforcing the final selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendPathPolicyPhase {
-    /// Validate access rules before a deferred routing hook performs external
-    /// work. Stateful policy such as rate limiting must not be charged here.
-    Preview,
-    /// Enforce the settled backend-effective path immediately before the
-    /// remaining deferred hooks, a deferred-hook rejection, or backend
-    /// dispatch. Stateful policy is committed exactly once in this phase.
-    Enforce,
 }
 
 /// All protocol variants, for plugins that support every protocol.
@@ -200,6 +200,21 @@ pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
 
 /// WebSocket-only (plugins that operate on WebSocket frames, not HTTP request/response).
 pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
+
+/// Parser-level limits contributed by a WebSocket size-policy plugin.
+///
+/// The relay combines every applicable instance before either peer is read,
+/// so the strictest frame and reassembled-message ceilings are enforced by
+/// tungstenite itself rather than by a post-reassembly `on_ws_frame` hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSizeLimits {
+    /// Maximum payload bytes accepted in any one wire frame.
+    pub max_frame_bytes: usize,
+    /// Maximum payload bytes accepted after continuation reassembly.
+    pub max_message_bytes: usize,
+    /// RFC 6455 Close reason paired with code 1009 on either violation.
+    pub close_reason: Arc<str>,
+}
 
 /// gRPC-only (single protocol).
 pub const GRPC_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Grpc];
@@ -846,6 +861,12 @@ pub struct RequestContext {
     /// Kept outside public metadata so backend/operator metadata cannot mint or
     /// overwrite trusted token and cost series.
     pub(crate) ai_usage_export: Option<AiUsageExport>,
+    /// Per-request ownership state for each live request-deduplication plugin
+    /// instance. Multiple instances may coexist on one proxy; keeping their
+    /// correlation state in a private instance-keyed map prevents one hook
+    /// from consuming another instance's key or local/Redis owner token.
+    pub(crate) request_deduplication_state:
+        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
     /// Aggregate CORS policy state staged across every attached CORS instance
     /// and consumed by the cache-inserted CORS finalizer. Kept outside public
     /// metadata so policy details never enter transaction logs.
@@ -1252,6 +1273,7 @@ impl RequestContext {
             gateway_deadline_response_selected: false,
             metadata: HashMap::new(),
             ai_usage_export: None,
+            request_deduplication_state: HashMap::new(),
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
@@ -1510,6 +1532,10 @@ impl RequestContext {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             ai_usage_export: self.ai_usage_export.clone(),
+            // Deduplication has no final request-body hook, and the caller only
+            // copies selected hook results back. Keep ownership solely on the
+            // live context instead of cloning request keys and tokens here.
+            request_deduplication_state: HashMap::new(),
             // Final request-body hooks cannot observe or mutate the real CORS
             // aggregate. CORS has no body hook, and only metadata is copied
             // back from this compatibility context.
@@ -3166,11 +3192,37 @@ async fn collect_mirror_result(
     }
 }
 
+/// Opaque release action for state acquired by a stream admission plugin.
+///
+/// The constructor is crate-private so plugins can attach permits without
+/// exposing their keys or counter identities through transaction metadata.
+/// Each permit invokes its release action exactly once, either when the stream
+/// runner releases it at rejection/teardown or when the connection context is
+/// dropped as a fallback.
+pub struct StreamAdmissionPermit {
+    release: Option<Box<dyn FnOnce() + Send + Sync + 'static>>,
+}
+
+impl StreamAdmissionPermit {
+    pub(crate) fn new(release: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
+    }
+}
+
+impl Drop for StreamAdmissionPermit {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
 /// Context for stream proxy (TCP/UDP) plugin hooks.
 ///
 /// Fields like `proxy_id`, `proxy_name`, `listen_port`, and `backend_scheme`
 /// are available for custom plugins to use in their `on_stream_connect` logic.
-#[derive(Clone)]
 #[allow(dead_code)]
 pub struct StreamConnectionContext {
     /// Gateway-resolved client IP. For TCP stream proxies with inbound PROXY
@@ -3212,6 +3264,12 @@ pub struct StreamConnectionContext {
     /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
     /// for stream connections that have no metadata-writing plugins configured.
     pub metadata: Option<HashMap<String, String>>,
+    /// Core-owned admission permits. External plugins should leave this empty
+    /// and use metadata for their own connection state. Built-in admission
+    /// plugins attach opaque permits through `add_admission_permit()` so state
+    /// release does not depend on mutable metadata keys.
+    #[doc(hidden)]
+    pub admission_permits: Vec<StreamAdmissionPermit>,
     /// DER-encoded client certificate from frontend TLS handshake (first cert in chain).
     /// Populated for TCP/TLS proxies after the TLS handshake completes.
     /// Used by plugins like `tcp_connection_throttle` for consumer-based throttling.
@@ -3281,6 +3339,22 @@ impl StreamConnectionContext {
     /// Take the metadata map, returning an empty map if never allocated.
     pub fn take_metadata(&mut self) -> HashMap<String, String> {
         self.metadata.take().unwrap_or_default()
+    }
+
+    pub(crate) fn add_admission_permit(&mut self, permit: StreamAdmissionPermit) {
+        self.admission_permits.push(permit);
+    }
+
+    /// Release every admission permit acquired so far, in reverse plugin order.
+    ///
+    /// TCP runners call this immediately when a later plugin rejects and when
+    /// transport teardown completes, before awaiting disconnect observers.
+    /// Draining the vector is idempotent, and dropping the context remains the
+    /// fallback for exceptional exit paths.
+    pub fn release_admission_permits(&mut self) {
+        while let Some(permit) = self.admission_permits.pop() {
+            drop(permit);
+        }
     }
 }
 
@@ -3787,9 +3861,9 @@ pub trait Plugin: Send + Sync {
 
     /// Returns `true` when a deferred `before_proxy` hook can mutate headers
     /// that normally participate in upstream target selection. The gateway
-    /// runs these hooks in a separate deferred subphase after an access preview
-    /// and pins that previewed target across the external call; the returned
-    /// headers cannot steer this request onto an unpreviewed path.
+    /// runs these hooks in a separate deferred subphase after backend-path
+    /// enforcement and pins the authorized target across the external call;
+    /// the returned headers cannot steer this request onto a different path.
     fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
         false
     }
@@ -3805,17 +3879,14 @@ pub trait Plugin: Send + Sync {
 
     /// Called after the backend-effective path has been assembled from the
     /// route override, listen-path stripping, proxy/backend path, and selected
-    /// upstream target path, but before any backend is dialed.
-    ///
-    /// When a deferred hook can mutate routing headers, `Preview` runs before
-    /// that hook and `Enforce` runs afterward against the same pinned target.
-    /// Otherwise only `Enforce` runs. Implementations must keep `Preview` free
-    /// of state-consuming effects such as rate-limit charges.
+    /// upstream target path. The selected target is pinned and this hook runs
+    /// exactly once before deferred external/synthetic hooks or backend dial,
+    /// so implementations may safely commit stateful policy such as rate-limit
+    /// charges here.
     async fn on_backend_path_resolved(
         &self,
         _ctx: &mut RequestContext,
         _backend_path: &str,
-        _phase: BackendPathPolicyPhase,
     ) -> PluginResult {
         PluginResult::Continue
     }
@@ -4267,6 +4338,22 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns true when the final request-body hook is a terminal dispatch
+    /// boundary and must run before backend-only circuit-breaker, egress,
+    /// admission, pool, or TLS work. When backend-path policy is active, the
+    /// selected path is authorized and deferred `before_proxy` hooks finish
+    /// before this terminal hook may perform external dispatch.
+    ///
+    /// This is narrower than [`Plugin::needs_final_request_body_context`]. It
+    /// is intended for plugins such as provider federators that consume the
+    /// finalized HTTP request body, perform their own external dispatch, and
+    /// return the complete client response from the hook. Ordinary validators
+    /// should keep the default so fail-fast backend gates can reject without
+    /// first draining a client upload.
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+        false
+    }
+
     /// Transform the response body before it is sent to the client.
     ///
     /// Called after `on_response_body` hooks, only for buffered responses
@@ -4494,7 +4581,28 @@ pub trait Plugin: Send + Sync {
         false
     }
 
-    /// Called for each WebSocket frame when at least one plugin on the proxy opts in.
+    /// Optional parser-level WebSocket size policy.
+    ///
+    /// Implementations must return immutable construction-time values. The
+    /// shared H1/H2/H3 relay evaluates this once per upgraded connection and
+    /// applies the strictest values before reading frames from either peer.
+    fn websocket_size_limits(&self) -> Option<WebSocketSizeLimits> {
+        None
+    }
+
+    /// Returns `true` when this plugin requires the parsed WebSocket relay.
+    ///
+    /// Parser-policy plugins automatically opt out of raw tunnel mode even if
+    /// they do not need the post-reassembly [`Plugin::on_ws_frame`] hook.
+    fn requires_websocket_framing(&self) -> bool {
+        self.requires_ws_frame_hooks() || self.websocket_size_limits().is_some()
+    }
+
+    /// Called for each complete WebSocket message when a plugin opts in.
+    ///
+    /// Tungstenite reassembles Text/Binary continuation frames before this
+    /// hook. Plugins that require actual wire-frame enforcement must contribute
+    /// parser policy through [`Plugin::websocket_size_limits`] instead.
     ///
     /// `connection_id` is a unique per-connection identifier (monotonic counter) that
     /// stateful plugins (e.g., ws_rate_limiting) can use to track per-connection state.
@@ -4775,7 +4883,10 @@ pub fn create_plugin_with_http_client(
         )?))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
         "tcp_connection_throttle" => Ok(Some(Arc::new(
-            tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
+            tcp_connection_throttle::TcpConnectionThrottle::new_with_pool_shard_amount(
+                config,
+                http_client.pool_shard_amount(),
+            )?,
         ))),
         "adaptive_concurrency" => Ok(Some(Arc::new(
             adaptive_concurrency::AdaptiveConcurrency::new(config, http_client.clone())?,
@@ -5030,6 +5141,21 @@ pub fn validate_plugin_config_with_policy(
 ) -> Result<(), String> {
     let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
     validate_plugin_config_with_http_client(name, config, http_client)?;
+    validate_plugin_config_policy_only(name, config, backend_allow_ips)
+}
+
+/// Apply admission-policy checks that live outside plugin construction.
+///
+/// Prospective named-schema validation constructs `schema_ref` consumers while
+/// an isolated schema registry is staged. Callers therefore skip a second full
+/// construction after that bracket is aborted, but must still apply these
+/// policy-only checks so an unrelated plugin cannot add an ignored
+/// `schema_ref` key to bypass egress admission.
+pub(crate) fn validate_plugin_config_policy_only(
+    name: &str,
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
     // The HTTP-endpoint screen above does not cover a plugin's own
     // literal-IP backend fields that aren't dialed through the shared
     // client (mesh_route_dispatch route destinations).

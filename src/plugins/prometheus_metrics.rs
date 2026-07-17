@@ -474,6 +474,16 @@ pub struct MetricsRegistry {
     pub mesh_request_duration_buckets: DashMap<MeshRequestKey, HistogramBuckets>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
+    /// Current ai_federation circuits in an open/half-open recovery state.
+    ai_federation_circuits_open: AtomicI64,
+    /// ai_federation closed-to-open transitions.
+    ai_federation_circuits_opened: AtomicU64,
+    /// ai_federation half-open-to-closed recoveries.
+    ai_federation_circuits_closed: AtomicU64,
+    /// ai_federation half-open probes admitted.
+    ai_federation_circuit_half_open_probes: AtomicU64,
+    /// Provider attempts skipped because an ai_federation circuit was open.
+    ai_federation_circuit_open_skips: AtomicU64,
     /// Stream connections by (proxy_id, protocol)
     pub stream_connection_counter: DashMap<StreamCounterKey, TimestampedCounter>,
     /// Stream connection duration histogram by proxy_id
@@ -585,6 +595,11 @@ impl MetricsRegistry {
             mesh_request_counter: DashMap::new(),
             mesh_request_duration_buckets: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
+            ai_federation_circuits_open: AtomicI64::new(0),
+            ai_federation_circuits_opened: AtomicU64::new(0),
+            ai_federation_circuits_closed: AtomicU64::new(0),
+            ai_federation_circuit_half_open_probes: AtomicU64::new(0),
+            ai_federation_circuit_open_skips: AtomicU64::new(0),
             stream_connection_counter: DashMap::new(),
             stream_duration_buckets: DashMap::new(),
             ws_session_counter: DashMap::new(),
@@ -736,6 +751,46 @@ impl MetricsRegistry {
     /// rate-limiter plugin.
     pub fn record_rate_limit_exceeded(&self) {
         self.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_ai_federation_circuit_opened(&self) {
+        self.ai_federation_circuits_open
+            .fetch_add(1, Ordering::Relaxed);
+        self.ai_federation_circuits_opened
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_ai_federation_circuit_closed(&self) {
+        let _ = self.ai_federation_circuits_open.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+        self.ai_federation_circuits_closed
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn release_ai_federation_open_circuit(&self) {
+        let _ = self.ai_federation_circuits_open.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_ai_federation_half_open_probe(&self) {
+        self.ai_federation_circuit_half_open_probes
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_ai_federation_open_skip(&self) {
+        self.ai_federation_circuit_open_skips
+            .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
     }
 
@@ -1610,6 +1665,45 @@ impl MetricsRegistry {
             ));
         }
 
+        output.push_str(
+            "# HELP ferrum_ai_federation_circuits_open Current ai_federation provider circuits in open or half-open recovery state.\n",
+        );
+        output.push_str("# TYPE ferrum_ai_federation_circuits_open gauge\n");
+        render_process_gauge(
+            &mut output,
+            "ferrum_ai_federation_circuits_open",
+            self.ai_federation_circuits_open.load(Ordering::Relaxed),
+            &ns_label,
+        );
+        for (name, help, value) in [
+            (
+                "ferrum_ai_federation_circuits_opened_total",
+                "ai_federation provider circuit closed-to-open transitions.",
+                self.ai_federation_circuits_opened.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_ai_federation_circuits_closed_total",
+                "ai_federation provider circuit half-open recoveries.",
+                self.ai_federation_circuits_closed.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_ai_federation_circuit_half_open_probes_total",
+                "ai_federation provider half-open probes admitted.",
+                self.ai_federation_circuit_half_open_probes
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_ai_federation_circuit_open_skips_total",
+                "ai_federation provider attempts skipped by an open circuit.",
+                self.ai_federation_circuit_open_skips
+                    .load(Ordering::Relaxed),
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            render_process_counter(&mut output, name, value, &ns_label);
+        }
+
         // Stream connection counter
         if !self.stream_connection_counter.is_empty() {
             output.push_str(
@@ -2231,6 +2325,17 @@ fn render_ai_counter_family(
 }
 
 fn render_process_counter(output: &mut String, metric_name: &str, value: u64, ns_label: &str) {
+    if ns_label.is_empty() {
+        output.push_str(&format!("{metric_name} {value}\n"));
+    } else {
+        output.push_str(&format!(
+            "{metric_name}{{{}}} {value}\n",
+            namespace_label_body(ns_label)
+        ));
+    }
+}
+
+fn render_process_gauge(output: &mut String, metric_name: &str, value: i64, ns_label: &str) {
     if ns_label.is_empty() {
         output.push_str(&format!("{metric_name} {value}\n"));
     } else {
