@@ -148,7 +148,7 @@ fn test_constructor_rejects_effective_real_ip_header_case_insensitively() {
     .err()
     .expect("configured real-IP header collision must fail closed");
     assert!(error.contains("FERRUM_REAL_IP_HEADER"), "got: {error}");
-    assert!(error.contains("CF-Connecting-IP"), "got: {error}");
+    assert!(error.contains("cf-connecting-ip"), "got: {error}");
 }
 
 #[test]
