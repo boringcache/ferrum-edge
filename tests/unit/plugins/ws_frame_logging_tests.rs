@@ -321,14 +321,8 @@ async fn disconnect_log_falls_back_to_legacy_custom_correlation_metadata() {
 
     logger
         .on_ws_disconnect(&disconnect_context(HashMap::from([
-            (
-                "request_id".to_string(),
-                "canonical-request-id".to_string(),
-            ),
-            (
-                "correlation_id".to_string(),
-                "legacy-custom-id".to_string(),
-            ),
+            ("request_id".to_string(), "canonical-request-id".to_string()),
+            ("correlation_id".to_string(), "legacy-custom-id".to_string()),
         ])))
         .await;
     let event = capture

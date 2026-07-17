@@ -2967,12 +2967,7 @@ async fn admin_allows_custom_correlation_owners_on_disjoint_protocols() {
             "admitted custom correlation config {id} was not persisted"
         );
     }
-    let (status, _, _) = admin_get(
-        &base_url,
-        "/proxies/disjoint-correlation-proxy",
-        &token,
-    )
-    .await;
+    let (status, _, _) = admin_get(&base_url, "/proxies/disjoint-correlation-proxy", &token).await;
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
