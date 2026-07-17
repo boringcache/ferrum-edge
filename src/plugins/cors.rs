@@ -221,8 +221,7 @@ pub struct CorsPlugin {
 impl CorsPlugin {
     fn remove_access_control_headers(response_headers: &mut HashMap<String, String>) {
         response_headers.retain(|key, _| {
-            !key
-                .as_bytes()
+            !key.as_bytes()
                 .get(..ACCESS_CONTROL_HEADER_PREFIX.len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(ACCESS_CONTROL_HEADER_PREFIX))
         });
