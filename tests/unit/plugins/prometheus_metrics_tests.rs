@@ -1562,7 +1562,10 @@ fn spoofed_backend_custom_and_malformed_ai_metadata_cannot_export_usage() {
             ("custom.export".to_string(), "v1".to_string()),
             ("custom.provider".to_string(), "openai".to_string()),
             ("custom.total_tokens".to_string(), "999".to_string()),
-            ("custom.estimated_cost".to_string(), "999.000000".to_string()),
+            (
+                "custom.estimated_cost".to_string(),
+                "999.000000".to_string(),
+            ),
         ]),
         HashMap::from([
             ("raw_provider".to_string(), "openai".to_string()),

@@ -1,7 +1,8 @@
 //! Tests for ai_token_metrics plugin
 
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, ProxyProtocol, RequestContext, ai_token_metrics::AiTokenMetrics,
+    Plugin, PluginResult, ProxyProtocol, RequestContext,
+    ai_token_metrics::AiTokenMetrics,
     utils::content_encoding::{DecodeLimits, decode_content_encoding},
     validate_plugin_config,
 };
@@ -794,9 +795,7 @@ fn cost_rate_maximum_matches_the_openapi_contract() {
         }))
         .is_ok()
     );
-    assert!(
-        AiTokenMetrics::new(&json!({"cost_per_prompt_token": 18_446_744_073_710.0})).is_err()
-    );
+    assert!(AiTokenMetrics::new(&json!({"cost_per_prompt_token": 18_446_744_073_710.0})).is_err());
 }
 
 #[test]
