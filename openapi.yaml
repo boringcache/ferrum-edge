@@ -1488,7 +1488,9 @@ paths:
         request throughput, connection pool sizes, circuit breaker states, health
         check results, load balancer active connections, cache statistics, consumer
         index breakdowns, rate limiter tracked keys, and database rejected-delta
-        polling state in database mode.
+        polling state in database mode. The `tcp_connection_throttle` status
+        object states that its configured concurrent-connection limit is
+        process-local and independently enforced per replica.
 
         The response is cached for 5 seconds to avoid performance impact from
         frequent polling. The `X-Cache` response header indicates `hit` or `miss`.
@@ -3539,6 +3541,12 @@ paths:
       responses:
         "204":
           description: Proxy deleted
+        "400":
+          description: Deletion would leave an invalid plugin-composition graph, such as a global TCP connection throttle with no supported TCP/TCP+TLS target
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -4116,6 +4124,12 @@ paths:
       responses:
         "204":
           description: Plugin configuration deleted
+        "400":
+          description: Deletion would expose an invalid plugin-composition graph, including unsupported TCP connection-throttle attachments
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -4835,7 +4849,8 @@ paths:
         Before deletion, Ferrum validates the prospective namespace plugin graph
         after applying every spec-owned and proxy cascade. The request returns
         422 without deleting anything when a retained enabled plugin would be
-        left with a dangling `schema_ref`.
+        left with a dangling `schema_ref`, or when the cascade would leave a
+        global TCP connection throttle without a supported TCP/TCP+TLS target.
 
         Returns 204 on success, 404 if the spec does not exist, or 422 when the
         prospective deletion fails plugin-graph validation.
@@ -4863,8 +4878,9 @@ paths:
         "422":
           description: |
             Deleting the spec and its cascaded resources would leave an invalid
-            transaction-log schema graph in the namespace. No resources are
-            deleted.
+            aggregate plugin-composition graph in the namespace, such as a dangling
+            transaction-log `schema_ref` or a global TCP connection throttle
+            with no supported TCP/TCP+TLS target. No resources are deleted.
           content:
             application/json:
               schema:
@@ -9627,6 +9643,7 @@ components:
         - caches
         - consumer_index
         - rate_limiting
+        - tcp_connection_throttle
       properties:
         gateway:
           $ref: "#/components/schemas/AdminMetricsGateway"
@@ -9649,6 +9666,8 @@ components:
           $ref: "#/components/schemas/AdminMetricsConsumerIndex"
         rate_limiting:
           $ref: "#/components/schemas/AdminMetricsRateLimiting"
+        tcp_connection_throttle:
+          $ref: "#/components/schemas/AdminMetricsTcpConnectionThrottle"
         database_polling:
           $ref: "#/components/schemas/DatabaseDeltaPollingMetrics"
 
@@ -9936,6 +9955,24 @@ components:
           description: |
             Total number of rate-limit keys currently tracked across all
             rate_limiting plugin instances (deduplicated by plugin identity)
+
+    AdminMetricsTcpConnectionThrottle:
+      type: object
+      description: Runtime scope contract for TCP concurrent-connection throttling.
+      required: [enforcement_scope, replica_limit_behavior]
+      properties:
+        enforcement_scope:
+          type: string
+          enum: [process_local]
+          description: Counters are held only by this ferrum-edge process.
+        replica_limit_behavior:
+          type: string
+          enum: [configured_limit_per_replica]
+          description: >-
+            Each replica enforces the configured limit independently, so the
+            aggregate deployment allowance can reach the configured limit
+            multiplied by the number of replicas receiving that identity's TCP
+            connections.
 
     # ── Pagination envelope ────────────────────────────────────────────
     Pagination:
@@ -13717,20 +13754,42 @@ components:
 
     TcpConnectionThrottleConfig:
       type: object
-      description: "Plugin: tcp_connection_throttle — Caps active TCP connections per Consumer when a stream auth plugin identified one, else per client IP."
+      additionalProperties: false
+      description: >-
+        Plugin: tcp_connection_throttle — Caps active TCP/TCP+TLS connections
+        per Consumer when a stream auth plugin identified one, else per
+        canonical client IP. Explicit proxy/proxy-group attachment to any other
+        protocol is rejected during configuration admission and plugin-cache
+        validation. A global policy with a nonempty effective target set must
+        cover at least one TCP/TCP+TLS proxy; mixed global scope is filtered
+        from unsupported listeners. UDP/DTLS is not protected; use
+        udp_rate_limiting for datagram/session admission.
+        Enforcement is process-local, so each replica independently permits up
+        to the configured limit and the deployment-wide allowance can be the
+        limit multiplied by the number of replicas receiving the same identity.
       required: [max_connections_per_key]
       properties:
         max_connections_per_key:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum active TCP connections allowed for one Consumer/IP key
+          description: >-
+            Maximum active TCP connections allowed for one Consumer/IP key in
+            this ferrum-edge process. Each replica enforces this limit
+            independently.
         cleanup_interval_seconds:
           type: integer
           format: uint64
           default: 60
           minimum: 0
-          description: Interval in seconds between background sweeps that remove zero-count entries from the per-key connection counter map. `0` disables the sweep (entries remain in memory until process restart).
+          maximum: 86400
+          description: >-
+            Interval in seconds between defensive background sweeps that remove
+            residual zero-count entries. Normal connection completion and
+            plugin-chain rejection release the exact admission permit and remove
+            its zero-count entry inline. The sweep never repairs a missed
+            positive decrement. `0` disables only the residual sweep; inline
+            permit release and removal remain enabled.
 
     AdaptiveConcurrencyConfig:
       type: object
@@ -18988,14 +19047,15 @@ components:
     ApiSpecValidationError:
       type: object
       description: |
-        Response body for 422 Unprocessable Entity from `POST /api-specs` or
-        `PUT /api-specs/{id}`, or for prospective plugin-graph validation from
-        `DELETE /api-specs/{id}`. For POST/PUT, the spec document was parsed
-        successfully and the Ferrum extensions were found, but one or more
-        extracted resources failed structural validation or database
-        cross-checks (e.g., duplicate `listen_path`, invalid plugin config).
-        For DELETE, removing the spec-owned and cascaded resources would leave
-        an invalid transaction-log schema graph.
+        Response body for 422 Unprocessable Entity from `POST /api-specs`,
+        `PUT /api-specs/{id}`, or `DELETE /api-specs/{id}`. For POST/PUT, the
+        spec document was parsed successfully and the Ferrum extensions were
+        found, but one or more extracted resources failed structural validation
+        or database cross-checks (e.g., duplicate `listen_path`, invalid plugin
+        config). For DELETE, removing the spec-owned and cascaded resources
+        would leave an invalid transaction-log schema graph or TCP-throttle
+        plugin composition. An authoritative in-transaction rejection may omit
+        `spec_version` and the failure `id`.
       properties:
         error:
           type: string
@@ -19011,8 +19071,8 @@ components:
             properties:
               resource_type:
                 type: string
-                enum: [proxy, upstream, plugin, plugin_graph]
-                description: Kind of resource that failed
+                enum: [proxy, upstream, plugin, plugin_composition, plugin_graph]
+                description: Kind of resource or aggregate plugin composition that failed
               id:
                 type: string
                 description: ID of the resource (from the extension object)

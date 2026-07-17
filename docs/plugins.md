@@ -2070,23 +2070,25 @@ Bare-host registry entries match only requests whose Host header omits an explic
 
 ### `tcp_connection_throttle`
 
-Limits concurrent TCP connections per observed client identity on a per-proxy basis. Returns HTTP 429 (mapped to a refused connection at the TCP layer) when the limit is exceeded.
+Limits concurrent TCP connections per observed client identity on a per-proxy basis. Returns HTTP 429 (mapped to a refused connection at the TCP layer) when the limit is exceeded. The plugin supports TCP and TCP+TLS only. An explicit proxy/proxy-group attachment to any other protocol is rejected during configuration admission and plugin-cache validation. When a global policy has a nonempty effective target set, that set must include at least one TCP/TCP+TLS proxy; in a mixed-protocol deployment it is filtered from the unsupported listeners. For UDP or DTLS, use [`udp_rate_limiting`](#udp_rate_limiting) for datagram/session admission.
 
 **Priority:** 2050
 **Protocols:** TCP only
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_connections_per_key` | u64 | **(required, > 0)** | Maximum active TCP connections for one key |
-| `cleanup_interval_seconds` | u64 | `60` | Background sweep interval in seconds for removing stale zero-count entries. Catches edge cases where connections drop without a corresponding `on_stream_disconnect`. Set to `0` to disable the background sweep — entries are still removed inline by the disconnect path |
+| `max_connections_per_key` | u64 | **(required, > 0)** | Maximum active TCP connections for one key in this ferrum-edge process |
+| `cleanup_interval_seconds` | u64 (0–86400) | `60` | Defensive background sweep interval for residual zero-count entries. Normal completion and later plugin rejection release the exact connection permit and remove zero-count entries inline. The sweep never repairs a missed positive decrement. Set to `0` to disable only this residual sweep; inline release/removal remains enabled |
 
 **Key selection:**
 - If a prior stream auth plugin identified a Consumer, the key is `proxy:{proxy_id}:consumer:{username}`
-- Otherwise the key is `proxy:{proxy_id}:ip:{client_ip}`
+- Otherwise the key is `proxy:{proxy_id}:ip:{client_ip}`, with IPv4-mapped IPv6 addresses canonicalized to their IPv4 form
 
-The proxy ID is included so the same identity can hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners.
+The proxy ID is included so the same identity can hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners. Each successful admission owns an opaque permit for the exact plugin instance and counter entry it incremented. Multiple throttle instances, priority/authentication boundaries, later plugin rejection, and config reloads do not share mutable metadata or release one another's entries.
 
-This makes plaintext TCP listeners IP-scoped, while TCP+TLS and UDP+DTLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP/UDP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
+Accounting is **process-local**. Each replica independently permits up to `max_connections_per_key`, so a deployment with _N_ replicas can collectively admit as many as _N × max_connections_per_key_ connections for one identity when traffic is distributed across them. There is no distributed synchronization mode. Compatible cache generations share accounting by plugin namespace and configuration ID, so reload does not reset live counts; removing a policy and later recreating it starts a new generation whose permits cannot be decremented by old connections.
+
+This makes plaintext TCP listeners IP-scoped, while TCP+TLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
 
 ### `adaptive_concurrency`
 

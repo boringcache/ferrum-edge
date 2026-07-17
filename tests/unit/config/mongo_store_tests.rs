@@ -19,8 +19,17 @@ use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use serde_json::json;
 
 const OWNER: &str = "test-owner-uuid";
+const MONGO_STORE_SOURCE: &str = include_str!("../../../src/config/mongo_store.rs");
 // Fixed client-clock instant so the builders are deterministic (no DateTime::now).
 const NOW_MILLIS: i64 = 1_700_000_000_000;
+
+fn mongo_method(name: &str) -> &str {
+    let marker = format!("        async fn {name}");
+    let start = MONGO_STORE_SOURCE.find(&marker).unwrap();
+    let tail = &MONGO_STORE_SOURCE[start + marker.len()..];
+    let end = tail.find("\n        async fn ").unwrap_or(tail.len());
+    &MONGO_STORE_SOURCE[start..start + marker.len() + end]
+}
 
 fn expiry_millis() -> i64 {
     NOW_MILLIS + mongo_migration_lease_duration_millis()
@@ -114,6 +123,61 @@ fn mtls_dns_admission_drop_retains_only_uncertain_mutations() {
         !mongo_mtls_dns_admission_drop_must_retain(true, true),
         "an explicit settled release may retry owner-qualified cleanup"
     );
+}
+
+#[test]
+fn mongo_plugin_graph_validation_runs_under_the_durable_namespace_fence() {
+    let validator = mongo_method("validate_mtls_dns_candidate_with_mode");
+    let graph_validation = validator
+        .find("validate_tcp_connection_throttle_attachments")
+        .expect("shared Mongo candidate validation must enforce TCP throttle attachments");
+    let mtls_fast_path = validator
+        .find("has_effective_mtls_dns_identity_policy")
+        .expect("mTLS consumer-load fast path");
+    assert!(
+        graph_validation < mtls_fast_path,
+        "TCP graph validation must run even when no effective mTLS DNS policy loads Consumers"
+    );
+
+    for method_name in [
+        "create_proxy(&self, proxy: &Proxy)",
+        "update_proxy(&self, proxy: &Proxy)",
+        "delete_proxy(&self, namespace: &str, id: &str)",
+        "create_plugin_config(&self, pc: &PluginConfig)",
+        "update_plugin_config(&self, pc: &PluginConfig)",
+        "delete_plugin_config(",
+        "batch_create_proxies(",
+        "batch_create_plugin_configs(",
+        "submit_api_spec_bundle(",
+        "delete_api_spec(&self, namespace: &str, id: &str)",
+    ] {
+        let method = mongo_method(method_name);
+        let acquire = method
+            .find("acquire_mtls_dns_admission")
+            .unwrap_or_else(|| panic!("{method_name} must acquire the durable namespace fence"));
+        let validate = method
+            .find("validate_plugin_graph")
+            .unwrap_or_else(|| panic!("{method_name} must validate the guarded graph candidate"));
+        let mutate = method[validate..]
+            .find("run_mutation")
+            .map(|offset| validate + offset)
+            .or_else(|| {
+                method[validate..]
+                    .find("run_mtls_dns_mutations")
+                    .map(|offset| validate + offset)
+            })
+            .unwrap_or_else(|| panic!("{method_name} must mutate only after validation"));
+        assert!(
+            acquire < validate && validate < mutate,
+            "{method_name} must acquire, re-read/validate, then mutate in that order"
+        );
+    }
+
+    let replace = mongo_method("replace_api_spec_bundle(");
+    let acquire = replace.find("acquire_mtls_dns_admission").unwrap();
+    let validate = replace.find("validate_plugin_graph").unwrap();
+    let graph_mutation = replace[validate..].find("run_mtls_dns_mutations").unwrap() + validate;
+    assert!(acquire < validate && validate < graph_mutation);
 }
 
 #[test]

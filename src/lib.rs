@@ -1004,6 +1004,12 @@ pub mod _test_support {
         config.has_effective_mtls_dns_identity_policy()
     }
 
+    pub fn validate_tcp_connection_throttle_attachments(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(), Vec<String>> {
+        crate::plugin_cache::validate_tcp_connection_throttle_attachments(config)
+    }
+
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
         crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
     }

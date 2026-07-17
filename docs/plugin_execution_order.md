@@ -237,7 +237,7 @@ Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_va
 
 `waf` request metadata inspection (path, query, headers, cookies, and method) runs in the `authorize` phase at priority 2930, after authentication and earlier authorization plugins such as `access_control`, `mesh_authz`, `opa`, and consumer-aware `rate_limiting`. Authenticated proxies that reject during auth/authz therefore avoid WAF scan cost, while public/no-auth proxies still run WAF before backend dispatch. WAF request-body inspection remains on the final backend-visible request body.
 
-**Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS and UDP+DTLS listeners it runs after the frontend TLS/DTLS handshake and before the backend connection/session is opened, so plugins can inspect the client certificate without spending upstream capacity first. Frontend TLS/DTLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection/session immediately and do not dial the backend. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`.
+**Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS and UDP+DTLS listeners it runs after the frontend TLS/DTLS handshake and before the backend connection/session is opened, so plugins can inspect the client certificate without spending upstream capacity first. Frontend TLS/DTLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection/session immediately and do not dial the backend. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`. Built-in admission plugins can instead attach opaque connection permits; TCP runners release all permits in reverse order immediately when a later plugin rejects, and normal connection teardown releases any remaining permits exactly once.
 
 **Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or a UDP/DTLS session expires, is cleaned up, or otherwise ends). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
 
@@ -252,7 +252,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS or UDP+DTLS |
 | `access_control` | ✓ | | Applies consumer and group allow/deny rules once a stream Consumer exists |
 | `mesh_authz` | ✓ | | Applies Layer 2 mesh authorization policies from SPIFFE/HBONE identity |
-| `tcp_connection_throttle` | ✓ | ✓ | Caps active TCP connections per Consumer, else per client IP |
+| `tcp_connection_throttle` | ✓ | | Owns an opaque permit that caps process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP; UDP/DTLS attachment is rejected |
 | `geo_restriction` | ✓ | | Rejects connections from denied countries |
 | `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |
 | `correlation_id` | ✓ | | Assigns a UUID request ID to metadata |
@@ -442,7 +442,7 @@ Given all built-in plugins enabled, the execution order is:
 | 22 | `hmac_auth` | 1400 | authenticate |
 | 23 | `soap_ws_security` | 1500 | before_proxy |
 | 24 | `access_control` | 2000 | authorize, on_stream_connect |
-| 25 | `tcp_connection_throttle` | 2050 | on_stream_connect, on_stream_disconnect |
+| 25 | `tcp_connection_throttle` | 2050 | on_stream_connect (opaque connection permit releases on rejection/teardown) |
 | 26 | `mesh_authz` | 2075 | authorize, on_stream_connect |
 | 27 | `opa` | 2080 | authorize |
 | 28 | `adaptive_concurrency` | 2090 | backend_admission |
@@ -767,7 +767,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `access_control` | ✓ | ✓ | ✓ | ✓ | ✓ | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `mesh_authz` | ✓ | ✓ | ✓ | ✓ | ✓ | Applies Layer 2 mesh policy using SPIFFE or HBONE identities |
 | `opa` | ✓ | | | | | Delegates HTTP request authorization to an OPA Data API policy |
-| `tcp_connection_throttle` | | | | ✓ | | Tracks active TCP connections per Consumer or client IP |
+| `tcp_connection_throttle` | | | | ✓ | | Tracks process-local active TCP/TCP+TLS connections per Consumer or canonical client IP; each replica enforces independently |
 | `adaptive_concurrency` | ✓ | ✓ | ✓ | | | Target-aware backend admission for HTTP-family upstream survival |
 | `grpc_web` | ✓ | ✓ | | | | Translates gRPC-Web (browser) ↔ native gRPC (HTTP/2) |
 | `grpc_method_router` | | ✓ | | | | gRPC method-level access control and rate limiting |

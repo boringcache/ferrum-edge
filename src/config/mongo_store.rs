@@ -46,7 +46,7 @@ mod inner {
         DeleteAllResourcesError, DeleteMode, IncrementalResult, MtlsDnsAdmissionUnavailable,
         MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts,
         NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
-        SnapshotDataIntegrityError, SortOrder,
+        SnapshotDataIntegrityError, SortOrder, TcpConnectionThrottleAttachmentConflict,
     };
     use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
     use crate::config::types::{
@@ -1694,7 +1694,19 @@ mod inner {
         where
             F: Fn(&mut GatewayConfig),
         {
-            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, false)
+            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, false, false)
+                .await
+        }
+
+        async fn validate_plugin_graph_admission_candidate<F>(
+            &self,
+            namespace: &str,
+            mutate: F,
+        ) -> Result<(), anyhow::Error>
+        where
+            F: Fn(&mut GatewayConfig),
+        {
+            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, false, true)
                 .await
         }
 
@@ -1706,7 +1718,19 @@ mod inner {
         where
             F: Fn(&mut GatewayConfig),
         {
-            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, true)
+            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, true, false)
+                .await
+        }
+
+        async fn validate_plugin_graph_repair_delete_candidate<F>(
+            &self,
+            namespace: &str,
+            mutate: F,
+        ) -> Result<(), anyhow::Error>
+        where
+            F: Fn(&mut GatewayConfig),
+        {
+            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, true, true)
                 .await
         }
 
@@ -1715,6 +1739,7 @@ mod inner {
             namespace: &str,
             mutate: F,
             allow_existing_conflicts: bool,
+            validate_plugin_graph: bool,
         ) -> Result<(), anyhow::Error>
         where
             F: Fn(&mut GatewayConfig),
@@ -1725,6 +1750,14 @@ mod inner {
             let mut policy_candidate = self.load_mtls_dns_policy_candidate(namespace).await?;
             mutate(&mut policy_candidate);
             policy_candidate.normalize_fields();
+            if validate_plugin_graph {
+                crate::plugin_cache::validate_tcp_connection_throttle_attachments(
+                    &policy_candidate,
+                )
+                .map_err(|errors| {
+                    anyhow::Error::new(TcpConnectionThrottleAttachmentConflict::new(errors))
+                })?;
+            }
             if !policy_candidate.has_effective_mtls_dns_identity_policy() {
                 return Ok(());
             }
@@ -4739,7 +4772,7 @@ mod inner {
             let mut mtls_lease = self
                 .acquire_mtls_dns_admission_lease(&proxy.namespace)
                 .await?;
-            self.validate_mtls_dns_candidate(&proxy.namespace, |candidate| {
+            self.validate_plugin_graph_admission_candidate(&proxy.namespace, |candidate| {
                 candidate.proxies.push(proxy.clone());
             })
             .await?;
@@ -4891,7 +4924,7 @@ mod inner {
             let mut mtls_lease = self
                 .acquire_mtls_dns_admission_lease(&proxy.namespace)
                 .await?;
-            self.validate_mtls_dns_candidate(&proxy.namespace, |candidate| {
+            self.validate_plugin_graph_admission_candidate(&proxy.namespace, |candidate| {
                 if let Some(existing) = candidate
                     .proxies
                     .iter_mut()
@@ -5158,7 +5191,7 @@ mod inner {
         async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
-            self.validate_mtls_dns_repair_delete_candidate(namespace, |candidate| {
+            self.validate_plugin_graph_repair_delete_candidate(namespace, |candidate| {
                 candidate.proxies.retain(|proxy| proxy.id != id);
                 candidate
                     .plugin_configs
@@ -6144,7 +6177,7 @@ mod inner {
         async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(&pc.namespace).await?;
-            self.validate_mtls_dns_candidate(&pc.namespace, |candidate| {
+            self.validate_plugin_graph_admission_candidate(&pc.namespace, |candidate| {
                 if let Some(existing) = candidate
                     .plugin_configs
                     .iter_mut()
@@ -6247,7 +6280,7 @@ mod inner {
         async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(&pc.namespace).await?;
-            self.validate_mtls_dns_candidate(&pc.namespace, |candidate| {
+            self.validate_plugin_graph_admission_candidate(&pc.namespace, |candidate| {
                 if let Some(existing) = candidate
                     .plugin_configs
                     .iter_mut()
@@ -6405,7 +6438,7 @@ mod inner {
         ) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
-            self.validate_mtls_dns_repair_delete_candidate(namespace, |candidate| {
+            self.validate_plugin_graph_repair_delete_candidate(namespace, |candidate| {
                 candidate.plugin_configs.retain(|plugin| plugin.id != id);
                 for proxy in &mut candidate.proxies {
                     proxy
@@ -7389,7 +7422,7 @@ mod inner {
                     .map(|proxy| proxy.namespace.as_str())
                     .collect();
                 for namespace in namespaces {
-                    self.validate_mtls_dns_candidate(namespace, |candidate| {
+                    self.validate_plugin_graph_admission_candidate(namespace, |candidate| {
                         candidate.proxies.extend(
                             proxies
                                 .iter()
@@ -7707,7 +7740,7 @@ mod inner {
                     .map(|config| config.namespace.as_str())
                     .collect();
                 for namespace in namespaces {
-                    self.validate_mtls_dns_candidate(namespace, |candidate| {
+                    self.validate_plugin_graph_admission_candidate(namespace, |candidate| {
                         candidate.plugin_configs.extend(
                             configs
                                 .iter()
@@ -8887,7 +8920,7 @@ mod inner {
                 )
                 .collect();
             for namespace in namespaces {
-                self.validate_mtls_dns_candidate(namespace, |candidate| {
+                self.validate_plugin_graph_admission_candidate(namespace, |candidate| {
                     if bundle.proxy.namespace == namespace {
                         candidate.proxies.push(bundle.proxy.clone());
                     }
@@ -9275,7 +9308,7 @@ mod inner {
                 )
                 .collect();
             for namespace in namespaces {
-                self.validate_mtls_dns_candidate(namespace, |candidate| {
+                self.validate_plugin_graph_admission_candidate(namespace, |candidate| {
                     candidate.plugin_configs.retain(|plugin| {
                         !old_spec_plugin_ids.contains(&plugin.id)
                             && !previous_declared_assoc_ids.contains(&plugin.id)
@@ -9945,7 +9978,7 @@ mod inner {
                 .as_ref()
                 .and_then(|d| d.get_str("proxy_id").ok())
                 .map(str::to_string);
-            self.validate_mtls_dns_repair_delete_candidate(namespace, |candidate| {
+            self.validate_plugin_graph_repair_delete_candidate(namespace, |candidate| {
                 if let Some(proxy_id) = proxy_id.as_deref() {
                     candidate.proxies.retain(|proxy| proxy.id != proxy_id);
                     candidate

@@ -77,7 +77,8 @@ pub(crate) fn mark_mtls_dns_admission_unavailable(error: anyhow::Error) -> anyho
 }
 
 /// Whether a batch owns its namespace admission guard and whether it runs
-/// normal mTLS DNS validation.
+/// normal namespace candidate validation (mTLS DNS plus guarded plugin-graph
+/// contracts).
 ///
 /// `RestoreRollbackReplay` is intentionally narrow: it may only replay the
 /// exact raw snapshot captured immediately before a destructive restore. That
@@ -135,6 +136,49 @@ pub fn is_mtls_dns_identity_conflict(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<MtlsDnsIdentityConflict>())
+}
+
+/// A datastore-serialized candidate would leave an enabled
+/// `tcp_connection_throttle` attached only to unsupported protocols (global
+/// scope) or directly attached to an unsupported proxy (proxy/proxy-group
+/// scope).
+///
+/// Persistence implementations carry this typed error through the namespace
+/// admission lock/lease so admin handlers can return the same validation
+/// response as their optimistic preflight without exposing database details.
+#[derive(Debug)]
+pub struct TcpConnectionThrottleAttachmentConflict {
+    errors: Vec<String>,
+}
+
+impl TcpConnectionThrottleAttachmentConflict {
+    pub fn new(errors: Vec<String>) -> Self {
+        Self { errors }
+    }
+
+    pub fn errors(&self) -> &[String] {
+        &self.errors
+    }
+}
+
+impl std::fmt::Display for TcpConnectionThrottleAttachmentConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tcp_connection_throttle attachment validation failed: {}",
+            self.errors.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for TcpConnectionThrottleAttachmentConflict {}
+
+pub fn tcp_connection_throttle_attachment_conflict(
+    error: &anyhow::Error,
+) -> Option<&TcpConnectionThrottleAttachmentConflict> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TcpConnectionThrottleAttachmentConflict>())
 }
 
 // ---------------------------------------------------------------------------

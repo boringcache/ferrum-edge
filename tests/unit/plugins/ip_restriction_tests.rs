@@ -26,6 +26,7 @@ fn create_stream_context_with_ip(ip: &str) -> StreamConnectionContext {
         authenticated_identity: None,
         auth_method: None,
         metadata: None,
+        admission_permits: Vec::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,

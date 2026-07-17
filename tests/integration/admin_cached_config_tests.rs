@@ -5394,6 +5394,96 @@ async fn test_stream_proxy_admin_shape_preserved_across_get_and_backup() {
     );
 }
 
+#[tokio::test]
+async fn tcp_connection_throttle_admin_rejects_udp_attachment_before_persistence() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let proxy = json!({
+        "id": "udp-throttle-admin-proxy",
+        "backend_scheme": "udp",
+        "backend_host": "localhost",
+        "backend_port": 5353,
+        "listen_port": 19011
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create UDP proxy failed: {body:?}");
+
+    // A scoped definition is dormant until the proxy association exists.
+    let plugin = json!({
+        "id": "udp-throttle-admin-plugin",
+        "plugin_name": "tcp_connection_throttle",
+        "scope": "proxy",
+        "proxy_id": "udp-throttle-admin-proxy",
+        "enabled": true,
+        "config": {"max_connections_per_key": 1}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+    assert_eq!(status, 201, "Create dormant throttle failed: {body:?}");
+
+    let attached = json!({
+        "id": "udp-throttle-admin-proxy",
+        "backend_scheme": "udp",
+        "backend_host": "localhost",
+        "backend_port": 5353,
+        "listen_port": 19011,
+        "plugins": [{"plugin_config_id": "udp-throttle-admin-plugin"}]
+    });
+    let (status, body) = admin_put(
+        &base_url,
+        "/proxies/udp-throttle-admin-proxy",
+        &token,
+        &attached,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "UDP throttle attachment was persisted: {body:?}"
+    );
+    assert!(body.to_string().contains("only TCP/TCP+TLS is supported"));
+
+    let (status, persisted, _) =
+        admin_get(&base_url, "/proxies/udp-throttle-admin-proxy", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        persisted["plugins"]
+            .as_array()
+            .is_some_and(|plugins| plugins.is_empty()),
+        "rejected attachment changed the persisted proxy: {persisted:?}"
+    );
+}
+
+#[tokio::test]
+async fn tcp_connection_throttle_batch_rejects_udp_attachment() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let batch = json!({
+        "proxies": [{
+            "id": "udp-throttle-batch-proxy",
+            "backend_scheme": "udp",
+            "backend_host": "localhost",
+            "backend_port": 5354,
+            "listen_port": 19012,
+            "plugins": [{"plugin_config_id": "udp-throttle-batch-plugin"}]
+        }],
+        "plugin_configs": [{
+            "id": "udp-throttle-batch-plugin",
+            "plugin_name": "tcp_connection_throttle",
+            "scope": "proxy",
+            "proxy_id": "udp-throttle-batch-proxy",
+            "enabled": true,
+            "config": {"max_connections_per_key": 1}
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 400, "UDP throttle batch was persisted: {body:?}");
+    assert!(body.to_string().contains("only TCP/TCP+TLS is supported"));
+}
+
 // ============================================================================
 // Health Endpoint with DB Availability Info
 // ============================================================================

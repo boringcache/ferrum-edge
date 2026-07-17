@@ -405,7 +405,7 @@ Each plugin declares which protocols it supports via `supported_protocols()`. On
 | `ip_restriction` | `on_stream_connect` | Block connections from denied IPs |
 | `mtls_auth` | `on_stream_connect` | Map TCP+TLS or UDP+DTLS client certificates to Consumers |
 | `access_control` | `on_stream_connect` | Consumer allow/deny after a stream auth plugin identifies the caller |
-| `tcp_connection_throttle` | `on_stream_connect`, `on_stream_disconnect` | Cap active TCP connections per Consumer, else per client IP |
+| `tcp_connection_throttle` | `on_stream_connect` + connection permit | Cap process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP. UDP/DTLS attachment is rejected; each replica enforces an independent limit |
 | `rate_limiting` | `on_stream_connect` | Connection/session rate limiting; consumer-aware when a stream identity exists |
 | `correlation_id` | `on_stream_connect` | Assign request ID to connection metadata |
 | `stdout_logging` | `on_stream_disconnect` | Log connection summary as JSON |
@@ -418,6 +418,7 @@ Each plugin declares which protocols it supports via `supported_protocols()`. On
 See [docs/plugin_execution_order.md](plugin_execution_order.md) for the full per-plugin protocol matrix.
 
 Notes:
+- `tcp_connection_throttle` is TCP/TCP+TLS-only. Explicit proxy/proxy-group attachment to any other protocol fails configuration admission and plugin-cache validation instead of silently claiming protection. A global policy with a nonempty effective target set must cover at least one TCP/TCP+TLS proxy; mixed global scope is applied only to its TCP-family listeners. In particular, it does not protect UDP/DTLS; use `udp_rate_limiting` for datagram/session admission. Its counters are process-local, so a replicated deployment's aggregate allowance can reach the configured limit per replica.
 - `access_control` applies to both TCP and UDP stream proxies. For TCP+TLS and UDP+DTLS, pair with `mtls_auth` for certificate-based consumer identification → ACL group/username authorization.
 - `mtls_auth` applies to both TCP+TLS and UDP+DTLS stream proxies. It only activates when the listener is configured with `frontend_tls: true` and a client certificate is presented during the TLS/DTLS handshake.
 

@@ -3116,11 +3116,37 @@ async fn collect_mirror_result(
     }
 }
 
+/// Opaque release action for state acquired by a stream admission plugin.
+///
+/// The constructor is crate-private so plugins can attach permits without
+/// exposing their keys or counter identities through transaction metadata.
+/// Each permit invokes its release action exactly once, either when the stream
+/// runner releases it at rejection/teardown or when the connection context is
+/// dropped as a fallback.
+pub struct StreamAdmissionPermit {
+    release: Option<Box<dyn FnOnce() + Send + Sync + 'static>>,
+}
+
+impl StreamAdmissionPermit {
+    pub(crate) fn new(release: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
+    }
+}
+
+impl Drop for StreamAdmissionPermit {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
 /// Context for stream proxy (TCP/UDP) plugin hooks.
 ///
 /// Fields like `proxy_id`, `proxy_name`, `listen_port`, and `backend_scheme`
 /// are available for custom plugins to use in their `on_stream_connect` logic.
-#[derive(Clone)]
 #[allow(dead_code)]
 pub struct StreamConnectionContext {
     /// Gateway-resolved client IP. For TCP stream proxies with inbound PROXY
@@ -3162,6 +3188,12 @@ pub struct StreamConnectionContext {
     /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
     /// for stream connections that have no metadata-writing plugins configured.
     pub metadata: Option<HashMap<String, String>>,
+    /// Core-owned admission permits. External plugins should leave this empty
+    /// and use metadata for their own connection state. Built-in admission
+    /// plugins attach opaque permits through `add_admission_permit()` so state
+    /// release does not depend on mutable metadata keys.
+    #[doc(hidden)]
+    pub admission_permits: Vec<StreamAdmissionPermit>,
     /// DER-encoded client certificate from frontend TLS handshake (first cert in chain).
     /// Populated for TCP/TLS proxies after the TLS handshake completes.
     /// Used by plugins like `tcp_connection_throttle` for consumer-based throttling.
@@ -3231,6 +3263,22 @@ impl StreamConnectionContext {
     /// Take the metadata map, returning an empty map if never allocated.
     pub fn take_metadata(&mut self) -> HashMap<String, String> {
         self.metadata.take().unwrap_or_default()
+    }
+
+    pub(crate) fn add_admission_permit(&mut self, permit: StreamAdmissionPermit) {
+        self.admission_permits.push(permit);
+    }
+
+    /// Release every admission permit acquired so far, in reverse plugin order.
+    ///
+    /// TCP runners call this immediately when a later plugin rejects and when
+    /// transport teardown completes, before awaiting disconnect observers.
+    /// Draining the vector is idempotent, and dropping the context remains the
+    /// fallback for exceptional exit paths.
+    pub fn release_admission_permits(&mut self) {
+        while let Some(permit) = self.admission_permits.pop() {
+            drop(permit);
+        }
     }
 }
 
@@ -4738,7 +4786,10 @@ pub fn create_plugin_with_http_client(
         )?))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
         "tcp_connection_throttle" => Ok(Some(Arc::new(
-            tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
+            tcp_connection_throttle::TcpConnectionThrottle::new_with_pool_shard_amount(
+                config,
+                http_client.pool_shard_amount(),
+            )?,
         ))),
         "adaptive_concurrency" => Ok(Some(Arc::new(
             adaptive_concurrency::AdaptiveConcurrency::new(config, http_client.clone())?,

@@ -14,6 +14,8 @@
 //!   namespace returns 404)
 //! - cross-process mTLS DNS-identity admission against a shared persistent
 //!   backend
+//! - cross-process MongoDB TCP-throttle graph admission under the durable
+//!   namespace fence
 //!
 //! Backends:
 //! - `sqlite`: runs unconditionally (tempdir-backed file DB)
@@ -815,6 +817,91 @@ async fn run_mtls_dns_cross_process_admission_suite(backend: Backend) {
     assert_ne!(policy_active, rotation_active);
 }
 
+/// Exercise the Mongo durable-fence ordering behaviorally with two independent
+/// admin processes. A global TCP throttle and an HTTP proxy are each valid
+/// against the initial empty graph, but their aggregate graph is invalid. The
+/// lease owner must re-read and validate after acquisition, before mutation, so
+/// exactly one write commits and the other fails closed.
+async fn run_tcp_throttle_cross_process_admission_mongodb() {
+    let Some(harness) = SharedAdminHarness::start(Backend::Mongodb).await else {
+        eprintln!("Skipping TCP-throttle Mongo admission suite — backend unavailable");
+        return;
+    };
+    let client = reqwest::Client::new();
+    let namespace = format!("tcp-throttle-{}", uuid::Uuid::new_v4().simple());
+    let proxy_id = mk_id("http-only");
+    let plugin_id = mk_id("global-tcp-throttle");
+    let proxy = serde_json::json!({
+        "id": proxy_id,
+        "hosts": [format!("{}.test", uuid::Uuid::new_v4().simple())],
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9
+    });
+    let throttle = serde_json::json!({
+        "id": plugin_id,
+        "plugin_name": "tcp_connection_throttle",
+        "scope": "global",
+        "enabled": true,
+        "config": {"max_connections_per_key": 1}
+    });
+    let proxy_url = format!("{}/proxies", harness.admin_a);
+    let throttle_url = format!("{}/plugins/config", harness.admin_b);
+
+    let (proxy_response, throttle_response) = tokio::join!(
+        admin_request(
+            &client,
+            reqwest::Method::POST,
+            &proxy_url,
+            Some(&namespace),
+            Some(&proxy),
+        ),
+        admin_request(
+            &client,
+            reqwest::Method::POST,
+            &throttle_url,
+            Some(&namespace),
+            Some(&throttle),
+        )
+    );
+    let statuses = [proxy_response.status(), throttle_response.status()];
+    assert_eq!(
+        statuses.iter().filter(|status| status.is_success()).count(),
+        1,
+        "Mongo durable admission must commit exactly one individually-valid write: {statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| status.as_u16() == 400)
+            .count(),
+        1,
+        "Mongo durable admission loser must fail closed with 400: {statuses:?}"
+    );
+
+    let stored_proxy = admin_request(
+        &client,
+        reqwest::Method::GET,
+        &format!("{}/proxies/{}", harness.admin_a, proxy_id),
+        Some(&namespace),
+        None,
+    )
+    .await;
+    let stored_throttle = admin_request(
+        &client,
+        reqwest::Method::GET,
+        &format!("{}/plugins/config/{}", harness.admin_b, plugin_id),
+        Some(&namespace),
+        None,
+    )
+    .await;
+    assert_ne!(
+        stored_proxy.status().is_success(),
+        stored_throttle.status().is_success(),
+        "the persisted Mongo graph must contain only the winning resource"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Entry points per backend
 // ---------------------------------------------------------------------------
@@ -865,6 +952,12 @@ async fn mtls_dns_cross_process_admission_mysql() {
 #[ignore]
 async fn mtls_dns_cross_process_admission_mongodb() {
     run_mtls_dns_cross_process_admission_suite(Backend::Mongodb).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn tcp_throttle_cross_process_admission_mongodb() {
+    run_tcp_throttle_cross_process_admission_mongodb().await;
 }
 
 // ---------------------------------------------------------------------------
