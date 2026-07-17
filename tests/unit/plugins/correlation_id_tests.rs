@@ -84,13 +84,20 @@ fn test_constructor_rejects_invalid_header_name_chars() {
 }
 
 #[test]
-fn test_constructor_rejects_protocol_managed_header_names() {
+fn test_constructor_rejects_protocol_managed_and_security_sensitive_header_names() {
     for header_name in [
+        "Authentication-Info",
+        "Authorization",
         "Connection",
         "Content-Length",
+        "Cookie",
+        "Grpc-Message",
+        "Grpc-Status",
+        "Grpc-Status-Details-Bin",
         "Host",
         "Keep-Alive",
         "Proxy-Authenticate",
+        "Proxy-Authentication-Info",
         "Proxy-Authorization",
         "Proxy-Connection",
         "Sec-WebSocket-Accept",
@@ -98,14 +105,19 @@ fn test_constructor_rejects_protocol_managed_header_names() {
         "Sec-WebSocket-Key",
         "Sec-WebSocket-Protocol",
         "Sec-WebSocket-Version",
+        "Set-Cookie",
         "TE",
         "Trailer",
         "Transfer-Encoding",
         "Upgrade",
+        "WWW-Authenticate",
+        "X-API-Key",
+        "X-Auth-Token",
+        "X-CSRF-Token",
     ] {
         let err = CorrelationId::new(&json!({"header_name": header_name}))
             .err()
-            .expect("protocol-managed header must be rejected");
+            .expect("reserved header must be rejected");
         assert!(err.contains("protocol-managed"), "{header_name}: {err}");
     }
 }
@@ -767,6 +779,10 @@ async fn assert_isolated_instances(external_first: bool) {
             .get("correlation_id.instance.x-external-correlation-id")
             .map(String::as_str),
         Some("attacker-preserved-id")
+    );
+    assert!(
+        !ctx.metadata.contains_key("correlation_id.canonical_owner"),
+        "correlation ownership bookkeeping must not enter public metadata"
     );
 
     let mut backend_headers = HashMap::new();

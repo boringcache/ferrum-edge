@@ -1909,6 +1909,11 @@ async fn test_admin_create_rejects_malformed_correlation_id_configs() {
             json!({"header_name": "Content-Length"}),
             "correlation_id: 'header_name' is protocol-managed",
         ),
+        (
+            "correlation-credential-header",
+            json!({"header_name": "Authorization"}),
+            "correlation_id: 'header_name' is protocol-managed or security-sensitive",
+        ),
     ] {
         let plugin = json!({
             "id": id,

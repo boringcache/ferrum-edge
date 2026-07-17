@@ -680,6 +680,10 @@ async fn test_multiple_correlation_instances_keep_stream_ids_isolated() {
     assert!(uuid::Uuid::parse_str(external).is_ok());
     assert_ne!(internal, external);
     assert_eq!(metadata.get(REQUEST_ID_METADATA_KEY), Some(internal));
+    assert!(
+        !metadata.contains_key("correlation_id.canonical_owner"),
+        "correlation ownership bookkeeping must not enter stream summaries"
+    );
 }
 
 // ---- WebSocket-only frame plugins ----

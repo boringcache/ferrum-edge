@@ -11,14 +11,20 @@ use uuid::Uuid;
 use super::{Plugin, PluginResult, REQUEST_ID_METADATA_KEY, RequestContext};
 
 const INSTANCE_METADATA_PREFIX: &str = "correlation_id.instance.";
-const CANONICAL_OWNER_METADATA_KEY: &str = "correlation_id.canonical_owner";
 
-const PROTOCOL_MANAGED_HEADER_NAMES: &[&str] = &[
+const RESERVED_HEADER_NAMES: &[&str] = &[
+    "authentication-info",
+    "authorization",
     "connection",
     "content-length",
+    "cookie",
+    "grpc-message",
+    "grpc-status",
+    "grpc-status-details-bin",
     "host",
     "keep-alive",
     "proxy-authenticate",
+    "proxy-authentication-info",
     "proxy-authorization",
     "proxy-connection",
     "sec-websocket-accept",
@@ -26,10 +32,15 @@ const PROTOCOL_MANAGED_HEADER_NAMES: &[&str] = &[
     "sec-websocket-key",
     "sec-websocket-protocol",
     "sec-websocket-version",
+    "set-cookie",
     "te",
     "trailer",
     "transfer-encoding",
     "upgrade",
+    "www-authenticate",
+    "x-api-key",
+    "x-auth-token",
+    "x-csrf-token",
 ];
 
 pub struct CorrelationId {
@@ -74,9 +85,9 @@ impl CorrelationId {
                     ));
                 }
                 let lower = trimmed.to_ascii_lowercase();
-                if is_protocol_managed_header_name(&lower) {
+                if is_reserved_header_name(&lower) {
                     return Err(format!(
-                        "correlation_id: 'header_name' is protocol-managed and cannot be used for correlation IDs: {trimmed:?}"
+                        "correlation_id: 'header_name' is protocol-managed or security-sensitive and cannot be used for correlation IDs: {trimmed:?}"
                     ));
                 }
                 lower
@@ -109,16 +120,16 @@ impl CorrelationId {
     }
 
     fn publish_request_id(&self, metadata: &mut HashMap<String, String>, request_id: String) {
+        // The instance-scoped entries are the correlation lifecycle state. Use
+        // their presence to identify the first correlation instance instead of
+        // adding a private bookkeeping key to public transaction metadata.
+        // Generic metadata may already contain `request_id` from a custom
+        // plugin; the first correlation instance intentionally replaces it.
+        let canonical_unclaimed = !metadata
+            .keys()
+            .any(|key| key.starts_with(INSTANCE_METADATA_PREFIX));
         metadata.insert(self.instance_metadata_key.clone(), request_id.clone());
-        // Generic metadata can be populated by earlier custom plugins. Only a
-        // correlation-specific claim proves that a correlation instance has
-        // selected the canonical consumer value. The first such instance
-        // replaces generic occupancy; later correlation instances preserve it.
-        if !metadata.contains_key(CANONICAL_OWNER_METADATA_KEY) {
-            metadata.insert(
-                CANONICAL_OWNER_METADATA_KEY.to_string(),
-                self.instance_metadata_key.clone(),
-            );
+        if canonical_unclaimed {
             metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
         }
     }
@@ -128,8 +139,8 @@ impl CorrelationId {
     }
 }
 
-fn is_protocol_managed_header_name(name: &str) -> bool {
-    PROTOCOL_MANAGED_HEADER_NAMES.contains(&name)
+fn is_reserved_header_name(name: &str) -> bool {
+    RESERVED_HEADER_NAMES.contains(&name)
 }
 
 /// Validate an HTTP header name per RFC 7230 §3.2.6 token grammar.
