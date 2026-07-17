@@ -5152,12 +5152,18 @@ pub fn create_plugin_with_http_client(
             config,
         )?))),
         "bot_detection" => Ok(Some(Arc::new(bot_detection::BotDetection::new(config)?))),
-        "correlation_id" => Ok(Some(Arc::new(
-            correlation_id::CorrelationId::new_with_real_ip_header(
-                config,
-                http_client.real_ip_header(),
-            )?,
-        ))),
+        "correlation_id" => {
+            let plugin = match http_client.real_ip_header() {
+                Some(real_ip_header) => {
+                    correlation_id::CorrelationId::new_with_real_ip_header(
+                        config,
+                        Some(real_ip_header),
+                    )?
+                }
+                None => correlation_id::CorrelationId::new(config)?,
+            };
+            Ok(Some(Arc::new(plugin)))
+        }
         "request_transformer" => Ok(Some(Arc::new(
             request_transformer::RequestTransformer::new(config)?,
         ))),
