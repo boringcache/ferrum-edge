@@ -207,8 +207,7 @@ impl Plugin for ExamplePlugin {
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         if let Some(header_name) = &self.correlation_header_name {
-            ctx.metadata
-                .insert(header_name.clone(), self.header_value.clone());
+            ctx.insert_metadata(header_name.clone(), self.header_value.clone());
         }
         PluginResult::Continue
     }
