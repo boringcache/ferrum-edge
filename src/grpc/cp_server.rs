@@ -516,7 +516,10 @@ impl CpGrpcServer {
             ));
         };
         let advertised = (!advertised.is_empty()).then_some(advertised);
-        let expected = self.real_ip_header.as_deref().filter(|header| !header.is_empty());
+        let expected = self
+            .real_ip_header
+            .as_deref()
+            .filter(|header| !header.is_empty());
         let matches = match (expected, advertised) {
             (None, None) => true,
             (Some(expected), Some(actual)) => expected.eq_ignore_ascii_case(actual),
