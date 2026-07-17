@@ -3,7 +3,8 @@
 //! When the gateway sits behind load balancers, CDNs, or reverse proxies, the
 //! TCP socket address (`remote_addr`) is the proxy's IP — not the real client's.
 //! This module resolves the true originating client IP from `X-Forwarded-For`
-//! (XFF) and recognizes the original HTTPS scheme from `X-Forwarded-Proto`,
+//! (XFF) and recognizes the original HTTP or HTTPS scheme from
+//! `X-Forwarded-Proto`,
 //! but only when the direct peer belongs to the trusted-proxy set.
 //!
 //! # Security model
@@ -120,20 +121,20 @@ impl TrustedProxies {
     }
 }
 
-/// Return whether a trusted direct proxy reports an HTTPS client-facing
-/// request through `X-Forwarded-Proto`.
+/// Return the HTTP-family client-facing scheme reported by a trusted direct
+/// proxy through `X-Forwarded-Proto`.
 ///
 /// The rightmost value represents the proxy nearest Ferrum when multiple
 /// field lines or comma-separated values are present. Empty, non-UTF-8, or
-/// unrecognized final values fail closed. Callers must never use this result
+/// unrecognized final values return `None`. Callers must never use this result
 /// for an untrusted socket peer because the header may then be client-controlled.
-pub fn trusted_forwarded_request_is_https<'a>(
+pub fn trusted_forwarded_request_scheme<'a>(
     socket_addr: &IpAddr,
     forwarded_proto_values: impl IntoIterator<Item = &'a [u8]>,
     trusted_proxies: &TrustedProxies,
-) -> bool {
+) -> Option<&'static str> {
     if !trusted_proxies.contains(socket_addr) {
-        return false;
+        return None;
     }
 
     let mut nearest_proto = None;
@@ -152,7 +153,11 @@ pub fn trusted_forwarded_request_is_https<'a>(
             nearest_proto = Some(trim_header_ows(proto));
         }
     }
-    nearest_proto.is_some_and(|proto| proto.eq_ignore_ascii_case(b"https"))
+    match nearest_proto {
+        Some(proto) if proto.eq_ignore_ascii_case(b"http") => Some("http"),
+        Some(proto) if proto.eq_ignore_ascii_case(b"https") => Some("https"),
+        _ => None,
+    }
 }
 
 fn trim_header_ows(value: &[u8]) -> &[u8] {

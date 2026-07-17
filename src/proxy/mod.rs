@@ -15080,25 +15080,26 @@ pub async fn run_authentication_phase(
     }
 }
 
-/// Apply the original HTTPS scheme reported by a directly connected trusted
-/// proxy. The same accepted fact drives both browser cookie storage checks and
-/// canonical frontend URL metadata consumed by authentication plugins.
+/// Apply the original HTTP-family scheme reported by a directly connected
+/// trusted proxy. The same accepted fact drives browser cookie storage checks,
+/// authority normalization, and canonical frontend URL metadata consumed by
+/// authentication plugins.
 pub fn apply_trusted_forwarded_request_scheme(
     ctx: &mut RequestContext,
     socket_addr: &IpAddr,
     trusted_proxies: &client_ip::TrustedProxies,
-) -> bool {
-    let forwarded_request_is_https = client_ip::trusted_forwarded_request_is_https(
+) -> Option<&'static str> {
+    let forwarded_scheme = client_ip::trusted_forwarded_request_scheme(
         socket_addr,
         ctx.raw_header_value_bytes("x-forwarded-proto"),
         trusted_proxies,
     );
-    if forwarded_request_is_https {
-        ctx.request_is_secure = true;
+    if let Some(scheme) = forwarded_scheme {
+        ctx.request_is_secure = scheme == "https";
         ctx.metadata
-            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+            .insert("ferrum.frontend_scheme".to_string(), scheme.to_string());
     }
-    forwarded_request_is_https
+    forwarded_scheme
 }
 
 /// Handle a single proxy request.
@@ -15247,10 +15248,11 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    let mut request_scheme = if is_tls { "https" } else { "http" };
     ctx.request_is_secure = is_tls;
     ctx.metadata.insert(
         "ferrum.frontend_scheme".to_string(),
-        if is_tls { "https" } else { "http" }.to_string(),
+        request_scheme.to_string(),
     );
     ctx.frontend_listen_port = Some(connection_metadata.frontend_listen_port.unwrap_or(
         if is_tls {
@@ -15483,7 +15485,11 @@ async fn handle_proxy_request_inner(
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         if let Some(ref addr) = socket_addr {
-            apply_trusted_forwarded_request_scheme(&mut ctx, addr, &state.trusted_proxies);
+            if let Some(forwarded_scheme) =
+                apply_trusted_forwarded_request_scheme(&mut ctx, addr, &state.trusted_proxies)
+            {
+                request_scheme = forwarded_scheme;
+            }
             let real_ip_header_val =
                 state
                     .env_config
@@ -15591,10 +15597,7 @@ async fn handle_proxy_request_inner(
         None => None,
     };
     let request_authority = raw_host.and_then(|authority| {
-        normalize_request_authority_for_signing(
-            authority,
-            Some(if is_tls { "https" } else { "http" }),
-        )
+        normalize_request_authority_for_signing(authority, Some(request_scheme))
     });
     ctx.request_authority = request_authority;
 
@@ -24779,7 +24782,7 @@ fn normalize_authority_for_consistency(value: &str, scheme: Option<&str>) -> Opt
 /// Canonicalize a validated Host/`:authority` value for request signatures.
 /// Default ports are omitted so equivalent HTTP authorities have one signing
 /// representation; non-default ports and bracketed IPv6 literals are retained.
-pub(crate) fn normalize_request_authority_for_signing(
+pub fn normalize_request_authority_for_signing(
     value: &str,
     scheme: Option<&str>,
 ) -> Option<String> {

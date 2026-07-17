@@ -662,11 +662,11 @@ pub struct RequestContext {
     /// Host/`:authority` validation and before authentication.
     pub request_authority: Option<String>,
     /// Whether the browser-facing request used a cryptographic transport.
-    /// HTTP/3 is always secure; HTTP/1.1 and HTTP/2 populate this from either
-    /// the accepted frontend transport or `X-Forwarded-Proto: https` supplied
-    /// by a direct peer in `FERRUM_TRUSTED_PROXIES`. Cookie storage checks
-    /// combine this with `request_authority` because browsers also trust HTTP
-    /// localhost and loopback origins.
+    /// HTTP/1.1, HTTP/2, and HTTP/3 initialize this from the accepted frontend
+    /// transport, then a direct peer in `FERRUM_TRUSTED_PROXIES` may override it
+    /// with a valid `X-Forwarded-Proto: http` or `https` value. Cookie storage
+    /// checks combine this with `request_authority` because browsers also trust
+    /// HTTP localhost and loopback origins.
     pub request_is_secure: bool,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization

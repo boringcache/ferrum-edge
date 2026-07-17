@@ -2,7 +2,7 @@
 
 use ferrum_edge::proxy::client_ip::{
     TrustedProxies, resolve_client_ip, resolve_forwarded_client_ip, resolve_real_ip_header,
-    trusted_forwarded_request_is_https,
+    trusted_forwarded_request_scheme,
 };
 
 // ── TrustedProxies parsing ───────────────────────────────────────────
@@ -131,41 +131,51 @@ fn parse_strict_rejects_empty_comma_segments() {
 }
 
 #[test]
-fn forwarded_https_requires_the_nearest_value_from_a_trusted_peer() {
+fn forwarded_scheme_requires_a_recognized_nearest_value_from_a_trusted_peer() {
     let trusted = TrustedProxies::parse("10.0.0.0/8");
     let trusted_peer = "10.0.0.8".parse().expect("valid trusted peer IP");
     let untrusted_peer = "203.0.113.8".parse().expect("valid untrusted peer IP");
 
-    assert!(trusted_forwarded_request_is_https(
-        &trusted_peer,
-        [b"http".as_slice(), b" HTTPS\t".as_slice()],
-        &trusted,
-    ));
-    assert!(!trusted_forwarded_request_is_https(
-        &trusted_peer,
-        [b"https, http".as_slice()],
-        &trusted,
-    ));
-    assert!(!trusted_forwarded_request_is_https(
-        &trusted_peer,
-        [b"https,".as_slice()],
-        &trusted,
-    ));
-    assert!(!trusted_forwarded_request_is_https(
-        &trusted_peer,
-        [b"https".as_slice(), &[0x80]],
-        &trusted,
-    ));
-    assert!(!trusted_forwarded_request_is_https(
-        &trusted_peer,
-        [b"https".as_slice(), b"\x80, https".as_slice()],
-        &trusted,
-    ));
-    assert!(!trusted_forwarded_request_is_https(
-        &untrusted_peer,
-        [b"https".as_slice()],
-        &trusted,
-    ));
+    assert_eq!(
+        trusted_forwarded_request_scheme(
+            &trusted_peer,
+            [b"http".as_slice(), b" HTTPS\t".as_slice()],
+            &trusted,
+        ),
+        Some("https")
+    );
+    assert_eq!(
+        trusted_forwarded_request_scheme(
+            &trusted_peer,
+            [b"https, http".as_slice()],
+            &trusted,
+        ),
+        Some("http")
+    );
+    assert_eq!(
+        trusted_forwarded_request_scheme(&trusted_peer, [b"https,".as_slice()], &trusted),
+        None
+    );
+    assert_eq!(
+        trusted_forwarded_request_scheme(
+            &trusted_peer,
+            [b"https".as_slice(), &[0x80]],
+            &trusted,
+        ),
+        None
+    );
+    assert_eq!(
+        trusted_forwarded_request_scheme(
+            &trusted_peer,
+            [b"https".as_slice(), b"\x80, https".as_slice()],
+            &trusted,
+        ),
+        None
+    );
+    assert_eq!(
+        trusted_forwarded_request_scheme(&untrusted_peer, [b"https".as_slice()], &trusted),
+        None
+    );
 }
 
 // ── resolve_client_ip ────────────────────────────────────────────────

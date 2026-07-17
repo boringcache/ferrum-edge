@@ -5,7 +5,8 @@ use ferrum_edge::config::types::{
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::{
     apply_trusted_forwarded_request_scheme, build_backend_effective_path, build_backend_url,
-    build_backend_url_with_target, retry_target_preserves_backend_path,
+    build_backend_url_with_target, normalize_request_authority_for_signing,
+    retry_target_preserves_backend_path,
 };
 use ferrum_edge::router_cache::RouterCache;
 use std::collections::HashMap;
@@ -1584,17 +1585,22 @@ async fn test_auth_rejection_cookie_storage_key_allows_trusted_tls_termination()
     raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("https"));
     ctx.set_raw_headers(raw_headers);
 
-    assert!(apply_trusted_forwarded_request_scheme(
+    let forwarded_scheme = apply_trusted_forwarded_request_scheme(
         &mut ctx,
         &socket_peer,
         &trusted,
-    ));
+    );
+    assert_eq!(forwarded_scheme, Some("https"));
     assert!(ctx.request_is_secure);
     assert_eq!(
         ctx.metadata
             .get("ferrum.frontend_scheme")
             .map(String::as_str),
         Some("https")
+    );
+    assert_eq!(
+        normalize_request_authority_for_signing("EXAMPLE.COM:443", forwarded_scheme),
+        Some("example.com".to_string())
     );
 
     let (_, _, headers) =
@@ -1605,6 +1611,56 @@ async fn test_auth_rejection_cookie_storage_key_allows_trusted_tls_termination()
     assert_eq!(
         headers.get("set-cookie").map(String::as_str),
         Some("transport=selected; Secure; Path=/")
+    );
+}
+
+#[tokio::test]
+async fn test_trusted_forwarded_http_overrides_tls_cookie_and_authority_scope() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "transport=staged; Path=/",
+    });
+    let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+        cookies: "transport=selected; Secure; Path=/",
+    });
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let trusted = TrustedProxies::parse("10.0.0.0/8");
+    let socket_peer: std::net::IpAddr = "10.0.0.8".parse().expect("valid trusted proxy IP");
+    let mut ctx = RequestContext::new(
+        socket_peer.to_string(),
+        "GET".to_string(),
+        "/cookie-scope".to_string(),
+    );
+    ctx.request_is_secure = true;
+    ctx.metadata
+        .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+    let mut raw_headers = http::HeaderMap::new();
+    raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("http"));
+    ctx.set_raw_headers(raw_headers);
+
+    let forwarded_scheme =
+        apply_trusted_forwarded_request_scheme(&mut ctx, &socket_peer, &trusted);
+    assert_eq!(forwarded_scheme, Some("http"));
+    assert!(!ctx.request_is_secure);
+    assert_eq!(
+        ctx.metadata
+            .get("ferrum.frontend_scheme")
+            .map(String::as_str),
+        Some("http")
+    );
+    assert_eq!(
+        normalize_request_authority_for_signing("EXAMPLE.COM:80", forwarded_scheme),
+        Some("example.com".to_string())
+    );
+
+    let (_, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("both auth attempts must reject");
+
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("transport=selected; Secure; Path=/\ntransport=staged; Path=/")
     );
 }
 
@@ -1627,17 +1683,33 @@ fn test_trusted_tls_termination_fails_closed_on_invalid_final_proto_field() {
     );
     ctx.set_raw_headers(raw_headers);
 
-    assert!(!apply_trusted_forwarded_request_scheme(
-        &mut ctx,
-        &socket_peer,
-        &trusted,
-    ));
+    assert_eq!(
+        apply_trusted_forwarded_request_scheme(&mut ctx, &socket_peer, &trusted),
+        None
+    );
     assert!(!ctx.request_is_secure);
     assert_eq!(
         ctx.metadata
             .get("ferrum.frontend_scheme")
             .map(String::as_str),
         Some("http")
+    );
+
+    // An invalid forwarded value does not downgrade an actually secure hop.
+    // Only a recognized value from the trusted peer overrides the transport.
+    ctx.request_is_secure = true;
+    ctx.metadata
+        .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+    assert_eq!(
+        apply_trusted_forwarded_request_scheme(&mut ctx, &socket_peer, &trusted),
+        None
+    );
+    assert!(ctx.request_is_secure);
+    assert_eq!(
+        ctx.metadata
+            .get("ferrum.frontend_scheme")
+            .map(String::as_str),
+        Some("https")
     );
 }
 

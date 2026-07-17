@@ -938,6 +938,7 @@ async fn handle_h3_request(
 
     // Build request context (client_ip resolved below after headers are parsed)
     let mut ctx = RequestContext::new(socket_ip.to_owned(), method.clone(), path.clone());
+    let mut request_scheme = "https";
     ctx.request_is_secure = true;
     ctx.metadata
         .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
@@ -1183,6 +1184,13 @@ async fn handle_h3_request(
     // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
     if !state.trusted_proxies.is_empty() {
         let socket_addr: std::net::IpAddr = remote_addr.ip();
+        if let Some(forwarded_scheme) = crate::proxy::apply_trusted_forwarded_request_scheme(
+            &mut ctx,
+            &socket_addr,
+            &state.trusted_proxies,
+        ) {
+            request_scheme = forwarded_scheme;
+        }
         let real_ip_header_val =
             state
                 .env_config
@@ -1289,7 +1297,7 @@ async fn handle_h3_request(
         None => None,
     };
     let request_authority = raw_host.and_then(|authority| {
-        crate::proxy::normalize_request_authority_for_signing(authority, Some("https"))
+        crate::proxy::normalize_request_authority_for_signing(authority, Some(request_scheme))
     });
     ctx.request_authority = request_authority;
 
