@@ -28,9 +28,9 @@ use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{
-    BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
-    PluginResult, ProxyProtocol, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
-    ResponseStreamAction, TransactionSummary, normalize_response_body_for_inspection,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
+    RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, ResponseStreamAction,
+    TransactionSummary, normalize_response_body_for_inspection,
 };
 use crate::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
 use crate::proxy::grpc_proxy::{
@@ -2878,10 +2878,9 @@ async fn handle_h3_request(
     // buffer/stream classification. This path exists only when request-body
     // buffering is already required and PluginCache says a response buffer or
     // stream hook is configured; ordinary H3 requests do no additional work.
-    // Provider-dispatch plugins synthesize the complete response from the
-    // finalized request body. As on H1/H2, the config-time bit avoids work when
-    // none are installed, while the request-time value requires that terminal
-    // plugin's own body-applicability predicate to match.
+    // Compute terminal-dispatch applicability before route ownership moves
+    // headers out of the context. The provider hook itself runs only after the
+    // selected backend-effective path is authorized below.
     let reevaluate_response_policy_after_request_body =
         matches!(backend_http_flavor, HttpFlavor::Plain)
             && plugin_needs_request_buffering
@@ -2889,6 +2888,243 @@ async fn handle_h3_request(
     let mut request_body_prepared = false;
     let mut prepared_raw_request_body_bytes: Option<u64> = None;
 
+    // --- Upstream target selection and circuit breaker ---
+    // DestinationRule-derived HTTP connectionPool/TLS knobs are projected below
+    // once the selected target's policy port is known. Per-port maxConnections,
+    // tcpKeepalive, and LB/outlier knobs stay protocol-scope-specific:
+    // maxConnections applies to H3 WebSocket sessions, tcpKeepalive is N/A for
+    // QUIC, and LB/outlier selection is handled by select_upstream_target.
+    // PASSTHROUGH orig-dst is `None` on H3: mesh capture is TCP-only
+    // (SO_ORIGINAL_DST/REDIRECT; H3/UDP are out of mesh scope), so an H3
+    // frontend never carries a captured original destination. A Passthrough
+    // upstream therefore round-robins here (with the existing warn).
+    let routing_proxy = Arc::clone(&proxy);
+    let selection = crate::proxy::backend_dispatch::select_upstream_target(
+        &proxy,
+        &state,
+        &epoch,
+        &ctx.client_ip,
+        &proxy_headers,
+        None,
+    );
+    let lb_hash_key = selection.lb_hash_key;
+    let upstream_target = crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
+        selection.target,
+        request_host.as_deref(),
+    );
+    let upstream_balancer = selection.balancer;
+    // Mirror H1/H2 selected-target policy: cap per-request retries, then build
+    // an effective proxy carrying per-target DestinationRule-derived
+    // connectionPool/TLS overrides for the FIRST selected target. That
+    // effective proxy backs the single-target dispatch decisions below
+    // (retry-dependent buffering, native-H3 capability, streaming dispatch).
+    // Every dispatch loop that can rotate retry targets — the buffered
+    // native-H3 retry loop, the H3->plain and H3->gRPC bridges, and the H3
+    // WebSocket dial loop — re-resolves the effective proxy per attempt from
+    // the capped but UNRESOLVED base proxy, so a later target does not inherit
+    // the first target's port-level TLS/SNI/H1 policy.
+    let selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
+        Arc::clone(&routing_proxy),
+        upstream_target.as_deref(),
+    );
+    let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
+        &selected_base_proxy,
+        upstream_target.as_deref(),
+    );
+    let proxy = match effective_proxy {
+        std::borrow::Cow::Borrowed(_) => Arc::clone(&selected_base_proxy),
+        std::borrow::Cow::Owned(owned) => Arc::new(owned),
+    };
+    // Plugins/logging see the retry-capped BASE proxy, matching the H1/H2 path
+    // (`handle_proxy_request_inner` assigns `ctx.matched_proxy` right after
+    // `cap_proxy_retry_for_target`). Per-port TLS/timeout overrides are a
+    // dispatch-time concern and must not appear baked into the plugin-visible
+    // proxy on H3 only.
+    ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
+
+    let has_deferred_routing_header_hooks = backend_path_is_policy_bound
+        && capabilities
+            .has(crate::plugin_cache::PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
+    let mut deferred_result = PluginResult::Continue;
+    // The target is already pinned, so enforce backend-path policy before a
+    // deferred routing-header hook can invoke an external service.
+    if backend_path_is_policy_bound {
+        let backend_path = crate::proxy::build_backend_effective_path(
+            &proxy,
+            &path,
+            strip_len,
+            upstream_target
+                .as_ref()
+                .and_then(|target| target.path.as_deref()),
+        );
+        if !run_h3_backend_path_plugins_or_send_reject(
+            backend_path_plugins,
+            &plugins,
+            &mut ctx,
+            &backend_path,
+            &original_request_path,
+            http_flavor,
+            &mut stream,
+            &state,
+            start_time,
+            &mut plugin_execution_ns,
+            grpc_web_response_content_type.as_deref(),
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        ctx.bind_authorized_backend_path(backend_path);
+    }
+
+    if has_deferred_routing_header_hooks {
+        // Deferral changes authorization order, not the client-path view that
+        // before_proxy hooks received before a mesh backend rewrite.
+        let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
+        let phase_start = std::time::Instant::now();
+        deferred_result = crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
+            &plugins,
+            &mut ctx,
+            &mut proxy_headers,
+            true,
+            crate::proxy::BackendPathBeforeProxyPass::RoutingHeaderDeferred,
+        )
+        .await;
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        ctx.path = backend_ctx_path;
+        if matches!(deferred_result, PluginResult::Continue) {
+            // Re-establish gateway-authenticated identity and egress baggage
+            // policy before a deferred function's headers reach a backend.
+            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+                &mut proxy_headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
+        }
+    }
+
+    if backend_path_is_policy_bound {
+        if matches!(deferred_result, PluginResult::Continue) {
+            // Deferred hooks retain the original client path; request_mirror
+            // separately consumes the private path that passed final policy.
+            let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
+            let phase_start = std::time::Instant::now();
+            deferred_result = crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
+                &plugins,
+                &mut ctx,
+                &mut proxy_headers,
+                true,
+                crate::proxy::BackendPathBeforeProxyPass::RemainingDeferred,
+            )
+            .await;
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+            ctx.path = backend_ctx_path;
+        }
+        if matches!(deferred_result, PluginResult::Continue) {
+            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+                &mut proxy_headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
+        }
+        match deferred_result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                    run_h3_reject_response_committed_hooks(
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type.as_deref(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await;
+                    let log_status_code = h3_reject_log_status_and_metadata(
+                        &mut ctx,
+                        http_flavor,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    );
+                    record_request(&state, log_status_code);
+                    send_h3_plugin_reject_flavor_aware(
+                        &mut stream,
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type.as_deref(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let mut headers = reject.headers;
+                let mut reject_status = reject.status_code;
+                let mut reject_body = reject.body;
+                apply_reject_after_proxy_and_synthetic_body_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut reject_status,
+                    &mut headers,
+                    &mut reject_body,
+                    matches!(http_flavor, HttpFlavor::Grpc),
+                    false,
+                )
+                .await;
+                let http_status = StatusCode::from_u16(reject_status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                run_h3_reject_response_committed_hooks(
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type.as_deref(),
+                    http_status,
+                    &reject_body,
+                    &headers,
+                )
+                .await;
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    http_status,
+                    &reject_body,
+                    &headers,
+                );
+                record_request(&state, log_status_code);
+                log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    log_status_code,
+                    start_time,
+                    "before_proxy",
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                send_h3_plugin_reject_flavor_aware(
+                    &mut stream,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type.as_deref(),
+                    http_status,
+                    &reject_body,
+                    &headers,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
+    // Terminal final-body hooks may perform provider egress. Run them only
+    // after the selected backend-effective path has been authorized and all
+    // deferred before_proxy hooks have completed, while preserving #2651's
+    // placement ahead of backend-only admission, circuit breaking, and dial.
     if final_body_before_backend_dispatch {
         let body_was_prebuffered = prebuffered_body_data.is_some();
         let mut body_data = prebuffered_body_data.take().unwrap_or_default();
@@ -3101,255 +3337,6 @@ async fn handle_h3_request(
                     http_flavor,
                     http_status,
                     &reject.body,
-                    &headers,
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    }
-
-    // --- Upstream target selection and circuit breaker ---
-    // DestinationRule-derived HTTP connectionPool/TLS knobs are projected below
-    // once the selected target's policy port is known. Per-port maxConnections,
-    // tcpKeepalive, and LB/outlier knobs stay protocol-scope-specific:
-    // maxConnections applies to H3 WebSocket sessions, tcpKeepalive is N/A for
-    // QUIC, and LB/outlier selection is handled by select_upstream_target.
-    // PASSTHROUGH orig-dst is `None` on H3: mesh capture is TCP-only
-    // (SO_ORIGINAL_DST/REDIRECT; H3/UDP are out of mesh scope), so an H3
-    // frontend never carries a captured original destination. A Passthrough
-    // upstream therefore round-robins here (with the existing warn).
-    let routing_proxy = Arc::clone(&proxy);
-    let selection = crate::proxy::backend_dispatch::select_upstream_target(
-        &proxy,
-        &state,
-        &epoch,
-        &ctx.client_ip,
-        &proxy_headers,
-        None,
-    );
-    let lb_hash_key = selection.lb_hash_key;
-    let upstream_target = crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
-        selection.target,
-        request_host.as_deref(),
-    );
-    let upstream_balancer = selection.balancer;
-    // Mirror H1/H2 selected-target policy: cap per-request retries, then build
-    // an effective proxy carrying per-target DestinationRule-derived
-    // connectionPool/TLS overrides for the FIRST selected target. That
-    // effective proxy backs the single-target dispatch decisions below
-    // (retry-dependent buffering, native-H3 capability, streaming dispatch).
-    // Every dispatch loop that can rotate retry targets — the buffered
-    // native-H3 retry loop, the H3->plain and H3->gRPC bridges, and the H3
-    // WebSocket dial loop — re-resolves the effective proxy per attempt from
-    // the capped but UNRESOLVED base proxy, so a later target does not inherit
-    // the first target's port-level TLS/SNI/H1 policy.
-    let selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
-        Arc::clone(&routing_proxy),
-        upstream_target.as_deref(),
-    );
-    let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
-        &selected_base_proxy,
-        upstream_target.as_deref(),
-    );
-    let proxy = match effective_proxy {
-        std::borrow::Cow::Borrowed(_) => Arc::clone(&selected_base_proxy),
-        std::borrow::Cow::Owned(owned) => Arc::new(owned),
-    };
-    // Plugins/logging see the retry-capped BASE proxy, matching the H1/H2 path
-    // (`handle_proxy_request_inner` assigns `ctx.matched_proxy` right after
-    // `cap_proxy_retry_for_target`). Per-port TLS/timeout overrides are a
-    // dispatch-time concern and must not appear baked into the plugin-visible
-    // proxy on H3 only.
-    ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
-
-    let has_deferred_routing_header_hooks = backend_path_is_policy_bound
-        && capabilities
-            .has(crate::plugin_cache::PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
-    let mut deferred_result = PluginResult::Continue;
-    let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
-
-    loop {
-        if backend_path_is_policy_bound {
-            let backend_path = crate::proxy::build_backend_effective_path(
-                &proxy,
-                &path,
-                strip_len,
-                upstream_target
-                    .as_ref()
-                    .and_then(|target| target.path.as_deref()),
-            );
-            let phase = if run_deferred_routing_headers {
-                BackendPathPolicyPhase::Preview
-            } else {
-                BackendPathPolicyPhase::Enforce
-            };
-            if !run_h3_backend_path_plugins_or_send_reject(
-                backend_path_plugins,
-                &plugins,
-                &mut ctx,
-                &backend_path,
-                &original_request_path,
-                http_flavor,
-                &mut stream,
-                &state,
-                start_time,
-                &mut plugin_execution_ns,
-                grpc_web_response_content_type.as_deref(),
-                phase,
-            )
-            .await?
-            {
-                return Ok(());
-            }
-            if phase == BackendPathPolicyPhase::Enforce {
-                ctx.bind_authorized_backend_path(backend_path);
-            }
-        }
-
-        if !run_deferred_routing_headers {
-            break;
-        }
-        run_deferred_routing_headers = false;
-
-        // Deferral changes authorization order, not the client-path view that
-        // before_proxy hooks received before a mesh backend rewrite.
-        let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
-        let phase_start = std::time::Instant::now();
-        deferred_result = crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
-            &plugins,
-            &mut ctx,
-            &mut proxy_headers,
-            true,
-            crate::proxy::BackendPathBeforeProxyPass::RoutingHeaderDeferred,
-        )
-        .await;
-        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-        ctx.path = backend_ctx_path;
-        if matches!(deferred_result, PluginResult::Continue) {
-            // Re-establish gateway-authenticated identity and egress baggage
-            // policy before a deferred function's headers reach a backend.
-            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
-            crate::modes::mesh::hbone::strip_egress_baggage_in_map(
-                &mut proxy_headers,
-                &state.mesh_egress_strip_baggage_keys,
-            );
-        }
-        // Always make one more pass after the routing-header hook, including
-        // when it rejects, so final enforcement charges the pinned method
-        // exactly once before any external-hook rejection is returned.
-    }
-
-    if backend_path_is_policy_bound {
-        if matches!(deferred_result, PluginResult::Continue) {
-            // Deferred hooks retain the original client path; request_mirror
-            // separately consumes the private path that passed final policy.
-            let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
-            let phase_start = std::time::Instant::now();
-            deferred_result = crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
-                &plugins,
-                &mut ctx,
-                &mut proxy_headers,
-                true,
-                crate::proxy::BackendPathBeforeProxyPass::RemainingDeferred,
-            )
-            .await;
-            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-            ctx.path = backend_ctx_path;
-        }
-        if matches!(deferred_result, PluginResult::Continue) {
-            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
-            crate::modes::mesh::hbone::strip_egress_baggage_in_map(
-                &mut proxy_headers,
-                &state.mesh_egress_strip_baggage_keys,
-            );
-        }
-        match deferred_result {
-            PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                let Some(reject) = plugin_result_into_reject_parts(reject) else {
-                    run_h3_reject_response_committed_hooks(
-                        &plugins,
-                        &mut ctx,
-                        http_flavor,
-                        grpc_web_response_content_type.as_deref(),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
-                        &HashMap::new(),
-                    )
-                    .await;
-                    let log_status_code = h3_reject_log_status_and_metadata(
-                        &mut ctx,
-                        http_flavor,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
-                        &HashMap::new(),
-                    );
-                    record_request(&state, log_status_code);
-                    send_h3_plugin_reject_flavor_aware(
-                        &mut stream,
-                        &plugins,
-                        &mut ctx,
-                        http_flavor,
-                        grpc_web_response_content_type.as_deref(),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
-                        &HashMap::new(),
-                    )
-                    .await?;
-                    return Ok(());
-                };
-                let mut headers = reject.headers;
-                let mut reject_status = reject.status_code;
-                let mut reject_body = reject.body;
-                apply_reject_after_proxy_and_synthetic_body_hooks(
-                    &plugins,
-                    &mut ctx,
-                    &mut reject_status,
-                    &mut headers,
-                    &mut reject_body,
-                    matches!(http_flavor, HttpFlavor::Grpc),
-                    false,
-                )
-                .await;
-                let http_status = StatusCode::from_u16(reject_status)
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                run_h3_reject_response_committed_hooks(
-                    &plugins,
-                    &mut ctx,
-                    http_flavor,
-                    grpc_web_response_content_type.as_deref(),
-                    http_status,
-                    &reject_body,
-                    &headers,
-                )
-                .await;
-                let log_status_code = h3_reject_log_status_and_metadata(
-                    &mut ctx,
-                    http_flavor,
-                    http_status,
-                    &reject_body,
-                    &headers,
-                );
-                record_request(&state, log_status_code);
-                log_rejected_request_with_path(
-                    &plugins,
-                    &ctx,
-                    log_status_code,
-                    start_time,
-                    "before_proxy",
-                    plugin_execution_ns,
-                    Some(&original_request_path),
-                )
-                .await;
-                send_h3_plugin_reject_flavor_aware(
-                    &mut stream,
-                    &plugins,
-                    &mut ctx,
-                    http_flavor,
-                    grpc_web_response_content_type.as_deref(),
-                    http_status,
-                    &reject_body,
                     &headers,
                 )
                 .await?;
@@ -6715,14 +6702,13 @@ async fn run_h3_backend_path_plugins_or_send_reject(
     start_time: std::time::Instant,
     plugin_execution_ns: &mut u64,
     grpc_web_response_content_type: Option<&str>,
-    phase: BackendPathPolicyPhase,
 ) -> Result<bool, anyhow::Error> {
     let phase_start = std::time::Instant::now();
     for plugin in backend_path_plugins {
         let deadline = ctx.grpc_deadline_at();
         match crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
-            plugin.on_backend_path_resolved(ctx, backend_path, phase),
+            plugin.on_backend_path_resolved(ctx, backend_path),
         )
         .await
         .into_plugin_result(ctx)

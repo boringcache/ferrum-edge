@@ -10,25 +10,44 @@ use ferrum_edge::plugins::{Plugin, RequestContext, TransactionSummary};
 use http::StatusCode;
 
 #[test]
-fn h3_terminal_final_body_dispatch_precedes_backend_selection_and_breaker() {
+fn h3_terminal_final_body_dispatch_follows_path_policy_and_precedes_breaker() {
     let source = include_str!("../../../src/http3/server.rs");
-    let terminal_gate = source
-        .find("if final_body_before_backend_dispatch {")
-        .expect("H3 terminal final-body dispatch gate must remain present");
-    let selection = source[terminal_gate..]
+    let selection = source
         .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
-        .map(|offset| terminal_gate + offset)
         .expect("H3 backend selection must remain present");
+    let path_policy = source[selection..]
+        .find("if backend_path_is_policy_bound {")
+        .map(|offset| selection + offset)
+        .expect("H3 selected-path policy must remain present");
+    let terminal_marker = source[path_policy..]
+        .find("// Terminal final-body hooks may perform provider egress.")
+        .map(|offset| path_policy + offset)
+        .expect("H3 terminal final-body dispatch boundary must remain present");
+    let terminal_gate = source[terminal_marker..]
+        .find("if final_body_before_backend_dispatch {")
+        .map(|offset| terminal_marker + offset)
+        .expect("H3 terminal final-body dispatch gate must remain present");
+    let routing_deferred = source[path_policy..terminal_gate]
+        .find("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .map(|offset| path_policy + offset)
+        .expect("H3 routing-header deferred pass must remain present");
+    let remaining_deferred = source[routing_deferred..terminal_gate]
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .map(|offset| routing_deferred + offset)
+        .expect("H3 remaining deferred pass must remain present");
     let breaker = source[selection..]
         .find("check_circuit_breaker(")
         .map(|offset| selection + offset)
         .expect("H3 backend circuit-breaker gate must remain present");
-    let terminal_path = &source[terminal_gate..selection];
+    let terminal_path = &source[terminal_gate..breaker];
 
     assert!(terminal_path.contains("run_final_request_body_hooks("));
     assert!(terminal_path.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
-    assert!(terminal_gate < selection);
-    assert!(selection < breaker);
+    assert!(selection < path_policy);
+    assert!(path_policy < routing_deferred);
+    assert!(routing_deferred < remaining_deferred);
+    assert!(remaining_deferred < terminal_gate);
+    assert!(terminal_gate < breaker);
 }
 
 #[test]
@@ -268,22 +287,25 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     );
     assert!(
         !source.contains("backend_dispatch::upstream_selection_hash_key("),
-        "H3 external deferred hooks must not select an unpreviewed target"
+        "H3 external deferred hooks must not reselect a different target"
     );
-    assert!(
-        policy_block.contains("BackendPathPolicyPhase::Preview")
-            && policy_block.contains("BackendPathPolicyPhase::Enforce"),
-        "H3 must preview access before deferred routing and charge final policy on the pinned path"
+    assert_eq!(
+        policy_block
+            .matches("run_h3_backend_path_plugins_or_send_reject(")
+            .count(),
+        1,
+        "H3 must enforce policy exactly once on the pinned path"
     );
     assert!(
         source.contains("BackendPathBeforeProxyPass::RemainingDeferred"),
         "H3 must keep remaining side-effect hooks behind any required reauthorization"
     );
+    let routing_hook = after_selection
+        .find("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .expect("H3 routing-header hook must remain present");
     assert!(
-        !source.contains(
-            "if !matches!(deferred_result, PluginResult::Continue) {\n            break;"
-        ),
-        "an H3 deferred routing-hook rejection must still reach final method enforcement"
+        path_policy < routing_hook && routing_hook < circuit_breaker,
+        "H3 stateful path policy must reject before deferred external work"
     );
     let native_retry = source
         .find("// Resolve and validate the retry target before charging this")
@@ -709,10 +731,10 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
         .count();
     assert_eq!(shared_terminal_reject_sends, 3);
     let terminal_dispatch = source
-        .split("let raw_request_body_bytes = body_data.len() as u64;")
+        .split("// Terminal final-body hooks may perform provider egress.")
         .nth(1)
         .expect("terminal provider dispatch")
-        .split("// --- Upstream target selection and circuit breaker ---")
+        .split("let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();")
         .next()
         .expect("bounded terminal provider dispatch");
     let non_plugin_terminal_boundaries = terminal_dispatch
@@ -834,7 +856,7 @@ fn h3_deferred_hooks_cannot_spoof_backend_consumer_identity() {
     );
     assert!(
         !after_routing_hook[..remaining_hook].contains("select_upstream_target("),
-        "H3 deferred headers must not steer onto an unpreviewed target"
+        "H3 deferred headers must not steer onto a different target"
     );
 
     let remaining_hook = routing_hook + remaining_hook;

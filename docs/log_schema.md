@@ -103,28 +103,66 @@ or removed schemas do not leak.
 
 `schema:` and `schema_ref:` are mutually exclusive on a single plugin.
 
-### Admin-API single-plugin updates
+### Admin-API prospective graph validation
 
-`POST /plugins` and `PUT /plugins/{id}` validate one plugin at a time,
-which has implications for `schema_ref:` resolution:
+Every relevant `POST`, `PUT`, or `DELETE` under `/plugins/config` is
+validated against the configuration that would exist after the mutation:
+the authoritative current namespace snapshot, overlaid with the submitted
+resource or with the deleted resource removed. Definitions are staged first
+and enabled `schema_ref` consumers are validated second. The staging area is
+discarded after validation and never changes the registry serving live traffic.
 
-- `schema_ref` validation consults the **currently committed** named-
-  schemas registry — the same map that's serving live traffic. It is NOT
-  re-derived from the request payload.
-- Result: a single-plugin POST/PUT carrying `schema_ref: foo` succeeds
-  iff some prior config-load pass committed a `transaction_log_schema`
-  defining `foo`. If you submit a `transaction_log_schema` and a
-  referencing plugin in two separate admin calls, send the
-  `transaction_log_schema` first.
-- Inline `schema:` blocks do not have this dependency — they compile
-  against the static field metadata in `fields.rs` and are reproducible
-  from the request alone.
+This rejects duplicate schema names and schema renames/deletes that would leave
+an enabled logger dangling before anything is persisted. It also means a
+logger submitted immediately after its schema definition resolves from the
+database snapshot; validation does not depend on whether a runtime poll has
+already refreshed the live registry.
 
-Full multi-resource updates (file mode SIGHUP, DB-mode poll cycle,
-control-plane snapshot push) always rebuild the registry atomically
-within one bracket, so cross-plugin `schema_ref:` resolves correctly
-regardless of declaration order in the config source. The ordering
-caveat applies only to incremental admin-API edits.
+Graph-relevant direct CRUD, batch, restore, and API-spec mutations for the same
+namespace hold a renewable datastore lease from the authoritative snapshot read
+through persistence. The process-local admission guard remains as a cheap first
+tier, while the SQL/MongoDB lease also serializes writable gateway instances
+that share persistence. Concurrent requests therefore cannot both validate
+against snapshots that omit the other request's committed graph change.
+If a write settles after its lease expires, Ferrum reacquires admission and
+validates the authoritative graph before accepting or compensating that result.
+Late restore clears use an additive, current-ID-wins recovery: the combined
+current and pre-restore graph is validated before any missing snapshot resource
+is replayed, so an intervening writer is neither erased nor combined into an
+invalid schema graph.
+
+Batch and restore payloads use the same definition-first graph pass, so a
+payload can list referrers before definitions. Each namespace is validated in
+isolation: the same schema name can be defined independently in separate
+namespaces, while a referrer cannot resolve a definition from another
+namespace. File reloads, DB poll cycles, and control-plane snapshots use the
+same prospective graph rules before atomically publishing a new runtime cache.
+SQL keeps every enabled graph participant in one batch transaction even when
+an unrelated large plugin import would normally be split into bounded chunks.
+API-spec `POST` validates extracted plugins against the same authoritative
+namespace snapshot, and exact `PUT` first removes the plugins owned by the old
+spec before overlaying the replacement bundle. API-spec `DELETE` validates the
+same removal-only candidate and rejects deletion when retained referrers would
+be left dangling.
+
+Graph participation never bypasses backend-egress admission. Direct and batch
+writes screen literal endpoints even for disabled configurations; disabled
+configurations defer construction and graph validation until they are enabled.
+Enabled `schema_ref` consumers also receive the policy-only checks that follow
+prospective graph construction, including custom plugins and plugins that ignore
+an unrecognized `schema_ref` key. SQL, MongoDB, and control-plane runtime
+snapshots reject dangling/non-string references before cache publication, while
+unrelated constructor failures on optional logging sinks retain their existing
+fail-open warning behavior.
+
+Upgrade note: every **enabled** plugin carrying a top-level `schema_ref`
+participates in this fail-closed graph, even if that plugin does not otherwise
+recognize the key. Remove accidental/stale `schema_ref` keys or add the named
+definition before upgrading or reloading. Disabled entries remain inert until
+they are enabled, at which point the same graph validation applies.
+
+Inline `schema:` blocks have no registry dependency; they compile directly
+against the static field metadata in `fields.rs`.
 
 ## Schema Fields
 
@@ -279,33 +317,37 @@ rejected rather than ignored.
 `SummarySchema::compile` rejects (with a clear error and Levenshtein
 suggestion where applicable):
 
-1. Unknown field names in `omit`, `rename`, `order`, derived `from`.
-2. Renaming and omitting the same field.
-3. Duplicate output keys (e.g. renaming two fields onto the same target).
-4. `order` referencing unknown output keys.
-5. `order` without `"*"` missing some fields.
-6. `order` containing more than one `"*"`.
-7. `summary_type: http` referring to stream-only fields, and vice versa.
-8. `static_fields` keys that match sensitive substrings.
-9. `static_fields` values containing nested keys with sensitive substrings.
-10. `static_fields` string values that begin with an HTTP auth scheme token (`Bearer xxx`, `Basic xxx`, `Digest`, `Negotiate`, `NTLM`, `HOBA`, `Mutual`, `SCRAM-SHA-1`, `SCRAM-SHA-256`, `vapid`, `AWS4-HMAC-SHA256`). Defense-in-depth against literal credential copy-paste.
-11. `static_fields` values that are `null`.
-12. `metadata.prefix` containing control characters.
-13. Unknown derived `kind`.
-14. Unknown top-level schema keys (typo guard).
-15. `schema:` and `schema_ref:` both present on the same plugin.
-16. `schema_ref:` pointing at an unregistered name.
+1. Unknown keys in the fixed-shape outer `transaction_log_schema` config,
+   each `derived_fields` entry, and the `metadata` policy. Errors identify the
+   named schema and nested path. The operator-named `schemas` map and the
+   `rename` and `static_fields` maps remain intentionally open.
+2. Unknown field names in `omit`, `rename`, and `order`.
+3. Renaming and omitting the same field.
+4. Duplicate output keys (e.g. renaming two fields onto the same target).
+5. `order` referencing unknown output keys.
+6. `order` without `"*"` missing some fields.
+7. `order` containing more than one `"*"`.
+8. `summary_type: http` referring to stream-only fields, and vice versa.
+9. `static_fields` keys that match sensitive substrings.
+10. `static_fields` values containing nested keys with sensitive substrings.
+11. `static_fields` string values that begin with an HTTP auth scheme token (`Bearer xxx`, `Basic xxx`, `Digest`, `Negotiate`, `NTLM`, `HOBA`, `Mutual`, `SCRAM-SHA-1`, `SCRAM-SHA-256`, `vapid`, `AWS4-HMAC-SHA256`). Defense-in-depth against literal credential copy-paste.
+12. `static_fields` values that are `null`.
+13. `metadata.prefix` containing control characters.
+14. Unknown derived `kind`.
+15. Unknown top-level schema keys (typo guard).
+16. `schema:` and `schema_ref:` both present on the same plugin.
+17. `schema_ref:` pointing at a name absent from the prospective namespace.
 
 For named schemas:
 
-17. `transaction_log_schema` with `scope: proxy` or `scope: proxy_group`
+18. `transaction_log_schema` with `scope: proxy` or `scope: proxy_group`
     is rejected at the admin write path (`PluginConfig::validate_fields`,
     returning a `400`) and by the runtime rejecting contract
     (`validate_plugin_references`). Both surfaces agree so an admitted write can
     never be rejected by a later full-config load (which would wedge the DB poll
     loop read-only — see issue #2158).
-18. Two `transaction_log_schema` plugins in the same config defining the
-    same name.
+19. Two enabled `transaction_log_schema` instances in the same namespace
+    defining the same name.
 
 ## Performance
 
@@ -318,8 +360,15 @@ For named schemas:
   pre-existing serde path with zero added cost.
 - The named-schemas registry is read-only on the hot path; `schema_ref`
   resolution is a one-shot `Arc::clone` at plugin construction.
-- The existing hot-path guard `if !plugins.is_empty()` (proxy.rs) still
-  decides whether to build the summary at all. No change.
+- `transaction_log_schema` instances are config-only: cache construction
+  compiles and stages their definitions, then discards the instances instead
+  of retaining them in global, per-proxy, capability, or HTTP/gRPC/WebSocket/
+  TCP/UDP protocol lists. A schema-only configuration therefore leaves every
+  runtime list empty and preserves the existing no-plugin transaction-summary
+  fast path. Full- and delta-reload cache tests cover this invariant, including
+  multiple schema instances; the schema-only test also pins repeated request
+  views to the same precomputed `Arc` lists so a per-request list allocation
+  regression fails deterministically without a wall-clock benchmark.
 
 ## Operator Cookbook
 

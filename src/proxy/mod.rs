@@ -15526,14 +15526,13 @@ async fn run_backend_path_plugins_or_build_reject(
     original_request_path: &str,
     is_grpc_request: bool,
     grpc_web_response_content_type: Option<&str>,
-    phase: BackendPathPolicyPhase,
 ) -> Option<Response<ProxyBody>> {
     let phase_start = Instant::now();
     for plugin in backend_path_plugins {
         let deadline = ctx.grpc_deadline_at();
         match crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
-            plugin.on_backend_path_resolved(ctx, backend_path, phase),
+            plugin.on_backend_path_resolved(ctx, backend_path),
         )
         .await
         .into_plugin_result(ctx)
@@ -18002,56 +18001,39 @@ async fn handle_proxy_request_inner(
     let has_deferred_routing_header_hooks = backend_path_is_policy_bound
         && capabilities.has(PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
     let mut deferred_result = PluginResult::Continue;
-    let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
-
-    loop {
-        // Preview access rules for the already-selected target before a
-        // deferred routing function performs external work, then enforce
-        // stateful policy exactly once after its header mutations settle. The
-        // target is deliberately pinned across this hook: otherwise a cloud
-        // function could cause side effects before its hash header selected a
-        // different, denied backend-effective method.
-        if backend_path_is_policy_bound {
-            let backend_path = build_backend_effective_path(
-                &proxy,
-                &path,
-                strip_len,
-                upstream_target
-                    .as_ref()
-                    .and_then(|target| target.path.as_deref()),
-            );
-            let phase = if run_deferred_routing_headers {
-                BackendPathPolicyPhase::Preview
-            } else {
-                BackendPathPolicyPhase::Enforce
-            };
-            if let Some(response) = run_backend_path_plugins_or_build_reject(
-                backend_path_plugins,
-                &plugins,
-                &mut ctx,
-                &backend_path,
-                &state,
-                start_time,
-                &mut plugin_execution_ns,
-                &original_request_path,
-                is_grpc_request,
-                grpc_web_response_content_type,
-                phase,
-            )
-            .await
-            {
-                return Ok(response);
-            }
-            if phase == BackendPathPolicyPhase::Enforce {
-                ctx.bind_authorized_backend_path(backend_path);
-            }
+    // The selected target is pinned before deferred routing-header hooks run,
+    // so enforce its backend-effective path before those hooks can perform
+    // external work. This also ensures an exhausted method rate limit rejects
+    // before a pre-proxy serverless function is invoked.
+    if backend_path_is_policy_bound {
+        let backend_path = build_backend_effective_path(
+            &proxy,
+            &path,
+            strip_len,
+            upstream_target
+                .as_ref()
+                .and_then(|target| target.path.as_deref()),
+        );
+        if let Some(response) = run_backend_path_plugins_or_build_reject(
+            backend_path_plugins,
+            &plugins,
+            &mut ctx,
+            &backend_path,
+            &state,
+            start_time,
+            &mut plugin_execution_ns,
+            &original_request_path,
+            is_grpc_request,
+            grpc_web_response_content_type,
+        )
+        .await
+        {
+            return Ok(response);
         }
+        ctx.bind_authorized_backend_path(backend_path);
+    }
 
-        if !run_deferred_routing_headers {
-            break;
-        }
-        run_deferred_routing_headers = false;
-
+    if has_deferred_routing_header_hooks {
         // These hooks moved later for authorization ordering, but their
         // documented request view remains the original client path.
         let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
@@ -18094,9 +18076,6 @@ async fn handle_proxy_request_inner(
                 &state.mesh_egress_strip_baggage_keys,
             );
         }
-        // Always make one more pass after the routing-header hook, including
-        // when it rejects, so final enforcement charges the pinned method
-        // exactly once before any external-hook rejection is returned.
     }
 
     // Hooks that can dispatch external work or synthesize a terminal response
