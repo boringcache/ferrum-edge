@@ -1585,11 +1585,7 @@ async fn test_auth_rejection_cookie_storage_key_allows_trusted_tls_termination()
     raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("https"));
     ctx.set_raw_headers(raw_headers);
 
-    let forwarded_scheme = apply_trusted_forwarded_request_scheme(
-        &mut ctx,
-        &socket_peer,
-        &trusted,
-    );
+    let forwarded_scheme = apply_trusted_forwarded_request_scheme(&mut ctx, &socket_peer, &trusted);
     assert_eq!(forwarded_scheme, Some("https"));
     assert!(ctx.request_is_secure);
     assert_eq!(
@@ -1638,8 +1634,7 @@ async fn test_trusted_forwarded_http_overrides_tls_cookie_and_authority_scope() 
     raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("http"));
     ctx.set_raw_headers(raw_headers);
 
-    let forwarded_scheme =
-        apply_trusted_forwarded_request_scheme(&mut ctx, &socket_peer, &trusted);
+    let forwarded_scheme = apply_trusted_forwarded_request_scheme(&mut ctx, &socket_peer, &trusted);
     assert_eq!(forwarded_scheme, Some("http"));
     assert!(!ctx.request_is_secure);
     assert_eq!(

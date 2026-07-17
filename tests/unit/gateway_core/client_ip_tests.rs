@@ -145,11 +145,7 @@ fn forwarded_scheme_requires_a_recognized_nearest_value_from_a_trusted_peer() {
         Some("https")
     );
     assert_eq!(
-        trusted_forwarded_request_scheme(
-            &trusted_peer,
-            [b"https, http".as_slice()],
-            &trusted,
-        ),
+        trusted_forwarded_request_scheme(&trusted_peer, [b"https, http".as_slice()], &trusted,),
         Some("http")
     );
     assert_eq!(
@@ -157,11 +153,7 @@ fn forwarded_scheme_requires_a_recognized_nearest_value_from_a_trusted_peer() {
         None
     );
     assert_eq!(
-        trusted_forwarded_request_scheme(
-            &trusted_peer,
-            [b"https".as_slice(), &[0x80]],
-            &trusted,
-        ),
+        trusted_forwarded_request_scheme(&trusted_peer, [b"https".as_slice(), &[0x80]], &trusted,),
         None
     );
     assert_eq!(
