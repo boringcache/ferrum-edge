@@ -9294,8 +9294,7 @@ mod inner {
                                     mongodb::error::Error::custom(error.to_string())
                                 })?;
 
-                                for (namespace, resource_type, resource_id) in
-                                    upsert_changes.iter()
+                                for (namespace, resource_type, resource_id) in upsert_changes.iter()
                                 {
                                     this.record_config_change_in_session(
                                         &mut *s,
