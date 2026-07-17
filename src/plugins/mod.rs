@@ -1394,8 +1394,8 @@ impl RequestContext {
     }
 
     fn replace_ai_usage_export(&mut self, candidate: AiUsageExport) {
-        self.ai_usage_export_token_prefix = (candidate.token_completeness() != 0)
-            .then(|| Arc::clone(&candidate.prefix));
+        self.ai_usage_export_token_prefix =
+            (candidate.token_completeness() != 0).then(|| Arc::clone(&candidate.prefix));
         self.ai_usage_export_cost_prefix = candidate
             .cost
             .as_ref()

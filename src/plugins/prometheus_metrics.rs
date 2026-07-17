@@ -421,9 +421,7 @@ impl TimestampedCostCounter {
         // increase, never expose a counter decrease.
         let whole = self.microunits.load(Ordering::Relaxed);
         let remainder = self.submicrounits.load(Ordering::Relaxed);
-        let rounded = whole.saturating_add(u64::from(
-            remainder >= AI_COST_SUBMICRO_SCALE / 2,
-        ));
+        let rounded = whole.saturating_add(u64::from(remainder >= AI_COST_SUBMICRO_SCALE / 2));
         self.published_microunits
             .fetch_max(rounded, Ordering::Release);
         self.last_updated
