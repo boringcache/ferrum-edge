@@ -38,9 +38,9 @@ use crate::plugins::{
 // ---------------------------------------------------------------------------
 
 use crate::plugins::{
-    BackendPathPolicyPhase, PluginResult, RequestContext, ResponseStreamInspector,
-    StreamConnectionContext, StreamTransactionSummary, TransactionSummary, UdpDatagramContext,
-    UdpDatagramVerdict, WebSocketFrameDirection, WebSocketSizeLimits,
+    PluginResult, RequestContext, ResponseStreamInspector, StreamConnectionContext,
+    StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
+    WebSocketFrameDirection, WebSocketSizeLimits,
 };
 use async_trait::async_trait;
 
