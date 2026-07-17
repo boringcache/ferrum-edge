@@ -18613,10 +18613,8 @@ async fn handle_proxy_request_inner(
             }
         };
         let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
-        let mut websocket_proxy_headers = owned_proxy_headers
-            .as_ref()
-            .unwrap_or(&ctx.headers)
-            .clone();
+        let mut websocket_proxy_headers =
+            owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
         apply_effective_backend_scheme_headers(
             &mut websocket_proxy_headers,
             &ctx.client_ip,
