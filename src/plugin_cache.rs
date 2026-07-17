@@ -287,6 +287,12 @@ pub(crate) fn validate_correlation_id_composition(
                 ));
             }
             let normalized_header_name = trimmed_header_name.to_ascii_lowercase();
+            if crate::plugins::correlation_id::is_reserved_header_name(&normalized_header_name) {
+                return Err(format!(
+                    "correlation_id: effective header_name {normalized_header_name:?} for plugin {:?} and protocol {protocol:?} violates reserved protocol-managed or security-sensitive header ownership",
+                    plugin.name()
+                ));
+            }
             if real_ip_header
                 .is_some_and(|configured| normalized_header_name.eq_ignore_ascii_case(configured))
             {

@@ -5486,6 +5486,58 @@ fn test_third_party_correlation_capability_cannot_claim_real_ip_header() {
 }
 
 #[test]
+fn test_third_party_correlation_capability_cannot_claim_reserved_header() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin {
+        claim: " AuThOrIzAtIoN ",
+    })];
+    let error =
+        ferrum_edge::_test_support::validate_correlation_id_composition_for_test(&plugins)
+            .expect_err("third-party reserved header ownership must fail closed");
+
+    assert!(
+        error.contains("effective header_name \"authorization\""),
+        "got: {error}"
+    );
+    assert!(error.contains("plugin \"raw_correlation_claim\""), "got: {error}");
+    assert!(error.contains("protocol Http"), "got: {error}");
+    assert!(
+        error.contains("reserved protocol-managed or security-sensitive header ownership"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn test_shipped_custom_correlation_plugin_cannot_claim_reserved_header() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let custom_owner = make_plugin_config_with_json(
+        "custom-corr-reserved",
+        "example_plugin",
+        json!({"correlation_header_name": " AuThOrIzAtIoN "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["custom-corr-reserved"])],
+        vec![custom_owner],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("shipped custom plugin must not claim reserved correlation headers");
+    assert!(
+        error.contains("effective header_name \"authorization\""),
+        "got: {error}"
+    );
+    assert!(error.contains("plugin \"example_plugin\""), "got: {error}");
+    assert!(error.contains("protocol Http"), "got: {error}");
+    assert!(error.contains("proxy_id=p1"), "got: {error}");
+    assert!(error.contains("reserved"), "got: {error}");
+}
+
+#[test]
 fn test_custom_correlation_owners_on_disjoint_protocols_are_allowed() {
     if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
         return;

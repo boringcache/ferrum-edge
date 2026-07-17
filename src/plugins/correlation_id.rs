@@ -153,7 +153,7 @@ impl CorrelationId {
     }
 }
 
-fn is_reserved_header_name(name: &str) -> bool {
+pub(crate) fn is_reserved_header_name(name: &str) -> bool {
     RESERVED_HEADER_NAMES.contains(&name)
 }
 

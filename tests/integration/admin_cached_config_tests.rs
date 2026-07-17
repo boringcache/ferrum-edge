@@ -2938,6 +2938,73 @@ async fn admin_rejects_custom_only_correlation_collision_before_persistence() {
 }
 
 #[tokio::test]
+async fn admin_rejects_reserved_custom_correlation_claim_before_persistence() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let batch = json!({
+        "proxies": [{
+            "id": "reserved-custom-correlation-proxy",
+            "listen_path": "/reserved-custom-correlation",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [{"plugin_config_id": "reserved-custom-correlation"}]
+        }],
+        "plugin_configs": [{
+            "id": "reserved-custom-correlation",
+            "plugin_name": "example_plugin",
+            "scope": "proxy",
+            "proxy_id": "reserved-custom-correlation-proxy",
+            "enabled": true,
+            "config": {"correlation_header_name": " AuThOrIzAtIoN "}
+        }]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+
+    assert_eq!(status, 400, "reserved custom claim was admitted: {body:?}");
+    assert!(
+        body["validation_errors"].as_array().is_some_and(|errors| {
+            errors.iter().filter_map(Value::as_str).any(|error| {
+                error.contains("effective header_name \"authorization\"")
+                    && error.contains("plugin \"example_plugin\"")
+                    && error.contains("protocol Http")
+                    && error.contains("reserved")
+            })
+        }),
+        "unexpected reserved custom correlation admission response: {body:?}"
+    );
+    let (status, _, _) = admin_get(
+        &base_url,
+        "/plugins/config/reserved-custom-correlation",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "rejected reserved custom correlation config was persisted"
+    );
+    let (status, _, _) = admin_get(
+        &base_url,
+        "/proxies/reserved-custom-correlation-proxy",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "rejected reserved custom correlation proxy was persisted"
+    );
+}
+
+#[tokio::test]
 async fn admin_allows_custom_correlation_owners_on_disjoint_protocols() {
     if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
         return;
