@@ -304,8 +304,9 @@ impl AiTokenMetrics {
             return true;
         }
         let family = match provider {
-            "openai" | "azure_openai" | "xai" | "deepseek" | "meta_llama"
-            | "hugging_face" => "openai",
+            "openai" | "azure_openai" | "xai" | "deepseek" | "meta_llama" | "hugging_face" => {
+                "openai"
+            }
             "anthropic" => "anthropic",
             "google" | "google_gemini" | "google_vertex" => "google",
             "cohere" => "cohere",
@@ -333,10 +334,8 @@ impl AiTokenMetrics {
             return;
         };
 
-        ctx.metadata.insert(
-            self.estimated_cost_key.clone(),
-            format!("{total_cost:.6}"),
-        );
+        ctx.metadata
+            .insert(self.estimated_cost_key.clone(), format!("{total_cost:.6}"));
         usage.prefix = Arc::clone(&self.metadata_prefix);
         usage.cost = Some(cost);
         ctx.stage_ai_usage_export(usage);
@@ -376,10 +375,8 @@ impl AiTokenMetrics {
         let cost = self
             .calculate_cost(usage.prompt_tokens, usage.completion_tokens)
             .map(|(total_cost, cost)| {
-                ctx.metadata.insert(
-                    self.estimated_cost_key.clone(),
-                    format!("{total_cost:.6}"),
-                );
+                ctx.metadata
+                    .insert(self.estimated_cost_key.clone(), format!("{total_cost:.6}"));
                 cost
             });
         if let Some(provider) = usage.provider {

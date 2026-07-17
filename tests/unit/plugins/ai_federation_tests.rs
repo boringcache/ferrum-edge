@@ -4307,7 +4307,9 @@ async fn configured_token_metrics_rates_price_trusted_federation_usage_determini
     assert_eq!(export.provider, "openai");
     assert_eq!(export.prompt_tokens, Some(10));
     assert_eq!(export.completion_tokens, Some(5));
-    let cost = export.cost.expect("configured rates must price federation usage");
+    let cost = export
+        .cost
+        .expect("configured rates must price federation usage");
     assert_eq!(cost.microunits, 200_000);
     assert_eq!(cost.submicrounits, 0);
 }

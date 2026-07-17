@@ -754,9 +754,8 @@ impl AiCost {
 
         let whole_microunits = scaled.floor();
         let mut microunits = whole_microunits as u64;
-        let mut submicrounits = ((scaled - whole_microunits)
-            * AI_COST_SUBMICRO_SCALE as f64)
-            .round() as u64;
+        let mut submicrounits =
+            ((scaled - whole_microunits) * AI_COST_SUBMICRO_SCALE as f64).round() as u64;
         if submicrounits >= AI_COST_SUBMICRO_SCALE {
             microunits = microunits.checked_add(1)?;
             submicrounits -= AI_COST_SUBMICRO_SCALE;

@@ -374,9 +374,7 @@ impl TimestampedCostCounter {
         Self {
             microunits: CachePadded::new(AtomicU64::new(0)),
             submicrounits: CachePadded::new(AtomicU64::new(0)),
-            last_updated: CachePadded::new(AtomicU64::new(
-                epoch.elapsed().as_nanos() as u64
-            )),
+            last_updated: CachePadded::new(AtomicU64::new(epoch.elapsed().as_nanos() as u64)),
         }
     }
 
@@ -397,15 +395,13 @@ impl TimestampedCostCounter {
         let submicrounits = value.submicrounits % AI_COST_SUBMICRO_SCALE;
         if submicrounits != 0 {
             let mut carried = false;
-            let _ = self.submicrounits.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| {
-                    let sum = current + submicrounits;
-                    carried = sum >= AI_COST_SUBMICRO_SCALE;
-                    Some(sum % AI_COST_SUBMICRO_SCALE)
-                },
-            );
+            let _ =
+                self.submicrounits
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        let sum = current + submicrounits;
+                        carried = sum >= AI_COST_SUBMICRO_SCALE;
+                        Some(sum % AI_COST_SUBMICRO_SCALE)
+                    });
             if carried {
                 self.add_microunits(1);
             }
