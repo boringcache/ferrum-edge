@@ -1376,7 +1376,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         "plugin_name": "ws_message_size_limiting",
         "scope": "global",
         "enabled": true,
-        "config": {"max_frame_bytes": 1024}
+        "config": {"max_frame_bytes": 1024, "max_message_bytes": 4096}
     });
     assert!(validator.validate(&valid).is_ok(), "config should be valid");
 
@@ -1389,6 +1389,15 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     assert!(
         validator.validate(&invalid).is_err(),
         "ws_message_size_limiting should require max_frame_bytes through PluginConfig"
+    );
+
+    let invalid_message_limit = plugin_config(
+        "ws_message_size_limiting",
+        Some(json!({"max_frame_bytes": 1024, "max_message_bytes": 0})),
+    );
+    assert!(
+        validator.validate(&invalid_message_limit).is_err(),
+        "ws_message_size_limiting should reject a zero max_message_bytes"
     );
 
     for (plugin_name, config) in [

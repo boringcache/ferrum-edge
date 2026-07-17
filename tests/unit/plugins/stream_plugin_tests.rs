@@ -692,12 +692,18 @@ fn test_ws_only_plugins() {
             "Plugin {} must NOT support UDP",
             name
         );
-        // All WS frame plugins must opt into frame hooks
+        // Every WebSocket policy must select the framed relay. Size limiting
+        // is parser-only; logging/rate limiting use post-reassembly hooks.
         assert!(
-            plugin.requires_ws_frame_hooks(),
-            "Plugin {} must return true from requires_ws_frame_hooks()",
+            plugin.requires_websocket_framing(),
+            "Plugin {} must require WebSocket framing",
             name
         );
+        if name == "ws_message_size_limiting" {
+            assert!(!plugin.requires_ws_frame_hooks());
+        } else {
+            assert!(plugin.requires_ws_frame_hooks());
+        }
     }
 }
 

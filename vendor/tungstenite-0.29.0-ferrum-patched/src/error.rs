@@ -138,7 +138,14 @@ pub enum CapacityError {
     /// Too many headers provided (see [`httparse::Error::TooManyHeaders`]).
     #[error("Too many headers")]
     TooManyHeaders,
-    /// Received header is too long.
+    /// Frame payload is bigger than the maximum allowed frame size.
+    #[error("Frame too long: {size} > {max_size}")]
+    FrameTooLong {
+        /// The size of the frame payload.
+        size: usize,
+        /// The maximum allowed frame payload size.
+        max_size: usize,
+    },
     /// Message is bigger than the maximum allowed size.
     #[error("Message too long: {size} > {max_size}")]
     MessageTooLong {

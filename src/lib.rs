@@ -83,7 +83,10 @@ pub mod _test_support {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    use futures_util::Sink;
     use hyper::StatusCode;
+    use tokio_tungstenite::tungstenite::Error as WsError;
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
@@ -639,12 +642,49 @@ pub mod _test_support {
             None,
             &crls,
             65_536,
+            262_144,
             4_096,
             None,
             None,
         )
         .await?;
         Ok(handshake.stream)
+    }
+
+    /// Exercise the production bounded WebSocket close/queued-echo path.
+    pub async fn send_bounded_ws_close_for_test<S>(sink: &mut S, close: Option<CloseFrame>)
+    where
+        S: Sink<Message, Error = WsError> + Unpin,
+    {
+        crate::proxy::send_bounded_ws_close(sink, close).await;
+    }
+
+    /// Exercise synchronous policy-close publication and cancellation.
+    pub fn publish_ws_policy_close_for_test(
+        policy_close: &std::sync::OnceLock<CloseFrame>,
+        cancel: &tokio_util::sync::CancellationToken,
+        close: Option<CloseFrame>,
+    ) -> Option<CloseFrame> {
+        crate::proxy::publish_ws_policy_close(policy_close, cancel, close)
+    }
+
+    /// Report the production parser-policy and post-reassembly hook lists.
+    pub fn websocket_relay_plugin_names_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        requires_websocket_framing: bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let (framing_plugins, frame_plugins) =
+            crate::proxy::collect_websocket_relay_plugins(plugins, requires_websocket_framing);
+        (
+            framing_plugins
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+            frame_plugins
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+        )
     }
 
     /// Variant of `connect_websocket_backend_for_test` that returns the
@@ -684,6 +724,7 @@ pub mod _test_support {
             None,
             &crls,
             65_536,
+            262_144,
             4_096,
             None,
             None,
