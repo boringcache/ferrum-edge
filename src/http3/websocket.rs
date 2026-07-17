@@ -1184,8 +1184,10 @@ pub(crate) async fn handle_h3_websocket(
     // are HTTP/1.1 only). The QUIC stream becomes the WebSocket
     // transport as soon as the client sees the 200.
     let mut response_headers = HashMap::new();
-    crate::proxy::finalize_websocket_response_headers(
-        &initial_response_header_policy_plugins,
+    crate::proxy::finalize_successful_websocket_response_headers(
+        &plugins,
+        &ctx,
+        StatusCode::OK.as_u16(),
         &mut response_headers,
     );
 
@@ -1573,6 +1575,7 @@ async fn emit_successful_upgrade_summary(
         latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: proxy_headers.get("user-agent").cloned(),
         metadata: crate::proxy::clone_log_metadata(ctx),
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
@@ -1655,6 +1658,7 @@ async fn emit_failed_upgrade_summary(
         request_user_agent: proxy_headers.get("user-agent").cloned(),
         error_class: Some(error_class),
         metadata,
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;

@@ -113,6 +113,10 @@ pub struct PluginHttpClient {
     /// collisions when multiple gateway instances with different namespaces share
     /// the same external backend.
     namespace: String,
+    /// Effective authoritative client-IP header after env/conf precedence and
+    /// normalization. Plugin construction uses this cold-path value to keep
+    /// correlation writers from claiming gateway-owned attribution state.
+    real_ip_header: Option<String>,
     /// Resolved backend IP policy (`FERRUM_BACKEND_ALLOW_IPS` after CLI/env/conf
     /// precedence). Used by plugins that validate outbound endpoints outside the
     /// proxy backend path.
@@ -389,6 +393,7 @@ impl PluginHttpClient {
             tls_ca_bundle_path: tls_ca_bundle_path.map(|s| s.to_string()),
             tls_crls,
             namespace: namespace.to_string(),
+            real_ip_header: None,
             backend_allow_ips,
             mesh_egress_strip_baggage_keys,
             bpf_metrics_state: None,
@@ -473,6 +478,7 @@ impl PluginHttpClient {
             tls_ca_bundle_path: None,
             tls_crls: Arc::new(Vec::new()),
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
+            real_ip_header: None,
             backend_allow_ips: BackendEgressPolicy::unrestricted(),
             mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
             bpf_metrics_state: None,
@@ -529,6 +535,19 @@ impl PluginHttpClient {
             Arc::new(Vec::new()),
             0, // pool_shard_amount → auto
         )
+    }
+
+    /// Carry the already-resolved authoritative real-IP header into plugin
+    /// construction and candidate admission. This remains cache-build state;
+    /// request handling continues to use `EnvConfig` directly.
+    pub(crate) fn with_real_ip_header(mut self, real_ip_header: Option<String>) -> Self {
+        self.real_ip_header = real_ip_header;
+        self
+    }
+
+    /// Effective authoritative real-IP header for cold-path plugin validation.
+    pub(crate) fn real_ip_header(&self) -> Option<&str> {
+        self.real_ip_header.as_deref()
     }
 
     /// Build a plugin HTTP client from pool config with custom slow-call and

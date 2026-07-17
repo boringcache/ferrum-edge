@@ -173,7 +173,7 @@ fn validate_candidate_plugin_graph(
     candidate: &GatewayConfig,
     http_client: &crate::plugins::PluginHttpClient,
 ) -> Result<(), AfterValidateError> {
-    crate::plugin_cache::validate_hmac_request_transform_candidate(candidate, http_client)
+    crate::plugin_cache::validate_plugin_composition_candidate(candidate, http_client)
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))?;
     crate::plugin_cache::validate_tcp_connection_throttle_attachments(candidate)
         .map_err(AfterValidateError::BadRequest)

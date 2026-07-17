@@ -1401,6 +1401,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     );
 
     for (plugin_name, config) in [
+        ("correlation_id", json!({})),
         ("bot_detection", json!({})),
         ("udp_rate_limiting", json!({"datagrams_per_second": 100})),
         (
@@ -1429,6 +1430,10 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     }
 
     for (plugin_name, config) in [
+        ("correlation_id", None),
+        ("correlation_id", Some(serde_json::Value::Null)),
+        ("correlation_id", Some(json!([]))),
+        ("correlation_id", Some(json!({"echo_downsteam": false}))),
         ("bot_detection", None),
         ("bot_detection", Some(serde_json::Value::Null)),
         ("bot_detection", Some(json!([]))),
@@ -1751,6 +1756,113 @@ fn assert_component_validity(
         actual_valid, expected_valid,
         "unexpected {component} validation result for {instance}"
     );
+}
+
+#[test]
+fn correlation_id_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::correlation_id::CorrelationId;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for valid in [
+        json!({}),
+        json!({"header_name": "x-request-id", "echo_downstream": false}),
+        json!({"header_name": "X-Correlation-ID", "echo_downstream": true}),
+        json!({"header_name": " X-Trimmed-ID "}),
+        json!({"header_name": null, "echo_downstream": null}),
+    ] {
+        assert_component_validity(&spec, "CorrelationIdConfig", &valid, true);
+        CorrelationId::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+
+    for invalid in [
+        serde_json::Value::Null,
+        json!([]),
+        json!("config"),
+        json!(42),
+        json!(true),
+        json!({"echo_downsteam": false}),
+        json!({"header_name": "x:request-id"}),
+        json!({"header_name": 42}),
+        json!({"echo_downstream": "true"}),
+        json!({"header_name": "API-Key"}),
+        json!({"header_name": "Authentication-Info"}),
+        json!({"header_name": "Authorization"}),
+        json!({"header_name": "Connection"}),
+        json!({"header_name": " Connection "}),
+        json!({"header_name": "Content-Encoding"}),
+        json!({"header_name": "Content-Length"}),
+        json!({"header_name": "Cookie"}),
+        json!({"header_name": " eARLY-dATA "}),
+        json!({"header_name": " eXPECT "}),
+        json!({"header_name": " fORWARDED "}),
+        json!({"header_name": "Grpc-Message"}),
+        json!({"header_name": "Grpc-Status"}),
+        json!({"header_name": "Grpc-Status-Details-Bin"}),
+        json!({"header_name": "Host"}),
+        json!({"header_name": "Keep-Alive"}),
+        json!({"header_name": "Proxy-Authenticate"}),
+        json!({"header_name": "Proxy-Authentication-Info"}),
+        json!({"header_name": "Proxy-Authorization"}),
+        json!({"header_name": "Proxy-Connection"}),
+        json!({"header_name": "X-Forwarded-Host"}),
+        json!({"header_name": " x-FORWARDED-proto "}),
+        json!({"header_name": "Sec-WebSocket-Accept"}),
+        json!({"header_name": "Sec-WebSocket-Extensions"}),
+        json!({"header_name": "Sec-WebSocket-Key"}),
+        json!({"header_name": "Sec-WebSocket-Protocol"}),
+        json!({"header_name": "Sec-WebSocket-Version"}),
+        json!({"header_name": "Set-Cookie"}),
+        json!({"header_name": "TE"}),
+        json!({"header_name": "Traceparent"}),
+        json!({"header_name": "Tracestate"}),
+        json!({"header_name": "Trailer"}),
+        json!({"header_name": "Transfer-Encoding"}),
+        json!({"header_name": "Upgrade"}),
+        json!({"header_name": "vIA"}),
+        json!({"header_name": "WWW-Authenticate"}),
+        json!({"header_name": "X-API-Key"}),
+        json!({"header_name": "X-Auth-Token"}),
+        json!({"header_name": "X-CSRF-Token"}),
+        json!({"header_name": "X-Ferrum-Original-Content-Encoding"}),
+        json!({"header_name": "X-Forwarded-Authorization"}),
+        json!({"header_name": "X-Forwarded-For"}),
+        json!({"header_name": "X-Goog-API-Key"}),
+        json!({"header_name": "x-gRPC-wEB-mODE"}),
+        json!({"header_name": "X-XSRF-Token"}),
+    ] {
+        assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
+        assert!(
+            CorrelationId::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let header_name_schema = spec
+        .pointer("/components/schemas/CorrelationIdConfig/properties/header_name")
+        .expect("correlation header_name schema exists");
+    for exclusion_pointer in ["/not", "/allOf/0/not"] {
+        let exclusion = header_name_schema
+            .pointer(exclusion_pointer)
+            .unwrap_or_else(|| panic!("correlation exclusion {exclusion_pointer} exists"));
+        let validator = jsonschema::draft202012::options()
+            .build(exclusion)
+            .unwrap_or_else(|error| panic!("correlation exclusion compiles: {error}"));
+        for reserved in [
+            json!(" Early-Data "),
+            json!(" Traceparent "),
+            json!("Tracestate"),
+            json!("X-Ferrum-Original-Content-Encoding"),
+            json!("x-gRPC-wEB-mODE"),
+        ] {
+            assert!(
+                validator.validate(&reserved).is_ok(),
+                "correlation exclusion {exclusion_pointer} missed {reserved}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -2674,6 +2786,61 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
         assert!(
             AiPromptCompressor::new(&config).is_err(),
             "runtime admitted {config}"
+        );
+    }
+}
+
+#[test]
+fn ai_token_metrics_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::ai_token_metrics::AiTokenMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiTokenMetricsConfig")
+        .expect("missing AiTokenMetricsConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiTokenMetricsConfig schema compiles");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    for config in [
+        json!({}),
+        json!({"provider": "openai"}),
+        json!({"provider": "google"}),
+        json!({"metadata_prefix": "tenant.ai_1"}),
+        json!({"buffer_streaming_responses": true}),
+        json!({"cost_per_prompt_token": 0.000003}),
+        json!({"cost_per_prompt_token": 18_446_744_073_709.55}),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema rejected {config}"
+        );
+        assert!(
+            AiTokenMetrics::new(&config).is_ok(),
+            "runtime rejected {config}"
+        );
+    }
+
+    for config in [
+        json!({"providre": "openai"}),
+        json!({"provider": "unknown"}),
+        json!({"provider": "OpenAI"}),
+        json!({"provider": " openai"}),
+        json!({"metadata_prefix": "not allowed"}),
+        json!({"metadata_prefix": " ai"}),
+        json!({"metadata_prefix": "x".repeat(65)}),
+        json!({"cost_per_prompt_token": -1}),
+        json!({"cost_per_prompt_token": 18_446_744_073_710.0}),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema accepted {config}"
+        );
+        assert!(
+            AiTokenMetrics::new(&config).is_err(),
+            "runtime accepted {config}"
         );
     }
 }

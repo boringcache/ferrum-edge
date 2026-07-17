@@ -91,6 +91,75 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    pub fn validate_correlation_id_composition_for_test(
+        plugins: &[Arc<dyn Plugin>],
+    ) -> Result<(), String> {
+        crate::plugin_cache::validate_correlation_id_composition(plugins, None)
+    }
+
+    pub fn validate_correlation_id_composition_with_real_ip_header_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        real_ip_header: Option<&str>,
+    ) -> Result<(), String> {
+        crate::plugin_cache::validate_correlation_id_composition(plugins, real_ip_header)
+    }
+
+    pub fn correlation_id_with_real_ip_header_for_test(
+        config: &serde_json::Value,
+        real_ip_header: Option<&str>,
+    ) -> Result<crate::plugins::correlation_id::CorrelationId, String> {
+        crate::plugins::correlation_id::CorrelationId::new_with_real_ip_header(
+            config,
+            real_ip_header,
+        )
+    }
+
+    pub fn udp_dtls_disconnect_metadata_after_datagram_metadata_for_test(
+        ctx: &mut crate::plugins::StreamConnectionContext,
+        datagram_metadata: HashMap<String, String>,
+    ) -> (HashMap<String, String>, HashMap<String, String>) {
+        let (connect_metadata, correlation_ids) = ctx.take_metadata_with_correlation_ids();
+
+        let udp_metadata = std::sync::Mutex::new(connect_metadata.clone());
+        crate::plugins::UdpMetadataSink::new(&udp_metadata).update(|metadata| {
+            metadata.extend(datagram_metadata.clone());
+        });
+        let udp_metadata = crate::proxy::udp_proxy::finalize_stream_summary_metadata(
+            udp_metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            &correlation_ids,
+        );
+
+        let mut dtls_metadata = connect_metadata;
+        dtls_metadata.extend(datagram_metadata);
+        let dtls_metadata = crate::proxy::udp_proxy::finalize_stream_summary_metadata(
+            dtls_metadata,
+            &correlation_ids,
+        );
+
+        (udp_metadata, dtls_metadata)
+    }
+
+    pub fn plugin_cache_with_real_ip_header_for_test(
+        config: &crate::config::types::GatewayConfig,
+        real_ip_header: Option<&str>,
+    ) -> Result<crate::PluginCache, String> {
+        let http_client = crate::plugins::PluginHttpClient::default()
+            .with_real_ip_header(real_ip_header.map(str::to_string));
+        crate::PluginCache::with_http_client(config, http_client)
+    }
+
+    pub fn validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        config: &crate::config::types::GatewayConfig,
+        real_ip_header: Option<&str>,
+    ) -> Result<(), String> {
+        let http_client = crate::plugins::PluginHttpClient::default()
+            .with_real_ip_header(real_ip_header.map(str::to_string));
+        crate::plugin_cache::validate_plugin_composition_candidate(config, &http_client)
+    }
+
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
     pub fn grpc_deadline_duration_millis_ceil_saturating_for_test(
         duration: std::time::Duration,
@@ -1113,6 +1182,27 @@ pub mod _test_support {
     }
 
     // ── proxy/mod ────────────────────────────────────────────────────────────
+    pub fn apply_effective_backend_scheme_headers_for_test(
+        headers: &mut HashMap<String, String>,
+        client_ip: &str,
+        request_is_secure: bool,
+        add_forwarded_header: bool,
+    ) {
+        crate::proxy::apply_effective_backend_scheme_headers(
+            headers,
+            client_ip,
+            request_is_secure,
+            add_forwarded_header,
+        );
+    }
+
+    pub fn collect_forwardable_websocket_headers_for_test(
+        raw_headers: &hyper::HeaderMap,
+        proxy_headers: &HashMap<String, String>,
+    ) -> Vec<(String, String)> {
+        crate::proxy::collect_forwardable_websocket_headers(raw_headers, proxy_headers)
+    }
+
     pub struct NormalizedRejectResponse {
         pub http_status: StatusCode,
         pub headers: HashMap<String, String>,

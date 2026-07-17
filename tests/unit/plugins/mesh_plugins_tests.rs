@@ -187,28 +187,15 @@ fn ambient_udp_source_scoping_slice() -> MeshSlice {
 }
 
 fn stream_context() -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "tcp-proxy".to_string(),
-        proxy_name: None,
-        listen_port: 15443,
-        backend_scheme: BackendScheme::Tcps,
-        consumer_index: Arc::new(ConsumerIndex::new(&[])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "tcp-proxy".to_string(),
+        None,
+        15443,
+        BackendScheme::Tcps,
+        Arc::new(ConsumerIndex::new(&[])),
+    )
 }
 
 #[test]
@@ -2685,28 +2672,17 @@ async fn workload_metrics_on_stream_connect_adds_source_identity_metadata() {
         }
     }))
     .expect("plugin config");
-    let mut ctx = StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "tcp-proxy".to_string(),
-        proxy_name: Some("payments-tcp".to_string()),
-        listen_port: 15432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ConsumerIndex::new(&[])),
-        identified_consumer: None,
-        authenticated_identity: Some("spiffe://cluster.local/ns/default/sa/client".to_string()),
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: Some(Arc::new(vec![1, 2, 3])),
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    let mut ctx = StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "tcp-proxy".to_string(),
+        Some("payments-tcp".to_string()),
+        15432,
+        BackendScheme::Tcp,
+        Arc::new(ConsumerIndex::new(&[])),
+    );
+    ctx.authenticated_identity = Some("spiffe://cluster.local/ns/default/sa/client".to_string());
+    ctx.tls_client_cert_der = Some(Arc::new(vec![1, 2, 3]));
 
     let result = plugin.on_stream_connect(&mut ctx).await;
 
@@ -6350,28 +6326,16 @@ async fn workload_metrics_unstamped_request_does_not_emit_direction_metadata() {
 #[tokio::test]
 async fn workload_metrics_stream_inbound_listener_stamps_mesh_direction() {
     let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
-    let mut ctx = StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "tcp-proxy".to_string(),
-        proxy_name: None,
-        listen_port: 15432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ConsumerIndex::new(&[])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: Some(MeshTrafficDirection::Inbound),
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    let mut ctx = StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "tcp-proxy".to_string(),
+        None,
+        15432,
+        BackendScheme::Tcp,
+        Arc::new(ConsumerIndex::new(&[])),
+    );
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
 
     let result = plugin.on_stream_connect(&mut ctx).await;
 

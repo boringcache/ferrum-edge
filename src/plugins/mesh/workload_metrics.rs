@@ -1825,28 +1825,18 @@ mod tests {
         authenticated_identity: Option<&str>,
         proxy_name: &str,
     ) -> StreamConnectionContext {
-        StreamConnectionContext {
-            client_ip: "10.0.0.2".to_string(),
-            direct_client_ip: "10.0.0.2".to_string(),
-            canonical_client_ip: Default::default(),
-            proxy_id: "mesh-stream".to_string(),
-            proxy_name: Some(proxy_name.to_string()),
-            listen_port: 5432,
-            backend_scheme: crate::config::types::BackendScheme::Tcp,
-            consumer_index: Arc::new(crate::consumer_index::ConsumerIndex::new(&[])),
-            identified_consumer: None,
-            authenticated_identity: authenticated_identity.map(str::to_owned),
-            auth_method: None,
-            metadata: None,
-            admission_permits: Vec::new(),
-            tls_client_cert_der: None,
-            tls_client_cert_chain_der: None,
-            sni_hostname: None,
-            mesh_direction: Some(direction),
-            node_waypoint_policy_scope: None,
-            first_bytes: None,
-            first_bytes_kind: None,
-        }
+        let mut ctx = StreamConnectionContext::new(
+            "10.0.0.2".to_string(),
+            "10.0.0.2".to_string(),
+            "mesh-stream".to_string(),
+            Some(proxy_name.to_string()),
+            5432,
+            crate::config::types::BackendScheme::Tcp,
+            Arc::new(crate::consumer_index::ConsumerIndex::new(&[])),
+        );
+        ctx.authenticated_identity = authenticated_identity.map(str::to_owned);
+        ctx.mesh_direction = Some(direction);
+        ctx
     }
 
     #[test]

@@ -25,28 +25,17 @@ fn make_consumer(username: &str) -> Consumer {
 }
 
 fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: ip.to_string(),
-        direct_client_ip: ip.to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: proxy_id.to_string(),
-        proxy_name: Some(format!("TCP Proxy {proxy_id}")),
-        listen_port: 5432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
-        identified_consumer: consumer.map(|c| Arc::new(make_consumer(c))),
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    let mut ctx = StreamConnectionContext::new(
+        ip.to_string(),
+        ip.to_string(),
+        proxy_id.to_string(),
+        Some(format!("TCP Proxy {proxy_id}")),
+        5432,
+        BackendScheme::Tcp,
+        Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    );
+    ctx.identified_consumer = consumer.map(|c| Arc::new(make_consumer(c)));
+    ctx
 }
 
 #[test]
