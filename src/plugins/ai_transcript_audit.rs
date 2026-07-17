@@ -1245,7 +1245,7 @@ impl Plugin for AiTranscriptAudit {
 
     /// The request body must be prebuffered before `before_proxy` so the
     /// candidate is staged **before**:
-    /// - `before_proxy` terminators (`ai_federation`, `ai_semantic_cache`
+    /// - request-phase terminators (`ai_federation`, `ai_semantic_cache`
     ///   hits) consume it and short-circuit — their transactions must still
     ///   be audited via the response/log hooks;
     /// - the proxy's post-transform response stream-vs-buffer decision runs (it

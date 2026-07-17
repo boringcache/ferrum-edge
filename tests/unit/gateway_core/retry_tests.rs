@@ -361,6 +361,17 @@ fn test_grpc_read_timeout_classified() {
 }
 
 #[test]
+fn test_grpc_client_deadline_before_dispatch_is_neutral() {
+    let err = GrpcProxyError::ClientDeadlineExceeded(
+        "gRPC deadline exceeded during backend connection acquisition".into(),
+    );
+    assert_eq!(
+        classify_grpc_proxy_error(&err),
+        ErrorClass::ClientDisconnect
+    );
+}
+
+#[test]
 fn test_grpc_body_read_timeout_classified() {
     let err = GrpcProxyError::BackendTimeout {
         kind: GrpcTimeoutKind::Read,

@@ -42,27 +42,17 @@ fn build_cert_with_uri_sans(uris: &[&str]) -> Vec<u8> {
 }
 
 fn empty_stream_ctx(cert_der: Option<Vec<u8>>) -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "tcp-proxy".to_string(),
-        proxy_name: Some("tcp".to_string()),
-        listen_port: 5432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ConsumerIndex::new(&[] as &[Consumer])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        tls_client_cert_der: cert_der.map(Arc::new),
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    let mut ctx = StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "tcp-proxy".to_string(),
+        Some("tcp".to_string()),
+        5432,
+        BackendScheme::Tcp,
+        Arc::new(ConsumerIndex::new(&[] as &[Consumer])),
+    );
+    ctx.tls_client_cert_der = cert_der.map(Arc::new);
+    ctx
 }
 
 #[test]

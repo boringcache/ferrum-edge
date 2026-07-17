@@ -344,7 +344,7 @@ gRPC supports **full bidirectional streaming** of both request and response bodi
 
 **Response body streaming**: HTTP/2 DATA frames are forwarded as they arrive from the backend, wrapped in `CoalescingH2Body` for efficient batching. HTTP/2 trailers (`grpc-status`, `grpc-message`) are forwarded automatically via hyper's `Incoming` body framing.
 
-When plugins require response body access (e.g., `ai_token_metrics`) or retries are configured, gRPC falls back to **buffered** mode for both request and response — the full body and trailers are collected before constructing the response.
+When native-gRPC-capable plugins require response body access or retries are configured, gRPC falls back to **buffered** mode for both request and response — the full body and trailers are collected before constructing the response. `ai_token_metrics` is HTTP-only: enabling it alone does not alter native gRPC streaming or inspect protobuf frames.
 
 ### WebSocket
 

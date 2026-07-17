@@ -37,6 +37,7 @@ fn make_full_summary() -> TransactionSummary {
         bytes_received: 0,
         mirror: false,
         metadata: HashMap::new(),
+        ai_usage_export: None,
     }
 }
 

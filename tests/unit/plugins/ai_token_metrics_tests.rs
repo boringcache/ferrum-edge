@@ -1,11 +1,15 @@
 //! Tests for ai_token_metrics plugin
 
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, ProxyProtocol, RequestContext, ai_token_metrics::AiTokenMetrics,
+    Plugin, PluginResult, ProxyProtocol, RequestContext,
+    ai_token_metrics::AiTokenMetrics,
+    utils::content_encoding::{DecodeLimits, decode_content_encoding},
     validate_plugin_config,
 };
 use serde_json::json;
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::Write;
 
 use super::plugin_utils::create_test_context;
 
@@ -19,6 +23,39 @@ fn json_headers() -> HashMap<String, String> {
     let mut h = HashMap::new();
     h.insert("content-type".to_string(), "application/json".to_string());
     h
+}
+
+fn gzip(body: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(body).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn brotli(body: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    let mut input = body;
+    brotli::BrotliCompress(
+        &mut input,
+        &mut encoded,
+        &brotli::enc::BrotliEncoderParams::default(),
+    )
+    .unwrap();
+    encoded
+}
+
+#[test]
+fn content_decoding_borrows_when_no_transform_is_required() {
+    let body = b"plain provider response";
+    let limits = DecodeLimits {
+        max_decoded_bytes: 4 * 1024 * 1024,
+        max_cumulative_bytes: 8 * 1024 * 1024,
+        max_codings: 4,
+    };
+    for header in [None, Some("identity")] {
+        let decoded = decode_content_encoding(header, body, limits).unwrap();
+        assert_eq!(decoded.as_ptr(), body.as_ptr());
+        assert!(matches!(decoded, Cow::Borrowed(_)));
+    }
 }
 
 fn ctx_with_content_type(method: &str, content_type: &str) -> RequestContext {
@@ -55,10 +92,7 @@ async fn test_plugin_name_and_priority() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "ai_token_metrics");
     assert_eq!(plugin.priority(), 4100);
-    assert_eq!(
-        plugin.supported_protocols(),
-        &[ProxyProtocol::Http, ProxyProtocol::Grpc]
-    );
+    assert_eq!(plugin.supported_protocols(), &[ProxyProtocol::Http]);
     assert!(plugin.requires_response_body_buffering());
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type(
@@ -123,7 +157,7 @@ fn test_streaming_response_buffering_requires_explicit_opt_in() {
 }
 
 // The pre-header `should_buffer_response_body` decision drives every backend
-// dispatch path — including the retry, native-gRPC, and HTTP/3-backend paths
+// dispatch path — including the retry and HTTP/3-backend paths
 // that never consult the header-time content-type refinement. These tests pin
 // the request-shape gating that keeps those paths streaming (PR #1751 follow-up).
 
@@ -159,32 +193,10 @@ fn test_pre_header_decision_streams_request_streaming_marker() {
 }
 
 #[test]
-fn test_pre_header_decision_never_buffers_native_grpc() {
-    let default_plugin = AiTokenMetrics::new(&json!({})).unwrap();
-    let opt_in_plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
-
-    // Native gRPC is never buffered (this plugin only parses JSON/SSE bodies),
-    // regardless of the streaming opt-in.
-    let grpc = ctx_with_content_type("POST", "application/grpc");
-    assert!(!default_plugin.should_buffer_response_body(&grpc));
-    assert!(!opt_in_plugin.should_buffer_response_body(&grpc));
-
-    let grpc_proto = ctx_with_content_type("POST", "application/grpc+proto");
-    assert!(!default_plugin.should_buffer_response_body(&grpc_proto));
-
-    // gRPC-Web is NOT native gRPC and stays on the normal (buffered) path.
-    let grpc_web = ctx_with_content_type("POST", "application/grpc-web");
-    assert!(default_plugin.should_buffer_response_body(&grpc_web));
-
-    // Bogus suffixes that share the `application/grpc` prefix but are NOT native
-    // gRPC (the dispatcher routes these as plain HTTP via the canonical
-    // delimiter-aware classifier). They must stay on the buffered path so a JSON
-    // LLM response from a tolerant upstream is still parsed for token usage; a
-    // naive prefix check would wrongly opt them out of buffering.
-    let grpc_foo = ctx_with_content_type("POST", "application/grpcfoo");
-    assert!(default_plugin.should_buffer_response_body(&grpc_foo));
-    let grpc_evil = ctx_with_content_type("POST", "application/grpc-evil");
-    assert!(default_plugin.should_buffer_response_body(&grpc_evil));
+fn test_native_grpc_is_explicitly_unsupported() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    assert_eq!(plugin.supported_protocols(), &[ProxyProtocol::Http]);
+    assert!(!plugin.supported_protocols().contains(&ProxyProtocol::Grpc));
 }
 
 #[test]
@@ -352,7 +364,7 @@ async fn test_cohere_v2_streaming_format() {
     // Cohere v2 SSE: the terminal `message-end` event carries counts under
     // `delta.usage.tokens.*`. The previous SSE detector classified all
     // `message*` events as Anthropic and dropped these.
-    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "text/event-stream".to_string());
@@ -419,22 +431,14 @@ async fn test_explicit_provider_openai() {
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "15");
 }
 
-#[tokio::test]
-async fn test_explicit_provider_is_case_insensitive() {
-    let plugin = AiTokenMetrics::new(&json!({"provider": " OpenAI "})).unwrap();
-    let mut ctx = create_test_context();
-    let headers = json_headers();
-    let body = serde_json::to_vec(&json!({
-        "model": "gpt-4",
-        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-    }))
-    .unwrap();
-
-    plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
-        .await;
-    assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "openai");
-    assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "15");
+#[test]
+fn explicit_provider_requires_the_documented_lowercase_enum_spelling() {
+    for provider in ["OpenAI", " openai", "openai ", "OPENAI"] {
+        let err = AiTokenMetrics::new(&json!({"provider": provider}))
+            .err()
+            .expect("non-canonical provider spelling must be rejected");
+        assert!(err.contains("unknown 'provider' value"), "got: {err}");
+    }
 }
 
 #[tokio::test]
@@ -783,6 +787,18 @@ fn test_zero_cost_accepted() {
 }
 
 #[test]
+fn cost_rate_maximum_matches_the_openapi_contract() {
+    assert!(
+        AiTokenMetrics::new(&json!({
+            "cost_per_prompt_token": 18_446_744_073_709.55,
+            "cost_per_completion_token": 18_446_744_073_709.55
+        }))
+        .is_ok()
+    );
+    assert!(AiTokenMetrics::new(&json!({"cost_per_prompt_token": 18_446_744_073_710.0})).is_err());
+}
+
+#[test]
 fn test_invalid_config_shapes_rejected() {
     for (config, needle) in [
         (json!(null), "config must be an object"),
@@ -889,4 +905,446 @@ async fn genuine_response_is_token_accounted_without_synthetic_marker() {
 
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "150");
     assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "openai");
+}
+
+#[tokio::test]
+async fn anthropic_sse_merges_cumulative_terminal_usage_without_double_counting() {
+    let plugin = AiTokenMetrics::new(&json!({
+        "buffer_streaming_responses": true,
+        "cost_per_prompt_token": 0.01,
+        "cost_per_completion_token": 0.02
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":15}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+
+    plugin
+        .on_response_body(&mut ctx, 200, &headers, body.as_bytes())
+        .await;
+
+    assert_eq!(
+        ctx.metadata.get("ai_provider").map(String::as_str),
+        Some("anthropic")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("25")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("15")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("40")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_estimated_cost").map(String::as_str),
+        Some("0.550000")
+    );
+}
+
+#[tokio::test]
+async fn anthropic_sse_without_message_start_keeps_explicit_partial_usage() {
+    let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n";
+
+    plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("9")
+    );
+    assert!(!ctx.metadata.contains_key("ai_prompt_tokens"));
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+}
+
+#[tokio::test]
+async fn partial_sse_component_update_retains_earlier_authoritative_total() {
+    let plugin = AiTokenMetrics::new(&json!({
+        "provider": "openai",
+        "buffer_streaming_responses": true
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"usage\":{\"total_tokens\":100}}\n\n",
+        "data: {\"usage\":{\"completion_tokens\":7}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    plugin
+        .on_response_body(&mut ctx, 200, &headers, body.as_bytes())
+        .await;
+
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("7")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("100")
+    );
+    assert!(!ctx.metadata.contains_key("ai_prompt_tokens"));
+    let export = ctx
+        .authoritative_ai_usage_export()
+        .expect("partial SSE usage must retain typed export provenance");
+    assert_eq!(export.prompt_tokens, None);
+    assert_eq!(export.completion_tokens, Some(7));
+    assert_eq!(export.total_tokens, Some(100));
+}
+
+#[tokio::test]
+async fn openai_responses_buffered_and_completed_sse_are_supported() {
+    let buffered = json!({
+        "id": "resp_123",
+        "object": "response",
+        "model": "gpt-4.1",
+        "usage": {
+            "input_tokens": 36,
+            "input_tokens_details": {"cached_tokens": 10},
+            "output_tokens": 87,
+            "output_tokens_details": {"reasoning_tokens": 12},
+            "total_tokens": 123
+        }
+    });
+    for config in [
+        json!({"cost_per_prompt_token": 0.01, "cost_per_completion_token": 0.02}),
+        json!({"provider": "openai", "cost_per_prompt_token": 0.01, "cost_per_completion_token": 0.02}),
+    ] {
+        let plugin = AiTokenMetrics::new(&config).unwrap();
+        let mut ctx = create_test_context();
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &json_headers(),
+                &serde_json::to_vec(&buffered).unwrap(),
+            )
+            .await;
+        assert_eq!(
+            ctx.metadata.get("ai_provider").map(String::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+            Some("36")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+            Some("87")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_total_tokens").map(String::as_str),
+            Some("123")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_estimated_cost").map(String::as_str),
+            Some("2.100000")
+        );
+    }
+
+    let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream; charset=utf-8".to_string(),
+    )]);
+    let event = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "type": "response.completed",
+            "response": buffered
+        })
+    );
+    plugin
+        .on_response_body(&mut ctx, 200, &headers, event.as_bytes())
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("123")
+    );
+}
+
+#[tokio::test]
+async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
+    let plugin = AiTokenMetrics::new(&json!({
+        "provider": "openai",
+        "buffer_streaming_responses": true,
+        "cost_per_prompt_token": 1.0
+    }))
+    .unwrap();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    for event_type in ["response.incomplete", "response.failed"] {
+        let mut ctx = create_test_context();
+        let event = format!(
+            "data: {}\n\n",
+            json!({"type": event_type, "response": {"usage": {"input_tokens": 5}}})
+        );
+        plugin
+            .on_response_body(&mut ctx, 200, &headers, event.as_bytes())
+            .await;
+        assert!(!ctx.metadata.contains_key("ai_provider"));
+        assert!(!ctx.metadata.contains_key("ai_estimated_cost"));
+    }
+
+    let mut ctx = create_test_context();
+    let malformed = serde_json::to_vec(&json!({
+        "object": "response",
+        "usage": {"input_tokens": 1.5, "output_tokens": "2", "total_tokens": -1}
+    }))
+    .unwrap();
+    plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &malformed)
+        .await;
+    assert!(ctx.metadata.is_empty());
+}
+
+#[tokio::test]
+async fn google_sse_merges_repeated_partial_usage_for_auto_and_fixed_provider() {
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}],\"modelVersion\":\"gemini-test\"}\n\n",
+        "data: {\"usageMetadata\":{\"promptTokenCount\":11}}\n\n",
+        "data: {\"usageMetadata\":{\"candidatesTokenCount\":7,\"totalTokenCount\":18}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    for config in [
+        json!({"buffer_streaming_responses": true}),
+        json!({"provider": "google", "buffer_streaming_responses": true}),
+    ] {
+        let plugin = AiTokenMetrics::new(&config).unwrap();
+        let mut ctx = create_test_context();
+        plugin
+            .on_response_body(&mut ctx, 200, &headers, body.as_bytes())
+            .await;
+        assert_eq!(
+            ctx.metadata.get("ai_provider").map(String::as_str),
+            Some("google")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+            Some("11")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_total_tokens").map(String::as_str),
+            Some("18")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_model").map(String::as_str),
+            Some("gemini-test")
+        );
+    }
+}
+
+#[tokio::test]
+async fn bedrock_titan_invoke_model_is_supported_without_ambiguous_result_summing() {
+    let plugin = AiTokenMetrics::new(&json!({
+        "cost_per_prompt_token": 0.01,
+        "cost_per_completion_token": 0.02
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    let body = serde_json::to_vec(&json!({
+        "inputTextTokenCount": 21,
+        "results": [{"tokenCount": 8, "outputText": "hello", "completionReason": "FINISH"}]
+    }))
+    .unwrap();
+    plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_provider").map(String::as_str),
+        Some("bedrock")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("21")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("8")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("29")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_estimated_cost").map(String::as_str),
+        Some("0.370000")
+    );
+
+    for results in [json!([]), json!([{"tokenCount": 2}, {"tokenCount": 3}])] {
+        let mut ctx = create_test_context();
+        let body = serde_json::to_vec(&json!({
+            "inputTextTokenCount": 5,
+            "results": results
+        }))
+        .unwrap();
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await;
+        assert_eq!(
+            ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+            Some("5")
+        );
+        assert!(!ctx.metadata.contains_key("ai_completion_tokens"));
+        assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+    }
+}
+
+#[tokio::test]
+async fn encoded_json_supports_gzip_brotli_and_coding_chains_without_mutation() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let plain = serde_json::to_vec(&json!({
+        "model": "gpt-test",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    }))
+    .unwrap();
+    let cases = [
+        ("GZip", gzip(&plain)),
+        ("br", brotli(&plain)),
+        ("gzip, BR", brotli(&gzip(&plain))),
+    ];
+
+    for (encoding, encoded) in cases {
+        let original = encoded.clone();
+        let headers = HashMap::from([
+            (
+                "Content-Type".to_string(),
+                "application/json; charset=utf-8".to_string(),
+            ),
+            ("Content-Encoding".to_string(), encoding.to_string()),
+            ("Content-Length".to_string(), encoded.len().to_string()),
+            ("ETag".to_string(), "encoded-validator".to_string()),
+        ]);
+        let mut ctx = create_test_context();
+        plugin
+            .on_response_body(&mut ctx, 200, &headers, &encoded)
+            .await;
+        assert_eq!(
+            ctx.metadata.get("ai_total_tokens").map(String::as_str),
+            Some("15")
+        );
+        assert_eq!(encoded, original);
+        assert_eq!(
+            headers.get("Content-Encoding").map(String::as_str),
+            Some(encoding)
+        );
+        assert_eq!(
+            headers
+                .get("Content-Length")
+                .and_then(|value| value.parse::<usize>().ok()),
+            Some(encoded.len())
+        );
+        assert_eq!(
+            headers.get("ETag").map(String::as_str),
+            Some("encoded-validator")
+        );
+    }
+}
+
+#[tokio::test]
+async fn encoded_sse_is_inspected_only_when_stream_buffering_is_enabled() {
+    let event = b"data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10}}\n\ndata: [DONE]\n\n";
+    let encoded = gzip(event);
+    let headers = HashMap::from([
+        ("content-type".to_string(), "text/event-stream".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+
+    for (enabled, expected) in [(false, None), (true, Some("10"))] {
+        let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": enabled})).unwrap();
+        let mut ctx = create_test_context();
+        plugin
+            .on_response_body(&mut ctx, 200, &headers, &encoded)
+            .await;
+        assert_eq!(
+            ctx.metadata.get("ai_total_tokens").map(String::as_str),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn encoded_json_rejects_malformed_unsupported_concatenated_and_oversized_content() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let plain = br#"{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    let mut concatenated = gzip(plain);
+    concatenated.extend_from_slice(&gzip(plain));
+    let oversized = gzip(&vec![b' '; 4 * 1024 * 1024 + 1]);
+    let cases = [
+        ("gzip", b"not-gzip".to_vec()),
+        ("zstd", plain.to_vec()),
+        ("gzip; level=9", gzip(plain)),
+        ("gzip", concatenated),
+        ("gzip", oversized),
+    ];
+    for (encoding, body) in cases {
+        let headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-encoding".to_string(), encoding.to_string()),
+        ]);
+        let mut ctx = create_test_context();
+        plugin
+            .on_response_body(&mut ctx, 200, &headers, &body)
+            .await;
+        assert!(
+            !ctx.metadata.contains_key("ai_total_tokens"),
+            "encoding={encoding}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn checked_usage_arithmetic_never_saturates_into_invented_totals() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let mut ctx = create_test_context();
+    let body = serde_json::to_vec(&json!({
+        "usage": {"prompt_tokens": u64::MAX, "completion_tokens": 1}
+    }))
+    .unwrap();
+    plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("18446744073709551615")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("1")
+    );
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+}
+
+#[test]
+fn every_unknown_root_config_key_is_rejected_with_allowed_key_list() {
+    for key in [
+        "providre",
+        "include_modle",
+        "include_token_detail",
+        "metadata_prefx",
+        "buffer_streaming_response",
+        "cost_per_prompt_tokn",
+        "cost_per_completion_tokn",
+    ] {
+        let err = AiTokenMetrics::new(&json!({(key): true})).err().unwrap();
+        assert!(err.contains(key), "got: {err}");
+        assert!(err.contains("allowed keys"), "got: {err}");
+        assert!(err.contains("metadata_prefix"), "got: {err}");
+    }
 }

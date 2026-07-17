@@ -137,6 +137,51 @@ fn assert_serde_component_field_parity<T>(
 }
 
 #[test]
+fn transaction_log_schema_closed_object_keys_match_openapi() {
+    use ferrum_edge::plugins::transaction_log_schema::TRANSACTION_LOG_SCHEMA_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::log_schema::{
+        DERIVED_FIELD_KEYS, METADATA_POLICY_KEYS, SUMMARY_LOG_SCHEMA_KEYS,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    for (label, pointer, runtime_keys) in [
+        (
+            "TransactionLogSchemaConfig",
+            "/components/schemas/TransactionLogSchemaConfig/properties",
+            TRANSACTION_LOG_SCHEMA_CONFIG_KEYS,
+        ),
+        (
+            "SummaryLogSchema",
+            "/components/schemas/SummaryLogSchema/properties",
+            SUMMARY_LOG_SCHEMA_KEYS,
+        ),
+        (
+            "SummaryLogSchema.derived_fields[]",
+            "/components/schemas/SummaryLogSchema/properties/derived_fields/items/properties",
+            DERIVED_FIELD_KEYS,
+        ),
+        (
+            "SummaryLogSchema.metadata",
+            "/components/schemas/SummaryLogSchema/properties/metadata/properties",
+            METADATA_POLICY_KEYS,
+        ),
+    ] {
+        let runtime: BTreeSet<String> = runtime_keys.iter().map(|key| (*key).to_string()).collect();
+        assert_eq!(runtime, schema_property_names(&spec, label, pointer));
+    }
+
+    for pointer in [
+        "/components/schemas/TransactionLogSchemaConfig/additionalProperties",
+        "/components/schemas/SummaryLogSchema/additionalProperties",
+        "/components/schemas/SummaryLogSchema/properties/derived_fields/items/additionalProperties",
+        "/components/schemas/SummaryLogSchema/properties/metadata/additionalProperties",
+    ] {
+        assert_eq!(spec.pointer(pointer), Some(&serde_json::Value::Bool(false)));
+    }
+}
+
+#[test]
 fn typed_component_properties_match_serde_field_inventories() {
     use ferrum_edge::config::types::{
         ActiveHealthCheck, BackendTlsConfig, CircuitBreakerConfig, ConsulConfig, Consumer,
@@ -975,6 +1020,68 @@ fn ldap_auth_schema_matches_runtime_invariants() {
 }
 
 #[test]
+fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiFederationConfig")
+        .expect("missing AiFederationConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiFederationConfig schema compiles");
+
+    let provider_properties = schema
+        .pointer("/properties/providers/items/properties")
+        .expect("missing provider properties");
+    assert_eq!(provider_properties["allow_plaintext"]["default"], false);
+    assert_eq!(
+        provider_properties["max_response_body_bytes"]["default"],
+        8_388_608
+    );
+    assert_eq!(provider_properties["max_response_body_bytes"]["minimum"], 1);
+    assert_eq!(
+        provider_properties["max_response_body_bytes"]["maximum"],
+        67_108_864
+    );
+    assert!(provider_properties.get("circuit_breaker").is_some());
+
+    let valid = json!({
+        "providers": [{
+            "name": "local-openai",
+            "provider_type": "openai",
+            "api_key": "test",
+            "base_url": "http://127.0.0.1:8080/v1/chat/completions",
+            "allow_plaintext": true,
+            "max_response_body_bytes": 1048576,
+            "circuit_breaker": {
+                "failure_threshold": 2,
+                "cooldown_seconds": 10,
+                "success_threshold": 1
+            }
+        }],
+        "fallback_on_protocol_errors": true,
+        "fallback_on_ambiguous_errors": false,
+        "max_concurrent_requests": 32
+    });
+    assert!(validator.validate(&valid).is_ok());
+
+    for invalid in [
+        json!({"providers": [{"name": "p", "provider_type": "openai"}], "fallback_on_netwrok_errors": true}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "model_paterns": []}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "circuit_breaker": {"failure_treshold": 2}}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "base_url": "http://127.0.0.1/v1/chat"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "model_mapping": {"gpt-../unsafe": "gpt-4o"}}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 0}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 67_108_865}]}),
+    ] {
+        assert!(
+            validator.validate(&invalid).is_err(),
+            "schema accepted {invalid}"
+        );
+    }
+}
+
+#[test]
 fn ldap_dial_policy_documentation_matches_openapi() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -1269,7 +1376,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         "plugin_name": "ws_message_size_limiting",
         "scope": "global",
         "enabled": true,
-        "config": {"max_frame_bytes": 1024}
+        "config": {"max_frame_bytes": 1024, "max_message_bytes": 4096}
     });
     assert!(validator.validate(&valid).is_ok(), "config should be valid");
 
@@ -1284,7 +1391,17 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         "ws_message_size_limiting should require max_frame_bytes through PluginConfig"
     );
 
+    let invalid_message_limit = plugin_config(
+        "ws_message_size_limiting",
+        Some(json!({"max_frame_bytes": 1024, "max_message_bytes": 0})),
+    );
+    assert!(
+        validator.validate(&invalid_message_limit).is_err(),
+        "ws_message_size_limiting should reject a zero max_message_bytes"
+    );
+
     for (plugin_name, config) in [
+        ("correlation_id", json!({})),
         ("bot_detection", json!({})),
         ("udp_rate_limiting", json!({"datagrams_per_second": 100})),
         (
@@ -1313,6 +1430,10 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     }
 
     for (plugin_name, config) in [
+        ("correlation_id", None),
+        ("correlation_id", Some(serde_json::Value::Null)),
+        ("correlation_id", Some(json!([]))),
+        ("correlation_id", Some(json!({"echo_downsteam": false}))),
         ("bot_detection", None),
         ("bot_detection", Some(serde_json::Value::Null)),
         ("bot_detection", Some(json!([]))),
@@ -1635,6 +1756,113 @@ fn assert_component_validity(
         actual_valid, expected_valid,
         "unexpected {component} validation result for {instance}"
     );
+}
+
+#[test]
+fn correlation_id_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::correlation_id::CorrelationId;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for valid in [
+        json!({}),
+        json!({"header_name": "x-request-id", "echo_downstream": false}),
+        json!({"header_name": "X-Correlation-ID", "echo_downstream": true}),
+        json!({"header_name": " X-Trimmed-ID "}),
+        json!({"header_name": null, "echo_downstream": null}),
+    ] {
+        assert_component_validity(&spec, "CorrelationIdConfig", &valid, true);
+        CorrelationId::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+
+    for invalid in [
+        serde_json::Value::Null,
+        json!([]),
+        json!("config"),
+        json!(42),
+        json!(true),
+        json!({"echo_downsteam": false}),
+        json!({"header_name": "x:request-id"}),
+        json!({"header_name": 42}),
+        json!({"echo_downstream": "true"}),
+        json!({"header_name": "API-Key"}),
+        json!({"header_name": "Authentication-Info"}),
+        json!({"header_name": "Authorization"}),
+        json!({"header_name": "Connection"}),
+        json!({"header_name": " Connection "}),
+        json!({"header_name": "Content-Encoding"}),
+        json!({"header_name": "Content-Length"}),
+        json!({"header_name": "Cookie"}),
+        json!({"header_name": " eARLY-dATA "}),
+        json!({"header_name": " eXPECT "}),
+        json!({"header_name": " fORWARDED "}),
+        json!({"header_name": "Grpc-Message"}),
+        json!({"header_name": "Grpc-Status"}),
+        json!({"header_name": "Grpc-Status-Details-Bin"}),
+        json!({"header_name": "Host"}),
+        json!({"header_name": "Keep-Alive"}),
+        json!({"header_name": "Proxy-Authenticate"}),
+        json!({"header_name": "Proxy-Authentication-Info"}),
+        json!({"header_name": "Proxy-Authorization"}),
+        json!({"header_name": "Proxy-Connection"}),
+        json!({"header_name": "X-Forwarded-Host"}),
+        json!({"header_name": " x-FORWARDED-proto "}),
+        json!({"header_name": "Sec-WebSocket-Accept"}),
+        json!({"header_name": "Sec-WebSocket-Extensions"}),
+        json!({"header_name": "Sec-WebSocket-Key"}),
+        json!({"header_name": "Sec-WebSocket-Protocol"}),
+        json!({"header_name": "Sec-WebSocket-Version"}),
+        json!({"header_name": "Set-Cookie"}),
+        json!({"header_name": "TE"}),
+        json!({"header_name": "Traceparent"}),
+        json!({"header_name": "Tracestate"}),
+        json!({"header_name": "Trailer"}),
+        json!({"header_name": "Transfer-Encoding"}),
+        json!({"header_name": "Upgrade"}),
+        json!({"header_name": "vIA"}),
+        json!({"header_name": "WWW-Authenticate"}),
+        json!({"header_name": "X-API-Key"}),
+        json!({"header_name": "X-Auth-Token"}),
+        json!({"header_name": "X-CSRF-Token"}),
+        json!({"header_name": "X-Ferrum-Original-Content-Encoding"}),
+        json!({"header_name": "X-Forwarded-Authorization"}),
+        json!({"header_name": "X-Forwarded-For"}),
+        json!({"header_name": "X-Goog-API-Key"}),
+        json!({"header_name": "x-gRPC-wEB-mODE"}),
+        json!({"header_name": "X-XSRF-Token"}),
+    ] {
+        assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
+        assert!(
+            CorrelationId::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let header_name_schema = spec
+        .pointer("/components/schemas/CorrelationIdConfig/properties/header_name")
+        .expect("correlation header_name schema exists");
+    for exclusion_pointer in ["/not", "/allOf/0/not"] {
+        let exclusion = header_name_schema
+            .pointer(exclusion_pointer)
+            .unwrap_or_else(|| panic!("correlation exclusion {exclusion_pointer} exists"));
+        let validator = jsonschema::draft202012::options()
+            .build(exclusion)
+            .unwrap_or_else(|error| panic!("correlation exclusion compiles: {error}"));
+        for reserved in [
+            json!(" Early-Data "),
+            json!(" Traceparent "),
+            json!("Tracestate"),
+            json!("X-Ferrum-Original-Content-Encoding"),
+            json!("x-gRPC-wEB-mODE"),
+        ] {
+            assert!(
+                validator.validate(&reserved).is_ok(),
+                "correlation exclusion {exclusion_pointer} missed {reserved}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -2041,6 +2269,79 @@ fn opa_schema_matches_runtime_validation_contract() {
             .insert(field.to_string(), json!(0));
         assert_component_validity(&spec, "OpaPluginConfig", &zero, false);
     }
+}
+
+#[test]
+fn grpc_deadline_schema_matches_runtime_validation_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let component = spec
+        .pointer("/components/schemas/GrpcDeadlineConfig")
+        .expect("GrpcDeadlineConfig component exists");
+    assert_eq!(component.get("additionalProperties"), Some(&json!(false)));
+    let reject_description = component
+        .pointer("/properties/reject_no_deadline/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("reject_no_deadline description exists");
+    for contract in ["Native H2/H3", "HTTP 200", "trailers-only", "grpc-status"] {
+        assert!(
+            reject_description.contains(contract),
+            "missing native gRPC wire contract `{contract}`"
+        );
+    }
+
+    let parity_cases = [
+        (json!({}), false),
+        (json!({"max_deadline_ms": 0}), false),
+        (json!({"default_deadline_ms": 0}), false),
+        (json!({"max_deadline_ms": null}), false),
+        (json!({"reject_no_deadline": null}), false),
+        (json!({"max_deadline_ms": "5000"}), false),
+        (json!({"reject_no_deadline": 1}), false),
+        (json!({"reject_no_deadline": false}), false),
+        (json!({"subtract_gateway_processing": false}), false),
+        (
+            json!({"max_deadline_ms": 30000, "reject_no_deadine": true}),
+            false,
+        ),
+        (json!({"max_deadline_ms": 30000}), true),
+        (json!({"default_deadline_ms": 5000}), true),
+        (json!({"reject_no_deadline": true}), true),
+        (json!({"subtract_gateway_processing": true}), true),
+        (
+            json!({
+                "max_deadline_ms": 30000,
+                "default_deadline_ms": 5000,
+                "subtract_gateway_processing": true,
+                "reject_no_deadline": true
+            }),
+            true,
+        ),
+    ];
+    for (config, expected_valid) in parity_cases {
+        assert_component_validity(&spec, "GrpcDeadlineConfig", &config, expected_valid);
+        let runtime_valid = ferrum_edge::plugins::create_plugin("grpc_deadline", &config).is_ok();
+        assert_eq!(
+            runtime_valid, expected_valid,
+            "runtime/schema parity drift for {config}"
+        );
+    }
+
+    let cross_field = json!({"max_deadline_ms": 5000, "default_deadline_ms": 60000});
+    let runtime_error = ferrum_edge::plugins::create_plugin("grpc_deadline", &cross_field)
+        .err()
+        .expect("runtime rejects default above max");
+    assert!(runtime_error.contains("cannot exceed"));
+    assert!(
+        component
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|description| {
+                description.contains("default_deadline_ms must be less than or equal")
+                    && description.contains("runtime validation")
+            }),
+        "OpenAPI must document the dynamic cross-field rule JSON Schema cannot compare"
+    );
 }
 
 #[test]
@@ -2490,6 +2791,61 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
 }
 
 #[test]
+fn ai_token_metrics_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::ai_token_metrics::AiTokenMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiTokenMetricsConfig")
+        .expect("missing AiTokenMetricsConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiTokenMetricsConfig schema compiles");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    for config in [
+        json!({}),
+        json!({"provider": "openai"}),
+        json!({"provider": "google"}),
+        json!({"metadata_prefix": "tenant.ai_1"}),
+        json!({"buffer_streaming_responses": true}),
+        json!({"cost_per_prompt_token": 0.000003}),
+        json!({"cost_per_prompt_token": 18_446_744_073_709.55}),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema rejected {config}"
+        );
+        assert!(
+            AiTokenMetrics::new(&config).is_ok(),
+            "runtime rejected {config}"
+        );
+    }
+
+    for config in [
+        json!({"providre": "openai"}),
+        json!({"provider": "unknown"}),
+        json!({"provider": "OpenAI"}),
+        json!({"provider": " openai"}),
+        json!({"metadata_prefix": "not allowed"}),
+        json!({"metadata_prefix": " ai"}),
+        json!({"metadata_prefix": "x".repeat(65)}),
+        json!({"cost_per_prompt_token": -1}),
+        json!({"cost_per_prompt_token": 18_446_744_073_710.0}),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema accepted {config}"
+        );
+        assert!(
+            AiTokenMetrics::new(&config).is_err(),
+            "runtime accepted {config}"
+        );
+    }
+}
+
+#[test]
 fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -2752,6 +3108,51 @@ fn mtls_dns_admission_mutations_document_conflict_responses() {
             "mTLS DNS admission mutation is missing 409 response: {pointer}"
         );
     }
+}
+
+#[test]
+fn plugin_graph_delete_rejections_have_openapi_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for pointer in [
+        "/paths/~1proxies~1{id}/delete/responses/400",
+        "/paths/~1plugins~1config~1{id}/delete/responses/400",
+    ] {
+        let response = spec
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("plugin-graph DELETE is missing 400 response: {pointer}"));
+        assert_eq!(
+            response["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/Error"
+        );
+        assert!(
+            response["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("plugin-composition"))
+        );
+    }
+
+    let api_spec_response = spec
+        .pointer("/paths/~1api-specs~1{id}/delete/responses/422")
+        .expect("API-spec DELETE is missing 422 response");
+    assert_eq!(
+        api_spec_response["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ApiSpecValidationError"
+    );
+    assert!(
+        api_spec_response["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("plugin-composition"))
+    );
+
+    let resource_types = spec
+        .pointer(
+            "/components/schemas/ApiSpecValidationError/properties/failures/items/properties/resource_type/enum",
+        )
+        .and_then(serde_json::Value::as_array)
+        .expect("API-spec validation resource types");
+    assert!(resource_types.contains(&json!("plugin_composition")));
 }
 
 #[test]
@@ -3076,6 +3477,70 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
     ] {
         assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
+}
+
+#[test]
+fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/TcpConnectionThrottleConfig")
+        .expect("TcpConnectionThrottleConfig component exists");
+    let schema_text = serde_json::to_string(schema).unwrap();
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let cache_docs = include_str!("../../docs/cache_management.md");
+    let source = include_str!("../../src/plugins/tcp_connection_throttle.rs");
+    let admin_source = include_str!("../../src/admin/mod.rs");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_intervl_seconds": 60}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 86401}),
+        false,
+    );
+    for text in [schema_text.as_str(), plugin_docs, cache_docs] {
+        assert!(
+            text.contains("process-local"),
+            "missing process-local scope"
+        );
+        assert!(
+            text.contains("residual"),
+            "missing residual sweep semantics"
+        );
+        assert!(text.contains("inline"), "missing inline removal semantics");
+    }
+    assert!(schema_text.contains("UDP/DTLS"));
+    assert!(plugin_docs.contains("attachment to any other protocol is rejected"));
+    assert!(source.contains("DashMap::with_shard_amount"));
+    assert!(source.contains("entry.remove()"));
+    assert!(!source.contains("tcp_connection_throttle.key"));
+    assert!(admin_source.contains(r#""enforcement_scope": "process_local""#));
+    assert!(admin_source.contains(r#""replica_limit_behavior": "configured_limit_per_replica""#));
+
+    let status_schema = spec
+        .pointer("/components/schemas/AdminMetricsTcpConnectionThrottle")
+        .expect("AdminMetricsTcpConnectionThrottle component exists");
+    assert_eq!(
+        status_schema["properties"]["enforcement_scope"]["enum"][0],
+        "process_local"
+    );
+    assert_eq!(
+        status_schema["properties"]["replica_limit_behavior"]["enum"][0],
+        "configured_limit_per_replica"
+    );
 }
 
 #[test]

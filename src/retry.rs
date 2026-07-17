@@ -278,6 +278,7 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
             GrpcTimeoutKind::Connect => ErrorClass::ConnectionTimeout,
             GrpcTimeoutKind::Read => ErrorClass::ReadWriteTimeout,
         },
+        GrpcProxyError::ClientDeadlineExceeded(_) => ErrorClass::ClientDisconnect,
         GrpcProxyError::BackendUnavailable {
             kind,
             message,

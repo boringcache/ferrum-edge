@@ -21,6 +21,7 @@ PATCHES=(
   "h3 Extended CONNECT :protocol=websocket|h3|0.0.8|hyperium/h3|NONE|NONE|docs/upstream-h3-patches/002-extended-connect-websocket-protocol/"
   "h3 peek buffered trailers before FIN|h3|0.0.8|hyperium/h3|NONE|NONE|docs/upstream-h3-patches/003-peek-buffered-trailers-before-fin/"
   "tungstenite lossless raw takeover|tungstenite|0.29.0|snapview/tungstenite-rs|556|NONE|docs/upstream-tungstenite-patches/"
+  "tungstenite distinct frame-limit origin|tungstenite|0.29.0|snapview/tungstenite-rs|NONE|NONE|docs/upstream-tungstenite-patches/"
   "tokio-tungstenite lossless raw takeover|tokio-tungstenite|0.29.0|snapview/tokio-tungstenite|380|NONE|docs/upstream-tungstenite-patches/"
 )
 

@@ -625,6 +625,19 @@ impl Http3WebSocket {
         self.send_frame(0x2, bytes, false).await
     }
 
+    /// Send one unmasked RFC 9220 data/control frame with an explicit FIN bit.
+    /// Test callers use opcode `0x1`/`0x2` for the first fragment, `0x0` for a
+    /// continuation, and `0x9`/`0xA` for interleaved Ping/Pong frames.
+    pub async fn send_fragment(
+        &mut self,
+        opcode: u8,
+        payload: &[u8],
+        is_final: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_frame_with_fin(opcode, payload, false, is_final)
+            .await
+    }
+
     pub async fn send_close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.send_frame(0x8, &[], false).await?;
         let _ = self.stream.finish().await;
@@ -693,7 +706,18 @@ impl Http3WebSocket {
         payload: &[u8],
         masked: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let frame = encode_ws_frame(opcode, payload, masked);
+        self.send_frame_with_fin(opcode, payload, masked, true)
+            .await
+    }
+
+    async fn send_frame_with_fin(
+        &mut self,
+        opcode: u8,
+        payload: &[u8],
+        masked: bool,
+        is_final: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let frame = encode_ws_frame(opcode, payload, masked, is_final);
         tokio::time::timeout(
             Duration::from_secs(15),
             self.stream.send_data(Bytes::from(frame)),
@@ -721,9 +745,9 @@ pub enum H3WebSocketFrame {
     Other { opcode: u8, payload: Vec<u8> },
 }
 
-fn encode_ws_frame(opcode: u8, payload: &[u8], masked: bool) -> Vec<u8> {
+fn encode_ws_frame(opcode: u8, payload: &[u8], masked: bool, is_final: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(14 + payload.len());
-    out.push(0x80 | (opcode & 0x0f));
+    out.push((if is_final { 0x80 } else { 0 }) | (opcode & 0x0f));
     let mask_bit = if masked { 0x80 } else { 0 };
     match payload.len() {
         len @ 0..=125 => out.push(mask_bit | len as u8),
@@ -934,13 +958,13 @@ mod tests {
 
     #[test]
     fn websocket_frame_encoder_uses_unmasked_h3_shape_by_default() {
-        let frame = encode_ws_frame(0x1, b"hi", false);
+        let frame = encode_ws_frame(0x1, b"hi", false, true);
         assert_eq!(frame, vec![0x81, 0x02, b'h', b'i']);
     }
 
     #[test]
     fn websocket_frame_parser_unmasks_client_frames_for_gap_test() {
-        let mut frame = encode_ws_frame(0x1, b"masked", true);
+        let mut frame = encode_ws_frame(0x1, b"masked", true, true);
         let parsed = try_parse_ws_frame(&mut frame)
             .expect("parse")
             .expect("frame");

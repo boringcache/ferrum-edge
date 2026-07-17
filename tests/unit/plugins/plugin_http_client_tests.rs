@@ -1,6 +1,6 @@
 use ferrum_edge::plugins::PluginHttpClient;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
@@ -157,6 +157,36 @@ async fn test_execute_screens_denied_literal_ip_endpoint() {
         resp.status(),
         502,
         "denied literal-IP endpoint must be screened to 502, not dialed"
+    );
+}
+
+#[tokio::test]
+async fn classified_execute_marks_dns_egress_denial_pre_wire() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+    use ferrum_edge::retry::ErrorClass;
+
+    let policy = BackendEgressPolicy::from_env(BackendAllowIps::Public, "", "", true).unwrap();
+    let client = PluginHttpClient::default_with_backend_allow_ips(policy);
+    let external_latency = AtomicU64::new(0);
+    let request = client
+        .get()
+        .post("http://localhost/provider")
+        .body("non-idempotent");
+
+    let failure = client
+        .execute_redacted_tracked_classified(
+            request,
+            "classified_egress_test",
+            "http://localhost/provider",
+            &external_latency,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.error_class, ErrorClass::DispatchPolicyRejected);
+    assert!(
+        !failure.request_reached_wire,
+        "DNS egress denial happens before any provider dial"
     );
 }
 

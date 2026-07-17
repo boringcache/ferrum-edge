@@ -15,6 +15,82 @@ use h3::error::Code;
 use h3::quic::{RecvStream, SendStream};
 use h3::server::RequestStream;
 
+/// Result of a downstream HTTP/3 write that is bounded by the client's
+/// absolute RPC deadline.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum H3ResponseWriteError<E> {
+    Write(E),
+    DeadlineExceeded,
+}
+
+/// A deadline can still be reported with a clean terminal gRPC status while
+/// the downstream client has not observed any response DATA. Once any DATA is
+/// visible, resetting is the only safe choice because the deadline may have
+/// interrupted a length-prefixed gRPC message.
+#[inline]
+pub(crate) fn grpc_deadline_can_send_terminal_status(bytes_streamed: u64) -> bool {
+    bytes_streamed == 0
+}
+
+/// Race one potentially flow-control-blocked downstream H3 write against the
+/// same absolute deadline that bounds the rest of the RPC.
+///
+/// The deadline arm is intentionally biased. Once the budget is exhausted, a
+/// simultaneously writable DATA frame must not escape downstream and turn a
+/// clean no-DATA expiry into a partial-message reset. Dropping `write` cancels
+/// the h3 send future; callers then reset the send half and drop/cancel their
+/// upstream response body.
+pub(crate) async fn await_response_write_before_deadline<F, T, E>(
+    deadline: Option<tokio::time::Instant>,
+    write: F,
+) -> Result<T, H3ResponseWriteError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let Some(deadline) = deadline else {
+        return write.await.map_err(H3ResponseWriteError::Write);
+    };
+
+    tokio::pin!(write);
+    let deadline_sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline_sleep);
+    tokio::select! {
+        biased;
+        () = &mut deadline_sleep => Err(H3ResponseWriteError::DeadlineExceeded),
+        result = &mut write => result.map_err(H3ResponseWriteError::Write),
+    }
+}
+
+/// Give a terminal status/FIN one immediate polling opportunity, then keep the
+/// write bounded by the same absolute RPC deadline.
+///
+/// This is only for the canonical zero-client-DATA deadline completion path.
+/// The deadline has already fired when that path synthesizes `grpc-status: 4`,
+/// so the normal deadline-biased helper would reject even an immediately-ready
+/// trailer write. Biasing the write here preserves the clean gRPC status when
+/// QUIC has credit, while a pending flow-control wait still loses immediately
+/// to the expired deadline and is cancelled by the caller's stream reset.
+pub(crate) async fn await_terminal_response_write_before_deadline<F, T, E>(
+    deadline: Option<tokio::time::Instant>,
+    write: F,
+) -> Result<T, H3ResponseWriteError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let Some(deadline) = deadline else {
+        return write.await.map_err(H3ResponseWriteError::Write);
+    };
+
+    tokio::pin!(write);
+    let deadline_sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline_sleep);
+    tokio::select! {
+        biased;
+        result = &mut write => result.map_err(H3ResponseWriteError::Write),
+        () = &mut deadline_sleep => Err(H3ResponseWriteError::DeadlineExceeded),
+    }
+}
+
 /// Signal the peer that we are done with the receive side of the
 /// request stream. Without this call, dropping the `RequestStream`
 /// surfaces as `RESET_STREAM(0x0)` on the QUIC wire — QUIC has no

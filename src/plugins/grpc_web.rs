@@ -355,20 +355,43 @@ pub(crate) fn client_uses_grpc_web(ctx: &RequestContext) -> bool {
     ctx.metadata.contains_key(META_GRPC_WEB_ORIGINAL_CT)
 }
 
+pub(crate) fn retained_response_content_type(ctx: &RequestContext) -> Option<&'static str> {
+    ctx.metadata
+        .get(META_GRPC_WEB_ORIGINAL_CT)
+        .map(|content_type| response_content_type(content_type))
+}
+
 pub struct GrpcWebErrorResponse {
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    terminal_headers: HashMap<String, String>,
 }
 
 /// Rebuild a synthesized error's body trailer frame after finalized rejection
-/// metadata has been merged into its temporary header map.
+/// metadata has been merged into its temporary header map. Preserve the
+/// originally selected status/message when decorators contribute no terminal
+/// fields, while letting case-insensitive finalized fields replace them.
 pub(crate) fn rebuild_error_body_from_headers(response: &mut GrpcWebErrorResponse) {
     let response_ct = response
         .headers
         .get("content-type")
         .map(String::as_str)
         .unwrap_or(APPLICATION_GRPC_WEB);
-    let mut body = build_trailer_frame(&response.headers);
+    let mut trailer_headers = response.terminal_headers.clone();
+    for (name, value) in &response.headers {
+        if is_valid_trailer_header(name).is_none() {
+            continue;
+        }
+        if let Some(existing) = trailer_headers
+            .keys()
+            .find(|existing| existing.eq_ignore_ascii_case(name))
+            .cloned()
+        {
+            trailer_headers.remove(&existing);
+        }
+        trailer_headers.insert(name.clone(), value.clone());
+    }
+    let mut body = build_trailer_frame(&trailer_headers);
     if is_grpc_web_text(response_ct) {
         body = BASE64.encode(&body).into_bytes();
     }
@@ -383,21 +406,31 @@ pub fn error_response_for_content_type(
     message: &str,
 ) -> GrpcWebErrorResponse {
     let response_ct = response_content_type(response_ct);
-    let mut headers = HashMap::with_capacity(5);
+    let mut headers = HashMap::with_capacity(3);
     headers.insert("content-type".to_string(), response_ct.to_string());
     headers.insert("x-grpc-web".to_string(), "1".to_string());
     headers.insert(
         "access-control-expose-headers".to_string(),
         BASE_EXPOSE_HEADERS_VALUE.to_string(),
     );
-    headers.insert("grpc-status".to_string(), status.to_string());
-    headers.insert("grpc-message".to_string(), message.to_string());
 
-    let mut body = build_trailer_frame(&headers);
+    // gRPC-Web carries terminal metadata in its body trailer frame, never as
+    // native response headers. Keep a separate trailer map so an early gateway
+    // refusal has the same client-visible shape as a transformed backend
+    // response.
+    let trailer_headers = HashMap::from([
+        ("grpc-status".to_string(), status.to_string()),
+        ("grpc-message".to_string(), message.to_string()),
+    ]);
+    let mut body = build_trailer_frame(&trailer_headers);
     if is_grpc_web_text(response_ct) {
         body = BASE64.encode(&body).into_bytes();
     }
-    GrpcWebErrorResponse { headers, body }
+    GrpcWebErrorResponse {
+        headers,
+        body,
+        terminal_headers: trailer_headers,
+    }
 }
 
 /// Build the client-visible gRPC-Web error shape for a recognized request that

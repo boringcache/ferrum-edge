@@ -501,7 +501,7 @@ jobs:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below keeps all 73 test-file filters visible to the grep-based coverage
+    # below keeps all 74 test-file filters visible to the grep-based coverage
     # contract while balancing them across two runners. Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
     # make elapsed time, not CPU utilisation, the useful balancing signal.
@@ -540,6 +540,7 @@ jobs:
               integration::log_schema_registry_tests
               integration::deferred_log_tests
               integration::example_plugin_contract_tests
+              integration::ai_token_metrics_contract_tests
               integration::api_chargeback_sink_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_istio_status_tests
@@ -768,8 +769,10 @@ jobs:
       - name: Run vendored h3 frame-drain regressions
         run: cargo test --manifest-path vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame
 
-      - name: Run vendored tungstenite raw-takeover regressions
-        run: cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
+      - name: Run vendored tungstenite raw-takeover and parser-policy regressions
+        run: |
+          cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
+          cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit
 
       - name: Run vendored tokio-tungstenite raw-takeover regression
         run: cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
@@ -829,6 +832,7 @@ jobs:
               functional_secrets_test
               functional_ai_plugins_test
               functional_ai_semantic_firewall_streaming_test
+              functional_grpc_method_pre_hook_test
               functional_grpc_plugins_test
               functional_logging_plugins_test
               functional_logging_test

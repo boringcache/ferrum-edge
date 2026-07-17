@@ -309,13 +309,20 @@ impl AdminClient {
     }
 
     async fn delete(&self, path: &str) -> reqwest::StatusCode {
-        self.client
+        self.delete_json(path).await.0
+    }
+
+    async fn delete_json(&self, path: &str) -> (reqwest::StatusCode, Value) {
+        let resp = self
+            .client
             .delete(self.url(path))
             .header("authorization", format!("Bearer {}", self.token))
             .send()
             .await
-            .unwrap()
-            .status()
+            .unwrap();
+        let status = resp.status();
+        let val: Value = resp.json().await.unwrap_or(json!(null));
+        (status, val)
     }
 }
 
@@ -1261,6 +1268,97 @@ async fn delete_unknown_id_returns_404() {
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn delete_rejects_removing_last_global_tcp_throttle_target_with_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_port = bound.local_addr().unwrap().port();
+    drop(bound);
+
+    let tcp_proxy_id = uid("spec-tcp-delete-guard");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "TCP delete guard", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": tcp_proxy_id,
+            "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9000,
+            "listen_port": listen_port
+        }
+    });
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "TCP API-spec setup failed: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("POST response must include spec id")
+        .to_string();
+
+    let http_proxy_id = uid("http-only");
+    store
+        .create_proxy(&make_proxy_for_db(
+            &http_proxy_id,
+            "ferrum",
+            &format!("/{http_proxy_id}"),
+        ))
+        .await
+        .expect("create unsupported global target");
+    let throttle_id = uid("global-tcp-throttle");
+    let now = Utc::now();
+    store
+        .create_plugin_config(&PluginConfig {
+            id: throttle_id,
+            namespace: "ferrum".to_string(),
+            plugin_name: "tcp_connection_throttle".to_string(),
+            config: json!({"max_connections_per_key": 1}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("mixed global throttle graph must be valid");
+
+    let (delete_status, delete_body) = client.delete_json(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid API-spec cascade did not return 422: {delete_body}"
+    );
+    assert!(
+        delete_body["failures"].as_array().is_some_and(|failures| {
+            failures
+                .iter()
+                .any(|failure| failure["resource_type"] == "plugin_composition")
+        }),
+        "422 response omitted the plugin-composition failure: {delete_body}"
+    );
+    assert!(
+        store
+            .get_api_spec("ferrum", &spec_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_proxy("ferrum", &tcp_proxy_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
 // ============================================================================
 // GET /api-specs (list)
 // ============================================================================
@@ -1461,6 +1559,303 @@ async fn post_with_failing_plugin_config_returns_422_via_real_validator() {
         "bad-rl",
         "plugin failure id must match the submitted plugin id"
     );
+}
+
+#[tokio::test]
+async fn api_spec_post_and_exact_put_validate_against_prospective_schema_graph() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let schema_name = uid("api-spec-schema");
+    let schema_plugin = PluginConfig {
+        id: uid("schema-plugin"),
+        namespace: "ferrum".to_string(),
+        plugin_name: "transaction_log_schema".to_string(),
+        config: json!({"schemas": {(schema_name.clone()): {}}}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    store
+        .create_plugin_config(&schema_plugin)
+        .await
+        .expect("persist prospective schema without publishing the live registry");
+
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("schema-api-spec-proxy");
+    let plugin_id = uid("schema-api-spec-logger");
+    let mut spec = json_spec_with_plugin(
+        &proxy_id,
+        "backend.internal",
+        &plugin_id,
+        "stdout_logging",
+        json!({"schema_ref": schema_name}),
+    );
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "POST must use the authoritative prospective graph: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id");
+
+    spec["info"]["version"] = json!("2.0.0");
+    spec["x-ferrum-plugins"][0]["config"]["filter"] = json!({"status_code_min": 500});
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::OK,
+        "exact PUT must remove old spec-owned plugins and overlay replacements before graph validation: {put_body}"
+    );
+}
+
+#[tokio::test]
+async fn api_spec_writes_ignore_an_unchanged_invalid_persisted_schema_graph() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("unrelated-schema-graph-proxy");
+    let mut spec = minimal_json_spec(&proxy_id);
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id");
+
+    store
+        .create_plugin_config(&PluginConfig {
+            id: uid("preexisting-dangling-logger"),
+            namespace: "ferrum".to_string(),
+            plugin_name: "stdout_logging".to_string(),
+            config: json!({"schema_ref": "missing"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist pre-existing invalid graph participant");
+
+    let unrelated_proxy_id = uid("second-unrelated-schema-graph-proxy");
+    let (unrelated_status, unrelated_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&unrelated_proxy_id))
+        .await;
+    assert_eq!(
+        unrelated_status,
+        reqwest::StatusCode::CREATED,
+        "unrelated POST must not repair the persisted graph: {unrelated_body}"
+    );
+
+    spec["info"]["version"] = json!("2.0.0");
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::OK,
+        "unrelated PUT must not repair the persisted graph: {put_body}"
+    );
+}
+
+#[tokio::test]
+async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("removed-schema-definition-proxy");
+    let mut spec = minimal_json_spec(&proxy_id);
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id")
+        .to_string();
+    let schema_name = uid("spec-owned-schema");
+    let schema_id = uid("spec-owned-schema-plugin");
+    store
+        .create_plugin_config(&PluginConfig {
+            id: schema_id.clone(),
+            namespace: "ferrum".to_string(),
+            plugin_name: "transaction_log_schema".to_string(),
+            config: json!({"schemas": {(schema_name.clone()): {}}}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist spec-owned schema definition");
+    sqlx::query("UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?")
+        .bind(&spec_id)
+        .bind("ferrum")
+        .bind(&schema_id)
+        .execute(&store.pool())
+        .await
+        .expect("tag schema definition with API-spec ownership");
+    let owned_plugins = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list spec-owned plugins before replacement");
+    assert!(
+        owned_plugins.iter().any(|plugin| plugin.id == schema_id),
+        "test precondition: the removed definition must be spec-owned"
+    );
+    store
+        .create_plugin_config(&PluginConfig {
+            id: uid("manual-schema-referrer"),
+            namespace: "ferrum".to_string(),
+            plugin_name: "stdout_logging".to_string(),
+            config: json!({"schema_ref": schema_name}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist manual schema referrer");
+
+    spec["info"]["version"] = json!("2.0.0");
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "removing the spec-owned definition must validate retained referrers: {put_body}"
+    );
+    assert!(
+        put_body.to_string().contains("unknown schema"),
+        "{put_body}"
+    );
+    let owned_plugins = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list spec-owned plugins after rejected PUT");
+    assert!(
+        owned_plugins.iter().any(|plugin| plugin.id == schema_id),
+        "rejected PUT must preserve the spec-owned schema definition"
+    );
+
+    let delete_status = client.delete(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "deleting a spec-owned definition must validate retained referrers"
+    );
+    let owned_plugins = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list spec-owned plugins after rejected DELETE");
+    assert!(
+        owned_plugins.iter().any(|plugin| plugin.id == schema_id),
+        "rejected DELETE must preserve the spec-owned schema definition"
+    );
+}
+
+#[tokio::test]
+async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("schema-cascade-proxy");
+    let spec = minimal_json_spec(&proxy_id);
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id")
+        .to_string();
+    let schema_name = uid("cascade-schema");
+    let schema_id = uid("cascade-schema-owner");
+    store
+        .create_plugin_config(&PluginConfig {
+            id: schema_id.clone(),
+            namespace: "ferrum".to_string(),
+            plugin_name: "transaction_log_schema".to_string(),
+            config: json!({"schemas": {(schema_name.clone()): {}}}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist schema definition");
+    sqlx::query("UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?")
+        .bind(&spec_id)
+        .bind("ferrum")
+        .bind(&schema_id)
+        .execute(&store.pool())
+        .await
+        .expect("tag schema definition with API-spec ownership");
+
+    let proxy_logger_id = uid("cascade-proxy-logger");
+    let proxy_logger = manual_proxy_plugin(
+        &proxy_logger_id,
+        &proxy_id,
+        "stdout_logging",
+        json!({"schema_ref": schema_name}),
+    );
+    attach_manual_proxy_plugin(&store, &proxy_id, &proxy_logger).await;
+
+    let group_logger_id = uid("cascade-group-logger");
+    let group_logger = PluginConfig {
+        id: group_logger_id.clone(),
+        namespace: "ferrum".to_string(),
+        plugin_name: "stdout_logging".to_string(),
+        config: json!({"schema_ref": schema_name}),
+        scope: PluginScope::ProxyGroup,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    attach_manual_proxy_plugin(&store, &proxy_id, &group_logger).await;
+
+    let delete_status = client.delete(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::NO_CONTENT,
+        "referrers removed by the same proxy cascade must not block deletion"
+    );
+    for plugin_id in [&schema_id, &proxy_logger_id, &group_logger_id] {
+        assert!(
+            store
+                .get_plugin_config("ferrum", plugin_id)
+                .await
+                .expect("read cascade-deleted plugin")
+                .is_none(),
+            "API-spec deletion must remove cascaded plugin {plugin_id}"
+        );
+    }
 }
 
 #[tokio::test]
