@@ -5402,17 +5402,19 @@ fn test_custom_only_duplicate_effective_correlation_headers_are_rejected() {
 fn test_empty_third_party_correlation_capability_claims_fail_closed_clearly() {
     for claim in ["", " \t "] {
         let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin { claim })];
-        let error = ferrum_edge::_test_support::validate_correlation_id_composition_for_test(
-            &plugins,
-        )
-        .expect_err("one empty normalized capability claim must fail closed");
+        let error =
+            ferrum_edge::_test_support::validate_correlation_id_composition_for_test(&plugins)
+                .expect_err("one empty normalized capability claim must fail closed");
 
         assert!(
             error.contains("plugin \"raw_correlation_claim\" returned an empty correlation_id_header_name capability claim"),
             "unexpected empty-claim error for {claim:?}: {error}"
         );
         assert!(error.contains("return None"), "got: {error}");
-        assert!(!error.contains("duplicate effective header_name"), "got: {error}");
+        assert!(
+            !error.contains("duplicate effective header_name"),
+            "got: {error}"
+        );
     }
 }
 
