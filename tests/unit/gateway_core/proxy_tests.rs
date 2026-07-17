@@ -2420,12 +2420,12 @@ async fn test_auth_rejection_cookie_storage_key_preserves_host_only_state() {
 }
 
 #[tokio::test]
-async fn test_auth_rejection_cookie_storage_key_excludes_secure_policy_rejections() {
+async fn test_auth_rejection_cookie_storage_key_applies_secure_prefixes_case_insensitively() {
     let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
-        cookies: "partitioned=staged; Secure; Partitioned; Path=/\nsame_site=staged; Secure; SameSite=None; Path=/\n__Secure-token=staged; Secure; Path=/\n__sEcUrE-case=staged; Secure; Path=/\n__Host-token=staged; Secure; Path=/\n__Host-path=staged; Secure; Path=/\n__Host-domain=staged; Secure; Path=/\nsame_site_last=staged; Path=/",
+        cookies: "partitioned=staged; Secure; Partitioned; Path=/\nsame_site=staged; Secure; SameSite=None; Path=/\n__Secure-token=staged; Secure; Path=/\n__sEcUrE-case=staged; Secure; Path=/\n__hOsT-token=staged; Secure; Path=/\n__Host-path=staged; Secure; Path=/\n__Host-domain=staged; Secure; Path=/\nsame_site_last=staged; Path=/",
     });
     let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
-        cookies: "partitioned=selected; Partitioned; Path=/\nsame_site=selected; SameSite=None; Path=/\n__Secure-token=selected; Path=/\n__sEcUrE-case=selected; Path=/\n__Host-token=selected; Path=/\n__Host-path=selected; Secure\n__Host-domain=selected; Secure; Domain=example.com; Path=/\nsame_site_last=selected; SameSite=None; SameSite=Lax; Path=/",
+        cookies: "partitioned=selected; Partitioned; Path=/\nsame_site=selected; SameSite=None; Path=/\n__Secure-token=selected; Path=/\n__sEcUrE-case=selected; Path=/\n__hOsT-token=selected; Path=/\n__Host-path=selected; Secure\n__Host-domain=selected; Secure; Domain=example.com; Path=/\nsame_site_last=selected; SameSite=None; SameSite=Lax; Path=/",
     });
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
@@ -2444,18 +2444,18 @@ async fn test_auth_rejection_cookie_storage_key_excludes_secure_policy_rejection
     assert_eq!(
         headers.get("set-cookie").map(String::as_str),
         Some(
-            "partitioned=selected; Partitioned; Path=/\nsame_site=selected; SameSite=None; Path=/\n__Secure-token=selected; Path=/\n__sEcUrE-case=selected; Path=/\n__Host-token=selected; Path=/\n__Host-path=selected; Secure\n__Host-domain=selected; Secure; Domain=example.com; Path=/\nsame_site_last=selected; SameSite=None; SameSite=Lax; Path=/\npartitioned=staged; Secure; Partitioned; Path=/\nsame_site=staged; Secure; SameSite=None; Path=/\n__Secure-token=staged; Secure; Path=/\n__sEcUrE-case=staged; Secure; Path=/\n__Host-token=staged; Secure; Path=/\n__Host-path=staged; Secure; Path=/\n__Host-domain=staged; Secure; Path=/"
+            "partitioned=selected; Partitioned; Path=/\nsame_site=selected; SameSite=None; Path=/\n__Secure-token=selected; Path=/\n__sEcUrE-case=selected; Path=/\n__hOsT-token=selected; Path=/\n__Host-path=selected; Secure\n__Host-domain=selected; Secure; Domain=example.com; Path=/\nsame_site_last=selected; SameSite=None; SameSite=Lax; Path=/\npartitioned=staged; Secure; Partitioned; Path=/\nsame_site=staged; Secure; SameSite=None; Path=/\n__Secure-token=staged; Secure; Path=/\n__sEcUrE-case=staged; Secure; Path=/\n__hOsT-token=staged; Secure; Path=/\n__Host-path=staged; Secure; Path=/\n__Host-domain=staged; Secure; Path=/"
         )
     );
 }
 
 #[tokio::test]
-async fn test_auth_rejection_cookie_storage_key_enforces_http_only_prefixes() {
+async fn test_auth_rejection_cookie_storage_key_applies_http_prefixes_case_insensitively() {
     let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
-        cookies: "__Http-session=staged; Secure; HttpOnly; Path=/\n__Host-Http-session=staged; Secure; HttpOnly; Path=/\n__hTtP-case=staged; Secure; HttpOnly; Path=/\n__Http-valid=staged; Secure; HttpOnly; Path=/",
+        cookies: "__Http-session=staged; Secure; HttpOnly; Path=/\n__hOsT-hTtP-session=staged; Secure; HttpOnly; Path=/\n__hTtP-case=staged; Secure; HttpOnly; Path=/\n__Http-valid=staged; Secure; HttpOnly; Path=/",
     });
     let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
-        cookies: "__Http-session=selected; Secure; Path=/\n__Host-Http-session=selected; Secure; Path=/\n__hTtP-case=selected; Secure; Path=/\n__Http-valid=selected; Secure; HttpOnly; Path=/",
+        cookies: "__Http-session=selected; Secure; Path=/\n__hOsT-hTtP-session=selected; Secure; Path=/\n__hTtP-case=selected; Secure; Path=/\n__Http-valid=selected; Secure; HttpOnly; Path=/",
     });
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
@@ -2474,7 +2474,7 @@ async fn test_auth_rejection_cookie_storage_key_enforces_http_only_prefixes() {
     assert_eq!(
         headers.get("set-cookie").map(String::as_str),
         Some(
-            "__Http-session=selected; Secure; Path=/\n__Host-Http-session=selected; Secure; Path=/\n__hTtP-case=selected; Secure; Path=/\n__Http-valid=selected; Secure; HttpOnly; Path=/\n__Http-session=staged; Secure; HttpOnly; Path=/\n__Host-Http-session=staged; Secure; HttpOnly; Path=/\n__hTtP-case=staged; Secure; HttpOnly; Path=/"
+            "__Http-session=selected; Secure; Path=/\n__hOsT-hTtP-session=selected; Secure; Path=/\n__hTtP-case=selected; Secure; Path=/\n__Http-valid=selected; Secure; HttpOnly; Path=/\n__Http-session=staged; Secure; HttpOnly; Path=/\n__hOsT-hTtP-session=staged; Secure; HttpOnly; Path=/\n__hTtP-case=staged; Secure; HttpOnly; Path=/"
         )
     );
 }

@@ -16172,6 +16172,9 @@ fn set_cookie_storage_key<'a>(
         Some(_) | None => default_path,
     };
 
+    // RFC 10025 §5.4 requires user agents to match cookie-name prefix strings
+    // case-insensitively; §5.7 applies that rule in the __Secure-/__Host-
+    // storage checks. Keep every browser-prefix check here case-insensitive.
     let secure_prefix = name
         .get(.."__Secure-".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Secure-"));
