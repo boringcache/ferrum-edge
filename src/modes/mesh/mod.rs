@@ -1500,12 +1500,18 @@ fn reconcile_fault_plugin_generations(candidate: &mut GatewayConfig, previous: &
         else {
             continue;
         };
-        if plugin.config == previous.config && plugin.enabled == previous.enabled {
+        if plugin.config == previous.config
+            && plugin.scope == previous.scope
+            && plugin.proxy_id == previous.proxy_id
+            && plugin.enabled == previous.enabled
+            && plugin.priority_override == previous.priority_override
+        {
             // The candidate may have been reconstructed from the static mesh
             // source timestamp while `previous` carries the synthetic stamp
             // assigned to an earlier RTDS materialization. Preserve that
-            // accepted stamp when the effective config is identical so
-            // ConfigDelta does not rebuild the plugin or reset its sampler.
+            // accepted stamp when the effective config, placement, and order
+            // are identical so ConfigDelta does not rebuild the plugin or
+            // reset its sampler.
             plugin.updated_at = previous.updated_at;
             continue;
         }
@@ -22538,6 +22544,23 @@ mod tests {
         );
         reconcile_fault_plugin_generations(&mut unrelated_only, &accepted);
         assert_eq!(unrelated_only.plugin_configs[0].updated_at, generation);
+
+        let mut moved_to_proxy = accepted.clone();
+        moved_to_proxy.plugin_configs[0].scope = PluginScope::Proxy;
+        moved_to_proxy.plugin_configs[0].proxy_id = Some("checkout".to_string());
+        reconcile_fault_plugin_generations(&mut moved_to_proxy, &accepted);
+        assert_ne!(moved_to_proxy.plugin_configs[0].updated_at, generation);
+        let moved_delta = crate::config_delta::ConfigDelta::compute(&accepted, &moved_to_proxy);
+        assert_eq!(moved_delta.modified_plugin_configs.len(), 1);
+        assert!(moved_delta.global_plugin_configs_changed);
+
+        let mut reprioritized = accepted.clone();
+        reprioritized.plugin_configs[0].priority_override = Some(42);
+        reconcile_fault_plugin_generations(&mut reprioritized, &accepted);
+        assert_ne!(reprioritized.plugin_configs[0].updated_at, generation);
+        let priority_delta = crate::config_delta::ConfigDelta::compute(&accepted, &reprioritized);
+        assert_eq!(priority_delta.modified_plugin_configs.len(), 1);
+        assert!(priority_delta.global_plugin_configs_changed);
 
         let mut disabled = accepted.clone();
         materialize_fault_runtime_overlay(
