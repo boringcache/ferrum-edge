@@ -56,10 +56,7 @@ fn permissive_backend_cors_headers() -> HashMap<String, String> {
             "access-control-expose-headers".to_string(),
             "X-Secret".to_string(),
         ),
-        (
-            "access-control-max-age".to_string(),
-            "99999".to_string(),
-        ),
+        ("access-control-max-age".to_string(), "99999".to_string()),
         (
             "Access-Control-Allow-Private-Network".to_string(),
             "true".to_string(),
