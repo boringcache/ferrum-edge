@@ -2158,9 +2158,10 @@ pub(crate) fn validate_plugin_composition_candidate(
     let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
     // A custom plugin's composition capabilities are known only after its
     // registered factory constructs the Plugin implementation.
-    let has_custom_composition_candidate = config.plugin_configs.iter().any(|plugin| {
-        plugin.enabled && custom_plugin_names.contains(&plugin.plugin_name.as_str())
-    });
+    let has_custom_composition_candidate = config
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.enabled && custom_plugin_names.contains(&plugin.plugin_name.as_str()));
     if !has_hmac && !has_correlation && !has_custom_composition_candidate {
         return Ok(());
     }

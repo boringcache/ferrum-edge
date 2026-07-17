@@ -2884,27 +2884,24 @@ async fn admin_rejects_custom_only_correlation_collision_before_persistence() {
 
     let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
 
-    assert_eq!(status, 400, "custom correlation collision was admitted: {body:?}");
+    assert_eq!(
+        status, 400,
+        "custom correlation collision was admitted: {body:?}"
+    );
     assert!(
         body.to_string()
             .contains("duplicate effective header_name \"x-custom-correlation-id\""),
         "unexpected custom correlation admission response: {body:?}"
     );
     for id in ["custom-correlation-first", "custom-correlation-second"] {
-        let (status, _, _) =
-            admin_get(&base_url, &format!("/plugins/config/{id}"), &token).await;
+        let (status, _, _) = admin_get(&base_url, &format!("/plugins/config/{id}"), &token).await;
         assert_eq!(
             status,
             reqwest::StatusCode::NOT_FOUND,
             "rejected custom correlation config {id} was persisted"
         );
     }
-    let (status, _, _) = admin_get(
-        &base_url,
-        "/proxies/custom-correlation-proxy",
-        &token,
-    )
-    .await;
+    let (status, _, _) = admin_get(&base_url, "/proxies/custom-correlation-proxy", &token).await;
     assert_eq!(
         status,
         reqwest::StatusCode::NOT_FOUND,
