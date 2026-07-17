@@ -137,6 +137,51 @@ fn assert_serde_component_field_parity<T>(
 }
 
 #[test]
+fn transaction_log_schema_closed_object_keys_match_openapi() {
+    use ferrum_edge::plugins::transaction_log_schema::TRANSACTION_LOG_SCHEMA_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::log_schema::{
+        DERIVED_FIELD_KEYS, METADATA_POLICY_KEYS, SUMMARY_LOG_SCHEMA_KEYS,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    for (label, pointer, runtime_keys) in [
+        (
+            "TransactionLogSchemaConfig",
+            "/components/schemas/TransactionLogSchemaConfig/properties",
+            TRANSACTION_LOG_SCHEMA_CONFIG_KEYS,
+        ),
+        (
+            "SummaryLogSchema",
+            "/components/schemas/SummaryLogSchema/properties",
+            SUMMARY_LOG_SCHEMA_KEYS,
+        ),
+        (
+            "SummaryLogSchema.derived_fields[]",
+            "/components/schemas/SummaryLogSchema/properties/derived_fields/items/properties",
+            DERIVED_FIELD_KEYS,
+        ),
+        (
+            "SummaryLogSchema.metadata",
+            "/components/schemas/SummaryLogSchema/properties/metadata/properties",
+            METADATA_POLICY_KEYS,
+        ),
+    ] {
+        let runtime: BTreeSet<String> = runtime_keys.iter().map(|key| (*key).to_string()).collect();
+        assert_eq!(runtime, schema_property_names(&spec, label, pointer));
+    }
+
+    for pointer in [
+        "/components/schemas/TransactionLogSchemaConfig/additionalProperties",
+        "/components/schemas/SummaryLogSchema/additionalProperties",
+        "/components/schemas/SummaryLogSchema/properties/derived_fields/items/additionalProperties",
+        "/components/schemas/SummaryLogSchema/properties/metadata/additionalProperties",
+    ] {
+        assert_eq!(spec.pointer(pointer), Some(&serde_json::Value::Bool(false)));
+    }
+}
+
+#[test]
 fn typed_component_properties_match_serde_field_inventories() {
     use ferrum_edge::config::types::{
         ActiveHealthCheck, BackendTlsConfig, CircuitBreakerConfig, ConsulConfig, Consumer,
@@ -971,6 +1016,68 @@ fn ldap_auth_schema_matches_runtime_invariants() {
         }),
     ] {
         assert_component_validity(&spec, "LdapAuthConfig", &config, false);
+    }
+}
+
+#[test]
+fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiFederationConfig")
+        .expect("missing AiFederationConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiFederationConfig schema compiles");
+
+    let provider_properties = schema
+        .pointer("/properties/providers/items/properties")
+        .expect("missing provider properties");
+    assert_eq!(provider_properties["allow_plaintext"]["default"], false);
+    assert_eq!(
+        provider_properties["max_response_body_bytes"]["default"],
+        8_388_608
+    );
+    assert_eq!(provider_properties["max_response_body_bytes"]["minimum"], 1);
+    assert_eq!(
+        provider_properties["max_response_body_bytes"]["maximum"],
+        67_108_864
+    );
+    assert!(provider_properties.get("circuit_breaker").is_some());
+
+    let valid = json!({
+        "providers": [{
+            "name": "local-openai",
+            "provider_type": "openai",
+            "api_key": "test",
+            "base_url": "http://127.0.0.1:8080/v1/chat/completions",
+            "allow_plaintext": true,
+            "max_response_body_bytes": 1048576,
+            "circuit_breaker": {
+                "failure_threshold": 2,
+                "cooldown_seconds": 10,
+                "success_threshold": 1
+            }
+        }],
+        "fallback_on_protocol_errors": true,
+        "fallback_on_ambiguous_errors": false,
+        "max_concurrent_requests": 32
+    });
+    assert!(validator.validate(&valid).is_ok());
+
+    for invalid in [
+        json!({"providers": [{"name": "p", "provider_type": "openai"}], "fallback_on_netwrok_errors": true}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "model_paterns": []}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "circuit_breaker": {"failure_treshold": 2}}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "base_url": "http://127.0.0.1/v1/chat"}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "model_mapping": {"gpt-../unsafe": "gpt-4o"}}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 0}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 67_108_865}]}),
+    ] {
+        assert!(
+            validator.validate(&invalid).is_err(),
+            "schema accepted {invalid}"
+        );
     }
 }
 

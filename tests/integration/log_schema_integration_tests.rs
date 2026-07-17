@@ -13,9 +13,12 @@
 //! * `transaction_log_schema` rejects non-global scopes via
 //!   `GatewayConfig::validate_plugin_references`.
 
+use chrono::Utc;
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugins::create_plugin;
 use ferrum_edge::plugins::utils::log_schema::registry;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 /// `Option<Arc<dyn Plugin>>` is not `Debug`, so `Result::expect_err` won't
 /// compile against it. Wrap the bare `create_plugin` to discard the Ok
@@ -39,11 +42,389 @@ fn create_ok(name: &str, config: Value) {
 /// reload-bracket serializer for their entire scope (writes AND
 /// assertions). This protects against parallel sibling tests booting
 /// gateways whose plugin-cache reloads would otherwise stomp the
-/// registry's `schemas` map between commit and lookup. Reentrant —
-/// `begin_reload` / `commit_reload` inside the scope are no-ops on the
-/// mutex.
+/// registry's `schemas` map between commit and lookup. The serializer is
+/// reentrant for this test guard plus one inner reload bracket.
 fn registry_lock() -> registry::ReloadBracketTestGuard {
     registry::lock_for_tests()
+}
+
+fn graph_plugin(id: &str, namespace: &str, plugin_name: &str, config: Value) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        plugin_name: plugin_name.to_string(),
+        namespace: namespace.to_string(),
+        config,
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn validate_graph(plugin_configs: Vec<PluginConfig>) -> Result<(), Vec<String>> {
+    ferrum_edge::_test_support::validate_transaction_log_schema_graph_for_test(&GatewayConfig {
+        plugin_configs,
+        ..GatewayConfig::default()
+    })
+}
+
+#[test]
+fn prospective_graph_is_definition_first_and_does_not_mutate_live_registry() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    registry::begin_reload().expect("reload bracket opens");
+    create_ok(
+        "transaction_log_schema",
+        json!({"schemas": {"live_baseline": {}}}),
+    );
+    registry::commit_reload().expect("reload bracket commits");
+
+    validate_graph(vec![
+        graph_plugin(
+            "logger",
+            "ferrum",
+            "stdout_logging",
+            json!({"schema_ref": "prospective"}),
+        ),
+        graph_plugin(
+            "schemas",
+            "ferrum",
+            "transaction_log_schema",
+            json!({"schemas": {"prospective": {"summary_type": "both"}}}),
+        ),
+    ])
+    .expect("referrers may precede their definition in a prospective config");
+
+    assert!(registry::lookup_named("live_baseline").is_some());
+    assert!(
+        registry::lookup_named("prospective").is_none(),
+        "validation staging must never publish into the live registry"
+    );
+}
+
+#[test]
+fn nested_reload_is_rejected_without_clobbering_outer_staging() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    registry::begin_reload().expect("outer reload bracket opens");
+    create_ok("transaction_log_schema", json!({"schemas": {"outer": {}}}));
+
+    let error = registry::begin_reload().expect_err("nested reload must be rejected");
+    assert!(error.contains("nested begin_reload"), "got: {error}");
+
+    create_ok(
+        "transaction_log_schema",
+        json!({"schemas": {"after_rejection": {}}}),
+    );
+    registry::commit_reload().expect("outer reload bracket commits");
+    assert!(registry::lookup_named("outer").is_some());
+    assert!(registry::lookup_named("after_rejection").is_some());
+}
+
+#[tokio::test]
+async fn namespace_config_admission_serializes_same_namespace_mutations() {
+    let first = ferrum_edge::_test_support::lock_namespace_config_admission_for_test(
+        "schema-lock-serialization",
+    )
+    .await;
+    let (attempting_tx, attempting_rx) = tokio::sync::oneshot::channel();
+    let mut waiter = tokio::spawn(async move {
+        let _ = attempting_tx.send(());
+        let _second = ferrum_edge::_test_support::lock_namespace_config_admission_for_test(
+            "schema-lock-serialization",
+        )
+        .await;
+    });
+
+    attempting_rx
+        .await
+        .expect("waiter reaches lock acquisition");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut waiter)
+            .await
+            .is_err(),
+        "same-namespace mutation must wait while admission through persistence is guarded"
+    );
+
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("waiter acquires promptly after release")
+        .expect("waiter task completes");
+}
+
+#[test]
+fn prospective_graph_rejects_duplicate_names_and_dangling_renames_or_deletes() {
+    let duplicate = validate_graph(vec![
+        graph_plugin(
+            "schemas-a",
+            "ferrum",
+            "transaction_log_schema",
+            json!({"schemas": {"audit": {}}}),
+        ),
+        graph_plugin(
+            "schemas-b",
+            "ferrum",
+            "transaction_log_schema",
+            json!({"schemas": {"audit": {}}}),
+        ),
+    ])
+    .expect_err("duplicate names across schema instances must be rejected");
+    assert!(
+        duplicate
+            .iter()
+            .any(|error| error.contains("registered more than once")),
+        "unexpected duplicate errors: {duplicate:?}"
+    );
+
+    for plugins in [
+        vec![
+            graph_plugin(
+                "schemas",
+                "ferrum",
+                "transaction_log_schema",
+                json!({"schemas": {"renamed": {}}}),
+            ),
+            graph_plugin(
+                "logger",
+                "ferrum",
+                "stdout_logging",
+                json!({"schema_ref": "removed"}),
+            ),
+        ],
+        vec![graph_plugin(
+            "logger",
+            "ferrum",
+            "stdout_logging",
+            json!({"schema_ref": "deleted"}),
+        )],
+    ] {
+        let errors = validate_graph(plugins)
+            .expect_err("renamed or deleted definitions must leave no dangling referrers");
+        assert!(
+            errors.iter().any(|error| error.contains("unknown schema")),
+            "unexpected dangling-ref errors: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn stray_schema_ref_participates_only_when_the_plugin_is_enabled() {
+    let mut plugin = graph_plugin(
+        "stray-ref",
+        "ferrum",
+        "cors",
+        json!({"origins": ["*"], "schema_ref": "missing"}),
+    );
+    plugin.enabled = false;
+    validate_graph(vec![plugin.clone()]).expect("disabled config is inert");
+
+    plugin.enabled = true;
+    let errors = validate_graph(vec![plugin])
+        .expect_err("enabled top-level schema_ref must participate fail-closed");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("unknown schema 'missing'")),
+        "unexpected errors: {errors:?}"
+    );
+}
+
+#[test]
+fn prospective_graph_is_namespace_scoped_across_multiple_instances() {
+    validate_graph(vec![
+        graph_plugin(
+            "schemas-a",
+            "tenant-a",
+            "transaction_log_schema",
+            json!({"schemas": {"audit": {}}}),
+        ),
+        graph_plugin(
+            "logger-a",
+            "tenant-a",
+            "stdout_logging",
+            json!({"schema_ref": "audit"}),
+        ),
+        graph_plugin(
+            "schemas-b",
+            "tenant-b",
+            "transaction_log_schema",
+            json!({"schemas": {"audit": {}}}),
+        ),
+        graph_plugin(
+            "logger-b",
+            "tenant-b",
+            "stdout_logging",
+            json!({"schema_ref": "audit"}),
+        ),
+    ])
+    .expect("the same schema name is independent in separate namespaces");
+
+    let errors = validate_graph(vec![
+        graph_plugin(
+            "schemas-a",
+            "tenant-a",
+            "transaction_log_schema",
+            json!({"schemas": {"audit": {}}}),
+        ),
+        graph_plugin(
+            "logger-b",
+            "tenant-b",
+            "stdout_logging",
+            json!({"schema_ref": "audit"}),
+        ),
+    ])
+    .expect_err("a referrer must not resolve a definition from another namespace");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("namespace=tenant-b") && error.contains("unknown schema")),
+        "unexpected cross-namespace errors: {errors:?}"
+    );
+}
+
+#[test]
+fn runtime_load_preserves_optional_logger_fail_open_but_not_dangling_refs() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+
+    let mut malformed_optional_sink = GatewayConfig {
+        plugin_configs: vec![
+            graph_plugin(
+                "schemas",
+                "ferrum",
+                "transaction_log_schema",
+                json!({"schemas": {"audit": {}}}),
+            ),
+            graph_plugin(
+                "logger",
+                "ferrum",
+                "stdout_logging",
+                json!({"schema_ref": "audit", "filter": "not-an-object"}),
+            ),
+        ],
+        ..GatewayConfig::default()
+    };
+    ferrum_edge::_test_support::validate_plugin_configs_fatal_for_test(
+        &mut malformed_optional_sink,
+        &policy,
+    )
+    .expect("optional logger constructor failures remain fail-open on runtime load");
+
+    let mut dangling_ref = GatewayConfig {
+        plugin_configs: vec![graph_plugin(
+            "logger",
+            "ferrum",
+            "stdout_logging",
+            json!({"schema_ref": "missing"}),
+        )],
+        ..GatewayConfig::default()
+    };
+    let error = ferrum_edge::_test_support::validate_plugin_configs_fatal_for_test(
+        &mut dangling_ref,
+        &policy,
+    )
+    .expect_err("reference-integrity failures remain fatal");
+    assert!(error.contains("1 errors"), "unexpected error: {error}");
+}
+
+#[test]
+fn shared_runtime_rejecting_contract_rejects_dangling_graphs_only() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+
+    let dangling_ref = GatewayConfig {
+        plugin_configs: vec![graph_plugin(
+            "logger",
+            "ferrum",
+            "stdout_logging",
+            json!({"schema_ref": "missing"}),
+        )],
+        ..GatewayConfig::default()
+    };
+    let errors =
+        ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&dangling_ref);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("unknown schema 'missing'")),
+        "database, MongoDB, and CP snapshots must reject dangling graph refs: {errors:?}"
+    );
+
+    let malformed_optional_sink = GatewayConfig {
+        plugin_configs: vec![
+            graph_plugin(
+                "schemas",
+                "ferrum",
+                "transaction_log_schema",
+                json!({"schemas": {"audit": {}}}),
+            ),
+            graph_plugin(
+                "logger",
+                "ferrum",
+                "stdout_logging",
+                json!({"schema_ref": "audit", "filter": "not-an-object"}),
+            ),
+        ],
+        ..GatewayConfig::default()
+    };
+    let errors = ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(
+        &malformed_optional_sink,
+    );
+    assert!(
+        errors.is_empty(),
+        "optional sink constructor failures must remain outside the rejecting graph contract: {errors:?}"
+    );
+}
+
+#[test]
+fn schema_ref_opt_in_cannot_bypass_policy_only_egress_validation() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    let policy = ferrum_edge::config::BackendEgressPolicy::from_env(
+        ferrum_edge::config::BackendAllowIps::Both,
+        "",
+        "",
+        true,
+    )
+    .expect("default egress policy is valid");
+    let mut config = GatewayConfig {
+        plugin_configs: vec![
+            graph_plugin(
+                "schemas",
+                "ferrum",
+                "transaction_log_schema",
+                json!({"schemas": {"audit": {}}}),
+            ),
+            graph_plugin(
+                "rate-limit",
+                "ferrum",
+                "rate_limiting",
+                json!({
+                    "window_seconds": 60,
+                    "max_requests": 10,
+                    "sync_mode": "redis",
+                    "redis_url": "redis://169.254.169.254:6379/0",
+                    "schema_ref": "audit"
+                }),
+            ),
+        ],
+        ..GatewayConfig::default()
+    };
+
+    let errors =
+        ferrum_edge::_test_support::collect_plugin_config_errors_for_test(&mut config, &policy)
+            .expect("collect validation should return policy errors");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("redis_url IP 169.254.169.254 denied")),
+        "schema_ref must not bypass policy-only checks: {errors:?}"
+    );
 }
 
 #[test]
@@ -53,7 +434,7 @@ fn schema_ref_resolves_when_schema_registered_first() {
 
     // Loader runs `begin_reload`, processes transaction_log_schema first,
     // then `commit_reload`, then the rest.
-    registry::begin_reload();
+    registry::begin_reload().expect("reload bracket opens");
     create_ok(
         "transaction_log_schema",
         json!({
@@ -65,7 +446,7 @@ fn schema_ref_resolves_when_schema_registered_first() {
             }
         }),
     );
-    registry::commit_reload();
+    registry::commit_reload().expect("reload bracket commits");
 
     create_ok("stdout_logging", json!({ "schema_ref": "splunk_cim" }));
 }
@@ -74,8 +455,8 @@ fn schema_ref_resolves_when_schema_registered_first() {
 fn schema_ref_unknown_rejected_after_commit() {
     let _g = registry_lock();
     registry::reset_for_tests();
-    registry::begin_reload();
-    registry::commit_reload(); // empty registry
+    registry::begin_reload().expect("reload bracket opens");
+    registry::commit_reload().expect("empty reload bracket commits");
 
     let err = create_err("stdout_logging", json!({ "schema_ref": "missing" }));
     assert!(err.contains("unknown schema 'missing'"), "got: {err}");
@@ -85,9 +466,9 @@ fn schema_ref_unknown_rejected_after_commit() {
 fn inline_and_schema_ref_mutually_exclusive() {
     let _g = registry_lock();
     registry::reset_for_tests();
-    registry::begin_reload();
+    registry::begin_reload().expect("reload bracket opens");
     create_ok("transaction_log_schema", json!({ "schemas": { "x": {} } }));
-    registry::commit_reload();
+    registry::commit_reload().expect("reload bracket commits");
 
     let err = create_err(
         "stdout_logging",
@@ -136,7 +517,7 @@ fn api_chargeback_rejects_schema() {
 fn schema_loaded_after_commit_visible_to_subsequent_constructions() {
     let _g = registry_lock();
     registry::reset_for_tests();
-    registry::begin_reload();
+    registry::begin_reload().expect("reload bracket opens");
     create_ok(
         "transaction_log_schema",
         json!({
@@ -146,7 +527,7 @@ fn schema_loaded_after_commit_visible_to_subsequent_constructions() {
             }
         }),
     );
-    registry::commit_reload();
+    registry::commit_reload().expect("reload bracket commits");
 
     // Both schemas should be resolvable.
     create_ok("stdout_logging", json!({ "schema_ref": "a" }));
@@ -159,7 +540,7 @@ fn reload_replaces_previous_schemas() {
     registry::reset_for_tests();
 
     // First reload: schemas "a" and "b".
-    registry::begin_reload();
+    registry::begin_reload().expect("reload bracket opens");
     create_ok(
         "transaction_log_schema",
         json!({
@@ -169,12 +550,12 @@ fn reload_replaces_previous_schemas() {
             }
         }),
     );
-    registry::commit_reload();
+    registry::commit_reload().expect("reload bracket commits");
     assert!(registry::lookup_named("a").is_some());
     assert!(registry::lookup_named("b").is_some());
 
     // Second reload: only schema "a" plus a new "c". "b" should vanish.
-    registry::begin_reload();
+    registry::begin_reload().expect("reload bracket opens");
     create_ok(
         "transaction_log_schema",
         json!({
@@ -184,7 +565,7 @@ fn reload_replaces_previous_schemas() {
             }
         }),
     );
-    registry::commit_reload();
+    registry::commit_reload().expect("reload bracket commits");
     assert!(registry::lookup_named("a").is_some(), "a survived");
     assert!(registry::lookup_named("b").is_none(), "b removed");
     assert!(registry::lookup_named("c").is_some(), "c added");

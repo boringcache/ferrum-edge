@@ -2,6 +2,13 @@
 
 Ferrum Edge executes plugins in a deterministic order based on two dimensions: **lifecycle phases** and **priority within each phase**.
 
+`transaction_log_schema` is a config-only exception to runtime ordering. Full
+and delta cache builds construct its global instances first to stage named
+schemas, then discard those instances after the registry owns the compiled
+definitions. It is absent from global/per-proxy lifecycle lists and all
+HTTP, gRPC, WebSocket, TCP, and UDP protocol snapshots, so it never runs a
+request, summary, connection, or frame hook.
+
 ## Lifecycle Phases
 
 HTTP-family routing and per-proxy allowed-method admission occur before the
@@ -55,22 +62,22 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 5a. path policy preview │  Stateless access check for initial selected path
+│ 5a. final path policy   │  Enforce selected method; charge state once
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 5b. routing-header hook │  Deferred enrichment with previewed target pinned
+│ 5b. routing-header hook │  Deferred enrichment with target pinned
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 5c. final path policy   │  Enforce settled method; charge state once
+│ 5c. deferred hooks      │  Remaining external/synthetic work after policy
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 5d. deferred before_proxy │  Remaining external/synthetic work after policy
+│ 5d. final request body  │  Terminal body dispatch after selected-path policy
 └────────────┬────────────┘
              │
              ▼
@@ -144,17 +151,15 @@ segments used by the backend URL builder, including regex/exact/prefix match
 length, encoded-slash normalization, `strip_listen_path`, `backend_path`, and
 the selected target's path. `grpc_method_router` uses this phase so
 allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
-backend wire. When a deferred external hook can inject headers used by load
-balancing, the policy hook first receives a non-state-consuming preview phase
-for the already selected path. That target remains pinned across the external
-call so the hook cannot cause side effects and then steer the request onto a
-method that was not authorized first. The same path is enforced once afterward;
-per-method rate limits are charged only in this final phase, so one request
-cannot consume two method buckets. Gateway-owned identity headers and
-configured egress baggage filtering are reapplied after every deferred mutation
-pass. Its
-pre-filtered plugin list is built on reload; proxies without an opt-in plugin do
-not scan the chain or allocate an effective-path string. Once policy binds the
+backend wire. The selected target remains pinned across deferred external hooks,
+so routing-header mutations cannot steer the request onto a different method.
+The gateway enforces the selected path, including stateful per-method rate
+limits, exactly once before invoking those hooks or a terminal final-request-
+body dispatch such as `ai_federation`. Gateway-owned identity headers and
+configured egress baggage filtering are reapplied after every deferred
+mutation pass. The pre-filtered backend-path plugin list is built on reload;
+proxies without an opt-in plugin do not scan the chain or allocate an
+effective-path string. Once policy binds the
 first target's path, retries may rotate host/port only when the candidate keeps
 the same assembled effective backend path, including the proxy `backend_path`
 fallback when a target has no explicit path. A candidate with a different path
@@ -176,14 +181,21 @@ normal request semantics even when mesh routing rewrote the backend path.
 is active and `mirror_path` is unset, it mirrors the exact effective path that
 passed final authorization. An explicit operator-configured `mirror_path`
 still wins. A deferred hook that can inject routing headers runs after the
-selected target's access preview, and that target is pinned across the external
-call. Ferrum performs the single state-consuming enforcement against the same
-effective path before any remaining external or synthetic hook. After each
+selected target's single state-consuming enforcement, and that target is pinned
+across the external call. After each
 deferred pass, the gateway removes every case variant of the reserved
 `x-consumer-username` and `x-consumer-custom-id` headers, restores only
 authenticated gateway values, and reapplies configured egress baggage-key
 filtering. Plugin-returned headers therefore cannot spoof backend identity,
-restore forbidden baggage, or steer this request to an unpreviewed target.
+restore forbidden baggage, or steer this request to a different unauthorized
+target.
+
+Terminal final-request-body plugins run after the selected path is pinned and
+authorized, and after both deferred `before_proxy` subphases, but before
+backend-only admission, circuit breaking, pool, TLS, or transport work. This
+keeps final transformed-body provider dispatch outside placeholder-backend
+health accounting without allowing it to bypass backend-effective gRPC method
+policy.
 
 When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
 
@@ -478,7 +490,7 @@ Given all built-in plugins enabled, the execution order is:
 | 58 | `response_transformer` | 4000 | after_proxy, transform_response_body |
 | 59 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
 | 60 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
-| 61 | `ai_federation` | 4060 | before_proxy |
+| 61 | `ai_federation` | 4060 | final request body (HTTP only) |
 | 62 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
 | 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
@@ -585,8 +597,8 @@ The AI plugins are ordered to compose correctly:
 5. **`ai_tool_governor` (2978)** runs after the request guard and before semantic cache and federation — it applies deterministic allow/deny/approval policy to concrete tool/function calls by name, arguments, JSON Schema, regex, identity, and an optional approval webhook. A disallowed tool schema in the request `tools[]`, a dangerous tool call in `choices[].message.tool_calls[]`, or a streamed SSE tool-call delta is screened before it reaches the client, semantic cache, or a federated provider. It complements `ai_semantic_firewall` (which catches intent); this plugin is purely deterministic (names, args, schema, regex, identity, approval). Because `request_transformer` (3000) and `response_transformer` (4000) run after the initial `before_proxy`/`on_response_body` inspection, the governor re-runs its deterministic request policy on the final backend-visible body (`on_final_request_body`) and its response policy on the final client-visible body (`on_final_response_body`), so a transform that rewrites an allowed body into a denied `tools/call` or injects a denied `choices[].message.tool_calls[]` is still fail-closed before dispatch or delivery.
 6. **`ai_semantic_cache` (2980)** runs after guardrails but before provider routing, so exact and semantic cache hits observe the accepted backend-visible prompt and can short-circuit before outbound provider dispatch.
 7. **`ai_stream_router` (2984)** claims streaming OpenAI Chat Completions requests (`"stream": true`) before non-streaming federation. It rewrites the route for provider-native streaming and normalizes provider SSE where needed without full-response buffering.
-8. **`ai_prompt_compressor` (4055)** runs after the guard, semantic cache, and `compression` request decompression. It boundedly shortens prompt text only for admitted OpenAI Chat/Text Completions representations (`messages[].content` for configured roles, plus legacy `prompt`). In `auto`, standard operation paths and body shapes must agree; the original incoming classification path is kept in one private per-request snapshot so a later routing rewrite cannot change eligibility, while fixed-family config is the explicit custom-path opt-in. Its request-time buffering gate stages plaintext `ctx.metadata["request_body"]` rewrites for compatible direct dispatch, privately reuses transformed bodies of at most 65,536 bytes when the wire source is unchanged, and otherwise recomputes against the final pre-compressor wire representation (including opt-in decompression) under the same work budget. Larger direct-dispatch prompts therefore retain no second transformed-body copy across provider latency. Final standard-wire counters replace provisional counters and remain instance-scoped before aggregation. Matching-backtick code, URLs, Unicode numbers, common identifiers, nested preserve text, and negations survive; successful changes intentionally reserialize the complete JSON body. Configured preserve markers use a separate non-queuing bounded sanitation lane and representation-preserving fallback when statistical work is saturated/over budget or output would overflow; the context-aware final hook rejects decoded bodies that exceed the hard sanitation bound or cannot enter the sanitation lane. Compressed client uploads still require standard dispatch because federation returns before request-body transforms run.
-9. **`ai_federation` (4060)** handles non-streaming provider routing after guardrails and prompt compression. It translates OpenAI-format requests to the matched provider, normalizes non-streaming responses back to OpenAI format, and returns via `RejectBinary`. Matched requests with `"stream": true` are rejected with `501` unless `ai_stream_router` already claimed the request via `ai_stream_router_claimed=true`. Successful synthetic federation responses are passed through the response-side body hooks before the client receives them — when the normal response-body-buffering capability gate is satisfied, `ai_semantic_firewall`, `ai_response_guard`, response transforms, and final-response hooks still apply over the synthetic 2xx body. `ai_token_metrics` is the deliberate exception: it skips synthetic short-circuit bodies, so `ai_federation` writes token metadata directly into `ctx.metadata`.
+8. **`ai_prompt_compressor` (4055)** runs after the guard, semantic cache, and `compression` request decompression. It boundedly shortens prompt text only for admitted OpenAI Chat/Text Completions representations (`messages[].content` for configured roles, plus legacy `prompt`). In `auto`, standard operation paths and body shapes must agree; the original incoming classification path is kept in one private per-request snapshot so a later routing rewrite cannot change eligibility, while fixed-family config is the explicit custom-path opt-in. Its request-time buffering gate stages plaintext `ctx.metadata["request_body"]` rewrites for compatible direct dispatch, privately reuses transformed bodies of at most 65,536 bytes when the wire source is unchanged, and otherwise recomputes against the final pre-compressor wire representation (including opt-in decompression) under the same work budget. Larger prompts therefore retain no second transformed-body copy across provider latency. Final wire counters replace provisional counters and remain instance-scoped before aggregation. Matching-backtick code, URLs, Unicode numbers, common identifiers, nested preserve text, and negations survive; successful changes intentionally reserialize the complete JSON body. Configured preserve markers use a separate non-queuing bounded sanitation lane and representation-preserving fallback when statistical work is saturated/over budget or output would overflow; the context-aware final hook rejects decoded bodies that exceed the hard sanitation bound or cannot enter the sanitation lane. Federation consumes the same final transformed body.
+9. **`ai_federation` (4060)** is HTTP-only and handles non-streaming provider routing from the final request body, after all request transforms and final request validators. It translates OpenAI-format requests to the matched provider, normalizes bounded non-streaming responses, and returns via `RejectBinary` before backend egress/admission/transport. Matched requests with `"stream": true` are rejected with `501` unless `ai_stream_router` already claimed the request via `ai_stream_router_claimed=true`. Successful synthetic federation responses pass through the response-side body hooks before the client receives them, including `ai_semantic_firewall`, `ai_response_guard`, response transforms, final-response hooks, and committed observers when configured. `ai_token_metrics` is the deliberate exception: it skips synthetic short-circuit bodies, so `ai_federation` writes token metadata directly into `ctx.metadata`.
 10. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses the LLM response body to extract token usage (prompt, completion, total, model) and writes it to `ctx.metadata`. This metadata flows into `TransactionSummary` for all downstream logging plugins. It is observability-only and never enforces budget policy. When `ai_federation` is active, `ai_federation` writes the same metadata keys directly (so accounting is correct even if the synthetic-body hooks are skipped), and `ai_rate_limiter` reconciles usage from that metadata on the rejection path.
 11. **`ai_rate_limiter` (4200)** reserves estimated token usage before proxying JSON `POST` requests, based on output-token caps plus estimated prompt tokens. It runs after `ai_token_metrics` on the response body path, reconciles the reservation to actual usage when usage metadata is available, and keeps/rejects/releases unmetered 2xx responses according to `on_unmetered_response`. Synthetic short-circuit bodies (cache/dedup/mock/etc.) are never charged or released — the limiter exempts them via the internal `ferrum:synthetic_short_circuit` marker. When `ai_federation` is active, the rate limiter uses `applies_after_proxy_on_reject()` to reconcile token usage from federation metadata on the rejection path (the sole federation charger, scoped per limiter instance).
 
@@ -607,7 +619,7 @@ guardrails on the same client-visible representation across H1/H2 and every
 buffered H3 path without changing `ai_stream_router`'s request-side priority
 (which must remain after `ai_semantic_cache`).
 
-Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`; `ai_federation` checks this at the top of its `before_proxy` and immediately continues, so the two plugins compose cleanly on the same proxy. Fallback across providers after the first downstream byte is out of scope — once bytes have streamed the provider cannot be switched (`ai_stream_router.fallback_attempts` is always `0`).
+Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`; `ai_federation` checks this at the top of its final request-body hook and immediately continues, so the two plugins compose cleanly on the same proxy. Fallback across providers after the first downstream byte is out of scope — once bytes have streamed the provider cannot be switched (`ai_stream_router.fallback_attempts` is always `0`).
 
 ### Transforms after auth (3000+)
 
@@ -794,7 +806,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
 | `ai_response_guard` | ✓ | | | | | HTTP-only JSON/SSE/text response inspection; native gRPC protobuf framing is unsupported |
 | `ai_stream_router` | ✓ | | | | | Claims `stream: true` OpenAI Chat Completions, route-overrides to a provider, normalizes provider SSE to OpenAI SSE |
-| `ai_federation` | ✓ | ✓ | | | | Routes to AI providers, normalizes responses |
+| `ai_federation` | ✓ | | | | | HTTP-only; routes final OpenAI JSON bodies to providers and normalizes bounded responses |
 | `mcp_gateway` | ✓ | ✓ | | | | Parses MCP JSON-RPC, emits `mcp.*` metadata, routes namespaced MCP tools/resources/prompts, and reverse-maps routed JSON results |
 | `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |

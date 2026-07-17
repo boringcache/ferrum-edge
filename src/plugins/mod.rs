@@ -2,8 +2,8 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → backend-path policy preview → deferred routing-header hooks →
-//! final backend-path enforcement → remaining deferred `before_proxy` hooks →
+//! `before_proxy` → backend-path policy enforcement →
+//! deferred routing-header hooks → remaining deferred `before_proxy` hooks →
 //! `transform_request_body` →
 //! `on_final_request_body` → `backend_admission` → `after_proxy` →
 //! `normalize_response_body` → `on_response_body` →
@@ -129,6 +129,19 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
 };
 
+/// Internal provenance marker set after a request-phase plugin has issued an
+/// external operation whose result must not be replayed from an ambiguous
+/// synthetic-response pipeline.
+pub(crate) const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str =
+    "ferrum:external_operation_completed";
+
+/// Internal marker set when a request is committed to a synthetic rejection
+/// before any external operation or backend dispatch could have started.
+/// Ownership plugins consume it from `on_response_committed` to release this
+/// request's exact local/distributed in-flight token safely.
+pub(crate) const RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY: &str =
+    "ferrum:release_dedup_inflight_on_commit";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JwtAuthAttributeValue {
     Scalar(String),
@@ -151,19 +164,6 @@ pub enum ProxyProtocol {
     Tcp,
     /// Raw UDP datagram proxy (includes DTLS termination/origination)
     Udp,
-}
-
-/// Whether a backend-effective path policy hook is validating a provisional
-/// selection or enforcing the final selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendPathPolicyPhase {
-    /// Validate access rules before a deferred routing hook performs external
-    /// work. Stateful policy such as rate limiting must not be charged here.
-    Preview,
-    /// Enforce the settled backend-effective path immediately before the
-    /// remaining deferred hooks, a deferred-hook rejection, or backend
-    /// dispatch. Stateful policy is committed exactly once in this phase.
-    Enforce,
 }
 
 /// All protocol variants, for plugins that support every protocol.
@@ -832,6 +832,12 @@ pub struct RequestContext {
     gateway_deadline_response_selected: bool,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Per-request ownership state for each live request-deduplication plugin
+    /// instance. Multiple instances may coexist on one proxy; keeping their
+    /// correlation state in a private instance-keyed map prevents one hook
+    /// from consuming another instance's key or local/Redis owner token.
+    pub(crate) request_deduplication_state:
+        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
     /// Aggregate CORS policy state staged across every attached CORS instance
     /// and consumed by the cache-inserted CORS finalizer. Kept outside public
     /// metadata so policy details never enter transaction logs.
@@ -1237,6 +1243,7 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             metadata: HashMap::new(),
+            request_deduplication_state: HashMap::new(),
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
@@ -1476,6 +1483,10 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            // Deduplication has no final request-body hook, and the caller only
+            // copies selected hook results back. Keep ownership solely on the
+            // live context instead of cloning request keys and tokens here.
+            request_deduplication_state: HashMap::new(),
             // Final request-body hooks cannot observe or mutate the real CORS
             // aggregate. CORS has no body hook, and only metadata is copied
             // back from this compatibility context.
@@ -3758,9 +3769,9 @@ pub trait Plugin: Send + Sync {
 
     /// Returns `true` when a deferred `before_proxy` hook can mutate headers
     /// that normally participate in upstream target selection. The gateway
-    /// runs these hooks in a separate deferred subphase after an access preview
-    /// and pins that previewed target across the external call; the returned
-    /// headers cannot steer this request onto an unpreviewed path.
+    /// runs these hooks in a separate deferred subphase after backend-path
+    /// enforcement and pins the authorized target across the external call;
+    /// the returned headers cannot steer this request onto a different path.
     fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
         false
     }
@@ -3776,17 +3787,14 @@ pub trait Plugin: Send + Sync {
 
     /// Called after the backend-effective path has been assembled from the
     /// route override, listen-path stripping, proxy/backend path, and selected
-    /// upstream target path, but before any backend is dialed.
-    ///
-    /// When a deferred hook can mutate routing headers, `Preview` runs before
-    /// that hook and `Enforce` runs afterward against the same pinned target.
-    /// Otherwise only `Enforce` runs. Implementations must keep `Preview` free
-    /// of state-consuming effects such as rate-limit charges.
+    /// upstream target path. The selected target is pinned and this hook runs
+    /// exactly once before deferred external/synthetic hooks or backend dial,
+    /// so implementations may safely commit stateful policy such as rate-limit
+    /// charges here.
     async fn on_backend_path_resolved(
         &self,
         _ctx: &mut RequestContext,
         _backend_path: &str,
-        _phase: BackendPathPolicyPhase,
     ) -> PluginResult {
         PluginResult::Continue
     }
@@ -4253,6 +4261,22 @@ pub trait Plugin: Send + Sync {
     /// Returns true when `on_final_request_body_with_context` needs the real
     /// mutable request context rather than the compatibility wrapper.
     fn needs_final_request_body_context(&self) -> bool {
+        false
+    }
+
+    /// Returns true when the final request-body hook is a terminal dispatch
+    /// boundary and must run before backend-only circuit-breaker, egress,
+    /// admission, pool, or TLS work. When backend-path policy is active, the
+    /// selected path is authorized and deferred `before_proxy` hooks finish
+    /// before this terminal hook may perform external dispatch.
+    ///
+    /// This is narrower than [`Plugin::needs_final_request_body_context`]. It
+    /// is intended for plugins such as provider federators that consume the
+    /// finalized HTTP request body, perform their own external dispatch, and
+    /// return the complete client response from the hook. Ordinary validators
+    /// should keep the default so fail-fast backend gates can reject without
+    /// first draining a client upload.
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
         false
     }
 
@@ -5019,6 +5043,21 @@ pub fn validate_plugin_config_with_policy(
 ) -> Result<(), String> {
     let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
     validate_plugin_config_with_http_client(name, config, http_client)?;
+    validate_plugin_config_policy_only(name, config, backend_allow_ips)
+}
+
+/// Apply admission-policy checks that live outside plugin construction.
+///
+/// Prospective named-schema validation constructs `schema_ref` consumers while
+/// an isolated schema registry is staged. Callers therefore skip a second full
+/// construction after that bracket is aborted, but must still apply these
+/// policy-only checks so an unrelated plugin cannot add an ignored
+/// `schema_ref` key to bypass egress admission.
+pub(crate) fn validate_plugin_config_policy_only(
+    name: &str,
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
     // The HTTP-endpoint screen above does not cover a plugin's own
     // literal-IP backend fields that aren't dialed through the shared
     // client (mesh_route_dispatch route destinations).

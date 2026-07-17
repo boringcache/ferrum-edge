@@ -51,11 +51,12 @@ use uuid::Uuid;
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, IncrementalResult,
-    MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict, NamespaceResourceCounts,
-    NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
-    SortOrder, extract_db_hostname, redact_url,
+    MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend,
+    NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+    SnapshotDataIntegrityError, SortOrder, extract_db_hostname, redact_url,
 };
 
+const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
 pub(crate) const MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL: &str = "INSERT INTO mtls_dns_admission_locks \
      (namespace, updated_at) VALUES (?, ?) \
      ON DUPLICATE KEY UPDATE updated_at = mtls_dns_admission_locks.updated_at";
@@ -697,6 +698,51 @@ impl DatabaseStore {
         }
     }
 
+    fn config_admission_lease_acquire_sql(&self) -> String {
+        let now = self.config_admission_lease_now_sql();
+        match self.db_type.as_str() {
+            "mysql" => format!(
+                "INSERT INTO config_admission_locks \
+                 (namespace, owner, expires_at, generation) VALUES (?, ?, {now} + ?, 1) \
+                 ON DUPLICATE KEY UPDATE \
+                 generation = IF(\
+                     expires_at <= {now} OR owner = VALUES(owner), \
+                     IF(owner = VALUES(owner), generation, generation + 1), \
+                     generation), \
+                 owner = IF(expires_at <= {now} OR owner = VALUES(owner), VALUES(owner), owner), \
+                 expires_at = IF(owner = VALUES(owner), VALUES(expires_at), expires_at)"
+            ),
+            _ => self.q(&format!(
+                "INSERT INTO config_admission_locks \
+                 (namespace, owner, expires_at, generation) VALUES (?, ?, {now} + ?, 1) \
+                 ON CONFLICT (namespace) DO UPDATE SET \
+                 generation = CASE \
+                     WHEN config_admission_locks.owner = excluded.owner \
+                     THEN config_admission_locks.generation \
+                     ELSE config_admission_locks.generation + 1 END, \
+                 owner = excluded.owner, expires_at = excluded.expires_at \
+                 WHERE config_admission_locks.expires_at <= {now} \
+                    OR config_admission_locks.owner = excluded.owner"
+            )),
+        }
+    }
+
+    fn config_admission_lease_now_sql(&self) -> &'static str {
+        match self.db_type.as_str() {
+            "mysql" => "CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)",
+            "sqlite" => "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+            _ => "CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)",
+        }
+    }
+
+    fn config_admission_lease_renew_sql(&self) -> String {
+        let now = self.config_admission_lease_now_sql();
+        self.q(&format!(
+            "UPDATE config_admission_locks SET expires_at = {now} + ? \
+             WHERE namespace = ? AND owner = ? AND expires_at > {now}"
+        ))
+    }
+
     fn mtls_dns_admission_lock_insert_sql(&self) -> String {
         match self.db_type.as_str() {
             // INSERT IGNORE takes a shared duplicate-key lock before the
@@ -713,7 +759,6 @@ impl DatabaseStore {
                  ON CONFLICT (namespace) DO NOTHING"),
         }
     }
-
     fn config_change_retention_upsert_sql(&self) -> String {
         match self.db_type.as_str() {
             "mysql" => "INSERT INTO config_change_retention \
@@ -2547,7 +2592,7 @@ impl DatabaseStore {
         .bind(if proxy.allowed_ws_origins.is_empty() { None } else { Some(serde_json::to_string(&proxy.allowed_ws_origins)?) })
         .bind(proxy.udp_max_response_amplification_factor.map(|v| v as f64))
         .bind(proxy.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
-        .bind(Utc::now().to_rfc3339())
+        .bind(proxy.updated_at.to_rfc3339())
         .bind(&proxy.id)
         .bind(&proxy.namespace)
         .execute(&mut *tx)
@@ -2993,7 +3038,7 @@ impl DatabaseStore {
         .bind(&consumer.custom_id)
         .bind(&creds_json)
         .bind(&acl_groups_json)
-        .bind(Utc::now().to_rfc3339())
+        .bind(consumer.updated_at.to_rfc3339())
         .bind(&consumer.id)
         .bind(&consumer.namespace)
         .execute(&mut *tx)
@@ -3170,7 +3215,7 @@ impl DatabaseStore {
         .bind(&pc.proxy_id)
         .bind(if pc.enabled { 1i32 } else { 0 })
         .bind(pc.priority_override.map(|v| v as i32))
-        .bind(Utc::now().to_rfc3339())
+        .bind(pc.updated_at.to_rfc3339())
         .bind(&pc.id)
         .bind(&pc.namespace)
         .execute(&mut *tx)
@@ -3812,7 +3857,7 @@ impl DatabaseStore {
         .bind(&upstream.backend_tls_server_ca_cert_path)
         .bind(&upstream.backend_tls_sni)
         .bind(&backend_tls_san_allow_list_json)
-        .bind(Utc::now().to_rfc3339())
+        .bind(upstream.updated_at.to_rfc3339())
         .bind(&upstream.id)
         .bind(&upstream.namespace)
         .execute(&mut *tx)
@@ -5393,8 +5438,9 @@ impl DatabaseStore {
         Ok(count)
     }
 
-    /// Batch-create multiple plugin configs, chunked into transactions of
-    /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
+    /// Batch-create multiple plugin configs. Graph-aware batches stay in one
+    /// transaction so a later insert failure cannot strand a referrer or its
+    /// schema definition; unrelated large imports retain bounded chunks.
     pub async fn batch_create_plugin_configs(
         &self,
         configs: &[PluginConfig],
@@ -5404,8 +5450,17 @@ impl DatabaseStore {
         if configs.is_empty() {
             return Ok(0);
         }
+        let (graph_configs, unrelated_configs): (Vec<_>, Vec<_>) = configs
+            .iter()
+            .cloned()
+            .partition(crate::plugins::transaction_log_schema::is_enabled_config_graph_participant);
         let mut total = 0usize;
-        for chunk in configs.chunks(Self::BATCH_CHUNK_SIZE) {
+        if !graph_configs.is_empty() {
+            total += self
+                .batch_create_plugin_configs_chunk(&graph_configs, mode)
+                .await?;
+        }
+        for chunk in unrelated_configs.chunks(Self::BATCH_CHUNK_SIZE) {
             total += self.batch_create_plugin_configs_chunk(chunk, mode).await?;
         }
         self.check_slow_query("batch_create_plugin_configs", start);
@@ -7743,6 +7798,85 @@ impl DatabaseStore {
 // ---------------------------------------------------------------------------
 // DatabaseBackend trait implementation for sqlx-backed DatabaseStore
 // ---------------------------------------------------------------------------
+
+#[async_trait]
+impl NamespaceConfigAdmissionLeaseBackend for DatabaseStore {
+    async fn try_acquire_namespace_config_admission_lease(
+        &self,
+        namespace: &str,
+        owner: &str,
+    ) -> Result<Option<u64>, anyhow::Error> {
+        let sql = self.config_admission_lease_acquire_sql();
+        sqlx::query(&sql)
+            .bind(namespace)
+            .bind(owner)
+            .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
+            .execute(&self.pool())
+            .await?;
+        let now = self.config_admission_lease_now_sql();
+        let generation_sql = self.q(&format!(
+            "SELECT generation FROM config_admission_locks \
+             WHERE namespace = ? AND owner = ? AND expires_at > {now}"
+        ));
+        let generation_result = sqlx::query_scalar::<_, i64>(&generation_sql)
+            .bind(namespace)
+            .bind(owner)
+            .fetch_optional(&self.pool())
+            .await;
+        let generation_result = match generation_result {
+            Ok(generation) => generation
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("namespace config admission generation is negative")),
+            Err(error) => Err(error.into()),
+        };
+        match generation_result {
+            Ok(generation) => Ok(generation),
+            Err(error) => {
+                if let Err(release_error) = self
+                    .release_namespace_config_admission_lease(namespace, owner)
+                    .await
+                {
+                    return Err(anyhow::anyhow!(
+                        "namespace config admission generation lookup failed: {error}; \
+                         additionally failed to release the claimed lease: {release_error}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn renew_namespace_config_admission_lease(
+        &self,
+        namespace: &str,
+        owner: &str,
+    ) -> Result<bool, anyhow::Error> {
+        let sql = self.config_admission_lease_renew_sql();
+        let result = sqlx::query(&sql)
+            .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
+            .bind(namespace)
+            .bind(owner)
+            .execute(&self.pool())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn release_namespace_config_admission_lease(
+        &self,
+        namespace: &str,
+        owner: &str,
+    ) -> Result<bool, anyhow::Error> {
+        let sql = self.q("UPDATE config_admission_locks SET expires_at = 0 \
+             WHERE namespace = ? AND owner = ?");
+        let result = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(owner)
+            .execute(&self.pool())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+}
 
 #[async_trait]
 impl DatabaseBackend for DatabaseStore {

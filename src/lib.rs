@@ -429,6 +429,64 @@ pub mod _test_support {
         )
     }
 
+    pub fn validate_transaction_log_schema_graph_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(), Vec<String>> {
+        crate::plugins::transaction_log_schema::validate_config_graph(
+            config,
+            &crate::plugins::PluginHttpClient::default(),
+            true,
+        )
+    }
+
+    pub fn intervening_clear_recovery_candidate_for_test(
+        snapshot: crate::config::types::GatewayConfig,
+        current: crate::config::types::GatewayConfig,
+    ) -> crate::config::types::GatewayConfig {
+        crate::admin::intervening_clear_recovery_candidate_for_test(snapshot, current)
+    }
+
+    pub fn collect_rejecting_runtime_config_errors_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Vec<String> {
+        crate::config::validation_pipeline::collect_rejecting_runtime_config_errors(config)
+    }
+
+    pub async fn lock_namespace_config_admission_for_test(
+        namespace: &str,
+    ) -> tokio::sync::MutexGuard<'static, ()> {
+        crate::admin::crud::lock_local_namespace_config_admission(namespace).await
+    }
+
+    pub fn validate_plugin_configs_fatal_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<(), String> {
+        crate::config::validation_pipeline::ValidationPipeline::new(config)
+            .validate_plugin_configs(
+                backend_allow_ips,
+                crate::config::validation_pipeline::ValidationAction::FatalCount(
+                    "Validation failed with {} errors",
+                ),
+            )
+            .run()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn collect_plugin_config_errors_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<Vec<String>, String> {
+        crate::config::validation_pipeline::ValidationPipeline::new(config)
+            .validate_plugin_configs(
+                backend_allow_ips,
+                crate::config::validation_pipeline::ValidationAction::Collect,
+            )
+            .run()
+            .map_err(|error| error.to_string())
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)

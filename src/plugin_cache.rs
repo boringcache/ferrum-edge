@@ -38,9 +38,9 @@ use crate::plugins::{
 // ---------------------------------------------------------------------------
 
 use crate::plugins::{
-    BackendPathPolicyPhase, PluginResult, RequestContext, ResponseStreamInspector,
-    StreamConnectionContext, StreamTransactionSummary, TransactionSummary, UdpDatagramContext,
-    UdpDatagramVerdict, WebSocketFrameDirection,
+    PluginResult, RequestContext, ResponseStreamInspector, StreamConnectionContext,
+    StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
+    WebSocketFrameDirection,
 };
 use async_trait::async_trait;
 
@@ -383,11 +383,8 @@ impl Plugin for PriorityOverridePlugin {
         &self,
         ctx: &mut RequestContext,
         backend_path: &str,
-        phase: BackendPathPolicyPhase,
     ) -> PluginResult {
-        self.inner
-            .on_backend_path_resolved(ctx, backend_path, phase)
-            .await
+        self.inner.on_backend_path_resolved(ctx, backend_path).await
     }
     fn apply_websocket_handshake_response_headers(
         &self,
@@ -633,6 +630,10 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn needs_final_request_body_context(&self) -> bool {
         self.inner.needs_final_request_body_context()
+    }
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+        self.inner
+            .requires_final_request_body_before_backend_dispatch()
     }
     async fn transform_response_body(
         &self,
@@ -2107,6 +2108,7 @@ impl PluginCapabilities {
     pub const HAS_BODY_BEFORE_AUTHORIZE: u16 = 1 << 10;
     pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
     pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
+    pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -2213,6 +2215,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.needs_final_request_body_context() {
             caps |= PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT;
+        }
+        if p.requires_final_request_body_before_backend_dispatch() {
+            caps |= PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH;
         }
         if p.requires_response_committed_hook() {
             caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;
@@ -3032,7 +3037,8 @@ impl PluginCache {
             // cheap (one Mutex acquire + empty HashMap) and guarantees
             // the registry stays in sync even if a sibling global plugin
             // was the trigger for the rebuild.
-            crate::plugins::utils::log_schema::registry::begin_reload();
+            crate::plugins::utils::log_schema::registry::begin_reload()
+                .map_err(|error| format!("Config reload rejected: {error}"))?;
             for pc in &config.plugin_configs {
                 if !pc.enabled || pc.scope != PluginScope::Global {
                     continue;
@@ -3047,7 +3053,9 @@ impl PluginCache {
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
                 ) {
-                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    // Config-only: construction stages the registry entry, but
+                    // the instance must never enter runtime hook/cache lists.
+                    Ok(Some(_)) => {}
                     Ok(None) => {}
                     Err(e) => {
                         error!("Config reload: {}", e);
@@ -3376,8 +3384,10 @@ impl PluginCache {
         // bracket above — abort it so the process-global named-schema
         // registry doesn't get mutated by a config that's being rejected.
         if !plugin_errors.is_empty() {
-            if rebuild_globals {
-                crate::plugins::utils::log_schema::registry::abort_reload();
+            if rebuild_globals
+                && let Err(error) = crate::plugins::utils::log_schema::registry::abort_reload()
+            {
+                plugin_errors.push(error);
             }
             return Err(format!(
                 "Config reload rejected: {} plugin config(s) failed validation: {}",
@@ -3388,7 +3398,13 @@ impl PluginCache {
 
         if let Err(error) = start_background_tasks(&new_map, &new_globals) {
             if rebuild_globals {
-                crate::plugins::utils::log_schema::registry::abort_reload();
+                crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                    |registry_error| {
+                        format!(
+                            "Config reload rejected: {error}; registry abort also failed: {registry_error}"
+                        )
+                    },
+                )?;
             }
             return Err(format!("Config reload rejected: {error}"));
         }
@@ -3452,7 +3468,8 @@ impl PluginCache {
         // above (rebuild_globals == true), promote the staged named
         // schemas now — pairs with the `begin_reload` at the top.
         if rebuild_globals {
-            crate::plugins::utils::log_schema::registry::commit_reload();
+            crate::plugins::utils::log_schema::registry::commit_reload()
+                .map_err(|error| format!("Config reload rejected: {error}"))?;
         }
 
         Ok(Arc::new(PluginCacheInner::new(
@@ -3705,7 +3722,8 @@ impl PluginCache {
         // the rest of the plugin-cache build succeeds; `abort_reload`
         // runs if any plugin fails validation, so the process-global
         // registry stays atomically tied to the cache.
-        crate::plugins::utils::log_schema::registry::begin_reload();
+        crate::plugins::utils::log_schema::registry::begin_reload()
+            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
         for pc in &config.plugin_configs {
             if !pc.enabled || pc.scope != PluginScope::Global {
                 continue;
@@ -3720,7 +3738,9 @@ impl PluginCache {
                 current_adaptive_states,
                 &mut adaptive_concurrency_instances,
             ) {
-                Ok(Some(plugin)) => global_plugins.push(plugin),
+                // Config-only: construction stages the registry entry, but
+                // the instance must never enter runtime hook/cache lists.
+                Ok(Some(_)) => {}
                 Ok(None) => {}
                 Err(e) => plugin_errors.push(e),
             }
@@ -3918,7 +3938,9 @@ impl PluginCache {
         // live PluginCache stays on the old plugins while the registry
         // already reflects the rejected reload's schemas.
         if !plugin_errors.is_empty() {
-            crate::plugins::utils::log_schema::registry::abort_reload();
+            if let Err(error) = crate::plugins::utils::log_schema::registry::abort_reload() {
+                plugin_errors.push(error);
+            }
             for err in &plugin_errors {
                 error!("{}", err);
             }
@@ -3930,13 +3952,20 @@ impl PluginCache {
         }
 
         if let Err(error) = start_background_tasks(&proxy_map, &global_plugins) {
-            crate::plugins::utils::log_schema::registry::abort_reload();
+            crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                |registry_error| {
+                    format!(
+                        "Gateway startup aborted: {error}; registry abort also failed: {registry_error}"
+                    )
+                },
+            )?;
             return Err(format!("Gateway startup aborted: {error}"));
         }
 
         // All plugins validated — promote the staged named schemas to live.
         // Pairs with the `begin_reload` at the start of this function.
-        crate::plugins::utils::log_schema::registry::commit_reload();
+        crate::plugins::utils::log_schema::registry::commit_reload()
+            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
 
         let global_needs_buffering = global_plugins
             .iter()

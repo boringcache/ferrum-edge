@@ -2774,6 +2774,135 @@ fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
 
 // ---- Protocol-filtered plugin lookup tests ----
 
+#[test]
+fn transaction_log_schema_only_cache_preserves_no_plugin_fast_path_for_all_protocols() {
+    use ferrum_edge::plugins::utils::log_schema::registry;
+
+    let _guard = registry::lock_for_tests();
+    registry::reset_for_tests();
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![
+            make_plugin_config_with_json(
+                "schemas-a",
+                "transaction_log_schema",
+                json!({"schemas": {"audit-a": {"summary_type": "both"}}}),
+                PluginScope::Global,
+                None,
+            ),
+            make_plugin_config_with_json(
+                "schemas-b",
+                "transaction_log_schema",
+                json!({"schemas": {"audit-b": {"summary_type": "both"}}}),
+                PluginScope::Global,
+                None,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("schema-only cache must build");
+
+    assert!(cache.get_plugins("p1").is_empty());
+    assert!(cache.get_plugins("unknown").is_empty());
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+        ProxyProtocol::Tcp,
+        ProxyProtocol::Udp,
+    ] {
+        let first_view = cache.request_view("p1", protocol);
+        let second_view = cache.request_view("p1", protocol);
+        let first_plugins = first_view.plugins();
+        let second_plugins = second_view.plugins();
+        assert!(
+            first_plugins.is_empty(),
+            "config-only schema instances leaked into the {protocol:?} runtime list"
+        );
+        assert!(
+            Arc::ptr_eq(&first_plugins, &second_plugins),
+            "{protocol:?} request views must reuse the precomputed plugin list instead of allocating per request"
+        );
+
+        let first_auth = first_view.auth_plugins();
+        let second_auth = second_view.auth_plugins();
+        let first_authorize = first_view.authorize_plugins();
+        let second_authorize = second_view.authorize_plugins();
+        let first_backend_admission = first_view.backend_admission_plugins();
+        let second_backend_admission = second_view.backend_admission_plugins();
+        let first_redactions = first_view.request_headers_to_redact();
+        let second_redactions = second_view.request_headers_to_redact();
+        let first_initial_response = first_view.initial_response_header_policy_plugins();
+        let second_initial_response = second_view.initial_response_header_policy_plugins();
+        let first_initial_names = first_view.initial_response_header_policy_names();
+        let second_initial_names = second_view.initial_response_header_policy_names();
+        assert!(Arc::ptr_eq(&first_auth, &second_auth));
+        assert!(Arc::ptr_eq(&first_authorize, &second_authorize));
+        assert!(Arc::ptr_eq(
+            &first_backend_admission,
+            &second_backend_admission
+        ));
+        assert!(Arc::ptr_eq(&first_redactions, &second_redactions));
+        assert!(Arc::ptr_eq(
+            &first_initial_response,
+            &second_initial_response
+        ));
+        assert!(Arc::ptr_eq(&first_initial_names, &second_initial_names));
+        assert!(!first_view.requires_response_body_buffering());
+        assert!(!first_view.requires_request_body_buffering());
+        assert!(!first_view.requires_ws_frame_hooks());
+    }
+    assert!(registry::lookup_named("audit-a").is_some());
+    assert!(registry::lookup_named("audit-b").is_some());
+}
+
+#[test]
+fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries() {
+    use ferrum_edge::plugins::utils::log_schema::registry;
+
+    let _guard = registry::lock_for_tests();
+    registry::reset_for_tests();
+    let old_schema = make_plugin_config_with_json(
+        "schemas",
+        "transaction_log_schema",
+        json!({"schemas": {"before": {}}}),
+        PluginScope::Global,
+        None,
+    );
+    let old_config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![old_schema.clone()],
+    );
+    let cache = PluginCache::new(&old_config).expect("initial schema cache");
+
+    let mut new_schema = old_schema;
+    new_schema.config = json!({"schemas": {"after": {}}});
+    new_schema.updated_at += chrono::Duration::seconds(1);
+    let new_config = make_config(vec![make_proxy("p1", "/api", vec![])], vec![new_schema]);
+    let delta = ConfigDelta::compute(&old_config, &new_config);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+    cache
+        .apply_delta(
+            &new_config,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect("schema delta reload");
+
+    assert!(registry::lookup_named("before").is_none());
+    assert!(registry::lookup_named("after").is_some());
+    assert!(cache.get_plugins("p1").is_empty());
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+        ProxyProtocol::Tcp,
+        ProxyProtocol::Udp,
+    ] {
+        assert!(cache.get_plugins_for_protocol("p1", protocol).is_empty());
+    }
+}
+
 fn make_plugin_config_with_json(
     id: &str,
     plugin_name: &str,
@@ -4919,6 +5048,38 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
         caps.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT),
         "WAF plugin must set NEEDS_FINAL_REQUEST_BODY_CONTEXT so the proxy \
          passes a mutable RequestContext into on_final_request_body hooks"
+    );
+}
+
+#[test]
+fn test_ai_federation_sets_terminal_final_body_dispatch_capability() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "ai_federation",
+        json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "api_key": "sk-test-key",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    // Exercise the priority wrapper too: it must forward the terminal dispatch
+    // contract or the proxy would run federation inside backend accounting.
+    plugin_config.priority_override = Some(2099);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        caps.has(PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH),
+        "AI federation must finalize and dispatch before backend-only preflights and accounting"
     );
 }
 
