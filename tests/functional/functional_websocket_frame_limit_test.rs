@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
 
@@ -27,7 +27,8 @@ const MAX_FRAME_BYTES: &str = "16";
 #[ignore]
 #[tokio::test]
 async fn functional_websocket_frame_limit_h1_rejects_oversized_client_frame() {
-    let (backend_port, backend_messages, backend_task) = spawn_counting_ws_backend().await;
+    let (backend_port, backend_messages, mut backend_closes, backend_task) =
+        spawn_counting_ws_backend().await;
     let mut gateway = frame_limit_gateway_builder(backend_port)
         .spawn()
         .await
@@ -38,6 +39,30 @@ async fn functional_websocket_frame_limit_h1_rejects_oversized_client_frame() {
         .expect("proxy port ready");
 
     let url = format!("ws://127.0.0.1:{}/ws", gateway.proxy_port);
+    let (mut graceful_ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("H1 graceful-close websocket connect");
+    let graceful_reason = "graceful close exceeds sixteen bytes";
+    graceful_ws
+        .send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: graceful_reason.into(),
+        })))
+        .await
+        .expect("send H1 graceful Close above application frame ceiling");
+    let graceful_reply = graceful_ws
+        .next()
+        .await
+        .expect("H1 graceful Close reply")
+        .expect("valid H1 Close must bypass application frame ceiling");
+    let Message::Close(graceful_reply) = graceful_reply else {
+        panic!("expected echoed H1 Close, got {graceful_reply:?}");
+    };
+    if let Some(graceful_reply) = graceful_reply {
+        assert_ne!(graceful_reply.code, CloseCode::Size);
+    }
+    assert_backend_close(&mut backend_closes, CloseCode::Normal, graceful_reason).await;
+
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("H1 websocket connect");
@@ -64,7 +89,8 @@ async fn functional_websocket_frame_limit_h1_rejects_oversized_client_frame() {
 #[ignore]
 #[tokio::test]
 async fn functional_websocket_frame_limit_h3_rejects_oversized_client_frame() {
-    let (backend_port, backend_messages, backend_task) = spawn_counting_ws_backend().await;
+    let (backend_port, backend_messages, _backend_closes, backend_task) =
+        spawn_counting_ws_backend().await;
     let https_port = reserve_https_port().await;
     let mut gateway = frame_limit_gateway_builder(backend_port)
         .env("FERRUM_ENABLE_HTTP3", "true")
@@ -145,6 +171,45 @@ async fn functional_ws_message_size_limit_h2_sends_1009_to_both_peers() {
         .expect("upgrade H2 CONNECT");
     let mut ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Client, None).await;
 
+    let graceful_request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{}/ws", gateway.proxy_port))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build graceful H2 WebSocket request");
+    let graceful_response = sender
+        .send_request(graceful_request)
+        .await
+        .expect("send graceful H2 WebSocket request");
+    assert_eq!(graceful_response.status(), StatusCode::OK);
+    let graceful_upgraded = hyper::upgrade::on(graceful_response)
+        .await
+        .expect("upgrade graceful H2 CONNECT");
+    let mut graceful_ws =
+        WebSocketStream::from_raw_socket(TokioIo::new(graceful_upgraded), Role::Client, None).await;
+    let graceful_reason = "graceful close exceeds sixteen bytes";
+    graceful_ws
+        .send(Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: graceful_reason.into(),
+        })))
+        .await
+        .expect("send H2 graceful Close above plugin frame ceiling");
+    let graceful_reply = graceful_ws
+        .next()
+        .await
+        .expect("H2 graceful Close reply")
+        .expect("valid H2 Close must bypass plugin frame ceiling");
+    let Message::Close(graceful_reply) = graceful_reply else {
+        panic!("expected echoed H2 Close, got {graceful_reply:?}");
+    };
+    if let Some(graceful_reply) = graceful_reply {
+        assert_ne!(graceful_reply.code, CloseCode::Size);
+    }
+    assert_backend_close(&mut backend_closes, CloseCode::Normal, graceful_reason).await;
+
     ws.send(Message::Frame(Frame::message(
         vec![1u8; 16],
         OpCode::Data(Data::Binary),
@@ -210,7 +275,7 @@ async fn functional_ws_message_size_limit_h2_sends_1009_to_both_peers() {
     .expect("H2 close timed out");
     assert_eq!(h2_close.code, CloseCode::Size);
     assert_eq!(h2_close.reason.as_str(), "plugin frame limit");
-    assert_backend_detailed_close(&mut backend_closes).await;
+    assert_backend_close(&mut backend_closes, CloseCode::Size, "plugin frame limit").await;
 
     drop(ws);
     let _ = tokio::time::timeout(Duration::from_secs(2), conn_task).await;
@@ -236,6 +301,26 @@ async fn functional_ws_message_size_limit_h3_sends_1009_to_both_peers() {
 
     let client = Http3Client::insecure().expect("H3 client");
     let url = format!("https://localhost:{https_port}/ws");
+    let mut graceful_ws = retry_h3_websocket(&client, &url).await;
+    let graceful_reason = "graceful close exceeds sixteen bytes";
+    let mut graceful_payload = Vec::from(u16::from(CloseCode::Normal).to_be_bytes());
+    graceful_payload.extend_from_slice(graceful_reason.as_bytes());
+    graceful_ws
+        .send_fragment(0x8, &graceful_payload, true)
+        .await
+        .expect("send H3 graceful Close above plugin frame ceiling");
+    let graceful_reply = graceful_ws
+        .recv_frame()
+        .await
+        .expect("valid H3 Close must bypass plugin frame ceiling");
+    let H3WebSocketFrame::Close(graceful_reply) = graceful_reply else {
+        panic!("expected echoed H3 Close, got {graceful_reply:?}");
+    };
+    if graceful_reply.len() >= 2 {
+        assert_ne!(u16::from_be_bytes([graceful_reply[0], graceful_reply[1]]), 1009);
+    }
+    assert_backend_close(&mut backend_closes, CloseCode::Normal, graceful_reason).await;
+
     let mut ws = retry_h3_websocket(&client, &url).await;
     ws.send_fragment(0x2, &[1u8; 16], false)
         .await
@@ -295,7 +380,7 @@ async fn functional_ws_message_size_limit_h3_sends_1009_to_both_peers() {
         other => panic!("expected H3 Close, got {other:?}"),
     };
     assert_close_payload(&payload);
-    assert_backend_detailed_close(&mut backend_closes).await;
+    assert_backend_close(&mut backend_closes, CloseCode::Size, "plugin frame limit").await;
 
     gateway.shutdown();
     backend_task.abort();
@@ -355,6 +440,7 @@ fn plugin_frame_limit_config(backend_port: u16) -> String {
             "scope": "proxy",
             "proxy_id": "ws-frame-limit",
             "enabled": true,
+            "priority_override": 101,
             "config": {
                 "max_frame_bytes": 16,
                 "max_message_bytes": 64,
@@ -452,34 +538,51 @@ fn assert_close_payload(payload: &[u8]) {
     );
 }
 
-async fn assert_backend_detailed_close(
+async fn assert_backend_close(
     backend_closes: &mut mpsc::UnboundedReceiver<(CloseCode, String)>,
+    expected_code: CloseCode,
+    expected_reason: &str,
 ) {
     let (code, reason) = tokio::time::timeout(Duration::from_secs(2), backend_closes.recv())
         .await
         .expect("backend close timed out")
         .expect("backend close channel ended");
-    assert_eq!(code, CloseCode::Size);
-    assert_eq!(reason, "plugin frame limit");
+    assert_eq!(code, expected_code);
+    assert_eq!(reason, expected_reason);
 }
 
-async fn spawn_counting_ws_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
+async fn spawn_counting_ws_backend() -> (
+    u16,
+    Arc<AtomicUsize>,
+    mpsc::UnboundedReceiver<(CloseCode, String)>,
+    JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind WebSocket backend");
     let port = listener.local_addr().expect("backend addr").port();
     let messages = Arc::new(AtomicUsize::new(0));
-    let task = tokio::spawn(run_counting_ws_backend(listener, Arc::clone(&messages)));
-    (port, messages, task)
+    let (close_tx, close_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run_counting_ws_backend(
+        listener,
+        Arc::clone(&messages),
+        close_tx,
+    ));
+    (port, messages, close_rx, task)
 }
 
 #[allow(clippy::collapsible_match)]
-async fn run_counting_ws_backend(listener: TcpListener, messages: Arc<AtomicUsize>) {
+async fn run_counting_ws_backend(
+    listener: TcpListener,
+    messages: Arc<AtomicUsize>,
+    close_tx: mpsc::UnboundedSender<(CloseCode, String)>,
+) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
         let messages = Arc::clone(&messages);
+        let close_tx = close_tx.clone();
         tokio::spawn(async move {
             let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                 Ok(ws) => ws,
@@ -506,8 +609,13 @@ async fn run_counting_ws_backend(listener: TcpListener, messages: Arc<AtomicUsiz
                             break;
                         }
                     }
-                    Message::Close(close) => {
-                        let _ = sink.send(Message::Close(close)).await;
+                    Message::Close(Some(close)) => {
+                        let _ = close_tx.send((close.code, close.reason.to_string()));
+                        let _ = sink.send(Message::Close(Some(close))).await;
+                        break;
+                    }
+                    Message::Close(None) => {
+                        let _ = sink.send(Message::Close(None)).await;
                         break;
                     }
                     _ => {}

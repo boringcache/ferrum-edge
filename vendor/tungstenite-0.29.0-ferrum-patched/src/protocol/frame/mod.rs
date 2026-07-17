@@ -12,6 +12,7 @@ pub use self::{
     utf8::Utf8Bytes,
 };
 
+use self::coding::{Control, OpCode};
 use crate::{
     error::{CapacityError, Error, ProtocolError, Result},
     protocol::frame::mask::apply_mask,
@@ -192,11 +193,25 @@ impl FrameCodec {
                 let advanced = cursor.position();
                 bytes::Buf::advance(&mut self.in_buffer, advanced as _);
 
-                if let Some((_, len)) = &self.header {
+                if let Some((header, len)) = &self.header {
                     let len = *len as usize;
 
-                    // Enforce frame size limit early
-                    if len > max_size {
+                    // Enforce RFC 6455's control-frame bound before reserving
+                    // payload memory. Close frames bypass the caller's policy
+                    // ceiling so a small application limit cannot turn a
+                    // graceful shutdown into a 1009 policy violation, but an
+                    // attacker still cannot use a declared Close length to
+                    // trigger an unbounded reservation.
+                    if matches!(header.opcode, OpCode::Control(_)) && len > 125 {
+                        return Err(Error::Protocol(ProtocolError::ControlFrameTooBig));
+                    }
+
+                    // Enforce the caller's frame-size policy before reserving
+                    // payload memory. Ping and Pong remain policy-controlled;
+                    // valid Close frames are transport teardown, not data.
+                    if len > max_size
+                        && !matches!(header.opcode, OpCode::Control(Control::Close))
+                    {
                         return Err(Error::Capacity(CapacityError::MessageTooLong {
                             size: len,
                             max_size,

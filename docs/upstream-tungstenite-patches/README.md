@@ -1,4 +1,4 @@
-# Vendored tungstenite patches: lossless WebSocket raw takeover
+# Vendored tungstenite patches: WebSocket takeover and bounded parsing
 
 > Governance: tracked in [docs/dependency-policy.md](../dependency-policy.md). Any
 > change to `vendor/tungstenite-0.29.0-ferrum-patched/` or
@@ -10,6 +10,10 @@
 Ferrum vendors patched copies of `tungstenite` and `tokio-tungstenite` so
 WebSocket tunnel mode can recover bytes that the backend coalesced with the
 `101 Switching Protocols` response before dropping to raw bidirectional relay.
+The tungstenite copy also carries Ferrum's early frame-policy enforcement: the
+declared payload length is checked before reservation, valid Close frames bypass
+the application ceiling, and every control frame is still rejected above RFC
+6455's 125-byte limit before allocation.
 
 ## Upstream tracking
 
@@ -37,6 +41,10 @@ upstream proposals:
 - Added a short `Ferrum local patch` changelog section to each vendored crate
   because the packaged release source does not carry the upstream PR's
   `UNRELEASED` heading.
+- Made the frame decoder's pre-reservation policy check opcode-aware. Text,
+  Binary, continuation, Ping, and Pong payloads honor the caller ceiling; valid
+  Close frames bypass it, while the protocol's 125-byte control-frame maximum
+  remains an independent pre-allocation bound.
 - Wired both crates through root `[patch.crates-io]`.
 
 No private Ferrum-only API was added.

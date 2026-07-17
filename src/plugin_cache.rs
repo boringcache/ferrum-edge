@@ -40,7 +40,7 @@ use crate::plugins::{
 use crate::plugins::{
     BackendPathPolicyPhase, PluginResult, RequestContext, ResponseStreamInspector,
     StreamConnectionContext, StreamTransactionSummary, TransactionSummary, UdpDatagramContext,
-    UdpDatagramVerdict, WebSocketFrameDirection,
+    UdpDatagramVerdict, WebSocketFrameDirection, WebSocketSizeLimits,
 };
 use async_trait::async_trait;
 
@@ -680,6 +680,12 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn requires_ws_frame_hooks(&self) -> bool {
         self.inner.requires_ws_frame_hooks()
+    }
+    fn websocket_size_limits(&self) -> Option<WebSocketSizeLimits> {
+        self.inner.websocket_size_limits()
+    }
+    fn requires_websocket_framing(&self) -> bool {
+        self.inner.requires_websocket_framing()
     }
     async fn on_ws_frame(
         &self,

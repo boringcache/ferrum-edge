@@ -1,6 +1,7 @@
 # Ferrum local patch
 
 * Backport snapview/tungstenite-rs#556: add `WebSocket::into_inner_with_read_buffer()` and `WebSocketContext::into_read_buffer()` so callers taking over the raw stream at a frame boundary can recover buffered bytes that `into_inner()` discards.
+* Enforce caller-supplied frame limits before payload reservation while exempting valid Close frames; all control frames remain capped at RFC 6455's 125-byte maximum before allocation.
 
 # 0.29.0
 

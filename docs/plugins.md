@@ -4656,13 +4656,15 @@ that hook so they can enforce actual wire-frame boundaries safely.
 
 ### `ws_message_size_limiting`
 
-Enforces an actual WebSocket frame-payload ceiling before payload reservation,
-including every continuation and control frame, plus an independent bound on
-the complete reassembled Text/Binary message. A fragmented message may exceed
-`max_frame_bytes` cumulatively as long as each individual frame is within that
-limit and the message remains within `max_message_bytes`. Fragmented Text keeps
-tungstenite's incremental UTF-8 validation, and interleaved Ping/Pong frames do
-not reset message state.
+Enforces an actual WebSocket frame-payload ceiling before payload reservation
+for Text, Binary, continuation, Ping, and Pong frames, plus an independent bound
+on the complete reassembled Text/Binary message. Valid Close frames bypass the
+application ceiling so teardown remains protocol-correct; every control frame
+still receives the independent RFC 6455 125-byte pre-allocation bound. A
+fragmented message may exceed `max_frame_bytes` cumulatively as long as each
+individual frame is within that limit and the message remains within
+`max_message_bytes`. Fragmented Text keeps tungstenite's incremental UTF-8
+validation, and interleaved Ping/Pong frames do not reset message state.
 
 On either violation the gateway publishes cancellation before attempting
 bounded polite-close writes and sends close code **1009 (Message Too Big)**

@@ -3219,24 +3219,40 @@ fn test_ws_frame_direction_debug_and_equality() {
 }
 
 #[test]
-fn test_plugin_cache_requires_ws_frame_hooks_true_with_ws_size_plugin() {
+fn test_priority_override_preserves_ws_parser_policy_and_framing() {
     // A parser-policy-only plugin must select the framed relay even though it
-    // does not opt into the post-reassembly message hook.
+    // does not opt into the post-reassembly message hook. Priority overrides
+    // must not hide either capability behind their wrapper.
+    let mut limiter = make_plugin_config(
+        "ws1",
+        "ws_message_size_limiting",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    limiter.priority_override = Some(101);
     let config = make_config(
         vec![make_proxy("p1", "/ws", vec!["ws1"])],
-        vec![make_plugin_config(
-            "ws1",
-            "ws_message_size_limiting",
-            PluginScope::Proxy,
-            Some("p1"),
-            true,
-        )],
+        vec![limiter],
     );
     let cache = PluginCache::new(&config).unwrap();
     assert!(
         cache.requires_ws_frame_hooks("p1"),
         "parser size policy must select the framed relay"
     );
+    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let limiter = ws_plugins
+        .iter()
+        .find(|plugin| plugin.name() == "ws_message_size_limiting")
+        .expect("wrapped limiter remains in WebSocket chain");
+    assert_eq!(limiter.priority(), 101);
+    assert!(!limiter.requires_ws_frame_hooks());
+    assert!(limiter.requires_websocket_framing());
+    let limits = limiter
+        .websocket_size_limits()
+        .expect("priority wrapper delegates parser policy");
+    assert_eq!(limits.max_frame_bytes, 65_536);
+    assert_eq!(limits.max_message_bytes, 262_144);
 }
 
 #[test]
