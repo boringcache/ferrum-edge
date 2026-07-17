@@ -705,15 +705,17 @@ async fn test_istio_policy_without_origin_strips_response_mock_access_control_he
     ));
 
     let mut request_headers = HashMap::new();
-    let (status_code, body, mut response_headers) =
-        match response_mock.before_proxy(&mut ctx, &mut request_headers).await {
-            PluginResult::Reject {
-                status_code,
-                body,
-                headers,
-            } => (status_code, body, headers),
-            _ => panic!("response_mock must short-circuit the request"),
-        };
+    let (status_code, body, mut response_headers) = match response_mock
+        .before_proxy(&mut ctx, &mut request_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body, headers),
+        _ => panic!("response_mock must short-circuit the request"),
+    };
     ctx.metadata
         .insert("ferrum:rejection_response".to_string(), "true".to_string());
 
@@ -750,15 +752,17 @@ async fn test_response_mock_headers_survive_rejection_without_cors_participation
     .unwrap();
     let mut ctx = make_ctx();
     let mut request_headers = HashMap::new();
-    let (status_code, body, mut response_headers) =
-        match response_mock.before_proxy(&mut ctx, &mut request_headers).await {
-            PluginResult::Reject {
-                status_code,
-                body,
-                headers,
-            } => (status_code, body, headers),
-            _ => panic!("response_mock must short-circuit the request"),
-        };
+    let (status_code, body, mut response_headers) = match response_mock
+        .before_proxy(&mut ctx, &mut request_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body, headers),
+        _ => panic!("response_mock must short-circuit the request"),
+    };
     let expected_headers = response_headers.clone();
     ctx.metadata
         .insert("ferrum:rejection_response".to_string(), "true".to_string());

@@ -888,8 +888,7 @@ fn finalize_cors_response(
     // request hook participates, including the no-Origin early return where no
     // policy is counted. Native no-Origin short-circuits retain direct-plugin
     // semantics; native requests with an Origin have a counted policy.
-    let policy_owns_rejection =
-        ctx.cors_state.policy_count > 0 || ctx.cors_state.istio_policy_seen;
+    let policy_owns_rejection = ctx.cors_state.policy_count > 0 || ctx.cors_state.istio_policy_seen;
     if should_sanitize && (!is_rejection_path || policy_owns_rejection) {
         CorsPlugin::remove_access_control_headers(response_headers);
     }
