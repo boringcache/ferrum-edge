@@ -4762,6 +4762,7 @@ fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClien
             plugins::PluginHttpClient::default_with_backend_allow_ips(
                 state.backend_allow_ips.clone(),
             )
+            .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
         })
 }
 

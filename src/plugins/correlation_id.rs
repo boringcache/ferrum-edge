@@ -39,6 +39,8 @@ const RESERVED_HEADER_NAMES: &[&str] = &[
     "sec-websocket-version",
     "set-cookie",
     "te",
+    "traceparent",
+    "tracestate",
     "trailer",
     "transfer-encoding",
     "upgrade",
@@ -65,6 +67,13 @@ pub struct CorrelationId {
 
 impl CorrelationId {
     pub fn new(config: &Value) -> Result<Self, String> {
+        Self::new_with_real_ip_header(config, None)
+    }
+
+    pub(crate) fn new_with_real_ip_header(
+        config: &Value,
+        real_ip_header: Option<&str>,
+    ) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "correlation_id: config must be a JSON object".to_string())?;
@@ -113,6 +122,14 @@ impl CorrelationId {
                 ));
             }
         };
+
+        if real_ip_header
+            .is_some_and(|configured| header_name.eq_ignore_ascii_case(configured))
+        {
+            return Err(format!(
+                "correlation_id: 'header_name' conflicts with the effective FERRUM_REAL_IP_HEADER client-attribution header and cannot be used for correlation IDs: {header_name:?}"
+            ));
+        }
 
         let echo_downstream = match config.get("echo_downstream") {
             None | Some(Value::Null) => true,

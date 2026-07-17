@@ -2191,6 +2191,16 @@ async fn test_admin_create_rejects_malformed_correlation_id_configs() {
             "correlation_id: 'header_name' is protocol-managed",
         ),
         (
+            "correlation-traceparent",
+            json!({"header_name": "Traceparent"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+        (
+            "correlation-tracestate",
+            json!({"header_name": "Tracestate"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+        (
             "correlation-credential-header",
             json!({"header_name": "Authorization"}),
             "correlation_id: 'header_name' is protocol-managed or security-sensitive",

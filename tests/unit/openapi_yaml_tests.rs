@@ -1816,6 +1816,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "Sec-WebSocket-Version"}),
         json!({"header_name": "Set-Cookie"}),
         json!({"header_name": "TE"}),
+        json!({"header_name": "Traceparent"}),
+        json!({"header_name": "Tracestate"}),
         json!({"header_name": "Trailer"}),
         json!({"header_name": "Transfer-Encoding"}),
         json!({"header_name": "Upgrade"}),
@@ -1850,6 +1852,8 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
             .unwrap_or_else(|error| panic!("correlation exclusion compiles: {error}"));
         for reserved in [
             json!(" Early-Data "),
+            json!(" Traceparent "),
+            json!("Tracestate"),
             json!("X-Ferrum-Original-Content-Encoding"),
             json!("x-gRPC-wEB-mODE"),
         ] {

@@ -113,6 +113,8 @@ fn test_constructor_rejects_protocol_managed_and_security_sensitive_header_names
         "Sec-WebSocket-Version",
         "Set-Cookie",
         "TE",
+        "Traceparent",
+        "Tracestate",
         "Trailer",
         "Transfer-Encoding",
         "Upgrade",
@@ -135,6 +137,40 @@ fn test_constructor_rejects_protocol_managed_and_security_sensitive_header_names
             .expect("reserved header must be rejected");
         assert!(err.contains("protocol-managed"), "{header_name}: {err}");
     }
+}
+
+#[test]
+fn test_constructor_rejects_effective_real_ip_header_case_insensitively() {
+    let error = ferrum_edge::_test_support::correlation_id_with_real_ip_header_for_test(
+        &json!({"header_name": " CF-Connecting-IP "}),
+        Some("cf-connecting-ip"),
+    )
+    .err()
+    .expect("configured real-IP header collision must fail closed");
+    assert!(error.contains("FERRUM_REAL_IP_HEADER"), "got: {error}");
+    assert!(error.contains("CF-Connecting-IP"), "got: {error}");
+}
+
+#[test]
+fn test_constructor_rejects_default_header_when_used_for_real_ip() {
+    let error = ferrum_edge::_test_support::correlation_id_with_real_ip_header_for_test(
+        &json!({}),
+        Some("X-Request-ID"),
+    )
+    .err()
+    .expect("the default correlation header must not replace the real-IP header");
+    assert!(error.contains("FERRUM_REAL_IP_HEADER"), "got: {error}");
+    assert!(error.contains("x-request-id"), "got: {error}");
+}
+
+#[test]
+fn test_constructor_accepts_header_distinct_from_effective_real_ip_header() {
+    let plugin = ferrum_edge::_test_support::correlation_id_with_real_ip_header_for_test(
+        &json!({"header_name": "X-Request-ID"}),
+        Some("cloudfront-viewer-address"),
+    )
+    .expect("distinct correlation and real-IP headers must remain valid");
+    assert_eq!(plugin.correlation_id_header_name(), Some("x-request-id"));
 }
 
 #[test]

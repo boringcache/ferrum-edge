@@ -3877,7 +3877,8 @@ pub trait Plugin: Send + Sync {
 
     /// Return the non-empty correlation header owned by this instance, or
     /// `None` when it owns no correlation header. Plugin-cache admission trims
-    /// and ASCII-case-folds claims before rejecting empty or ambiguous writers.
+    /// and ASCII-case-folds claims before rejecting empty, deployment-owned
+    /// `FERRUM_REAL_IP_HEADER`, or ambiguous writers.
     #[doc(hidden)]
     fn correlation_id_header_name(&self) -> Option<&str> {
         None
@@ -5151,7 +5152,12 @@ pub fn create_plugin_with_http_client(
             config,
         )?))),
         "bot_detection" => Ok(Some(Arc::new(bot_detection::BotDetection::new(config)?))),
-        "correlation_id" => Ok(Some(Arc::new(correlation_id::CorrelationId::new(config)?))),
+        "correlation_id" => Ok(Some(Arc::new(
+            correlation_id::CorrelationId::new_with_real_ip_header(
+                config,
+                http_client.real_ip_header(),
+            )?,
+        ))),
         "request_transformer" => Ok(Some(Arc::new(
             request_transformer::RequestTransformer::new(config)?,
         ))),
@@ -5389,7 +5395,8 @@ pub fn validate_plugin_config_with_policy(
     config: &Value,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
-    let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
+    let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
+        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header());
     validate_plugin_config_with_http_client(name, config, http_client)?;
     validate_plugin_config_policy_only(name, config, backend_allow_ips)
 }

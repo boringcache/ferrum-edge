@@ -262,6 +262,7 @@ fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> R
 /// while allowing disjoint protocol owners that can never contend at runtime.
 pub(crate) fn validate_correlation_id_composition(
     plugins: &[Arc<dyn Plugin>],
+    real_ip_header: Option<&str>,
 ) -> Result<(), String> {
     for protocol in ALL_PROXY_PROTOCOLS {
         let mut headers = HashSet::new();
@@ -286,6 +287,14 @@ pub(crate) fn validate_correlation_id_composition(
                 ));
             }
             let normalized_header_name = trimmed_header_name.to_ascii_lowercase();
+            if real_ip_header
+                .is_some_and(|configured| normalized_header_name.eq_ignore_ascii_case(configured))
+            {
+                return Err(format!(
+                    "correlation_id: effective header_name {normalized_header_name:?} for plugin {:?} and protocol {protocol:?} conflicts with the effective FERRUM_REAL_IP_HEADER client-attribution header",
+                    plugin.name()
+                ));
+            }
             if !headers.insert(normalized_header_name.clone()) {
                 return Err(format!(
                     "correlation_id: duplicate effective header_name {normalized_header_name:?} for protocol {protocol:?} on the same plugin chain; each overlapping correlation trust domain must use a distinct header"
@@ -302,9 +311,12 @@ pub(crate) fn validate_correlation_id_composition(
     Ok(())
 }
 
-fn validate_plugin_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
+fn validate_plugin_composition(
+    plugins: &[Arc<dyn Plugin>],
+    real_ip_header: Option<&str>,
+) -> Result<(), String> {
     validate_hmac_request_transform_composition(plugins)?;
-    validate_correlation_id_composition(plugins)
+    validate_correlation_id_composition(plugins, real_ip_header)
 }
 
 #[async_trait]
@@ -2254,13 +2266,17 @@ pub(crate) fn validate_plugin_composition_candidate(
             remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
             merged.push(Arc::clone(plugin));
         }
-        if let Err(error) = validate_plugin_composition(&merged) {
+        if let Err(error) =
+            validate_plugin_composition(&merged, http_client.real_ip_header())
+        {
             errors.push(format!("proxy_id={}: {error}", proxy.id));
         }
     }
 
     for (namespace, plugins) in &global_plugins {
-        if let Err(error) = validate_plugin_composition(plugins) {
+        if let Err(error) =
+            validate_plugin_composition(plugins, http_client.real_ip_header())
+        {
             errors.push(format!("global plugins namespace={namespace:?}: {error}"));
         }
     }
@@ -3351,7 +3367,9 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
-            if let Err(e) = validate_plugin_composition(&global_plugins) {
+            if let Err(e) =
+                validate_plugin_composition(&global_plugins, self.http_client.real_ip_header())
+            {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
             Arc::new(global_plugins)
@@ -3605,7 +3623,9 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) = validate_plugin_composition(&merged) {
+            if let Err(e) =
+                validate_plugin_composition(&merged, self.http_client.real_ip_header())
+            {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
             new_map.insert(proxy.id.clone(), Arc::new(merged));
@@ -4174,7 +4194,7 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) = validate_plugin_composition(&merged) {
+            if let Err(e) = validate_plugin_composition(&merged, http_client.real_ip_header()) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
 
@@ -4203,7 +4223,9 @@ impl PluginCache {
         if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
-        if let Err(e) = validate_plugin_composition(&global_plugins) {
+        if let Err(e) =
+            validate_plugin_composition(&global_plugins, http_client.real_ip_header())
+        {
             plugin_errors.push(format!("global plugins: {e}"));
         }
 

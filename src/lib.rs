@@ -94,7 +94,42 @@ pub mod _test_support {
     pub fn validate_correlation_id_composition_for_test(
         plugins: &[Arc<dyn Plugin>],
     ) -> Result<(), String> {
-        crate::plugin_cache::validate_correlation_id_composition(plugins)
+        crate::plugin_cache::validate_correlation_id_composition(plugins, None)
+    }
+
+    pub fn validate_correlation_id_composition_with_real_ip_header_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        real_ip_header: Option<&str>,
+    ) -> Result<(), String> {
+        crate::plugin_cache::validate_correlation_id_composition(plugins, real_ip_header)
+    }
+
+    pub fn correlation_id_with_real_ip_header_for_test(
+        config: &serde_json::Value,
+        real_ip_header: Option<&str>,
+    ) -> Result<crate::plugins::correlation_id::CorrelationId, String> {
+        crate::plugins::correlation_id::CorrelationId::new_with_real_ip_header(
+            config,
+            real_ip_header,
+        )
+    }
+
+    pub fn plugin_cache_with_real_ip_header_for_test(
+        config: &crate::config::types::GatewayConfig,
+        real_ip_header: Option<&str>,
+    ) -> Result<crate::PluginCache, String> {
+        let http_client = crate::plugins::PluginHttpClient::default()
+            .with_real_ip_header(real_ip_header.map(str::to_string));
+        crate::PluginCache::with_http_client(config, http_client)
+    }
+
+    pub fn validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        config: &crate::config::types::GatewayConfig,
+        real_ip_header: Option<&str>,
+    ) -> Result<(), String> {
+        let http_client = crate::plugins::PluginHttpClient::default()
+            .with_real_ip_header(real_ip_header.map(str::to_string));
+        crate::plugin_cache::validate_plugin_composition_candidate(config, &http_client)
     }
 
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────

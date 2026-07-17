@@ -6,6 +6,11 @@ use ferrum_edge::config::types::{
     PluginScope, Proxy,
 };
 use ferrum_edge::config_delta::ConfigDelta;
+use ferrum_edge::_test_support::{
+    plugin_cache_with_real_ip_header_for_test,
+    validate_correlation_id_composition_with_real_ip_header_for_test,
+    validate_plugin_composition_candidate_with_real_ip_header_for_test,
+};
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
     apply_initial_response_header_policies,
@@ -5296,6 +5301,55 @@ fn test_duplicate_effective_correlation_headers_are_rejected() {
 }
 
 #[test]
+fn test_real_ip_header_collision_is_rejected_by_candidate_and_runtime_cache() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr"])],
+        vec![make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": " CF-Connecting-IP "}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    let candidate_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &config,
+        Some("cf-connecting-ip"),
+    )
+    .expect_err("candidate admission must reject the real-IP header collision");
+    assert!(candidate_error.contains("FERRUM_REAL_IP_HEADER"));
+
+    let cache_error =
+        plugin_cache_with_real_ip_header_for_test(&config, Some("cf-connecting-ip"))
+            .err()
+            .expect("runtime cache construction must reject the real-IP header collision");
+    assert!(cache_error.contains("FERRUM_REAL_IP_HEADER"));
+}
+
+#[test]
+fn test_real_ip_header_non_collision_is_accepted_by_candidate_and_runtime_cache() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr"])],
+        vec![make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": "X-Request-ID"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &config,
+        Some("cloudfront-viewer-address"),
+    )
+    .expect("distinct candidate headers must be accepted");
+    plugin_cache_with_real_ip_header_for_test(&config, Some("cloudfront-viewer-address"))
+    .expect("distinct runtime headers must be accepted");
+}
+
+#[test]
 fn test_equal_effective_correlation_priorities_are_rejected() {
     let config = make_config(
         vec![make_proxy(
@@ -5416,6 +5470,20 @@ fn test_empty_third_party_correlation_capability_claims_fail_closed_clearly() {
             "got: {error}"
         );
     }
+}
+
+#[test]
+fn test_third_party_correlation_capability_cannot_claim_real_ip_header() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin {
+        claim: " CF-Connecting-IP ",
+    })];
+    let error = validate_correlation_id_composition_with_real_ip_header_for_test(
+        &plugins,
+        Some("cf-connecting-ip"),
+    )
+    .expect_err("third-party real-IP header collision must fail closed");
+    assert!(error.contains("FERRUM_REAL_IP_HEADER"), "got: {error}");
+    assert!(error.contains("cf-connecting-ip"), "got: {error}");
 }
 
 #[test]
