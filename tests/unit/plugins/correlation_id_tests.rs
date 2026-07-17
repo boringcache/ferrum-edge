@@ -4,6 +4,7 @@ use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, REQUEST_ID_METADATA_KEY, RequestContext, correlation_id::CorrelationId,
     priority,
 };
+use ferrum_edge::_test_support::clone_log_metadata;
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -793,6 +794,22 @@ async fn assert_isolated_instances(external_first: bool) {
         "correlation ownership bookkeeping must not enter public metadata"
     );
 
+    // A later plugin can write arbitrary public metadata names. Those writes
+    // must not replace the authoritative canonical or instance values used for
+    // backend propagation, response echo, or transaction summaries.
+    ctx.metadata.insert(
+        REQUEST_ID_METADATA_KEY.to_string(),
+        "poisoned-canonical-id".to_string(),
+    );
+    ctx.metadata.insert(
+        "correlation_id.instance.x-internal-request-id".to_string(),
+        "poisoned-internal-id".to_string(),
+    );
+    ctx.metadata.insert(
+        "correlation_id.instance.x-external-correlation-id".to_string(),
+        "poisoned-external-id".to_string(),
+    );
+
     let mut backend_headers = HashMap::new();
     for plugin in ordered {
         plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
@@ -804,6 +821,24 @@ async fn assert_isolated_instances(external_first: bool) {
     assert_eq!(
         backend_headers
             .get("x-external-correlation-id")
+            .map(String::as_str),
+        Some("attacker-preserved-id")
+    );
+
+    let logged = clone_log_metadata(&ctx);
+    assert_eq!(
+        logged.get(REQUEST_ID_METADATA_KEY).map(String::as_str),
+        Some(expected_canonical)
+    );
+    assert_eq!(
+        logged
+            .get("correlation_id.instance.x-internal-request-id")
+            .map(String::as_str),
+        Some(internal_id.as_str())
+    );
+    assert_eq!(
+        logged
+            .get("correlation_id.instance.x-external-correlation-id")
             .map(String::as_str),
         Some("attacker-preserved-id")
     );

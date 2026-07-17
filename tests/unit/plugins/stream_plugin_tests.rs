@@ -688,6 +688,34 @@ async fn test_multiple_correlation_instances_keep_stream_ids_isolated() {
         !metadata.contains_key("correlation_id.canonical_owner"),
         "correlation ownership bookkeeping must not enter stream summaries"
     );
+
+    let expected_internal = internal.clone();
+    let expected_external = external.clone();
+    ctx.insert_metadata(
+        REQUEST_ID_METADATA_KEY.to_string(),
+        "poisoned-canonical-id".to_string(),
+    );
+    ctx.insert_metadata(
+        "correlation_id.instance.x-internal-request-id".to_string(),
+        "poisoned-internal-id".to_string(),
+    );
+    ctx.insert_metadata(
+        "correlation_id.instance.x-external-request-id".to_string(),
+        "poisoned-external-id".to_string(),
+    );
+    let metadata = ctx.take_metadata();
+    assert_eq!(
+        metadata.get(REQUEST_ID_METADATA_KEY),
+        Some(&expected_internal)
+    );
+    assert_eq!(
+        metadata.get("correlation_id.instance.x-internal-request-id"),
+        Some(&expected_internal)
+    );
+    assert_eq!(
+        metadata.get("correlation_id.instance.x-external-request-id"),
+        Some(&expected_external)
+    );
 }
 
 // ---- WebSocket-only frame plugins ----

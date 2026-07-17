@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::{Plugin, PluginResult, REQUEST_ID_METADATA_KEY, RequestContext};
+use super::{Plugin, PluginResult, RequestContext};
 
 const INSTANCE_METADATA_PREFIX: &str = "correlation_id.instance.";
 
@@ -123,20 +123,8 @@ impl CorrelationId {
         })
     }
 
-    fn publish_request_id(
-        &self,
-        metadata: &mut HashMap<String, String>,
-        request_id: String,
-        publish_canonical: bool,
-    ) {
-        metadata.insert(self.instance_metadata_key.clone(), request_id.clone());
-        if publish_canonical {
-            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
-        }
-    }
-
-    fn request_id<'a>(&self, ctx: &'a RequestContext) -> Option<&'a String> {
-        ctx.metadata.get(&self.instance_metadata_key)
+    fn request_id<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
+        ctx.correlation_id(&self.instance_metadata_key)
     }
 }
 
@@ -202,9 +190,7 @@ impl Plugin for CorrelationId {
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
         let id = Uuid::new_v4().to_string();
-        let publish_canonical = ctx.claim_canonical_correlation_id();
-        let metadata = ctx.metadata.get_or_insert_with(HashMap::new);
-        self.publish_request_id(metadata, id, publish_canonical);
+        ctx.publish_correlation_id(&self.instance_metadata_key, id);
         super::PluginResult::Continue
     }
 
@@ -213,8 +199,8 @@ impl Plugin for CorrelationId {
             // Preserve the client-supplied id only when it is both within the
             // length cap AND made up of safe correlation-id characters. The
             // inbound value is untrusted and is reflected downstream, forwarded
-            // upstream, and stored in `ctx.metadata["request_id"]` (consumed by
-            // logging sinks). `http::HeaderValue` already blocks CR/LF/NUL, but
+            // upstream, and projected into `ctx.metadata["request_id"]` for
+            // logging sinks. `http::HeaderValue` already blocks CR/LF/NUL, but
             // it legally permits HTAB, DEL (0x7F), and obs-text (0x80-0xFF),
             // which could pollute a plain-text log sink or a downstream consumer
             // expecting a token. Reject those by regenerating a fresh UUID —
@@ -233,12 +219,11 @@ impl Plugin for CorrelationId {
             id
         };
 
-        // Keep each instance immutable across phase-separated execution. The
-        // first instance in configured lifecycle order also publishes the one
-        // canonical consumer-facing request ID; later trust domains cannot
-        // overwrite it.
-        let publish_canonical = ctx.claim_canonical_correlation_id();
-        self.publish_request_id(&mut ctx.metadata, request_id, publish_canonical);
+        // Keep each authoritative instance value in private lifecycle state
+        // across phase-separated execution. Public metadata is a compatibility
+        // projection only. The first instance in configured lifecycle order
+        // also owns the canonical consumer-facing request ID.
+        ctx.publish_correlation_id(&self.instance_metadata_key, request_id);
 
         PluginResult::Continue
     }
@@ -250,7 +235,7 @@ impl Plugin for CorrelationId {
     ) -> PluginResult {
         // Ensure the correlation ID header is in the outgoing request
         if let Some(request_id) = self.request_id(ctx) {
-            headers.insert(self.header_name.clone(), request_id.clone());
+            headers.insert(self.header_name.clone(), request_id.to_string());
         }
         PluginResult::Continue
     }
@@ -264,7 +249,7 @@ impl Plugin for CorrelationId {
         if self.echo_downstream
             && let Some(request_id) = self.request_id(ctx)
         {
-            response_headers.insert(self.header_name.clone(), request_id.clone());
+            response_headers.insert(self.header_name.clone(), request_id.to_string());
         }
         PluginResult::Continue
     }
@@ -278,7 +263,7 @@ impl Plugin for CorrelationId {
         if self.echo_downstream
             && let Some(request_id) = self.request_id(ctx)
         {
-            response_headers.insert(self.header_name.clone(), request_id.clone());
+            response_headers.insert(self.header_name.clone(), request_id.to_string());
         }
     }
 

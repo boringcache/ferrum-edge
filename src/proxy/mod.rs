@@ -2575,6 +2575,7 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
     let mut metadata = ctx.metadata.clone();
+    ctx.project_correlation_ids(&mut metadata);
     redact_request_body_from_log_metadata(&mut metadata);
     ctx.apply_waf_owned_log_metadata(&mut metadata);
     metadata

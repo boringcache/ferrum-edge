@@ -655,12 +655,18 @@ pub struct WsDisconnectContext {
 /// IPv4-mapped IPv6, and publishes the result here. Every later plugin instance
 /// performs only the lock-free `OnceLock::get_or_init` fast path. `None` is
 /// cached as well, preserving fail-closed behavior for malformed identities.
-/// The same private typed state also records one-time correlation ownership;
-/// plugin-writable transaction metadata is deliberately not authoritative.
+/// The same private typed state retains authoritative correlation values;
+/// plugin-writable transaction metadata is only a compatibility projection.
 #[derive(Debug, Clone, Default)]
 pub struct CanonicalClientIpCache {
     value: OnceLock<Option<IpAddr>>,
-    correlation_id_canonical_owner: OnceLock<()>,
+    correlation_ids: CorrelationIdState,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CorrelationIdState {
+    canonical: Option<String>,
+    instances: HashMap<String, String>,
 }
 
 impl CanonicalClientIpCache {
@@ -680,8 +686,35 @@ impl CanonicalClientIpCache {
         self.value.get().is_some()
     }
 
-    fn claim_canonical_correlation_id(&self) -> bool {
-        self.correlation_id_canonical_owner.set(()).is_ok()
+    fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
+        let publish_canonical = self.correlation_ids.canonical.is_none();
+        self.correlation_ids
+            .instances
+            .insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            self.correlation_ids.canonical = Some(request_id);
+        }
+        publish_canonical
+    }
+
+    fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.correlation_ids
+            .instances
+            .get(instance_key)
+            .map(String::as_str)
+    }
+
+    fn canonical_correlation_id(&self) -> Option<&str> {
+        self.correlation_ids.canonical.as_deref()
+    }
+
+    fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        for (key, value) in &self.correlation_ids.instances {
+            metadata.insert(key.clone(), value.clone());
+        }
+        if let Some(request_id) = &self.correlation_ids.canonical {
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.clone());
+        }
     }
 }
 
@@ -1313,8 +1346,28 @@ impl RequestContext {
         }
     }
 
-    pub(crate) fn claim_canonical_correlation_id(&self) -> bool {
-        self.canonical_client_ip.claim_canonical_correlation_id()
+    pub(crate) fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) {
+        let publish_canonical = self
+            .canonical_client_ip
+            .publish_correlation_id(instance_key, request_id.clone());
+        self.metadata
+            .insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            self.metadata
+                .insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+        }
+    }
+
+    pub(crate) fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.canonical_client_ip.correlation_id(instance_key)
+    }
+
+    pub(crate) fn canonical_correlation_id(&self) -> Option<&str> {
+        self.canonical_client_ip.canonical_correlation_id()
+    }
+
+    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        self.canonical_client_ip.project_correlation_ids(metadata);
     }
 
     /// Return the one absolute gRPC deadline established for this request.
@@ -3233,8 +3286,15 @@ impl StreamConnectionContext {
         self.canonical_client_ip.is_initialized()
     }
 
-    pub(crate) fn claim_canonical_correlation_id(&self) -> bool {
-        self.canonical_client_ip.claim_canonical_correlation_id()
+    pub(crate) fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) {
+        let publish_canonical = self
+            .canonical_client_ip
+            .publish_correlation_id(instance_key, request_id.clone());
+        let metadata = self.metadata.get_or_insert_with(HashMap::new);
+        metadata.insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+        }
     }
 
     /// Return the stable authenticated identity for stream policies. A mapped
@@ -3255,7 +3315,10 @@ impl StreamConnectionContext {
 
     /// Take the metadata map, returning an empty map if never allocated.
     pub fn take_metadata(&mut self) -> HashMap<String, String> {
-        self.metadata.take().unwrap_or_default()
+        let mut metadata = self.metadata.take().unwrap_or_default();
+        self.canonical_client_ip
+            .project_correlation_ids(&mut metadata);
+        metadata
     }
 }
 
