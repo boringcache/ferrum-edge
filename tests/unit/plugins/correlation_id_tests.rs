@@ -1,10 +1,10 @@
 //! Tests for the Correlation ID plugin
 
+use ferrum_edge::_test_support::clone_log_metadata;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, REQUEST_ID_METADATA_KEY, RequestContext, correlation_id::CorrelationId,
     priority,
 };
-use ferrum_edge::_test_support::clone_log_metadata;
 use serde_json::json;
 use std::collections::HashMap;
 

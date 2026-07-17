@@ -1242,7 +1242,10 @@ impl AiToolGovernor {
         provider: Option<&str>,
     ) -> CorrelationMeta {
         CorrelationMeta {
-            request_id: ctx.canonical_correlation_id().unwrap_or_default().to_string(),
+            request_id: ctx
+                .canonical_correlation_id()
+                .unwrap_or_default()
+                .to_string(),
             consumer: ctx.effective_identity().map(str::to_string),
             proxy: ctx
                 .matched_proxy
