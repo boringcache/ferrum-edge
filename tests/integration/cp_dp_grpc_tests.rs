@@ -363,8 +363,7 @@ async fn start_test_cp_server(
     (addr, update_tx, handle)
 }
 
-/// Start a CP whose correlation/client-attribution ownership contract requires
-/// one effective real-IP header on every subscribing DP.
+/// Start a CP with the supplied correlation/client-attribution ownership value.
 async fn start_test_cp_server_with_real_ip_header(
     config: GatewayConfig,
     real_ip_header: &str,
@@ -1365,6 +1364,67 @@ async fn test_cp_enforces_real_ip_header_ownership_contract_before_distribution(
         accepted.is_ok(),
         "case-insensitively matching DP ownership must be admitted: {:?}",
         accepted.err()
+    );
+
+    server_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_treats_explicitly_empty_real_ip_header_as_unset() {
+    let (addr, server_handle) =
+        start_test_cp_server_with_real_ip_header(create_test_config(1), "").await;
+    let token = dp_client::generate_dp_jwt_with_issuer(
+        TEST_JWT_SECRET,
+        "real-ip-unset",
+        TEST_DEFAULT_ISSUER,
+    )
+    .unwrap();
+    let mut client = connect_client_with_token!(addr, token);
+
+    let missing_status = client
+        .subscribe(tonic::Request::new(
+            ferrum_edge::grpc::proto::SubscribeRequest {
+                node_id: "real-ip-unset".to_string(),
+                ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                namespace: "ferrum".to_string(),
+                real_ip_header: None,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(missing_status.code(), tonic::Code::FailedPrecondition);
+    assert!(missing_status.message().contains("did not advertise"));
+
+    let subscribed = client
+        .subscribe(tonic::Request::new(
+            ferrum_edge::grpc::proto::SubscribeRequest {
+                node_id: "real-ip-unset".to_string(),
+                ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                namespace: "ferrum".to_string(),
+                real_ip_header: Some(String::new()),
+            },
+        ))
+        .await;
+    assert!(
+        subscribed.is_ok(),
+        "explicitly empty CP and DP ownership must both mean unset: {:?}",
+        subscribed.err()
+    );
+
+    let full_config = client
+        .get_full_config(tonic::Request::new(
+            ferrum_edge::grpc::proto::FullConfigRequest {
+                node_id: "real-ip-unset".to_string(),
+                ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                namespace: "ferrum".to_string(),
+                real_ip_header: Some(String::new()),
+            },
+        ))
+        .await;
+    assert!(
+        full_config.is_ok(),
+        "unary config fetch must apply the same empty ownership normalization: {:?}",
+        full_config.err()
     );
 
     server_handle.abort();

@@ -516,7 +516,8 @@ impl CpGrpcServer {
             ));
         };
         let advertised = (!advertised.is_empty()).then_some(advertised);
-        let matches = match (self.real_ip_header.as_deref(), advertised) {
+        let expected = self.real_ip_header.as_deref().filter(|header| !header.is_empty());
+        let matches = match (expected, advertised) {
             (None, None) => true,
             (Some(expected), Some(actual)) => expected.eq_ignore_ascii_case(actual),
             _ => false,
@@ -527,7 +528,7 @@ impl CpGrpcServer {
 
         Err(Status::failed_precondition(format!(
             "DP effective FERRUM_REAL_IP_HEADER ({advertised:?}) does not match the CP cluster ownership contract ({:?}); configure the same value on every CP and DP",
-            self.real_ip_header.as_deref()
+            expected
         )))
     }
 
