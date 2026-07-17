@@ -137,6 +137,51 @@ fn assert_serde_component_field_parity<T>(
 }
 
 #[test]
+fn transaction_log_schema_closed_object_keys_match_openapi() {
+    use ferrum_edge::plugins::transaction_log_schema::TRANSACTION_LOG_SCHEMA_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::log_schema::{
+        DERIVED_FIELD_KEYS, METADATA_POLICY_KEYS, SUMMARY_LOG_SCHEMA_KEYS,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    for (label, pointer, runtime_keys) in [
+        (
+            "TransactionLogSchemaConfig",
+            "/components/schemas/TransactionLogSchemaConfig/properties",
+            TRANSACTION_LOG_SCHEMA_CONFIG_KEYS,
+        ),
+        (
+            "SummaryLogSchema",
+            "/components/schemas/SummaryLogSchema/properties",
+            SUMMARY_LOG_SCHEMA_KEYS,
+        ),
+        (
+            "SummaryLogSchema.derived_fields[]",
+            "/components/schemas/SummaryLogSchema/properties/derived_fields/items/properties",
+            DERIVED_FIELD_KEYS,
+        ),
+        (
+            "SummaryLogSchema.metadata",
+            "/components/schemas/SummaryLogSchema/properties/metadata/properties",
+            METADATA_POLICY_KEYS,
+        ),
+    ] {
+        let runtime: BTreeSet<String> = runtime_keys.iter().map(|key| (*key).to_string()).collect();
+        assert_eq!(runtime, schema_property_names(&spec, label, pointer));
+    }
+
+    for pointer in [
+        "/components/schemas/TransactionLogSchemaConfig/additionalProperties",
+        "/components/schemas/SummaryLogSchema/additionalProperties",
+        "/components/schemas/SummaryLogSchema/properties/derived_fields/items/additionalProperties",
+        "/components/schemas/SummaryLogSchema/properties/metadata/additionalProperties",
+    ] {
+        assert_eq!(spec.pointer(pointer), Some(&serde_json::Value::Bool(false)));
+    }
+}
+
+#[test]
 fn typed_component_properties_match_serde_field_inventories() {
     use ferrum_edge::config::types::{
         ActiveHealthCheck, BackendTlsConfig, CircuitBreakerConfig, ConsulConfig, Consumer,

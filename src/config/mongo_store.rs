@@ -44,8 +44,9 @@ mod inner {
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
         DeleteAllResourcesError, DeleteMode, IncrementalResult, MtlsDnsAdmissionUnavailable,
-        MtlsDnsIdentityConflict, NamespaceResourceCounts, NamespacedResourceId,
-        PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
+        MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts,
+        NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+        SnapshotDataIntegrityError, SortOrder,
     };
     use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
     use crate::config::types::{
@@ -99,6 +100,7 @@ mod inner {
         MONGO_MIGRATION_LEASE_DURATION.as_millis() as i64;
     const MONGO_MIGRATION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
     const MONGO_MIGRATION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+    const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
     const MONGO_ADMISSION_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
     const HMAC_SECRET_HASHES_FIELD: &str = "_ferrum_hmac_secret_hashes";
     // Dedicated migration-lease pool size. Lease upkeep only issues tiny
@@ -1351,7 +1353,7 @@ mod inner {
             Ok(())
         }
 
-        /// Aggregation-pipeline update that takes or holds the migration lease
+        /// Aggregation-pipeline update that takes or holds a renewable lease.
         /// using MongoDB SERVER time (`$$NOW`). Clock skew on the connecting
         /// client can never enter the expiry comparison: the server both
         /// evaluates whether the existing lease is expired and stamps the new
@@ -1359,6 +1361,53 @@ mod inner {
         /// The lease is (re)claimed only when it is missing, server-expired, or
         /// already owned by us; otherwise every field is left untouched so an
         /// active owner is never stomped.
+        fn server_time_lease_acquire_pipeline(owner: &str, duration_millis: i64) -> Vec<Document> {
+            vec![
+                doc! {
+                    "$set": {
+                        "_ferrum_same_owner": { "$eq": [ "$owner", owner ] },
+                        "_ferrum_claimable": {
+                            "$or": [
+                                { "$eq": [ { "$type": "$expires_at" }, "missing" ] },
+                                { "$lte": [ "$expires_at", "$$NOW" ] },
+                                { "$eq": [ "$owner", owner ] },
+                            ],
+                        },
+                    },
+                },
+                doc! {
+                    "$set": {
+                        "owner": { "$cond": [ "$_ferrum_claimable", owner, "$owner" ] },
+                        "expires_at": {
+                            "$cond": [
+                                "$_ferrum_claimable",
+                                { "$add": [ "$$NOW", duration_millis ] },
+                                "$expires_at",
+                            ],
+                        },
+                        "generation": {
+                            "$cond": [
+                                "$_ferrum_claimable",
+                                {
+                                    "$cond": [
+                                        "$_ferrum_same_owner",
+                                        { "$ifNull": [ "$generation", 1_i64 ] },
+                                        { "$add": [ { "$ifNull": [ "$generation", 0_i64 ] }, 1_i64 ] },
+                                    ],
+                                },
+                                "$generation",
+                            ],
+                        },
+                        "updated_at": {
+                            "$cond": [ "$_ferrum_claimable", "$$NOW", "$updated_at" ],
+                        },
+                        "created_at": { "$ifNull": [ "$created_at", "$$NOW" ] },
+                    },
+                },
+                doc! { "$unset": [ "_ferrum_claimable", "_ferrum_same_owner" ] },
+            ]
+        }
+
         fn migration_lease_acquire_pipeline(owner: &str) -> Vec<Document> {
             vec![
                 doc! {
@@ -1392,16 +1441,26 @@ mod inner {
             ]
         }
 
-        /// Aggregation-pipeline update that renews the lease with a fresh
+        /// Aggregation-pipeline update that renews a lease with a fresh
         /// server-time (`$$NOW`) expiry. The owner match stays in the query
         /// filter so a renewal that no longer owns the lock matches nothing.
-        fn migration_lease_renew_pipeline() -> Vec<Document> {
+        fn server_time_lease_renew_pipeline(duration_millis: i64) -> Vec<Document> {
             vec![doc! {
                 "$set": {
-                    "expires_at": { "$add": [ "$$NOW", MONGO_MIGRATION_LEASE_DURATION_MILLIS ] },
+                    "expires_at": { "$add": [ "$$NOW", duration_millis ] },
                     "updated_at": "$$NOW",
                 },
             }]
+        }
+
+        async fn lease_server_time(&self) -> Result<BsonDateTime, anyhow::Error> {
+            let response = self.lease_db().run_command(doc! { "hello": 1 }).await?;
+            response
+                .get_datetime("localTime")
+                .cloned()
+                .map_err(|error| {
+                    anyhow::anyhow!("MongoDB hello response omitted localTime: {error}")
+                })
         }
 
         /// The migration-lease duration in milliseconds (exposed for tests that
@@ -2022,7 +2081,9 @@ mod inner {
                                 renew_collection
                                     .update_one(
                                         renew_filter,
-                                        MongoStore::migration_lease_renew_pipeline(),
+                                        MongoStore::server_time_lease_renew_pipeline(
+                                            MONGO_MIGRATION_LEASE_DURATION_MILLIS,
+                                        ),
                                     )
                                     .await
                             }
@@ -2110,6 +2171,18 @@ mod inner {
             }
         }
 
+        /// Snapshot of the dedicated lease `Database` handle. Lease acquisition,
+        /// renewal, release, and supporting server-time reads must not queue
+        /// behind ordinary datastore traffic.
+        fn lease_db(&self) -> MongoDatabaseHandle {
+            let connection = self.connection();
+            let db = connection.lease_client.database(connection.db.name());
+            MongoDatabaseHandle {
+                db,
+                _connection: connection,
+            }
+        }
+
         fn collection(&self, name: &str) -> MongoCollectionHandle {
             let connection = self.connection();
             MongoCollectionHandle {
@@ -2148,6 +2221,14 @@ mod inner {
 
         fn config_change_counters(&self) -> MongoCollectionHandle {
             self.collection("config_change_counters")
+        }
+
+        fn config_admission_locks(&self) -> MongoCollectionHandle {
+            let lease_db = self.lease_db();
+            MongoCollectionHandle {
+                collection: lease_db.collection("config_admission_locks"),
+                _connection: lease_db._connection,
+            }
         }
 
         /// Merged consumer identity keyspace (id ∪ username ∪ custom_id per
@@ -3942,6 +4023,145 @@ mod inner {
     // -----------------------------------------------------------------------
     // DatabaseBackend trait implementation
     // -----------------------------------------------------------------------
+
+    #[async_trait]
+    impl NamespaceConfigAdmissionLeaseBackend for MongoStore {
+        async fn try_acquire_namespace_config_admission_lease(
+            &self,
+            namespace: &str,
+            owner: &str,
+        ) -> Result<Option<u64>, anyhow::Error> {
+            let collection = self.config_admission_locks();
+            let result = collection
+                .find_one_and_update(
+                    doc! { "_id": namespace },
+                    Self::server_time_lease_acquire_pipeline(
+                        owner,
+                        CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+                    ),
+                )
+                .upsert(true)
+                .return_document(ReturnDocument::After)
+                .await;
+            let result = match result {
+                Err(error) if is_pipeline_update_unsupported(&error) => {
+                    let now = self.lease_server_time().await?;
+                    let expires_at = BsonDateTime::from_millis(
+                        now.timestamp_millis() + CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+                    );
+                    let retained = collection
+                        .find_one_and_update(
+                            doc! { "_id": namespace, "owner": owner },
+                            doc! {
+                                "$set": {
+                                    "expires_at": expires_at,
+                                    "updated_at": now,
+                                },
+                            },
+                        )
+                        .return_document(ReturnDocument::After)
+                        .await?;
+                    if retained.is_some() {
+                        Ok(retained)
+                    } else {
+                        collection
+                            .find_one_and_update(
+                                doc! {
+                                    "_id": namespace,
+                                    "$or": [
+                                        { "expires_at": { "$exists": false } },
+                                        { "expires_at": { "$lte": now } },
+                                        { "owner": owner },
+                                    ],
+                                },
+                                doc! {
+                                    "$set": {
+                                        "owner": owner,
+                                        "expires_at": expires_at,
+                                        "updated_at": now,
+                                    },
+                                    "$inc": { "generation": 1_i64 },
+                                    "$setOnInsert": { "created_at": now },
+                                },
+                            )
+                            .upsert(true)
+                            .return_document(ReturnDocument::After)
+                            .await
+                    }
+                }
+                result => result,
+            };
+            match result {
+                Ok(Some(document)) if document.get_str("owner").ok() == Some(owner) => {
+                    let generation = document.get_i64("generation").map_err(anyhow::Error::new)?;
+                    Ok(Some(u64::try_from(generation).map_err(|_| {
+                        anyhow::anyhow!("namespace config admission generation is negative")
+                    })?))
+                }
+                Ok(Some(_)) | Ok(None) => Ok(None),
+                Err(error) if is_duplicate_key(&error) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        }
+
+        async fn renew_namespace_config_admission_lease(
+            &self,
+            namespace: &str,
+            owner: &str,
+        ) -> Result<bool, anyhow::Error> {
+            let collection = self.config_admission_locks();
+            let result = collection
+                .update_one(
+                    doc! {
+                        "_id": namespace,
+                        "owner": owner,
+                        "$expr": { "$gt": [ "$expires_at", "$$NOW" ] },
+                    },
+                    Self::server_time_lease_renew_pipeline(CONFIG_ADMISSION_LEASE_DURATION_MILLIS),
+                )
+                .await;
+            let result = match result {
+                Err(error) if is_pipeline_update_unsupported(&error) => {
+                    let now = self.lease_server_time().await?;
+                    let expires_at = BsonDateTime::from_millis(
+                        now.timestamp_millis() + CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+                    );
+                    collection
+                        .update_one(
+                            doc! {
+                                "_id": namespace,
+                                "owner": owner,
+                                "expires_at": { "$gt": now },
+                            },
+                            doc! {
+                                "$set": {
+                                    "expires_at": expires_at,
+                                    "updated_at": now,
+                                },
+                            },
+                        )
+                        .await
+                }
+                result => result,
+            }?;
+            Ok(result.matched_count == 1)
+        }
+
+        async fn release_namespace_config_admission_lease(
+            &self,
+            namespace: &str,
+            owner: &str,
+        ) -> Result<bool, anyhow::Error> {
+            let result = self
+                .config_admission_locks()
+                .update_one(
+                    doc! { "_id": namespace, "owner": owner },
+                    doc! { "$set": { "expires_at": BsonDateTime::from_millis(0) } },
+                )
+                .await?;
+            Ok(result.matched_count == 1)
+        }
+    }
 
     #[async_trait]
     impl DatabaseBackend for MongoStore {

@@ -2986,7 +2986,8 @@ impl PluginCache {
             // cheap (one Mutex acquire + empty HashMap) and guarantees
             // the registry stays in sync even if a sibling global plugin
             // was the trigger for the rebuild.
-            crate::plugins::utils::log_schema::registry::begin_reload();
+            crate::plugins::utils::log_schema::registry::begin_reload()
+                .map_err(|error| format!("Config reload rejected: {error}"))?;
             for pc in &config.plugin_configs {
                 if !pc.enabled || pc.scope != PluginScope::Global {
                     continue;
@@ -3001,7 +3002,9 @@ impl PluginCache {
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
                 ) {
-                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    // Config-only: construction stages the registry entry, but
+                    // the instance must never enter runtime hook/cache lists.
+                    Ok(Some(_)) => {}
                     Ok(None) => {}
                     Err(e) => {
                         error!("Config reload: {}", e);
@@ -3330,8 +3333,10 @@ impl PluginCache {
         // bracket above — abort it so the process-global named-schema
         // registry doesn't get mutated by a config that's being rejected.
         if !plugin_errors.is_empty() {
-            if rebuild_globals {
-                crate::plugins::utils::log_schema::registry::abort_reload();
+            if rebuild_globals
+                && let Err(error) = crate::plugins::utils::log_schema::registry::abort_reload()
+            {
+                plugin_errors.push(error);
             }
             return Err(format!(
                 "Config reload rejected: {} plugin config(s) failed validation: {}",
@@ -3342,7 +3347,13 @@ impl PluginCache {
 
         if let Err(error) = start_background_tasks(&new_map, &new_globals) {
             if rebuild_globals {
-                crate::plugins::utils::log_schema::registry::abort_reload();
+                crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                    |registry_error| {
+                        format!(
+                            "Config reload rejected: {error}; registry abort also failed: {registry_error}"
+                        )
+                    },
+                )?;
             }
             return Err(format!("Config reload rejected: {error}"));
         }
@@ -3406,7 +3417,8 @@ impl PluginCache {
         // above (rebuild_globals == true), promote the staged named
         // schemas now — pairs with the `begin_reload` at the top.
         if rebuild_globals {
-            crate::plugins::utils::log_schema::registry::commit_reload();
+            crate::plugins::utils::log_schema::registry::commit_reload()
+                .map_err(|error| format!("Config reload rejected: {error}"))?;
         }
 
         Ok(Arc::new(PluginCacheInner::new(
@@ -3659,7 +3671,8 @@ impl PluginCache {
         // the rest of the plugin-cache build succeeds; `abort_reload`
         // runs if any plugin fails validation, so the process-global
         // registry stays atomically tied to the cache.
-        crate::plugins::utils::log_schema::registry::begin_reload();
+        crate::plugins::utils::log_schema::registry::begin_reload()
+            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
         for pc in &config.plugin_configs {
             if !pc.enabled || pc.scope != PluginScope::Global {
                 continue;
@@ -3674,7 +3687,9 @@ impl PluginCache {
                 current_adaptive_states,
                 &mut adaptive_concurrency_instances,
             ) {
-                Ok(Some(plugin)) => global_plugins.push(plugin),
+                // Config-only: construction stages the registry entry, but
+                // the instance must never enter runtime hook/cache lists.
+                Ok(Some(_)) => {}
                 Ok(None) => {}
                 Err(e) => plugin_errors.push(e),
             }
@@ -3872,7 +3887,9 @@ impl PluginCache {
         // live PluginCache stays on the old plugins while the registry
         // already reflects the rejected reload's schemas.
         if !plugin_errors.is_empty() {
-            crate::plugins::utils::log_schema::registry::abort_reload();
+            if let Err(error) = crate::plugins::utils::log_schema::registry::abort_reload() {
+                plugin_errors.push(error);
+            }
             for err in &plugin_errors {
                 error!("{}", err);
             }
@@ -3884,13 +3901,20 @@ impl PluginCache {
         }
 
         if let Err(error) = start_background_tasks(&proxy_map, &global_plugins) {
-            crate::plugins::utils::log_schema::registry::abort_reload();
+            crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                |registry_error| {
+                    format!(
+                        "Gateway startup aborted: {error}; registry abort also failed: {registry_error}"
+                    )
+                },
+            )?;
             return Err(format!("Gateway startup aborted: {error}"));
         }
 
         // All plugins validated — promote the staged named schemas to live.
         // Pairs with the `begin_reload` at the start of this function.
-        crate::plugins::utils::log_schema::registry::commit_reload();
+        crate::plugins::utils::log_schema::registry::commit_reload()
+            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
 
         let global_needs_buffering = global_plugins
             .iter()

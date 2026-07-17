@@ -10,7 +10,7 @@
 
 use ferrum_edge::plugins::transaction_log_schema::TransactionLogSchema;
 use ferrum_edge::plugins::utils::log_schema::registry;
-use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, priority, validate_plugin_config};
+use ferrum_edge::plugins::{Plugin, priority, validate_plugin_config};
 use serde_json::json;
 
 /// Hold the reload-bracket serializer across both writes and assertions
@@ -32,7 +32,6 @@ fn test_plugin_identity() {
     .expect("plugin constructs with a single valid schema");
     assert_eq!(plugin.name(), "transaction_log_schema");
     assert_eq!(plugin.priority(), priority::TRANSACTION_LOG_SCHEMA);
-    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
 
 // ── Valid construction ──────────────────────────────────────────────
@@ -133,6 +132,19 @@ fn test_schemas_not_object_rejected() {
     assert!(err.contains("must be an object"), "got: {err}");
 }
 
+#[test]
+fn test_unknown_outer_config_key_rejected_with_path() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    let err = TransactionLogSchema::new(&json!({
+        "schemas": { "default": {} },
+        "strict": true
+    }))
+    .expect_err("unknown outer config keys must be rejected");
+    assert!(err.contains("unknown config key 'strict'"), "got: {err}");
+    assert!(err.contains("config.strict"), "got: {err}");
+}
+
 // ── Empty schema name ───────────────────────────────────────────────
 
 #[test]
@@ -178,6 +190,43 @@ fn test_invalid_inner_schema_unknown_top_level_key_rejected() {
     .expect_err("schema with typo'd top-level key must be rejected");
     assert!(err.contains("[typo]"), "got: {err}");
     assert!(err.contains("unknown schema key 'renaime'"), "got: {err}");
+}
+
+#[test]
+fn test_unknown_derived_field_entry_key_rejected_with_path() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    let err = TransactionLogSchema::new(&json!({
+        "schemas": {
+            "audit": {
+                "derived_fields": [
+                    { "name": "outcome", "kind": "outcome", "from": "response_status_code" }
+                ]
+            }
+        }
+    }))
+    .expect_err("unknown derived-field keys must be rejected");
+    assert!(err.contains("[audit]"), "got: {err}");
+    assert!(err.contains("derived_fields[0].from"), "got: {err}");
+}
+
+#[test]
+fn test_unknown_metadata_key_rejected_with_path() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    let err = TransactionLogSchema::new(&json!({
+        "schemas": {
+            "audit": {
+                "metadata": {
+                    "mode": "flatten",
+                    "on_collison": "overwrite"
+                }
+            }
+        }
+    }))
+    .expect_err("unknown metadata keys must be rejected");
+    assert!(err.contains("[audit]"), "got: {err}");
+    assert!(err.contains("metadata.on_collison"), "got: {err}");
 }
 
 #[test]

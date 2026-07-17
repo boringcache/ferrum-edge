@@ -4993,6 +4993,21 @@ pub fn validate_plugin_config_with_policy(
 ) -> Result<(), String> {
     let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
     validate_plugin_config_with_http_client(name, config, http_client)?;
+    validate_plugin_config_policy_only(name, config, backend_allow_ips)
+}
+
+/// Apply admission-policy checks that live outside plugin construction.
+///
+/// Prospective named-schema validation constructs `schema_ref` consumers while
+/// an isolated schema registry is staged. Callers therefore skip a second full
+/// construction after that bracket is aborted, but must still apply these
+/// policy-only checks so an unrelated plugin cannot add an ignored
+/// `schema_ref` key to bypass egress admission.
+pub(crate) fn validate_plugin_config_policy_only(
+    name: &str,
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
     // The HTTP-endpoint screen above does not cover a plugin's own
     // literal-IP backend fields that aren't dialed through the shared
     // client (mesh_route_dispatch route destinations).

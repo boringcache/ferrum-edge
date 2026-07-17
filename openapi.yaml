@@ -3222,10 +3222,15 @@ paths:
         all existing resources, and imports the provided configuration. If any
         import (or the delete) step fails, Ferrum clears the partial state and
         reapplies the snapshot. One persistent namespace-scoped datastore guard
-        spans that compensating clear and every replay batch, so other
+        normally spans that compensating clear and every replay batch, so other
         DNS-sensitive writers cannot interleave with the rollback-only raw
-        replay. Requires `?confirm=true` query parameter to prevent accidental
-        invocation.
+        replay. If a successful clear settles after its namespace lease expires
+        and another writer commits under the next generation, recovery keeps
+        current resources authoritative for matching IDs, validates the combined
+        transaction-log schema graph, and inserts only missing snapshot resources.
+        It never clears the intervening write; an invalid combined graph is
+        rejected before replay. Requires `?confirm=true` query parameter to
+        prevent accidental invocation.
 
         The recovery snapshot uses a **non-validating raw load** from the
         primary, so an already-invalid-but-present namespace (the case an
@@ -3283,11 +3288,14 @@ paths:
         "500":
           description: >-
             Restore failed (import, delete, or preparation). The prior
-            configuration was reapplied, or the response warns that the
-            best-effort rollback was incomplete. Also returned when a stored
-            row/document cannot be decoded for the pre-delete rollback snapshot;
-            that fail-safe response has `failure_class: data_integrity` and no
-            delete is attempted.
+            configuration was reapplied, additively reconciled with an
+            intervening post-expiry write, or the response warns that the
+            best-effort rollback was incomplete. Additive reconciliation rejects
+            an invalid combined transaction-log schema graph before replaying any
+            snapshot resources. Also returned when a stored row/document cannot
+            be decoded for the pre-delete rollback snapshot; that fail-safe
+            response has `failure_class: data_integrity` and no delete is
+            attempted.
           content:
             application/json:
               schema:
@@ -3306,13 +3314,16 @@ paths:
                     enum: [completed, incomplete, not_needed, unknown_outcome]
                     description: >-
                       Outcome of the best-effort rollback. `completed` — prior
-                      config reapplied; `incomplete` — reapply failed (see
-                      `rollback_errors`); `not_needed` — the clear failed
-                      atomically (SQL / replica-set MongoDB), so nothing was
-                      deleted and the prior config was retained without any
-                      compensating re-import; `unknown_outcome` — an ambiguous
-                      MongoDB commit result could not be resolved by authoritative
-                      post-state counts, so manual recovery is required.
+                      config reapplied, or a valid late-clear union retained both
+                      intervening and missing prior resources; `incomplete` —
+                      reapply failed or an invalid late-clear union was rejected
+                      before replay (see `rollback_errors`); `not_needed` — the
+                      clear failed atomically (SQL / replica-set MongoDB), so
+                      nothing was deleted and the prior config was retained
+                      without any compensating re-import; `unknown_outcome` — an
+                      ambiguous MongoDB commit result could not be resolved by
+                      authoritative post-state counts, so manual recovery is
+                      required.
                   failure_class:
                     type: string
                     enum: [data_integrity]
@@ -4821,7 +4832,13 @@ paths:
         the database `ON DELETE CASCADE` constraint removes the spec row in that
         case too.
 
-        Returns 204 on success, 404 if the spec does not exist.
+        Before deletion, Ferrum validates the prospective namespace plugin graph
+        after applying every spec-owned and proxy cascade. The request returns
+        422 without deleting anything when a retained enabled plugin would be
+        left with a dangling `schema_ref`.
+
+        Returns 204 on success, 404 if the spec does not exist, or 422 when the
+        prospective deletion fails plugin-graph validation.
 
         This mutation requires the `admin` role.
       tags: [API Specs]
@@ -4843,6 +4860,15 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "422":
+          description: |
+            Deleting the spec and its cascaded resources would leave an invalid
+            transaction-log schema graph in the namespace. No resources are
+            deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiSpecValidationError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -10088,7 +10114,9 @@ components:
         redaction always applies on every code path — sensitive
         substrings (`authorization`, `cookie`, `password`, `token`, …)
         cannot be introduced via `static_fields` or `derived_fields`
-        (rejected at construction). See docs/log_schema.md.
+        (rejected at construction). This object, each `derived_fields`
+        entry, and `metadata` are strict fixed shapes: unknown keys are
+        rejected with a nested path. See docs/log_schema.md.
       additionalProperties: false
       properties:
         summary_type:
@@ -10716,7 +10744,12 @@ components:
         scope is `global`; constructed by the loader BEFORE any plugin that
         uses `schema_ref:` so resolution always succeeds. The registry is
         atomically replaced on every config reload — renamed or removed
-        schemas do not leak. See docs/log_schema.md.
+        schemas do not leak. Config-only instances are discarded after
+        staging and never retained in runtime hook or protocol cache lists.
+        Admin create/update/delete, batch, and restore validate the complete
+        prospective namespace graph without consulting or modifying the live
+        registry. Unknown outer and nested fixed-shape keys are rejected.
+        See docs/log_schema.md.
       required: [schemas]
       additionalProperties: false
       properties:
@@ -10728,8 +10761,8 @@ components:
           description: >-
             Map of schema name → schema definition. Names are referenced
             by other plugins as `schema_ref: <name>`. Duplicate names
-            across multiple `transaction_log_schema` plugins in the same
-            config are rejected at load time.
+            across multiple enabled `transaction_log_schema` plugins in the
+            same namespace are rejected before persistence or load.
 
     TransactionDebuggerConfig:
       type: object
@@ -18956,17 +18989,20 @@ components:
       type: object
       description: |
         Response body for 422 Unprocessable Entity from `POST /api-specs` or
-        `PUT /api-specs/{id}`. The spec document was parsed successfully and the
-        Ferrum extensions were found, but one or more extracted resources failed
-        structural validation or database cross-checks (e.g., duplicate
-        `listen_path`, invalid plugin config).
+        `PUT /api-specs/{id}`, or for prospective plugin-graph validation from
+        `DELETE /api-specs/{id}`. For POST/PUT, the spec document was parsed
+        successfully and the Ferrum extensions were found, but one or more
+        extracted resources failed structural validation or database
+        cross-checks (e.g., duplicate `listen_path`, invalid plugin config).
+        For DELETE, removing the spec-owned and cascaded resources would leave
+        an invalid transaction-log schema graph.
       properties:
         error:
           type: string
           example: "Spec validation failed"
         spec_version:
           type: string
-          description: Version string detected from the submitted document
+          description: Version string detected from the submitted document, or from the stored spec for DELETE
         failures:
           type: array
           description: One entry per resource that failed validation
@@ -18975,7 +19011,7 @@ components:
             properties:
               resource_type:
                 type: string
-                enum: [proxy, upstream, plugin]
+                enum: [proxy, upstream, plugin, plugin_graph]
                 description: Kind of resource that failed
               id:
                 type: string
