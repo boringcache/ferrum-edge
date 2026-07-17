@@ -184,6 +184,7 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
+    pool_enable_http2: false
     circuit_breaker:
       failure_threshold: 1
       success_threshold: 1
