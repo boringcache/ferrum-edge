@@ -652,6 +652,31 @@ async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
     }
 }
 
+#[tokio::test]
+async fn test_istio_forward_owns_access_control_headers_without_origin() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example"],
+        "unmatched_preflights": "forward"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut response_headers = permissive_backend_cors_headers();
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_no_access_control_headers(&response_headers);
+    assert_eq!(response_headers.len(), 1);
+    assert_eq!(response_headers["x-backend"], "ok");
+}
+
 #[test]
 fn test_istio_mode_rejects_direct_preflight_continue_combination() {
     let err = CorsPlugin::new(&json!({

@@ -22,6 +22,7 @@ const BACKEND_ACCESS_CONTROL_HEADERS: [&str; 7] = [
     "access-control-max-age",
     "access-control-allow-private-network",
 ];
+const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 struct CapturedResponse {
@@ -44,9 +45,31 @@ impl PermissiveCorsBackend {
                 match listener.accept().await {
                     Ok((mut stream, _)) => {
                         tokio::spawn(async move {
-                            let mut request = vec![0u8; 4096];
-                            let size = stream.read(&mut request).await.unwrap_or(0);
-                            let request = String::from_utf8_lossy(&request[..size]);
+                            let mut request = Vec::with_capacity(4096);
+                            let mut chunk = [0u8; 4096];
+                            let mut request_head_complete = false;
+                            while request.len() < MAX_REQUEST_HEAD_BYTES {
+                                let remaining = MAX_REQUEST_HEAD_BYTES - request.len();
+                                let read_len = remaining.min(chunk.len());
+                                let size = match stream.read(&mut chunk[..read_len]).await {
+                                    Ok(0) => {
+                                        request_head_complete = true;
+                                        break;
+                                    }
+                                    Ok(size) => size,
+                                    Err(_) => return,
+                                };
+                                request.extend_from_slice(&chunk[..size]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    request_head_complete = true;
+                                    break;
+                                }
+                            }
+                            if !request_head_complete {
+                                return;
+                            }
+
+                            let request = String::from_utf8_lossy(&request);
                             let path = request
                                 .lines()
                                 .next()

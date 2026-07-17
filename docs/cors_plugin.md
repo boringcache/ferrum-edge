@@ -205,7 +205,8 @@ plugin_configs:
 ## Istio translation semantics
 
 An Istio `VirtualService.http[].corsPolicy` is projected through the gateway and
-mesh slice with source behavior intact:
+mesh slice with its source request-handling behavior intact. Ferrum remains
+authoritative over the browser-facing response fields:
 
 - omitted, `UNSPECIFIED`, and `FORWARD` unmatched preflights go to the backend,
   preserving its status/body but stripping every upstream `Access-Control-*`
@@ -214,6 +215,10 @@ mesh slice with source behavior intact:
 - unmatched actual requests go to the backend with its status/body preserved,
   every upstream `Access-Control-*` response field stripped, and no gateway
   CORS authorization fields added;
+- a participating translated policy owns `Access-Control-*` response fields
+  even when the request has no `Origin`; Ferrum strips those upstream fields
+  while preserving unrelated response headers, preventing a shared-cache replay
+  from widening the gateway policy;
 - omitted/empty method and header lists stay empty, and omitted `maxAge` stays
   absent; and
 - `StringMatch.exact: "*"` and legacy `allowOrigin: ["*"]` mean allow-all.
