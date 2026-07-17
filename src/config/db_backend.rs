@@ -77,7 +77,10 @@ pub(crate) fn validate_api_spec_restore_inputs(
     }
 
     let mut inserted_plugin_ids = HashSet::with_capacity(
-        bundle.plugins.len().saturating_add(additional_plugins.len()),
+        bundle
+            .plugins
+            .len()
+            .saturating_add(additional_plugins.len()),
     );
     for plugin in &bundle.plugins {
         if plugin.namespace != spec.namespace {
@@ -138,9 +141,7 @@ pub(crate) fn validate_api_spec_restore_inputs(
                 plugin.id,
                 bundle.proxy.id
             ),
-            PluginScope::Proxy
-                if plugin.proxy_id.as_deref() != Some(bundle.proxy.id.as_str()) =>
-            {
+            PluginScope::Proxy if plugin.proxy_id.as_deref() != Some(bundle.proxy.id.as_str()) => {
                 anyhow::bail!(
                     "API-spec restore additional plugin '{}' targets a different proxy",
                     plugin.id

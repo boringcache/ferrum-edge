@@ -4076,11 +4076,7 @@ mod inner {
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
         let proxies = store
-            .load_full_proxies_opt_session(
-                namespace,
-                Some((connection, &mut *session)),
-                true,
-            )
+            .load_full_proxies_opt_session(namespace, Some((connection, &mut *session)), true)
             .await?;
         let plugin_configs = store
             .load_full_plugin_configs_opt_session(
@@ -4110,11 +4106,7 @@ mod inner {
             return Ok(());
         }
         candidate.consumers = store
-            .load_full_consumers_opt_session(
-                namespace,
-                Some((connection, &mut *session)),
-                true,
-            )
+            .load_full_consumers_opt_session(namespace, Some((connection, &mut *session)), true)
             .await?;
         candidate
             .validate_unique_mtls_dns_identities()
@@ -9223,7 +9215,9 @@ mod inner {
                 .await?;
             self.validate_plugin_graph_admission_candidate(&spec.namespace, |candidate| {
                 candidate.proxies.push(bundle.proxy.clone());
-                candidate.plugin_configs.extend(bundle.plugins.iter().cloned());
+                candidate
+                    .plugin_configs
+                    .extend(bundle.plugins.iter().cloned());
                 candidate
                     .plugin_configs
                     .extend(additional_plugins.iter().cloned());
@@ -9318,7 +9312,8 @@ mod inner {
                     .map_err(anyhow::Error::new)
                     .context("restore_api_spec_bundle transaction failed")?;
 
-                self.compact_config_changes_best_effort(&spec.namespace).await;
+                self.compact_config_changes_best_effort(&spec.namespace)
+                    .await;
                 Ok(())
             })
             .await?;

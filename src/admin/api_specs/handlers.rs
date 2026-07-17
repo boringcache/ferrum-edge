@@ -3356,10 +3356,8 @@ pub async fn handle_delete_api_spec(
         })
         .map(|plugin| plugin.id.clone())
         .collect::<Vec<_>>();
-    let additional_plugin_id_set: HashSet<&str> = additional_plugin_ids
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let additional_plugin_id_set: HashSet<&str> =
+        additional_plugin_ids.iter().map(String::as_str).collect();
     let mut additional_plugins = Vec::with_capacity(additional_plugin_ids.len());
     for plugin_id in &additional_plugin_ids {
         if !proxy_plugin_ids.contains(plugin_id.as_str()) {

@@ -485,7 +485,10 @@ async fn restore_bundle_preserves_complete_owned_and_hand_added_graph() {
         .await
         .expect("get_proxy failed")
         .expect("restored proxy missing");
-    assert_eq!(restored_proxy.api_spec_id.as_deref(), Some(spec_id.as_str()));
+    assert_eq!(
+        restored_proxy.api_spec_id.as_deref(),
+        Some(spec_id.as_str())
+    );
     assert_eq!(restored_proxy.created_at, created_at);
     assert_eq!(restored_proxy.updated_at, updated_at);
     let association_ids: HashSet<&str> = restored_proxy
@@ -515,7 +518,10 @@ async fn restore_bundle_preserves_complete_owned_and_hand_added_graph() {
         .await
         .expect("get owned plugin failed")
         .expect("restored owned plugin missing");
-    assert_eq!(restored_owned.api_spec_id.as_deref(), Some(spec_id.as_str()));
+    assert_eq!(
+        restored_owned.api_spec_id.as_deref(),
+        Some(spec_id.as_str())
+    );
     assert_eq!(restored_owned.scope, PluginScope::Proxy);
     assert_eq!(restored_owned.proxy_id.as_deref(), Some(proxy_id.as_str()));
     assert!(restored_owned.enabled);
@@ -665,7 +671,11 @@ async fn restore_bundle_rejects_overlapping_ids_and_foreign_ownership_before_wri
 
     for (suffix, additional_owner, expected_error) in [
         ("overlap", None, "overlapping plugin id"),
-        ("foreign", Some("different-api-spec"), "owned by an API spec"),
+        (
+            "foreign",
+            Some("different-api-spec"),
+            "owned by an API spec",
+        ),
     ] {
         let proxy_id = format!("restore-input-{suffix}-proxy");
         let plugin_id = format!("restore-input-{suffix}-plugin");
@@ -745,7 +755,9 @@ async fn restore_bundle_rejects_wrong_preexisting_plugin_instance_and_rolls_back
         .await
         .expect_err("global plugin association must fail closed");
     assert!(
-        error.to_string().contains("invalid proxy/plugin associations"),
+        error
+            .to_string()
+            .contains("invalid proxy/plugin associations"),
         "unexpected wrong-instance error: {error:#}"
     );
     assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
@@ -804,7 +816,13 @@ async fn restore_bundle_preserves_preexisting_proxy_when_later_insert_conflicts(
         .unwrap()
         .expect("pre-existing proxy was lost");
     assert_eq!(preserved.id, existing.id);
-    assert!(store.get_upstream(ns, &upstream_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_upstream(ns, &upstream_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
 }
 
