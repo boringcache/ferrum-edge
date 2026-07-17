@@ -72,6 +72,7 @@ const MAX_CUMULATIVE_DECODED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONTENT_CODINGS: usize = 4;
 const MAX_COST_RATE: f64 = u64::MAX as f64 / 1_000_000.0;
 pub(crate) const PROMETHEUS_EXPORT_SUFFIX: &str = "_usage_export";
+pub(crate) const DEFAULT_PROMETHEUS_EXPORT_KEY: &str = "ai_usage_export";
 
 impl AiTokenMetrics {
     pub fn new(config: &Value) -> Result<Self, String> {

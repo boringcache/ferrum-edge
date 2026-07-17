@@ -63,8 +63,8 @@ pub struct AiUsageKey {
 }
 
 #[derive(Debug)]
-struct AiMetadataUsage {
-    prefix: String,
+struct AiMetadataUsage<'a> {
+    prefix: &'a str,
     provider: &'static str,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
@@ -83,12 +83,13 @@ impl AiMetadataUsage {
 
 fn ai_provider_label(value: &str) -> Option<&'static str> {
     match value {
-        "openai" => Some("openai"),
+        "openai" | "azure_openai" | "xai" | "deepseek" | "meta_llama"
+        | "hugging_face" => Some("openai"),
         "anthropic" => Some("anthropic"),
-        "google" => Some("google"),
+        "google" | "google_gemini" | "google_vertex" => Some("google"),
         "cohere" => Some("cohere"),
         "mistral" => Some("mistral"),
-        "bedrock" => Some("bedrock"),
+        "bedrock" | "aws_bedrock" => Some("bedrock"),
         _ => None,
     }
 }
@@ -112,10 +113,24 @@ fn parse_cost_microunits(value: &str) -> Option<u64> {
     whole.checked_mul(1_000_000)?.checked_add(fraction)
 }
 
-fn ai_metadata_usage(
-    metadata: &std::collections::HashMap<String, String>,
-) -> Option<AiMetadataUsage> {
-    let mut selected: Option<AiMetadataUsage> = None;
+/// Find a marked-prefix field without concatenating or copying keys on the
+/// per-request transaction-recording path.
+fn prefixed_metadata_value<'a>(
+    metadata: &'a std::collections::HashMap<String, String>,
+    prefix: &str,
+    suffix: &str,
+) -> Option<&'a str> {
+    metadata.iter().find_map(|(key, value)| {
+        key.strip_prefix(prefix)
+            .filter(|remainder| *remainder == suffix)
+            .map(|_| value.as_str())
+    })
+}
+
+fn ai_metadata_usage<'a>(
+    metadata: &'a std::collections::HashMap<String, String>,
+) -> Option<AiMetadataUsage<'a>> {
+    let mut selected: Option<AiMetadataUsage<'a>> = None;
 
     for (marker_key, marker_value) in metadata {
         if marker_value != "v1" {
@@ -130,27 +145,21 @@ fn ai_metadata_usage(
             continue;
         }
 
-        let key = |suffix: &str| format!("{prefix}_{suffix}");
-        let Some(provider) = metadata
-            .get(&key("provider"))
+        let Some(provider) = prefixed_metadata_value(metadata, prefix, "_provider")
             .and_then(|value| ai_provider_label(value))
         else {
             continue;
         };
         let candidate = AiMetadataUsage {
-            prefix: prefix.to_string(),
+            prefix,
             provider,
-            prompt_tokens: metadata
-                .get(&key("prompt_tokens"))
+            prompt_tokens: prefixed_metadata_value(metadata, prefix, "_prompt_tokens")
                 .and_then(|value| parse_canonical_u64(value)),
-            completion_tokens: metadata
-                .get(&key("completion_tokens"))
+            completion_tokens: prefixed_metadata_value(metadata, prefix, "_completion_tokens")
                 .and_then(|value| parse_canonical_u64(value)),
-            total_tokens: metadata
-                .get(&key("total_tokens"))
+            total_tokens: prefixed_metadata_value(metadata, prefix, "_total_tokens")
                 .and_then(|value| parse_canonical_u64(value)),
-            cost_microunits: metadata
-                .get(&key("estimated_cost"))
+            cost_microunits: prefixed_metadata_value(metadata, prefix, "_estimated_cost")
                 .and_then(|value| parse_cost_microunits(value)),
         };
         if candidate.completeness() == 0 {

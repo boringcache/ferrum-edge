@@ -2182,6 +2182,29 @@ async fn multimodal_reject_provider_falls_through_to_translate_provider() {
         other => panic!("expected fallback provider response (200), got {other:?}"),
     }
 
+    assert_eq!(
+        ctx.metadata.get("ai_usage_export").map(String::as_str),
+        Some("v1")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_provider").map(String::as_str),
+        Some("openai")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("10")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_completion_tokens")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("15")
+    );
+
     // The image part was passed through to the openai-compatible provider.
     let outbound = first_received_json(&server).await;
     let content = outbound["messages"][0]["content"].as_array().unwrap();

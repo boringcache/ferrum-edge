@@ -1446,6 +1446,46 @@ async fn ai_token_metadata_records_and_renders_bounded_prometheus_families() {
     assert!(!output.contains("must-not-be-a-label"));
 }
 
+#[test]
+fn federation_provider_aliases_use_bounded_ai_metric_families() {
+    let registry = MetricsRegistry::new();
+    registry.configure(0, 3600, 0, "federation-ns");
+    let aliases = [
+        ("azure_openai", "openai"),
+        ("xai", "openai"),
+        ("deepseek", "openai"),
+        ("meta_llama", "openai"),
+        ("hugging_face", "openai"),
+        ("google_gemini", "google"),
+        ("google_vertex", "google"),
+        ("aws_bedrock", "bedrock"),
+    ];
+
+    for (index, (raw_provider, _)) in aliases.iter().enumerate() {
+        let mut summary = make_summary(
+            &format!("federation-{index}"),
+            "POST",
+            200,
+            1.0,
+            1.0,
+        );
+        summary.metadata = HashMap::from([
+            ("ai_usage_export".to_string(), "v1".to_string()),
+            ("ai_provider".to_string(), (*raw_provider).to_string()),
+            ("ai_total_tokens".to_string(), "1".to_string()),
+        ]);
+        registry.record(&summary);
+    }
+
+    let output = registry.render_uncached();
+    for (index, (raw_provider, metric_provider)) in aliases.iter().enumerate() {
+        assert!(output.contains(&format!(
+            "ferrum_ai_tokens_total{{proxy_id=\"federation-{index}\",provider=\"{metric_provider}\",namespace=\"federation-ns\"}} 1"
+        )));
+        assert!(!output.contains(&format!("provider=\"{raw_provider}\"")));
+    }
+}
+
 #[tokio::test]
 async fn multiple_ai_token_instances_select_one_complete_snapshot_without_double_counting() {
     let sparse = AiTokenMetrics::new(&json!({

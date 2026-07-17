@@ -3224,6 +3224,10 @@ impl AiFederation {
             "ai_federation_provider".to_string(),
             provider_name.to_string(),
         );
+        ctx.metadata.insert(
+            super::ai_token_metrics::DEFAULT_PROMETHEUS_EXPORT_KEY.to_string(),
+            "v1".to_string(),
+        );
     }
 
     fn write_multimodal_text_only_metadata(
