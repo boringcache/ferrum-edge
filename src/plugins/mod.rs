@@ -302,7 +302,7 @@ impl BufferedDeadlineResponseHeaderProvenance {
 
     fn canonical_snapshot(headers: &HashMap<String, String>) -> HashMap<String, String> {
         let mut entries = headers.iter().collect::<Vec<_>>();
-        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        entries.sort_unstable_by_key(|(left, _)| *left);
         let mut canonical = HashMap::with_capacity(entries.len());
         for (name, value) in entries {
             let lowercase = name.to_ascii_lowercase();
