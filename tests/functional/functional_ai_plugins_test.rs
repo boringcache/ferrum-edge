@@ -49,6 +49,7 @@ async fn start_counted_json_server_on(
     listener: TcpListener,
     status: u16,
     body: &'static str,
+    counted_request_prefix: &'static [u8],
     hits: Arc<AtomicUsize>,
 ) {
     loop {
@@ -56,8 +57,10 @@ async fn start_counted_json_server_on(
             let hits = Arc::clone(&hits);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 16384];
-                let _ = stream.read(&mut buf).await;
-                hits.fetch_add(1, Ordering::Relaxed);
+                let bytes_read = stream.read(&mut buf).await.unwrap_or(0);
+                if buf[..bytes_read].starts_with(counted_request_prefix) {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                }
                 let response = format!(
                     "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -161,6 +164,7 @@ async fn test_ai_federation_terminal_dispatch_is_backend_accounting_neutral() {
         backend_listener,
         200,
         r#"{"backend":true}"#,
+        b"POST /chat ",
         Arc::clone(&backend_hits),
     ));
 
@@ -171,6 +175,7 @@ async fn test_ai_federation_terminal_dispatch_is_backend_accounting_neutral() {
         provider_listener,
         503,
         r#"{"error":"provider unavailable"}"#,
+        b"POST /v1/chat/completions ",
         Arc::clone(&provider_hits),
     ));
 
@@ -185,6 +190,7 @@ proxies:
     backend_port: {backend_port}
     strip_listen_path: true
     pool_enable_http2: false
+    upstream_id: "federation-isolation-upstream"
     circuit_breaker:
       failure_threshold: 1
       success_threshold: 1
@@ -196,7 +202,19 @@ proxies:
       - plugin_config_id: "federation-isolation-plugin"
 
 consumers: []
-upstreams: []
+upstreams:
+  - id: "federation-isolation-upstream"
+    algorithm: round_robin
+    targets:
+      - host: "127.0.0.1"
+        port: {backend_port}
+        weight: 1
+    health_checks:
+      passive:
+        unhealthy_status_codes: [503]
+        unhealthy_threshold: 1
+        unhealthy_window_seconds: 60
+        healthy_after_seconds: 0
 
 plugin_configs:
   - id: "federation-isolation-plugin"
@@ -246,7 +264,36 @@ plugin_configs:
     assert_eq!(
         backend_hits.load(Ordering::Relaxed),
         0,
-        "terminal federation dispatch must not enter backend transport"
+        "terminal federation dispatch must not send the application request to backend transport"
+    );
+
+    let runtime_metrics: serde_json::Value = client
+        .get(gateway.admin_url("/admin/metrics"))
+        .header("Authorization", gateway.auth_header())
+        .send()
+        .await
+        .expect("read runtime metrics after provider response")
+        .json()
+        .await
+        .expect("parse runtime metrics after provider response");
+    if let Some(breaker) = runtime_metrics["circuit_breakers"]
+        .as_array()
+        .and_then(|breakers| {
+            breakers
+                .iter()
+                .find(|breaker| breaker["proxy_id"] == "federation-isolation")
+        })
+    {
+        assert_eq!(breaker["state"], "closed");
+        assert_eq!(breaker["failure_count"].as_u64().unwrap_or(0), 0);
+    }
+    assert!(
+        runtime_metrics["health_check"]["unhealthy_targets"]
+            .as_array()
+            .expect("runtime unhealthy target list")
+            .iter()
+            .all(|target| target["proxy_id"] != "federation-isolation"),
+        "provider failures must not poison backend passive health: {runtime_metrics}"
     );
 
     let metrics = client
