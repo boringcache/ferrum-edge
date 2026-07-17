@@ -538,3 +538,12 @@ fn cp_full_and_incremental_rejection_share_plugin_composition_validation() {
         "CP incremental snapshots must use the shared rejecting contract"
     );
 }
+
+#[test]
+fn runtime_config_rejection_includes_tcp_throttle_attachment_validation() {
+    let shared = include_str!("../../../src/config/validation_pipeline.rs");
+    assert!(
+        shared.contains("validate_tcp_connection_throttle_attachments(config)"),
+        "database and CP snapshots must reject unsupported TCP-throttle attachments"
+    );
+}

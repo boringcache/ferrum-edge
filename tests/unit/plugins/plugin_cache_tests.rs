@@ -7,12 +7,13 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, ProxyProtocol, RequestContext, apply_initial_response_header_policies,
+    Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
+    apply_initial_response_header_policies,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 struct LegacyAuthorizePlugin;
@@ -141,6 +142,65 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
+}
+
+fn make_tcp_proxy(id: &str, plugin_ids: Vec<&str>) -> Proxy {
+    let mut proxy = make_proxy(id, "/", plugin_ids);
+    proxy.listen_path = None;
+    proxy.listen_port = Some(15432);
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+    proxy
+}
+
+fn make_udp_proxy(id: &str, plugin_ids: Vec<&str>, scheme: BackendScheme) -> Proxy {
+    let mut proxy = make_proxy(id, "/", plugin_ids);
+    proxy.listen_path = None;
+    proxy.listen_port = Some(15353);
+    proxy.backend_scheme = Some(scheme);
+    proxy.dispatch_kind = DispatchKind::from(scheme);
+    proxy
+}
+
+fn make_tcp_stream_context(ip: &str) -> StreamConnectionContext {
+    StreamConnectionContext {
+        client_ip: ip.to_string(),
+        direct_client_ip: ip.to_string(),
+        canonical_client_ip: Default::default(),
+        proxy_id: "p1".to_string(),
+        proxy_name: Some("Proxy p1".to_string()),
+        listen_port: 15432,
+        backend_scheme: BackendScheme::Tcp,
+        consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+        identified_consumer: None,
+        authenticated_identity: None,
+        auth_method: None,
+        metadata: None,
+        admission_permits: Vec::new(),
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
+        sni_hostname: None,
+        mesh_direction: None,
+        node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
+    }
+}
+
+async fn run_tcp_connect_chain(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut StreamConnectionContext,
+) -> bool {
+    for plugin in plugins {
+        if matches!(
+            plugin.on_stream_connect(ctx).await,
+            PluginResult::Reject { .. }
+        ) {
+            ctx.release_admission_permits();
+            return false;
+        }
+    }
+    true
 }
 
 fn make_plugin_config(
@@ -965,9 +1025,8 @@ fn mesh_route_dispatch_ignores_non_http_interleaving_when_finalizing() {
     );
     second_route.priority_override = Some(3040);
     let config = make_config(
-        vec![make_proxy(
+        vec![make_tcp_proxy(
             "p1",
-            "/api",
             vec!["first-route", "tcp-throttle", "second-route"],
         )],
         vec![first_route, tcp_only, second_route],
@@ -3147,13 +3206,10 @@ async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
     use ferrum_edge::plugins::available_plugins;
     use ferrum_edge::plugins::create_plugin;
 
-    // Every non-WS-frame built-in plugin must return false for requires_ws_frame_hooks().
-    // This is the zero-overhead guarantee — only explicit WS frame plugins opt in.
-    const WS_FRAME_PLUGINS: &[&str] = &[
-        "ws_message_size_limiting",
-        "ws_frame_logging",
-        "ws_rate_limiting",
-    ];
+    // Every non-message-hook built-in plugin must return false for
+    // requires_ws_frame_hooks(). Parser-only policies use the independent
+    // requires_websocket_framing() aggregate.
+    const WS_FRAME_PLUGINS: &[&str] = &["ws_frame_logging", "ws_rate_limiting"];
 
     for name in available_plugins() {
         if WS_FRAME_PLUGINS.contains(&name) {
@@ -3351,23 +3407,37 @@ fn test_ws_frame_direction_debug_and_equality() {
 }
 
 #[test]
-fn test_plugin_cache_requires_ws_frame_hooks_true_with_ws_size_plugin() {
-    // When a WS frame plugin is assigned to a proxy, requires_ws_frame_hooks must be TRUE.
-    let config = make_config(
-        vec![make_proxy("p1", "/ws", vec!["ws1"])],
-        vec![make_plugin_config(
-            "ws1",
-            "ws_message_size_limiting",
-            PluginScope::Proxy,
-            Some("p1"),
-            true,
-        )],
+fn test_priority_override_preserves_ws_parser_policy_and_framing() {
+    // A parser-policy-only plugin must select the framed relay even though it
+    // does not opt into the post-reassembly message hook. Priority overrides
+    // must not hide either capability behind their wrapper.
+    let mut limiter = make_plugin_config(
+        "ws1",
+        "ws_message_size_limiting",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
     );
+    limiter.priority_override = Some(101);
+    let config = make_config(vec![make_proxy("p1", "/ws", vec!["ws1"])], vec![limiter]);
     let cache = PluginCache::new(&config).unwrap();
     assert!(
         cache.requires_ws_frame_hooks("p1"),
-        "requires_ws_frame_hooks must be TRUE when ws_message_size_limiting is attached"
+        "parser size policy must select the framed relay"
     );
+    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let limiter = ws_plugins
+        .iter()
+        .find(|plugin| plugin.name() == "ws_message_size_limiting")
+        .expect("wrapped limiter remains in WebSocket chain");
+    assert_eq!(limiter.priority(), 101);
+    assert!(!limiter.requires_ws_frame_hooks());
+    assert!(limiter.requires_websocket_framing());
+    let limits = limiter
+        .websocket_size_limits()
+        .expect("priority wrapper delegates parser policy");
+    assert_eq!(limits.max_frame_bytes, 65_536);
+    assert_eq!(limits.max_message_bytes, 262_144);
 }
 
 #[test]
@@ -4448,7 +4518,7 @@ fn test_multiple_proxies_with_different_plugins() {
 fn test_tcp_only_plugin_excluded_from_http() {
     // tcp_connection_throttle supports TCP_ONLY_PROTOCOLS
     let config = make_config(
-        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_tcp_proxy("p1", vec!["ps1"])],
         vec![make_plugin_config(
             "ps1",
             "tcp_connection_throttle",
@@ -4585,7 +4655,7 @@ fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
     // tcp_connection_throttle = TCP_ONLY, udp_rate_limiting = UDP_ONLY,
     // cors = HTTP_ONLY, stdout_logging = ALL_PROTOCOLS
     let config = make_config(
-        vec![make_proxy("p1", "/svc", vec!["ps1", "ps2", "ps3", "ps4"])],
+        vec![make_tcp_proxy("p1", vec!["ps1", "ps2", "ps3", "ps4"])],
         vec![
             make_plugin_config(
                 "ps1",
@@ -4639,6 +4709,383 @@ fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
     assert!(!udp_names.contains(&"cors"));
     assert!(!udp_names.contains(&"tcp_connection_throttle"));
     assert_eq!(udp_names.len(), 2);
+}
+
+#[test]
+fn test_tcp_connection_throttle_rejects_udp_and_dtls_attachments() {
+    for scheme in [BackendScheme::Udp, BackendScheme::Dtls] {
+        let config = make_config(
+            vec![make_udp_proxy("p1", vec!["throttle"], scheme)],
+            vec![make_plugin_config_with_json(
+                "throttle",
+                "tcp_connection_throttle",
+                json!({"max_connections_per_key": 1}),
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        );
+        let error = PluginCache::new(&config)
+            .err()
+            .expect("UDP/DTLS attachment must fail visibly");
+        assert!(error.contains("unsupported UDP/DTLS"), "{error}");
+        assert!(error.contains("udp_rate_limiting"), "{error}");
+    }
+
+    let global_only_udp = make_config(
+        vec![make_udp_proxy("p1", vec![], BackendScheme::Udp)],
+        vec![make_plugin_config_with_json(
+            "global-throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let error = PluginCache::new(&global_only_udp)
+        .err()
+        .expect("a global throttle with only UDP coverage must fail visibly");
+    assert!(error.contains("has no TCP/TCP+TLS proxy"), "{error}");
+
+    let http_attachment = make_config(
+        vec![make_proxy("p1", "/api", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let error = PluginCache::new(&http_attachment)
+        .err()
+        .expect("HTTP-family attachment must fail visibly");
+    assert!(error.contains("HTTP-family"), "{error}");
+}
+
+#[test]
+fn test_tcp_connection_throttle_accepts_tcp_and_tcp_tls_attachments() {
+    for scheme in [BackendScheme::Tcp, BackendScheme::Tcps] {
+        let mut proxy = make_tcp_proxy("p1", vec!["throttle"]);
+        proxy.backend_scheme = Some(scheme);
+        proxy.dispatch_kind = DispatchKind::from(scheme);
+        let config = make_config(
+            vec![proxy],
+            vec![make_plugin_config_with_json(
+                "throttle",
+                "tcp_connection_throttle",
+                json!({"max_connections_per_key": 1}),
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        );
+        let cache = PluginCache::new(&config)
+            .unwrap_or_else(|error| panic!("{scheme} attachment was rejected: {error}"));
+        let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name(), "tcp_connection_throttle");
+    }
+}
+
+#[test]
+fn test_tcp_connection_throttle_global_mixed_protocol_scope_protects_only_tcp() {
+    let config = make_config(
+        vec![
+            make_tcp_proxy("tcp", vec![]),
+            make_udp_proxy("udp", vec![], BackendScheme::Udp),
+        ],
+        vec![make_plugin_config_with_json(
+            "global-throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("mixed global scope has TCP coverage");
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("tcp", ProxyProtocol::Tcp)
+            .len(),
+        1
+    );
+    assert!(
+        cache
+            .get_plugins_for_protocol("udp", ProxyProtocol::Udp)
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_tcp_connection_throttle_proxy_group_rejects_mixed_protocol_attachment() {
+    let config = make_config(
+        vec![
+            make_tcp_proxy("tcp", vec!["group-throttle"]),
+            make_udp_proxy("udp", vec!["group-throttle"], BackendScheme::Dtls),
+        ],
+        vec![make_plugin_config_with_json(
+            "group-throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1}),
+            PluginScope::ProxyGroup,
+            None,
+        )],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("mixed-protocol proxy-group attachment must fail closed");
+    assert!(error.contains("udp (dtls)"), "{error}");
+    assert!(error.contains("only TCP/TCP+TLS is supported"), "{error}");
+}
+
+#[test]
+fn test_tcp_connection_throttle_global_validation_is_namespace_scoped() {
+    let mut tenant_a_http = make_proxy("shared-id", "/tenant-a", vec![]);
+    tenant_a_http.namespace = "tenant-a".to_string();
+    let mut tenant_b_tcp = make_tcp_proxy("shared-id", vec![]);
+    tenant_b_tcp.namespace = "tenant-b".to_string();
+    let mut tenant_a_throttle = make_plugin_config_with_json(
+        "global-throttle",
+        "tcp_connection_throttle",
+        json!({"max_connections_per_key": 1}),
+        PluginScope::Global,
+        None,
+    );
+    tenant_a_throttle.namespace = "tenant-a".to_string();
+
+    let config = make_config(vec![tenant_a_http, tenant_b_tcp], vec![tenant_a_throttle]);
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("another namespace's TCP proxy must not satisfy global coverage");
+    assert!(error.contains("has no TCP/TCP+TLS proxy"), "{error}");
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances() {
+    let mut wide = make_plugin_config_with_json(
+        "wide",
+        "tcp_connection_throttle",
+        json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    wide.priority_override = Some(1000);
+    let mut strict = make_plugin_config_with_json(
+        "strict",
+        "tcp_connection_throttle",
+        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    strict.priority_override = Some(2000);
+    let config = make_config(
+        vec![make_tcp_proxy("p1", vec!["wide", "strict"])],
+        vec![wide, strict],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    assert_eq!(plugins.len(), 2);
+    assert_eq!(plugins[0].priority(), 1000);
+    assert_eq!(plugins[1].priority(), 2000);
+
+    let mut first = make_tcp_stream_context("10.0.0.1");
+    assert!(run_tcp_connect_chain(&plugins, &mut first).await);
+    assert_eq!(first.admission_permits.len(), 2);
+
+    let mut rejected = make_tcp_stream_context("10.0.0.1");
+    assert!(!run_tcp_connect_chain(&plugins, &mut rejected).await);
+    assert!(rejected.admission_permits.is_empty());
+    assert_eq!(cache.total_rate_limiter_keys(), 2);
+
+    first.release_admission_permits();
+    assert_eq!(cache.total_rate_limiter_keys(), 0);
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_full_reload_preserves_live_admissions() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut old_connection = make_tcp_stream_context("10.0.0.2");
+    assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
+
+    let mut replacement = initial.clone();
+    replacement.plugin_configs[0].priority_override = Some(1800);
+    replacement.plugin_configs[0].updated_at = Utc::now();
+    cache.rebuild(&replacement).unwrap();
+    let new_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut blocked = make_tcp_stream_context("10.0.0.2");
+    assert!(!run_tcp_connect_chain(&new_plugins, &mut blocked).await);
+
+    old_connection.release_admission_permits();
+    let mut admitted = make_tcp_stream_context("10.0.0.2");
+    assert!(run_tcp_connect_chain(&new_plugins, &mut admitted).await);
+    admitted.release_admission_permits();
+    assert_eq!(cache.total_rate_limiter_keys(), 0);
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_state() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut old_connection = make_tcp_stream_context("10.0.0.3");
+    assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
+
+    let mut replacement = initial.clone();
+    replacement.plugin_configs[0].config =
+        json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0});
+    replacement.plugin_configs[0].updated_at = Utc::now();
+    cache
+        .apply_delta(&replacement, &HashSet::from(["p1".to_string()]), &[], false)
+        .unwrap();
+    let new_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut second = make_tcp_stream_context("10.0.0.3");
+    assert!(run_tcp_connect_chain(&new_plugins, &mut second).await);
+    let mut third = make_tcp_stream_context("10.0.0.3");
+    assert!(!run_tcp_connect_chain(&new_plugins, &mut third).await);
+
+    old_connection.release_admission_permits();
+    second.release_admission_permits();
+    assert_eq!(cache.total_rate_limiter_keys(), 0);
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_decreased_limit_waits_for_old_permits_to_drain() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut first = make_tcp_stream_context("10.0.0.5");
+    let mut second = make_tcp_stream_context("10.0.0.5");
+    assert!(run_tcp_connect_chain(&old_plugins, &mut first).await);
+    assert!(run_tcp_connect_chain(&old_plugins, &mut second).await);
+
+    let mut replacement = initial.clone();
+    replacement.plugin_configs[0].config =
+        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0});
+    cache.rebuild(&replacement).unwrap();
+    let new_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut blocked = make_tcp_stream_context("10.0.0.5");
+    assert!(!run_tcp_connect_chain(&new_plugins, &mut blocked).await);
+    first.release_admission_permits();
+    assert!(!run_tcp_connect_chain(&new_plugins, &mut blocked).await);
+    second.release_admission_permits();
+    assert!(run_tcp_connect_chain(&new_plugins, &mut blocked).await);
+    blocked.release_admission_permits();
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_scope_move_keeps_same_proxy_accounting() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut old_connection = make_tcp_stream_context("10.0.0.6");
+    assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
+
+    let mut moved = initial.clone();
+    moved.plugin_configs[0].scope = PluginScope::ProxyGroup;
+    moved.plugin_configs[0].proxy_id = None;
+    cache.rebuild(&moved).unwrap();
+    let moved_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut blocked = make_tcp_stream_context("10.0.0.6");
+    assert!(!run_tcp_connect_chain(&moved_plugins, &mut blocked).await);
+    old_connection.release_admission_permits();
+    assert!(run_tcp_connect_chain(&moved_plugins, &mut blocked).await);
+    blocked.release_admission_permits();
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_rejected_reload_keeps_old_generation() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut existing = make_tcp_stream_context("10.0.0.7");
+    assert!(run_tcp_connect_chain(&plugins, &mut existing).await);
+
+    let mut invalid = initial.clone();
+    invalid.plugin_configs[0].config = json!({"max_connections_per_key": 0});
+    assert!(cache.rebuild(&invalid).is_err());
+    let still_current = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut blocked = make_tcp_stream_context("10.0.0.7");
+    assert!(!run_tcp_connect_chain(&still_current, &mut blocked).await);
+    existing.release_admission_permits();
+    assert!(run_tcp_connect_chain(&still_current, &mut blocked).await);
+    blocked.release_admission_permits();
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_removed_policy_is_generation_isolated() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut old_connection = make_tcp_stream_context("10.0.0.4");
+    assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
+
+    let removed = make_config(vec![make_tcp_proxy("p1", vec![])], vec![]);
+    cache.rebuild(&removed).unwrap();
+    cache.rebuild(&initial).unwrap();
+    let recreated_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut recreated = make_tcp_stream_context("10.0.0.4");
+    assert!(run_tcp_connect_chain(&recreated_plugins, &mut recreated).await);
+
+    old_connection.release_admission_permits();
+    let mut still_blocked = make_tcp_stream_context("10.0.0.4");
+    assert!(!run_tcp_connect_chain(&recreated_plugins, &mut still_blocked).await);
+    recreated.release_admission_permits();
+    assert_eq!(cache.total_rate_limiter_keys(), 0);
 }
 
 // ---- Body buffering flag tests ----

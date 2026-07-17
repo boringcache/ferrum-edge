@@ -62,7 +62,7 @@ pub mod udp_proxy;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use futures_util::{SinkExt, Stream, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -80,6 +80,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{
     WebSocketStream, client_async_tls_with_config, client_async_with_config,
@@ -109,7 +111,8 @@ use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, TransactionSummary,
-    WebSocketFrameDirection, is_builtin_plugin_name, mesh_route_dispatch::MeshRouteDispatchConfig,
+    WebSocketFrameDirection, WebSocketSizeLimits, is_builtin_plugin_name,
+    mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
 use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
@@ -8516,7 +8519,7 @@ async fn handle_websocket_request_authenticated(
     mesh_inbound_pre_handshake_app_port: Option<u16>,
     cb_target_key: Option<String>,
     cb_is_half_open_probe: bool,
-    requires_ws_frame_hooks: bool,
+    requires_websocket_framing: bool,
     query_string: String,
     strip_len: usize,
     backend_path_is_policy_bound: bool,
@@ -8652,6 +8655,12 @@ async fn handle_websocket_request_authenticated(
     // If the backend is unreachable, we return 502 instead of a premature 101.
     // Supports retry with upstream target rotation for connection failures.
     let env_config = state.env_config.clone();
+    // Compute the strictest parser limits before the backend handshake so its
+    // framer is born with the same per-proxy bounds as the client-side framer.
+    // This precedes every retry attempt and uses the immutable request plugin
+    // generation, so target rotation cannot change policy mid-upgrade.
+    let ws_size_limits =
+        EffectiveWsSizeLimits::from_plugins(state.max_websocket_frame_size_bytes, &plugins);
     // The client-sent Host: the mesh egress Extended CONNECT `:authority` is
     // derived from it (the egress route is `preserve_host_header`) so the peer's
     // inbound route matches on the SERVICE host, exactly like HTTP egress. Read
@@ -8840,7 +8849,8 @@ async fn handle_websocket_request_authenticated(
                     ws_client_host.as_deref(),
                     ws_path_and_query.as_ref(),
                     &client_headers,
-                    state.max_websocket_frame_size_bytes,
+                    ws_size_limits.max_frame_bytes,
+                    ws_size_limits.max_message_bytes,
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
                     // Preserve the original authenticated mesh peer's identity into
@@ -8861,7 +8871,8 @@ async fn handle_websocket_request_authenticated(
                     &client_headers,
                     state.tls_policy.as_deref(),
                     &state.crls,
-                    state.max_websocket_frame_size_bytes,
+                    ws_size_limits.max_frame_bytes,
+                    ws_size_limits.max_message_bytes,
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
                     Some(&state.dns_cache),
@@ -9429,18 +9440,11 @@ async fn handle_websocket_request_authenticated(
             response
         });
 
-    // Collect plugins that opted into per-frame WebSocket hooks. `plugins`
-    // was resolved from the request's plugin-cache snapshot, so the upgrade
-    // path does not reload the cache and risk mixing generations.
-    let ws_frame_plugins: Vec<Arc<dyn Plugin>> = if requires_ws_frame_hooks {
-        plugins
-            .iter()
-            .filter(|p| p.requires_ws_frame_hooks())
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Keep parser-policy plugins out of the post-reassembly hook loop. The
+    // lists come from the same request-cache snapshot, so neither path reloads
+    // the cache or risks mixing generations.
+    let (ws_framing_plugins, ws_frame_plugins) =
+        collect_websocket_relay_plugins(&plugins, requires_websocket_framing);
     // Collect disconnect-hook plugins separately. These fire exactly once at
     // session end instead of per-frame, so keeping them in their own list
     // avoids the per-frame filter cost paid by the frame-hook path.
@@ -9545,6 +9549,7 @@ async fn handle_websocket_request_authenticated(
                             handshake.stream,
                             &proxy_id,
                             ws_conn_id,
+                            ws_framing_plugins,
                             ws_frame_plugins,
                             ws_disconnect_plugins,
                             session_meta,
@@ -9570,6 +9575,7 @@ async fn handle_websocket_request_authenticated(
                             handshake.stream,
                             &proxy_id,
                             ws_conn_id,
+                            ws_framing_plugins,
                             ws_frame_plugins,
                             ws_disconnect_plugins,
                             session_meta,
@@ -10216,6 +10222,7 @@ pub(crate) async fn connect_websocket_backend(
     tls_policy: Option<&TlsPolicy>,
     crls: &crate::tls::CrlList,
     max_websocket_frame_size_bytes: usize,
+    max_websocket_message_size_bytes: usize,
     websocket_write_buffer_size: usize,
     idle_tracker: Option<Arc<WsIdleTracker>>,
     // When `Some`, the backend host is resolved through the gateway DNS cache so
@@ -10226,7 +10233,7 @@ pub(crate) async fn connect_websocket_backend(
 ) -> Result<BackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
-    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    ws_config.max_message_size = Some(max_websocket_message_size_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
 
     let mut ws_request = backend_url.into_client_request()?;
@@ -10449,6 +10456,7 @@ async fn connect_mesh_websocket_backend(
     path_and_query: &str,
     client_headers: &[(String, String)],
     max_websocket_frame_size_bytes: usize,
+    max_websocket_message_size_bytes: usize,
     websocket_write_buffer_size: usize,
     idle_tracker: Option<Arc<WsIdleTracker>>,
     // The ASSERTED source identity to stamp into the Ambient HBONE baggage — the
@@ -10462,7 +10470,7 @@ async fn connect_mesh_websocket_backend(
 ) -> Result<MeshBackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
-    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    ws_config.max_message_size = Some(max_websocket_message_size_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
 
     match egress {
@@ -10857,9 +10865,11 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 }
 
 /// `connection_id` — unique per-connection identifier for stateful frame plugins.
-/// `ws_frame_plugins` — plugins that opted into per-frame hooks by returning `true`
-/// from `requires_ws_frame_hooks()`. Pass an empty `Vec` for zero-overhead forwarding
-/// when no plugin on this proxy needs frame inspection.
+/// `ws_framing_plugins` — plugins that require parsing for a parser-level
+/// policy or post-reassembly hook. Pass an empty `Vec` for zero-overhead
+/// forwarding when no plugin on this proxy needs WebSocket framing.
+/// `ws_frame_plugins` — the subset that opted into post-reassembly hooks.
+/// Parser-policy-only plugins must not enter the per-message loop.
 /// `ws_disconnect_plugins` — plugins that opted into end-of-session hooks by
 /// returning `true` from `requires_ws_disconnect_hooks()`. Pass an empty `Vec`
 /// to skip disconnect bookkeeping entirely.
@@ -10877,6 +10887,193 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 /// on a healthy TCP connection, so 100ms is generous for the happy path while
 /// still bounding teardown for pathological peers.
 const WS_CANCEL_CLOSE_TIMEOUT_MS: u64 = 100;
+
+#[derive(Clone)]
+struct WsSizeLimitRule {
+    max_bytes: usize,
+    close_reason: Arc<str>,
+}
+
+pub(crate) type WebSocketRelayPluginLists = (Vec<Arc<dyn Plugin>>, Vec<Arc<dyn Plugin>>);
+
+pub(crate) struct EffectiveWsSizeLimits {
+    pub(crate) max_frame_bytes: usize,
+    pub(crate) max_message_bytes: usize,
+    plugin_frame: Option<WsSizeLimitRule>,
+    plugin_message: Option<WsSizeLimitRule>,
+}
+
+pub(crate) fn collect_websocket_relay_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    requires_websocket_framing: bool,
+) -> WebSocketRelayPluginLists {
+    if !requires_websocket_framing {
+        return (Vec::new(), Vec::new());
+    }
+    let framing_plugins: Vec<_> = plugins
+        .iter()
+        .filter(|plugin| plugin.requires_websocket_framing())
+        .cloned()
+        .collect();
+    let frame_plugins = framing_plugins
+        .iter()
+        .filter(|plugin| plugin.requires_ws_frame_hooks())
+        .cloned()
+        .collect();
+    (framing_plugins, frame_plugins)
+}
+
+impl EffectiveWsSizeLimits {
+    pub(crate) fn from_plugins(global_frame_bytes: usize, plugins: &[Arc<dyn Plugin>]) -> Self {
+        let mut plugin_frame: Option<WsSizeLimitRule> = None;
+        let mut plugin_message: Option<WsSizeLimitRule> = None;
+
+        for plugin in plugins {
+            let Some(WebSocketSizeLimits {
+                max_frame_bytes,
+                max_message_bytes,
+                close_reason,
+            }) = plugin.websocket_size_limits()
+            else {
+                continue;
+            };
+
+            if plugin_frame
+                .as_ref()
+                .is_none_or(|current| max_frame_bytes < current.max_bytes)
+            {
+                plugin_frame = Some(WsSizeLimitRule {
+                    max_bytes: max_frame_bytes,
+                    close_reason: Arc::clone(&close_reason),
+                });
+            }
+            if plugin_message
+                .as_ref()
+                .is_none_or(|current| max_message_bytes < current.max_bytes)
+            {
+                plugin_message = Some(WsSizeLimitRule {
+                    max_bytes: max_message_bytes,
+                    close_reason,
+                });
+            }
+        }
+
+        let global_message_bytes = global_frame_bytes.saturating_mul(4);
+        let max_frame_bytes = plugin_frame
+            .as_ref()
+            .map(|rule| global_frame_bytes.min(rule.max_bytes))
+            .unwrap_or(global_frame_bytes);
+        let max_message_bytes = plugin_message
+            .as_ref()
+            .map(|rule| global_message_bytes.min(rule.max_bytes))
+            .unwrap_or(global_message_bytes);
+        Self {
+            max_frame_bytes,
+            max_message_bytes,
+            // Keep only rules that actually determine an effective parser
+            // ceiling. This prevents an inactive plugin frame rule from being
+            // mistaken for a numerically equal global message rejection.
+            plugin_frame: plugin_frame.filter(|rule| rule.max_bytes == max_frame_bytes),
+            plugin_message: plugin_message.filter(|rule| rule.max_bytes == max_message_bytes),
+        }
+    }
+
+    fn plugin_close_for_error(
+        &self,
+        error: &tokio_tungstenite::tungstenite::Error,
+    ) -> Option<(CloseFrame, &'static str, usize, usize)> {
+        use tokio_tungstenite::tungstenite::Error;
+        use tokio_tungstenite::tungstenite::error::CapacityError;
+
+        let (size, max_size, rule, kind) = match error {
+            Error::Capacity(CapacityError::FrameTooLong { size, max_size }) => {
+                let rule = self.plugin_frame.as_ref().filter(|rule| {
+                    self.max_frame_bytes == *max_size && rule.max_bytes == *max_size
+                })?;
+                (*size, *max_size, rule, "frame")
+            }
+            Error::Capacity(CapacityError::MessageTooLong { size, max_size }) => {
+                let rule = self.plugin_message.as_ref().filter(|rule| {
+                    self.max_message_bytes == *max_size && rule.max_bytes == *max_size
+                })?;
+                (*size, *max_size, rule, "message")
+            }
+            _ => return None,
+        };
+        Some((
+            CloseFrame {
+                code: CloseCode::Size,
+                reason: rule.close_reason.as_ref().to_owned().into(),
+            },
+            kind,
+            size,
+            max_size,
+        ))
+    }
+}
+
+fn ws_close_write_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
+    use tokio_tungstenite::tungstenite::Error;
+
+    match error {
+        Error::ConnectionClosed => "connection_closed",
+        Error::AlreadyClosed => "already_closed",
+        Error::Io(_) => "io",
+        Error::Protocol(_) => "protocol",
+        Error::Capacity(_) => "capacity",
+        _ => "other",
+    }
+}
+
+pub(crate) async fn send_bounded_ws_close<S>(sink: &mut S, close: Option<CloseFrame>)
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+    let result = crate::lazy_timeout::lazy_timeout(
+        Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
+        async {
+            match sink.send(Message::Close(close)).await {
+                Err(Error::Protocol(ProtocolError::SendAfterClosing)) => {
+                    // Reading a peer Close makes tungstenite queue the required
+                    // echo and enter ClosedByPeer. A second send is rejected,
+                    // so drive the already-queued control frame out instead.
+                    ("flush_queued_peer_echo", sink.flush().await)
+                }
+                result => ("send", result),
+            }
+        },
+    )
+    .await;
+
+    // Timeout is an expected teardown bound and stays quiet. Completed
+    // failures get a low-cardinality diagnostic without logging Close reasons
+    // or any peer-controlled payload.
+    if let Ok((phase, Err(error))) = result {
+        debug!(
+            phase,
+            error_kind = ws_close_write_error_kind(&error),
+            "Bounded WebSocket close write failed"
+        );
+    }
+}
+
+pub(crate) fn publish_ws_policy_close(
+    policy_close: &std::sync::OnceLock<CloseFrame>,
+    cancel: &tokio_util::sync::CancellationToken,
+    close: Option<CloseFrame>,
+) -> Option<CloseFrame> {
+    if let Some(details) = close {
+        let _ = policy_close.set(details);
+    }
+    // This helper is synchronous: callers cannot begin a bounded write until
+    // the first detailed Close is published and both relay halves can observe
+    // cancellation.
+    cancel.cancel();
+    policy_close.get().cloned()
+}
 
 /// Drain grace used after one WebSocket relay half exits and the other half is
 /// cancelled. Also acts as the fallback safety bound for tunnel-mode residual
@@ -11137,6 +11334,7 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     backend_ws_stream: WebSocketStream<B>,
     proxy_id: &str,
     connection_id: u64,
+    ws_framing_plugins: Vec<Arc<dyn Plugin>>,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
     ws_disconnect_plugins: Vec<Arc<dyn Plugin>>,
     session_meta: WsSessionMeta,
@@ -11175,13 +11373,13 @@ where
     );
     let websocket_idle_timeout = ws_idle_tracker.as_ref().map(|tracker| tracker.timeout);
 
-    // When tunnel mode is enabled and no plugins need frame-level hooks, bypass
+    // When tunnel mode is enabled and no plugins need parsed framing, bypass
     // WebSocket frame parsing entirely and do raw TCP bidirectional copy. This
     // avoids per-frame header parsing, masking validation, and opcode dispatch —
     // critical for large frames (9 MB+). Trade-off: FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES
     // is not enforced, but data streams through a fixed-size copy buffer so there
     // is no large-allocation DoS risk.
-    if websocket_tunnel_mode && ws_frame_plugins.is_empty() {
+    if websocket_tunnel_mode && ws_framing_plugins.is_empty() {
         debug!(
             proxy_id = %proxy_id,
             connection_id,
@@ -11321,9 +11519,13 @@ where
         return Ok(());
     }
 
+    let effective_size_limits = Arc::new(EffectiveWsSizeLimits::from_plugins(
+        max_websocket_frame_size_bytes,
+        &ws_framing_plugins,
+    ));
     let mut ws_config = WebSocketConfig::default();
-    ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
-    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    ws_config.max_frame_size = Some(effective_size_limits.max_frame_bytes);
+    ws_config.max_message_size = Some(effective_size_limits.max_message_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
     // RFC 9220 §5: frames over HTTP/3 are NOT masked. H1/H2 callers
     // pass `false` (RFC 6455 / RFC 8441 mandate masked client frames);
@@ -11386,12 +11588,17 @@ where
     // framers, so mid-message read progress also refreshes the watermark.
     let ws_idle_tracker_ctb = ws_idle_tracker.clone();
     let ws_idle_tracker_btc = ws_idle_tracker;
+    let size_limits_ctb = Arc::clone(&effective_size_limits);
+    let size_limits_btc = effective_size_limits;
 
     // Cancellation token for clean bidirectional close when a plugin triggers Close.
     // Each direction checks this token to know if the other side initiated a close.
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_ctb = cancel.clone();
     let cancel_btc = cancel.clone();
+    let policy_close: Arc<std::sync::OnceLock<CloseFrame>> = Arc::new(std::sync::OnceLock::new());
+    let policy_close_ctb = Arc::clone(&policy_close);
+    let policy_close_btc = policy_close;
 
     // Forward messages from client to backend
     let client_to_backend = async move {
@@ -11409,9 +11616,9 @@ where
                     // healthy TCP) and only registers a timer on Pending.
                     // Cannot use select+cancel here — cancel is already signaled
                     // and would skip the Close entirely.
-                    let _ = crate::lazy_timeout::lazy_timeout(
-                        Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
-                        backend_sink.send(Message::Close(None)),
+                    send_bounded_ws_close(
+                        &mut backend_sink,
+                        policy_close_ctb.get().cloned(),
                     )
                     .await;
                     break;
@@ -11469,18 +11676,24 @@ where
                                     WebSocketFrameDirection::ClientToBackend,
                                 )
                             };
-                            // If a plugin transformed the frame into a Close, close both sides.
-                            // Race cancel in case the opposite direction already exited while we
-                            // were running plugin hooks — keeps teardown prompt without dropping
-                            // the Close on the happy path.
-                            if matches!(&outgoing, Message::Close(_)) {
+                            // If a plugin transformed the message into a Close, publish its
+                            // details and cancel both halves before any bounded polite write.
+                            if let Message::Close(close_frame) = &outgoing {
                                 debug!("Plugin triggered close on client->backend frame");
-                                tokio::select! {
-                                    biased;
-                                    _ = cancel_ctb.cancelled() => {}
-                                    _ = backend_sink.send(outgoing) => {}
-                                }
-                                cancel_ctb.cancel(); // signal other direction
+                                // Publish the detailed Close first, then cancel before the
+                                // bounded destination write. The opposite half can therefore
+                                // notify the offending sender immediately even if this sink is
+                                // permanently backpressured.
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    close_frame.clone(),
+                                );
+                                send_bounded_ws_close(
+                                    &mut backend_sink,
+                                    close,
+                                )
+                                .await;
                                 break;
                             }
                             match &outgoing {
@@ -11554,12 +11767,37 @@ where
                             trace!("Client -> Backend: Frame");
                         }
                         Err(e) => {
-                            error!("Error receiving from client: {}", e);
+                            let error_class = if let Some((close, limit_kind, size, max_size)) =
+                                size_limits_ctb.plugin_close_for_error(&e)
+                            {
+                                warn!(
+                                    plugin = "ws_message_size_limiting",
+                                    proxy_id = %proxy_id_ctb,
+                                    connection_id,
+                                    direction = "client->backend",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket size policy rejected input before forwarding"
+                                );
+                                // Cancellation precedes the bounded polite write so policy
+                                // teardown cannot be held by a non-reading destination.
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                retry::ErrorClass::RequestBodyTooLarge
+                            } else {
+                                error!("Error receiving from client: {}", e);
+                                retry::classify_boxed_error(&e)
+                            };
                             // Read-side failure on the c2b path means the client
                             // dropped / reset the socket.
                             let _ = first_failure_ctb.set((
                                 crate::plugins::Direction::ClientToBackend,
-                                retry::classify_boxed_error(&e),
+                                error_class,
                                 Some(tcp_proxy::StreamIoSide::Read),
                             ));
                             break;
@@ -11590,9 +11828,9 @@ where
                     // `lazy_timeout` so the client sink cannot hang `tokio::join!`
                     // forever if the client socket is dead or not reading. See
                     // `WS_CANCEL_CLOSE_TIMEOUT_MS` for the rationale.
-                    let _ = crate::lazy_timeout::lazy_timeout(
-                        Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
-                        ws_sink.send(Message::Close(None)),
+                    send_bounded_ws_close(
+                        &mut ws_sink,
+                        policy_close_btc.get().cloned(),
                     )
                     .await;
                     break;
@@ -11650,17 +11888,16 @@ where
                                     WebSocketFrameDirection::BackendToClient,
                                 )
                             };
-                            // If a plugin transformed the frame into a Close, close both sides.
-                            // Race cancel — the opposite direction may have already exited while
-                            // we were running plugin hooks.
-                            if matches!(&outgoing, Message::Close(_)) {
+                            // If a plugin transformed the message into a Close, publish its
+                            // details and cancel both halves before any bounded polite write.
+                            if let Message::Close(close_frame) = &outgoing {
                                 debug!("Plugin triggered close on backend->client frame");
-                                tokio::select! {
-                                    biased;
-                                    _ = cancel_btc.cancelled() => {}
-                                    _ = ws_sink.send(outgoing) => {}
-                                }
-                                cancel_btc.cancel(); // signal other direction
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    close_frame.clone(),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
                                 break;
                             }
                             match &outgoing {
@@ -11730,12 +11967,35 @@ where
                             trace!("Backend -> Client: Frame");
                         }
                         Err(e) => {
-                            error!("Error receiving from backend: {}", e);
+                            let error_class = if let Some((close, limit_kind, size, max_size)) =
+                                size_limits_btc.plugin_close_for_error(&e)
+                            {
+                                warn!(
+                                    plugin = "ws_message_size_limiting",
+                                    proxy_id = %proxy_id_btc,
+                                    connection_id,
+                                    direction = "backend->client",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket size policy rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                retry::ErrorClass::ResponseBodyTooLarge
+                            } else {
+                                error!("Error receiving from backend: {}", e);
+                                retry::classify_boxed_error(&e)
+                            };
                             // Read-side failure on the b2c path means the
                             // backend closed / reset the socket.
                             let _ = first_failure_btc.set((
                                 crate::plugins::Direction::BackendToClient,
-                                retry::classify_boxed_error(&e),
+                                error_class,
                                 Some(tcp_proxy::StreamIoSide::Read),
                             ));
                             break;
@@ -18500,7 +18760,7 @@ async fn handle_proxy_request_inner(
                 ));
             }
         };
-        let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
+        let requires_websocket_framing = plugin_cache_view.requires_ws_frame_hooks();
         let websocket_proxy_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
         return handle_websocket_request_authenticated(
             request,
@@ -18524,7 +18784,7 @@ async fn handle_proxy_request_inner(
             mesh_inbound_pre_handshake_app_port,
             cb_target_key,
             cb_is_half_open_probe,
-            requires_ws_frame_hooks,
+            requires_websocket_framing,
             effective_query_string.to_string(),
             strip_len,
             backend_path_is_policy_bound,

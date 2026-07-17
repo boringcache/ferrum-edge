@@ -1376,7 +1376,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         "plugin_name": "ws_message_size_limiting",
         "scope": "global",
         "enabled": true,
-        "config": {"max_frame_bytes": 1024}
+        "config": {"max_frame_bytes": 1024, "max_message_bytes": 4096}
     });
     assert!(validator.validate(&valid).is_ok(), "config should be valid");
 
@@ -1389,6 +1389,15 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     assert!(
         validator.validate(&invalid).is_err(),
         "ws_message_size_limiting should require max_frame_bytes through PluginConfig"
+    );
+
+    let invalid_message_limit = plugin_config(
+        "ws_message_size_limiting",
+        Some(json!({"max_frame_bytes": 1024, "max_message_bytes": 0})),
+    );
+    assert!(
+        validator.validate(&invalid_message_limit).is_err(),
+        "ws_message_size_limiting should reject a zero max_message_bytes"
     );
 
     for (plugin_name, config) in [
@@ -3012,6 +3021,51 @@ fn mtls_dns_admission_mutations_document_conflict_responses() {
 }
 
 #[test]
+fn plugin_graph_delete_rejections_have_openapi_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for pointer in [
+        "/paths/~1proxies~1{id}/delete/responses/400",
+        "/paths/~1plugins~1config~1{id}/delete/responses/400",
+    ] {
+        let response = spec
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("plugin-graph DELETE is missing 400 response: {pointer}"));
+        assert_eq!(
+            response["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/Error"
+        );
+        assert!(
+            response["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("plugin-composition"))
+        );
+    }
+
+    let api_spec_response = spec
+        .pointer("/paths/~1api-specs~1{id}/delete/responses/422")
+        .expect("API-spec DELETE is missing 422 response");
+    assert_eq!(
+        api_spec_response["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ApiSpecValidationError"
+    );
+    assert!(
+        api_spec_response["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("plugin-composition"))
+    );
+
+    let resource_types = spec
+        .pointer(
+            "/components/schemas/ApiSpecValidationError/properties/failures/items/properties/resource_type/enum",
+        )
+        .and_then(serde_json::Value::as_array)
+        .expect("API-spec validation resource types");
+    assert!(resource_types.contains(&json!("plugin_composition")));
+}
+
+#[test]
 fn namespace_admission_contention_is_documented_as_retryable() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -3333,6 +3387,70 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
     ] {
         assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
+}
+
+#[test]
+fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/TcpConnectionThrottleConfig")
+        .expect("TcpConnectionThrottleConfig component exists");
+    let schema_text = serde_json::to_string(schema).unwrap();
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let cache_docs = include_str!("../../docs/cache_management.md");
+    let source = include_str!("../../src/plugins/tcp_connection_throttle.rs");
+    let admin_source = include_str!("../../src/admin/mod.rs");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_intervl_seconds": 60}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 86401}),
+        false,
+    );
+    for text in [schema_text.as_str(), plugin_docs, cache_docs] {
+        assert!(
+            text.contains("process-local"),
+            "missing process-local scope"
+        );
+        assert!(
+            text.contains("residual"),
+            "missing residual sweep semantics"
+        );
+        assert!(text.contains("inline"), "missing inline removal semantics");
+    }
+    assert!(schema_text.contains("UDP/DTLS"));
+    assert!(plugin_docs.contains("attachment to any other protocol is rejected"));
+    assert!(source.contains("DashMap::with_shard_amount"));
+    assert!(source.contains("entry.remove()"));
+    assert!(!source.contains("tcp_connection_throttle.key"));
+    assert!(admin_source.contains(r#""enforcement_scope": "process_local""#));
+    assert!(admin_source.contains(r#""replica_limit_behavior": "configured_limit_per_replica""#));
+
+    let status_schema = spec
+        .pointer("/components/schemas/AdminMetricsTcpConnectionThrottle")
+        .expect("AdminMetricsTcpConnectionThrottle component exists");
+    assert_eq!(
+        status_schema["properties"]["enforcement_scope"]["enum"][0],
+        "process_local"
+    );
+    assert_eq!(
+        status_schema["properties"]["replica_limit_behavior"]["enum"][0],
+        "configured_limit_per_replica"
+    );
 }
 
 #[test]

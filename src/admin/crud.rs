@@ -20,6 +20,7 @@ use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
     PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_admission_unavailable,
     is_mtls_dns_identity_conflict, mark_mtls_dns_admission_unavailable,
+    tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
@@ -166,6 +167,16 @@ pub(crate) async fn lock_local_namespace_config_admission(
     namespace.hash(&mut hasher);
     let shard = hasher.finish() as usize % NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS;
     locks[shard].lock().await
+}
+
+fn validate_candidate_plugin_graph(
+    candidate: &GatewayConfig,
+    http_client: &crate::plugins::PluginHttpClient,
+) -> Result<(), AfterValidateError> {
+    crate::plugin_cache::validate_plugin_composition_candidate(candidate, http_client)
+        .map_err(|error| AfterValidateError::BadRequest(vec![error]))?;
+    crate::plugin_cache::validate_tcp_connection_throttle_attachments(candidate)
+        .map_err(AfterValidateError::BadRequest)
 }
 
 pub(crate) struct NamespaceConfigAdmissionGuard {
@@ -1078,7 +1089,9 @@ async fn validate_mtls_auth_candidate(
         .map_err(AfterValidateError::Conflict)
 }
 
-pub(crate) async fn validate_plugin_composition_candidates(
+/// Validate the exact post-mutation graph for cross-resource plugin contracts
+/// before a Proxy or PluginConfig write is persisted.
+pub(crate) async fn validate_plugin_graph_candidates(
     db: &dyn DatabaseBackend,
     state: &AdminState,
     namespace: &str,
@@ -1124,8 +1137,41 @@ pub(crate) async fn validate_plugin_composition_candidates(
     }
 
     let http_client = super::plugin_validation_http_client(state);
-    crate::plugin_cache::validate_plugin_composition_candidate(&candidate, &http_client)
-        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+    validate_candidate_plugin_graph(&candidate, &http_client)
+}
+
+/// Validate the exact graph produced by deleting a Proxy, including the
+/// proxy-scoped plugin FK cascade and orphaned proxy-group cleanup performed by
+/// both direct Proxy deletion and API-spec cascade deletion.
+pub(crate) async fn validate_plugin_graph_proxy_deletion_candidate(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    removed_proxy_id: &str,
+) -> Result<(), AfterValidateError> {
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    candidate
+        .proxies
+        .retain(|proxy| proxy.id != removed_proxy_id);
+    candidate
+        .plugin_configs
+        .retain(|plugin| plugin.proxy_id.as_deref() != Some(removed_proxy_id));
+
+    let remaining_associations: HashSet<String> = candidate
+        .proxies
+        .iter()
+        .flat_map(|proxy| proxy.plugins.iter())
+        .map(|association| association.plugin_config_id.clone())
+        .collect();
+    candidate.plugin_configs.retain(|plugin| {
+        plugin.scope != PluginScope::ProxyGroup || remaining_associations.contains(&plugin.id)
+    });
+
+    let http_client = super::plugin_validation_http_client(state);
+    validate_candidate_plugin_graph(&candidate, &http_client)
 }
 
 /// Validate the post-mutation named log-schema graph for one namespace.
@@ -1174,7 +1220,7 @@ pub(crate) async fn validate_transaction_log_schema_candidates(
 /// same graph here so admission neither rejects a valid replacement because of
 /// removed globals nor admits an invalid chain by dropping retained manual
 /// associations.
-pub(crate) async fn validate_plugin_composition_api_spec_replacement_candidate(
+pub(crate) async fn validate_plugin_graph_api_spec_replacement_candidate(
     db: &dyn DatabaseBackend,
     state: &AdminState,
     namespace: &str,
@@ -1266,8 +1312,7 @@ pub(crate) async fn validate_plugin_composition_api_spec_replacement_candidate(
     }
 
     let http_client = super::plugin_validation_http_client(state);
-    crate::plugin_cache::validate_plugin_composition_candidate(&candidate, &http_client)
-        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+    validate_candidate_plugin_graph(&candidate, &http_client)
 }
 
 /// Validate the named log-schema graph produced by an exact API-spec PUT.
@@ -1411,13 +1456,12 @@ pub(crate) async fn validate_transaction_log_schema_api_spec_deletion_candidate(
 /// Validate a wholesale namespace replacement without retaining resources that
 /// the restore will delete. Runtime plugin chains are namespace-scoped, so the
 /// normalized replacement is the complete authoritative candidate.
-pub(crate) fn validate_plugin_composition_restore_candidate(
+pub(crate) fn validate_plugin_graph_restore_candidate(
     state: &AdminState,
     replacement: &GatewayConfig,
 ) -> Result<(), AfterValidateError> {
     let http_client = super::plugin_validation_http_client(state);
-    crate::plugin_cache::validate_plugin_composition_candidate(replacement, &http_client)
-        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+    validate_candidate_plugin_graph(replacement, &http_client)
 }
 
 async fn consumer_candidate_config(
@@ -1552,6 +1596,9 @@ pub(crate) trait AdminResource:
         if is_mtls_dns_admission_unavailable(error) {
             return super::mtls_dns_admission_unavailable_response();
         }
+        if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
+            return Self::map_after_validate_errors(conflict.errors());
+        }
         // Unique-constraint violations at persist time are conflicts, not
         // server faults: the admission prechecks are namespace-scoped and
         // raceable, so the DB constraint is the authoritative backstop (e.g.
@@ -1573,6 +1620,8 @@ pub(crate) trait AdminResource:
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
         if is_mtls_dns_admission_unavailable(error) {
             super::mtls_dns_admission_unavailable_response()
+        } else if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
+            Self::map_after_validate_errors(conflict.errors())
         } else if is_mtls_dns_identity_conflict(error) {
             super::json_response(StatusCode::CONFLICT, &json!({"error": error.to_string()}))
         } else {
@@ -3389,7 +3438,7 @@ impl AdminResource for PluginConfig {
         {
             validate_mtls_auth_candidate(db, namespace, None, Some(resource), None).await?;
         }
-        validate_plugin_composition_candidates(
+        validate_plugin_graph_candidates(
             db,
             state,
             namespace,
@@ -3426,7 +3475,7 @@ impl AdminResource for PluginConfig {
         if existing.plugin_name == "mtls_auth" {
             validate_mtls_auth_candidate(db, namespace, None, None, Some(&existing.id)).await?;
         }
-        validate_plugin_composition_candidates(db, state, namespace, &[], &[], Some(&existing.id))
+        validate_plugin_graph_candidates(db, state, namespace, &[], &[], Some(&existing.id))
             .await?;
         if crate::plugins::transaction_log_schema::is_enabled_config_graph_participant(existing) {
             validate_transaction_log_schema_candidates(
@@ -3889,6 +3938,9 @@ impl AdminResource for Proxy {
         if is_mtls_dns_admission_unavailable(error) {
             return super::mtls_dns_admission_unavailable_response();
         }
+        if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
+            return Self::map_after_validate_errors(conflict.errors());
+        }
         let message = error.to_string();
         if message.contains(PROXY_ROUTE_CONFLICT_ERROR) {
             return super::json_response(
@@ -4041,7 +4093,7 @@ impl AdminResource for Proxy {
         // effective `mtls_auth` association; compatibility validation itself
         // remains stream-specific.
         validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
-        validate_plugin_composition_candidates(
+        validate_plugin_graph_candidates(
             db,
             state,
             namespace,
@@ -4093,6 +4145,16 @@ impl AdminResource for Proxy {
         }
 
         Ok(())
+    }
+
+    async fn before_delete(
+        db: &dyn DatabaseBackend,
+        state: &AdminState,
+        namespace: &str,
+        existing: &Self,
+        _ctx: &ValidationCtx<'_>,
+    ) -> Result<(), AfterValidateError> {
+        validate_plugin_graph_proxy_deletion_candidate(db, state, namespace, &existing.id).await
     }
 
     async fn after_write(

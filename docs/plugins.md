@@ -19,7 +19,7 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 11. **`on_response_committed`** — Observe-only exporter hook for the final client-visible buffered status, headers, and body after validators and rejection replacement
 12. **`on_response_stream_terminated`** — Releases state and writes aggregate metadata for streamed, non-buffered responses after terminal success, error, or client disconnect
 13. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
-14. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
+14. **WebSocket policy/hooks** — Parser-level size limits, then per-message rate limiting and logging
 
 ## Custom Plugins
 
@@ -2078,23 +2078,25 @@ Bare-host registry entries match only requests whose Host header omits an explic
 
 ### `tcp_connection_throttle`
 
-Limits concurrent TCP connections per observed client identity on a per-proxy basis. Returns HTTP 429 (mapped to a refused connection at the TCP layer) when the limit is exceeded.
+Limits concurrent TCP connections per observed client identity on a per-proxy basis. Returns HTTP 429 (mapped to a refused connection at the TCP layer) when the limit is exceeded. The plugin supports TCP and TCP+TLS only. An explicit proxy/proxy-group attachment to any other protocol is rejected during configuration admission and plugin-cache validation. When a global policy has a nonempty effective target set, that set must include at least one TCP/TCP+TLS proxy; in a mixed-protocol deployment it is filtered from the unsupported listeners. For UDP or DTLS, use [`udp_rate_limiting`](#udp_rate_limiting) for datagram/session admission.
 
 **Priority:** 2050
 **Protocols:** TCP only
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_connections_per_key` | u64 | **(required, > 0)** | Maximum active TCP connections for one key |
-| `cleanup_interval_seconds` | u64 | `60` | Background sweep interval in seconds for removing stale zero-count entries. Catches edge cases where connections drop without a corresponding `on_stream_disconnect`. Set to `0` to disable the background sweep — entries are still removed inline by the disconnect path |
+| `max_connections_per_key` | u64 | **(required, > 0)** | Maximum active TCP connections for one key in this ferrum-edge process |
+| `cleanup_interval_seconds` | u64 (0–86400) | `60` | Defensive background sweep interval for residual zero-count entries. Normal completion and later plugin rejection release the exact connection permit and remove zero-count entries inline. The sweep never repairs a missed positive decrement. Set to `0` to disable only this residual sweep; inline release/removal remains enabled |
 
 **Key selection:**
 - If a prior stream auth plugin identified a Consumer, the key is `proxy:{proxy_id}:consumer:{username}`
-- Otherwise the key is `proxy:{proxy_id}:ip:{client_ip}`
+- Otherwise the key is `proxy:{proxy_id}:ip:{client_ip}`, with IPv4-mapped IPv6 addresses canonicalized to their IPv4 form
 
-The proxy ID is included so the same identity can hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners.
+The proxy ID is included so the same identity can hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners. Each successful admission owns an opaque permit for the exact plugin instance and counter entry it incremented. Multiple throttle instances, priority/authentication boundaries, later plugin rejection, and config reloads do not share mutable metadata or release one another's entries.
 
-This makes plaintext TCP listeners IP-scoped, while TCP+TLS and UDP+DTLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP/UDP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
+Accounting is **process-local**. Each replica independently permits up to `max_connections_per_key`, so a deployment with _N_ replicas can collectively admit as many as _N × max_connections_per_key_ connections for one identity when traffic is distributed across them. There is no distributed synchronization mode. Compatible cache generations share accounting by plugin namespace and configuration ID, so reload does not reset live counts; removing a policy and later recreating it starts a new generation whose permits cannot be decremented by old connections.
+
+This makes plaintext TCP listeners IP-scoped, while TCP+TLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
 
 ### `adaptive_concurrency`
 
@@ -4645,11 +4647,29 @@ Because `detection.strip_accept_encoding` defaults to `true`, attaching this plu
 
 ## WebSocket Plugins
 
-WebSocket plugins operate at the frame level via the `on_ws_frame` lifecycle hook. They fire on every WebSocket frame (both client-to-backend and backend-to-client directions) and can inspect, modify, or reject individual frames.
+WebSocket plugins share the bidirectional H1 Upgrade, H2 Extended CONNECT, and
+H3 Extended CONNECT relay. Ordinary `on_ws_frame` hooks receive complete
+tungstenite messages (with continuation frames already reassembled), in both
+directions. Parser-level policies such as `ws_message_size_limiting` run before
+that hook so they can enforce actual wire-frame boundaries safely.
 
 ### `ws_message_size_limiting`
 
-Enforces maximum frame size for WebSocket connections. Closes the connection with close code **1009 (Message Too Big)** per RFC 6455 §7.4 when a Text, Binary, or Ping frame exceeds the configured limit. Operates in both directions (client-to-backend and backend-to-client).
+Enforces an actual WebSocket frame-payload ceiling before payload reservation
+for Text, Binary, continuation, Ping, and Pong frames, plus an independent bound
+on the complete reassembled Text/Binary message. Valid Close frames bypass the
+application ceiling so teardown remains protocol-correct; every control frame
+still receives the independent RFC 6455 125-byte pre-allocation bound. A
+fragmented message may exceed `max_frame_bytes` cumulatively as long as each
+individual frame is within that limit and the message remains within
+`max_message_bytes`. Fragmented Text keeps tungstenite's incremental UTF-8
+validation, and interleaved Ping/Pong frames do not reset message state.
+
+On either violation the gateway publishes cancellation before attempting
+bounded polite-close writes and sends close code **1009 (Message Too Big)**
+with the configured reason to both client and backend when their sinks remain
+writable. The same behavior applies in both relay directions and on H1, H2,
+and H3 WebSocket frontends.
 
 **Priority:** 2810
 
@@ -4658,15 +4678,21 @@ Enforces maximum frame size for WebSocket connections. Closes the connection wit
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_frame_bytes` | u64 | *(required)* | Maximum allowed frame payload in bytes. Must be greater than 0 — configs with `max_frame_bytes` of 0 (or missing) are rejected at config load time. |
+| `max_message_bytes` | u64 | `4 × max_frame_bytes` | Maximum reassembled Text/Binary message payload. Must be greater than or equal to `max_frame_bytes`. This separately bounds continuation accumulation without treating the whole message as one frame. |
 | `close_reason` | String | `"Message too large"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
 
 ```yaml
 plugin_name: ws_message_size_limiting
 config:
   max_frame_bytes: 65536
+  max_message_bytes: 262144
 ```
 
-The plugin opts the WebSocket connection out of `FERRUM_WEBSOCKET_TUNNEL_MODE` raw-copy mode by returning `true` from `requires_ws_frame_hooks()`, so frame inspection always runs when this plugin is configured.
+With multiple applicable limiter instances, the relay uses the smallest frame
+ceiling and the smallest message ceiling independently; ties retain configured
+plugin order, including the corresponding close reason. The plugin opts the
+connection out of `FERRUM_WEBSOCKET_TUNNEL_MODE` raw-copy mode, so both peer
+parsers receive the effective limits before their first frame read.
 
 ### `ws_rate_limiting`
 

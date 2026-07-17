@@ -210,6 +210,21 @@ pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
 /// metadata value an earlier custom plugin may have stored under this key.
 pub const REQUEST_ID_METADATA_KEY: &str = "request_id";
 
+/// Parser-level limits contributed by a WebSocket size-policy plugin.
+///
+/// The relay combines every applicable instance before either peer is read,
+/// so the strictest frame and reassembled-message ceilings are enforced by
+/// tungstenite itself rather than by a post-reassembly `on_ws_frame` hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSizeLimits {
+    /// Maximum payload bytes accepted in any one wire frame.
+    pub max_frame_bytes: usize,
+    /// Maximum payload bytes accepted after continuation reassembly.
+    pub max_message_bytes: usize,
+    /// RFC 6455 Close reason paired with code 1009 on either violation.
+    pub close_reason: Arc<str>,
+}
+
 /// gRPC-only (single protocol).
 pub const GRPC_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Grpc];
 
@@ -3189,11 +3204,37 @@ async fn collect_mirror_result(
     }
 }
 
+/// Opaque release action for state acquired by a stream admission plugin.
+///
+/// The constructor is crate-private so plugins can attach permits without
+/// exposing their keys or counter identities through transaction metadata.
+/// Each permit invokes its release action exactly once, either when the stream
+/// runner releases it at rejection/teardown or when the connection context is
+/// dropped as a fallback.
+pub struct StreamAdmissionPermit {
+    release: Option<Box<dyn FnOnce() + Send + Sync + 'static>>,
+}
+
+impl StreamAdmissionPermit {
+    pub(crate) fn new(release: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
+    }
+}
+
+impl Drop for StreamAdmissionPermit {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
 /// Context for stream proxy (TCP/UDP) plugin hooks.
 ///
 /// Fields like `proxy_id`, `proxy_name`, `listen_port`, and `backend_scheme`
 /// are available for custom plugins to use in their `on_stream_connect` logic.
-#[derive(Clone)]
 #[allow(dead_code)]
 pub struct StreamConnectionContext {
     /// Gateway-resolved client IP. For TCP stream proxies with inbound PROXY
@@ -3236,6 +3277,12 @@ pub struct StreamConnectionContext {
     /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
     /// for stream connections that have no metadata-writing plugins configured.
     pub metadata: Option<HashMap<String, String>>,
+    /// Core-owned admission permits. External plugins should leave this empty
+    /// and use metadata for their own connection state. Built-in admission
+    /// plugins attach opaque permits through `add_admission_permit()` so state
+    /// release does not depend on mutable metadata keys.
+    #[doc(hidden)]
+    pub admission_permits: Vec<StreamAdmissionPermit>,
     /// DER-encoded client certificate from frontend TLS handshake (first cert in chain).
     /// Populated for TCP/TLS proxies after the TLS handshake completes.
     /// Used by plugins like `tcp_connection_throttle` for consumer-based throttling.
@@ -3319,6 +3366,22 @@ impl StreamConnectionContext {
         self.canonical_client_ip
             .project_correlation_ids(&mut metadata);
         metadata
+    }
+
+    pub(crate) fn add_admission_permit(&mut self, permit: StreamAdmissionPermit) {
+        self.admission_permits.push(permit);
+    }
+
+    /// Release every admission permit acquired so far, in reverse plugin order.
+    ///
+    /// TCP runners call this immediately when a later plugin rejects and when
+    /// transport teardown completes, before awaiting disconnect observers.
+    /// Draining the vector is idempotent, and dropping the context remains the
+    /// fallback for exceptional exit paths.
+    pub fn release_admission_permits(&mut self) {
+        while let Some(permit) = self.admission_permits.pop() {
+            drop(permit);
+        }
     }
 }
 
@@ -4570,7 +4633,28 @@ pub trait Plugin: Send + Sync {
         false
     }
 
-    /// Called for each WebSocket frame when at least one plugin on the proxy opts in.
+    /// Optional parser-level WebSocket size policy.
+    ///
+    /// Implementations must return immutable construction-time values. The
+    /// shared H1/H2/H3 relay evaluates this once per upgraded connection and
+    /// applies the strictest values before reading frames from either peer.
+    fn websocket_size_limits(&self) -> Option<WebSocketSizeLimits> {
+        None
+    }
+
+    /// Returns `true` when this plugin requires the parsed WebSocket relay.
+    ///
+    /// Parser-policy plugins automatically opt out of raw tunnel mode even if
+    /// they do not need the post-reassembly [`Plugin::on_ws_frame`] hook.
+    fn requires_websocket_framing(&self) -> bool {
+        self.requires_ws_frame_hooks() || self.websocket_size_limits().is_some()
+    }
+
+    /// Called for each complete WebSocket message when a plugin opts in.
+    ///
+    /// Tungstenite reassembles Text/Binary continuation frames before this
+    /// hook. Plugins that require actual wire-frame enforcement must contribute
+    /// parser policy through [`Plugin::websocket_size_limits`] instead.
     ///
     /// `connection_id` is a unique per-connection identifier (monotonic counter) that
     /// stateful plugins (e.g., ws_rate_limiting) can use to track per-connection state.
@@ -4851,7 +4935,10 @@ pub fn create_plugin_with_http_client(
         )?))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
         "tcp_connection_throttle" => Ok(Some(Arc::new(
-            tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
+            tcp_connection_throttle::TcpConnectionThrottle::new_with_pool_shard_amount(
+                config,
+                http_client.pool_shard_amount(),
+            )?,
         ))),
         "adaptive_concurrency" => Ok(Some(Arc::new(
             adaptive_concurrency::AdaptiveConcurrency::new(config, http_client.clone())?,

@@ -309,13 +309,20 @@ impl AdminClient {
     }
 
     async fn delete(&self, path: &str) -> reqwest::StatusCode {
-        self.client
+        self.delete_json(path).await.0
+    }
+
+    async fn delete_json(&self, path: &str) -> (reqwest::StatusCode, Value) {
+        let resp = self
+            .client
             .delete(self.url(path))
             .header("authorization", format!("Bearer {}", self.token))
             .send()
             .await
-            .unwrap()
-            .status()
+            .unwrap();
+        let status = resp.status();
+        let val: Value = resp.json().await.unwrap_or(json!(null));
+        (status, val)
     }
 }
 
@@ -1259,6 +1266,97 @@ async fn delete_unknown_id_returns_404() {
 
     let status = client.delete("/api-specs/no-such-id").await;
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_rejects_removing_last_global_tcp_throttle_target_with_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_port = bound.local_addr().unwrap().port();
+    drop(bound);
+
+    let tcp_proxy_id = uid("spec-tcp-delete-guard");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "TCP delete guard", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": tcp_proxy_id,
+            "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9000,
+            "listen_port": listen_port
+        }
+    });
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "TCP API-spec setup failed: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("POST response must include spec id")
+        .to_string();
+
+    let http_proxy_id = uid("http-only");
+    store
+        .create_proxy(&make_proxy_for_db(
+            &http_proxy_id,
+            "ferrum",
+            &format!("/{http_proxy_id}"),
+        ))
+        .await
+        .expect("create unsupported global target");
+    let throttle_id = uid("global-tcp-throttle");
+    let now = Utc::now();
+    store
+        .create_plugin_config(&PluginConfig {
+            id: throttle_id,
+            namespace: "ferrum".to_string(),
+            plugin_name: "tcp_connection_throttle".to_string(),
+            config: json!({"max_connections_per_key": 1}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("mixed global throttle graph must be valid");
+
+    let (delete_status, delete_body) = client.delete_json(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid API-spec cascade did not return 422: {delete_body}"
+    );
+    assert!(
+        delete_body["failures"].as_array().is_some_and(|failures| {
+            failures
+                .iter()
+                .any(|failure| failure["resource_type"] == "plugin_composition")
+        }),
+        "422 response omitted the plugin-composition failure: {delete_body}"
+    );
+    assert!(
+        store
+            .get_api_spec("ferrum", &spec_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_proxy("ferrum", &tcp_proxy_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 // ============================================================================

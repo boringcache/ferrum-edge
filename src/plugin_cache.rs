@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::types::{GatewayConfig, PluginScope};
+use crate::config::types::{BackendScheme, GatewayConfig, PluginScope};
 use tracing::{error, warn};
 
 use crate::adaptive_concurrency::{
@@ -28,6 +28,7 @@ use crate::adaptive_concurrency::{
     adaptive_concurrency_scope,
 };
 use crate::config::types::PluginConfig;
+use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnectionThrottleState};
 use crate::plugins::utils::jwks_cache::retain_active_requirements;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client,
@@ -40,7 +41,7 @@ use crate::plugins::{
 use crate::plugins::{
     PluginResult, RequestContext, ResponseStreamInspector, StreamConnectionContext,
     StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
-    WebSocketFrameDirection,
+    WebSocketFrameDirection, WebSocketSizeLimits,
 };
 use async_trait::async_trait;
 
@@ -729,6 +730,12 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_ws_frame_hooks(&self) -> bool {
         self.inner.requires_ws_frame_hooks()
     }
+    fn websocket_size_limits(&self) -> Option<WebSocketSizeLimits> {
+        self.inner.websocket_size_limits()
+    }
+    fn requires_websocket_framing(&self) -> bool {
+        self.inner.requires_websocket_framing()
+    }
     async fn on_ws_frame(
         &self,
         proxy_id: &str,
@@ -796,6 +803,91 @@ impl Plugin for PriorityOverridePlugin {
     }
 }
 
+fn validate_tcp_connection_throttle_attachment(
+    pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
+) -> Result<(), String> {
+    let attached = gateway_config.proxies.iter().filter(|proxy| {
+        tcp_connection_throttle_effectively_applies_to_proxy(pc, proxy, gateway_config)
+    });
+    let mut attached_count = 0usize;
+    let mut unsupported = Vec::new();
+    for proxy in attached {
+        attached_count += 1;
+        if !matches!(
+            proxy.effective_scheme(),
+            BackendScheme::Tcp | BackendScheme::Tcps
+        ) {
+            unsupported.push(format!("{} ({})", proxy.id, proxy.effective_scheme()));
+        }
+    }
+
+    match pc.scope {
+        PluginScope::Global if attached_count > 0 && unsupported.len() == attached_count => {
+            Err(format!(
+                "tcp_connection_throttle: global plugin config '{}' has no TCP/TCP+TLS proxy to protect; UDP/DTLS and HTTP-family proxies are unsupported",
+                pc.id
+            ))
+        }
+        PluginScope::Proxy | PluginScope::ProxyGroup if !unsupported.is_empty() => Err(format!(
+            "tcp_connection_throttle: plugin config '{}' is attached to unsupported UDP/DTLS or HTTP-family proxy/proxies {}; only TCP/TCP+TLS is supported (use udp_rate_limiting for datagram/session admission)",
+            pc.id,
+            unsupported.join(", ")
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Validate protocol attachment semantics for every enabled TCP throttle in a
+/// complete candidate graph. Admin admission and config-source validation use
+/// this before persistence/publication so unsupported protection is never
+/// accepted only to be silently filtered from a UDP/DTLS or HTTP plugin list.
+pub(crate) fn validate_tcp_connection_throttle_attachments(
+    gateway_config: &GatewayConfig,
+) -> Result<(), Vec<String>> {
+    let errors: Vec<String> = gateway_config
+        .plugin_configs
+        .iter()
+        .filter(|pc| pc.enabled && pc.plugin_name == "tcp_connection_throttle")
+        .filter_map(|pc| validate_tcp_connection_throttle_attachment(pc, gateway_config).err())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn create_tcp_connection_throttle_plugin(
+    pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
+    http_client: &PluginHttpClient,
+    current: &TcpConnectionThrottleInstanceMap,
+    staged: &mut TcpConnectionThrottleInstanceMap,
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    validate_tcp_connection_throttle_attachment(pc, gateway_config)?;
+    let identity = tcp_connection_throttle_policy_id(pc);
+    let existing_state = staged
+        .get(&identity)
+        .or_else(|| current.get(&identity))
+        .map(|instance| Arc::clone(&instance.state));
+    let plugin = match existing_state {
+        Some(state) => TcpConnectionThrottle::with_shared_state(&pc.config, state)?,
+        None => TcpConnectionThrottle::new_with_pool_shard_amount(
+            &pc.config,
+            http_client.pool_shard_amount(),
+        )?,
+    };
+    staged.insert(
+        identity,
+        TcpConnectionThrottleInstance {
+            state: plugin.shared_state(),
+            cleanup_interval_seconds: plugin.cleanup_interval_seconds(),
+        },
+    );
+    Ok(Some(Arc::new(plugin)))
+}
+
 /// Try to create a plugin and apply `priority_override` from the plugin config.
 ///
 /// Enabled plugin configs are load-bearing configuration: unknown plugin names
@@ -808,6 +900,8 @@ fn try_create_plugin(
     http_client: &PluginHttpClient,
     current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
     staged_adaptive_states: &mut AdaptiveConcurrencyInstanceMap,
+    current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
+    staged_tcp_throttle_states: &mut TcpConnectionThrottleInstanceMap,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     let created = if pc.plugin_name == "adaptive_concurrency" {
         create_adaptive_concurrency_plugin(
@@ -816,6 +910,14 @@ fn try_create_plugin(
             http_client,
             current_adaptive_states,
             staged_adaptive_states,
+        )
+    } else if pc.plugin_name == "tcp_connection_throttle" {
+        create_tcp_connection_throttle_plugin(
+            pc,
+            gateway_config,
+            http_client,
+            current_tcp_throttle_states,
+            staged_tcp_throttle_states,
         )
     } else {
         create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone())
@@ -884,7 +986,7 @@ type BufferingMap = HashMap<String, bool>;
 /// Map from proxy_id to whether any plugin may require request body buffering
 /// for at least some requests.
 type RequestBufferingMap = HashMap<String, bool>;
-/// Map from proxy_id to whether any plugin requires per-frame WebSocket hooks.
+/// Map from proxy_id to whether any plugin requires parsed WebSocket framing.
 type WsFrameMap = HashMap<String, bool>;
 /// Map from proxy_group plugin_config_id to its shared plugin instance.
 type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
@@ -944,6 +1046,28 @@ struct AdaptiveConcurrencyInstance {
 type AdaptiveConcurrencyInstanceMap =
     HashMap<AdaptiveConcurrencyPolicyId, AdaptiveConcurrencyInstance>;
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TcpConnectionThrottlePolicyId {
+    namespace: String,
+    plugin_config_id: String,
+}
+
+#[derive(Clone)]
+struct TcpConnectionThrottleInstance {
+    state: Arc<TcpConnectionThrottleState>,
+    cleanup_interval_seconds: u64,
+}
+
+type TcpConnectionThrottleInstanceMap =
+    HashMap<TcpConnectionThrottlePolicyId, TcpConnectionThrottleInstance>;
+
+fn tcp_connection_throttle_policy_id(pc: &PluginConfig) -> TcpConnectionThrottlePolicyId {
+    TcpConnectionThrottlePolicyId {
+        namespace: pc.namespace.clone(),
+        plugin_config_id: pc.id.clone(),
+    }
+}
+
 fn adaptive_concurrency_policy_id(pc: &PluginConfig) -> AdaptiveConcurrencyPolicyId {
     AdaptiveConcurrencyPolicyId {
         namespace: pc.namespace.clone(),
@@ -1000,6 +1124,56 @@ fn plugin_config_effectively_applies_to_proxy(
             scoped_plugin_config_applies_to_proxy(pc, proxy)
         }
     }
+}
+
+fn tcp_connection_throttle_effectively_applies_to_proxy(
+    pc: &PluginConfig,
+    proxy: &crate::config::types::Proxy,
+    config: &GatewayConfig,
+) -> bool {
+    if !pc.enabled || proxy.namespace != pc.namespace {
+        return false;
+    }
+    match &pc.scope {
+        PluginScope::Global => !config.plugin_configs.iter().any(|candidate| {
+            candidate.namespace == pc.namespace
+                && candidate.enabled
+                && candidate.plugin_name == pc.plugin_name
+                && scoped_plugin_config_applies_to_proxy(candidate, proxy)
+        }),
+        PluginScope::Proxy | PluginScope::ProxyGroup => {
+            scoped_plugin_config_applies_to_proxy(pc, proxy)
+        }
+    }
+}
+
+fn tcp_connection_throttle_policy_is_active(pc: &PluginConfig, config: &GatewayConfig) -> bool {
+    match pc.scope {
+        PluginScope::Global => true,
+        PluginScope::Proxy | PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+            proxy.namespace == pc.namespace && scoped_plugin_config_applies_to_proxy(pc, proxy)
+        }),
+    }
+}
+
+fn retained_tcp_connection_throttle_states(
+    current: &TcpConnectionThrottleInstanceMap,
+    config: &GatewayConfig,
+) -> TcpConnectionThrottleInstanceMap {
+    let mut retained = HashMap::new();
+    for pc in &config.plugin_configs {
+        if !pc.enabled
+            || pc.plugin_name != "tcp_connection_throttle"
+            || !tcp_connection_throttle_policy_is_active(pc, config)
+        {
+            continue;
+        }
+        let identity = tcp_connection_throttle_policy_id(pc);
+        if let Some(existing) = current.get(&identity) {
+            retained.insert(identity, existing.clone());
+        }
+    }
+    retained
 }
 
 fn target_matches_subset(
@@ -1990,6 +2164,8 @@ pub(crate) fn validate_plugin_composition_candidate(
     let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
+    let current_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
+    let mut staged_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
 
     for plugin_config in &config.plugin_configs {
         if !plugin_config.enabled
@@ -2004,6 +2180,8 @@ pub(crate) fn validate_plugin_composition_candidate(
             http_client,
             &current_adaptive_states,
             &mut staged_adaptive_states,
+            &current_tcp_throttle_states,
+            &mut staged_tcp_throttle_states,
         ) {
             Ok(Some(plugin)) if plugin_config.scope == PluginScope::Global => {
                 global_plugins.push(plugin);
@@ -2414,9 +2592,9 @@ pub(crate) struct PluginCacheInner {
     /// Pre-computed per-protocol plugin lists + phase data (auth plugin lists,
     /// capability bitsets).
     protocol_snapshot: ProtocolSnapshot,
-    /// Pre-computed: does any plugin for this proxy require per-frame WebSocket hooks?
+    /// Pre-computed: does any plugin require parser policy or message hooks?
     requires_ws_frame: WsFrameMap,
-    /// Whether global-only plugins require per-frame WebSocket hooks (fallback).
+    /// Whether global-only plugins require parsed WebSocket framing (fallback).
     global_requires_ws_frame: bool,
     /// Shared proxy-group plugin instances, keyed by plugin_config_id. Kept
     /// across incremental updates so rebuilt proxies can keep sharing state
@@ -2426,6 +2604,10 @@ pub(crate) struct PluginCacheInner {
     /// ID. Replacement plugin objects share these limiters so live permits and
     /// learned target state remain coherent across cache generations.
     adaptive_concurrency_instances: AdaptiveConcurrencyInstanceMap,
+    /// Stable process-local TCP throttle accounting keyed by namespace +
+    /// plugin config ID. Replacement plugin objects share these maps so live
+    /// connection permits remain counted across cache generations.
+    tcp_connection_throttle_instances: TcpConnectionThrottleInstanceMap,
 }
 
 impl PluginCacheInner {
@@ -2442,6 +2624,7 @@ impl PluginCacheInner {
         global_requires_ws_frame: bool,
         proxy_group_plugins: ProxyGroupInstanceMap,
         adaptive_concurrency_instances: AdaptiveConcurrencyInstanceMap,
+        tcp_connection_throttle_instances: TcpConnectionThrottleInstanceMap,
     ) -> Self {
         Self {
             proxy_plugins,
@@ -2455,6 +2638,15 @@ impl PluginCacheInner {
             global_requires_ws_frame,
             proxy_group_plugins,
             adaptive_concurrency_instances,
+            tcp_connection_throttle_instances,
+        }
+    }
+
+    fn apply_tcp_connection_throttle_cleanup_intervals(&self) {
+        for instance in self.tcp_connection_throttle_instances.values() {
+            instance
+                .state
+                .set_cleanup_interval(instance.cleanup_interval_seconds);
         }
     }
 
@@ -2807,7 +2999,7 @@ impl PluginCacheRequestView {
         self.requires_request_body_buffering
     }
 
-    /// Check WebSocket frame-hook requirement from this request view.
+    /// Check parsed WebSocket relay requirement from this request view.
     pub fn requires_ws_frame_hooks(&self) -> bool {
         self.requires_ws_frame_hooks
     }
@@ -2894,15 +3086,17 @@ impl PluginCache {
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
     ) -> Result<Arc<PluginCacheInner>, String> {
-        Self::build_inner_with_prior_adaptive_states(config, http_client, &HashMap::new())
+        Self::build_inner_with_prior_states(config, http_client, &HashMap::new(), &HashMap::new())
     }
 
-    fn build_inner_with_prior_adaptive_states(
+    fn build_inner_with_prior_states(
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
         current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
+        current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
+        validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
             globals,
@@ -2914,7 +3108,13 @@ impl PluginCache {
             global_needs_ws_frame,
             proxy_group_plugins,
             adaptive_concurrency_instances,
-        ) = Self::build_cache(config, http_client, current_adaptive_states)?;
+            tcp_connection_throttle_instances,
+        ) = Self::build_cache(
+            config,
+            http_client,
+            current_adaptive_states,
+            current_tcp_throttle_states,
+        )?;
         let snapshot = build_protocol_snapshot(&proxy_map, &globals);
 
         Ok(Arc::new(PluginCacheInner::new(
@@ -2929,6 +3129,7 @@ impl PluginCache {
             global_needs_ws_frame,
             proxy_group_plugins,
             adaptive_concurrency_instances,
+            tcp_connection_throttle_instances,
         )))
     }
 
@@ -2937,17 +3138,28 @@ impl PluginCache {
         config: &GatewayConfig,
     ) -> Result<Arc<PluginCacheInner>, String> {
         let current = self.inner.load();
-        Self::build_inner_with_prior_adaptive_states(
+        Self::build_inner_with_prior_states(
             config,
             &self.http_client,
             &current.adaptive_concurrency_instances,
+            &current.tcp_connection_throttle_instances,
         )
     }
 
     pub(crate) fn store_inner(&self, inner: Arc<PluginCacheInner>) {
+        let previous = self.inner.load_full();
         inner.prepare_adaptive_concurrency_generations();
         self.inner.store(Arc::clone(&inner));
         inner.commit_adaptive_concurrency_generations();
+        for (identity, instance) in &previous.tcp_connection_throttle_instances {
+            if !inner
+                .tcp_connection_throttle_instances
+                .contains_key(identity)
+            {
+                instance.state.set_cleanup_interval(0);
+            }
+        }
+        inner.apply_tcp_connection_throttle_cleanup_intervals();
     }
 
     pub(crate) fn load_inner(&self) -> Arc<PluginCacheInner> {
@@ -2972,8 +3184,8 @@ impl PluginCache {
 
     /// Atomically rebuild the cache when config changes. Most old plugin
     /// instances are dropped only after in-flight requests release them;
-    /// adaptive-concurrency policies additionally carry coherent admission
-    /// state into compatible replacement generations.
+    /// adaptive-concurrency and TCP-throttle policies additionally carry
+    /// coherent admission state into compatible replacement generations.
     ///
     /// Returns `Err` if any enabled plugin config cannot be resolved or fails validation.
     pub fn rebuild(&self, config: &GatewayConfig) -> Result<(), String> {
@@ -3007,6 +3219,7 @@ impl PluginCache {
         rebuild_globals: bool,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
+        validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
@@ -3019,6 +3232,10 @@ impl PluginCache {
         let global_plugins_changed = rebuild_globals || rebuild_adaptive_globals;
         let mut adaptive_concurrency_instances =
             retained_adaptive_concurrency_states(&current.adaptive_concurrency_instances, config);
+        let mut tcp_connection_throttle_instances = retained_tcp_connection_throttle_states(
+            &current.tcp_connection_throttle_instances,
+            config,
+        );
 
         // Rebuild globals if any global plugin config changed
         let new_globals = if rebuild_globals {
@@ -3052,6 +3269,8 @@ impl PluginCache {
                     &self.http_client,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
+                    &current.tcp_connection_throttle_instances,
+                    &mut tcp_connection_throttle_instances,
                 ) {
                     // Config-only: construction stages the registry entry, but
                     // the instance must never enter runtime hook/cache lists.
@@ -3078,6 +3297,8 @@ impl PluginCache {
                         &self.http_client,
                         &current.adaptive_concurrency_instances,
                         &mut adaptive_concurrency_instances,
+                        &current.tcp_connection_throttle_instances,
+                        &mut tcp_connection_throttle_instances,
                     ) {
                         Ok(Some(plugin)) => global_plugins.push(plugin),
                         Ok(None) => {}
@@ -3122,6 +3343,8 @@ impl PluginCache {
                     &self.http_client,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
+                    &current.tcp_connection_throttle_instances,
+                    &mut tcp_connection_throttle_instances,
                 ) {
                     Ok(Some(plugin)) => global_plugins.push(plugin),
                     Ok(None) => {}
@@ -3233,6 +3456,8 @@ impl PluginCache {
                             &self.http_client,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
+                            &current.tcp_connection_throttle_instances,
+                            &mut tcp_connection_throttle_instances,
                         ) {
                             Ok(Some(plugin)) => {
                                 // Detect when an auto-emitted plugin instance
@@ -3299,6 +3524,8 @@ impl PluginCache {
                             &self.http_client,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
+                            &current.tcp_connection_throttle_instances,
+                            &mut tcp_connection_throttle_instances,
                         ) {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
@@ -3372,7 +3599,7 @@ impl PluginCache {
                 );
                 new_ws_frame.insert(
                     proxy.id.clone(),
-                    plugins.iter().any(|p| p.requires_ws_frame_hooks()),
+                    plugins.iter().any(|p| p.requires_websocket_framing()),
                 );
             }
         }
@@ -3459,7 +3686,7 @@ impl PluginCache {
             current.global_requires_request_buffering
         };
         let new_global_requires_ws_frame = if global_plugins_changed {
-            new_globals.iter().any(|p| p.requires_ws_frame_hooks())
+            new_globals.iter().any(|p| p.requires_websocket_framing())
         } else {
             current.global_requires_ws_frame
         };
@@ -3489,6 +3716,7 @@ impl PluginCache {
             new_global_requires_ws_frame,
             group_plugin_instances,
             adaptive_concurrency_instances,
+            tcp_connection_throttle_instances,
         )))
     }
 
@@ -3591,7 +3819,7 @@ impl PluginCache {
         inner.requires_request_body_buffering(proxy_id)
     }
 
-    /// Check whether any plugin for this proxy requires per-frame WebSocket hooks.
+    /// Check whether any plugin for this proxy requires parsed WebSocket framing.
     /// When false, the WebSocket frame forwarding loop skips plugins entirely (zero overhead).
     /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
     ///
@@ -3679,6 +3907,7 @@ impl PluginCache {
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
         current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
+        current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
     ) -> Result<
         (
             ProxyPluginMap,
@@ -3691,6 +3920,7 @@ impl PluginCache {
             bool,
             ProxyGroupInstanceMap,
             AdaptiveConcurrencyInstanceMap,
+            TcpConnectionThrottleInstanceMap,
         ),
         String,
     > {
@@ -3698,6 +3928,8 @@ impl PluginCache {
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
         let mut adaptive_concurrency_instances =
             retained_adaptive_concurrency_states(current_adaptive_states, config);
+        let mut tcp_connection_throttle_instances =
+            retained_tcp_connection_throttle_states(current_tcp_throttle_states, config);
 
         // Pre-index proxy-scoped plugin configs by proxy_id for O(1) lookup
         // instead of scanning all plugin_configs for every proxy (O(P×C) → O(P+C)).
@@ -3737,6 +3969,8 @@ impl PluginCache {
                 http_client,
                 current_adaptive_states,
                 &mut adaptive_concurrency_instances,
+                current_tcp_throttle_states,
+                &mut tcp_connection_throttle_instances,
             ) {
                 // Config-only: construction stages the registry entry, but
                 // the instance must never enter runtime hook/cache lists.
@@ -3762,6 +3996,8 @@ impl PluginCache {
                     http_client,
                     current_adaptive_states,
                     &mut adaptive_concurrency_instances,
+                    current_tcp_throttle_states,
+                    &mut tcp_connection_throttle_instances,
                 ) {
                     Ok(Some(plugin)) => global_plugins.push(plugin),
                     Ok(None) => {}
@@ -3820,6 +4056,8 @@ impl PluginCache {
                             http_client,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
+                            current_tcp_throttle_states,
+                            &mut tcp_connection_throttle_instances,
                         ) {
                             Ok(Some(plugin)) => {
                                 // Remove only GLOBAL plugins of the same name —
@@ -3862,6 +4100,8 @@ impl PluginCache {
                             http_client,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
+                            current_tcp_throttle_states,
+                            &mut tcp_connection_throttle_instances,
                         ) {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
@@ -3911,8 +4151,9 @@ impl PluginCache {
             let needs_req_buffering = merged.iter().any(|p| p.requires_request_body_buffering());
             req_buffering_map.insert(proxy.id.clone(), needs_req_buffering);
 
-            // Pre-compute whether any plugin requires per-frame WebSocket hooks
-            let needs_ws_frame = merged.iter().any(|p| p.requires_ws_frame_hooks());
+            // Pre-compute whether any plugin requires WebSocket parsing for a
+            // parser policy or post-reassembly message hook.
+            let needs_ws_frame = merged.iter().any(|p| p.requires_websocket_framing());
             ws_frame_map.insert(proxy.id.clone(), needs_ws_frame);
 
             proxy_map.insert(proxy.id.clone(), Arc::new(merged));
@@ -3973,7 +4214,9 @@ impl PluginCache {
         let global_needs_req_buffering = global_plugins
             .iter()
             .any(|p| p.requires_request_body_buffering());
-        let global_needs_ws_frame = global_plugins.iter().any(|p| p.requires_ws_frame_hooks());
+        let global_needs_ws_frame = global_plugins
+            .iter()
+            .any(|p| p.requires_websocket_framing());
 
         Ok((
             proxy_map,
@@ -3986,6 +4229,7 @@ impl PluginCache {
             global_needs_ws_frame,
             group_plugin_instances,
             adaptive_concurrency_instances,
+            tcp_connection_throttle_instances,
         ))
     }
 }

@@ -6,13 +6,22 @@
 use serde_json::json;
 
 #[test]
-fn test_proxy_and_plugin_writes_run_plugin_composition_candidate_validation() {
+fn test_proxy_and_plugin_writes_run_plugin_graph_candidate_validation() {
     let source = include_str!("../../../src/admin/crud.rs");
     assert!(
-        source
-            .matches("validate_plugin_composition_candidates(")
-            .count()
-            >= 3,
+        source.contains("validate_candidate_plugin_graph("),
+        "cross-resource plugin checks must share one candidate graph"
+    );
+    assert!(
+        source.contains("validate_plugin_composition_candidate(candidate, http_client)"),
+        "admin candidates must enforce HMAC and correlation-ID composition"
+    );
+    assert!(
+        source.contains("validate_tcp_connection_throttle_attachments(candidate)"),
+        "admin candidates must reject unsupported TCP-throttle attachments"
+    );
+    assert!(
+        source.matches("validate_plugin_graph_candidates(").count() >= 3,
         "the helper definition plus Proxy and PluginConfig admission calls must exist"
     );
     assert!(
@@ -20,7 +29,7 @@ fn test_proxy_and_plugin_writes_run_plugin_composition_candidate_validation() {
         "both resource write paths must overlay their candidate"
     );
     let validation = source
-        .rfind("validate_plugin_composition_candidates(")
+        .rfind("validate_plugin_graph_candidates(")
         .expect("candidate validation call must exist");
     let persistence = source
         .rfind("resource.prepare_for_write()")
@@ -32,10 +41,42 @@ fn test_proxy_and_plugin_writes_run_plugin_composition_candidate_validation() {
 }
 
 #[test]
-fn test_batch_writes_run_plugin_composition_candidate_validation() {
+fn proxy_and_api_spec_deletes_validate_the_post_cascade_plugin_graph() {
+    let crud = include_str!("../../../src/admin/crud.rs");
+    assert!(
+        crud.contains("validate_plugin_graph_proxy_deletion_candidate("),
+        "direct Proxy deletion must build the post-cascade graph"
+    );
+    assert!(
+        crud.contains(
+            "validate_plugin_graph_proxy_deletion_candidate(db, state, namespace, &existing.id)"
+        ),
+        "Proxy::before_delete must reject the candidate before persistence"
+    );
+    assert!(
+        crud.contains("plugin.proxy_id.as_deref() != Some(removed_proxy_id)"),
+        "the candidate must mirror proxy-scoped plugin cascade deletion"
+    );
+    assert!(
+        crud.contains("plugin.scope != PluginScope::ProxyGroup"),
+        "the candidate must mirror orphaned proxy-group cleanup"
+    );
+
+    let api_specs = include_str!("../../../src/admin/api_specs/handlers.rs");
+    let validation = api_specs
+        .rfind("validate_plugin_graph_proxy_deletion_candidate(")
+        .expect("API-spec DELETE must validate its proxy cascade");
+    let persistence = api_specs
+        .rfind("persistence_db.delete_api_spec(&settlement_namespace, &persistence_id)")
+        .expect("settled API-spec DELETE persistence call");
+    assert!(validation < persistence);
+}
+
+#[test]
+fn test_batch_writes_run_plugin_graph_candidate_validation() {
     let source = include_str!("../../../src/admin/mod.rs");
     assert!(
-        source.contains("crud::validate_plugin_composition_candidates("),
+        source.contains("crud::validate_plugin_graph_candidates("),
         "batch Proxy and PluginConfig admission must validate the candidate chain"
     );
     assert!(source.contains("&batch.proxies,"));

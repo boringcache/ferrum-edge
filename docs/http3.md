@@ -273,7 +273,9 @@ size remains governed separately by
 `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`.
 This means every WebSocket plugin works on H3 sessions unchanged:
 
-- `on_ws_frame` (frame-level inspection / transformation; `ws_rate_limit`, `ws_message_size_limiting`, `ws_frame_logging`)
+- parser-level actual-frame/message limits (`ws_message_size_limiting`) and
+  `on_ws_frame` inspection/transformation after continuation reassembly
+  (`ws_rate_limiting`, `ws_frame_logging`)
 - `on_ws_disconnect` (end-of-session bookkeeping with frame counts and direction attribution)
 - `prometheus_metrics` WebSocket session count/duration and directional
   byte/frame totals (the shared disconnect hook gives H1 Upgrade, H2 Extended
