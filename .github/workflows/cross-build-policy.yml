@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
         with:
           ref: ${{ github.event.pull_request.base.sha }}
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Enforce trusted ARM64 cross-build policy
@@ -34,17 +34,19 @@ jobs:
           set -euo pipefail
 
           proposed_config="$RUNNER_TEMP/proposed-Cross.toml"
-          git fetch --no-tags --depth=1 origin "refs/pull/${PR_NUMBER}/head"
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
 
           # These files define and invoke the trusted policy. Once this
           # bootstrap workflow is on main, changes to either require an
-          # explicit branch-protection bypass rather than an ordinary PR.
+          # explicit branch-protection bypass rather than an ordinary PR. Use
+          # the merge base so unrelated changes made later on main do not make
+          # an otherwise untouched PR appear to modify these files.
           protected_paths=(
             ".github/scripts/verify_cross_build_policy.py"
             ".github/workflows/cross-build-policy.yml"
           )
           for protected_path in "${protected_paths[@]}"; do
-            if ! git diff --no-ext-diff --quiet HEAD FETCH_HEAD -- "$protected_path"; then
+            if ! git diff --no-ext-diff --quiet HEAD...FETCH_HEAD -- "$protected_path"; then
               echo "::error file=${protected_path}::trusted cross-build policy files cannot be changed by a pull request" >&2
               exit 1
             fi
