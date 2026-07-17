@@ -1,0 +1,42 @@
+name: Cross Build Policy
+
+on:
+  pull_request_target:
+    branches:
+      - main
+
+concurrency:
+  group: cross-build-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Trusted Cross Build Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # pull_request_target loads this workflow from the base branch. Keep the
+      # checkout on the trusted base commit and treat the PR's Cross.toml only
+      # as data; no code from the PR is executed in this job.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Enforce trusted ARM64 cross-build policy
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          proposed_config="$RUNNER_TEMP/proposed-Cross.toml"
+          git fetch --no-tags --depth=1 origin "refs/pull/${PR_NUMBER}/head"
+          git show "FETCH_HEAD:Cross.toml" > "$proposed_config"
+
+          python3 .github/scripts/verify_cross_build_policy.py \
+            --self-test \
+            --config "$proposed_config"
