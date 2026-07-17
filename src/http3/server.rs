@@ -6683,6 +6683,7 @@ fn build_h3_backend_url_for_flavor(
 /// backends reject and that breaks virtual-host routing on the upstream.
 /// Falls back to `proxy.backend_host` only when no upstream selection is
 /// available (single-target proxies).
+#[allow(clippy::too_many_arguments)]
 fn build_h3_backend_headers(
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
