@@ -55,8 +55,8 @@ use super::utils::aws_sigv4;
 use super::utils::body_transform::is_json_content_type;
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::{
-    EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, Plugin, PluginHttpClient, PluginResult,
-    RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
+    AiUsageExport, EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, Plugin, PluginHttpClient,
+    PluginResult, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
 };
 
 const DEFAULT_MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -5812,6 +5812,14 @@ impl AiFederation {
             "ai_federation_provider".to_string(),
             provider_name.to_string(),
         );
+        ctx.stage_ai_usage_export(AiUsageExport {
+            prefix: Arc::from("ai"),
+            provider: provider_type.as_str(),
+            prompt_tokens: tokens.prompt_tokens,
+            completion_tokens: tokens.completion_tokens,
+            total_tokens: tokens.total_tokens,
+            cost: None,
+        });
     }
 
     fn write_multimodal_text_only_metadata(

@@ -56,6 +56,7 @@ fn make_summary(
         bytes_received: 0,
         mirror: false,
         metadata: HashMap::new(),
+        ai_usage_export: None,
     }
 }
 

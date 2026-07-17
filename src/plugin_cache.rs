@@ -16,7 +16,7 @@
 //! lists (including their stateful instances) and only rebuild affected proxies.
 
 use arc_swap::ArcSwap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2172,7 +2172,7 @@ pub(crate) fn validate_plugin_composition_candidate(
         return Ok(());
     }
     let mut errors = Vec::new();
-    let mut global_plugins = Vec::new();
+    let mut global_plugins: BTreeMap<&str, Vec<Arc<dyn Plugin>>> = BTreeMap::new();
     let mut scoped_plugins: CompositionPluginMap<'_> = HashMap::new();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
@@ -2196,7 +2196,10 @@ pub(crate) fn validate_plugin_composition_candidate(
             &mut staged_tcp_throttle_states,
         ) {
             Ok(Some(plugin)) if plugin_config.scope == PluginScope::Global => {
-                global_plugins.push(plugin);
+                global_plugins
+                    .entry(plugin_config.namespace.as_str())
+                    .or_default()
+                    .push(plugin);
             }
             Ok(Some(plugin)) => {
                 scoped_plugins.insert(
@@ -2210,7 +2213,10 @@ pub(crate) fn validate_plugin_composition_candidate(
     }
 
     for proxy in &config.proxies {
-        let mut merged = global_plugins.clone();
+        let mut merged = global_plugins
+            .get(proxy.namespace.as_str())
+            .cloned()
+            .unwrap_or_default();
         let global_ptrs: HashSet<usize> = merged
             .iter()
             .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
@@ -2238,8 +2244,10 @@ pub(crate) fn validate_plugin_composition_candidate(
         }
     }
 
-    if let Err(error) = validate_plugin_composition(&global_plugins) {
-        errors.push(format!("global plugins: {error}"));
+    for (namespace, plugins) in &global_plugins {
+        if let Err(error) = validate_plugin_composition(plugins) {
+            errors.push(format!("global plugins namespace={namespace:?}: {error}"));
+        }
     }
 
     if errors.is_empty() {

@@ -58,6 +58,7 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         bytes_received: 0,
         mirror: false,
         metadata,
+        ai_usage_export: None,
     }
 }
 
@@ -185,6 +186,7 @@ fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         bytes_received: 0,
         mirror: false,
         metadata,
+        ai_usage_export: None,
     }
 }
 
