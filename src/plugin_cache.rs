@@ -2266,17 +2266,13 @@ pub(crate) fn validate_plugin_composition_candidate(
             remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
             merged.push(Arc::clone(plugin));
         }
-        if let Err(error) =
-            validate_plugin_composition(&merged, http_client.real_ip_header())
-        {
+        if let Err(error) = validate_plugin_composition(&merged, http_client.real_ip_header()) {
             errors.push(format!("proxy_id={}: {error}", proxy.id));
         }
     }
 
     for (namespace, plugins) in &global_plugins {
-        if let Err(error) =
-            validate_plugin_composition(plugins, http_client.real_ip_header())
-        {
+        if let Err(error) = validate_plugin_composition(plugins, http_client.real_ip_header()) {
             errors.push(format!("global plugins namespace={namespace:?}: {error}"));
         }
     }
@@ -3623,8 +3619,7 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) =
-                validate_plugin_composition(&merged, self.http_client.real_ip_header())
+            if let Err(e) = validate_plugin_composition(&merged, self.http_client.real_ip_header())
             {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
@@ -4223,9 +4218,7 @@ impl PluginCache {
         if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
-        if let Err(e) =
-            validate_plugin_composition(&global_plugins, http_client.real_ip_header())
-        {
+        if let Err(e) = validate_plugin_composition(&global_plugins, http_client.real_ip_header()) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
 

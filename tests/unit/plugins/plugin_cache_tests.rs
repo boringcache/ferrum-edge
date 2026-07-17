@@ -1,16 +1,16 @@
 //! Tests for PluginCache — pre-resolved plugin instances per proxy
 
 use chrono::Utc;
-use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
-    PluginScope, Proxy,
-};
-use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::_test_support::{
     plugin_cache_with_real_ip_header_for_test,
     validate_correlation_id_composition_with_real_ip_header_for_test,
     validate_plugin_composition_candidate_with_real_ip_header_for_test,
 };
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
+    PluginScope, Proxy,
+};
+use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
     apply_initial_response_header_policies,
@@ -5320,10 +5320,9 @@ fn test_real_ip_header_collision_is_rejected_by_candidate_and_runtime_cache() {
     .expect_err("candidate admission must reject the real-IP header collision");
     assert!(candidate_error.contains("FERRUM_REAL_IP_HEADER"));
 
-    let cache_error =
-        plugin_cache_with_real_ip_header_for_test(&config, Some("cf-connecting-ip"))
-            .err()
-            .expect("runtime cache construction must reject the real-IP header collision");
+    let cache_error = plugin_cache_with_real_ip_header_for_test(&config, Some("cf-connecting-ip"))
+        .err()
+        .expect("runtime cache construction must reject the real-IP header collision");
     assert!(cache_error.contains("FERRUM_REAL_IP_HEADER"));
 }
 
@@ -5346,7 +5345,7 @@ fn test_real_ip_header_non_collision_is_accepted_by_candidate_and_runtime_cache(
     )
     .expect("distinct candidate headers must be accepted");
     plugin_cache_with_real_ip_header_for_test(&config, Some("cloudfront-viewer-address"))
-    .expect("distinct runtime headers must be accepted");
+        .expect("distinct runtime headers must be accepted");
 }
 
 #[test]

@@ -123,9 +123,7 @@ impl CorrelationId {
             }
         };
 
-        if real_ip_header
-            .is_some_and(|configured| header_name.eq_ignore_ascii_case(configured))
-        {
+        if real_ip_header.is_some_and(|configured| header_name.eq_ignore_ascii_case(configured)) {
             return Err(format!(
                 "correlation_id: 'header_name' conflicts with the effective FERRUM_REAL_IP_HEADER client-attribution header and cannot be used for correlation IDs: {header_name:?}"
             ));
