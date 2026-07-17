@@ -88,6 +88,129 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
+    pub fn grpc_deadline_duration_millis_ceil_saturating_for_test(
+        duration: std::time::Duration,
+    ) -> Option<u64> {
+        crate::plugins::grpc_deadline::duration_millis_ceil_saturating(duration)
+    }
+
+    pub fn set_grpc_deadline_budget_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        budget_ms: Option<u64>,
+    ) {
+        ctx.set_grpc_deadline_budget(budget_ms);
+    }
+
+    pub async fn await_request_plugin_deadline_for_test<F>(
+        deadline: Option<tokio::time::Instant>,
+        future: F,
+    ) -> crate::plugins::PluginResult
+    where
+        F: std::future::Future<Output = crate::plugins::PluginResult>,
+    {
+        match crate::plugins::await_request_plugin_deadline_with_provenance(deadline, future).await
+        {
+            crate::plugins::RequestPluginDeadlineResult::Completed(result) => result,
+            crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded => {
+                crate::plugins::grpc_deadline_exceeded_plugin_result()
+            }
+        }
+    }
+
+    pub async fn finalize_plugin_rejection_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: u16,
+        body: Vec<u8>,
+        headers: HashMap<String, String>,
+    ) -> (u16, Vec<u8>, HashMap<String, String>) {
+        let mut response_status = status_code;
+        let mut response_headers = headers.clone();
+        let response_body = crate::proxy::apply_plugin_rejection_response(
+            plugins,
+            ctx,
+            &mut response_status,
+            &mut response_headers,
+            crate::proxy::RejectedResponseParts {
+                status_code,
+                body,
+                headers,
+            },
+        )
+        .await;
+        (response_status, response_body, response_headers)
+    }
+
+    pub fn gateway_deadline_response_selected_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.gateway_deadline_response_selected()
+    }
+
+    pub fn mark_gateway_deadline_response_selected_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.mark_gateway_deadline_response_selected();
+    }
+
+    pub async fn run_context_free_final_request_body_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> crate::plugins::PluginResult {
+        let deadline = ctx.grpc_deadline_at();
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            None,
+            deadline,
+            headers,
+            body.to_vec(),
+        )
+        .await;
+        crate::proxy::run_final_request_body_hooks_with_provenance(
+            plugins,
+            None,
+            deadline,
+            headers,
+            &transformed,
+        )
+        .await
+        .into_plugin_result(ctx)
+    }
+
+    pub struct GrpcWebPluginViewForTest {
+        pub plugins: Vec<String>,
+        pub grpc_deadline_plugins: Vec<String>,
+        pub backend_path_plugins: Vec<String>,
+    }
+
+    pub fn grpc_web_request_view_for_test(
+        cache: &crate::PluginCache,
+        proxy_id: &str,
+    ) -> GrpcWebPluginViewForTest {
+        let inner = cache.load_inner();
+        let view = inner.grpc_web_request_view(proxy_id);
+        GrpcWebPluginViewForTest {
+            plugins: view
+                .plugins()
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+            grpc_deadline_plugins: view
+                .grpc_deadline_plugins()
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+            backend_path_plugins: view
+                .backend_path_plugins()
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+        }
+    }
+
     pub fn bind_authorized_backend_path_for_test(
         ctx: &mut crate::plugins::RequestContext,
         path: &str,
@@ -304,6 +427,64 @@ pub mod _test_support {
             plugin_config,
             crate::plugins::PluginHttpClient::default(),
         )
+    }
+
+    pub fn validate_transaction_log_schema_graph_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(), Vec<String>> {
+        crate::plugins::transaction_log_schema::validate_config_graph(
+            config,
+            &crate::plugins::PluginHttpClient::default(),
+            true,
+        )
+    }
+
+    pub fn intervening_clear_recovery_candidate_for_test(
+        snapshot: crate::config::types::GatewayConfig,
+        current: crate::config::types::GatewayConfig,
+    ) -> crate::config::types::GatewayConfig {
+        crate::admin::intervening_clear_recovery_candidate_for_test(snapshot, current)
+    }
+
+    pub fn collect_rejecting_runtime_config_errors_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Vec<String> {
+        crate::config::validation_pipeline::collect_rejecting_runtime_config_errors(config)
+    }
+
+    pub async fn lock_namespace_config_admission_for_test(
+        namespace: &str,
+    ) -> tokio::sync::MutexGuard<'static, ()> {
+        crate::admin::crud::lock_local_namespace_config_admission(namespace).await
+    }
+
+    pub fn validate_plugin_configs_fatal_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<(), String> {
+        crate::config::validation_pipeline::ValidationPipeline::new(config)
+            .validate_plugin_configs(
+                backend_allow_ips,
+                crate::config::validation_pipeline::ValidationAction::FatalCount(
+                    "Validation failed with {} errors",
+                ),
+            )
+            .run()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn collect_plugin_config_errors_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<Vec<String>, String> {
+        crate::config::validation_pipeline::ValidationPipeline::new(config)
+            .validate_plugin_configs(
+                backend_allow_ips,
+                crate::config::validation_pipeline::ValidationAction::Collect,
+            )
+            .run()
+            .map_err(|error| error.to_string())
     }
 
     // ── plugins/request_deduplication ─────────────────────────────────────────
@@ -877,7 +1058,7 @@ pub mod _test_support {
         http_status: StatusCode,
         body: &[u8],
         headers: &HashMap<String, String>,
-    ) {
+    ) -> bool {
         crate::http3::server::run_h3_reject_response_committed_hooks(
             plugins,
             ctx,
@@ -887,7 +1068,7 @@ pub mod _test_support {
             body,
             headers,
         )
-        .await;
+        .await
     }
 
     // ── proxy/mod ────────────────────────────────────────────────────────────
@@ -897,6 +1078,225 @@ pub mod _test_support {
         pub body: Vec<u8>,
         pub grpc_status: Option<u32>,
         pub grpc_message: Option<String>,
+    }
+
+    pub struct DeadlineBackendResponse {
+        pub status_code: u16,
+        pub headers: HashMap<String, String>,
+        pub body: Vec<u8>,
+        pub connection_error: bool,
+        pub error_class: Option<crate::retry::ErrorClass>,
+    }
+
+    pub struct PreacquiredBackendAdmissionForTest {
+        inner: crate::proxy::PreacquiredBackendAdmission,
+    }
+
+    impl PreacquiredBackendAdmissionForTest {
+        pub fn acquired(permits: Option<crate::plugins::BackendAdmissionPermitSet>) -> Self {
+            Self {
+                inner: crate::proxy::PreacquiredBackendAdmission::acquired(permits),
+            }
+        }
+
+        pub fn take_if_acquired(
+            &mut self,
+        ) -> Option<Option<crate::plugins::BackendAdmissionPermitSet>> {
+            self.inner.take_if_acquired()
+        }
+    }
+
+    pub fn h3_buffered_grpc_deadline_replacement_for_test(
+        grpc_web_response_content_type: Option<&str>,
+    ) -> NormalizedRejectResponse {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test.Service/Call".to_string(),
+        );
+        let mut headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-correlation-id".to_string(), "request-123".to_string()),
+        ]);
+        let mut body = b"backend response".to_vec();
+        let http_status = crate::http3::server::replace_buffered_h3_response_with_grpc_deadline(
+            &mut ctx,
+            grpc_web_response_content_type,
+            &mut headers,
+            &mut body,
+            &[],
+        );
+        NormalizedRejectResponse {
+            http_status,
+            headers,
+            body,
+            grpc_status: ctx
+                .metadata
+                .get("grpc_status")
+                .and_then(|value| value.parse().ok()),
+            grpc_message: ctx.metadata.get("grpc_message").cloned(),
+        }
+    }
+
+    pub fn buffered_grpc_deadline_replacement_for_test(
+        grpc_web_response_content_type: Option<&str>,
+        mut headers: HashMap<String, String>,
+        mut body: Vec<u8>,
+    ) -> NormalizedRejectResponse {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test.Service/Call".to_string(),
+        );
+        let http_status = crate::proxy::replace_buffered_grpc_response_with_deadline(
+            &mut ctx,
+            grpc_web_response_content_type,
+            &mut headers,
+            &mut body,
+            &[],
+        );
+        NormalizedRejectResponse {
+            http_status,
+            headers,
+            body,
+            grpc_status: ctx
+                .metadata
+                .get("grpc_status")
+                .and_then(|value| value.parse().ok()),
+            grpc_message: ctx.metadata.get("grpc_message").cloned(),
+        }
+    }
+
+    pub async fn run_deadline_bounded_response_committed_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut Vec<u8>,
+    ) -> bool {
+        crate::proxy::run_deadline_bounded_response_committed_hooks(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            &[],
+        )
+        .await
+    }
+
+    pub async fn transform_buffered_response_body_with_deadline_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut Vec<u8>,
+        grpc_web_response_content_type: Option<&str>,
+    ) -> bool {
+        crate::proxy::transform_buffered_response_body_with_deadline(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            grpc_web_response_content_type,
+            &[],
+        )
+        .await
+        .0
+    }
+
+    pub fn strip_content_length_for_streaming_grpc_deadline_for_test(
+        response_headers: &mut HashMap<String, String>,
+        deadline_enabled: bool,
+    ) {
+        let deadline = deadline_enabled.then(tokio::time::Instant::now);
+        crate::proxy::strip_content_length_for_streaming_grpc_deadline(response_headers, deadline);
+    }
+
+    /// Return true when an indefinitely stalled downstream H3 write is
+    /// cancelled by the supplied absolute deadline.
+    pub async fn stalled_h3_response_write_expires_for_test(
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let write = std::future::pending::<Result<(), ()>>();
+        matches!(
+            crate::http3::stream_util::await_response_write_before_deadline(Some(deadline), write,)
+                .await,
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
+        )
+    }
+
+    /// Return true when a terminal H3 status that is immediately writable can
+    /// still complete after the timer selected the zero-DATA deadline path.
+    pub async fn ready_h3_terminal_write_wins_expired_deadline_for_test(
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        matches!(
+            crate::http3::stream_util::await_terminal_response_write_before_deadline(
+                Some(deadline),
+                std::future::ready(Ok::<(), ()>(())),
+            )
+            .await,
+            Ok(())
+        )
+    }
+
+    pub fn grpc_deadline_can_send_terminal_status_for_test(bytes_streamed: u64) -> bool {
+        crate::http3::stream_util::grpc_deadline_can_send_terminal_status(bytes_streamed)
+    }
+
+    pub fn client_grpc_deadline_response_for_request_for_test(
+        content_type: &str,
+    ) -> DeadlineBackendResponse {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test.Service/Call".to_string(),
+        );
+        let request_headers =
+            HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        let response = crate::proxy::client_grpc_deadline_exceeded_response_for_request(
+            &ctx,
+            &request_headers,
+            None,
+        );
+        let body = match response.body {
+            crate::retry::ResponseBody::Buffered(body) => body,
+            crate::retry::ResponseBody::Streaming { .. }
+            | crate::retry::ResponseBody::StreamingH2(_)
+            | crate::retry::ResponseBody::StreamingH3(_) => Vec::new(),
+        };
+        DeadlineBackendResponse {
+            status_code: response.status_code,
+            headers: response.headers,
+            body,
+            connection_error: response.connection_error,
+            error_class: response.error_class,
+        }
+    }
+
+    pub fn response_header_deadline_for_test(
+        client_deadline_after_ms: Option<u64>,
+        backend_read_timeout_ms: u64,
+    ) -> Option<(bool, u128)> {
+        let read_started_at = tokio::time::Instant::now();
+        let client_deadline = client_deadline_after_ms.and_then(|millis| {
+            read_started_at.checked_add(std::time::Duration::from_millis(millis))
+        });
+        crate::proxy::response_header_deadline(
+            client_deadline,
+            backend_read_timeout_ms,
+            read_started_at,
+        )
+        .map(|(deadline, source)| {
+            (
+                matches!(source, crate::proxy::ResponseHeaderDeadlineSource::Client),
+                deadline
+                    .saturating_duration_since(read_started_at)
+                    .as_millis(),
+            )
+        })
     }
 
     pub fn can_use_direct_http2_pool(
@@ -936,7 +1336,10 @@ pub mod _test_support {
         headers: &HashMap<String, String>,
         body_bytes: Vec<u8>,
     ) -> Vec<u8> {
-        crate::proxy::apply_request_body_plugins(plugins, headers, body_bytes).await
+        crate::proxy::apply_request_body_plugins_with_context(
+            plugins, None, None, headers, body_bytes,
+        )
+        .await
     }
 
     pub fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {
@@ -1090,5 +1493,49 @@ pub mod _test_support {
         >,
     ) -> crate::proxy::ProxyBody {
         crate::proxy::body::ProxyBody::streaming(body)
+    }
+
+    pub fn proxy_body_with_client_grpc_deadline_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: tokio::time::Instant,
+        grpc_web_response_content_type: Option<&str>,
+    ) -> crate::proxy::ProxyBody {
+        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
+    }
+
+    pub async fn finalized_upload_deadline_response_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        grpc_web_response_content_type: Option<&str>,
+    ) -> http::Response<crate::proxy::ProxyBody> {
+        crate::proxy::build_finalized_upload_deadline_response(
+            plugins,
+            ctx,
+            grpc_web_response_content_type,
+        )
+        .await
+        .0
+    }
+
+    pub fn inspected_proxy_body_for_test(
+        body: crate::proxy::ProxyBody,
+        inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
+    ) -> crate::proxy::ProxyBody {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(crate::proxy::body::run_proxy_body_response_inspection(
+            body,
+            inspector,
+            tx,
+            0,
+            crate::proxy::LoadBalancerConnectionGuard::new(None, None),
+        ));
+        crate::proxy::body::inspected_streaming_body(rx)
+    }
+
+    pub fn h3_plugin_protocol_for_request_for_test(
+        flavor: crate::config::types::HttpFlavor,
+        grpc_web_request: bool,
+    ) -> crate::plugins::ProxyProtocol {
+        crate::http3::server::h3_plugin_protocol_for_request(flavor, grpc_web_request)
     }
 }

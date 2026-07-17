@@ -1640,22 +1640,21 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
 
 #[tokio::test]
 async fn test_request_view_precomputes_response_committed_hook_capability() {
-    let config = make_config(
-        vec![make_proxy("p1", "/api", vec!["audit"])],
-        vec![make_plugin_config_with_json(
-            "audit",
-            "ai_transcript_audit",
-            json!({
-                "capture": { "request": true, "response": true },
-                "sink": {
-                    "type": "http",
-                    "endpoint_url": "https://audit.example.com/ingest"
-                }
-            }),
-            PluginScope::Proxy,
-            Some("p1"),
-        )],
+    let mut audit = make_plugin_config_with_json(
+        "audit",
+        "ai_transcript_audit",
+        json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest"
+            }
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
     );
+    audit.priority_override = Some(125);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
     let cache = PluginCache::new(&config).unwrap();
     let view = cache.request_view("p1", ProxyProtocol::Http);
 
@@ -1663,11 +1662,45 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
         view.capabilities()
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
     );
+    assert_eq!(view.response_committed_plugins().len(), 1);
+    assert_eq!(
+        view.response_committed_plugins()[0].name(),
+        "ai_transcript_audit"
+    );
+    assert_eq!(view.response_committed_plugins()[0].priority(), 125);
     assert!(
         !cache
             .request_view("missing", ProxyProtocol::Http)
             .capabilities()
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+    );
+}
+
+#[test]
+fn test_request_view_precomputes_grpc_deadline_policy_plugins() {
+    let mut deadline = make_plugin_config_with_json(
+        "deadline",
+        "grpc_deadline",
+        json!({"default_deadline_ms": 1000}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    deadline.priority_override = Some(120);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["deadline"])],
+        vec![deadline],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let grpc_view = cache.request_view("p1", ProxyProtocol::Grpc);
+    assert_eq!(grpc_view.grpc_deadline_plugins().len(), 1);
+    assert_eq!(grpc_view.grpc_deadline_plugins()[0].name(), "grpc_deadline");
+    assert_eq!(grpc_view.grpc_deadline_plugins()[0].priority(), 120);
+    assert!(
+        cache
+            .request_view("p1", ProxyProtocol::Http)
+            .grpc_deadline_plugins()
+            .is_empty()
     );
 }
 
@@ -2800,6 +2833,135 @@ fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
 
 // ---- Protocol-filtered plugin lookup tests ----
 
+#[test]
+fn transaction_log_schema_only_cache_preserves_no_plugin_fast_path_for_all_protocols() {
+    use ferrum_edge::plugins::utils::log_schema::registry;
+
+    let _guard = registry::lock_for_tests();
+    registry::reset_for_tests();
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![
+            make_plugin_config_with_json(
+                "schemas-a",
+                "transaction_log_schema",
+                json!({"schemas": {"audit-a": {"summary_type": "both"}}}),
+                PluginScope::Global,
+                None,
+            ),
+            make_plugin_config_with_json(
+                "schemas-b",
+                "transaction_log_schema",
+                json!({"schemas": {"audit-b": {"summary_type": "both"}}}),
+                PluginScope::Global,
+                None,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("schema-only cache must build");
+
+    assert!(cache.get_plugins("p1").is_empty());
+    assert!(cache.get_plugins("unknown").is_empty());
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+        ProxyProtocol::Tcp,
+        ProxyProtocol::Udp,
+    ] {
+        let first_view = cache.request_view("p1", protocol);
+        let second_view = cache.request_view("p1", protocol);
+        let first_plugins = first_view.plugins();
+        let second_plugins = second_view.plugins();
+        assert!(
+            first_plugins.is_empty(),
+            "config-only schema instances leaked into the {protocol:?} runtime list"
+        );
+        assert!(
+            Arc::ptr_eq(&first_plugins, &second_plugins),
+            "{protocol:?} request views must reuse the precomputed plugin list instead of allocating per request"
+        );
+
+        let first_auth = first_view.auth_plugins();
+        let second_auth = second_view.auth_plugins();
+        let first_authorize = first_view.authorize_plugins();
+        let second_authorize = second_view.authorize_plugins();
+        let first_backend_admission = first_view.backend_admission_plugins();
+        let second_backend_admission = second_view.backend_admission_plugins();
+        let first_redactions = first_view.request_headers_to_redact();
+        let second_redactions = second_view.request_headers_to_redact();
+        let first_initial_response = first_view.initial_response_header_policy_plugins();
+        let second_initial_response = second_view.initial_response_header_policy_plugins();
+        let first_initial_names = first_view.initial_response_header_policy_names();
+        let second_initial_names = second_view.initial_response_header_policy_names();
+        assert!(Arc::ptr_eq(&first_auth, &second_auth));
+        assert!(Arc::ptr_eq(&first_authorize, &second_authorize));
+        assert!(Arc::ptr_eq(
+            &first_backend_admission,
+            &second_backend_admission
+        ));
+        assert!(Arc::ptr_eq(&first_redactions, &second_redactions));
+        assert!(Arc::ptr_eq(
+            &first_initial_response,
+            &second_initial_response
+        ));
+        assert!(Arc::ptr_eq(&first_initial_names, &second_initial_names));
+        assert!(!first_view.requires_response_body_buffering());
+        assert!(!first_view.requires_request_body_buffering());
+        assert!(!first_view.requires_ws_frame_hooks());
+    }
+    assert!(registry::lookup_named("audit-a").is_some());
+    assert!(registry::lookup_named("audit-b").is_some());
+}
+
+#[test]
+fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries() {
+    use ferrum_edge::plugins::utils::log_schema::registry;
+
+    let _guard = registry::lock_for_tests();
+    registry::reset_for_tests();
+    let old_schema = make_plugin_config_with_json(
+        "schemas",
+        "transaction_log_schema",
+        json!({"schemas": {"before": {}}}),
+        PluginScope::Global,
+        None,
+    );
+    let old_config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![old_schema.clone()],
+    );
+    let cache = PluginCache::new(&old_config).expect("initial schema cache");
+
+    let mut new_schema = old_schema;
+    new_schema.config = json!({"schemas": {"after": {}}});
+    new_schema.updated_at += chrono::Duration::seconds(1);
+    let new_config = make_config(vec![make_proxy("p1", "/api", vec![])], vec![new_schema]);
+    let delta = ConfigDelta::compute(&old_config, &new_config);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+    cache
+        .apply_delta(
+            &new_config,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect("schema delta reload");
+
+    assert!(registry::lookup_named("before").is_none());
+    assert!(registry::lookup_named("after").is_some());
+    assert!(cache.get_plugins("p1").is_empty());
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+        ProxyProtocol::Tcp,
+        ProxyProtocol::Udp,
+    ] {
+        assert!(cache.get_plugins_for_protocol("p1", protocol).is_empty());
+    }
+}
+
 fn make_plugin_config_with_json(
     id: &str,
     plugin_name: &str,
@@ -3559,8 +3721,33 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
+#[tokio::test]
+async fn test_priority_override_delegates_deadline_rejection_replacement_capability() {
+    let mut audit = make_plugin_config_with_json(
+        "audit",
+        "ai_transcript_audit",
+        json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest"
+            }
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    audit.priority_override = Some(100);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 100);
+    assert!(plugins[0].may_replace_rejection_response());
+}
+
 #[test]
-fn test_priority_override_delegates_rejection_replacement_capability() {
+fn test_priority_override_delegates_spec_rejection_replacement_capability() {
     let mut plugin_config = make_plugin_config_with_json(
         "ps1",
         "spec_expose",
@@ -3582,6 +3769,7 @@ fn test_priority_override_delegates_rejection_replacement_capability() {
     assert_eq!(plugins[0].priority(), 211);
     assert!(plugins[0].applies_after_proxy_on_reject());
     assert!(plugins[0].may_replace_rejection_response());
+    assert!(!plugins[0].warn_on_rejection_response_replacement());
 }
 
 #[test]
@@ -5125,6 +5313,38 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
 }
 
 #[test]
+fn test_ai_federation_sets_terminal_final_body_dispatch_capability() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "ai_federation",
+        json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "api_key": "sk-test-key",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    // Exercise the priority wrapper too: it must forward the terminal dispatch
+    // contract or the proxy would run federation inside backend accounting.
+    plugin_config.priority_override = Some(2099);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        caps.has(PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH),
+        "AI federation must finalize and dispatch before backend-only preflights and accounting"
+    );
+}
+
+#[test]
 fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["ps1"])],
@@ -5389,6 +5609,129 @@ fn test_default_priority_used_when_no_override() {
     // cors (100) should come before key_auth (1200)
     assert_eq!(plugins[0].name(), "cors");
     assert_eq!(plugins[1].name(), "key_auth");
+}
+
+#[test]
+fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_policies() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["dedup", "grpc-web", "method-router", "deadline"],
+        )],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "method-router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "deadline",
+                "grpc_deadline",
+                json!({"default_deadline_ms": 1000}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("plugin cache");
+    let view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+
+    assert!(
+        view.plugins
+            .iter()
+            .any(|name| name == "request_deduplication")
+    );
+    assert!(view.plugins.iter().any(|name| name == "grpc_web"));
+    assert_eq!(
+        view.plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_method_router")
+            .count(),
+        1
+    );
+    assert_eq!(
+        view.plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_deadline")
+            .count(),
+        1
+    );
+    assert_eq!(view.grpc_deadline_plugins, vec!["grpc_deadline"]);
+    assert_eq!(view.backend_path_plugins, vec!["grpc_method_router"]);
+
+    let merged_names = cache
+        .get_plugins("p1")
+        .iter()
+        .filter(|plugin| {
+            plugin.supported_protocols().contains(&ProxyProtocol::Http)
+                || (["grpc_method_router", "grpc_deadline"].contains(&plugin.name())
+                    && plugin.supported_protocols().contains(&ProxyProtocol::Grpc))
+        })
+        .map(|plugin| plugin.name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        view.plugins, merged_names,
+        "the precomputed composed view must preserve merged priority/config order"
+    );
+
+    let reloaded = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["grpc-web", "method-router", "deadline"],
+        )],
+        vec![
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "method-router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "deadline",
+                "grpc_deadline",
+                json!({"default_deadline_ms": 1000}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    cache
+        .apply_delta(
+            &reloaded,
+            &std::collections::HashSet::from(["p1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("gRPC-Web composed view delta rebuild");
+    let reloaded_view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+    assert!(
+        !reloaded_view
+            .plugins
+            .iter()
+            .any(|name| name == "request_deduplication")
+    );
+    assert_eq!(
+        reloaded_view
+            .plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_deadline")
+            .count(),
+        1
+    );
 }
 
 #[test]

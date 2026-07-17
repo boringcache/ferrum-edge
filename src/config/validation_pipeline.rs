@@ -98,6 +98,13 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     if let Err(found) = config.validate_plugin_references() {
         errors.extend(found);
     }
+    if let Err(found) = crate::plugins::transaction_log_schema::validate_config_graph(
+        config,
+        &crate::plugins::PluginHttpClient::default(),
+        false,
+    ) {
+        errors.extend(found);
+    }
     // Serving modes reject malformed fail-closed plugins while staging the
     // PluginCache. CP mode has no runtime PluginCache, so validate the
     // security-critical ip_restriction shape here as well before a database
@@ -429,8 +436,51 @@ impl<'a> ValidationPipeline<'a> {
                     action,
                 } => {
                     let mut errors = Vec::new();
+                    let graph_http_client =
+                        crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
+                            backend_allow_ips.clone(),
+                        );
+                    if let Err(graph_errors) =
+                        crate::plugins::transaction_log_schema::validate_config_graph(
+                            config,
+                            &graph_http_client,
+                            matches!(&action, ValidationAction::Collect),
+                        )
+                    {
+                        errors.extend(graph_errors);
+                    }
                     for plugin_config in &config.plugin_configs {
                         if !plugin_config.enabled {
+                            continue;
+                        }
+                        // The prospective graph pass above validates schema
+                        // definitions and referrers in definition-first order.
+                        // Re-validating either one here would consult the live
+                        // registry after the isolated bracket was aborted.
+                        if crate::plugins::transaction_log_schema::participates_in_config_graph(
+                            plugin_config,
+                        ) {
+                            if let Err(err) = crate::plugins::validate_plugin_config_policy_only(
+                                &plugin_config.plugin_name,
+                                &plugin_config.config,
+                                backend_allow_ips,
+                            ) {
+                                let message = format!(
+                                    "Plugin '{}' (id={}): {}",
+                                    plugin_config.plugin_name, plugin_config.id, err
+                                );
+                                if !matches!(&action, ValidationAction::Collect)
+                                    && crate::plugins::plugin_failure_policy(
+                                        &plugin_config.plugin_name,
+                                    ) == Some(
+                                        crate::plugins::PluginFailurePolicy::OptionalFailOpen,
+                                    )
+                                {
+                                    warn!("Optional plugin config validation warning: {}", message);
+                                } else {
+                                    errors.push(message);
+                                }
+                            }
                             continue;
                         }
                         if let Err(err) = crate::plugins::validate_plugin_config_with_policy(

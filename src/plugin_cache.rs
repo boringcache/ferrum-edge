@@ -39,9 +39,9 @@ use crate::plugins::{
 // ---------------------------------------------------------------------------
 
 use crate::plugins::{
-    BackendPathPolicyPhase, PluginResult, RequestContext, ResponseStreamInspector,
-    StreamConnectionContext, StreamTransactionSummary, TransactionSummary, UdpDatagramContext,
-    UdpDatagramVerdict, WebSocketFrameDirection,
+    PluginResult, RequestContext, ResponseStreamInspector, StreamConnectionContext,
+    StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
+    WebSocketFrameDirection,
 };
 use async_trait::async_trait;
 
@@ -262,6 +262,12 @@ impl Plugin for PriorityOverridePlugin {
     fn priority(&self) -> u16 {
         self.priority
     }
+    fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
+        self.inner.prepare_grpc_deadline(ctx)
+    }
+    fn requires_grpc_deadline_preflight(&self) -> bool {
+        self.inner.requires_grpc_deadline_preflight()
+    }
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         self.inner.on_request_received(ctx).await
     }
@@ -343,11 +349,8 @@ impl Plugin for PriorityOverridePlugin {
         &self,
         ctx: &mut RequestContext,
         backend_path: &str,
-        phase: BackendPathPolicyPhase,
     ) -> PluginResult {
-        self.inner
-            .on_backend_path_resolved(ctx, backend_path, phase)
-            .await
+        self.inner.on_backend_path_resolved(ctx, backend_path).await
     }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();
@@ -581,6 +584,10 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn needs_final_request_body_context(&self) -> bool {
         self.inner.needs_final_request_body_context()
+    }
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+        self.inner
+            .requires_final_request_body_before_backend_dispatch()
     }
     async fn transform_response_body(
         &self,
@@ -2222,6 +2229,7 @@ impl PluginCapabilities {
     pub const HAS_BODY_BEFORE_AUTHORIZE: u16 = 1 << 10;
     pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
     pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
+    pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -2233,6 +2241,8 @@ impl PluginCapabilities {
 /// Built at config reload time so the hot path does zero filtering or allocation.
 #[derive(Clone)]
 pub struct PluginPhaseData {
+    /// gRPC deadline-policy plugins only, in configured priority order.
+    pub grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Auth plugins only (pre-filtered from the protocol plugin list).
     pub auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Authorization plugins only (pre-filtered from the protocol plugin list).
@@ -2248,6 +2258,8 @@ pub struct PluginPhaseData {
     pub initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Unique canonical field names touched by initial-response policy.
     pub initial_response_header_policy_names: Arc<Vec<String>>,
+    /// Final committed-response observers only, in configured priority order.
+    pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
 }
@@ -2256,13 +2268,18 @@ pub struct PluginPhaseData {
 fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut caps = 0u16;
     let mut auth = Vec::new();
+    let mut grpc_deadline = Vec::new();
     let mut authorize = Vec::new();
     let mut backend_admission = Vec::new();
     let mut backend_path = Vec::new();
     let mut request_headers_to_redact = Vec::new();
     let mut initial_response_header_policy_plugins = Vec::new();
     let mut initial_response_header_policy_names = Vec::new();
+    let mut response_committed = Vec::new();
     for p in plugins {
+        if p.requires_grpc_deadline_preflight() {
+            grpc_deadline.push(Arc::clone(p));
+        }
         if p.is_auth_plugin() {
             caps |= PluginCapabilities::HAS_AUTH_PLUGINS;
             auth.push(Arc::clone(p));
@@ -2320,14 +2337,19 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         if p.needs_final_request_body_context() {
             caps |= PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT;
         }
+        if p.requires_final_request_body_before_backend_dispatch() {
+            caps |= PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH;
+        }
         if p.requires_response_committed_hook() {
             caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;
+            response_committed.push(Arc::clone(p));
         }
         if p.requires_response_stream_hooks() {
             caps |= PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS;
         }
     }
     PluginPhaseData {
+        grpc_deadline_plugins: Arc::new(grpc_deadline),
         auth_plugins: Arc::new(auth),
         authorize_plugins: Arc::new(authorize),
         backend_admission_plugins: Arc::new(backend_admission),
@@ -2335,6 +2357,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         request_headers_to_redact: Arc::new(request_headers_to_redact),
         initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
+        response_committed_plugins: Arc::new(response_committed),
         capabilities: PluginCapabilities(caps),
     }
 }
@@ -2372,6 +2395,11 @@ struct ProtocolSnapshot {
     proxy: HashMap<String, HashMap<ProxyProtocol, ProtocolEntry>>,
     /// Global fallback: protocol → ProtocolEntry
     global: HashMap<ProxyProtocol, ProtocolEntry>,
+    /// HTTP plugin view plus the two native-gRPC policies that are compatible
+    /// with recognized H3 gRPC-Web requests.
+    grpc_web_proxy: HashMap<String, ProtocolEntry>,
+    /// Global fallback for the composed H3 gRPC-Web view.
+    grpc_web_global: ProtocolEntry,
 }
 
 const ALL_PROXY_PROTOCOLS: [ProxyProtocol; 5] = [
@@ -2391,18 +2419,42 @@ fn build_protocol_entry(plugins: &[Arc<dyn Plugin>], proto: ProxyProtocol) -> Pr
     }
 }
 
+const H3_GRPC_WEB_NATIVE_POLICY_PLUGINS: [&str; 2] = ["grpc_method_router", "grpc_deadline"];
+
+fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
+    // The merged proxy list is already in configured priority/config order.
+    // Filtering it once preserves that order, retains every ordinary HTTP
+    // guardrail, and includes each compatible native-gRPC policy instance at
+    // most once even if a future implementation supports both protocols.
+    let plugins = Arc::new(
+        plugins
+            .iter()
+            .filter(|plugin| {
+                plugin.supported_protocols().contains(&ProxyProtocol::Http)
+                    || (H3_GRPC_WEB_NATIVE_POLICY_PLUGINS.contains(&plugin.name())
+                        && plugin.supported_protocols().contains(&ProxyProtocol::Grpc))
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let phase = build_phase_data(&plugins);
+    ProtocolEntry { plugins, phase }
+}
+
 /// Build the full protocol snapshot from the plugin map + global fallback.
 fn build_protocol_snapshot(
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
 ) -> ProtocolSnapshot {
     let mut proxy = HashMap::with_capacity(proxy_map.len());
+    let mut grpc_web_proxy = HashMap::with_capacity(proxy_map.len());
     for (proxy_id, plugins) in proxy_map {
         let mut inner = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
         for &proto in &ALL_PROXY_PROTOCOLS {
             inner.insert(proto, build_protocol_entry(plugins, proto));
         }
         proxy.insert(proxy_id.clone(), inner);
+        grpc_web_proxy.insert(proxy_id.clone(), build_grpc_web_protocol_entry(plugins));
     }
 
     let mut global = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
@@ -2410,7 +2462,14 @@ fn build_protocol_snapshot(
         global.insert(proto, build_protocol_entry(globals, proto));
     }
 
-    ProtocolSnapshot { proxy, global }
+    let grpc_web_global = build_grpc_web_protocol_entry(globals);
+
+    ProtocolSnapshot {
+        proxy,
+        global,
+        grpc_web_proxy,
+        grpc_web_global,
+    }
 }
 
 /// Collect all JWKS URIs actively referenced by `jwks_auth` plugin instances
@@ -2618,6 +2677,16 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    pub(crate) fn get_grpc_deadline_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.grpc_deadline_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub(crate) fn get_authorize_plugins(
         &self,
         proxy_id: &str,
@@ -2678,6 +2747,16 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    pub(crate) fn get_response_committed_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.response_committed_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub(crate) fn get_capabilities(
         &self,
         proxy_id: &str,
@@ -2720,6 +2799,7 @@ impl PluginCacheInner {
             .then(|| self.get_backend_path_plugins(proxy_id, protocol));
         PluginCacheRequestView {
             plugins: self.get_plugins_for_protocol(proxy_id, protocol),
+            grpc_deadline_plugins: self.get_grpc_deadline_plugins(proxy_id, protocol),
             auth_plugins: self.get_auth_plugins(proxy_id, protocol),
             authorize_plugins: self.get_authorize_plugins(proxy_id, protocol),
             backend_admission_plugins: self.get_backend_admission_plugins(proxy_id, protocol),
@@ -2729,6 +2809,39 @@ impl PluginCacheInner {
                 .get_initial_response_header_policy_plugins(proxy_id, protocol),
             initial_response_header_policy_names: self
                 .get_initial_response_header_policy_names(proxy_id, protocol),
+            response_committed_plugins: self.get_response_committed_plugins(proxy_id, protocol),
+            capabilities,
+            requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
+            requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
+            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_id),
+        }
+    }
+
+    pub(crate) fn grpc_web_request_view(&self, proxy_id: &str) -> PluginCacheRequestView {
+        let entry = self
+            .protocol_snapshot
+            .grpc_web_proxy
+            .get(proxy_id)
+            .unwrap_or(&self.protocol_snapshot.grpc_web_global);
+        let capabilities = entry.phase.capabilities;
+        let backend_path_plugins = capabilities
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+            .then(|| Arc::clone(&entry.phase.backend_path_plugins));
+        PluginCacheRequestView {
+            plugins: Arc::clone(&entry.plugins),
+            grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
+            auth_plugins: Arc::clone(&entry.phase.auth_plugins),
+            authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
+            backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
+            backend_path_plugins,
+            request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
+            initial_response_header_policy_plugins: Arc::clone(
+                &entry.phase.initial_response_header_policy_plugins,
+            ),
+            initial_response_header_policy_names: Arc::clone(
+                &entry.phase.initial_response_header_policy_names,
+            ),
+            response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
             capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
@@ -2745,6 +2858,7 @@ impl PluginCacheInner {
 #[derive(Clone)]
 pub struct PluginCacheRequestView {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -2752,6 +2866,7 @@ pub struct PluginCacheRequestView {
     request_headers_to_redact: Arc<Vec<String>>,
     initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     initial_response_header_policy_names: Arc<Vec<String>>,
+    response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
@@ -2762,6 +2877,11 @@ impl PluginCacheRequestView {
     /// Get pre-resolved protocol-filtered plugins from this request view.
     pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.plugins)
+    }
+
+    /// Get the pre-filtered synchronous gRPC deadline-policy chain.
+    pub fn grpc_deadline_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.grpc_deadline_plugins.as_slice()
     }
 
     /// Get pre-computed auth plugins from this request view.
@@ -2800,6 +2920,11 @@ impl PluginCacheRequestView {
     /// Get canonical field names touched by initial-response policy.
     pub fn initial_response_header_policy_names(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.initial_response_header_policy_names)
+    }
+
+    /// Get the pre-filtered committed-response observer chain.
+    pub fn response_committed_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.response_committed_plugins.as_slice()
     }
 
     /// Get pre-computed capability bitset from this request view.
@@ -3072,7 +3197,8 @@ impl PluginCache {
             // cheap (one Mutex acquire + empty HashMap) and guarantees
             // the registry stays in sync even if a sibling global plugin
             // was the trigger for the rebuild.
-            crate::plugins::utils::log_schema::registry::begin_reload();
+            crate::plugins::utils::log_schema::registry::begin_reload()
+                .map_err(|error| format!("Config reload rejected: {error}"))?;
             for pc in &config.plugin_configs {
                 if !pc.enabled || pc.scope != PluginScope::Global {
                     continue;
@@ -3089,7 +3215,9 @@ impl PluginCache {
                     &current.tcp_connection_throttle_instances,
                     &mut tcp_connection_throttle_instances,
                 ) {
-                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    // Config-only: construction stages the registry entry, but
+                    // the instance must never enter runtime hook/cache lists.
+                    Ok(Some(_)) => {}
                     Ok(None) => {}
                     Err(e) => {
                         error!("Config reload: {}", e);
@@ -3426,8 +3554,10 @@ impl PluginCache {
         // bracket above — abort it so the process-global named-schema
         // registry doesn't get mutated by a config that's being rejected.
         if !plugin_errors.is_empty() {
-            if rebuild_globals {
-                crate::plugins::utils::log_schema::registry::abort_reload();
+            if rebuild_globals
+                && let Err(error) = crate::plugins::utils::log_schema::registry::abort_reload()
+            {
+                plugin_errors.push(error);
             }
             return Err(format!(
                 "Config reload rejected: {} plugin config(s) failed validation: {}",
@@ -3438,7 +3568,13 @@ impl PluginCache {
 
         if let Err(error) = start_background_tasks(&new_map, &new_globals) {
             if rebuild_globals {
-                crate::plugins::utils::log_schema::registry::abort_reload();
+                crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                    |registry_error| {
+                        format!(
+                            "Config reload rejected: {error}; registry abort also failed: {registry_error}"
+                        )
+                    },
+                )?;
             }
             return Err(format!("Config reload rejected: {error}"));
         }
@@ -3446,8 +3582,10 @@ impl PluginCache {
         // Rebuild protocol snapshot (plugins + phase data) for changed proxies.
         // Clone-and-patch from the current snapshot so unchanged proxies are preserved.
         let mut new_proxy_proto = current.protocol_snapshot.proxy.clone();
+        let mut new_grpc_web_proxy = current.protocol_snapshot.grpc_web_proxy.clone();
         for id in removed_proxy_ids {
             new_proxy_proto.remove(id);
+            new_grpc_web_proxy.remove(id);
         }
         for proxy in &config.proxies {
             if proxy_ids_to_rebuild.contains(&proxy.id)
@@ -3458,6 +3596,7 @@ impl PluginCache {
                     inner.insert(proto, build_protocol_entry(plugins, proto));
                 }
                 new_proxy_proto.insert(proxy.id.clone(), inner);
+                new_grpc_web_proxy.insert(proxy.id.clone(), build_grpc_web_protocol_entry(plugins));
             }
         }
         let new_global_proto = if global_plugins_changed {
@@ -3468,6 +3607,11 @@ impl PluginCache {
             g
         } else {
             current.protocol_snapshot.global.clone()
+        };
+        let new_grpc_web_global = if global_plugins_changed {
+            build_grpc_web_protocol_entry(&new_globals)
+        } else {
+            current.protocol_snapshot.grpc_web_global.clone()
         };
 
         let new_global_requires_buffering = if global_plugins_changed {
@@ -3494,7 +3638,8 @@ impl PluginCache {
         // above (rebuild_globals == true), promote the staged named
         // schemas now — pairs with the `begin_reload` at the top.
         if rebuild_globals {
-            crate::plugins::utils::log_schema::registry::commit_reload();
+            crate::plugins::utils::log_schema::registry::commit_reload()
+                .map_err(|error| format!("Config reload rejected: {error}"))?;
         }
 
         Ok(Arc::new(PluginCacheInner::new(
@@ -3507,6 +3652,8 @@ impl PluginCache {
             ProtocolSnapshot {
                 proxy: new_proxy_proto,
                 global: new_global_proto,
+                grpc_web_proxy: new_grpc_web_proxy,
+                grpc_web_global: new_grpc_web_global,
             },
             new_ws_frame,
             new_global_requires_ws_frame,
@@ -3750,7 +3897,8 @@ impl PluginCache {
         // the rest of the plugin-cache build succeeds; `abort_reload`
         // runs if any plugin fails validation, so the process-global
         // registry stays atomically tied to the cache.
-        crate::plugins::utils::log_schema::registry::begin_reload();
+        crate::plugins::utils::log_schema::registry::begin_reload()
+            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
         for pc in &config.plugin_configs {
             if !pc.enabled || pc.scope != PluginScope::Global {
                 continue;
@@ -3767,7 +3915,9 @@ impl PluginCache {
                 current_tcp_throttle_states,
                 &mut tcp_connection_throttle_instances,
             ) {
-                Ok(Some(plugin)) => global_plugins.push(plugin),
+                // Config-only: construction stages the registry entry, but
+                // the instance must never enter runtime hook/cache lists.
+                Ok(Some(_)) => {}
                 Ok(None) => {}
                 Err(e) => plugin_errors.push(e),
             }
@@ -3971,7 +4121,9 @@ impl PluginCache {
         // live PluginCache stays on the old plugins while the registry
         // already reflects the rejected reload's schemas.
         if !plugin_errors.is_empty() {
-            crate::plugins::utils::log_schema::registry::abort_reload();
+            if let Err(error) = crate::plugins::utils::log_schema::registry::abort_reload() {
+                plugin_errors.push(error);
+            }
             for err in &plugin_errors {
                 error!("{}", err);
             }
@@ -3983,13 +4135,20 @@ impl PluginCache {
         }
 
         if let Err(error) = start_background_tasks(&proxy_map, &global_plugins) {
-            crate::plugins::utils::log_schema::registry::abort_reload();
+            crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                |registry_error| {
+                    format!(
+                        "Gateway startup aborted: {error}; registry abort also failed: {registry_error}"
+                    )
+                },
+            )?;
             return Err(format!("Gateway startup aborted: {error}"));
         }
 
         // All plugins validated — promote the staged named schemas to live.
         // Pairs with the `begin_reload` at the start of this function.
-        crate::plugins::utils::log_schema::registry::commit_reload();
+        crate::plugins::utils::log_schema::registry::commit_reload()
+            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
 
         let global_needs_buffering = global_plugins
             .iter()

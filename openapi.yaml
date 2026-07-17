@@ -3224,10 +3224,15 @@ paths:
         all existing resources, and imports the provided configuration. If any
         import (or the delete) step fails, Ferrum clears the partial state and
         reapplies the snapshot. One persistent namespace-scoped datastore guard
-        spans that compensating clear and every replay batch, so other
+        normally spans that compensating clear and every replay batch, so other
         DNS-sensitive writers cannot interleave with the rollback-only raw
-        replay. Requires `?confirm=true` query parameter to prevent accidental
-        invocation.
+        replay. If a successful clear settles after its namespace lease expires
+        and another writer commits under the next generation, recovery keeps
+        current resources authoritative for matching IDs, validates the combined
+        transaction-log schema graph, and inserts only missing snapshot resources.
+        It never clears the intervening write; an invalid combined graph is
+        rejected before replay. Requires `?confirm=true` query parameter to
+        prevent accidental invocation.
 
         The recovery snapshot uses a **non-validating raw load** from the
         primary, so an already-invalid-but-present namespace (the case an
@@ -3285,11 +3290,14 @@ paths:
         "500":
           description: >-
             Restore failed (import, delete, or preparation). The prior
-            configuration was reapplied, or the response warns that the
-            best-effort rollback was incomplete. Also returned when a stored
-            row/document cannot be decoded for the pre-delete rollback snapshot;
-            that fail-safe response has `failure_class: data_integrity` and no
-            delete is attempted.
+            configuration was reapplied, additively reconciled with an
+            intervening post-expiry write, or the response warns that the
+            best-effort rollback was incomplete. Additive reconciliation rejects
+            an invalid combined transaction-log schema graph before replaying any
+            snapshot resources. Also returned when a stored row/document cannot
+            be decoded for the pre-delete rollback snapshot; that fail-safe
+            response has `failure_class: data_integrity` and no delete is
+            attempted.
           content:
             application/json:
               schema:
@@ -3308,13 +3316,16 @@ paths:
                     enum: [completed, incomplete, not_needed, unknown_outcome]
                     description: >-
                       Outcome of the best-effort rollback. `completed` — prior
-                      config reapplied; `incomplete` — reapply failed (see
-                      `rollback_errors`); `not_needed` — the clear failed
-                      atomically (SQL / replica-set MongoDB), so nothing was
-                      deleted and the prior config was retained without any
-                      compensating re-import; `unknown_outcome` — an ambiguous
-                      MongoDB commit result could not be resolved by authoritative
-                      post-state counts, so manual recovery is required.
+                      config reapplied, or a valid late-clear union retained both
+                      intervening and missing prior resources; `incomplete` —
+                      reapply failed or an invalid late-clear union was rejected
+                      before replay (see `rollback_errors`); `not_needed` — the
+                      clear failed atomically (SQL / replica-set MongoDB), so
+                      nothing was deleted and the prior config was retained
+                      without any compensating re-import; `unknown_outcome` — an
+                      ambiguous MongoDB commit result could not be resolved by
+                      authoritative post-state counts, so manual recovery is
+                      required.
                   failure_class:
                     type: string
                     enum: [data_integrity]
@@ -4835,8 +4846,14 @@ paths:
         the database `ON DELETE CASCADE` constraint removes the spec row in that
         case too.
 
-        Returns 204 on success, 404 if the spec does not exist, or 422 when
-        the cascade would leave an invalid plugin-composition graph.
+        Before deletion, Ferrum validates the prospective namespace plugin graph
+        after applying every spec-owned and proxy cascade. The request returns
+        422 without deleting anything when a retained enabled plugin would be
+        left with a dangling `schema_ref`, or when the cascade would leave a
+        global TCP connection throttle without a supported TCP/TCP+TLS target.
+
+        Returns 204 on success, 404 if the spec does not exist, or 422 when the
+        prospective deletion fails plugin-graph validation.
 
         This mutation requires the `admin` role.
       tags: [API Specs]
@@ -4859,7 +4876,11 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "422":
-          description: The spec cascade would leave an invalid plugin-composition graph, such as a global TCP connection throttle with no supported TCP/TCP+TLS target
+          description: |
+            Deleting the spec and its cascaded resources would leave an invalid
+            aggregate plugin-composition graph in the namespace, such as a dangling
+            transaction-log `schema_ref` or a global TCP connection throttle
+            with no supported TCP/TCP+TLS target. No resources are deleted.
           content:
             application/json:
               schema:
@@ -10130,7 +10151,9 @@ components:
         redaction always applies on every code path — sensitive
         substrings (`authorization`, `cookie`, `password`, `token`, …)
         cannot be introduced via `static_fields` or `derived_fields`
-        (rejected at construction). See docs/log_schema.md.
+        (rejected at construction). This object, each `derived_fields`
+        entry, and `metadata` are strict fixed shapes: unknown keys are
+        rejected with a nested path. See docs/log_schema.md.
       additionalProperties: false
       properties:
         summary_type:
@@ -10758,7 +10781,12 @@ components:
         scope is `global`; constructed by the loader BEFORE any plugin that
         uses `schema_ref:` so resolution always succeeds. The registry is
         atomically replaced on every config reload — renamed or removed
-        schemas do not leak. See docs/log_schema.md.
+        schemas do not leak. Config-only instances are discarded after
+        staging and never retained in runtime hook or protocol cache lists.
+        Admin create/update/delete, batch, and restore validate the complete
+        prospective namespace graph without consulting or modifying the live
+        registry. Unknown outer and nested fixed-shape keys are rejected.
+        See docs/log_schema.md.
       required: [schemas]
       additionalProperties: false
       properties:
@@ -10770,8 +10798,8 @@ components:
           description: >-
             Map of schema name → schema definition. Names are referenced
             by other plugins as `schema_ref: <name>`. Duplicate names
-            across multiple `transaction_log_schema` plugins in the same
-            config are rejected at load time.
+            across multiple enabled `transaction_log_schema` plugins in the
+            same namespace are rejected before persistence or load.
 
     TransactionDebuggerConfig:
       type: object
@@ -15875,17 +15903,34 @@ components:
 
     GrpcDeadlineConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: grpc_deadline — Manages the grpc-timeout metadata header.
-        Supports all gRPC timeout units (H, M, S, m, u, n).
+        Supports all gRPC timeout units (H, M, S, m, u, n). At least one
+        effective rule is required. When both deadline values are configured,
+        default_deadline_ms must be less than or equal to max_deadline_ms;
+        runtime validation enforces this cross-field relationship.
+      anyOf:
+        - required: [max_deadline_ms]
+        - required: [default_deadline_ms]
+        - required: [subtract_gateway_processing]
+          properties:
+            subtract_gateway_processing:
+              const: true
+        - required: [reject_no_deadline]
+          properties:
+            reject_no_deadline:
+              const: true
       properties:
         max_deadline_ms:
           type: integer
           format: uint64
+          minimum: 1
           description: Cap incoming deadlines to this value (milliseconds)
         default_deadline_ms:
           type: integer
           format: uint64
+          minimum: 1
           description: Inject grpc-timeout when client omits it
         subtract_gateway_processing:
           type: boolean
@@ -15897,8 +15942,10 @@ components:
           type: boolean
           default: false
           description: >-
-            Reject requests missing grpc-timeout with HTTP 400. Takes
-            precedence over default_deadline_ms.
+            Reject requests missing a positive grpc-timeout. Takes precedence
+            over default_deadline_ms. Native H2/H3 gRPC clients receive HTTP
+            200 with a non-OK grpc-status in the trailers-only header block;
+            the internal plugin rejection status is not exposed as HTTP 400.
 
     AiSemanticFirewallBuiltinPackConfig:
       oneOf:
@@ -17239,19 +17286,25 @@ components:
 
     AiFederationConfig:
       type: object
-      description: "Plugin: ai_federation — Universal AI gateway. Routes OpenAI Chat Completions-format requests to any of 11 supported AI providers (OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face), translating requests to native provider formats and normalizing non-streaming responses back to OpenAI format. Uses 'terminate and respond' pattern: makes its own outbound HTTP call and bypasses normal proxy dispatch. Streaming Chat Completions (`stream: true`) are intentionally unsupported for matched providers and return 501; there is no provider SSE normalization path. Config fields named `stream`, `streaming`, `streaming_enabled`, or `enable_streaming` are rejected during plugin validation because they do not enable streaming. Supports priority-ordered fallback across providers. Fails closed by default when a JSON POST body cannot be inspected, is missing a top-level string `model`, or no provider matches the requested model; pass-through requires explicit opt-in and can bypass AI gateway policy. NOTE: Outbound calls use the shared PluginHttpClient and only honor global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY) — per-proxy backend TLS overrides do not apply."
+      additionalProperties: false
+      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) return 501. Priority fallback is allowed for configured statuses, malformed provider success responses, and proven pre-wire transport failures. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
       required: [providers]
       properties:
         providers:
           type: array
           minItems: 1
+          maxItems: 128
           description: One or more provider definitions. Tried in priority order (lower number = first).
           items:
             type: object
+            additionalProperties: false
             required: [name, provider_type]
             properties:
               name:
                 type: string
+                minLength: 1
+                maxLength: 128
+                pattern: '^[A-Za-z0-9._-]+$'
                 description: Unique provider name used in logs and metadata (e.g. ai_federation_provider field).
               provider_type:
                 type: string
@@ -17271,24 +17324,45 @@ components:
                 description: AI provider format / wire protocol.
               priority:
                 type: integer
+                minimum: 0
+                maximum: 4294967295
                 description: "Lower = tried first. Defaults to provider's index + 1."
               api_key:
                 type: string
                 description: API key for the provider. Required for all providers except aws_bedrock (uses SigV4) and google_vertex (uses service account JWT).
               model_patterns:
                 type: array
+                maxItems: 128
                 items:
                   type: string
+                  minLength: 1
+                  maxLength: 256
+                  pattern: '^[A-Za-z0-9._:/+*-]+$'
+                  not: { pattern: '\.\.' }
                 default: []
                 description: "Glob patterns to match the request's `model` field (e.g. ['claude-*', 'gpt-4*']). Empty = catch-all."
               model_mapping:
                 type: object
+                maxProperties: 1024
+                propertyNames:
+                  minLength: 1
+                  maxLength: 256
+                  pattern: '^[A-Za-z0-9._:/+-]+$'
+                  not: { pattern: '\.\.' }
                 additionalProperties:
                   type: string
+                  minLength: 1
+                  maxLength: 256
+                  pattern: '^[A-Za-z0-9._:/+-]+$'
+                  not: { pattern: '\.\.' }
                 default: {}
                 description: "Map client-facing model names to provider-native names (e.g. {claude-4-sonnet: 'claude-sonnet-4-20250514'})."
               default_model:
                 type: string
+                minLength: 1
+                maxLength: 256
+                pattern: '^[A-Za-z0-9._:/+-]+$'
+                not: { pattern: '\.\.' }
                 description: Model to send to the provider when no mapping matches.
               multimodal_mode:
                 type: string
@@ -17299,36 +17373,68 @@ components:
                 description: "How this provider handles OpenAI Chat Completions content parts that are not text. Translated providers default to reject; OpenAI-compatible providers and Cohere default to translate. text_only_with_warning intentionally drops non-text parts and records ai_federation_multimodal_* metadata."
               connect_timeout_seconds:
                 type: integer
+                minimum: 1
                 default: 5
                 description: Per-provider TCP + TLS handshake timeout for outbound provider calls.
               read_timeout_seconds:
                 type: integer
+                minimum: 1
                 default: 60
                 description: Overall per-request deadline for outbound provider calls.
+              max_response_body_bytes:
+                type: integer
+                minimum: 1
+                maximum: 67108864
+                default: 8388608
+                description: Maximum provider response bytes collected and maximum normalized JSON bytes emitted. Collection/serialization aborts as soon as this bound is exceeded.
               base_url:
                 type: string
-                description: Override the provider's default endpoint URL (for self-hosted models, internal proxies, or pinned regional endpoints).
+                format: uri
+                pattern: '^https?://[^/?#@]+(?:/[^?#]*)?$'
+                description: Override the provider endpoint. Userinfo, query strings, and fragments are rejected. HTTPS is required unless allow_plaintext is explicitly true; literal and resolved IPs remain subject to FERRUM_BACKEND_ALLOW_IPS.
+              allow_plaintext:
+                type: boolean
+                default: false
+                description: Permit an explicit http:// base_url. This weakens credential transport security and never permits provider-generated redirects.
               azure_resource:
                 type: string
+                minLength: 2
+                maxLength: 64
+                pattern: '^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$'
                 description: "Azure OpenAI resource name (the {resource} in {resource}.openai.azure.com). Required for azure_openai."
               azure_deployment:
                 type: string
+                minLength: 1
+                maxLength: 64
+                pattern: '^[A-Za-z0-9._:-]+$'
                 description: Azure OpenAI deployment name. Required for azure_openai.
               azure_api_version:
                 type: string
+                minLength: 1
+                maxLength: 64
+                pattern: '^[A-Za-z0-9._:-]+$'
                 default: "2024-06-01"
                 description: Azure OpenAI api-version query parameter.
               google_project_id:
                 type: string
+                minLength: 1
+                maxLength: 128
+                pattern: '^[A-Za-z0-9._:-]+$'
                 description: Google Cloud project ID. Required for google_vertex.
               google_region:
                 type: string
+                minLength: 1
+                maxLength: 63
+                pattern: '^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$'
                 description: Google Vertex AI region (e.g. us-central1). Required for google_vertex.
               google_service_account_json:
                 type: string
                 description: Google service account JSON contents (the file body, not the path). Required for google_vertex; used to mint OAuth2 access tokens via JWT bearer flow.
               aws_region:
                 type: string
+                minLength: 1
+                maxLength: 63
+                pattern: '^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$'
                 description: "AWS region for Bedrock (e.g. us-east-1). Required for aws_bedrock unless AWS_DEFAULT_REGION/AWS_REGION env var is set."
               aws_access_key_id:
                 type: string
@@ -17339,6 +17445,61 @@ components:
               aws_session_token:
                 type: string
                 description: "Optional AWS STS session token for temporary credentials. Falls back to AWS_SESSION_TOKEN env var."
+              circuit_breaker:
+                type: object
+                additionalProperties: false
+                description: Optional passive circuit. State belongs to this resolved provider instance and is discarded on configuration reload.
+                properties:
+                  failure_threshold:
+                    type: integer
+                    minimum: 1
+                    maximum: 100
+                    default: 3
+                    description: Consecutive configured transport, status, or protocol failures before opening.
+                  cooldown_seconds:
+                    type: integer
+                    minimum: 1
+                    maximum: 86400
+                    default: 30
+                    description: Time to skip an open provider before permitting one half-open probe.
+                  success_threshold:
+                    type: integer
+                    minimum: 1
+                    maximum: 100
+                    default: 1
+                    description: Successful half-open probes required to close the circuit.
+            allOf:
+              - if:
+                  properties:
+                    provider_type:
+                      enum: [openai, anthropic, google_gemini, azure_openai, mistral, cohere, xai, deepseek, meta_llama, hugging_face]
+                  required: [provider_type]
+                then:
+                  required: [api_key]
+              - if:
+                  properties:
+                    provider_type:
+                      const: azure_openai
+                  required: [provider_type]
+                then:
+                  required: [azure_resource, azure_deployment]
+              - if:
+                  properties:
+                    provider_type:
+                      const: google_vertex
+                  required: [provider_type]
+                then:
+                  required: [google_project_id, google_region, google_service_account_json]
+              - if:
+                  properties:
+                    base_url:
+                      pattern: '^http://'
+                  required: [base_url]
+                then:
+                  properties:
+                    allow_plaintext:
+                      const: true
+                  required: [allow_plaintext]
         fallback_enabled:
           type: boolean
           default: true
@@ -17347,12 +17508,22 @@ components:
           type: array
           items:
             type: integer
+            minimum: 100
+            maximum: 599
           default: [429, 500, 502, 503]
           description: HTTP status codes from a provider that trigger fallback to the next provider.
         fallback_on_network_errors:
           type: boolean
           default: true
-          description: Trigger fallback when the provider is unreachable (DNS/TCP/TLS failure).
+          description: Trigger fallback only for transport failures proven to occur before the non-idempotent provider POST reached the wire.
+        fallback_on_protocol_errors:
+          type: boolean
+          default: true
+          description: Try the next provider when a 2xx response is malformed or cannot be losslessly normalized, or when a redirect is returned.
+        fallback_on_ambiguous_errors:
+          type: boolean
+          default: false
+          description: Permit replay on the next provider after a POST may have reached the prior provider. Enabling this can duplicate model calls and charges; leave false unless the provider contract supplies replay safety.
         fail_on_missing_model:
           type: boolean
           default: true
@@ -17361,6 +17532,12 @@ components:
           type: boolean
           default: true
           description: Reject requests whose `model` does not match any configured provider. Set to false only to explicitly pass unsupported models through to the normal backend.
+        max_concurrent_requests:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 64
+          description: Maximum simultaneous federation provider chains, including fallback and OAuth work. Excess requests fail with 503 without queueing.
 
     AiStreamRouterConfig:
       type: object
@@ -18235,7 +18412,7 @@ components:
 
     RequestDeduplicationConfig:
       type: object
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and are not backward-compatible with pre-fingerprint values. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed ai_federation provider call publishes a small non-replayable 409 tombstone so an identical idempotency-key retry cannot repeat the billable external operation or double-apply response transforms; this provenance contract does not yet cover other externally executed synthetic plugins. Completed response retention is bounded by per-entry and exact local total byte limits; ordinary size-skipped responses return normally and are not retained. If a federation tombstone cannot fit, in-flight ownership remains until inflight_ttl_seconds rather than failing open immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and are not backward-compatible with pre-fingerprint values. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
       properties:
         header_name:
           type: string
@@ -18875,8 +19052,9 @@ components:
         spec document was parsed successfully and the Ferrum extensions were
         found, but one or more extracted resources failed structural validation
         or database cross-checks (e.g., duplicate `listen_path`, invalid plugin
-        config). For DELETE, the cascade would leave an invalid
-        `plugin_composition`; an authoritative in-transaction rejection may omit
+        config). For DELETE, removing the spec-owned and cascaded resources
+        would leave an invalid transaction-log schema graph or TCP-throttle
+        plugin composition. An authoritative in-transaction rejection may omit
         `spec_version` and the failure `id`.
       properties:
         error:
@@ -18884,7 +19062,7 @@ components:
           example: "Spec validation failed"
         spec_version:
           type: string
-          description: Version string detected from the submitted document
+          description: Version string detected from the submitted document, or from the stored spec for DELETE
         failures:
           type: array
           description: One entry per resource that failed validation
@@ -18893,7 +19071,7 @@ components:
             properties:
               resource_type:
                 type: string
-                enum: [proxy, upstream, plugin, plugin_composition]
+                enum: [proxy, upstream, plugin, plugin_composition, plugin_graph]
                 description: Kind of resource or aggregate plugin composition that failed
               id:
                 type: string

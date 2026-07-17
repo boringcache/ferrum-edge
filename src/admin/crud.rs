@@ -5,8 +5,11 @@ use hyper::{Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
@@ -16,7 +19,8 @@ use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
     PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_admission_unavailable,
-    is_mtls_dns_identity_conflict, tcp_connection_throttle_attachment_conflict,
+    is_mtls_dns_identity_conflict, mark_mtls_dns_admission_unavailable,
+    tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
@@ -52,6 +56,41 @@ impl<'a> ValidationCtx<'a> {
 pub(crate) enum WriteAction<'a> {
     Create,
     Update { id: &'a str },
+}
+
+enum LateResourceWrite<'a> {
+    Create,
+    Update { id: &'a str },
+    Delete { id: &'a str },
+}
+
+pub(crate) enum InterveningWriteRecovery {
+    Compensate,
+    KeepCurrent,
+}
+
+pub(crate) struct ApiSpecDeleteSnapshot {
+    spec: crate::config::types::ApiSpec,
+    upstreams: Vec<Upstream>,
+    plugins: Vec<PluginConfig>,
+}
+
+#[derive(Clone, Copy)]
+struct LateDeleteSnapshots<'a> {
+    config: &'a GatewayConfig,
+    api_spec: Option<&'a ApiSpecDeleteSnapshot>,
+}
+
+struct LateResourceRecovery<'a, R> {
+    written: Option<&'a R>,
+    previous: Option<&'a R>,
+    delete_snapshots: Option<LateDeleteSnapshots<'a>>,
+}
+
+struct OwnedLateDeleteRecovery<R> {
+    previous: R,
+    config: Option<GatewayConfig>,
+    api_spec: Option<ApiSpecDeleteSnapshot>,
 }
 
 pub(crate) enum AfterValidateError {
@@ -93,13 +132,16 @@ pub(crate) enum BatchPreparationError {
     Internal(String),
 }
 
-const MTLS_ADMISSION_LOCK_SHARDS: usize = 64;
-static MTLS_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+const NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS: usize = 64;
+static NAMESPACE_CONFIG_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+const CONFIG_ADMISSION_LEASE_DURATION: Duration = Duration::from_secs(120);
+const CONFIG_ADMISSION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+const CONFIG_ADMISSION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Same-process serialization of mTLS-sensitive admin mutations for a namespace
+/// Serialize graph- and credential-sensitive admin mutations for a namespace
 /// from candidate validation through persistence. A bounded process-global
-/// lock set covers every `AdminState` served by this process without retaining
-/// attacker-chosen namespace strings indefinitely.
+/// lock set is the cheap first tier; the datastore lease below coordinates
+/// writable gateway instances that share SQL or MongoDB persistence.
 ///
 /// SQL transactions and MongoDB leases provide the authoritative cross-process
 /// backstop. The additional ASCII-folded `san_dns` constraint is conditional on
@@ -109,16 +151,21 @@ static MTLS_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
 /// backend serialization covers separate admin processes.
 /// Every credential mutation takes this lock, even for non-mTLS types, because
 /// those endpoints persist the complete `Consumer` and could otherwise replay
-/// stale `mtls_auth` entries loaded before a concurrent mTLS mutation.
-pub(crate) async fn lock_mtls_admission(namespace: &str) -> MutexGuard<'static, ()> {
-    let locks = MTLS_ADMISSION_LOCKS.get_or_init(|| {
-        (0..MTLS_ADMISSION_LOCK_SHARDS)
+/// stale `mtls_auth` entries loaded before a concurrent mTLS mutation. Every
+/// plugin-graph mutation (including API-spec bundles) uses the same lock so a
+/// prospective transaction-log schema snapshot remains authoritative until
+/// the corresponding write commits.
+pub(crate) async fn lock_local_namespace_config_admission(
+    namespace: &str,
+) -> MutexGuard<'static, ()> {
+    let locks = NAMESPACE_CONFIG_ADMISSION_LOCKS.get_or_init(|| {
+        (0..NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS)
             .map(|_| Mutex::new(()))
             .collect()
     });
     let mut hasher = DefaultHasher::new();
     namespace.hash(&mut hasher);
-    let shard = hasher.finish() as usize % MTLS_ADMISSION_LOCK_SHARDS;
+    let shard = hasher.finish() as usize % NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS;
     locks[shard].lock().await
 }
 
@@ -130,6 +177,865 @@ fn validate_candidate_plugin_graph(
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))?;
     crate::plugin_cache::validate_tcp_connection_throttle_attachments(candidate)
         .map_err(AfterValidateError::BadRequest)
+}
+
+pub(crate) struct NamespaceConfigAdmissionGuard {
+    local: Option<MutexGuard<'static, ()>>,
+    db: Option<Arc<dyn DatabaseBackend>>,
+    namespace: String,
+    owner: String,
+    generation: u64,
+    stop_tx: Option<tokio::sync::watch::Sender<bool>>,
+    renew_task: Option<tokio::task::JoinHandle<()>>,
+    valid: Arc<AtomicBool>,
+    lease_started_at: Instant,
+    valid_until_millis: Arc<AtomicU64>,
+    lease_state_rx: tokio::sync::watch::Receiver<u64>,
+}
+
+pub(crate) enum NamespaceConfigAdmissionCompletion<T> {
+    Held(T),
+    Lost { result: T, error: anyhow::Error },
+}
+
+impl NamespaceConfigAdmissionGuard {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn immediately_succeeds_generation(&self, previous: u64) -> bool {
+        previous.checked_add(1) == Some(self.generation)
+    }
+
+    pub(crate) fn ensure_held(&self) -> Result<(), anyhow::Error> {
+        let elapsed_millis =
+            u64::try_from(self.lease_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if self.valid.load(Ordering::Acquire)
+            && elapsed_millis < self.valid_until_millis.load(Ordering::Acquire)
+        {
+            Ok(())
+        } else {
+            anyhow::bail!("namespace config admission lease was lost before persistence")
+        }
+    }
+
+    /// Run a persistence operation that is not cancellation-safe to a concrete
+    /// result while still observing the admission lease. If ownership is lost,
+    /// the caller receives both the completed result and the lease error so it
+    /// can verify or compensate under a newly acquired lease.
+    pub(crate) async fn run_to_completion_while_held<F, T>(
+        &self,
+        future: F,
+    ) -> Result<NamespaceConfigAdmissionCompletion<T>, anyhow::Error>
+    where
+        F: Future<Output = T>,
+    {
+        self.ensure_held()?;
+        let mut lease_state_rx = self.lease_state_rx.clone();
+        tokio::pin!(future);
+        let persistence_started = AtomicBool::new(false);
+        loop {
+            let valid_until_millis = *lease_state_rx.borrow_and_update();
+            let elapsed_millis =
+                u64::try_from(self.lease_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if valid_until_millis == 0 || elapsed_millis >= valid_until_millis {
+                if !persistence_started.load(Ordering::Acquire) {
+                    anyhow::bail!(
+                        "namespace config admission lease was lost before persistence started"
+                    );
+                }
+                let result = future.await;
+                return Ok(NamespaceConfigAdmissionCompletion::Lost {
+                    result,
+                    error: anyhow::anyhow!(
+                        "namespace config admission lease was lost during persistence"
+                    ),
+                });
+            }
+            let remaining = Duration::from_millis(valid_until_millis - elapsed_millis);
+            tokio::select! {
+                biased;
+                changed = lease_state_rx.changed() => {
+                    if changed.is_err() {
+                        if !persistence_started.load(Ordering::Acquire) {
+                            anyhow::bail!(
+                                "namespace config admission lease monitor stopped before persistence started"
+                            );
+                        }
+                        let result = future.await;
+                        return Ok(NamespaceConfigAdmissionCompletion::Lost {
+                            result,
+                            error: anyhow::anyhow!(
+                                "namespace config admission lease monitor stopped during persistence"
+                            ),
+                        });
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    if !persistence_started.load(Ordering::Acquire) {
+                        anyhow::bail!(
+                            "namespace config admission lease expired before persistence started"
+                        );
+                    }
+                    let result = future.await;
+                    return Ok(NamespaceConfigAdmissionCompletion::Lost {
+                        result,
+                        error: anyhow::anyhow!(
+                            "namespace config admission lease expired during persistence"
+                        ),
+                    });
+                }
+                result = std::future::poll_fn(|context| {
+                    persistence_started.store(true, Ordering::Release);
+                    future.as_mut().poll(context)
+                }) => {
+                    return Ok(match self.ensure_held() {
+                        Ok(()) => NamespaceConfigAdmissionCompletion::Held(result),
+                        Err(error) => NamespaceConfigAdmissionCompletion::Lost { result, error },
+                    });
+                }
+            }
+        }
+    }
+}
+
+impl Drop for NamespaceConfigAdmissionGuard {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        let Some(db) = self.db.take() else {
+            return;
+        };
+        let namespace = std::mem::take(&mut self.namespace);
+        let owner = std::mem::take(&mut self.owner);
+        let renew_task = self.renew_task.take();
+        let local = self.local.take();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Some(task) = renew_task {
+                    task.abort();
+                    let _ = task.await;
+                }
+                match tokio::time::timeout(
+                    CONFIG_ADMISSION_LEASE_RETRY_INTERVAL,
+                    db.release_namespace_config_admission_lease(&namespace, &owner),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            namespace = %namespace,
+                            %error,
+                            "Failed to release namespace config admission lease; expiry will recover it"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            namespace = %namespace,
+                            "Timed out releasing namespace config admission lease; expiry will recover it"
+                        );
+                    }
+                }
+                drop(local);
+            });
+        }
+    }
+}
+
+async fn release_namespace_config_admission_claim(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    owner: &str,
+    context: &'static str,
+) {
+    match tokio::time::timeout(
+        CONFIG_ADMISSION_LEASE_RETRY_INTERVAL,
+        db.release_namespace_config_admission_lease(namespace, owner),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(
+            %namespace,
+            %error,
+            "Failed to release {context}; expiry will recover it"
+        ),
+        Err(_) => tracing::warn!(
+            %namespace,
+            "Timed out releasing {context}; expiry will recover it"
+        ),
+    }
+}
+
+struct PendingNamespaceConfigAdmissionClaim {
+    db: Arc<dyn DatabaseBackend>,
+    namespace: String,
+    owner: String,
+    lease_started_at: Instant,
+    generation: u64,
+    armed: bool,
+}
+
+impl PendingNamespaceConfigAdmissionClaim {
+    fn into_acquired(mut self) -> (Instant, u64) {
+        self.armed = false;
+        (self.lease_started_at, self.generation)
+    }
+}
+
+impl Drop for PendingNamespaceConfigAdmissionClaim {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let db = self.db.clone();
+        let namespace = self.namespace.clone();
+        let owner = self.owner.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _cleanup_task = runtime.spawn(async move {
+                release_namespace_config_admission_claim(
+                    db.as_ref(),
+                    &namespace,
+                    &owner,
+                    "a cancelled namespace config admission acquisition",
+                )
+                .await;
+            });
+        }
+    }
+}
+
+pub(crate) async fn lock_namespace_config_admission(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+) -> Result<NamespaceConfigAdmissionGuard, anyhow::Error> {
+    let local = lock_local_namespace_config_admission(namespace).await;
+    let owner = Uuid::new_v4().to_string();
+    let (lease_started_at, generation) = loop {
+        let acquire_db = db.clone();
+        let acquire_namespace = namespace.to_string();
+        let acquire_owner = owner.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let _acquire_task = tokio::spawn(async move {
+            let attempt_started_at = Instant::now();
+            let result = acquire_db
+                .try_acquire_namespace_config_admission_lease(&acquire_namespace, &acquire_owner)
+                .await;
+
+            // An error can be an ambiguous datastore outcome. Make one
+            // owner-qualified release attempt before reporting it. If the
+            // request disappeared while acquisition was in flight, an
+            // acquired claim is likewise released instead of waiting for its
+            // full lease expiry.
+            if result.is_err() {
+                release_namespace_config_admission_claim(
+                    acquire_db.as_ref(),
+                    &acquire_namespace,
+                    &acquire_owner,
+                    "an ambiguous namespace config admission acquisition",
+                )
+                .await;
+            }
+
+            let result = result.map(|generation| {
+                generation.map(|generation| PendingNamespaceConfigAdmissionClaim {
+                    db: acquire_db,
+                    namespace: acquire_namespace,
+                    owner: acquire_owner,
+                    lease_started_at: attempt_started_at,
+                    generation,
+                    armed: true,
+                })
+            });
+            // If the receiver disappeared before or after this send, the
+            // undelivered/queued claim is dropped and starts cleanup.
+            let _ = result_tx.send(result);
+        });
+        if let Some(claim) = result_rx.await.map_err(|_| {
+            anyhow::anyhow!("namespace config admission acquisition task stopped unexpectedly")
+        })?? {
+            break claim.into_acquired();
+        }
+        tokio::time::sleep(CONFIG_ADMISSION_LEASE_RETRY_INTERVAL).await;
+    };
+
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let renew_db = db.clone();
+    let renew_namespace = namespace.to_string();
+    let renew_owner = owner.clone();
+    let valid = Arc::new(AtomicBool::new(true));
+    let renew_valid = valid.clone();
+    let lease_duration_millis =
+        u64::try_from(CONFIG_ADMISSION_LEASE_DURATION.as_millis()).unwrap_or(u64::MAX);
+    let valid_until_millis = Arc::new(AtomicU64::new(lease_duration_millis));
+    let renew_valid_until_millis = valid_until_millis.clone();
+    let (lease_state_tx, lease_state_rx) = tokio::sync::watch::channel(lease_duration_millis);
+    let renew_task = tokio::spawn(async move {
+        let mut valid_until = lease_started_at + CONFIG_ADMISSION_LEASE_DURATION;
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(CONFIG_ADMISSION_LEASE_RENEW_INTERVAL) => {}
+            }
+
+            loop {
+                let renewal_started_at = Instant::now();
+                match renew_db
+                    .renew_namespace_config_admission_lease(&renew_namespace, &renew_owner)
+                    .await
+                {
+                    Ok(true) => {
+                        valid_until = renewal_started_at + CONFIG_ADMISSION_LEASE_DURATION;
+                        let elapsed_millis = u64::try_from(
+                            renewal_started_at
+                                .duration_since(lease_started_at)
+                                .as_millis(),
+                        )
+                        .unwrap_or(u64::MAX);
+                        renew_valid_until_millis.store(
+                            elapsed_millis.saturating_add(lease_duration_millis),
+                            Ordering::Release,
+                        );
+                        let _ = lease_state_tx
+                            .send(elapsed_millis.saturating_add(lease_duration_millis));
+                        break;
+                    }
+                    Ok(false) => {
+                        renew_valid.store(false, Ordering::Release);
+                        let _ = lease_state_tx.send(0);
+                        tracing::error!(
+                            namespace = %renew_namespace,
+                            "Namespace config admission lease renewal lost ownership"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        if Instant::now() + CONFIG_ADMISSION_LEASE_RETRY_INTERVAL >= valid_until {
+                            renew_valid.store(false, Ordering::Release);
+                            let _ = lease_state_tx.send(0);
+                            tracing::error!(
+                                namespace = %renew_namespace,
+                                %error,
+                                "Namespace config admission lease expired after renewal failures"
+                            );
+                            return;
+                        }
+                        tracing::debug!(
+                            namespace = %renew_namespace,
+                            %error,
+                            "Namespace config admission lease renewal failed; retrying before expiry"
+                        );
+                        tokio::select! {
+                            changed = stop_rx.changed() => {
+                                if changed.is_err() || *stop_rx.borrow() {
+                                    return;
+                                }
+                            }
+                            _ = tokio::time::sleep(CONFIG_ADMISSION_LEASE_RETRY_INTERVAL) => {}
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(NamespaceConfigAdmissionGuard {
+        local: Some(local),
+        db: Some(db),
+        namespace: namespace.to_string(),
+        owner,
+        generation,
+        stop_tx: Some(stop_tx),
+        renew_task: Some(renew_task),
+        valid,
+        lease_started_at,
+        valid_until_millis,
+        lease_state_rx,
+    })
+}
+
+async fn run_db_write_while_held<T, F>(
+    guard: Option<&NamespaceConfigAdmissionGuard>,
+    future: F,
+) -> Result<NamespaceConfigAdmissionCompletion<DbResult<T>>, anyhow::Error>
+where
+    F: Future<Output = DbResult<T>>,
+{
+    match guard {
+        Some(guard) => guard.run_to_completion_while_held(future).await,
+        None => Ok(NamespaceConfigAdmissionCompletion::Held(future.await)),
+    }
+}
+
+async fn plugin_has_proxy_association(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    plugin_id: &str,
+) -> DbResult<bool> {
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_proxies_paginated(namespace, PAGE_SIZE, offset)
+            .await?;
+        let items_len = page.items.len() as i64;
+        if page.items.iter().any(|proxy| {
+            proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == plugin_id)
+        }) {
+            return Ok(true);
+        }
+        if items_len == 0 || offset + items_len >= page.total {
+            return Ok(false);
+        }
+        offset += items_len;
+    }
+}
+
+async fn proxy_has_scoped_plugin(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy_id: &str,
+) -> DbResult<bool> {
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+            .await?;
+        let items_len = page.items.len() as i64;
+        if page
+            .items
+            .iter()
+            .any(|plugin| plugin.proxy_id.as_deref() == Some(proxy_id))
+        {
+            return Ok(true);
+        }
+        if items_len == 0 || offset + items_len >= page.total {
+            return Ok(false);
+        }
+        offset += items_len;
+    }
+}
+
+/// Reacquire namespace admission after a successful late write. With no
+/// intervening claimant, the original validation remains authoritative. If a
+/// writer did intervene, undo only the still-current late delta; a later
+/// same-resource mutation supersedes the delta and is left intact.
+async fn recover_late_resource_write<R: AdminResource>(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    lost_generation: u64,
+    http_client: crate::plugins::PluginHttpClient,
+    action: LateResourceWrite<'_>,
+    recovery: LateResourceRecovery<'_, R>,
+) -> Result<bool, anyhow::Error> {
+    let recovery_guard = lock_namespace_config_admission(db.clone(), namespace).await?;
+    if recovery_guard.immediately_succeeds_generation(lost_generation) {
+        return Ok(true);
+    }
+    if matches!(
+        &action,
+        LateResourceWrite::Update { .. } | LateResourceWrite::Delete { .. }
+    ) && matches!(
+        R::intervening_write_recovery(
+            db.as_ref(),
+            namespace,
+            recovery.previous,
+            http_client.clone(),
+        )
+        .await?,
+        InterveningWriteRecovery::KeepCurrent
+    ) {
+        return Ok(false);
+    }
+
+    let compensation = async {
+        match action {
+            LateResourceWrite::Create => {
+                let written = recovery.written.ok_or_else(|| {
+                    anyhow::anyhow!("late create recovery is missing the written resource")
+                })?;
+                if let Some(current) =
+                    R::db_get_for_write(db.as_ref(), namespace, written.id()).await?
+                    && R::late_create_compensation_safe(
+                        db.as_ref(),
+                        namespace,
+                        &current,
+                        written,
+                        recovery.delete_snapshots.map(|snapshots| snapshots.config),
+                        http_client,
+                    )
+                    .await?
+                    && !R::db_delete(db.as_ref(), namespace, written.id()).await?
+                {
+                    anyhow::bail!("late create compensation found no matching resource");
+                }
+            }
+            LateResourceWrite::Update { id } => {
+                let written = recovery.written.ok_or_else(|| {
+                    anyhow::anyhow!("late update recovery is missing the written resource")
+                })?;
+                let previous = recovery.previous.ok_or_else(|| {
+                    anyhow::anyhow!("late update recovery is missing the prior resource")
+                })?;
+                if R::db_get_for_write(db.as_ref(), namespace, id)
+                    .await?
+                    .is_some_and(|current| current.updated_at() == written.updated_at())
+                    && !R::db_update(db.as_ref(), previous).await?
+                {
+                    anyhow::bail!("late update compensation found no matching resource");
+                }
+            }
+            LateResourceWrite::Delete { id } => {
+                let previous = recovery.previous.ok_or_else(|| {
+                    anyhow::anyhow!("late delete recovery is missing the prior resource")
+                })?;
+                if R::db_get_for_write(db.as_ref(), namespace, id)
+                    .await?
+                    .is_none()
+                {
+                    R::compensate_late_delete(
+                        db.as_ref(),
+                        namespace,
+                        previous,
+                        recovery.delete_snapshots.map(|snapshots| snapshots.config),
+                        recovery
+                            .delete_snapshots
+                            .and_then(|snapshots| snapshots.api_spec),
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    };
+    match recovery_guard
+        .run_to_completion_while_held(compensation)
+        .await?
+    {
+        NamespaceConfigAdmissionCompletion::Held(result) => result?,
+        NamespaceConfigAdmissionCompletion::Lost { result, error } => {
+            result?;
+            return Err(error);
+        }
+    }
+    Ok(false)
+}
+
+struct OwnedWriteSettlementContext {
+    db: Arc<dyn DatabaseBackend>,
+    namespace: String,
+    guard: Option<NamespaceConfigAdmissionGuard>,
+    http_client: crate::plugins::PluginHttpClient,
+    state: AdminState,
+    actor: AuditActor,
+}
+
+async fn persist_create_to_settlement<R: AdminResource>(
+    context: OwnedWriteSettlementContext,
+    written: R,
+) -> DbResult<()> {
+    let OwnedWriteSettlementContext {
+        db,
+        namespace,
+        mut guard,
+        http_client,
+        state,
+        actor,
+    } = context;
+    let success_db = db.clone();
+    let result = match run_db_write_while_held(guard.as_ref(), R::db_create(db.as_ref(), &written))
+        .await
+    {
+        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+            Ok(()) => {
+                let lost_generation = guard
+                    .as_ref()
+                    .map(NamespaceConfigAdmissionGuard::generation)
+                    .unwrap_or_default();
+                drop(guard.take());
+                match recover_late_resource_write(
+                    db,
+                    &namespace,
+                    lost_generation,
+                    http_client,
+                    LateResourceWrite::Create,
+                    LateResourceRecovery {
+                        written: Some(&written),
+                        previous: None,
+                        delete_snapshots: None,
+                    },
+                )
+                .await
+                {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                        "namespace config admission was lost during create; the late write was compensated: {error}"
+                    ))),
+                    Err(recovery_error) => {
+                        Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                            "namespace config admission was lost during create and recovery failed: {recovery_error}; original error: {error}"
+                        )))
+                    }
+                }
+            }
+            Err(persistence_error) => Err(persistence_error),
+        },
+        Err(error) => Err(error),
+    };
+    if result.is_ok() {
+        finish_write_success(
+            success_db,
+            &state,
+            &actor,
+            &namespace,
+            &written,
+            None,
+            WriteAction::Create,
+        )
+        .await;
+    }
+    result
+}
+
+async fn persist_update_to_settlement<R: AdminResource>(
+    context: OwnedWriteSettlementContext,
+    id: String,
+    written: R,
+    previous: R,
+) -> DbResult<bool> {
+    let OwnedWriteSettlementContext {
+        db,
+        namespace,
+        mut guard,
+        http_client,
+        state,
+        actor,
+    } = context;
+    let success_db = db.clone();
+    let result = match run_db_write_while_held(guard.as_ref(), R::db_update(db.as_ref(), &written))
+        .await
+    {
+        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+            Ok(false) => Ok(false),
+            Ok(true) => {
+                let lost_generation = guard
+                    .as_ref()
+                    .map(NamespaceConfigAdmissionGuard::generation)
+                    .unwrap_or_default();
+                drop(guard.take());
+                match recover_late_resource_write(
+                    db,
+                    &namespace,
+                    lost_generation,
+                    http_client,
+                    LateResourceWrite::Update { id: &id },
+                    LateResourceRecovery {
+                        written: Some(&written),
+                        previous: Some(&previous),
+                        delete_snapshots: None,
+                    },
+                )
+                .await
+                {
+                    Ok(true) => Ok(true),
+                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                        "namespace config admission was lost during update; the late write was compensated: {error}"
+                    ))),
+                    Err(recovery_error) => {
+                        Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                            "namespace config admission was lost during update and recovery failed: {recovery_error}; original error: {error}"
+                        )))
+                    }
+                }
+            }
+            Err(persistence_error) => Err(persistence_error),
+        },
+        Err(error) => Err(error),
+    };
+    if matches!(&result, Ok(true)) {
+        finish_write_success(
+            success_db,
+            &state,
+            &actor,
+            &namespace,
+            &written,
+            Some(&previous),
+            WriteAction::Update { id: &id },
+        )
+        .await;
+    }
+    result
+}
+
+async fn persist_delete_to_settlement<R: AdminResource>(
+    context: OwnedWriteSettlementContext,
+    id: String,
+    recovery: OwnedLateDeleteRecovery<R>,
+) -> DbResult<bool> {
+    let OwnedWriteSettlementContext {
+        db,
+        namespace,
+        mut guard,
+        http_client,
+        state,
+        actor,
+    } = context;
+    let success_db = db.clone();
+    let result = match run_db_write_while_held(
+        guard.as_ref(),
+        R::db_delete(db.as_ref(), &namespace, &id),
+    )
+    .await
+    {
+        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+            Ok(false) => Ok(false),
+            Ok(true) => {
+                let lost_generation = guard
+                    .as_ref()
+                    .map(NamespaceConfigAdmissionGuard::generation)
+                    .unwrap_or_default();
+                drop(guard.take());
+                match recover_late_resource_write(
+                    db,
+                    &namespace,
+                    lost_generation,
+                    http_client,
+                    LateResourceWrite::Delete { id: &id },
+                    LateResourceRecovery {
+                        written: None,
+                        previous: Some(&recovery.previous),
+                        delete_snapshots: recovery.config.as_ref().map(|config| {
+                            LateDeleteSnapshots {
+                                config,
+                                api_spec: recovery.api_spec.as_ref(),
+                            }
+                        }),
+                    },
+                )
+                .await
+                {
+                    Ok(true) => Ok(true),
+                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                        "namespace config admission was lost during delete; the late write was compensated: {error}"
+                    ))),
+                    Err(recovery_error) => {
+                        Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                            "namespace config admission was lost during delete and recovery failed: {recovery_error}; original error: {error}"
+                        )))
+                    }
+                }
+            }
+            Err(persistence_error) => Err(persistence_error),
+        },
+        Err(error) => Err(error),
+    };
+    if matches!(&result, Ok(true)) {
+        let event = AuditEvent::new(
+            &actor,
+            "delete",
+            R::RESOURCE_NAME.replace(' ', "_"),
+            &id,
+            &namespace,
+            audit::delete_diff(R::audit_body(&recovery.previous)),
+        );
+        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event) {
+            super::log_audit_enqueue_failure(&error);
+        }
+    }
+    result
+}
+
+async fn finish_write_success<R: AdminResource>(
+    db: Arc<dyn DatabaseBackend>,
+    state: &AdminState,
+    actor: &AuditActor,
+    namespace: &str,
+    resource: &R,
+    existing: Option<&R>,
+    action: WriteAction<'_>,
+) {
+    if let Err(error) =
+        R::after_write(db.as_ref(), state, namespace, resource, existing, action).await
+    {
+        tracing::warn!(
+            "Post-write hook failed for {} '{}': {}",
+            R::RESOURCE_NAME,
+            resource.id(),
+            error
+        );
+    }
+
+    let (audit_action, diff) = match action {
+        WriteAction::Create => ("create", audit::create_diff(R::audit_body(resource))),
+        WriteAction::Update { .. } => {
+            let before = existing.map(R::audit_body).unwrap_or_else(|| json!(null));
+            (
+                "update",
+                audit::update_diff(before, R::audit_body(resource)),
+            )
+        }
+    };
+    let event = AuditEvent::new(
+        actor,
+        audit_action,
+        R::RESOURCE_NAME.replace(' ', "_"),
+        resource.id(),
+        namespace,
+        diff,
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event) {
+        super::log_audit_enqueue_failure(&error);
+    }
+}
+
+pub(super) async fn validate_transaction_log_schema_graph_on_blocking_pool(
+    candidate: GatewayConfig,
+    http_client: crate::plugins::PluginHttpClient,
+) -> Result<(), AfterValidateError> {
+    tokio::task::spawn_blocking(move || {
+        crate::plugins::transaction_log_schema::validate_config_graph(
+            &candidate,
+            &http_client,
+            true,
+        )
+    })
+    .await
+    .map_err(|error| {
+        AfterValidateError::Db(anyhow::anyhow!(
+            "transaction-log schema validation task failed: {error}"
+        ))
+    })?
+    .map_err(AfterValidateError::BadRequest)
+}
+
+pub(crate) async fn current_transaction_log_schema_graph_is_valid(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+) -> DbResult<bool> {
+    let candidate = db.load_namespace_snapshot(namespace).await?;
+    let http_client = super::plugin_validation_http_client(state);
+    match validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await {
+        Ok(()) => Ok(true),
+        Err(AfterValidateError::BadRequest(_) | AfterValidateError::Conflict(_)) => Ok(false),
+        Err(AfterValidateError::Db(error)) => Err(error),
+        Err(AfterValidateError::Response(_)) => {
+            anyhow::bail!("transaction-log schema graph validation returned an HTTP response")
+        }
+    }
 }
 
 async fn validate_mtls_auth_candidate(
@@ -268,6 +1174,44 @@ pub(crate) async fn validate_plugin_graph_proxy_deletion_candidate(
     validate_candidate_plugin_graph(&candidate, &http_client)
 }
 
+/// Validate the post-mutation named log-schema graph for one namespace.
+///
+/// The authoritative snapshot is overlaid exactly as plugin CRUD/batch
+/// persistence will change it, then definitions and referrers are validated in
+/// an isolated registry bracket. No live registry state participates.
+pub(crate) async fn validate_transaction_log_schema_candidates(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    plugins: &[PluginConfig],
+    removed_plugin_id: Option<&str>,
+) -> Result<(), AfterValidateError> {
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+
+    if let Some(removed_plugin_id) = removed_plugin_id {
+        candidate
+            .plugin_configs
+            .retain(|plugin| plugin.namespace != namespace || plugin.id != removed_plugin_id);
+    }
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+
+    let http_client = super::plugin_validation_http_client(state);
+    validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
+}
+
 /// Validate the exact post-PUT API-spec replacement candidate.
 ///
 /// The persistence contract deletes plugin configs owned by the replaced spec,
@@ -371,6 +1315,144 @@ pub(crate) async fn validate_plugin_graph_api_spec_replacement_candidate(
     validate_candidate_plugin_graph(&candidate, &http_client)
 }
 
+/// Validate the named log-schema graph produced by an exact API-spec PUT.
+///
+/// `replace_api_spec_bundle` deletes every plugin config owned by the old spec
+/// before inserting the replacement bundle. Mirror that ownership boundary so
+/// removed definitions/referrers cannot leak into validation and retained
+/// manual plugins remain part of the authoritative prospective namespace.
+pub(crate) async fn validate_transaction_log_schema_api_spec_replacement_candidate(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    existing_spec: &crate::config::types::ApiSpec,
+    plugins: &[PluginConfig],
+) -> Result<(), AfterValidateError> {
+    let replaced_plugins = db
+        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    if !plugins
+        .iter()
+        .chain(replaced_plugins.iter())
+        .any(crate::plugins::transaction_log_schema::is_enabled_config_graph_participant)
+    {
+        return Ok(());
+    }
+
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let replaced_plugin_ids: HashSet<String> = replaced_plugins
+        .into_iter()
+        .map(|plugin| plugin.id)
+        .collect();
+
+    if let Some(plugin) = plugins.iter().find(|plugin| {
+        !replaced_plugin_ids.contains(&plugin.id)
+            && candidate
+                .plugin_configs
+                .iter()
+                .any(|existing| existing.namespace == namespace && existing.id == plugin.id)
+    }) {
+        return Err(AfterValidateError::BadRequest(vec![format!(
+            "plugin_config id '{}' already exists in namespace '{}' outside api_spec '{}'; replacement cannot take ownership of it",
+            plugin.id, namespace, existing_spec.id
+        )]));
+    }
+
+    candidate
+        .plugin_configs
+        .retain(|plugin| !replaced_plugin_ids.contains(&plugin.id));
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+
+    let http_client = super::plugin_validation_http_client(state);
+    validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
+}
+
+/// Validate the named log-schema graph produced by deleting an API spec.
+///
+/// API-spec deletion removes every plugin config owned by the spec, every
+/// proxy-scoped config tied to the deleted proxy, and proxy-group configs that
+/// become orphaned after that proxy's associations disappear. Mirror all three
+/// cascades so retained manual referrers cannot be stranded while referrers
+/// deleted by the same operation do not cause a false rejection.
+pub(crate) async fn validate_transaction_log_schema_api_spec_deletion_candidate(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    existing_spec: &crate::config::types::ApiSpec,
+) -> Result<(), AfterValidateError> {
+    let spec_owned_plugins = db
+        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let mut removed_plugin_ids: HashSet<String> = spec_owned_plugins
+        .into_iter()
+        .map(|plugin| plugin.id)
+        .collect();
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+
+    candidate
+        .proxies
+        .retain(|proxy| proxy.namespace != namespace || proxy.id != existing_spec.proxy_id);
+    removed_plugin_ids.extend(
+        candidate
+            .plugin_configs
+            .iter()
+            .filter(|plugin| {
+                plugin.namespace == namespace
+                    && plugin.proxy_id.as_deref() == Some(existing_spec.proxy_id.as_str())
+            })
+            .map(|plugin| plugin.id.clone()),
+    );
+
+    let retained_association_ids: HashSet<&str> = candidate
+        .proxies
+        .iter()
+        .flat_map(|proxy| proxy.plugins.iter())
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    removed_plugin_ids.extend(
+        candidate
+            .plugin_configs
+            .iter()
+            .filter(|plugin| {
+                plugin.namespace == namespace
+                    && plugin.scope == crate::config::types::PluginScope::ProxyGroup
+                    && !retained_association_ids.contains(plugin.id.as_str())
+            })
+            .map(|plugin| plugin.id.clone()),
+    );
+
+    if !candidate.plugin_configs.iter().any(|plugin| {
+        removed_plugin_ids.contains(&plugin.id)
+            && crate::plugins::transaction_log_schema::is_enabled_config_graph_participant(plugin)
+    }) {
+        return Ok(());
+    }
+
+    candidate
+        .plugin_configs
+        .retain(|plugin| !removed_plugin_ids.contains(&plugin.id));
+    let http_client = super::plugin_validation_http_client(state);
+    validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
+}
+
 /// Validate a wholesale namespace replacement without retaining resources that
 /// the restore will delete. Runtime plugin chains are namespace-scoped, so the
 /// normalized replacement is the complete authoritative candidate.
@@ -416,9 +1498,9 @@ pub(crate) async fn mtls_consumer_candidate_errors(
 /// already claimed by another consumer in the namespace. Snapshot-based like
 /// the mTLS candidate check (rather than a credential-index probe) so
 /// pre-existing rows written before hmac secrets were policed are still
-/// authoritative. `lock_mtls_admission` serializes same-process prechecks;
-/// namespace-scoped SQL/Mongo uniqueness constraints are the cross-process
-/// persistence backstop.
+/// authoritative. `lock_namespace_config_admission` serializes same-process
+/// prechecks; namespace-scoped SQL/Mongo uniqueness constraints are the
+/// cross-process persistence backstop.
 pub(crate) async fn hmac_consumer_candidate_errors(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -440,7 +1522,7 @@ impl ValidationError {
     }
 }
 
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub(crate) trait AdminResource:
     Send + Sync + Serialize + DeserializeOwned + Clone + Sized + 'static
 {
@@ -449,7 +1531,7 @@ pub(crate) trait AdminResource:
     const VALIDATION_ERROR_LABEL: &'static str;
     const NOT_FOUND_MESSAGE: &'static str;
     const ID_CONFLICT_LABEL: &'static str = Self::RESOURCE_LABEL;
-    const SERIALIZE_MTLS_ADMISSION: bool = false;
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = false;
 
     fn id(&self) -> &str;
     fn set_id(&mut self, id: String);
@@ -457,6 +1539,7 @@ pub(crate) trait AdminResource:
     fn set_namespace(&mut self, ns: String);
     fn set_created_at(&mut self, now: DateTime<Utc>);
     fn set_updated_at(&mut self, now: DateTime<Utc>);
+    fn updated_at(&self) -> DateTime<Utc>;
     fn normalize(&mut self);
     fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError>;
     fn cached_items(config: &GatewayConfig) -> &[Self];
@@ -575,6 +1658,44 @@ pub(crate) trait AdminResource:
     /// phantom success (issue #2122 DB-M4).
     async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool>;
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool>;
+
+    async fn compensate_late_delete(
+        db: &dyn DatabaseBackend,
+        _namespace: &str,
+        previous: &Self,
+        _previous_snapshot: Option<&GatewayConfig>,
+        _previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+    ) -> DbResult<()> {
+        Self::db_create(db, previous).await
+    }
+
+    async fn intervening_write_recovery(
+        _db: &dyn DatabaseBackend,
+        _namespace: &str,
+        _previous: Option<&Self>,
+        _http_client: crate::plugins::PluginHttpClient,
+    ) -> DbResult<InterveningWriteRecovery> {
+        Ok(InterveningWriteRecovery::Compensate)
+    }
+
+    async fn late_delete_api_spec_snapshot(
+        _db: &dyn DatabaseBackend,
+        _namespace: &str,
+        _previous: &Self,
+    ) -> DbResult<Option<ApiSpecDeleteSnapshot>> {
+        Ok(None)
+    }
+
+    async fn late_create_compensation_safe(
+        _db: &dyn DatabaseBackend,
+        _namespace: &str,
+        current: &Self,
+        written: &Self,
+        _previous_snapshot: Option<&GatewayConfig>,
+        _http_client: crate::plugins::PluginHttpClient,
+    ) -> DbResult<bool> {
+        Ok(current.updated_at() == written.updated_at())
+    }
 
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
@@ -762,12 +1883,14 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
-    let _mtls_admission_guard = if R::SERIALIZE_MTLS_ADMISSION {
-        Some(lock_mtls_admission(namespace).await)
+    let mut namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
+        match lock_namespace_config_admission(db_arc.clone(), namespace).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return Ok(R::map_precheck_db_error(&error)),
+        }
     } else {
         None
     };
-
     let existing = match R::db_get_for_write(db, namespace, id).await {
         Ok(None) => {
             return Ok(not_found_response::<R>());
@@ -777,27 +1900,49 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
         Ok(Some(resource)) => resource,
     };
+    let previous_snapshot = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
+        match db.load_namespace_snapshot(namespace).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => return Ok(R::map_precheck_db_error(&error)),
+        }
+    } else {
+        None
+    };
+    let previous_api_spec = match R::late_delete_api_spec_snapshot(db, namespace, &existing).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Ok(R::map_precheck_db_error(&error)),
+    };
 
     let validation_ctx = ValidationCtx::from_state(state);
     if let Err(error) = R::before_delete(db, state, namespace, &existing, &validation_ctx).await {
         return Ok(map_after_validate_error::<R>(error));
     }
 
-    match R::db_delete(db, namespace, id).await {
-        Ok(true) => {
-            let event = AuditEvent::new(
-                actor,
-                "delete",
-                R::RESOURCE_NAME.replace(' ', "_"),
-                id,
-                namespace,
-                audit::delete_diff(R::audit_body(&existing)),
-            );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db_arc, event) {
-                super::log_audit_enqueue_failure(&error);
-            }
-            Ok(super::empty_response(StatusCode::NO_CONTENT))
-        }
+    let persistence = match tokio::spawn(persist_delete_to_settlement(
+        OwnedWriteSettlementContext {
+            db: db_arc.clone(),
+            namespace: namespace.to_string(),
+            guard: namespace_config_admission_guard.take(),
+            http_client: super::plugin_validation_http_client(state),
+            state: state.clone(),
+            actor: actor.clone(),
+        },
+        id.to_string(),
+        OwnedLateDeleteRecovery {
+            previous: existing.clone(),
+            config: previous_snapshot,
+            api_spec: previous_api_spec,
+        },
+    ))
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::anyhow!(
+            "namespace delete persistence task failed: {error}"
+        )),
+    };
+    match persistence {
+        Ok(true) => Ok(super::empty_response(StatusCode::NO_CONTENT)),
         Ok(false) => Ok(not_found_response::<R>()),
         Err(error) => Ok(R::map_delete_db_error(&error)),
     }
@@ -1596,6 +2741,7 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
         || normalized.contains("client_secret")
         || normalized.contains("credential")
         || normalized.contains("private_key")
+        || normalized.contains("service_account_json")
         || normalized.contains("webhook")
 }
 
@@ -1691,6 +2837,7 @@ pub(crate) async fn check_credential_value_uniqueness(
 // SQL INSERT/UPDATE statements already exclude the column, but Mongo's
 // replace_one serializes the full struct.
 
+#[async_trait::async_trait]
 impl AdminResource for Upstream {
     const RESOURCE_NAME: &'static str = "upstream";
     const RESOURCE_LABEL: &'static str = "Upstream";
@@ -1719,6 +2866,10 @@ impl AdminResource for Upstream {
 
     fn set_updated_at(&mut self, now: DateTime<Utc>) {
         self.updated_at = now;
+    }
+
+    fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
     }
 
     fn normalize(&mut self) {
@@ -1943,12 +3094,13 @@ impl AdminResource for Upstream {
     }
 }
 
+#[async_trait::async_trait]
 impl AdminResource for PluginConfig {
     const RESOURCE_NAME: &'static str = "plugin config";
     const RESOURCE_LABEL: &'static str = "Plugin config";
     const VALIDATION_ERROR_LABEL: &'static str = "plugin config fields";
     const NOT_FOUND_MESSAGE: &'static str = "Plugin config not found";
-    const SERIALIZE_MTLS_ADMISSION: bool = true;
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
     const ID_CONFLICT_LABEL: &'static str = "PluginConfig";
 
     fn id(&self) -> &str {
@@ -1973,6 +3125,10 @@ impl AdminResource for PluginConfig {
 
     fn set_updated_at(&mut self, now: DateTime<Utc>) {
         self.updated_at = now;
+    }
+
+    fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
     }
 
     fn normalize(&mut self) {
@@ -2060,6 +3216,127 @@ impl AdminResource for PluginConfig {
         db.delete_plugin_config(namespace, id).await
     }
 
+    async fn compensate_late_delete(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        previous: &Self,
+        previous_snapshot: Option<&GatewayConfig>,
+        _previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+    ) -> DbResult<()> {
+        let snapshot = previous_snapshot.ok_or_else(|| {
+            anyhow::anyhow!("late plugin delete recovery is missing the namespace snapshot")
+        })?;
+        db.create_plugin_config(previous).await?;
+        for prior_proxy in &snapshot.proxies {
+            let prior_associations = prior_proxy
+                .plugins
+                .iter()
+                .filter(|association| association.plugin_config_id == previous.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            if prior_associations.is_empty() {
+                continue;
+            }
+            let Some(mut current_proxy) =
+                db.get_proxy_for_write(namespace, &prior_proxy.id).await?
+            else {
+                continue;
+            };
+            let mut changed = false;
+            for association in prior_associations {
+                if !current_proxy
+                    .plugins
+                    .iter()
+                    .any(|current| current.plugin_config_id == association.plugin_config_id)
+                {
+                    current_proxy.plugins.push(association);
+                    changed = true;
+                }
+            }
+            if changed {
+                current_proxy.updated_at = Utc::now();
+                if !db.update_proxy(&current_proxy).await? {
+                    anyhow::bail!(
+                        "late plugin delete compensation could not restore proxy '{}' associations",
+                        current_proxy.id
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn intervening_write_recovery(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        previous: Option<&Self>,
+        http_client: crate::plugins::PluginHttpClient,
+    ) -> DbResult<InterveningWriteRecovery> {
+        let mut candidate = db.load_namespace_snapshot(namespace).await?;
+        if validate_transaction_log_schema_graph_on_blocking_pool(
+            candidate.clone(),
+            http_client.clone(),
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(InterveningWriteRecovery::KeepCurrent);
+        }
+
+        let previous = previous.ok_or_else(|| {
+            anyhow::anyhow!("late plugin recovery is missing the prior plugin config")
+        })?;
+        if let Some(current) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|plugin| plugin.namespace == namespace && plugin.id == previous.id)
+        {
+            *current = previous.clone();
+        } else {
+            candidate.plugin_configs.push(previous.clone());
+        }
+        match validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await {
+            Ok(()) => Ok(InterveningWriteRecovery::Compensate),
+            Err(AfterValidateError::BadRequest(errors)) => anyhow::bail!(
+                "late plugin recovery could not produce a valid transaction-log schema graph: {}",
+                errors.join("; ")
+            ),
+            Err(AfterValidateError::Db(error)) => Err(error),
+            Err(AfterValidateError::Conflict(errors)) => anyhow::bail!(
+                "late plugin recovery conflicted while validating the transaction-log schema graph: {}",
+                errors.join("; ")
+            ),
+            Err(AfterValidateError::Response(_)) => anyhow::bail!(
+                "late plugin recovery received an unexpected response while validating the transaction-log schema graph"
+            ),
+        }
+    }
+
+    async fn late_create_compensation_safe(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        current: &Self,
+        written: &Self,
+        _previous_snapshot: Option<&GatewayConfig>,
+        http_client: crate::plugins::PluginHttpClient,
+    ) -> DbResult<bool> {
+        if current.updated_at != written.updated_at {
+            return Ok(false);
+        }
+        if plugin_has_proxy_association(db, namespace, &written.id).await? {
+            return Ok(false);
+        }
+        let mut candidate = db.load_namespace_snapshot(namespace).await?;
+        candidate
+            .plugin_configs
+            .retain(|plugin| plugin.namespace != namespace || plugin.id != written.id);
+        Ok(
+            validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client)
+                .await
+                .is_ok(),
+        )
+    }
+
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
         namespace: &str,
@@ -2111,7 +3388,18 @@ impl AdminResource for PluginConfig {
             }
         }
 
-        if let Err(error) = validate_plugin_config_definition(state, resource) {
+        if crate::plugins::transaction_log_schema::participates_in_config_graph(resource) {
+            if let Err(error) = crate::plugins::validate_plugin_config_policy_only(
+                &resource.plugin_name,
+                &resource.config,
+                &state.backend_allow_ips,
+            ) {
+                return Err(AfterValidateError::BadRequest(vec![format!(
+                    "Invalid plugin config: {}",
+                    error
+                )]));
+            }
+        } else if let Err(error) = validate_plugin_config_definition(state, resource) {
             return Err(AfterValidateError::BadRequest(vec![format!(
                 "Invalid plugin config: {}",
                 error
@@ -2159,6 +3447,20 @@ impl AdminResource for PluginConfig {
             None,
         )
         .await?;
+        if crate::plugins::transaction_log_schema::is_enabled_config_graph_participant(resource)
+            || existing.is_some_and(
+                crate::plugins::transaction_log_schema::is_enabled_config_graph_participant,
+            )
+        {
+            validate_transaction_log_schema_candidates(
+                db,
+                state,
+                namespace,
+                std::slice::from_ref(resource),
+                None,
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -2175,6 +3477,16 @@ impl AdminResource for PluginConfig {
         }
         validate_plugin_graph_candidates(db, state, namespace, &[], &[], Some(&existing.id))
             .await?;
+        if crate::plugins::transaction_log_schema::is_enabled_config_graph_participant(existing) {
+            validate_transaction_log_schema_candidates(
+                db,
+                state,
+                namespace,
+                &[],
+                Some(&existing.id),
+            )
+            .await?;
+        }
         Ok(())
     }
 }
@@ -2244,12 +3556,13 @@ async fn enabled_prometheus_metrics_owner_exists_inner(
     Ok(false)
 }
 
+#[async_trait::async_trait]
 impl AdminResource for Proxy {
     const RESOURCE_NAME: &'static str = "proxy";
     const RESOURCE_LABEL: &'static str = "Proxy";
     const VALIDATION_ERROR_LABEL: &'static str = "proxy fields";
     const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
-    const SERIALIZE_MTLS_ADMISSION: bool = true;
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
 
     fn id(&self) -> &str {
         &self.id
@@ -2273,6 +3586,10 @@ impl AdminResource for Proxy {
 
     fn set_updated_at(&mut self, now: DateTime<Utc>) {
         self.updated_at = now;
+    }
+
+    fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
     }
 
     fn normalize(&mut self) {
@@ -2391,6 +3708,171 @@ impl AdminResource for Proxy {
 
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
         db.delete_proxy(namespace, id).await
+    }
+
+    async fn late_create_compensation_safe(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        current: &Self,
+        written: &Self,
+        _previous_snapshot: Option<&GatewayConfig>,
+        _http_client: crate::plugins::PluginHttpClient,
+    ) -> DbResult<bool> {
+        if current.updated_at != written.updated_at {
+            return Ok(false);
+        }
+        let current_associations = current
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.as_str())
+            .collect::<HashSet<_>>();
+        let written_associations = written
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.as_str())
+            .collect::<HashSet<_>>();
+        if current_associations != written_associations {
+            return Ok(false);
+        }
+        Ok(!proxy_has_scoped_plugin(db, namespace, &written.id).await?)
+    }
+
+    async fn compensate_late_delete(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        previous: &Self,
+        previous_snapshot: Option<&GatewayConfig>,
+        previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+    ) -> DbResult<()> {
+        let snapshot = previous_snapshot.ok_or_else(|| {
+            anyhow::anyhow!("late proxy delete recovery is missing the namespace snapshot")
+        })?;
+        let associated_ids: HashSet<&str> = previous
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.as_str())
+            .collect();
+        let other_associated_ids: HashSet<&str> = snapshot
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id != previous.id)
+            .flat_map(|proxy| proxy.plugins.iter())
+            .map(|association| association.plugin_config_id.as_str())
+            .collect();
+        let mut affected_plugins = snapshot
+            .plugin_configs
+            .iter()
+            .filter(|plugin| {
+                plugin.proxy_id.as_deref() == Some(previous.id.as_str())
+                    || (plugin.scope == PluginScope::ProxyGroup
+                        && associated_ids.contains(plugin.id.as_str())
+                        && !other_associated_ids.contains(plugin.id.as_str()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(api_spec_snapshot) = previous_api_spec {
+            for plugin in &api_spec_snapshot.plugins {
+                if !affected_plugins
+                    .iter()
+                    .any(|affected| affected.id == plugin.id)
+                {
+                    affected_plugins.push(plugin.clone());
+                }
+            }
+        }
+
+        let mut affected_upstreams = snapshot
+            .upstreams
+            .iter()
+            .filter(|upstream| previous.upstream_id.as_deref() == Some(upstream.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(api_spec_snapshot) = previous_api_spec {
+            for upstream in &api_spec_snapshot.upstreams {
+                if !affected_upstreams
+                    .iter()
+                    .any(|affected| affected.id == upstream.id)
+                {
+                    affected_upstreams.push(upstream.clone());
+                }
+            }
+        }
+
+        if let Some(api_spec_snapshot) = previous_api_spec {
+            let spec = &api_spec_snapshot.spec;
+            let spec_plugins = api_spec_snapshot.plugins.clone();
+            let spec_plugin_ids = spec_plugins
+                .iter()
+                .map(|plugin| plugin.id.as_str())
+                .collect::<HashSet<_>>();
+            let bundle_upstream = affected_upstreams
+                .iter()
+                .find(|upstream| {
+                    upstream.api_spec_id.as_deref() == Some(spec.id.as_str())
+                        && previous.upstream_id.as_deref() == Some(upstream.id.as_str())
+                })
+                .or_else(|| {
+                    affected_upstreams
+                        .iter()
+                        .find(|upstream| upstream.api_spec_id.as_deref() == Some(spec.id.as_str()))
+                })
+                .cloned();
+            for upstream in &affected_upstreams {
+                if bundle_upstream.as_ref().map(|item| item.id.as_str())
+                    != Some(upstream.id.as_str())
+                    && db.get_upstream(namespace, &upstream.id).await?.is_none()
+                {
+                    db.create_upstream(upstream).await?;
+                }
+            }
+            let mut base_proxy = previous.clone();
+            base_proxy.plugins.retain(|association| {
+                spec_plugin_ids.contains(association.plugin_config_id.as_str())
+            });
+            let bundle = crate::admin::api_specs::ExtractedBundle {
+                proxy: base_proxy,
+                upstream: bundle_upstream,
+                plugins: spec_plugins,
+            };
+            db.submit_api_spec_bundle(&bundle, spec).await?;
+        } else {
+            for upstream in &affected_upstreams {
+                if db.get_upstream(namespace, &upstream.id).await?.is_none() {
+                    db.create_upstream(upstream).await?;
+                }
+            }
+            let mut proxy_without_associations = previous.clone();
+            proxy_without_associations.plugins.clear();
+            db.create_proxy(&proxy_without_associations).await?;
+        }
+        for plugin in affected_plugins {
+            if db.get_plugin_config(namespace, &plugin.id).await?.is_none() {
+                db.create_plugin_config(&plugin).await?;
+            }
+        }
+        if !db.update_proxy(previous).await? {
+            anyhow::bail!("late proxy delete compensation could not restore associations");
+        }
+        Ok(())
+    }
+
+    async fn late_delete_api_spec_snapshot(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        previous: &Self,
+    ) -> DbResult<Option<ApiSpecDeleteSnapshot>> {
+        let Some(spec) = db.get_api_spec_by_proxy(namespace, &previous.id).await? else {
+            return Ok(None);
+        };
+        let upstreams = db.list_spec_owned_upstreams(namespace, &spec.id).await?;
+        let plugins = db
+            .list_spec_owned_plugin_configs(namespace, &spec.id)
+            .await?;
+        Ok(Some(ApiSpecDeleteSnapshot {
+            spec,
+            upstreams,
+            plugins,
+        }))
     }
 
     async fn check_uniqueness(
@@ -2699,12 +4181,13 @@ impl AdminResource for Proxy {
     }
 }
 
+#[async_trait::async_trait]
 impl AdminResource for Consumer {
     const RESOURCE_NAME: &'static str = "consumer";
     const RESOURCE_LABEL: &'static str = "Consumer";
     const VALIDATION_ERROR_LABEL: &'static str = "consumer fields";
     const NOT_FOUND_MESSAGE: &'static str = "Consumer not found";
-    const SERIALIZE_MTLS_ADMISSION: bool = true;
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
 
     fn id(&self) -> &str {
         &self.id
@@ -2728,6 +4211,10 @@ impl AdminResource for Consumer {
 
     fn set_updated_at(&mut self, now: DateTime<Utc>) {
         self.updated_at = now;
+    }
+
+    fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
     }
 
     fn normalize(&mut self) {
@@ -2935,8 +4422,11 @@ async fn handle_write<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
-    let _mtls_admission_guard = if R::SERIALIZE_MTLS_ADMISSION {
-        Some(lock_mtls_admission(namespace).await)
+    let mut namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
+        match lock_namespace_config_admission(db_arc.clone(), namespace).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return Ok(R::map_precheck_db_error(&error)),
+        }
     } else {
         None
     };
@@ -2973,7 +4463,11 @@ async fn handle_write<R: AdminResource>(
             }
         },
     };
-
+    if let Some(guard) = namespace_config_admission_guard.as_ref()
+        && let Err(error) = guard.ensure_held()
+    {
+        return Ok(R::map_precheck_db_error(&error));
+    }
     match action {
         WriteAction::Create => {
             if resource.id().is_empty() {
@@ -3066,58 +4560,64 @@ async fn handle_write<R: AdminResource>(
 
     match action {
         WriteAction::Create => {
-            if let Err(error) = R::db_create(db, &resource).await {
+            let persistence = match tokio::spawn(persist_create_to_settlement(
+                OwnedWriteSettlementContext {
+                    db: db_arc.clone(),
+                    namespace: namespace.to_string(),
+                    guard: namespace_config_admission_guard.take(),
+                    http_client: super::plugin_validation_http_client(state),
+                    state: state.clone(),
+                    actor: actor.clone(),
+                },
+                resource.clone(),
+            ))
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(
+                    "namespace create persistence task failed: {error}"
+                )),
+            };
+            if let Err(error) = persistence {
                 return Ok(R::map_persist_db_error(&error, action));
             }
         }
-        WriteAction::Update { .. } => match R::db_update(db, &resource).await {
+        WriteAction::Update { id } => {
+            let Some(previous) = existing.clone() else {
+                return Ok(super::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "Update persistence is missing the prior resource"}),
+                ));
+            };
+            let persistence = match tokio::spawn(persist_update_to_settlement(
+                OwnedWriteSettlementContext {
+                    db: db_arc.clone(),
+                    namespace: namespace.to_string(),
+                    guard: namespace_config_admission_guard.take(),
+                    http_client: super::plugin_validation_http_client(state),
+                    state: state.clone(),
+                    actor: actor.clone(),
+                },
+                id.to_string(),
+                resource.clone(),
+                previous,
+            ))
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(
+                    "namespace update persistence task failed: {error}"
+                )),
+            };
             // The row vanished between the precheck and the write (concurrent
             // delete). The backend recorded no change — report not-found
             // rather than a phantom success (issue #2122 DB-M4).
-            Ok(false) => {
-                return Ok(not_found_response::<R>());
+            match persistence {
+                Ok(false) => return Ok(not_found_response::<R>()),
+                Ok(true) => {}
+                Err(error) => return Ok(R::map_persist_db_error(&error, action)),
             }
-            Ok(true) => {}
-            Err(error) => {
-                return Ok(R::map_persist_db_error(&error, action));
-            }
-        },
-    }
-
-    if let Err(error) =
-        R::after_write(db, state, namespace, &resource, existing.as_ref(), action).await
-    {
-        tracing::warn!(
-            "Post-write hook failed for {} '{}': {}",
-            R::RESOURCE_NAME,
-            resource.id(),
-            error
-        );
-    }
-
-    let (audit_action, diff) = match action {
-        WriteAction::Create => ("create", audit::create_diff(R::audit_body(&resource))),
-        WriteAction::Update { .. } => {
-            let before = existing
-                .as_ref()
-                .map(R::audit_body)
-                .unwrap_or_else(|| json!(null));
-            (
-                "update",
-                audit::update_diff(before, R::audit_body(&resource)),
-            )
         }
-    };
-    let event = AuditEvent::new(
-        actor,
-        audit_action,
-        R::RESOURCE_NAME.replace(' ', "_"),
-        resource.id(),
-        namespace,
-        diff,
-    );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db_arc, event) {
-        super::log_audit_enqueue_failure(&error);
     }
 
     let body = R::response_body_for_role(&resource, actor.role);

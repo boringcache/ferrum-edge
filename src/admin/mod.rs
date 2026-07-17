@@ -2744,6 +2744,22 @@ async fn load_consumer_in_namespace(
     }
 }
 
+async fn acquire_credential_namespace_admission(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+) -> Result<crud::NamespaceConfigAdmissionGuard, Response<Full<Bytes>>> {
+    crud::lock_namespace_config_admission(db, namespace)
+        .await
+        .map_err(|error| {
+            warn!(
+                namespace = %namespace,
+                %error,
+                "Credential namespace config admission could not be acquired"
+            );
+            mtls_dns_admission_unavailable_response()
+        })
+}
+
 pub(crate) fn basic_auth_credential_error_status(
     error: &crate::config::types::BasicAuthCredentialPreparationError,
 ) -> StatusCode {
@@ -2838,11 +2854,13 @@ async fn ensure_hmac_consumer_candidate(
 }
 
 async fn persist_consumer_update(
-    db: &dyn DatabaseBackend,
+    db: Arc<dyn DatabaseBackend>,
     mut consumer: Consumer,
+    previous: &Consumer,
     success_status: StatusCode,
     mode: &BatchConfigWriteMode,
     admission: &MtlsDnsAdmissionOperation,
+    namespace_admission: crud::NamespaceConfigAdmissionGuard,
 ) -> Response<Full<Bytes>> {
     // Every credential endpoint rewrites the complete Consumer and rebuilds
     // its credential index entries. Revalidate retained HMAC credentials even
@@ -2850,15 +2868,77 @@ async fn persist_consumer_update(
     // out-of-band duplicates fail before the datastore uniqueness backstop.
     if !consumer.credential_entries("hmac_auth").is_empty()
         && let Err(response) =
-            ensure_hmac_consumer_candidate(db, &consumer.namespace, &consumer).await
+            ensure_hmac_consumer_candidate(db.as_ref(), &consumer.namespace, &consumer).await
     {
         return *response;
     }
     consumer.updated_at = Utc::now();
-    match admission
-        .run_mutation(db.update_consumer(&consumer, mode))
+    if let Err(error) = namespace_admission.ensure_held() {
+        warn!(
+            namespace = %consumer.namespace,
+            %error,
+            "Credential namespace config admission was lost before persistence"
+        );
+        return mtls_dns_admission_unavailable_response();
+    }
+    let persistence = match namespace_admission
+        .run_to_completion_while_held(admission.run_mutation(db.update_consumer(&consumer, mode)))
         .await
     {
+        Ok(crud::NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+            Ok(true) => {
+                let lost_generation = namespace_admission.generation();
+                if let Err(release_error) = admission.release_guard().await {
+                    error!(
+                        namespace = %consumer.namespace,
+                        %release_error,
+                        "Credential mTLS admission guard could not be released before namespace recovery"
+                    );
+                    return mtls_dns_admission_unavailable_response();
+                }
+                drop(namespace_admission);
+                match recover_late_credential_update(
+                    db,
+                    &consumer.namespace,
+                    lost_generation,
+                    &consumer,
+                    previous,
+                )
+                .await
+                {
+                    Ok(true) => Ok(true),
+                    Ok(false) => {
+                        warn!(
+                            namespace = %consumer.namespace,
+                            %error,
+                            "Credential namespace admission was lost during persistence; the late write was compensated"
+                        );
+                        return mtls_dns_admission_unavailable_response();
+                    }
+                    Err(recovery_error) => {
+                        error!(
+                            namespace = %consumer.namespace,
+                            %error,
+                            %recovery_error,
+                            "Credential namespace admission was lost during persistence and recovery failed"
+                        );
+                        return mtls_dns_admission_unavailable_response();
+                    }
+                }
+            }
+            other => other,
+        },
+        Err(error) => {
+            warn!(
+                namespace = %consumer.namespace,
+                %error,
+                "Credential namespace config admission was lost before persistence"
+            );
+            return mtls_dns_admission_unavailable_response();
+        }
+    };
+    match persistence {
         // The consumer vanished between the namespace-scoped load and the
         // write (concurrent delete) — not-found, not a phantom success.
         Ok(false) => consumer_not_found_response(),
@@ -2871,6 +2951,50 @@ async fn persist_consumer_update(
         }
         Err(e) => crud::consumer_persist_error_response(&e),
     }
+}
+
+async fn recover_late_credential_update(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    lost_generation: u64,
+    written: &Consumer,
+    previous: &Consumer,
+) -> Result<bool, anyhow::Error> {
+    let recovery_guard = crud::lock_namespace_config_admission(db.clone(), namespace).await?;
+    if recovery_guard.immediately_succeeds_generation(lost_generation) {
+        return Ok(true);
+    }
+
+    let mut recovery_admission =
+        MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await?;
+    let recovery_mode = BatchConfigWriteMode::GuardedAdmission {
+        guard_owner: recovery_admission.guard_owner().to_string(),
+    };
+    let recovery_operation = recovery_admission.operation();
+    let compensation = recovery_operation.run_mutation(async {
+        if db
+            .get_consumer(namespace, &written.id)
+            .await?
+            .is_some_and(|current| current.updated_at == written.updated_at)
+            && !db.update_consumer(previous, &recovery_mode).await?
+        {
+            anyhow::bail!("late credential update compensation found no matching consumer");
+        }
+        Ok(())
+    });
+    let completion = recovery_guard
+        .run_to_completion_while_held(compensation)
+        .await;
+    let release_result = recovery_admission.release().await;
+    match completion? {
+        crud::NamespaceConfigAdmissionCompletion::Held(result) => result?,
+        crud::NamespaceConfigAdmissionCompletion::Lost { result, error } => {
+            result?;
+            return Err(error);
+        }
+    }
+    release_result?;
+    Ok(false)
 }
 
 const MTLS_DNS_ADMISSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2900,13 +3024,27 @@ impl MtlsDnsAdmissionMutationState {
 
 #[derive(Clone)]
 struct MtlsDnsAdmissionOperation {
+    db: Arc<dyn DatabaseBackend>,
+    namespace: String,
     guard_owner: String,
     mutation_state: Arc<AtomicU8>,
+    released: Arc<AtomicBool>,
 }
 
 impl MtlsDnsAdmissionOperation {
     fn guard_owner(&self) -> &str {
         &self.guard_owner
+    }
+
+    async fn release_guard(&self) -> Result<(), anyhow::Error> {
+        if self.released.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.db
+            .release_mtls_dns_admission_guard(&self.namespace, &self.guard_owner)
+            .await?;
+        self.released.store(true, Ordering::Release);
+        Ok(())
     }
 
     async fn run_mutation<T, F>(&self, mutation: F) -> T
@@ -2931,6 +3069,7 @@ struct MtlsDnsAdmissionGuardLifecycle {
     namespace: String,
     guard_owner: String,
     mutation_state: Arc<AtomicU8>,
+    released: Arc<AtomicBool>,
     armed: bool,
 }
 
@@ -2962,14 +3101,18 @@ impl MtlsDnsAdmissionGuardLifecycle {
             mutation_state: Arc::new(AtomicU8::new(
                 MtlsDnsAdmissionMutationState::NotStarted as u8,
             )),
+            released: Arc::new(AtomicBool::new(false)),
             armed: true,
         }
     }
 
     fn operation(&self) -> MtlsDnsAdmissionOperation {
         MtlsDnsAdmissionOperation {
+            db: self.db.clone(),
+            namespace: self.namespace.clone(),
             guard_owner: self.guard_owner.clone(),
             mutation_state: self.mutation_state.clone(),
+            released: self.released.clone(),
         }
     }
 
@@ -2985,11 +3128,16 @@ impl MtlsDnsAdmissionGuardLifecycle {
     }
 
     async fn release(&mut self) -> Result<(), anyhow::Error> {
+        if self.released.load(Ordering::Acquire) {
+            self.armed = false;
+            return Ok(());
+        }
         let result = self
             .db
             .release_mtls_dns_admission_guard(&self.namespace, &self.guard_owner)
             .await;
         if result.is_ok() {
+            self.released.store(true, Ordering::Release);
             self.armed = false;
         }
         result
@@ -2998,7 +3146,7 @@ impl MtlsDnsAdmissionGuardLifecycle {
 
 impl Drop for MtlsDnsAdmissionGuardLifecycle {
     fn drop(&mut self) {
-        if !self.armed {
+        if !self.armed || self.released.load(Ordering::Acquire) {
             return;
         }
         let state =
@@ -3454,6 +3602,225 @@ async fn persist_payload_resources(
     (counts, errors, admission_unavailable)
 }
 
+/// Remove only resources that a failed batch could have inserted. Pre-existing
+/// IDs from the raw primary snapshot are never deleted, and API specs are not
+/// touched because batch create cannot mutate them.
+async fn rollback_failed_batch_create(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    batch: &RestorePayload,
+    snapshot: &RestorePayload,
+    protected_plugin_config_ids: &HashSet<String>,
+) -> Result<(), Vec<String>> {
+    let prior_proxy_ids: HashSet<&str> = snapshot
+        .proxies
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect();
+    let prior_consumer_ids: HashSet<&str> = snapshot
+        .consumers
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect();
+    let prior_plugin_config_ids: HashSet<&str> = snapshot
+        .plugin_configs
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect();
+    let prior_upstream_ids: HashSet<&str> = snapshot
+        .upstreams
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect();
+    let mut errors = Vec::new();
+
+    // Remove dependants before their plugin/upstream dependencies.
+    for proxy in &batch.proxies {
+        if !prior_proxy_ids.contains(proxy.id.as_str()) {
+            match db.get_proxy(namespace, &proxy.id).await {
+                Ok(Some(current)) if current.updated_at == proxy.updated_at => {
+                    if let Err(error) = db.delete_proxy(namespace, &proxy.id).await {
+                        errors.push(format!("proxy '{}': {}", proxy.id, error));
+                    }
+                }
+                Ok(Some(_)) => errors.push(format!(
+                    "proxy '{}' changed after admission loss and was not deleted",
+                    proxy.id
+                )),
+                Ok(None) => {}
+                Err(error) => errors.push(format!("proxy '{}': {}", proxy.id, error)),
+            }
+        }
+    }
+    for plugin_config in &batch.plugin_configs {
+        if !prior_plugin_config_ids.contains(plugin_config.id.as_str()) {
+            if protected_plugin_config_ids.contains(&plugin_config.id) {
+                errors.push(format!(
+                    "plugin_config '{}' gained an intervening proxy association and was not deleted",
+                    plugin_config.id
+                ));
+                continue;
+            }
+            match db.get_plugin_config(namespace, &plugin_config.id).await {
+                Ok(Some(current)) if current.updated_at == plugin_config.updated_at => {
+                    if let Err(error) = db.delete_plugin_config(namespace, &plugin_config.id).await
+                    {
+                        errors.push(format!("plugin_config '{}': {}", plugin_config.id, error));
+                    }
+                }
+                Ok(Some(_)) => errors.push(format!(
+                    "plugin_config '{}' changed after admission loss and was not deleted",
+                    plugin_config.id
+                )),
+                Ok(None) => {}
+                Err(error) => {
+                    errors.push(format!("plugin_config '{}': {}", plugin_config.id, error));
+                }
+            }
+        }
+    }
+    for consumer in &batch.consumers {
+        if !prior_consumer_ids.contains(consumer.id.as_str()) {
+            match db.get_consumer(namespace, &consumer.id).await {
+                Ok(Some(current)) if current.updated_at == consumer.updated_at => {
+                    if let Err(error) = db.delete_consumer(namespace, &consumer.id).await {
+                        errors.push(format!("consumer '{}': {}", consumer.id, error));
+                    }
+                }
+                Ok(Some(_)) => errors.push(format!(
+                    "consumer '{}' changed after admission loss and was not deleted",
+                    consumer.id
+                )),
+                Ok(None) => {}
+                Err(error) => errors.push(format!("consumer '{}': {}", consumer.id, error)),
+            }
+        }
+    }
+    for upstream in &batch.upstreams {
+        if !prior_upstream_ids.contains(upstream.id.as_str()) {
+            match db.get_upstream(namespace, &upstream.id).await {
+                Ok(Some(current)) if current.updated_at == upstream.updated_at => {
+                    if let Err(error) = db.delete_upstream(namespace, &upstream.id).await {
+                        errors.push(format!("upstream '{}': {}", upstream.id, error));
+                    }
+                }
+                Ok(Some(_)) => errors.push(format!(
+                    "upstream '{}' changed after admission loss and was not deleted",
+                    upstream.id
+                )),
+                Ok(None) => {}
+                Err(error) => errors.push(format!("upstream '{}': {}", upstream.id, error)),
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn batch_plugin_configs_with_intervening_proxy_dependencies(
+    current: &GatewayConfig,
+    batch: &RestorePayload,
+    snapshot: &RestorePayload,
+) -> HashSet<String> {
+    let prior_plugin_config_ids = snapshot
+        .plugin_configs
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let batch_created_plugin_config_ids = batch
+        .plugin_configs
+        .iter()
+        .filter(|resource| !prior_plugin_config_ids.contains(resource.id.as_str()))
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut protected = HashSet::new();
+    for proxy in &current.proxies {
+        for association in &proxy.plugins {
+            if batch_created_plugin_config_ids.contains(association.plugin_config_id.as_str())
+                && !batch.proxies.iter().any(|submitted| {
+                    submitted.id == proxy.id
+                        && submitted.plugins.iter().any(|expected| {
+                            expected.plugin_config_id == association.plugin_config_id
+                        })
+                })
+            {
+                protected.insert(association.plugin_config_id.clone());
+            }
+        }
+    }
+    protected
+}
+
+fn batch_rollback_candidate_after_intervening_write(
+    current: &GatewayConfig,
+    batch: &RestorePayload,
+    snapshot: &RestorePayload,
+    protected_plugin_config_ids: &HashSet<String>,
+) -> GatewayConfig {
+    let prior_proxy_ids = snapshot
+        .proxies
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let prior_consumer_ids = snapshot
+        .consumers
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let prior_plugin_config_ids = snapshot
+        .plugin_configs
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let prior_upstream_ids = snapshot
+        .upstreams
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut candidate = current.clone();
+    candidate.proxies.retain(|current| {
+        prior_proxy_ids.contains(current.id.as_str())
+            || !batch.proxies.iter().any(|submitted| {
+                submitted.id == current.id && submitted.updated_at == current.updated_at
+            })
+    });
+    candidate.consumers.retain(|current| {
+        prior_consumer_ids.contains(current.id.as_str())
+            || !batch.consumers.iter().any(|submitted| {
+                submitted.id == current.id && submitted.updated_at == current.updated_at
+            })
+    });
+    candidate.plugin_configs.retain(|current| {
+        protected_plugin_config_ids.contains(&current.id)
+            || prior_plugin_config_ids.contains(current.id.as_str())
+            || !batch.plugin_configs.iter().any(|submitted| {
+                submitted.id == current.id && submitted.updated_at == current.updated_at
+            })
+    });
+    candidate.upstreams.retain(|current| {
+        prior_upstream_ids.contains(current.id.as_str())
+            || !batch.upstreams.iter().any(|submitted| {
+                submitted.id == current.id && submitted.updated_at == current.updated_at
+            })
+    });
+    candidate
+}
+
+fn transaction_log_graph_validation_error_message(error: crud::AfterValidateError) -> String {
+    match error {
+        crud::AfterValidateError::BadRequest(errors)
+        | crud::AfterValidateError::Conflict(errors) => errors.join("; "),
+        crud::AfterValidateError::Db(error) => error.to_string(),
+        crud::AfterValidateError::Response(_) => {
+            "transaction-log schema validation returned an HTTP response".to_string()
+        }
+    }
+}
+
 async fn rollback_failed_restore(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -3472,6 +3839,153 @@ async fn rollback_failed_restore(
         let (_, persist_errors, _) = persist_payload_resources(db, snapshot, false, &mode).await;
         errors.extend(persist_errors);
     }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn snapshot_resources_missing_after_intervening_write(
+    snapshot: &RestorePayload,
+    current: &GatewayConfig,
+) -> RestorePayload {
+    let proxy_ids = current
+        .proxies
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let consumer_ids = current
+        .consumers
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let plugin_config_ids = current
+        .plugin_configs
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let upstream_ids = current
+        .upstreams
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    RestorePayload {
+        version: snapshot.version.clone(),
+        proxies: snapshot
+            .proxies
+            .iter()
+            .filter(|resource| !proxy_ids.contains(resource.id.as_str()))
+            .cloned()
+            .collect(),
+        consumers: snapshot
+            .consumers
+            .iter()
+            .filter(|resource| !consumer_ids.contains(resource.id.as_str()))
+            .cloned()
+            .collect(),
+        plugin_configs: snapshot
+            .plugin_configs
+            .iter()
+            .filter(|resource| !plugin_config_ids.contains(resource.id.as_str()))
+            .cloned()
+            .collect(),
+        upstreams: snapshot
+            .upstreams
+            .iter()
+            .filter(|resource| !upstream_ids.contains(resource.id.as_str()))
+            .cloned()
+            .collect(),
+    }
+}
+
+fn intervening_clear_recovery_candidate(
+    snapshot: &RestorePayload,
+    current: &GatewayConfig,
+) -> (GatewayConfig, RestorePayload) {
+    let missing = snapshot_resources_missing_after_intervening_write(snapshot, current);
+    let mut candidate = current.clone();
+    candidate.proxies.extend(missing.proxies.iter().cloned());
+    candidate
+        .consumers
+        .extend(missing.consumers.iter().cloned());
+    candidate
+        .plugin_configs
+        .extend(missing.plugin_configs.iter().cloned());
+    candidate
+        .upstreams
+        .extend(missing.upstreams.iter().cloned());
+    (candidate, missing)
+}
+
+#[doc(hidden)]
+// External tests reach this through the lib target's `_test_support` shim;
+// the bin target recompiles this module without that caller.
+#[allow(dead_code)]
+pub(crate) fn intervening_clear_recovery_candidate_for_test(
+    snapshot: GatewayConfig,
+    current: GatewayConfig,
+) -> GatewayConfig {
+    intervening_clear_recovery_candidate(&restore_payload_from_config(snapshot), &current).0
+}
+
+async fn restore_snapshot_after_intervening_clear(
+    state: &AdminState,
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    snapshot: &RestorePayload,
+    guard_owner: &str,
+) -> Result<(), Vec<String>> {
+    let current = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(|error| vec![format!("failed to load intervening resources: {error}")])?;
+    let (candidate, missing) = intervening_clear_recovery_candidate(snapshot, &current);
+    let mut identity_errors = candidate
+        .validate_mtls_auth_compatibility()
+        .err()
+        .unwrap_or_default();
+    identity_errors.extend(
+        candidate
+            .validate_unique_mtls_credentials()
+            .err()
+            .unwrap_or_default(),
+    );
+    if !identity_errors.is_empty() {
+        return Err(vec![format!(
+            "additive rollback would leave invalid mTLS identities or associations: {}",
+            identity_errors.join("; ")
+        )]);
+    }
+    match crud::validate_transaction_log_schema_graph_on_blocking_pool(
+        candidate,
+        plugin_validation_http_client(state),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crud::AfterValidateError::BadRequest(errors))
+        | Err(crud::AfterValidateError::Conflict(errors)) => {
+            return Err(vec![format!(
+                "additive rollback would leave an invalid transaction-log schema graph: {}",
+                errors.join("; ")
+            )]);
+        }
+        Err(crud::AfterValidateError::Db(error)) => {
+            return Err(vec![format!(
+                "failed to validate the additive rollback graph: {error}"
+            )]);
+        }
+        Err(crud::AfterValidateError::Response(_)) => {
+            return Err(vec![
+                "additive rollback graph validation returned an HTTP response".to_string(),
+            ]);
+        }
+    }
+    let mode = BatchConfigWriteMode::RestoreRollbackReplay {
+        guard_owner: guard_owner.to_string(),
+    };
+    let (_, errors, _) = persist_payload_resources(db, &missing, false, &mode).await;
     if errors.is_empty() {
         Ok(())
     } else {
@@ -3577,6 +4091,90 @@ async fn finish_failed_restore(
         response["api_specs_note"] = json!(note);
     }
 
+    json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
+}
+
+/// Recover a clear that completed after namespace admission expired without
+/// deleting resources committed by the intervening lease owner. Current IDs
+/// win, the combined transaction-log schema graph is validated, and only
+/// snapshot resources that are still absent are replayed.
+async fn finish_failed_restore_after_intervening_clear(
+    state: &AdminState,
+    db: Arc<dyn DatabaseBackend>,
+    actor: &AuditActor,
+    namespace: &str,
+    restore_errors: Vec<String>,
+    snapshot: &RestoreSnapshot,
+    guard: &mut MtlsDnsAdmissionGuardLifecycle,
+) -> Response<Full<Bytes>> {
+    let guard_owner = guard.guard_owner().to_string();
+    let operation = guard.operation();
+    let (mut rollback_status, mut rollback_errors) = match operation
+        .run_mutation(restore_snapshot_after_intervening_clear(
+            state,
+            db.as_ref(),
+            namespace,
+            &snapshot.payload,
+            &guard_owner,
+        ))
+        .await
+    {
+        Ok(()) => ("completed", None),
+        Err(errors) => {
+            error!(
+                namespace = %namespace,
+                errors = %errors.join("; "),
+                "Restore: additive rollback after an intervening clear failed"
+            );
+            ("incomplete", Some(errors))
+        }
+    };
+    if let Err(error) = guard.release().await {
+        error!(
+            namespace = %namespace,
+            %error,
+            "Restore: additive rollback guard could not be released"
+        );
+        rollback_status = "incomplete";
+        rollback_errors
+            .get_or_insert_with(Vec::new)
+            .push("failed to release restore admission guard".to_string());
+    }
+
+    let event = audit::AuditEvent::new(
+        actor,
+        "restore",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            json!({"rollback": rollback_status}),
+        ),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event) {
+        log_audit_enqueue_failure(&error);
+    }
+
+    let mut response = json!({
+        "error": if rollback_status == "completed" {
+            "Restore lost namespace admission during clear; prior and intervening config resources were preserved"
+        } else {
+            "Restore lost namespace admission during clear and additive rollback was incomplete; manual recovery required"
+        },
+        "restore_errors": restore_errors,
+        "rollback": rollback_status,
+    });
+    if let Some(errors) = rollback_errors {
+        response["rollback_errors"] = json!(errors);
+    }
+    if snapshot.api_specs_total > 0 {
+        response["api_specs_not_restored"] = json!(snapshot.api_specs_total);
+        response["api_specs_note"] = json!(format!(
+            "{} pre-restore API spec(s) were removed by the clear and are not part of config rollback. API specs committed by the intervening writer were not deleted.",
+            snapshot.api_specs_total
+        ));
+    }
     json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
 }
 
@@ -3702,8 +4300,6 @@ async fn handle_update_credentials(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
-
     let mut cred_value = match parse_json_value(body) {
         Ok(value) => value,
         Err(resp) => return Ok(*resp),
@@ -3715,7 +4311,20 @@ async fn handle_update_credentials(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut cred_value) {
         return Ok(*resp);
     }
+    let namespace_admission =
+        match acquire_credential_namespace_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(response) => return Ok(response),
+        };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        if let Err(error) = namespace_admission.ensure_held() {
+            warn!(
+                namespace = %namespace,
+                %error,
+                "Credential namespace config admission was lost before the update read"
+            );
+            return mtls_dns_admission_unavailable_response();
+        }
         let mode = BatchConfigWriteMode::GuardedAdmission {
             guard_owner: admission.guard_owner().to_string(),
         };
@@ -3752,11 +4361,13 @@ async fn handle_update_credentials(
             return *resp;
         }
         let response = persist_consumer_update(
-            db.as_ref(),
+            db.clone(),
             consumer.clone(),
+            &before,
             StatusCode::OK,
             &mode,
             &admission,
+            namespace_admission,
         )
         .await;
         if response.status().is_success() {
@@ -3805,9 +4416,20 @@ async fn handle_delete_credentials(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
-
+    let namespace_admission =
+        match acquire_credential_namespace_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(response) => return Ok(response),
+        };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        if let Err(error) = namespace_admission.ensure_held() {
+            warn!(
+                namespace = %namespace,
+                %error,
+                "Credential namespace config admission was lost before the delete read"
+            );
+            return mtls_dns_admission_unavailable_response();
+        }
         let mode = BatchConfigWriteMode::GuardedAdmission {
             guard_owner: admission.guard_owner().to_string(),
         };
@@ -3819,11 +4441,13 @@ async fn handle_delete_credentials(
         let before = consumer.clone();
         consumer.credentials.remove(cred_type);
         let response = persist_consumer_update(
-            db.as_ref(),
+            db.clone(),
             consumer.clone(),
+            &before,
             StatusCode::NO_CONTENT,
             &mode,
             &admission,
+            namespace_admission,
         )
         .await;
         if response.status().is_success() {
@@ -3874,8 +4498,6 @@ async fn handle_append_credential(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
-
     let mut new_cred = match parse_json_value(body) {
         Ok(value) => value,
         Err(resp) => return Ok(*resp),
@@ -3889,7 +4511,20 @@ async fn handle_append_credential(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut new_cred) {
         return Ok(*resp);
     }
+    let namespace_admission =
+        match acquire_credential_namespace_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(response) => return Ok(response),
+        };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        if let Err(error) = namespace_admission.ensure_held() {
+            warn!(
+                namespace = %namespace,
+                %error,
+                "Credential namespace config admission was lost before the append read"
+            );
+            return mtls_dns_admission_unavailable_response();
+        }
         let mode = BatchConfigWriteMode::GuardedAdmission {
             guard_owner: admission.guard_owner().to_string(),
         };
@@ -3947,11 +4582,13 @@ async fn handle_append_credential(
             return *resp;
         }
         let response = persist_consumer_update(
-            db.as_ref(),
+            db.clone(),
             consumer.clone(),
+            &before,
             StatusCode::OK,
             &mode,
             &admission,
+            namespace_admission,
         )
         .await;
         if response.status().is_success() {
@@ -4013,9 +4650,20 @@ async fn handle_delete_credential_by_index(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
-
+    let namespace_admission =
+        match acquire_credential_namespace_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(response) => return Ok(response),
+        };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        if let Err(error) = namespace_admission.ensure_held() {
+            warn!(
+                namespace = %namespace,
+                %error,
+                "Credential namespace config admission was lost before the indexed delete read"
+            );
+            return mtls_dns_admission_unavailable_response();
+        }
         let mode = BatchConfigWriteMode::GuardedAdmission {
             guard_owner: admission.guard_owner().to_string(),
         };
@@ -4060,11 +4708,13 @@ async fn handle_delete_credential_by_index(
         }
 
         let response = persist_consumer_update(
-            db.as_ref(),
+            db.clone(),
             consumer.clone(),
+            &before,
             StatusCode::OK,
             &mode,
             &admission,
+            namespace_admission,
         )
         .await;
         if response.status().is_success() {
@@ -4473,7 +5123,16 @@ async fn handle_batch_create(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
+    let _namespace_config_admission_guard =
+        match crud::lock_namespace_config_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Config admission unavailable: {error}")}),
+                ));
+            }
+        };
 
     let mut batch: RestorePayload = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -4550,13 +5209,56 @@ async fn handle_batch_create(
                 plugin_config.id, plugin_config.plugin_name
             ));
         }
-        if let Err(err) =
+        if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin_config) {
+            if let Err(err) = crate::plugins::validate_plugin_config_policy_only(
+                &plugin_config.plugin_name,
+                &plugin_config.config,
+                &state.backend_allow_ips,
+            ) {
+                validation_errors.push(format!(
+                    "PluginConfig '{}': invalid config: {}",
+                    plugin_config.id, err
+                ));
+            }
+        } else if let Err(err) =
             validate_plugin_config_definition(plugin_config, plugin_validation_http_client(state))
         {
             validation_errors.push(format!(
                 "PluginConfig '{}': invalid config: {}",
                 plugin_config.id, err
             ));
+        }
+    }
+
+    if batch
+        .plugin_configs
+        .iter()
+        .any(crate::plugins::transaction_log_schema::is_enabled_config_graph_participant)
+    {
+        match crud::validate_transaction_log_schema_candidates(
+            db.as_ref(),
+            state,
+            namespace,
+            &batch.plugin_configs,
+            None,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(
+                crud::AfterValidateError::BadRequest(errors)
+                | crud::AfterValidateError::Conflict(errors),
+            ) => {
+                validation_errors.extend(errors);
+            }
+            Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
+                "Failed to load config for transaction-log schema candidate validation: {}",
+                error
+            )),
+            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
+                "Transaction-log schema candidate validation returned an unexpected response"
+                    .to_string(),
+            ),
         }
     }
 
@@ -4955,9 +5657,197 @@ async fn handle_batch_create(
         ));
     }
 
-    let (created, errors, admission_unavailable) =
-        persist_payload_resources(db.as_ref(), &batch, true, &BatchConfigWriteMode::Admission)
-            .await;
+    // Batch persistence spans independently committed resource groups (and
+    // bounded chunks within a group). Capture the pre-batch IDs so lease loss
+    // can remove only resources this request may have inserted.
+    let batch_rollback_snapshot = match db.load_namespace_snapshot(namespace).await {
+        Ok(config) => restore_payload_from_config(config),
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": format!(
+                        "Batch aborted: prior config could not be snapshotted for admission recovery: {error}"
+                    )
+                }),
+            ));
+        }
+    };
+
+    let persistence = match _namespace_config_admission_guard
+        .run_to_completion_while_held(persist_payload_resources(
+            db.as_ref(),
+            &batch,
+            true,
+            &BatchConfigWriteMode::Admission,
+        ))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Config admission unavailable: {error}")}),
+            ));
+        }
+    };
+    let (created, errors, admission_unavailable) = match persistence {
+        crud::NamespaceConfigAdmissionCompletion::Held(result) => result,
+        crud::NamespaceConfigAdmissionCompletion::Lost {
+            result: (created, errors, _),
+            error,
+        } => {
+            error!(
+                namespace = %namespace,
+                %error,
+                "Batch: namespace admission was lost during persistence; reacquiring for rollback"
+            );
+            let lost_generation = _namespace_config_admission_guard.generation();
+            drop(_namespace_config_admission_guard);
+            let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(rollback_error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was lost during batch persistence and could not be reacquired for rollback: {rollback_error}"
+                            ),
+                            "admission_error": error.to_string(),
+                            "persistence_errors": errors,
+                            "created": {
+                                "proxies": created.proxies,
+                                "consumers": created.consumers,
+                                "plugin_configs": created.plugin_configs,
+                                "upstreams": created.upstreams,
+                            },
+                            "rollback": "not_started",
+                        }),
+                    ));
+                }
+            };
+            let mut protected_plugin_config_ids = HashSet::new();
+            if !rollback_guard.immediately_succeeds_generation(lost_generation) {
+                let current = match db.load_namespace_snapshot(namespace).await {
+                    Ok(current) => current,
+                    Err(recovery_error) => {
+                        return Ok(json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({
+                                "error": format!(
+                                    "Config admission was lost during batch persistence and the intervening graph could not be loaded for recovery: {recovery_error}"
+                                ),
+                                "admission_error": error.to_string(),
+                                "persistence_errors": errors,
+                                "rollback": "not_started_after_intervening_write",
+                            }),
+                        ));
+                    }
+                };
+                let http_client = plugin_validation_http_client(state);
+                if crud::validate_transaction_log_schema_graph_on_blocking_pool(
+                    current.clone(),
+                    http_client.clone(),
+                )
+                .await
+                .is_ok()
+                {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": "Config admission was lost during batch persistence after another writer acquired the namespace lease; the merged graph is valid and was preserved",
+                            "admission_error": error.to_string(),
+                            "persistence_errors": errors,
+                            "created": {
+                                "proxies": created.proxies,
+                                "consumers": created.consumers,
+                                "plugin_configs": created.plugin_configs,
+                                "upstreams": created.upstreams,
+                            },
+                            "rollback": "not_needed_after_intervening_write",
+                        }),
+                    ));
+                }
+                protected_plugin_config_ids =
+                    batch_plugin_configs_with_intervening_proxy_dependencies(
+                        &current,
+                        &batch,
+                        &batch_rollback_snapshot,
+                    );
+                let candidate = batch_rollback_candidate_after_intervening_write(
+                    &current,
+                    &batch,
+                    &batch_rollback_snapshot,
+                    &protected_plugin_config_ids,
+                );
+                if let Err(validation_error) =
+                    crud::validate_transaction_log_schema_graph_on_blocking_pool(
+                        candidate,
+                        http_client,
+                    )
+                    .await
+                {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was lost during batch persistence; conditional rollback after an intervening writer would not restore a valid transaction-log schema graph: {}",
+                                transaction_log_graph_validation_error_message(validation_error)
+                            ),
+                            "admission_error": error.to_string(),
+                            "persistence_errors": errors,
+                            "rollback": "skipped_after_intervening_write",
+                        }),
+                    ));
+                }
+            }
+            let rollback = rollback_guard
+                .run_to_completion_while_held(rollback_failed_batch_create(
+                    db.as_ref(),
+                    namespace,
+                    &batch,
+                    &batch_rollback_snapshot,
+                    &protected_plugin_config_ids,
+                ))
+                .await;
+            let (rollback_status, rollback_errors, rollback_admission_error) = match rollback {
+                Ok(crud::NamespaceConfigAdmissionCompletion::Held(Ok(()))) => {
+                    ("completed", None, None)
+                }
+                Ok(crud::NamespaceConfigAdmissionCompletion::Held(Err(errors))) => {
+                    ("incomplete", Some(errors), None)
+                }
+                Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
+                    result: Ok(()),
+                    error,
+                }) => ("completed", None, Some(error.to_string())),
+                Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
+                    result: Err(errors),
+                    error,
+                }) => ("incomplete", Some(errors), Some(error.to_string())),
+                Err(error) => ("not_started", None, Some(error.to_string())),
+            };
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Config admission was lost during batch persistence",
+                    "admission_error": error.to_string(),
+                    "persistence_errors": errors,
+                    "created": {
+                        "proxies": created.proxies,
+                        "consumers": created.consumers,
+                        "plugin_configs": created.plugin_configs,
+                        "upstreams": created.upstreams,
+                    },
+                    "rollback": rollback_status,
+                    "rollback_errors": rollback_errors,
+                    "rollback_admission_error": rollback_admission_error,
+                }),
+            ));
+        }
+    };
 
     if admission_unavailable && !created.any() {
         return Ok(mtls_dns_admission_unavailable_response());
@@ -5134,6 +6024,43 @@ async fn handle_backup(
     Ok(resp)
 }
 
+async fn validate_restore_candidate_on_blocking_pool(
+    mut candidate: GatewayConfig,
+    cert_expiry_days: u64,
+    backend_allow_ips: crate::config::BackendEgressPolicy,
+) -> Result<(GatewayConfig, Vec<String>), anyhow::Error> {
+    let (candidate, result) = tokio::task::spawn_blocking(move || {
+        let result = ValidationPipeline::new(&mut candidate)
+            .validate_all_fields_with_ip_policy(
+                cert_expiry_days,
+                &backend_allow_ips,
+                ValidationAction::Collect,
+            )
+            .validate_unique_resource_ids(ValidationAction::Collect)
+            .validate_unique_consumer_identities(ValidationAction::Collect)
+            .validate_unique_consumer_credentials(ValidationAction::Collect)
+            .validate_hosts(ValidationAction::Collect)
+            .validate_regex_listen_paths(ValidationAction::Collect)
+            .validate_listen_path_encodings(ValidationAction::Collect)
+            .validate_unique_listen_paths(ValidationAction::Collect)
+            .validate_stream_proxies(ValidationAction::Collect)
+            .validate_plugin_configs(&backend_allow_ips, ValidationAction::Collect)
+            .validate_upstream_references(ValidationAction::Collect)
+            .validate_mesh_route_dispatch_references(ValidationAction::Collect)
+            .validate_plugin_references(ValidationAction::Collect)
+            .run();
+        (candidate, result)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("restore validation task failed: {error}"))?;
+
+    let errors = match result {
+        Ok(errors) => errors,
+        Err(error) => vec![error.to_string()],
+    };
+    Ok((candidate, errors))
+}
+
 /// Restore the gateway configuration from a backup payload.
 async fn handle_restore(
     state: &AdminState,
@@ -5159,7 +6086,25 @@ async fn handle_restore(
             }),
         ));
     }
-    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
+    let mut namespace_config_admission_guard = match crud::lock_namespace_config_admission(
+        db.clone(),
+        namespace,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": format!(
+                        "Restore aborted: config admission unavailable: {error}. Existing config was NOT deleted."
+                    ),
+                    "failure_class": "connectivity",
+                }),
+            ));
+        }
+    };
 
     // Phase 1: Parse all resources directly into typed structs before deleting
     // anything. This avoids an intermediate serde_json::Value copy (~50% less
@@ -5229,36 +6174,32 @@ async fn handle_restore(
         for u in &mut temp_config.upstreams {
             u.namespace = namespace.to_string();
         }
-        let mut validation_errors: Vec<String> = Vec::new();
-
         let cert_expiry_days = state
             .proxy_state
             .as_ref()
             .map(|ps| ps.env_config.tls_cert_expiry_warning_days)
             .unwrap_or(crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS);
-        match ValidationPipeline::new(&mut temp_config)
-            .validate_all_fields_with_ip_policy(
+        let (temp_config, mut validation_errors) =
+            match validate_restore_candidate_on_blocking_pool(
+                temp_config,
                 cert_expiry_days,
-                &state.backend_allow_ips,
-                ValidationAction::Collect,
+                state.backend_allow_ips.clone(),
             )
-            .validate_unique_resource_ids(ValidationAction::Collect)
-            .validate_unique_consumer_identities(ValidationAction::Collect)
-            .validate_unique_consumer_credentials(ValidationAction::Collect)
-            .validate_hosts(ValidationAction::Collect)
-            .validate_regex_listen_paths(ValidationAction::Collect)
-            .validate_listen_path_encodings(ValidationAction::Collect)
-            .validate_unique_listen_paths(ValidationAction::Collect)
-            .validate_stream_proxies(ValidationAction::Collect)
-            .validate_plugin_configs(&state.backend_allow_ips, ValidationAction::Collect)
-            .validate_upstream_references(ValidationAction::Collect)
-            .validate_mesh_route_dispatch_references(ValidationAction::Collect)
-            .validate_plugin_references(ValidationAction::Collect)
-            .run()
-        {
-            Ok(errs) => validation_errors.extend(errs),
-            Err(err) => validation_errors.push(err.to_string()),
-        }
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Restore aborted: payload validation could not complete: {}. Existing config was NOT deleted.",
+                                error
+                            )
+                        }),
+                    ));
+                }
+            };
         // Restore is an operator-provided admin write, so reject mesh-PROJECTED
         // upstream fields the same way direct POST/PUT does. This check is
         // intentionally NOT part of the shared `validate_all_fields` step (that
@@ -5431,10 +6372,151 @@ async fn handle_restore(
     // Phase 3: Delete all existing resources in the namespace (safe: payload is
     // validated and the prior state has been snapshotted from the primary above).
     let delete_operation = restore_guard.operation();
-    if let Err(e) = delete_operation
-        .run_mutation(db.delete_all_resources(namespace, &restore_mode))
+    let delete_completion = match namespace_config_admission_guard
+        .run_to_completion_while_held(
+            delete_operation.run_mutation(db.delete_all_resources(namespace, &restore_mode)),
+        )
         .await
     {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Config admission unavailable: {error}")}),
+            ));
+        }
+    };
+    let (delete_result, delete_admission_error) = match delete_completion {
+        crud::NamespaceConfigAdmissionCompletion::Held(result) => (result, None),
+        crud::NamespaceConfigAdmissionCompletion::Lost { result, error } => (result, Some(error)),
+    };
+    if delete_result.is_ok() {
+        // A cancelled restore after a successful clear is still an incomplete
+        // multi-phase mutation. Retain the durable fence until import or
+        // compensating rollback reaches a definitive result.
+        restore_guard.retain_uncertain();
+    }
+    if let Some(error) = delete_admission_error {
+        error!(
+            namespace = %namespace,
+            %error,
+            "Restore: namespace admission was lost during clear; reacquiring for recovery"
+        );
+        let lost_generation = namespace_config_admission_guard.generation();
+        if let Err(release_error) = restore_guard.release().await {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": format!(
+                        "Config admission was lost during restore clear and the restore guard could not be released before recovery: {release_error}"
+                    ),
+                    "restore_errors": [error.to_string()],
+                }),
+            ));
+        }
+        drop(namespace_config_admission_guard);
+        namespace_config_admission_guard = match crud::lock_namespace_config_admission(
+            db.clone(),
+            namespace,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(recovery_error) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Config admission was lost during restore clear and could not be reacquired for recovery: {recovery_error}"
+                        ),
+                        "restore_errors": [error.to_string()],
+                    }),
+                ));
+            }
+        };
+        let intervening_write =
+            !namespace_config_admission_guard.immediately_succeeds_generation(lost_generation);
+        restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(recovery_error) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Config admission was reacquired after restore clear, but the restore guard could not be reacquired: {recovery_error}"
+                        ),
+                        "restore_errors": [error.to_string()],
+                    }),
+                ));
+            }
+        };
+        if delete_result.is_ok() {
+            let restore_errors = vec![format!(
+                "namespace admission was lost during restore clear: {error}"
+            )];
+            let rollback = async {
+                if intervening_write {
+                    finish_failed_restore_after_intervening_clear(
+                        state,
+                        db.clone(),
+                        actor,
+                        namespace,
+                        restore_errors,
+                        &snapshot,
+                        &mut restore_guard,
+                    )
+                    .await
+                } else {
+                    finish_failed_restore(
+                        state,
+                        db.clone(),
+                        actor,
+                        namespace,
+                        restore_errors,
+                        &snapshot,
+                        &mut restore_guard,
+                    )
+                    .await
+                }
+            };
+            return Ok(
+                match namespace_config_admission_guard
+                    .run_to_completion_while_held(rollback)
+                    .await
+                {
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
+                        error!(
+                            namespace = %namespace,
+                            %error,
+                            "Restore: admission was lost again after clear recovery completed"
+                        );
+                        result
+                    }
+                    Err(rollback_error) => json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was unavailable before restore clear recovery: {rollback_error}"
+                            ),
+                            "restore_errors": [error.to_string()],
+                        }),
+                    ),
+                },
+            );
+        }
+        if intervening_write {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
+                    "restore_errors": [error.to_string()],
+                    "rollback": "not_needed_after_intervening_write",
+                }),
+            ));
+        }
+    }
+    if let Err(e) = delete_result {
         error!("Restore: failed to delete existing resources: {}", e);
         if e.mode().is_atomic() {
             if e.has_unknown_commit_result() {
@@ -5503,25 +6585,131 @@ async fn handle_restore(
         .await);
     }
 
-    // A cancelled restore after a successful clear is still an incomplete
-    // multi-phase mutation even though the clear itself settled. Keep the
-    // fence until import or compensating rollback reaches a definitive result.
-    restore_guard.retain_uncertain();
-
     info!("Restore: cleared existing config, beginning import");
 
     // Phase 3: Import resources in dependency order.
     // Each batch_create_* method internally chunks into 1,000-record
     // transactions to keep WAL/redo size bounded.
     let import_operation = restore_guard.operation();
-    let (created, errors, _) = import_operation
-        .run_mutation(persist_payload_resources(
+    let import_completion = match namespace_config_admission_guard
+        .run_to_completion_while_held(import_operation.run_mutation(persist_payload_resources(
             db.as_ref(),
             &payload,
             false,
             &restore_mode,
-        ))
-        .await;
+        )))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Config admission unavailable: {error}")}),
+            ));
+        }
+    };
+    let (created, errors, _) = match import_completion {
+        crud::NamespaceConfigAdmissionCompletion::Held(result) => result,
+        crud::NamespaceConfigAdmissionCompletion::Lost {
+            result: (_, mut errors, _),
+            error,
+        } => {
+            error!(
+                namespace = %namespace,
+                %error,
+                "Restore: namespace admission was lost during import; reacquiring for rollback"
+            );
+            errors.insert(
+                0,
+                format!("namespace admission was lost during restore import: {error}"),
+            );
+            let lost_generation = namespace_config_admission_guard.generation();
+            if let Err(release_error) = restore_guard.release().await {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Config admission was lost during restore import and the restore guard could not be released before rollback: {release_error}"
+                        ),
+                        "restore_errors": errors,
+                    }),
+                ));
+            }
+            drop(namespace_config_admission_guard);
+            let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(rollback_error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was lost during restore and could not be reacquired for rollback: {rollback_error}"
+                            ),
+                            "restore_errors": errors,
+                        }),
+                    ));
+                }
+            };
+            if !rollback_guard.immediately_succeeds_generation(lost_generation) {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": "Config admission was lost during restore import; rollback was skipped because another writer acquired the namespace lease",
+                        "restore_errors": errors,
+                        "rollback": "skipped_after_intervening_write",
+                    }),
+                ));
+            }
+            restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(rollback_error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was reacquired after restore import, but the restore guard could not be reacquired: {rollback_error}"
+                            ),
+                            "restore_errors": errors,
+                        }),
+                    ));
+                }
+            };
+            let rollback = finish_failed_restore(
+                state,
+                db.clone(),
+                actor,
+                namespace,
+                errors,
+                &snapshot,
+                &mut restore_guard,
+            );
+            return Ok(
+                match rollback_guard.run_to_completion_while_held(rollback).await {
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
+                        error!(
+                            namespace = %namespace,
+                            %error,
+                            "Restore: admission was lost again after import rollback completed"
+                        );
+                        result
+                    }
+                    Err(rollback_error) => json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was unavailable before restore import rollback: {rollback_error}"
+                            ),
+                        }),
+                    ),
+                },
+            );
+        }
+    };
 
     info!(
         "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
@@ -5543,7 +6731,7 @@ async fn handle_restore(
             namespace,
             errors.join("; ")
         );
-        return Ok(finish_failed_restore(
+        let rollback = finish_failed_restore(
             state,
             db.clone(),
             actor,
@@ -5551,8 +6739,27 @@ async fn handle_restore(
             errors,
             &snapshot,
             &mut restore_guard,
-        )
-        .await);
+        );
+        return Ok(
+            match namespace_config_admission_guard
+                .run_to_completion_while_held(rollback)
+                .await
+            {
+                Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
+                Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
+                    error!(
+                        namespace = %namespace,
+                        %error,
+                        "Restore: admission was lost after failed-import rollback completed"
+                    );
+                    result
+                }
+                Err(error) => json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Config admission unavailable during restore rollback: {error}")}),
+                ),
+            },
+        );
     }
 
     if let Err(error) = restore_guard.release().await {

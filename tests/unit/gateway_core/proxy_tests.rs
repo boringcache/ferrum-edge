@@ -9,6 +9,67 @@ use ferrum_edge::proxy::{
 use ferrum_edge::router_cache::RouterCache;
 use std::collections::HashMap;
 
+#[test]
+fn terminal_final_body_dispatch_follows_path_policy_and_precedes_backend_breaker() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let request_scoped_gate = src
+        .find("let has_terminal_body_dispatch = capabilities")
+        .expect("terminal dispatch must retain a request-scoped applicability gate");
+    let terminal_dispatch = src
+        .find("if final_body_before_backend_dispatch {")
+        .expect("terminal final-body dispatch gate must remain present");
+    let selection = src
+        .find("let selection = backend_dispatch::select_upstream_target(")
+        .expect("selected-target lookup must remain present");
+    let path_policy = src[selection..]
+        .find("if backend_path_is_policy_bound {")
+        .map(|offset| selection + offset)
+        .expect("selected backend-path policy must remain present");
+    let routing_deferred = src[path_policy..terminal_dispatch]
+        .find("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .map(|offset| path_policy + offset)
+        .expect("routing-header deferred pass must remain present");
+    let remaining_deferred = src[routing_deferred..terminal_dispatch]
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .map(|offset| routing_deferred + offset)
+        .expect("remaining deferred pass must remain present");
+    let breaker = src[terminal_dispatch..]
+        .find("// Circuit breaker check")
+        .map(|offset| terminal_dispatch + offset)
+        .expect("backend circuit-breaker gate must remain present");
+    let provider_hook = src[terminal_dispatch..breaker]
+        .find("run_final_request_body_hooks(")
+        .expect("terminal final-body hook must run before the backend breaker");
+    let synthetic_pipeline = src[terminal_dispatch..breaker]
+        .find("finalize_reject_response_with_after_proxy_hooks(")
+        .expect("terminal response must use the synthetic response pipeline");
+    let backend_transport = src
+        .find("async fn proxy_to_backend(")
+        .expect("backend transport function must remain present");
+
+    let applicability = &src[request_scoped_gate..terminal_dispatch];
+    assert!(applicability.contains("if let Some(transformed_headers)"));
+    assert!(applicability.contains("std::mem::swap(&mut ctx.headers, transformed_headers)"));
+    assert!(applicability.contains("final_request_body_requirements("));
+    let helper = src
+        .split("pub(crate) fn final_request_body_requirements(")
+        .nth(1)
+        .expect("shared final-body applicability helper must remain present")
+        .split("pub(crate) fn request_body_requirements_before_authenticate(")
+        .next()
+        .expect("shared final-body applicability helper must remain bounded");
+    assert!(helper.contains("plugin.should_buffer_request_body(ctx)"));
+    assert!(helper.contains("plugin.requires_final_request_body_before_backend_dispatch()"));
+    assert!(provider_hook < synthetic_pipeline);
+    assert!(request_scoped_gate < terminal_dispatch);
+    assert!(selection < path_policy);
+    assert!(path_policy < routing_deferred);
+    assert!(routing_deferred < remaining_deferred);
+    assert!(remaining_deferred < terminal_dispatch);
+    assert!(terminal_dispatch < breaker);
+    assert!(breaker < backend_transport);
+}
+
 fn test_proxy() -> Proxy {
     Proxy {
         id: "test".into(),
@@ -151,6 +212,33 @@ fn test_build_backend_url_target_path_overrides_backend_path() {
         Some("/v2"),
     );
     assert_eq!(url, "http://target.example.com:9090/v2/users");
+}
+
+#[test]
+fn request_phase_deadline_rejects_preserve_grpc_web_framing() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let phase = source
+        .find("// Execute on_request_received hooks")
+        .expect("request hook phase must remain present");
+    let phase = &source[phase..];
+    let end = phase
+        .find("// Materialize query params before authentication")
+        .expect("request hook phase must remain bounded");
+    let phase = &phase[..end];
+    assert!(phase.contains("build_grpc_web_reject_response("));
+    assert!(phase.contains("grpc_web_response_content_type,"));
+
+    let helper = source
+        .find("async fn build_grpc_web_reject_response(")
+        .expect("request rejection writer must remain flavor-aware");
+    let helper = &source[helper..];
+    let helper_end = helper
+        .find("async fn run_backend_path_plugins_or_build_reject(")
+        .expect("request rejection helper must remain bounded");
+    let helper = &helper[..helper_end];
+    assert!(helper.contains("error_response_for_content_type("));
+    assert!(helper.contains("finalize_grpc_web_error_response_headers("));
+    assert!(helper.contains("build_grpc_web_error_response_from_parts("));
 }
 
 #[test]
@@ -405,26 +493,36 @@ fn test_final_request_body_rejects_are_gateway_local_terminal_outcomes() {
 #[test]
 fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     let source = include_str!("../../../src/proxy/mod.rs");
-    let path_policy = source
-        .rfind("if let Some(response) = run_backend_path_plugins_or_build_reject(")
+    let handler_start = source
+        .find("async fn handle_proxy_request_inner(")
+        .expect("H1/H2 request handler must remain present");
+    let handler = &source[handler_start..];
+    let path_policy = handler
+        .find("if let Some(response) = run_backend_path_plugins_or_build_reject(")
         .expect("backend-path policy hook must remain present");
-    let deferred = source
+    let deferred = handler
         .find("// Hooks that can dispatch external work or synthesize a terminal response")
         .expect("deferred before_proxy pass must remain present");
     assert!(path_policy < deferred);
     assert!(source.contains("BackendPathBeforeProxyPass::RoutingHeaderDeferred"));
-    assert!(source.contains("BackendPathPolicyPhase::Preview"));
-    assert!(source.contains("BackendPathPolicyPhase::Enforce"));
     assert!(
         !source.contains("backend_dispatch::upstream_selection_hash_key("),
-        "an external deferred hook must not reselect an unpreviewed target"
+        "an external deferred hook must not reselect a different target"
     );
     assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
+    let routing_hook = handler
+        .find("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .expect("routing-header hook must remain present");
+    assert_eq!(
+        handler[path_policy..routing_hook]
+            .matches("run_backend_path_plugins_or_build_reject(")
+            .count(),
+        1,
+        "H1/H2 must enforce policy exactly once on the pinned path"
+    );
     assert!(
-        !source.contains(
-            "if !matches!(deferred_result, PluginResult::Continue) {\n            break;"
-        ),
-        "a deferred routing-hook rejection must still reach final method enforcement"
+        path_policy < routing_hook,
+        "stateful path policy must reject before deferred external work"
     );
 
     let mirror = include_str!("../../../src/plugins/request_mirror.rs");
@@ -555,7 +653,7 @@ fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
     );
     assert!(
         !after_routing_hook[..remaining_hook].contains("select_upstream_target("),
-        "deferred headers must not steer the request to an unpreviewed target"
+        "deferred headers must not steer the request to a different target"
     );
 
     let remaining_hook = routing_hook + remaining_hook;
@@ -630,8 +728,10 @@ fn test_no_match() {
 use async_trait::async_trait;
 use ferrum_edge::_test_support::{
     apply_request_body_plugins, can_dispatch_direct_http2_pool, can_use_direct_http2_pool,
-    extract_grpc_reject_message, insert_grpc_error_metadata, map_http_reject_status_to_grpc_status,
-    normalize_reject_response, request_may_have_body,
+    extract_grpc_reject_message, finalize_plugin_rejection_for_test,
+    finalized_upload_deadline_response_for_test, insert_grpc_error_metadata,
+    map_http_reject_status_to_grpc_status, normalize_reject_response, request_may_have_body,
+    set_grpc_deadline_budget_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
@@ -805,6 +905,255 @@ impl Plugin for IdentityThenRejectAuth {
             status_code: 403,
             body: r#"{"error":"account disabled"}"#.to_string(),
             headers: HashMap::new(),
+        }
+    }
+}
+
+struct ServerRejectingAuth;
+
+#[async_trait]
+impl Plugin for ServerRejectingAuth {
+    fn name(&self) -> &str {
+        "server_rejecting_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 503,
+            body: r#"{"error":"Identity provider unavailable"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+struct PendingAuth;
+
+#[async_trait]
+impl Plugin for PendingAuth {
+    fn name(&self) -> &str {
+        "pending_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        std::future::pending().await
+    }
+}
+
+struct DeadlineRejectDecorator;
+
+struct PendingDeadlineRejectCleanup {
+    started: Arc<std::sync::atomic::AtomicBool>,
+    release: Arc<tokio::sync::Notify>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Plugin for PendingDeadlineRejectCleanup {
+    fn name(&self) -> &str {
+        "pending_deadline_reject_cleanup"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release.notified().await;
+        self.completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        PluginResult::Continue
+    }
+}
+
+struct DeadlineRejectCleanupFollower {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    completed: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Plugin for DeadlineRejectCleanupFollower {
+    fn name(&self) -> &str {
+        "deadline_reject_cleanup_follower"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.completed.notify_one();
+        PluginResult::Continue
+    }
+}
+
+#[async_trait]
+impl Plugin for DeadlineRejectDecorator {
+    fn name(&self) -> &str {
+        "deadline_reject_decorator"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        response_headers.insert("x-deadline-decorated".to_string(), "true".to_string());
+        PluginResult::Continue
+    }
+}
+
+struct DeadlineRejectReplacer;
+
+struct DeadlineCommittedObserver {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    saw_decorator: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PendingDeadlineCommittedObserver {
+    started: Arc<std::sync::atomic::AtomicBool>,
+    release: Arc<tokio::sync::Notify>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Plugin for PendingDeadlineCommittedObserver {
+    fn name(&self) -> &str {
+        "pending_deadline_committed_observer"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release.notified().await;
+        self.completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct DeadlineCommittedFollower {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    completed: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Plugin for DeadlineCommittedFollower {
+    fn name(&self) -> &str {
+        "deadline_committed_follower"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.completed.notify_one();
+    }
+}
+
+#[async_trait]
+impl Plugin for DeadlineCommittedObserver {
+    fn name(&self) -> &str {
+        "deadline_committed_observer"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if response_status == 200
+            && response_headers
+                .get("x-deadline-decorated")
+                .is_some_and(|value| value == "true")
+        {
+            self.saw_decorator
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for DeadlineRejectReplacer {
+    fn name(&self) -> &str {
+        "deadline_reject_replacer"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    fn may_replace_rejection_response(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 503,
+            body: "must not replace terminal deadline".to_string(),
+            headers: HashMap::from([("x-replaced".to_string(), "true".to_string())]),
         }
     }
 }
@@ -1223,6 +1572,559 @@ async fn test_multi_auth_preserves_specific_reject_when_surrounded_by_missing() 
 }
 
 #[tokio::test]
+async fn test_multi_auth_deadline_expiry_overrides_earlier_server_reject() {
+    let deadline_plugin =
+        ferrum_edge::plugins::create_plugin("grpc_deadline", &json!({"default_deadline_ms": 10}))
+            .unwrap()
+            .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(matches!(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&[deadline_plugin], &mut ctx,),
+        PluginResult::Continue
+    ));
+
+    let auth_plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(ServerRejectingAuth), Arc::new(PendingAuth)];
+    let rejection = run_authentication_phase(
+        AuthMode::Multi,
+        &auth_plugins,
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("expired authentication phase must reject");
+
+    assert_eq!(rejection.0, 200);
+    assert!(rejection.1.is_empty());
+    assert_eq!(
+        rejection.2.get("grpc-status").map(String::as_str),
+        Some("4")
+    );
+    assert_eq!(
+        rejection.2.get("grpc-message").map(String::as_str),
+        Some("Deadline exceeded at gateway")
+    );
+}
+
+#[tokio::test]
+async fn terminal_deadline_reject_runs_decorators_but_not_replacers() {
+    use ferrum_edge::_test_support::mark_gateway_deadline_response_selected_for_test;
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(DeadlineRejectDecorator),
+        Arc::new(DeadlineRejectReplacer),
+    ];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    mark_gateway_deadline_response_selected_for_test(&mut ctx);
+
+    let (status, body, headers) = finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        200,
+        Vec::new(),
+        HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("grpc-status".to_string(), "4".to_string()),
+            (
+                "grpc-message".to_string(),
+                "Deadline exceeded at gateway".to_string(),
+            ),
+        ]),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Deadline exceeded at gateway")
+    );
+    assert_eq!(
+        headers.get("x-deadline-decorated").map(String::as_str),
+        Some("true"),
+        "header-only rejection decorators must complete after deadline expiry"
+    );
+    assert!(
+        !headers.contains_key("x-replaced"),
+        "an expired fail-closed replacer must not override the terminal deadline"
+    );
+}
+
+#[tokio::test]
+async fn rejection_hook_pending_at_deadline_does_not_delay_status_four() {
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let follower_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let follower_completed = Arc::new(tokio::sync::Notify::new());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(PendingDeadlineRejectCleanup {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            completed: Arc::clone(&completed),
+        }),
+        Arc::new(DeadlineRejectCleanupFollower {
+            calls: Arc::clone(&follower_calls),
+            completed: Arc::clone(&follower_completed),
+        }),
+    ];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(20));
+
+    let (status, body, headers) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        finalize_plugin_rejection_for_test(
+            &plugins,
+            &mut ctx,
+            503,
+            b"backend unavailable".to_vec(),
+            HashMap::new(),
+        ),
+    )
+    .await
+    .expect("a pending rejection cleanup hook must not retain the client response");
+
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        follower_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "ordered cleanup must wait for the pending hook on detached state"
+    );
+
+    release.notify_waiters();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        follower_completed.notified(),
+    )
+    .await
+    .expect("detached rejection cleanup must continue in plugin order");
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(follower_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn deadline_text_without_typed_provenance_does_not_claim_gateway_ownership() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(DeadlineRejectReplacer)];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+
+    let (status, body, headers) = finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        200,
+        Vec::new(),
+        HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("grpc-status".to_string(), "4".to_string()),
+            (
+                "grpc-message".to_string(),
+                "Deadline exceeded at gateway".to_string(),
+            ),
+        ]),
+    )
+    .await;
+
+    assert_eq!(status, 503);
+    assert_eq!(body.as_slice(), b"must not replace terminal deadline");
+    assert_eq!(headers.get("x-replaced").map(String::as_str), Some("true"));
+}
+
+#[tokio::test]
+async fn grpc_web_upload_deadline_finalization_preserves_decorators_and_committed_cleanup() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let saw_decorator = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(DeadlineRejectDecorator),
+        Arc::new(DeadlineCommittedObserver {
+            calls: Arc::clone(&calls),
+            saw_decorator: Arc::clone(&saw_decorator),
+        }),
+    ];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+
+    let response = finalized_upload_deadline_response_for_test(
+        &plugins,
+        &mut ctx,
+        Some("application/grpc-web+proto"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-deadline-decorated")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "gRPC-Web translation must preserve finalized rejection decorators"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        saw_decorator.load(std::sync::atomic::Ordering::SeqCst),
+        "the committed observer must see the translated decorated response exactly once"
+    );
+}
+
+#[tokio::test]
+async fn pending_committed_observer_does_not_retain_terminal_deadline_response() {
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let follower_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let follower_completed = Arc::new(tokio::sync::Notify::new());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(PendingDeadlineCommittedObserver {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            completed: Arc::clone(&completed),
+        }),
+        Arc::new(DeadlineCommittedFollower {
+            calls: Arc::clone(&follower_calls),
+            completed: Arc::clone(&follower_completed),
+        }),
+    ];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        finalized_upload_deadline_response_for_test(&plugins, &mut ctx, None),
+    )
+    .await
+    .expect("a pending committed observer must not retain the terminal response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("4")
+    );
+    assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(follower_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    release.notify_waiters();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        follower_completed.notified(),
+    )
+    .await
+    .expect("detached committed observers must continue in plugin order");
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(follower_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let finalization = source
+        .split("async fn build_finalized_upload_deadline_response(")
+        .nth(1)
+        .expect("shared upload-deadline response finalization")
+        .split("async fn finalize_upload_deadline_rejection(")
+        .next()
+        .expect("bounded upload-deadline response finalization");
+    assert!(
+        finalization.contains("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
+    );
+    assert!(finalization.contains("build_grpc_web_reject_response("));
+    assert_eq!(
+        finalization
+            .matches("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        finalization
+            .matches("build_grpc_web_reject_response(")
+            .count(),
+        1
+    );
+
+    let helper = source
+        .split("async fn finalize_upload_deadline_rejection(")
+        .nth(1)
+        .expect("shared upload-deadline rejection finalizer")
+        .split("fn release_circuit_breaker_probe_on_admission_reject")
+        .next()
+        .expect("bounded upload-deadline finalizer");
+    assert!(helper.contains("build_finalized_upload_deadline_response("));
+    assert!(helper.contains("log_rejected_request_with_path("));
+    assert!(helper.contains("record_request(state,"));
+    assert_eq!(
+        helper
+            .matches("build_finalized_upload_deadline_response(")
+            .count(),
+        1
+    );
+    assert_eq!(helper.matches("log_rejected_request_with_path(").count(), 1);
+    assert_eq!(helper.matches("record_request(state,").count(), 1);
+    let finalize = helper
+        .find("build_finalized_upload_deadline_response(")
+        .expect("upload deadline finalization");
+    let log = helper
+        .find("log_rejected_request_with_path(")
+        .expect("upload deadline log");
+    let metric = helper
+        .find("record_request(state,")
+        .expect("upload deadline metric");
+    assert!(finalize < log && log < metric);
+
+    for phase in [
+        "grpc_deadline_upload_before_authenticate",
+        "grpc_deadline_upload_before_authorize",
+        "grpc_deadline_upload_before_before_proxy",
+        "grpc_deadline_terminal_request_body",
+        "grpc_deadline_upload_before_dispatch",
+        "grpc_deadline_buffered_grpc_upload",
+    ] {
+        assert!(
+            source.contains(phase),
+            "missing finalized upload deadline phase {phase}"
+        );
+    }
+    assert_eq!(
+        source
+            .matches("finalize_upload_deadline_rejection(")
+            .count(),
+        8,
+        "the helper definition plus all seven H1/H2 buffered upload exits must stay routed through cleanup"
+    );
+
+    let grpc_collect_deadline_branches: Vec<&str> = source
+        .split("Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {")
+        .skip(1)
+        .map(|branch| {
+            branch
+                .split("Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy")
+                .next()
+                .expect("bounded buffered gRPC deadline branch")
+        })
+        .collect();
+    assert_eq!(grpc_collect_deadline_branches.len(), 2);
+    for branch in grpc_collect_deadline_branches {
+        assert!(branch.contains("grpc_probe_guard.disarm()"));
+        assert!(branch.contains("release_circuit_breaker_probe_on_admission_reject("));
+        assert!(branch.contains("preacquired_backend_admission.take_if_acquired()"));
+    }
+}
+
+#[test]
+fn streaming_deadline_wraps_client_visible_body_after_inspection() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    for (arm, next_arm) in [
+        (
+            "ResponseBody::StreamingH2(resp) => {",
+            "ResponseBody::StreamingH3(h3_resp) => {",
+        ),
+        (
+            "ResponseBody::StreamingH3(h3_resp) => {",
+            "ResponseBody::Buffered(data) => {",
+        ),
+    ] {
+        let body = source
+            .split(arm)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing {arm}"))
+            .split(next_arm)
+            .next()
+            .expect("bounded streaming response arm");
+        let inspection = body
+            .find("run_proxy_body_response_inspection(")
+            .unwrap_or_else(|| panic!("missing inspector construction in {arm}"));
+        let deadline = body
+            .find("with_client_grpc_deadline(")
+            .unwrap_or_else(|| panic!("missing client-visible deadline wrapper in {arm}"));
+        assert!(
+            inspection < deadline,
+            "{arm} must base the deadline DATA decision on inspector output"
+        );
+    }
+}
+
+#[test]
+fn generic_retry_backoff_uses_request_aware_grpc_deadline_response() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let retry_loop = source
+        .find("while retry::should_retry(retry_config, &method, &result, attempt) {")
+        .expect("generic HTTP retry loop must remain present");
+    let retry_loop = &source[retry_loop..];
+    let backoff_end = retry_loop
+        .find("attempt += 1;")
+        .expect("generic HTTP retry backoff must remain present");
+    let backoff = &retry_loop[..backoff_end];
+
+    assert!(
+        backoff.contains("client_grpc_deadline_exceeded_response_for_request("),
+        "gRPC-Web retry-backoff expiry must use the request-aware deadline shaper"
+    );
+    assert!(
+        !backoff
+            .contains("client_grpc_deadline_exceeded_response(result.backend_resolved_ip.clone())"),
+        "the generic retry backoff must not regress to native-only gRPC framing"
+    );
+    assert!(backoff.contains("&ctx,"));
+    assert!(backoff.contains("owned_proxy_headers_ref.unwrap_or(&ctx.headers),"));
+}
+
+#[test]
+fn direct_h2_response_header_wait_uses_earliest_client_or_operator_deadline() {
+    use ferrum_edge::_test_support::response_header_deadline_for_test;
+
+    assert_eq!(
+        response_header_deadline_for_test(Some(500), 50),
+        Some((false, 50))
+    );
+    assert_eq!(
+        response_header_deadline_for_test(Some(50), 500),
+        Some((true, 50))
+    );
+    assert_eq!(
+        response_header_deadline_for_test(Some(50), 0),
+        Some((true, 50))
+    );
+    assert_eq!(
+        response_header_deadline_for_test(None, 50),
+        Some((false, 50))
+    );
+    assert_eq!(response_header_deadline_for_test(None, 0), None);
+}
+
+#[test]
+fn streaming_grpc_deadline_removes_backend_content_length_before_headers_commit() {
+    use ferrum_edge::_test_support::strip_content_length_for_streaming_grpc_deadline_for_test;
+
+    let mut deadline_headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("content-length".to_string(), "128".to_string()),
+    ]);
+    strip_content_length_for_streaming_grpc_deadline_for_test(&mut deadline_headers, true);
+    assert!(!deadline_headers.contains_key("content-length"));
+
+    let mut unbounded_headers = HashMap::from([("content-length".to_string(), "128".to_string())]);
+    strip_content_length_for_streaming_grpc_deadline_for_test(&mut unbounded_headers, false);
+    assert_eq!(
+        unbounded_headers.get("content-length").map(String::as_str),
+        Some("128")
+    );
+}
+
+#[test]
+fn mesh_mtls_arms_operator_read_window_after_sender_readiness() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let function = source
+        .split("async fn proxy_to_backend_mesh_mtls")
+        .nth(1)
+        .expect("mesh mTLS dispatch function")
+        .split("async fn proxy_to_backend_http2")
+        .next()
+        .expect("mesh mTLS dispatch body");
+    let readiness = function
+        .find("sender.ready()")
+        .expect("sender readiness boundary");
+    let read_window = function
+        .find("let backend_read_deadline")
+        .expect("operator read window");
+
+    assert!(
+        readiness < read_window,
+        "operator response-read timeout must not include pool acquisition/readiness"
+    );
+}
+
+#[test]
+fn grpc_deadline_phase_zero_precedes_request_security_hooks_on_h1_h2_and_h3() {
+    let h1_h2 = include_str!("../../../src/proxy/mod.rs")
+        .split("async fn handle_proxy_request_inner")
+        .nth(1)
+        .expect("H1/H2 request handler");
+    let h3 = include_str!("../../../src/http3/server.rs")
+        .split("let prepared = crate::plugins::grpc_deadline::prepare_request_deadline")
+        .nth(1)
+        .expect("H3 deadline preflight tail");
+
+    let h1_h2_deadline = h1_h2
+        .find("prepare_request_deadline")
+        .expect("H1/H2 deadline preflight");
+    let h1_h2_request_hooks = h1_h2
+        .find("// Execute on_request_received hooks")
+        .expect("H1/H2 request hook phase");
+    let h1_h2_auth = h1_h2
+        .find("run_authentication_phase")
+        .expect("H1/H2 authentication phase");
+    assert!(h1_h2_deadline < h1_h2_request_hooks);
+    assert!(h1_h2_deadline < h1_h2_auth);
+
+    let h3_request_hooks = h3
+        .find("// Execute on_request_received hooks")
+        .expect("H3 request hook phase");
+    let h3_auth = h3
+        .find("run_authentication_phase")
+        .expect("H3 authentication phase");
+    assert!(h3_request_hooks > 0);
+    assert!(h3_auth > 0);
+}
+
+#[test]
+fn grpc_deadline_hot_paths_use_cached_preflight_lists_without_deadline_only_context_clones() {
+    for (surface, source) in [
+        ("H1/H2", include_str!("../../../src/proxy/mod.rs")),
+        ("H3", include_str!("../../../src/http3/server.rs")),
+    ] {
+        let call = source
+            .split("prepare_request_deadline(")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{surface}: deadline preflight"));
+        assert!(
+            call.starts_with("\n            plugin_cache_view.grpc_deadline_plugins(),"),
+            "{surface}: preflight must use the PluginCache capability list"
+        );
+        assert!(
+            !source.contains("needs_final_request_body_context ||"),
+            "{surface}: a deadline alone must not clone final-body RequestContext"
+        );
+        assert!(
+            source.contains("plugin_cache_view.response_committed_plugins(),"),
+            "{surface}: committed hooks must use the PluginCache observer list"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministically() {
     let staged: Arc<dyn Plugin> = Arc::new(StagedCookieRejectingAuth);
     let selected: Arc<dyn Plugin> = Arc::new(MixedCaseCookieRejectingAuth);
@@ -1633,4 +2535,30 @@ async fn test_single_auth_rejects_when_mandatory_plugin_rejects_despite_mesh_per
         String::from_utf8_lossy(&body),
         r#"{"error":"API key required"}"#
     );
+}
+
+#[test]
+fn deadline_bound_grpc_web_pass_through_never_selects_native_backend_h3() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let dispatch = source
+        .split("let deadline_bound_grpc_web_pass_through =")
+        .nth(1)
+        .expect("deadline-bound untranslated gRPC-Web classifier")
+        .split("let bytes_sent_observed =")
+        .next()
+        .expect("initial backend H3 selection block");
+    assert!(dispatch.contains("grpc_web_request && !grpc_request_is_web_translated"));
+    assert!(dispatch.contains("&& ctx.grpc_deadline_at().is_some();"));
+    assert!(
+        dispatch.contains("let mut current_dispatch_h3 = !deadline_bound_grpc_web_pass_through")
+    );
+
+    let retry_rotation = source
+        .split("if target_changed {")
+        .nth(1)
+        .expect("retry target capability refresh")
+        .split("// Re-evaluate the live PeerAuthentication snapshot")
+        .next()
+        .expect("bounded retry target capability refresh");
+    assert!(retry_rotation.contains("current_dispatch_h3 = !deadline_bound_grpc_web_pass_through"));
 }

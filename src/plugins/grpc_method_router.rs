@@ -18,8 +18,7 @@ use super::utils::rate_limit::{
     RateLimitWindowSpec,
 };
 use super::{
-    BackendPathPolicyPhase, GRPC_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult,
-    ProxyProtocol, RequestContext,
+    GRPC_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
 };
 
 /// Maximum rate-limit state entries before triggering stale eviction.
@@ -361,7 +360,6 @@ impl Plugin for GrpcMethodRouter {
         &self,
         ctx: &mut RequestContext,
         backend_path: &str,
-        phase: BackendPathPolicyPhase,
     ) -> PluginResult {
         let metadata = grpc_method_metadata(backend_path);
         refresh_grpc_method_metadata(ctx, metadata);
@@ -410,14 +408,6 @@ impl Plugin for GrpcMethodRouter {
                 body: grpc_json_error_body(format!("gRPC method '{full_method}' is not permitted")),
                 headers: grpc_content_type_header(),
             };
-        }
-
-        // A deferred routing-header hook performs external work and can return
-        // values that would normally change target selection. Preview access
-        // rules first; the proxy pins that target across the hook, then charges
-        // stateful policy once so one request cannot consume two method buckets.
-        if matches!(phase, BackendPathPolicyPhase::Preview) {
-            return PluginResult::Continue;
         }
 
         // Check per-method rate limits on the pinned selected method.

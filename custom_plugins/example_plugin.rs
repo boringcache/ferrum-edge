@@ -159,8 +159,9 @@ impl Plugin for ExamplePlugin {
         PluginResult::Continue
     }
 
-    /// Called for transaction logging. Buffered handlers await log hooks
-    /// sequentially before returning; native H3 also awaits after body
+    /// Called for transaction logging. Buffered handlers normally await log
+    /// hooks sequentially before returning; deadline-bearing H1/H2 handlers
+    /// detach that cleanup under a finite bound. Native H3 awaits after body
     /// completion. Hyper-owned streamed bodies spawn logging after terminal
     /// body completion. Hand potentially slow I/O to a bounded, plugin-owned
     /// worker instead of performing it directly here.

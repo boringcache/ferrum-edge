@@ -2,8 +2,8 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → backend-path policy preview → deferred routing-header hooks →
-//! final backend-path enforcement → remaining deferred `before_proxy` hooks →
+//! `before_proxy` → backend-path policy enforcement →
+//! deferred routing-header hooks → remaining deferred `before_proxy` hooks →
 //! `transform_request_body` →
 //! `on_final_request_body` → `backend_admission` → `after_proxy` →
 //! `normalize_response_body` → `on_response_body` →
@@ -125,6 +125,22 @@ use crate::config::types::{
 };
 use crate::consumer_index::ConsumerIndex;
 use crate::modes::mesh::MeshTrafficDirection;
+use crate::proxy::grpc_proxy::{
+    GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+};
+
+/// Internal provenance marker set after a request-phase plugin has issued an
+/// external operation whose result must not be replayed from an ambiguous
+/// synthetic-response pipeline.
+pub(crate) const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str =
+    "ferrum:external_operation_completed";
+
+/// Internal marker set when a request is committed to a synthetic rejection
+/// before any external operation or backend dispatch could have started.
+/// Ownership plugins consume it from `on_response_committed` to release this
+/// request's exact local/distributed in-flight token safely.
+pub(crate) const RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY: &str =
+    "ferrum:release_dedup_inflight_on_commit";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JwtAuthAttributeValue {
@@ -148,19 +164,6 @@ pub enum ProxyProtocol {
     Tcp,
     /// Raw UDP datagram proxy (includes DTLS termination/origination)
     Udp,
-}
-
-/// Whether a backend-effective path policy hook is validating a provisional
-/// selection or enforcing the final selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendPathPolicyPhase {
-    /// Validate access rules before a deferred routing hook performs external
-    /// work. Stateful policy such as rate limiting must not be charged here.
-    Preview,
-    /// Enforce the settled backend-effective path immediately before the
-    /// remaining deferred hooks, a deferred-hook rejection, or backend
-    /// dispatch. Stateful policy is committed exactly once in this phase.
-    Enforce,
 }
 
 /// All protocol variants, for plugins that support every protocol.
@@ -780,8 +783,45 @@ pub struct RequestContext {
     /// compiled-in literal — zero allocation on the hot path.
     pub auth_method: Option<&'static str>,
     pub timestamp_received: DateTime<Utc>,
+    /// Whether the request's gRPC deadline state has been initialized from the
+    /// inbound `grpc-timeout` value. Initialization happens once, immediately
+    /// after routing and before any request-plugin or body-buffering await.
+    pub(crate) grpc_deadline_initialized: bool,
+    /// Whether the inbound request supplied a valid positive `grpc-timeout`.
+    /// Keep this source fact separate from the effective budget so an earlier
+    /// default policy cannot satisfy a later `reject_no_deadline` policy.
+    pub(crate) grpc_deadline_had_valid_client_timeout: bool,
+    /// Monotonic receipt instant captured with the request context. Effective
+    /// budgets are added to this exact anchor, independent of wall-clock jumps.
+    pub(crate) grpc_deadline_received_at: tokio::time::Instant,
+    /// Whether the gateway's full ordered deadline-policy preflight completed.
+    /// Direct plugin callers that skip the preflight still apply each instance
+    /// from `before_proxy` for backward-compatible composition.
+    pub(crate) grpc_deadline_preflight_complete: bool,
+    /// Effective receipt-anchored gRPC budget after every `grpc_deadline`
+    /// policy has applied its default/cap decision. Kept separate from the
+    /// relative header forwarded upstream so retries never re-arm the budget.
+    pub(crate) grpc_deadline_budget_ms: Option<u64>,
+    /// Single monotonic absolute deadline shared by request phases, backend
+    /// attempts, retry backoff, and streaming response bodies.
+    pub(crate) grpc_deadline_at: Option<tokio::time::Instant>,
+    /// Once any `grpc_deadline` instance requests gateway-time subtraction,
+    /// every later instance forwards the same remaining budget instead of
+    /// subtracting receipt-to-hook elapsed time again.
+    pub(crate) grpc_deadline_header_is_remaining: bool,
+    /// Whether the gateway selected the canonical client-visible deadline
+    /// response for this request. Keep this typed provenance out of metadata:
+    /// backend or plugin-controlled `grpc-status`/`grpc-message` text must not
+    /// unlock the write-biased terminal H3 completion path.
+    gateway_deadline_response_selected: bool,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Per-request ownership state for each live request-deduplication plugin
+    /// instance. Multiple instances may coexist on one proxy; keeping their
+    /// correlation state in a private instance-keyed map prevents one hook
+    /// from consuming another instance's key or local/Redis owner token.
+    pub(crate) request_deduplication_state:
+        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
     /// Aggregate CORS policy state staged across every attached CORS instance
     /// and consumed by the cache-inserted CORS finalizer. Kept outside public
     /// metadata so policy details never enter transaction logs.
@@ -1178,7 +1218,16 @@ impl RequestContext {
             authenticated_identity_header: None,
             auth_method: None,
             timestamp_received: Utc::now(),
+            grpc_deadline_initialized: false,
+            grpc_deadline_had_valid_client_timeout: false,
+            grpc_deadline_received_at: tokio::time::Instant::now(),
+            grpc_deadline_preflight_complete: false,
+            grpc_deadline_budget_ms: None,
+            grpc_deadline_at: None,
+            grpc_deadline_header_is_remaining: false,
+            gateway_deadline_response_selected: false,
             metadata: HashMap::new(),
+            request_deduplication_state: HashMap::new(),
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
@@ -1246,6 +1295,50 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
+    }
+
+    /// Return the one absolute gRPC deadline established for this request.
+    /// The instant is monotonic and must be reused rather than reconstructed
+    /// from the relative `grpc-timeout` header on later backend attempts.
+    pub fn grpc_deadline_at(&self) -> Option<tokio::time::Instant> {
+        self.grpc_deadline_at
+    }
+
+    pub(crate) fn mark_gateway_deadline_response_selected(&mut self) {
+        self.gateway_deadline_response_selected = true;
+    }
+
+    pub(crate) fn gateway_deadline_response_selected(&self) -> bool {
+        self.gateway_deadline_response_selected
+    }
+
+    /// Remaining whole-millisecond gRPC budget, rounded up so a positive
+    /// sub-millisecond remainder can never become the invalid wire value `0m`.
+    pub fn grpc_deadline_remaining_ms(&self) -> Option<u64> {
+        let remaining = self
+            .grpc_deadline_at?
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Some(0);
+        }
+        grpc_deadline::duration_millis_ceil_saturating(remaining)
+    }
+
+    pub(crate) fn initialize_grpc_deadline_budget(&mut self, budget_ms: Option<u64>) {
+        if self.grpc_deadline_initialized {
+            return;
+        }
+        self.grpc_deadline_initialized = true;
+        self.grpc_deadline_had_valid_client_timeout = budget_ms.is_some();
+        self.set_grpc_deadline_budget(budget_ms);
+    }
+
+    pub(crate) fn set_grpc_deadline_budget(&mut self, budget_ms: Option<u64>) {
+        self.grpc_deadline_budget_ms = budget_ms;
+        self.grpc_deadline_at = budget_ms.and_then(|budget| {
+            self.grpc_deadline_received_at
+                .checked_add(Duration::from_millis(budget))
+        });
     }
 
     /// Correlation id for the concrete response-stream inspector chain, when
@@ -1350,6 +1443,14 @@ impl RequestContext {
             authenticated_identity_header: self.authenticated_identity_header.clone(),
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
+            grpc_deadline_initialized: self.grpc_deadline_initialized,
+            grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
+            grpc_deadline_received_at: self.grpc_deadline_received_at,
+            grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
+            grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
+            grpc_deadline_at: self.grpc_deadline_at,
+            grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
+            gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             // Omit `request_body` (the full buffered prompt): no
             // `on_final_request_body` hook reads it from the context — they all
             // take the body as a `&[u8]` parameter — so copying it here would burn
@@ -1362,6 +1463,10 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            // Deduplication has no final request-body hook, and the caller only
+            // copies selected hook results back. Keep ownership solely on the
+            // live context instead of cloning request keys and tokens here.
+            request_deduplication_state: HashMap::new(),
             // Final request-body hooks cannot observe or mutate the real CORS
             // aggregate. CORS has no body hook, and only metadata is copied
             // back from this compatibility context.
@@ -2094,6 +2199,73 @@ pub enum PluginResult {
     },
 }
 
+/// Preserve whether a request plugin produced its result or exhausted the
+/// client RPC deadline so protocol writers can choose terminal write bias.
+pub(crate) enum RequestPluginDeadlineResult {
+    Completed(PluginResult),
+    DeadlineExceeded,
+}
+
+impl RequestPluginDeadlineResult {
+    pub(crate) fn into_plugin_result(self, ctx: &mut RequestContext) -> PluginResult {
+        match self {
+            Self::Completed(result) => result,
+            Self::DeadlineExceeded => {
+                ctx.mark_gateway_deadline_response_selected();
+                grpc_deadline_exceeded_plugin_result()
+            }
+        }
+    }
+}
+
+/// Await one request-phase plugin hook under the RPC's absolute deadline while
+/// preserving typed deadline provenance for protocol-specific finalizers.
+pub(crate) async fn await_request_plugin_deadline_with_provenance<F>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> RequestPluginDeadlineResult
+where
+    F: std::future::Future<Output = PluginResult>,
+{
+    match await_grpc_deadline(deadline, future).await {
+        Ok(result) => RequestPluginDeadlineResult::Completed(result),
+        Err(()) => RequestPluginDeadlineResult::DeadlineExceeded,
+    }
+}
+
+pub(crate) async fn await_grpc_deadline<F, T>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(deadline) = deadline else {
+        return Ok(future.await);
+    };
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| ())
+}
+
+pub(crate) fn grpc_deadline_exceeded_plugin_result() -> PluginResult {
+    PluginResult::Reject {
+        status_code: 200,
+        body: String::new(),
+        headers: HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            (
+                "grpc-status".to_string(),
+                GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER.to_string(),
+            ),
+            (
+                "grpc-message".to_string(),
+                GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
+            ),
+        ]),
+    }
+}
+
 /// Action returned by a [`ResponseStreamInspector`]'s per-chunk/end hooks
 /// ([`ResponseStreamInspector::on_chunk`] / [`ResponseStreamInspector::on_end`]),
 /// generalizing the WebSocket [`Plugin::on_ws_frame`] model to streaming HTTP
@@ -2365,16 +2537,35 @@ pub async fn normalize_response_body_for_inspection(
     let content_type = response_headers.get("content-type").cloned();
     let mut normalized = false;
     for plugin in plugins {
-        if let Some(body) = plugin
-            .normalize_response_body_with_context(
+        let deadline = ctx.grpc_deadline_at();
+        let body = match await_grpc_deadline(
+            deadline,
+            plugin.normalize_response_body_with_context(
                 ctx,
                 response_status,
                 response_body,
                 content_type.as_deref(),
                 response_headers,
-            )
-            .await
+            ),
+        )
+        .await
         {
+            Ok(body) => body,
+            Err(()) => {
+                let grpc_web_response_content_type =
+                    crate::plugins::grpc_web::retained_response_content_type(ctx);
+                crate::proxy::replace_buffered_grpc_response_with_deadline(
+                    ctx,
+                    grpc_web_response_content_type,
+                    response_headers,
+                    response_body,
+                    &[],
+                );
+                normalized = true;
+                break;
+            }
+        };
+        if let Some(body) = body {
             response_headers.insert("content-length".to_string(), body.len().to_string());
             *response_body = body;
             normalized = true;
@@ -2844,6 +3035,10 @@ pub async fn log_with_mirror(
         None
     };
     for plugin in plugins {
+        // Transaction logging is gateway cleanup after the client-visible
+        // outcome is final. A client RPC deadline must bound request handling,
+        // but it must not suppress the audit/transaction record for the
+        // deadline outcome itself.
         plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
@@ -2872,6 +3067,41 @@ pub async fn log_with_mirror(
             plugin
                 .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
                 .await;
+        }
+    });
+}
+
+/// Run terminal transaction logging before a buffered H1/H2 response is handed
+/// to hyper without allowing logging cleanup to extend an active gRPC deadline.
+///
+/// Ordinary requests preserve the historical sequential, awaited logging
+/// contract. Once an absolute RPC deadline is installed, the client-visible
+/// response owns the deadline and logging continues on cloned state under a
+/// finite cleanup bound. This keeps audit delivery best-effort without letting
+/// a blocked sink suppress the terminal response.
+pub async fn log_with_mirror_before_buffered_response(
+    plugins: &[Arc<dyn Plugin>],
+    summary: TransactionSummary,
+    ctx: &RequestContext,
+) {
+    if ctx.grpc_deadline_at().is_none() {
+        log_with_mirror(plugins, &summary, ctx).await;
+        return;
+    }
+
+    let plugins = plugins.to_vec();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            log_with_mirror(&plugins, &summary, &ctx),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                "Detached transaction logging exceeded the post-response cleanup timeout"
+            );
         }
     });
 }
@@ -3353,6 +3583,22 @@ pub trait Plugin: Send + Sync {
         priority::DEFAULT
     }
 
+    /// Apply a request-receipt gRPC deadline policy synchronously, before any
+    /// plugin or request-body await. Only `grpc_deadline` overrides this hook.
+    /// It must not perform I/O or mutate the forwarded header; `before_proxy`
+    /// emits the relative upstream value from the typed absolute state.
+    fn prepare_grpc_deadline(&self, _ctx: &mut RequestContext) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin participates in the synchronous gRPC
+    /// deadline preflight. The plugin cache uses this to build a dedicated
+    /// phase list so ordinary gRPC requests do not scan the full plugin chain
+    /// before the first asynchronous hook.
+    fn requires_grpc_deadline_preflight(&self) -> bool {
+        false
+    }
+
     /// Called after routing and per-proxy allowed-method admission succeed.
     /// Native gRPC requests must also use `POST` before this hook runs.
     ///
@@ -3539,9 +3785,9 @@ pub trait Plugin: Send + Sync {
 
     /// Returns `true` when a deferred `before_proxy` hook can mutate headers
     /// that normally participate in upstream target selection. The gateway
-    /// runs these hooks in a separate deferred subphase after an access preview
-    /// and pins that previewed target across the external call; the returned
-    /// headers cannot steer this request onto an unpreviewed path.
+    /// runs these hooks in a separate deferred subphase after backend-path
+    /// enforcement and pins the authorized target across the external call;
+    /// the returned headers cannot steer this request onto a different path.
     fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
         false
     }
@@ -3557,17 +3803,14 @@ pub trait Plugin: Send + Sync {
 
     /// Called after the backend-effective path has been assembled from the
     /// route override, listen-path stripping, proxy/backend path, and selected
-    /// upstream target path, but before any backend is dialed.
-    ///
-    /// When a deferred hook can mutate routing headers, `Preview` runs before
-    /// that hook and `Enforce` runs afterward against the same pinned target.
-    /// Otherwise only `Enforce` runs. Implementations must keep `Preview` free
-    /// of state-consuming effects such as rate-limit charges.
+    /// upstream target path. The selected target is pinned and this hook runs
+    /// exactly once before deferred external/synthetic hooks or backend dial,
+    /// so implementations may safely commit stateful policy such as rate-limit
+    /// charges here.
     async fn on_backend_path_resolved(
         &self,
         _ctx: &mut RequestContext,
         _backend_path: &str,
-        _phase: BackendPathPolicyPhase,
     ) -> PluginResult {
         PluginResult::Continue
     }
@@ -4019,6 +4262,22 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns true when the final request-body hook is a terminal dispatch
+    /// boundary and must run before backend-only circuit-breaker, egress,
+    /// admission, pool, or TLS work. When backend-path policy is active, the
+    /// selected path is authorized and deferred `before_proxy` hooks finish
+    /// before this terminal hook may perform external dispatch.
+    ///
+    /// This is narrower than [`Plugin::needs_final_request_body_context`]. It
+    /// is intended for plugins such as provider federators that consume the
+    /// finalized HTTP request body, perform their own external dispatch, and
+    /// return the complete client response from the hook. Ordinary validators
+    /// should keep the default so fail-fast backend gates can reject without
+    /// first draining a client upload.
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+        false
+    }
+
     /// Transform the response body before it is sent to the client.
     ///
     /// Called after `on_response_body` hooks, only for buffered responses
@@ -4132,14 +4391,17 @@ pub trait Plugin: Send + Sync {
 
     /// Called for transaction logging.
     ///
-    /// Buffered HTTP-family handlers await each plugin's hook sequentially
-    /// before returning the response. Native H3 also awaits the hooks after it
-    /// has synchronously driven the response body to completion. Hyper-owned
-    /// streamed H1/H2/gRPC bodies instead spawn terminal hooks and logging when
-    /// the body completes; that spawned work can be lost if no runtime remains
-    /// during shutdown. Plugins should hand slow I/O to a bounded,
-    /// lifecycle-owned worker rather than awaiting it inline or spawning one
-    /// unbounded task per transaction.
+    /// Buffered HTTP-family handlers normally await each plugin's hook
+    /// sequentially before returning the response. When an absolute gRPC
+    /// deadline is active, buffered H1/H2 handlers instead move logging to a
+    /// bounded detached cleanup task so a blocked sink cannot suppress the
+    /// terminal RPC response. Native H3 awaits the hooks after it has
+    /// synchronously driven the response body to completion. Hyper-owned
+    /// streamed H1/H2/gRPC bodies spawn terminal hooks and logging when the body
+    /// completes; spawned work can be lost if no runtime remains during
+    /// shutdown. Plugins should hand slow I/O to a bounded, lifecycle-owned
+    /// worker rather than awaiting it inline or spawning one unbounded task per
+    /// transaction.
     async fn log(&self, _summary: &TransactionSummary) {}
 
     /// Called for transaction logging with a precomputed mesh RED key when
@@ -4782,6 +5044,21 @@ pub fn validate_plugin_config_with_policy(
 ) -> Result<(), String> {
     let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
     validate_plugin_config_with_http_client(name, config, http_client)?;
+    validate_plugin_config_policy_only(name, config, backend_allow_ips)
+}
+
+/// Apply admission-policy checks that live outside plugin construction.
+///
+/// Prospective named-schema validation constructs `schema_ref` consumers while
+/// an isolated schema registry is staged. Callers therefore skip a second full
+/// construction after that bracket is aborted, but must still apply these
+/// policy-only checks so an unrelated plugin cannot add an ignored
+/// `schema_ref` key to bypass egress admission.
+pub(crate) fn validate_plugin_config_policy_only(
+    name: &str,
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
     // The HTTP-endpoint screen above does not cover a plugin's own
     // literal-IP backend fields that aren't dialed through the shared
     // client (mesh_route_dispatch route destinations).

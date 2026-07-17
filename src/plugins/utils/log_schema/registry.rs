@@ -72,9 +72,10 @@ fn write_lock() -> RwLockWriteGuard<'static, RegistryState> {
 // other (and any in-flight test that's mid-bracket on another thread).
 //
 // `begin_reload` enters the bracket; `commit_reload` leaves it. A
-// thread-local depth counter makes the pair reentrant on the same
-// thread, so tests can `lock_for_tests()` to hold the bracket across
-// their own assertions (which read the live map after committing).
+// thread-local depth counter lets tests use `lock_for_tests()` around a
+// complete reload plus assertions. Reload brackets themselves are deliberately
+// non-reentrant: a nested `begin_reload` is an error rather than permission to
+// replace the outer staging map.
 fn reload_serializer() -> &'static Mutex<()> {
     static RELOAD: OnceLock<Mutex<()>> = OnceLock::new();
     RELOAD.get_or_init(|| Mutex::new(()))
@@ -88,12 +89,16 @@ struct BracketKeeper {
     /// Nesting depth — incremented by every `enter_bracket()` on this
     /// thread, decremented by every `leave_bracket()`.
     depth: u32,
+    /// True only while this thread owns an actual begin/commit-or-abort reload
+    /// pass. `lock_for_tests()` increments `depth` without setting this flag.
+    reload_open: bool,
 }
 
 thread_local! {
     static KEEPER: RefCell<BracketKeeper> = const { RefCell::new(BracketKeeper {
         outer_guard: None,
         depth: 0,
+        reload_open: false,
     }) };
 }
 
@@ -158,17 +163,44 @@ fn leave_bracket() {
 /// Acquires the process-wide reload-bracket lock so two concurrent
 /// reloads serialize at the bracket boundary (without serializing reads
 /// against `lookup_named`). The lock is released by [`commit_reload`].
-/// Reentrant on the same thread — a test can hold the bracket open via
-/// [`lock_for_tests`] and still call begin/commit normally within.
+/// A test can hold the serializer via [`lock_for_tests`] and still call one
+/// begin/commit pair normally within it. A second `begin_reload` before the
+/// first pass closes returns an error and preserves the existing staging map.
 ///
 /// **Threading invariant:** `begin_reload` / `register_named` /
 /// `commit_reload` for one reload pass must all run on the same thread.
 /// The serializer guard is stored thread-local; cross-thread brackets
 /// leak the guard. plugin_cache and tests both satisfy this naturally.
-pub fn begin_reload() {
+pub fn begin_reload() -> Result<(), String> {
     enter_bracket();
-    let mut state = write_lock();
-    state.staging = Some(HashMap::new());
+    let nested = KEEPER.with(|keeper| keeper.borrow().reload_open);
+    if nested {
+        leave_bracket();
+        return Err(
+            "log_schema::registry: nested begin_reload on the same thread would clobber the active staging map"
+                .to_string(),
+        );
+    }
+
+    let staging_already_open = {
+        let mut state = write_lock();
+        if state.staging.is_some() {
+            true
+        } else {
+            state.staging = Some(HashMap::new());
+            false
+        }
+    };
+    if staging_already_open {
+        leave_bracket();
+        return Err(
+            "log_schema::registry: begin_reload found an active staging map without a matching reload owner"
+                .to_string(),
+        );
+    }
+
+    KEEPER.with(|keeper| keeper.borrow_mut().reload_open = true);
+    Ok(())
 }
 
 /// Register a named schema into the in-progress reload staging area.
@@ -176,10 +208,10 @@ pub fn begin_reload() {
 /// When called between [`begin_reload`] and [`commit_reload`] (the normal
 /// loader path), writes to the staging map and rejects duplicates.
 ///
-/// When called outside a reload pass (e.g., from admin-API single-plugin
-/// validation via `validate_plugin_config`), this is a no-op. Validation
-/// just needs `SummarySchema::compile` to succeed; the registry stays
-/// untouched and will be re-populated by the next config-reload pass.
+/// When called outside a reload pass (for example, isolated constructor
+/// validation via `validate_plugin_config`), this is a no-op. Prospective
+/// graph validation opens an abort-only bracket explicitly, so it detects
+/// duplicates and resolves referrers without changing the live registry.
 pub fn register_named(
     name: &str,
     raw: Arc<Value>,
@@ -202,14 +234,30 @@ pub fn register_named(
 /// `transaction_log_schema` plugins for this reload pass have constructed
 /// AND the rest of the plugin-cache build has succeeded. Decrements the
 /// bracket depth (releases the serializer on outermost exit).
-pub fn commit_reload() {
-    {
+pub fn commit_reload() -> Result<(), String> {
+    if !KEEPER.with(|keeper| keeper.borrow().reload_open) {
+        return Err(
+            "log_schema::registry: commit_reload called without an open reload on this thread"
+                .to_string(),
+        );
+    }
+
+    let promoted = {
         let mut state = write_lock();
         if let Some(staging) = state.staging.take() {
             state.schemas = staging;
+            true
+        } else {
+            false
         }
-    }
+    };
+    KEEPER.with(|keeper| keeper.borrow_mut().reload_open = false);
     leave_bracket();
+    if promoted {
+        Ok(())
+    } else {
+        Err("log_schema::registry: commit_reload found no active staging map".to_string())
+    }
 }
 
 /// Discard the staging area without promoting it. Called when the rest
@@ -220,12 +268,25 @@ pub fn commit_reload() {
 ///
 /// Always pair `begin_reload` with exactly one of `commit_reload` or
 /// `abort_reload` on the same thread.
-pub fn abort_reload() {
-    {
-        let mut state = write_lock();
-        state.staging = None;
+pub fn abort_reload() -> Result<(), String> {
+    if !KEEPER.with(|keeper| keeper.borrow().reload_open) {
+        return Err(
+            "log_schema::registry: abort_reload called without an open reload on this thread"
+                .to_string(),
+        );
     }
+
+    let discarded = {
+        let mut state = write_lock();
+        state.staging.take().is_some()
+    };
+    KEEPER.with(|keeper| keeper.borrow_mut().reload_open = false);
     leave_bracket();
+    if discarded {
+        Ok(())
+    } else {
+        Err("log_schema::registry: abort_reload found no active staging map".to_string())
+    }
 }
 
 /// Test-only: hold the reload-bracket serializer across an arbitrary
@@ -356,7 +417,7 @@ mod tests {
     fn commit_publishes_staging() {
         let _g = lock();
         reset_for_tests();
-        begin_reload();
+        begin_reload().expect("reload bracket opens");
         register_named("a", raw_schema(), empty_schema()).unwrap();
         // The reload thread sees its own staging so plugin construction
         // in the second pass can resolve `schema_ref` before commit.
@@ -368,7 +429,7 @@ mod tests {
             on_other_thread.is_none(),
             "external readers see only the committed map"
         );
-        commit_reload();
+        commit_reload().expect("reload bracket commits");
         assert!(lookup_named("a").is_some());
         // After commit, external readers see the promoted schemas too.
         let on_other_thread = std::thread::spawn(lookup_named_a).join().unwrap();
@@ -385,15 +446,15 @@ mod tests {
         reset_for_tests();
         // Seed a live schema so we can confirm it survives the aborted
         // reload.
-        begin_reload();
+        begin_reload().expect("reload bracket opens");
         register_named("keep", raw_schema(), empty_schema()).unwrap();
-        commit_reload();
+        commit_reload().expect("reload bracket commits");
         assert!(lookup_named("keep").is_some());
 
         // Start a reload that registers a new schema, then abort.
-        begin_reload();
+        begin_reload().expect("reload bracket opens");
         register_named("transient", raw_schema(), empty_schema()).unwrap();
-        abort_reload();
+        abort_reload().expect("reload bracket aborts");
 
         // The aborted reload's staged schema must NOT leak into the live map.
         assert!(
@@ -411,10 +472,11 @@ mod tests {
     fn duplicate_within_reload_rejected() {
         let _g = lock();
         reset_for_tests();
-        begin_reload();
+        begin_reload().expect("reload bracket opens");
         register_named("a", raw_schema(), empty_schema()).unwrap();
         let r = register_named("a", raw_schema(), empty_schema());
         assert!(r.is_err());
+        abort_reload().expect("reload bracket aborts");
     }
 
     #[test]
@@ -422,15 +484,15 @@ mod tests {
         let _g = lock();
         reset_for_tests();
         // First reload: register "a".
-        begin_reload();
+        begin_reload().expect("reload bracket opens");
         register_named("a", raw_schema(), empty_schema()).unwrap();
-        commit_reload();
+        commit_reload().expect("reload bracket commits");
         assert!(lookup_named("a").is_some());
 
         // Second reload: register only "b". "a" should vanish.
-        begin_reload();
+        begin_reload().expect("reload bracket opens");
         register_named("b", raw_schema(), empty_schema()).unwrap();
-        commit_reload();
+        commit_reload().expect("reload bracket commits");
         assert!(lookup_named("a").is_none());
         assert!(lookup_named("b").is_some());
     }
@@ -439,11 +501,11 @@ mod tests {
     fn registered_names_sorted() {
         let _g = lock();
         reset_for_tests();
-        begin_reload();
+        begin_reload().expect("reload bracket opens");
         register_named("zebra", raw_schema(), empty_schema()).unwrap();
         register_named("alpha", raw_schema(), empty_schema()).unwrap();
         register_named("mango", raw_schema(), empty_schema()).unwrap();
-        commit_reload();
+        commit_reload().expect("reload bracket commits");
         assert_eq!(registered_names(), vec!["alpha", "mango", "zebra"]);
     }
 }
