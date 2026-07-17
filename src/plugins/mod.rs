@@ -114,7 +114,7 @@ use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -690,11 +690,11 @@ fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
 
 /// Parse the legacy client/rule literal forms without allocation.
 ///
-/// IPv4 accepts the same four decimal-octet grammar used by the original
-/// `ip_restriction` matcher. Brackets and zone identifiers remain IPv6-only;
-/// accepting them on IPv4 would broaden the established policy grammar.
+/// IPv4 uses the standard library's strict literal grammar. Brackets and zone
+/// identifiers remain IPv6-only; accepting them on IPv4 would broaden the
+/// established policy grammar.
 fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
-    if let Some(ipv4) = parse_ipv4_client_ip_literal(client_ip) {
+    if let Ok(ipv4) = client_ip.parse() {
         return Some(IpAddr::V4(ipv4));
     }
 
@@ -706,20 +706,6 @@ fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
         .find('%')
         .map_or(unbracketed, |index| &unbracketed[..index]);
     without_zone.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
-}
-
-fn parse_ipv4_client_ip_literal(client_ip: &str) -> Option<Ipv4Addr> {
-    let mut octets = client_ip.split('.');
-    let ipv4 = [
-        octets.next()?.parse::<u8>().ok()?,
-        octets.next()?.parse::<u8>().ok()?,
-        octets.next()?.parse::<u8>().ok()?,
-        octets.next()?.parse::<u8>().ok()?,
-    ];
-    if octets.next().is_some() {
-        return None;
-    }
-    Some(Ipv4Addr::from(ipv4))
 }
 
 /// Context passed through the plugin pipeline for a single request.

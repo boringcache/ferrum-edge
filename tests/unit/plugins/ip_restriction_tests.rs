@@ -767,6 +767,14 @@ fn noncanonical_ipv4_rule_literals_reject_construction() {
 }
 
 #[test]
+fn noncanonical_ipv4_client_literals_do_not_match() {
+    use ferrum_edge::plugins::ip_restriction::ip_matches;
+
+    assert!(!ip_matches("+10.1.2.3", "10.1.2.3"));
+    assert!(!ip_matches("010.1.2.3", "10.1.2.3"));
+}
+
+#[test]
 fn canonical_ipv4_rule_literals_remain_valid() {
     for rule in ["0.0.0.0", "10.1.2.3", "255.255.255.255/32"] {
         let config = json!({"deny": [rule]});
