@@ -5,8 +5,8 @@ use ferrum_edge::{
     config::{BackendAllowIps, BackendEgressPolicy},
     plugins::{
         Plugin, PluginHttpClient, RequestContext, ResponseStreamAction, ResponseStreamInspector,
-        ai_tool_governor::AiToolGovernor, available_plugins, create_plugin_with_http_client,
-        create_response_stream_inspector, priority,
+        ai_tool_governor::AiToolGovernor, available_plugins, correlation_id::CorrelationId,
+        create_plugin_with_http_client, create_response_stream_inspector, priority,
     },
     proxy::deferred_log::BodyOutcome,
 };
@@ -972,6 +972,146 @@ async fn approval_allow_forwards() {
             .map(String::as_str),
         Some("appr-1")
     );
+}
+
+#[tokio::test]
+async fn correlation_id_composition_populates_generated_and_preserved_approval_request_ids() {
+    let server = MockServer::start().await;
+    let correlation = CorrelationId::new(&json!({})).expect("valid correlation config");
+    let external_correlation = CorrelationId::new(&json!({
+        "header_name": "x-external-correlation-id"
+    }))
+    .expect("valid external correlation config");
+
+    let mut generated_ctx = create_test_context();
+    generated_ctx.headers.insert(
+        "x-external-correlation-id".to_string(),
+        "attacker-controlled-alias".to_string(),
+    );
+    assert_continue(correlation.on_request_received(&mut generated_ctx).await);
+    assert_continue(
+        external_correlation
+            .on_request_received(&mut generated_ctx)
+            .await,
+    );
+    let generated_id = generated_ctx
+        .metadata
+        .get(ferrum_edge::plugins::REQUEST_ID_METADATA_KEY)
+        .expect("generated canonical request ID")
+        .clone();
+    assert!(uuid::Uuid::parse_str(&generated_id).is_ok());
+    assert_ne!(generated_id, "attacker-controlled-alias");
+
+    let mut preserved_ctx = create_test_context();
+    preserved_ctx.headers.insert(
+        "x-request-id".to_string(),
+        "approval-preserved-id".to_string(),
+    );
+    assert_continue(correlation.on_request_received(&mut preserved_ctx).await);
+
+    for request_id in [&generated_id, "approval-preserved-id"] {
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .and(body_string_contains(format!(
+                r#""request_id":"{request_id}""#
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "decision": "allow"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    // Exercise both request IDs at the webhook boundary. Approval caching is
+    // covered separately and would intentionally collapse these otherwise
+    // identical tool calls before the second request reaches the mock server.
+    let mut governor_config = approval_config(&format!("{}/approve", server.uri()));
+    governor_config["approval"]["cache_ttl_seconds"] = json!(0);
+    let governor = make(governor_config);
+    let body = response_with_tool_call("deploy", r#"{"env":"prod"}"#);
+    assert_continue(
+        governor
+            .on_response_body(&mut generated_ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    assert_continue(
+        governor
+            .on_response_body(&mut preserved_ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn approval_request_ids_prefer_canonical_then_legacy_custom_metadata() {
+    let server = MockServer::start().await;
+    for request_id in [
+        "canonical-approval-id",
+        "custom-request-id",
+        "custom-correlation-id",
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .and(body_string_contains(format!(
+                r#""request_id":"{request_id}""#
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "decision": "allow"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let correlation = CorrelationId::new(&json!({})).expect("valid correlation config");
+    let mut canonical_ctx = create_test_context();
+    canonical_ctx.headers.insert(
+        "x-request-id".to_string(),
+        "canonical-approval-id".to_string(),
+    );
+    assert_continue(correlation.on_request_received(&mut canonical_ctx).await);
+    canonical_ctx.metadata.insert(
+        ferrum_edge::plugins::REQUEST_ID_METADATA_KEY.to_string(),
+        "spoofed-legacy-request-id".to_string(),
+    );
+    canonical_ctx.metadata.insert(
+        "correlation_id".to_string(),
+        "spoofed-legacy-correlation-id".to_string(),
+    );
+
+    let mut request_id_ctx = create_test_context();
+    request_id_ctx.metadata.insert(
+        ferrum_edge::plugins::REQUEST_ID_METADATA_KEY.to_string(),
+        "custom-request-id".to_string(),
+    );
+    request_id_ctx.metadata.insert(
+        "correlation_id".to_string(),
+        "lower-priority-custom-correlation-id".to_string(),
+    );
+
+    let mut correlation_id_ctx = create_test_context();
+    correlation_id_ctx.metadata.insert(
+        "correlation_id".to_string(),
+        "custom-correlation-id".to_string(),
+    );
+
+    let mut governor_config = approval_config(&format!("{}/approve", server.uri()));
+    governor_config["approval"]["cache_ttl_seconds"] = json!(0);
+    let governor = make(governor_config);
+    let body = response_with_tool_call("deploy", r#"{"env":"prod"}"#);
+    for ctx in [
+        &mut canonical_ctx,
+        &mut request_id_ctx,
+        &mut correlation_id_ctx,
+    ] {
+        assert_continue(
+            governor
+                .on_response_body(ctx, 200, &json_headers(), &body)
+                .await,
+        );
+    }
+    server.verify().await;
 }
 
 #[tokio::test]

@@ -1,6 +1,11 @@
 //! Tests for PluginCache — pre-resolved plugin instances per proxy
 
 use chrono::Utc;
+use ferrum_edge::_test_support::{
+    plugin_cache_with_real_ip_header_for_test,
+    validate_correlation_id_composition_with_real_ip_header_for_test,
+    validate_plugin_composition_candidate_with_real_ip_header_for_test,
+};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
     PluginScope, Proxy,
@@ -26,6 +31,21 @@ impl Plugin for LegacyAuthorizePlugin {
 
     async fn authorize(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue
+    }
+}
+
+struct RawCorrelationClaimPlugin {
+    claim: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Plugin for RawCorrelationClaimPlugin {
+    fn name(&self) -> &str {
+        "raw_correlation_claim"
+    }
+
+    fn correlation_id_header_name(&self) -> Option<&str> {
+        Some(self.claim)
     }
 }
 
@@ -163,28 +183,15 @@ fn make_udp_proxy(id: &str, plugin_ids: Vec<&str>, scheme: BackendScheme) -> Pro
 }
 
 fn make_tcp_stream_context(ip: &str) -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: ip.to_string(),
-        direct_client_ip: ip.to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "p1".to_string(),
-        proxy_name: Some("Proxy p1".to_string()),
-        listen_port: 15432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    StreamConnectionContext::new(
+        ip.to_string(),
+        ip.to_string(),
+        "p1".to_string(),
+        Some("Proxy p1".to_string()),
+        15432,
+        BackendScheme::Tcp,
+        Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    )
 }
 
 async fn run_tcp_connect_chain(
@@ -3618,6 +3625,90 @@ fn test_multiple_same_type_proxy_plugins_both_present() {
     assert_eq!(plugins[1].name(), "stdout_logging");
 }
 
+#[tokio::test]
+async fn correlation_id_priority_overrides_select_canonical_without_collapsing_instances() {
+    for internal_priority in [40, 60] {
+        let external_priority = if internal_priority == 40 { 60 } else { 40 };
+        let mut internal = make_plugin_config_with_priority(
+            "internal-correlation",
+            "correlation_id",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(internal_priority),
+        );
+        internal.config = json!({"header_name": "x-internal-request-id"});
+        let mut external = make_plugin_config_with_priority(
+            "external-correlation",
+            "correlation_id",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(external_priority),
+        );
+        external.config = json!({"header_name": "x-external-request-id"});
+        let config = make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                vec!["external-correlation", "internal-correlation"],
+            )],
+            vec![external, internal],
+        );
+        let cache = PluginCache::new(&config).expect("multi-instance correlation cache");
+        let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(
+            plugins[0].priority(),
+            internal_priority.min(external_priority)
+        );
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.headers.insert(
+            "x-external-request-id".to_string(),
+            "priority-preserved-id".to_string(),
+        );
+        assert!(matches!(
+            run_request_received_chain(&plugins, &mut ctx).await,
+            PluginResult::Continue
+        ));
+
+        let internal_id = ctx.headers.get("x-internal-request-id").unwrap();
+        assert!(uuid::Uuid::parse_str(internal_id).is_ok());
+        assert_ne!(internal_id, "priority-preserved-id");
+        let expected_canonical = if internal_priority < external_priority {
+            internal_id.as_str()
+        } else {
+            "priority-preserved-id"
+        };
+        assert_eq!(
+            ctx.metadata
+                .get(ferrum_edge::plugins::REQUEST_ID_METADATA_KEY)
+                .map(String::as_str),
+            Some(expected_canonical)
+        );
+
+        let mut handshake_headers = HashMap::new();
+        for plugin in plugins.iter() {
+            plugin.apply_websocket_handshake_response_headers(&ctx, 101, &mut handshake_headers);
+        }
+        assert_eq!(
+            handshake_headers.get("x-internal-request-id"),
+            Some(internal_id)
+        );
+        assert_eq!(
+            handshake_headers
+                .get("x-external-request-id")
+                .map(String::as_str),
+            Some("priority-preserved-id")
+        );
+    }
+}
+
 #[test]
 fn test_proxy_scoped_plugin_removes_only_global_of_same_name() {
     // A global stdout_logging and two proxy-scoped stdout_logging instances.
@@ -5165,6 +5256,322 @@ fn test_hmac_auth_allows_header_only_request_transformer() {
     );
 
     assert!(PluginCache::new(&config).is_ok());
+}
+
+#[test]
+fn test_duplicate_effective_correlation_headers_are_rejected() {
+    let first = make_plugin_config_with_json(
+        "corr-first",
+        "correlation_id",
+        json!({}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let mut second = make_plugin_config_with_json(
+        "corr-second",
+        "correlation_id",
+        json!({"header_name": " X-Request-ID "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second.priority_override = Some(75);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr-first", "corr-second"])],
+        vec![first, second],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("duplicate normalized correlation headers must fail closed");
+    assert!(error.contains("duplicate effective header_name \"x-request-id\""));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
+fn test_real_ip_header_collision_is_rejected_by_candidate_and_runtime_cache() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr"])],
+        vec![make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": " CF-Connecting-IP "}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    let candidate_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &config,
+        Some("cf-connecting-ip"),
+    )
+    .expect_err("candidate admission must reject the real-IP header collision");
+    assert!(candidate_error.contains("FERRUM_REAL_IP_HEADER"));
+
+    let cache_error = plugin_cache_with_real_ip_header_for_test(&config, Some("cf-connecting-ip"))
+        .err()
+        .expect("runtime cache construction must reject the real-IP header collision");
+    assert!(cache_error.contains("FERRUM_REAL_IP_HEADER"));
+}
+
+#[test]
+fn test_real_ip_header_non_collision_is_accepted_by_candidate_and_runtime_cache() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr"])],
+        vec![make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": "X-Request-ID"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &config,
+        Some("cloudfront-viewer-address"),
+    )
+    .expect("distinct candidate headers must be accepted");
+    plugin_cache_with_real_ip_header_for_test(&config, Some("cloudfront-viewer-address"))
+        .expect("distinct runtime headers must be accepted");
+}
+
+#[test]
+fn test_equal_effective_correlation_priorities_are_rejected() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["corr-internal", "corr-external"],
+        )],
+        vec![
+            make_plugin_config_with_json(
+                "corr-internal",
+                "correlation_id",
+                json!({"header_name": "x-internal-request-id"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "corr-external",
+                "correlation_id",
+                json!({"header_name": "x-external-request-id"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("equal correlation priorities must fail closed");
+    assert!(error.contains("duplicate effective priority 50"));
+    assert!(error.contains("priority_override"));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
+fn test_same_correlation_header_on_disjoint_proxy_chains_is_allowed() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/one", vec!["corr-one"]),
+            make_proxy("p2", "/two", vec!["corr-two"]),
+        ],
+        vec![
+            make_plugin_config(
+                "corr-one",
+                "correlation_id",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "corr-two",
+                "correlation_id",
+                PluginScope::Proxy,
+                Some("p2"),
+                true,
+            ),
+        ],
+    );
+
+    assert!(PluginCache::new(&config).is_ok());
+}
+
+#[test]
+fn test_custom_only_duplicate_effective_correlation_headers_are_rejected() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    // The example plugin retains configured whitespace and casing at the
+    // capability boundary, modeling a third-party implementation that did not
+    // pre-normalize its correlation_id_header_name() result. Core validation
+    // must still trim and compare these two claims case-insensitively.
+    let first = make_plugin_config_with_json(
+        "custom-corr-first",
+        "example_plugin",
+        json!({"correlation_header_name": "x-custom-correlation-id"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let mut second = make_plugin_config_with_json(
+        "custom-corr-second",
+        "example_plugin",
+        json!({"correlation_header_name": " X-Custom-Correlation-ID "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second.priority_override = Some(5001);
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["custom-corr-first", "custom-corr-second"],
+        )],
+        vec![first, second],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("mixed-whitespace/case correlation claims must fail closed");
+    assert!(error.contains("duplicate effective header_name \"x-custom-correlation-id\""));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
+fn test_empty_third_party_correlation_capability_claims_fail_closed_clearly() {
+    for claim in ["", " \t "] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin { claim })];
+        let error =
+            ferrum_edge::_test_support::validate_correlation_id_composition_for_test(&plugins)
+                .expect_err("one empty normalized capability claim must fail closed");
+
+        assert!(
+            error.contains("plugin \"raw_correlation_claim\" returned an empty correlation_id_header_name capability claim"),
+            "unexpected empty-claim error for {claim:?}: {error}"
+        );
+        assert!(error.contains("return None"), "got: {error}");
+        assert!(
+            !error.contains("duplicate effective header_name"),
+            "got: {error}"
+        );
+    }
+}
+
+#[test]
+fn test_third_party_correlation_capability_cannot_claim_real_ip_header() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin {
+        claim: " CF-Connecting-IP ",
+    })];
+    let error = validate_correlation_id_composition_with_real_ip_header_for_test(
+        &plugins,
+        Some("cf-connecting-ip"),
+    )
+    .expect_err("third-party real-IP header collision must fail closed");
+    assert!(error.contains("FERRUM_REAL_IP_HEADER"), "got: {error}");
+    assert!(error.contains("cf-connecting-ip"), "got: {error}");
+}
+
+#[test]
+fn test_third_party_correlation_capability_cannot_claim_reserved_header() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin {
+        claim: " AuThOrIzAtIoN ",
+    })];
+    let error = ferrum_edge::_test_support::validate_correlation_id_composition_for_test(&plugins)
+        .expect_err("third-party reserved header ownership must fail closed");
+
+    assert!(
+        error.contains("effective header_name \"authorization\""),
+        "got: {error}"
+    );
+    assert!(
+        error.contains("plugin \"raw_correlation_claim\""),
+        "got: {error}"
+    );
+    assert!(error.contains("protocol Http"), "got: {error}");
+    assert!(
+        error.contains("reserved protocol-managed or security-sensitive header ownership"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn test_shipped_custom_correlation_plugin_cannot_claim_reserved_header() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let custom_owner = make_plugin_config_with_json(
+        "custom-corr-reserved",
+        "example_plugin",
+        json!({"correlation_header_name": " AuThOrIzAtIoN "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["custom-corr-reserved"])],
+        vec![custom_owner],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("shipped custom plugin must not claim reserved correlation headers");
+    assert!(
+        error.contains("effective header_name \"authorization\""),
+        "got: {error}"
+    );
+    assert!(error.contains("plugin \"example_plugin\""), "got: {error}");
+    assert!(error.contains("protocol Http"), "got: {error}");
+    assert!(error.contains("proxy_id=p1"), "got: {error}");
+    assert!(error.contains("reserved"), "got: {error}");
+}
+
+#[test]
+fn test_custom_correlation_owners_on_disjoint_protocols_are_allowed() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let http_owner = make_plugin_config_with_json(
+        "custom-corr-http",
+        "example_plugin",
+        json!({"correlation_header_name": "x-custom-correlation-id"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let tcp_owner = make_plugin_config_with_json(
+        "custom-corr-tcp",
+        "example_plugin",
+        json!({
+            "correlation_header_name": " X-Custom-Correlation-ID ",
+            "protocol": "tcp"
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["custom-corr-http", "custom-corr-tcp"],
+        )],
+        vec![http_owner, tcp_owner],
+    );
+
+    let cache = PluginCache::new(&config)
+        .expect("disjoint protocol owners cannot contend for correlation ownership");
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("p1", ProxyProtocol::Http)
+            .len(),
+        1
+    );
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("p1", ProxyProtocol::Tcp)
+            .len(),
+        1
+    );
 }
 
 #[test]

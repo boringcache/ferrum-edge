@@ -41,6 +41,11 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 4. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, serverless, mock, gRPC deadline, mirror, load, cache, compression
 5. `on_final_request_body`: body validator and gRPC-Web validation
 6. `after_proxy`: response-side counterpart to before_proxy
+   - Successful H1/H2/H3 WebSocket handshakes bypass general `after_proxy` and
+     instead run the synchronous, non-rejecting
+     `apply_websocket_handshake_response_headers` boundary in configured order.
+     Transport-owned handshake/framing fields are stripped afterward and
+     restored only by proxy core.
 7. `normalize_response_body`: provider/protocol adapters produce the client-visible buffered representation
 8. `on_response_body`: AI response guard and token metrics inspect the normalized body
 9. `transform_response_body`: ordinary client-facing body rewrites

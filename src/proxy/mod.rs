@@ -173,12 +173,13 @@ pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
     "ferrum:replaceable_rejection_response";
 
 /// One-shot handoff for requester-owned auth session state that changed before
-/// authentication attempts rejected. Distinct cookie names are newline-joined;
-/// a later attempt replaces an earlier candidate with the same exact name. The
-/// authentication phase removes this key on every exit: it attaches the cookies
-/// only to the final rejection and discards them when a later credential
-/// succeeds. The key contains "cookie" so metadata serialization still redacts
-/// the sealed values defensively.
+/// authentication attempts rejected. Distinct cookie storage keys are
+/// newline-joined; a later attempt replaces an earlier candidate with the same
+/// exact name/domain/host-only/path/partitioned scope. The authentication phase
+/// removes this key on every exit: it attaches the cookies only to the final
+/// rejection and discards them when a later credential succeeds. The key
+/// contains "cookie" so metadata serialization still redacts the sealed values
+/// defensively.
 pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_set_cookie";
 
 /// Marker recorded in `ctx.metadata` for the duration of
@@ -2578,6 +2579,7 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
     let mut metadata = ctx.metadata.clone();
+    ctx.project_correlation_ids(&mut metadata);
     redact_request_body_from_log_metadata(&mut metadata);
     ctx.apply_waf_owned_log_metadata(&mut metadata);
     metadata
@@ -3344,6 +3346,31 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
         push_forwarded_param_value(&mut val, h);
     }
     val
+}
+
+/// Replace proxy-managed scheme metadata with the effective browser-facing
+/// request scheme. Direct gRPC and WebSocket dispatch start from a sanitized
+/// request map instead of the canonical HTTP backend builders, so normalize
+/// these fields before those protocol-specific paths merge or forward it.
+/// Remove every case-insensitive variant first because this string-keyed map
+/// does not otherwise provide HTTP header-name equality.
+pub(crate) fn apply_effective_backend_scheme_headers(
+    headers: &mut HashMap<String, String>,
+    client_ip: &str,
+    request_is_secure: bool,
+    add_forwarded_header: bool,
+) {
+    let scheme = if request_is_secure { "https" } else { "http" };
+    let forwarded = add_forwarded_header
+        .then(|| build_forwarded_value(client_ip, scheme, headers.get("host").map(String::as_str)));
+    headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("x-forwarded-proto")
+            && (!add_forwarded_header || !name.eq_ignore_ascii_case("forwarded"))
+    });
+    headers.insert("x-forwarded-proto".to_string(), scheme.to_string());
+    if let Some(forwarded) = forwarded {
+        headers.insert("forwarded".to_string(), forwarded);
+    }
 }
 
 fn push_forwarded_param_value(buf: &mut String, value: &str) {
@@ -5164,7 +5191,8 @@ impl ProxyState {
             env_config_arc.backend_allow_ips.clone(),
             mesh_egress_strip_baggage_keys.clone(),
             env_config_arc.pool_shard_amount,
-        );
+        )
+        .with_real_ip_header(env_config_arc.real_ip_header.clone());
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will
         // route `__mesh_bpf_metrics` to use it via `with_state`.
@@ -8444,6 +8472,28 @@ pub(crate) fn finalize_websocket_response_headers(
     strip_websocket_transport_managed_response_header_map(response_headers);
 }
 
+/// Apply the successful-handshake response chain in configured plugin order.
+///
+/// Static initial-response policies and request-local WebSocket decorators
+/// share this pass so priority overrides remain authoritative across both
+/// categories. The hook contract is non-rejecting; once the backend handshake
+/// succeeds, this boundary always proceeds to a protocol-correct client
+/// handshake after transport-managed fields are stripped.
+pub(crate) fn finalize_successful_websocket_response_headers(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+) {
+    for plugin in plugins {
+        plugin.apply_websocket_handshake_response_headers(ctx, response_status, response_headers);
+        if plugin.is_initial_response_header_policy() {
+            plugin.apply_initial_response_header_policy(response_headers);
+        }
+    }
+    strip_websocket_transport_managed_response_header_map(response_headers);
+}
+
 fn build_websocket_error_response(
     status: StatusCode,
     body: &str,
@@ -9175,6 +9225,7 @@ async fn handle_websocket_request_authenticated(
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
                             error_class: Some(ws_error_class),
                             metadata,
+                            ai_usage_export: ctx.ai_usage_export.clone(),
                             ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror_before_buffered_response(
@@ -9336,6 +9387,7 @@ async fn handle_websocket_request_authenticated(
         latency_gateway_overhead_ms: ws_gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         metadata: clone_log_metadata(&ctx),
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
 
@@ -9345,9 +9397,16 @@ async fn handle_websocket_request_authenticated(
     // This matches ordinary HTTP/gRPC ordering: operator policy governs backend
     // metadata, while the gateway's selected-target cookie and mandatory
     // handshake fields are committed at the client boundary afterward.
+    let response_status = if is_h2_websocket {
+        StatusCode::OK
+    } else {
+        StatusCode::SWITCHING_PROTOCOLS
+    };
     let mut response_headers = HashMap::new();
-    finalize_websocket_response_headers(
-        &initial_response_header_policy_plugins,
+    finalize_successful_websocket_response_headers(
+        &plugins,
+        &ctx,
+        response_status.as_u16(),
         &mut response_headers,
     );
     if sticky_cookie_needed
@@ -9375,11 +9434,6 @@ async fn handle_websocket_request_authenticated(
     // HTTP/2 Extended CONNECT (RFC 8441): 200 OK — the H2 stream becomes the WebSocket
     // transport. No Upgrade/Connection/Sec-WebSocket-Accept headers (those are HTTP/1.1).
     // HTTP/1.1: 101 Switching Protocols with standard WebSocket handshake headers.
-    let response_status = if is_h2_websocket {
-        StatusCode::OK
-    } else {
-        StatusCode::SWITCHING_PROTOCOLS
-    };
     let mut ws_resp_builder = headers_mod::apply_response_headers(
         Response::builder().status(response_status),
         &response_headers,
@@ -9639,7 +9693,7 @@ fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(
 /// handshake-equivalent repeated headers such as multiple
 /// `Sec-WebSocket-Protocol` values, while still honoring plugin-driven strips
 /// and rewrites reflected in `proxy_headers`.
-fn collect_forwardable_websocket_headers(
+pub(crate) fn collect_forwardable_websocket_headers(
     raw_headers: &hyper::HeaderMap,
     proxy_headers: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
@@ -13692,6 +13746,7 @@ pub(crate) async fn log_rejected_request_with_path(
         // is typically small and flowing through the main handler's buffered
         // arm, which populates `bytes_received` separately. Leave 0 here.
         metadata,
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
 
@@ -15881,14 +15936,27 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     PluginResult::Continue
 }
 
-/// Return the RFC 6265 cookie-name from the leading cookie-pair only.
-/// Attributes, padded names, and lines without a valid token are not names.
+const MAX_SET_COOKIE_NAME_VALUE_BYTES: usize = 4096;
+
+/// Return the RFC 10025 cookie-name from a browser-comparable leading
+/// cookie-pair. Keep the existing strict producer grammar for names, but use
+/// the user-agent value boundary: browsers accept non-control value syntax
+/// that producers are discouraged from emitting, including spaces, commas,
+/// quotes, and backslashes.
 fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     let cookie_pair = set_cookie
         .split_once(';')
         .map_or(set_cookie, |(pair, _)| pair);
-    let (name, _) = cookie_pair.split_once('=')?;
-    if name.is_empty()
+    let (name, value) = cookie_pair.split_once('=')?;
+    // RFC 6265 strips leading and trailing SP/HTAB from both sides of the
+    // cookie-pair before validating its name and value.
+    let name = name.trim_matches([' ', '\t']);
+    let value = value.trim_matches([' ', '\t']);
+    // RFC 10025 rejects a cookie when its trimmed name and value total more
+    // than 4096 octets. Such a line cannot own and suppress a valid staged
+    // cleanup cookie that the browser can actually store.
+    if name.len().saturating_add(value.len()) > MAX_SET_COOKIE_NAME_VALUE_BYTES
+        || name.is_empty()
         || !name.bytes().all(|byte| {
             matches!(
                 byte,
@@ -15914,18 +15982,338 @@ fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     {
         return None;
     }
+
+    // The first semicolon already terminated `cookie_pair`. Reject C0/DEL so
+    // malformed or header-injection-bearing values remain non-comparable,
+    // while retaining ownership for values a user agent can actually store.
+    if value.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+        return None;
+    }
+
     Some(name)
 }
 
+/// RFC 6265 ignores one leading dot on Domain attributes and compares the
+/// resulting canonicalized domain case-insensitively. Ferrum accepts the full
+/// RFC 3986 reg-name and bracketed IP-literal forms at request admission, so
+/// apply the same validation here instead of narrowing comparable cookie
+/// scopes to LDH names. Normalize IPv6 text so equivalent compressed and
+/// expanded forms cannot evade storage-key ownership.
+enum CanonicalSetCookieDomain<'a> {
+    Text(&'a str),
+    Ipv6(std::net::Ipv6Addr),
+}
+
+fn canonical_set_cookie_domain(domain: &str) -> Option<CanonicalSetCookieDomain<'_>> {
+    let domain = domain.strip_prefix('.').unwrap_or(domain);
+    if let Some(content) = domain
+        .strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+    {
+        if let Ok(ipv6) = content.parse::<std::net::Ipv6Addr>() {
+            return Some(CanonicalSetCookieDomain::Ipv6(ipv6));
+        }
+        return is_valid_ip_literal_contents(content)
+            .then_some(CanonicalSetCookieDomain::Text(domain));
+    }
+    if domain.ends_with('.') || !is_valid_reg_name(domain) {
+        return None;
+    }
+    Some(CanonicalSetCookieDomain::Text(domain))
+}
+
+fn canonical_set_cookie_domain_ip(domain: &CanonicalSetCookieDomain<'_>) -> Option<IpAddr> {
+    match domain {
+        CanonicalSetCookieDomain::Text(domain) => domain.parse().ok(),
+        CanonicalSetCookieDomain::Ipv6(domain) => Some(IpAddr::V6(*domain)),
+    }
+}
+
+fn set_cookie_request_host(authority: Option<&str>) -> Option<&str> {
+    split_request_authority(authority?).map(|(host, _)| host)
+}
+
+fn set_cookie_request_host_ip(request_host: Option<&str>) -> Option<IpAddr> {
+    let host = request_host?;
+    host.strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
+fn set_cookie_domain_is_public_suffix(domain: &str) -> bool {
+    let lowercase_domain = domain.to_ascii_lowercase();
+    psl::suffix_str(&lowercase_domain).is_some_and(|suffix| suffix == lowercase_domain.as_str())
+}
+
+fn valid_set_cookie_path(path: &str) -> bool {
+    path.starts_with('/') && !path.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
+}
+
+fn default_set_cookie_path(request_path: &str) -> &str {
+    if !request_path.starts_with('/') {
+        return "/";
+    }
+    match request_path.rfind('/') {
+        Some(0) | None => "/",
+        Some(last_slash) => &request_path[..last_slash],
+    }
+}
+
+/// Browsers treat HTTP loopback and `localhost` origins as potentially
+/// trustworthy, so they may store `Secure` cookies even without TLS. Match the
+/// default trust boundary from Secure Contexts; user-configured browser
+/// allowlists are intentionally unknowable at the proxy.
+fn request_authority_is_potentially_trustworthy(authority: &str) -> bool {
+    let Some((host, _)) = split_request_authority(authority) else {
+        return false;
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let localhost_suffix = ".localhost";
+    if host.eq_ignore_ascii_case("localhost")
+        || (host.len() > localhost_suffix.len()
+            && host
+                .get(host.len() - localhost_suffix.len()..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(localhost_suffix)))
+    {
+        return true;
+    }
+
+    let ip_literal = host
+        .strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+        .unwrap_or(host);
+    match ip_literal.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => address.octets()[0] == 127,
+        Ok(std::net::IpAddr::V6(address)) => address.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+fn request_can_store_secure_cookie(ctx: &RequestContext) -> bool {
+    ctx.request_is_secure
+        || ctx
+            .request_authority
+            .as_deref()
+            .is_some_and(request_authority_is_potentially_trustworthy)
+}
+
+struct SetCookieStorageKey<'a> {
+    name: &'a str,
+    domain: Option<CanonicalSetCookieDomain<'a>>,
+    path: &'a str,
+    host_only: bool,
+    partitioned: bool,
+}
+
+/// Return the effective RFC 10025 cookie storage key. Omitted Domain resolves
+/// to the exact validated request host used for browser cookie comparison while
+/// retaining its host-only state. Omitted, empty, or non-absolute Path
+/// attributes use the request path's default directory. Host-only and
+/// Partitioned cookies remain independent from otherwise equivalent domain and
+/// unpartitioned cookies.
+fn set_cookie_storage_key<'a>(
+    set_cookie: &'a str,
+    default_path: &'a str,
+    request_is_secure: bool,
+    request_host: Option<&'a str>,
+    request_host_ip: Option<IpAddr>,
+) -> Option<SetCookieStorageKey<'a>> {
+    let name = set_cookie_name(set_cookie)?;
+    let mut domain_attribute = None;
+    let mut path_attribute = None;
+    let mut partitioned = false;
+    let mut secure = false;
+    let mut http_only = false;
+    let mut same_site_none = false;
+
+    for attribute in set_cookie.split(';').skip(1) {
+        let attribute = attribute.trim_matches([' ', '\t']);
+        // User agents reject control-bearing cookie attributes. Do not treat a
+        // hostile Path control as ordinary invalid syntax and resolve it to the
+        // default path, which could suppress a valid staged cleanup cookie.
+        if attribute.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+            return None;
+        }
+        let (attribute_name, attribute_value) = match attribute.split_once('=') {
+            Some((name, value)) => (
+                name.trim_matches([' ', '\t']),
+                Some(value.trim_matches([' ', '\t'])),
+            ),
+            None => (attribute, None),
+        };
+        if attribute_name.eq_ignore_ascii_case("partitioned") {
+            partitioned = true;
+        } else if attribute_name.eq_ignore_ascii_case("secure") {
+            secure = true;
+        } else if attribute_name.eq_ignore_ascii_case("httponly") {
+            http_only = true;
+        } else if attribute_name.eq_ignore_ascii_case("samesite") {
+            // The last SameSite attribute wins; invalid and bare values map to
+            // the default enforcement rather than preserving an earlier None.
+            same_site_none =
+                attribute_value.is_some_and(|value| value.eq_ignore_ascii_case("none"));
+        } else if attribute_name.eq_ignore_ascii_case("domain") {
+            // User agents ignore empty and bare Domain cookie-avs. A later
+            // empty value therefore does not erase an earlier valid Domain.
+            if let Some(value) = attribute_value.filter(|value| !value.is_empty()) {
+                domain_attribute = Some(value);
+            }
+        } else if attribute_name.eq_ignore_ascii_case("path") {
+            // A bare Path is the last Path attribute with an empty value, so
+            // it supersedes an earlier value and resolves to default_path.
+            path_attribute = Some(attribute_value.unwrap_or(""));
+        }
+    }
+
+    // RFC 6265 uses the last effective Domain/Path attribute. Empty Domain
+    // values were ignored above, while a trailing-dot or otherwise malformed
+    // non-empty Domain rejects the cookie. Mainstream user agents treat an
+    // exact-IP Domain as a host cookie and reject a nonmatching IP Domain.
+    // An invalid Path value falls back to the request's default path.
+    let (domain, host_only) = match domain_attribute {
+        None => (request_host.and_then(canonical_set_cookie_domain), true),
+        Some(domain) => {
+            let domain = canonical_set_cookie_domain(domain)?;
+            if let Some(domain_ip) = canonical_set_cookie_domain_ip(&domain) {
+                if request_host_ip != Some(domain_ip) {
+                    return None;
+                }
+                (Some(domain), true)
+            } else {
+                // RFC 6265bis public-suffix handling is storage-key-visible:
+                // a Domain equal to the request host is converted to a
+                // host-only cookie, while any other public-suffix Domain is
+                // rejected. Use the current Mozilla PSL (including private
+                // suffixes such as github.io) so Ferrum compares the same key
+                // a browser will actually store.
+                let CanonicalSetCookieDomain::Text(domain_text) = &domain else {
+                    return None;
+                };
+                if set_cookie_domain_is_public_suffix(domain_text) {
+                    if !request_host.is_some_and(|host| host.eq_ignore_ascii_case(domain_text)) {
+                        return None;
+                    }
+                    (Some(domain), true)
+                } else {
+                    (Some(domain), false)
+                }
+            }
+        }
+    };
+    let path = match path_attribute {
+        Some(path) if valid_set_cookie_path(path) => path,
+        Some(_) | None => default_path,
+    };
+
+    // RFC 10025 §5.4 requires user agents to match cookie-name prefix strings
+    // case-insensitively; §5.7 applies that rule in the __Secure-/__Host-
+    // storage checks. Keep every browser-prefix check here case-insensitive.
+    let secure_prefix = name
+        .get(.."__Secure-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Secure-"));
+    let host_prefix = name
+        .get(.."__Host-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Host-"));
+    let http_prefix = name
+        .get(.."__Http-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Http-"));
+    let host_http_prefix = name
+        .get(.."__Host-Http-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Host-Http-"));
+    // Cookies that a browser will reject cannot own a staged cookie's storage
+    // key. Keep the selected line in the response, but make it non-comparable
+    // so a valid earlier cleanup is appended after it. `__Host-` additionally
+    // requires an explicit Path=/ attribute, not merely a default path of `/`;
+    // `__Http-` and `__Host-Http-` additionally require HttpOnly.
+    if (secure && !request_is_secure)
+        || (partitioned && !secure)
+        || (same_site_none && !secure)
+        || (secure_prefix && !secure)
+        || (host_prefix && (!secure || !host_only || path_attribute != Some("/")))
+        || (http_prefix && (!secure || !http_only))
+        || (host_http_prefix && !http_only)
+    {
+        return None;
+    }
+
+    Some(SetCookieStorageKey {
+        name,
+        domain,
+        path,
+        host_only,
+        partitioned,
+    })
+}
+
+fn set_cookie_same_storage_key(
+    existing: &str,
+    candidate: &str,
+    default_path: &str,
+    request_is_secure: bool,
+    request_host: Option<&str>,
+    request_host_ip: Option<IpAddr>,
+) -> bool {
+    let Some(existing_key) = set_cookie_storage_key(
+        existing,
+        default_path,
+        request_is_secure,
+        request_host,
+        request_host_ip,
+    ) else {
+        return false;
+    };
+    let Some(candidate_key) = set_cookie_storage_key(
+        candidate,
+        default_path,
+        request_is_secure,
+        request_host,
+        request_host_ip,
+    ) else {
+        return false;
+    };
+
+    existing_key.name == candidate_key.name
+        && existing_key.path == candidate_key.path
+        && existing_key.host_only == candidate_key.host_only
+        && existing_key.partitioned == candidate_key.partitioned
+        && match (existing_key.domain, candidate_key.domain) {
+            (
+                Some(CanonicalSetCookieDomain::Text(existing_domain)),
+                Some(CanonicalSetCookieDomain::Text(candidate_domain)),
+            ) => existing_domain.eq_ignore_ascii_case(candidate_domain),
+            (
+                Some(CanonicalSetCookieDomain::Ipv6(existing_domain)),
+                Some(CanonicalSetCookieDomain::Ipv6(candidate_domain)),
+            ) => existing_domain == candidate_domain,
+            (None, None) => true,
+            _ => false,
+        }
+}
+
 /// Add newline-joined `Set-Cookie` lines in encounter order, replacing an
-/// earlier line when a later line owns the same exact, case-sensitive cookie
-/// name. Invalid cookie-pairs can only replace byte-identical lines.
-fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
+/// earlier line only when a later line owns the same RFC 10025 storage key.
+/// Invalid cookie-pairs can only replace byte-identical lines.
+fn collect_later_set_cookies(
+    cookies: &mut Vec<String>,
+    joined: &str,
+    default_path: &str,
+    request_is_secure: bool,
+    request_host: Option<&str>,
+    request_host_ip: Option<IpAddr>,
+) {
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
-        let candidate_name = set_cookie_name(candidate);
         if let Some(index) = cookies.iter().position(|existing| {
             existing == candidate
-                || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+                || set_cookie_same_storage_key(
+                    existing,
+                    candidate,
+                    default_path,
+                    request_is_secure,
+                    request_host,
+                    request_host_ip,
+                )
         }) {
             cookies.remove(index);
         }
@@ -15933,22 +16321,53 @@ fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
     }
 }
 
-fn set_cookie_conflicts(cookies: &[String], candidate: &str) -> bool {
-    let candidate_name = set_cookie_name(candidate);
+fn set_cookie_conflicts(
+    cookies: &[String],
+    candidate: &str,
+    default_path: &str,
+    request_is_secure: bool,
+    request_host: Option<&str>,
+    request_host_ip: Option<IpAddr>,
+) -> bool {
     cookies.iter().any(|existing| {
         existing == candidate
-            || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+            || set_cookie_same_storage_key(
+                existing,
+                candidate,
+                default_path,
+                request_is_secure,
+                request_host,
+                request_host_ip,
+            )
     })
 }
 
 /// Stage requester-owned cookies from rejecting auth attempts. This remains on
 /// the rejection path: successful authentication only removes the metadata.
 pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
+    let default_path = default_set_cookie_path(&ctx.path);
+    let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
+    let request_host = set_cookie_request_host(ctx.request_authority.as_deref());
+    let request_host_ip = set_cookie_request_host_ip(request_host);
     let mut staged = Vec::new();
     if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
-        collect_later_set_cookies(&mut staged, existing);
+        collect_later_set_cookies(
+            &mut staged,
+            existing,
+            default_path,
+            can_store_secure_cookie,
+            request_host,
+            request_host_ip,
+        );
     }
-    collect_later_set_cookies(&mut staged, &cookie);
+    collect_later_set_cookies(
+        &mut staged,
+        &cookie,
+        default_path,
+        can_store_secure_cookie,
+        request_host,
+        request_host_ip,
+    );
 
     if staged.is_empty() {
         ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
@@ -15967,6 +16386,10 @@ fn attach_auth_rejection_set_cookie(
     let Some(staged) = ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) else {
         return;
     };
+    let default_path = default_set_cookie_path(&ctx.path);
+    let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
+    let request_host = set_cookie_request_host(ctx.request_authority.as_deref());
+    let request_host_ip = set_cookie_request_host_ip(request_host);
 
     // A custom plugin can return multiple case variants because rejection
     // headers use a String-keyed HashMap. Sort the variants by their exact key
@@ -15983,16 +16406,37 @@ fn attach_auth_rejection_set_cookie(
 
     let mut merged = Vec::new();
     for (_, value) in selected_variants {
-        collect_later_set_cookies(&mut merged, &value);
+        collect_later_set_cookies(
+            &mut merged,
+            &value,
+            default_path,
+            can_store_secure_cookie,
+            request_host,
+            request_host_ip,
+        );
     }
 
     let mut staged_cookies = Vec::new();
-    collect_later_set_cookies(&mut staged_cookies, &staged);
+    collect_later_set_cookies(
+        &mut staged_cookies,
+        &staged,
+        default_path,
+        can_store_secure_cookie,
+        request_host,
+        request_host_ip,
+    );
     for candidate in staged_cookies {
         // The selected final rejection owns conflicts. Preserve each selected
         // line's full attributes and deterministic order, appending only
-        // independently named requester-owned cookies from earlier rejects.
-        if !set_cookie_conflicts(&merged, &candidate) {
+        // independently scoped requester-owned cookies from earlier rejects.
+        if !set_cookie_conflicts(
+            &merged,
+            &candidate,
+            default_path,
+            can_store_secure_cookie,
+            request_host,
+            request_host_ip,
+        ) {
             merged.push(candidate);
         }
     }
@@ -16129,6 +16573,30 @@ pub async fn run_authentication_phase(
             }
         }
     }
+}
+
+/// Apply the original HTTP-family scheme reported by a directly connected
+/// trusted proxy through either a singleton overwrite or an XFF-correlated
+/// appended chain. The same accepted fact drives browser cookie storage checks,
+/// authority normalization, and canonical frontend URL metadata consumed by
+/// authentication plugins.
+pub fn apply_trusted_forwarded_request_scheme(
+    ctx: &mut RequestContext,
+    socket_addr: &IpAddr,
+    trusted_proxies: &client_ip::TrustedProxies,
+) -> Option<&'static str> {
+    let forwarded_scheme = client_ip::trusted_forwarded_request_scheme(
+        socket_addr,
+        ctx.raw_header_value_bytes("x-forwarded-for"),
+        ctx.raw_header_value_bytes("x-forwarded-proto"),
+        trusted_proxies,
+    );
+    if let Some(scheme) = forwarded_scheme {
+        ctx.request_is_secure = scheme == "https";
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), scheme.to_string());
+    }
+    forwarded_scheme
 }
 
 /// Handle a single proxy request.
@@ -16277,9 +16745,11 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    let mut request_scheme = if is_tls { "https" } else { "http" };
+    ctx.request_is_secure = is_tls;
     ctx.metadata.insert(
         "ferrum.frontend_scheme".to_string(),
-        if is_tls { "https" } else { "http" }.to_string(),
+        request_scheme.to_string(),
     );
     ctx.frontend_listen_port = Some(connection_metadata.frontend_listen_port.unwrap_or(
         if is_tls {
@@ -16512,6 +16982,11 @@ async fn handle_proxy_request_inner(
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         if let Some(ref addr) = socket_addr {
+            if let Some(forwarded_scheme) =
+                apply_trusted_forwarded_request_scheme(&mut ctx, addr, &state.trusted_proxies)
+            {
+                request_scheme = forwarded_scheme;
+            }
             let real_ip_header_val =
                 state
                     .env_config
@@ -16619,10 +17094,7 @@ async fn handle_proxy_request_inner(
         None => None,
     };
     let request_authority = raw_host.and_then(|authority| {
-        normalize_request_authority_for_signing(
-            authority,
-            Some(if is_tls { "https" } else { "http" }),
-        )
+        normalize_request_authority_for_signing(authority, Some(request_scheme))
     });
     ctx.request_authority = request_authority;
 
@@ -18614,6 +19086,7 @@ async fn handle_proxy_request_inner(
                     }
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
+                    ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
                     if let Some(body) = request_body {
                         ctx.metadata.insert("request_body".to_string(), body);
                     }
@@ -18676,12 +19149,6 @@ async fn handle_proxy_request_inner(
     // Early-prepared bodies already ran both hook phases above.
     let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
         .then(|| ctx.clone_for_final_request_body_hooks());
-    // Keep only the independently owned header map borrowed across dispatch.
-    // When no owned map exists, borrow `ctx.headers` at each use so final-body
-    // deadline provenance can still update the rest of `ctx` without cloning
-    // the hot-path request headers.
-    let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
-
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
     // (plaintext `http` or TLS `https`) can serve WebSocket upgrades; the
@@ -18736,7 +19203,14 @@ async fn handle_proxy_request_inner(
             }
         };
         let requires_websocket_framing = plugin_cache_view.requires_ws_frame_hooks();
-        let websocket_proxy_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
+        let mut websocket_proxy_headers =
+            owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        apply_effective_backend_scheme_headers(
+            &mut websocket_proxy_headers,
+            &ctx.client_ip,
+            ctx.request_is_secure,
+            state.add_forwarded_header,
+        );
         return handle_websocket_request_authenticated(
             request,
             state,
@@ -18827,6 +19301,17 @@ async fn handle_proxy_request_inner(
             )
         });
     if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
+        {
+            let grpc_proxy_headers = owned_proxy_headers.as_mut().unwrap_or(&mut ctx.headers);
+            apply_effective_backend_scheme_headers(
+                grpc_proxy_headers,
+                &ctx.client_ip,
+                ctx.request_is_secure,
+                state.add_forwarded_header,
+            );
+        }
+        let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
+
         // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
         // branch cannot dispatch over its secured transport (issue #2003):
         //   * CROSS-CLUSTER east-west targets (Ambient `mesh.hbone` or Sidecar
@@ -19194,6 +19679,7 @@ async fn handle_proxy_request_inner(
                 // it). Disjoint field assignments avoid a whole-`ctx` borrow.
                 let request_body = ctx.metadata.remove("request_body");
                 ctx.metadata = body_hook_ctx.metadata;
+                ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
                 if let Some(body) = request_body {
                     ctx.metadata.insert("request_body".to_string(), body);
                 }
@@ -20378,6 +20864,7 @@ async fn handle_proxy_request_inner(
                         error_class: final_error_class,
                         bytes_sent,
                         metadata,
+                        ai_usage_export: ctx.ai_usage_export.clone(),
                         ..TransactionSummary::default()
                     };
                     if body_exceeded {
@@ -21145,6 +21632,7 @@ async fn handle_proxy_request_inner(
                         bytes_sent,
                         bytes_received,
                         metadata: clone_log_metadata(&ctx),
+                        ai_usage_export: ctx.ai_usage_export.clone(),
                         ..TransactionSummary::default()
                     };
                     crate::plugins::log_with_mirror_before_buffered_response(
@@ -21327,6 +21815,7 @@ async fn handle_proxy_request_inner(
                             error_class: Some(grpc_error_class),
                             bytes_sent,
                             metadata,
+                            ai_usage_export: ctx.ai_usage_export.clone(),
                             ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror_before_buffered_response(
@@ -21382,6 +21871,12 @@ async fn handle_proxy_request_inner(
             }
         }
     }
+
+    // Keep only the independently owned header map borrowed across the
+    // selected generic dispatch. When no owned map exists, borrow
+    // `ctx.headers` at each use so final-body deadline provenance can still
+    // update the rest of `ctx` without cloning the hot-path request headers.
+    let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
 
     // Build backend URL (using upstream target if available)
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
@@ -21693,7 +22188,7 @@ async fn handle_proxy_request_inner(
             request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
-            is_tls,
+            ctx.request_is_secure,
             false,
             false,
             current_dispatch_h3,
@@ -21711,6 +22206,7 @@ async fn handle_proxy_request_inner(
             // Disjoint field assignments avoid a whole-`ctx` borrow.
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
             if let Some(body) = request_body {
                 ctx.metadata.insert("request_body".to_string(), body);
             }
@@ -22039,7 +22535,7 @@ async fn handle_proxy_request_inner(
                     &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
-                    is_tls,
+                    ctx.request_is_secure,
                     inbound_version,
                 )
                 .await
@@ -22057,7 +22553,7 @@ async fn handle_proxy_request_inner(
                     &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
-                    is_tls,
+                    ctx.request_is_secure,
                     inbound_version,
                 )
                 .await
@@ -22101,7 +22597,7 @@ async fn handle_proxy_request_inner(
             request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
-            is_tls,
+            ctx.request_is_secure,
             current_dispatch_hbone,
             current_dispatch_mesh_mtls,
             current_dispatch_h3,
@@ -22119,6 +22615,7 @@ async fn handle_proxy_request_inner(
             // Disjoint field assignments avoid a whole-`ctx` borrow.
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
             if let Some(body) = request_body {
                 ctx.metadata.insert("request_body".to_string(), body);
             }
@@ -22759,6 +23256,7 @@ async fn handle_proxy_request_inner(
                 bytes_sent,
                 bytes_received: bytes_received_buffered,
                 metadata: clone_log_metadata(&ctx),
+                ai_usage_export: ctx.ai_usage_export.clone(),
                 ..TransactionSummary::default()
             };
 
@@ -23888,7 +24386,7 @@ pub(crate) async fn proxy_to_backend_retry(
     request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
     // Honor DestinationRule per-port `connect_timeout_ms` overrides for this
@@ -24065,7 +24563,7 @@ pub(crate) async fn proxy_to_backend_retry(
         xff_append_ip,
         &state.trusted_proxies,
     );
-    let proto_str = if is_tls { "https" } else { "http" };
+    let proto_str = if request_is_secure { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
@@ -24697,7 +25195,7 @@ async fn proxy_to_backend(
     request_body_prepared: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     dispatch_hbone: bool,
     dispatch_mesh_mtls: bool,
     dispatch_h3: bool,
@@ -24833,7 +25331,7 @@ async fn proxy_to_backend(
             stream_response,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
         )
@@ -24919,7 +25417,7 @@ async fn proxy_to_backend(
             stream_response,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
         )
@@ -24989,7 +25487,7 @@ async fn proxy_to_backend(
             upstream_target,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             inbound_version,
             stream_request_body,
             retain_request_body,
@@ -25232,7 +25730,7 @@ async fn proxy_to_backend(
                         stream_response,
                         client_ip,
                         xff_append_ip,
-                        is_tls,
+                        request_is_secure,
                         resolved_ip,
                         ctx_bytes_sent_observed,
                     )
@@ -25428,7 +25926,7 @@ async fn proxy_to_backend(
         xff_append_ip,
         &state.trusted_proxies,
     );
-    let proto_str = if is_tls { "https" } else { "http" };
+    let proto_str = if request_is_secure { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
@@ -26616,7 +27114,7 @@ fn normalize_authority_for_consistency(value: &str, scheme: Option<&str>) -> Opt
 /// Canonicalize a validated Host/`:authority` value for request signatures.
 /// Default ports are omitted so equivalent HTTP authorities have one signing
 /// representation; non-default ports and bracketed IPv6 literals are retained.
-pub(crate) fn normalize_request_authority_for_signing(
+pub fn normalize_request_authority_for_signing(
     value: &str,
     scheme: Option<&str>,
 ) -> Option<String> {
@@ -27300,7 +27798,7 @@ async fn proxy_to_backend_hbone(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (
@@ -27733,7 +28231,7 @@ async fn proxy_to_backend_hbone(
         "hbone",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -27756,7 +28254,7 @@ async fn proxy_to_backend_hbone(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -27999,7 +28497,7 @@ async fn proxy_to_backend_mesh_mtls(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (
@@ -28659,7 +29157,7 @@ async fn proxy_to_backend_mesh_mtls(
         "mesh_mtls",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -28682,7 +29180,7 @@ async fn proxy_to_backend_mesh_mtls(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -29107,7 +29605,7 @@ async fn proxy_to_backend_http2(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     // Shared counter for request body bytes. The H2 direct pool forwards
     // the body via hyper without the reqwest adapter layer, so we wrap
@@ -29245,7 +29743,7 @@ async fn proxy_to_backend_http2(
         "direct_h2",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -29268,7 +29766,7 @@ async fn proxy_to_backend_http2(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -29458,7 +29956,7 @@ struct Http3BackendHeaderContext<'a> {
     client_ip: &'a str,
     xff_append_ip: &'a str,
     effective_host: &'a str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
     content_length: Option<&'a str>,
 }
@@ -29531,7 +30029,11 @@ fn build_http3_backend_headers(
     if let Ok(v) = xff.parse() {
         http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
     }
-    let proto = if ctx.is_tls { "https" } else { "http" };
+    let proto = if ctx.request_is_secure {
+        "https"
+    } else {
+        "http"
+    };
     if let Ok(v) = proto.parse() {
         http3_headers.push((
             hyper::header::HeaderName::from_static("x-forwarded-proto"),
@@ -29588,7 +30090,7 @@ async fn proxy_to_backend_http3(
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
     stream_request_body: bool,
     retain_request_body: bool,
@@ -29685,7 +30187,7 @@ async fn proxy_to_backend_http3(
                         client_ip,
                         xff_append_ip,
                         effective_host,
-                        is_tls,
+                        request_is_secure,
                         inbound_version,
                         content_length: headers.get("content-length").map(String::as_str),
                     },
@@ -30045,7 +30547,7 @@ async fn proxy_to_backend_http3(
             client_ip,
             xff_append_ip,
             effective_host,
-            is_tls,
+            request_is_secure,
             inbound_version,
             content_length: request_content_length.as_deref(),
         },
@@ -30673,7 +31175,7 @@ async fn proxy_to_backend_http3_retry(
     request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
     // reqwest dispatch receives `upstream_target` separately, so it only
@@ -30721,7 +31223,7 @@ async fn proxy_to_backend_http3_retry(
             client_ip,
             xff_append_ip,
             effective_host,
-            is_tls,
+            request_is_secure,
             inbound_version,
             content_length: None,
         },
@@ -34226,7 +34728,7 @@ mod tests {
                 false, // request_body_prepared
                 "127.0.0.1",
                 "127.0.0.1",
-                false, // is_tls
+                false, // request_is_secure
                 false, // dispatch_hbone
                 false, // dispatch_mesh_mtls
                 false, // dispatch_h3
@@ -34411,7 +34913,7 @@ mod tests {
                 client_ip: "203.0.113.44",
                 xff_append_ip: "127.0.0.1",
                 effective_host: "backend.internal",
-                is_tls: false,
+                request_is_secure: false,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,
             },
@@ -34459,7 +34961,7 @@ mod tests {
                 client_ip: "203.0.113.9",
                 xff_append_ip: "10.0.0.7",
                 effective_host: "h3-backend.example",
-                is_tls: true,
+                request_is_secure: true,
                 inbound_version: hyper::Version::HTTP_2,
                 content_length: None,
             },
