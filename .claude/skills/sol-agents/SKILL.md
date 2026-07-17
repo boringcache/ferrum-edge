@@ -1,6 +1,6 @@
 ---
 name: sol-agents
-description: Dispatch and orchestrate parallel gpt-5.6-sol codex CLI subagents (high/xhigh/max effort) for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Use when the user asks to spawn sol/codex agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate parallel gpt-5.6-sol codex CLI subagents (medium/high/xhigh effort) for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Use when the user asks to spawn sol/codex agents on issues, PRs, review findings, or red CI.
 ---
 
 # sol-agents: codex CLI subagent orchestration
@@ -16,7 +16,7 @@ PROMPT=$(cat <<'EOF'
 <per-task prompt — see modes below>
 EOF
 )
-codex exec --model gpt-5.6-sol -c model_reasoning_effort='"<high|xhigh|max>"' \
+codex exec --model gpt-5.6-sol -c model_reasoning_effort='"<medium|high|xhigh>"' \
   --sandbox danger-full-access \
   --cd <ABS_PATH_TO_SHARED_REPO_CLONE> \
   "$PROMPT" < /dev/null
@@ -33,16 +33,17 @@ Non-negotiables:
 
 ## Effort selection
 
-- **high** — default. Handles scoped fixes, review rounds, test work, and doc
-  reconciliation (clean codex rounds, correct root-causing) at reasonable
-  latency/cost.
-- **xhigh** — security-critical surfaces (authz, trust boundaries, fail-closed
-  contracts), architecturally sensitive proxy-core/dispatch work, or greenfield
-  multi-file features.
-- **max** — the hardest, highest-stakes work: subtle protocol correctness, deep
-  multi-subsystem refactors, or anything where a wrong call is expensive and the
-  extra deliberation earns its cost. Use sparingly.
-- The user may override per prompt ("on max", "on xhigh", "on high") — honor it.
+- **medium** — easier tasks and quick singular code fixes: a contained single-file
+  change, a mechanical refactor, a doc correction, or a review finding whose fix is
+  obvious and local.
+- **high** — default. Challenging multi-step coding across interconnected components:
+  scoped fixes and review rounds that span several modules, test work, and doc
+  reconciliation where the worker must reason about how the pieces fit together.
+- **xhigh** — very high-stakes work that needs lots of thinking: security-critical
+  surfaces (authz, trust boundaries, fail-closed contracts), subtle protocol
+  correctness, architecturally sensitive proxy-core/dispatch work, deep multi-subsystem
+  refactors, or anything where a wrong call is expensive. Use sparingly.
+- The user may override per prompt ("on xhigh", "on high", "on medium") — honor it.
 
 ## Prompt construction (all modes)
 
