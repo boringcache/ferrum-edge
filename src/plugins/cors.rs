@@ -868,12 +868,12 @@ fn finalize_cors_response(
         .get(crate::proxy::REJECTION_RESPONSE_METADATA_KEY)
         .is_some_and(|value| value == "true");
 
-    // Native CORS retains its established sanitization of every backend
-    // response. A matching translated Istio policy also owns the response
-    // fields. Pure Istio unmatched/no-Origin forwarding is different: Envoy
-    // leaves the upstream response untouched, so preserve that source
-    // behavior instead of silently taking ownership.
-    let should_sanitize = ctx.cors_state.native_policy_seen || ctx.cors_state.sanitize_response;
+    // A configured gateway CORS policy must remain authoritative even when an
+    // Istio policy forwards an unmatched request. Otherwise a permissive
+    // backend could re-authorize a disallowed origin with its own CORS fields.
+    let should_sanitize = ctx.cors_state.native_policy_seen
+        || ctx.cors_state.istio_policy_seen
+        || ctx.cors_state.sanitize_response;
     if should_sanitize && !(is_rejection_path && ctx.cors_state.policy_count == 0) {
         CorsPlugin::remove_access_control_headers(response_headers);
     }

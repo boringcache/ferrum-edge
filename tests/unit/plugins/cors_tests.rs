@@ -563,7 +563,17 @@ async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
         forward.on_request_received(&mut unmatched_preflight).await,
         PluginResult::Continue
     ));
-    let mut upstream_headers = HashMap::from([("x-backend".to_string(), "ok".to_string())]);
+    let mut upstream_headers = HashMap::from([
+        ("x-backend".to_string(), "ok".to_string()),
+        (
+            "access-control-allow-origin".to_string(),
+            "https://other.example".to_string(),
+        ),
+        (
+            "access-control-allow-credentials".to_string(),
+            "true".to_string(),
+        ),
+    ]);
     let _ = forward
         .after_proxy(&mut unmatched_preflight, 299, &mut upstream_headers)
         .await;
@@ -575,11 +585,21 @@ async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
         forward.on_request_received(&mut unmatched_actual).await,
         PluginResult::Continue
     ));
-    let mut actual_headers = HashMap::new();
+    let mut actual_headers = HashMap::from([
+        (
+            "access-control-allow-origin".to_string(),
+            "https://other.example".to_string(),
+        ),
+        (
+            "access-control-allow-credentials".to_string(),
+            "true".to_string(),
+        ),
+    ]);
     let _ = forward
         .after_proxy(&mut unmatched_actual, 200, &mut actual_headers)
         .await;
     assert!(!actual_headers.contains_key("access-control-allow-origin"));
+    assert!(!actual_headers.contains_key("access-control-allow-credentials"));
 
     let mut matched_actual = make_cors_ctx("DELETE", "https://app.example");
     matched_actual
