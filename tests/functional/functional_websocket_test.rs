@@ -363,6 +363,13 @@ plugin_configs:
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
+  - id: "plugin-correlation-id-ws"
+    plugin_name: "correlation_id"
+    config:
+      header_name: X-Request-Id
+      echo_downstream: true
+    scope: global
+    enabled: true
 "#,
         backend_port
     );
@@ -370,6 +377,33 @@ plugin_configs:
     let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
     file.write_all(config.as_bytes())
         .expect("Failed to write config");
+}
+
+fn write_invalid_correlation_id_file_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "invalid-correlation-proxy"
+    listen_path: "/invalid-correlation"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {}
+    strip_listen_path: true
+
+consumers: []
+plugin_configs:
+  - id: "invalid-correlation-plugin"
+    plugin_name: "correlation_id"
+    config: []
+    scope: global
+    enabled: true
+"#,
+        backend_port
+    );
+    let mut file = std::fs::File::create(config_path).expect("create invalid config file");
+    file.write_all(config.as_bytes())
+        .expect("write invalid config file");
 }
 
 /// Write a WebSocket config whose route-level method filter rejects both the
@@ -974,6 +1008,28 @@ fn assert_ws_security_policy(headers: &http::HeaderMap) {
     );
 }
 
+fn assert_generated_ws_request_id(headers: &http::HeaderMap) -> String {
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("successful WebSocket response must include generated x-request-id")
+        .to_string();
+    assert!(
+        uuid::Uuid::parse_str(&request_id).is_ok(),
+        "generated WebSocket request ID must be UUID v4: {request_id}"
+    );
+    request_id
+}
+
+fn assert_preserved_ws_request_id(headers: &http::HeaderMap, expected: &str) {
+    assert_eq!(
+        headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected)
+    );
+}
+
 fn assert_ws_later_reject_hook_wins(headers: &http::HeaderMap) {
     assert_eq!(
         headers
@@ -1035,6 +1091,46 @@ fn assert_no_failed_websocket_transport_headers(headers: &http::HeaderMap) {
 // Tests
 // ============================================================================
 
+#[ignore]
+#[tokio::test]
+async fn test_file_mode_rejects_non_object_correlation_id_config() {
+    let temp_dir = TempDir::new().expect("temporary config directory");
+    let config_path = temp_dir.path().join("invalid-correlation.yaml");
+    write_invalid_correlation_id_file_config(&config_path, free_port().await);
+    build_gateway().expect("build gateway");
+
+    let mut gateway = start_gateway_with_extra_env(
+        config_path.to_str().unwrap(),
+        free_port().await,
+        None,
+        None,
+        None,
+        &[],
+    )
+    .expect("spawn gateway with invalid file config");
+    let exit_status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = gateway.try_wait().expect("poll invalid gateway") {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+
+    match exit_status {
+        Ok(status) => assert!(
+            !status.success(),
+            "file mode must fail startup for non-object correlation_id config"
+        ),
+        Err(_) => {
+            let _ = gateway.kill();
+            let _ = gateway.wait();
+            panic!("gateway stayed running with non-object correlation_id config");
+        }
+    }
+}
+
 /// Test plaintext WebSocket (ws://) proxying: client → gateway → backend echo.
 #[ignore]
 #[tokio::test]
@@ -1061,6 +1157,7 @@ async fn test_websocket_plaintext_echo() {
         .await
         .expect("Failed to connect WebSocket");
     assert_ws_security_policy(response.headers());
+    assert_generated_ws_request_id(response.headers());
     assert_no_ws_transport_policy_values(response.headers());
     assert_eq!(
         response
@@ -1105,6 +1202,25 @@ async fn test_websocket_plaintext_echo() {
     ws.send(Message::Close(None))
         .await
         .expect("Failed to send close");
+
+    let preserved_id = "h1-preserved-websocket-id";
+    let mut preserved_request = url
+        .as_str()
+        .into_client_request()
+        .expect("valid preserved-ID WebSocket request");
+    preserved_request.headers_mut().insert(
+        "x-request-id",
+        preserved_id.parse().expect("valid preserved request ID"),
+    );
+    let (mut preserved_ws, preserved_response) =
+        tokio_tungstenite::connect_async(preserved_request)
+            .await
+            .expect("preserved-ID H1 WebSocket handshake");
+    assert_preserved_ws_request_id(preserved_response.headers(), preserved_id);
+    preserved_ws
+        .send(Message::Close(None))
+        .await
+        .expect("close preserved-ID H1 WebSocket");
 
     // Cleanup
     let _ = gateway.kill();
@@ -1593,6 +1709,7 @@ async fn test_h2_websocket_extended_connect_echo() {
     assert_eq!(response.status(), http::StatusCode::OK);
     assert_eq!(response.version(), Version::HTTP_2);
     assert_ws_security_policy(response.headers());
+    assert_generated_ws_request_id(response.headers());
     assert_no_ws_transport_policy_values(response.headers());
     assert_no_h1_only_websocket_headers(response.headers());
     assert!(
@@ -1630,6 +1747,33 @@ async fn test_h2_websocket_extended_connect_echo() {
         .await
         .expect("close H2 WebSocket");
     drop(ws);
+
+    let preserved_id = "h2-preserved-websocket-id";
+    let preserved_request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{}/ws-echo", gateway_port))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .header("x-request-id", preserved_id)
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build preserved-ID H2 WebSocket CONNECT request");
+    let preserved_response = sender
+        .send_request(preserved_request)
+        .await
+        .expect("send preserved-ID H2 WebSocket CONNECT");
+    assert_eq!(preserved_response.status(), http::StatusCode::OK);
+    assert_preserved_ws_request_id(preserved_response.headers(), preserved_id);
+    let preserved_upgrade = hyper::upgrade::on(preserved_response)
+        .await
+        .expect("preserved-ID H2 Extended CONNECT upgrade");
+    let mut preserved_ws =
+        WebSocketStream::from_raw_socket(TokioIo::new(preserved_upgrade), Role::Client, None).await;
+    preserved_ws
+        .send(Message::Close(None))
+        .await
+        .expect("close preserved-ID H2 WebSocket");
+    drop(preserved_ws);
     let _ = tokio::time::timeout(Duration::from_secs(2), conn_task).await;
 
     let _ = gateway.kill();
@@ -2040,6 +2184,7 @@ async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
         .expect("H3 WebSocket connect");
     assert_eq!(ws.status, StatusCode::OK);
     assert_ws_security_policy(&ws.headers);
+    assert_generated_ws_request_id(&ws.headers);
     assert_no_ws_transport_policy_values(&ws.headers);
     assert_no_h1_only_websocket_headers(&ws.headers);
     assert!(
@@ -2070,6 +2215,24 @@ async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
         }
         other => panic!("expected protocol close after masked frame, got {other:?}"),
     }
+
+    let preserved_id = "h3-preserved-websocket-id";
+    let mut preserved_ws = client
+        .websocket(
+            &url,
+            WebSocketOptions {
+                headers: vec![("x-request-id".to_string(), preserved_id.to_string())],
+                ..WebSocketOptions::default()
+            },
+        )
+        .await
+        .expect("preserved-ID H3 WebSocket connect");
+    assert_eq!(preserved_ws.status, StatusCode::OK);
+    assert_preserved_ws_request_id(&preserved_ws.headers, preserved_id);
+    preserved_ws
+        .send_close()
+        .await
+        .expect("close preserved-ID H3 WebSocket");
 
     let _ = gateway.kill();
     let _ = gateway.wait();

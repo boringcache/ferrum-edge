@@ -7071,6 +7071,7 @@ components:
               plugin_name:
                 const: correlation_id
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/CorrelationIdConfig"
@@ -10829,16 +10830,26 @@ components:
 
     CorrelationIdConfig:
       type: object
-      description: "Plugin: correlation_id — Generates a UUID v4 per request when missing, preserves client-supplied IDs (truncating values longer than 256 chars to a fresh UUID), and propagates the value to backends and response headers."
+      additionalProperties: false
+      description: "Plugin: correlation_id — Preserves a non-empty inbound ID only when it is at most 256 bytes and matches [A-Za-z0-9._-]+; every missing or rejected value is replaced (never truncated) with UUID v4. Multiple instances retain independent authoritative values in private typed request/session state. The first instance in priority order owns the canonical request_id, while every instance forwards and echoes only its own private value, including on successful H1/H2/H3 WebSocket handshakes. Public request_id and correlation_id.instance.* metadata are compatibility projections; later plugin writes cannot change authoritative forwarding, echo, or logged values. Effective instances on one proxy chain that overlap on any supported protocol must normalize to distinct header_name values and have distinct effective priorities; use priority_override to make canonical ownership deterministic. Disjoint protocol owners do not conflict. Admission and reload reject either overlapping ambiguous composition. Runtime admission also rejects the deployment-specific effective FERRUM_REAL_IP_HEADER value case-insensitively; that dynamic exclusion cannot be expressed by this static schema. CP/DP config sync requires every DP to advertise the same effective value as the CP before configuration is distributed. The top-level config must be an object; null fields select defaults."
       properties:
         header_name:
-          type: string
+          type: [string, "null"]
           default: x-request-id
-          description: "Header name (lowercased internally). Used for both the inbound preserved value and the outbound/echoed value. Defaults to x-request-id; common alternatives include x-correlation-id, x-trace-id."
+          minLength: 1
+          pattern: "^\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+\\s*$"
+          not:
+            type: string
+            pattern: "^\\s*(?:[Ee][Aa][Rr][Ll][Yy]-[Dd][Aa][Tt][Aa]|[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Xx]-[Gg][Rr][Pp][Cc]-[Ww][Ee][Bb]-[Mm][Oo][Dd][Ee]|[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ii][Oo][Nn]-[Ii][Nn][Ff][Oo]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Cc][Oo][Oo][Kk][Ii][Ee]|[Ee][Xx][Pp][Ee][Cc][Tt]|[Gg][Rr][Pp][Cc]-[Mm][Ee][Ss][Ss][Aa][Gg][Ee]|[Gg][Rr][Pp][Cc]-[Ss][Tt][Aa][Tt][Uu][Ss]|[Gg][Rr][Pp][Cc]-[Ss][Tt][Aa][Tt][Uu][Ss]-[Dd][Ee][Tt][Aa][Ii][Ll][Ss]-[Bb][Ii][Nn]|[Hh][Oo][Ss][Tt]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ii][Oo][Nn]-[Ii][Nn][Ff][Oo]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Aa][Cc][Cc][Ee][Pp][Tt]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Ee][Xx][Tt][Ee][Nn][Ss][Ii][Oo][Nn][Ss]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Kk][Ee][Yy]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Pp][Rr][Oo][Tt][Oo][Cc][Oo][Ll]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Vv][Ee][Rr][Ss][Ii][Oo][Nn]|[Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]|[Tt][Ee]|[Tt][Rr][Aa][Cc][Ee][Pp][Aa][Rr][Ee][Nn][Tt]|[Tt][Rr][Aa][Cc][Ee][Ss][Tt][Aa][Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Ww][Ww][Ww]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Xx]-[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Xx]-[Aa][Uu][Tt][Hh]-[Tt][Oo][Kk][Ee][Nn]|[Xx]-[Cc][Ss][Rr][Ff]-[Tt][Oo][Kk][Ee][Nn]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Ff][Oo][Rr]|[Xx]-[Gg][Oo][Oo][Gg]-[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Xx]-[Xx][Ss][Rr][Ff]-[Tt][Oo][Kk][Ee][Nn])\\s*$"
+          allOf:
+            - not:
+                type: string
+                pattern: "^\\s*(?:[Ee][Aa][Rr][Ll][Yy]-[Dd][Aa][Tt][Aa]|[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Xx]-[Gg][Rr][Pp][Cc]-[Ww][Ee][Bb]-[Mm][Oo][Dd][Ee]|[Tt][Rr][Aa][Cc][Ee][Pp][Aa][Rr][Ee][Nn][Tt]|[Tt][Rr][Aa][Cc][Ee][Ss][Tt][Aa][Tt][Ee]|[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]|[Vv][Ii][Aa]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Hh][Oo][Ss][Tt]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Pp][Rr][Oo][Tt][Oo])\\s*$"
+          description: "Header name (surrounding whitespace trimmed and lowercased internally). Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names, are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
         echo_downstream:
-          type: boolean
+          type: [boolean, "null"]
           default: true
-          description: When true, the resolved correlation ID is added to client response headers (and on rejected responses too)
+          description: When true, this instance's resolved ID is added to ordinary responses, rejection responses, and successful H1 Upgrade/H2-H3 Extended CONNECT WebSocket handshakes. Null selects true.
 
     PrometheusMetricsConfig:
       type: object

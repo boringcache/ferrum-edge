@@ -201,6 +201,15 @@ pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
 /// WebSocket-only (plugins that operate on WebSocket frames, not HTTP request/response).
 pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
 
+/// Canonical metadata key for the request ID selected by the first configured
+/// correlation-ID instance in lifecycle order.
+///
+/// Later instances retain their independently resolved values in
+/// header-scoped slots and must not overwrite this consumer-facing key. The
+/// first correlation instance claims ownership independently of any generic
+/// metadata value an earlier custom plugin may have stored under this key.
+pub const REQUEST_ID_METADATA_KEY: &str = "request_id";
+
 /// Parser-level limits contributed by a WebSocket size-policy plugin.
 ///
 /// The relay combines every applicable instance before either peer is read,
@@ -661,9 +670,49 @@ pub struct WsDisconnectContext {
 /// IPv4-mapped IPv6, and publishes the result here. Every later plugin instance
 /// performs only the lock-free `OnceLock::get_or_init` fast path. `None` is
 /// cached as well, preserving fail-closed behavior for malformed identities.
+/// When embedded privately in [`RequestContext`], the same typed state also
+/// retains authoritative HTTP correlation values. Stream contexts keep their
+/// correlation lifecycle state separately so replacing this public cache to
+/// reparse a changed client IP cannot erase stream correlation ownership.
 #[derive(Debug, Clone, Default)]
 pub struct CanonicalClientIpCache {
     value: OnceLock<Option<IpAddr>>,
+    correlation_ids: CorrelationIdState,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CorrelationIdState {
+    canonical: Option<String>,
+    instances: HashMap<String, String>,
+}
+
+impl CorrelationIdState {
+    fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
+        let publish_canonical = self.canonical.is_none();
+        self.instances
+            .insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            self.canonical = Some(request_id);
+        }
+        publish_canonical
+    }
+
+    fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.instances.get(instance_key).map(String::as_str)
+    }
+
+    fn canonical_correlation_id(&self) -> Option<&str> {
+        self.canonical.as_deref()
+    }
+
+    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        for (key, value) in &self.instances {
+            metadata.insert(key.clone(), value.clone());
+        }
+        if let Some(request_id) = &self.canonical {
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.clone());
+        }
+    }
 }
 
 impl CanonicalClientIpCache {
@@ -681,6 +730,23 @@ impl CanonicalClientIpCache {
     #[doc(hidden)]
     pub fn is_initialized(&self) -> bool {
         self.value.get().is_some()
+    }
+
+    fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
+        self.correlation_ids
+            .publish_correlation_id(instance_key, request_id)
+    }
+
+    fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.correlation_ids.correlation_id(instance_key)
+    }
+
+    fn canonical_correlation_id(&self) -> Option<&str> {
+        self.correlation_ids.canonical_correlation_id()
+    }
+
+    fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        self.correlation_ids.project_correlation_ids(metadata);
     }
 }
 
@@ -1400,6 +1466,30 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
+    }
+
+    pub(crate) fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) {
+        let publish_canonical = self
+            .canonical_client_ip
+            .publish_correlation_id(instance_key, request_id.clone());
+        self.metadata
+            .insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            self.metadata
+                .insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+        }
+    }
+
+    pub(crate) fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.canonical_client_ip.correlation_id(instance_key)
+    }
+
+    pub(crate) fn canonical_correlation_id(&self) -> Option<&str> {
+        self.canonical_client_ip.canonical_correlation_id()
+    }
+
+    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        self.canonical_client_ip.project_correlation_ids(metadata);
     }
 
     fn replace_ai_usage_export(&mut self, candidate: AiUsageExport) {
@@ -3376,9 +3466,16 @@ pub struct StreamConnectionContext {
     /// `mesh_authz` to populate Istio's `source.ip` principal (socket peer)
     /// separately from `remote.ip` (forwarded/resolved address).
     pub direct_client_ip: String,
-    /// Shared typed-client-IP cache for stream policy instances.
+    /// Shared typed client-IP cache for stream policy instances.
+    /// Replacing this cache after changing `client_ip` invalidates only typed
+    /// client-IP parsing; authoritative correlation ownership is independent.
     #[doc(hidden)]
     pub canonical_client_ip: CanonicalClientIpCache,
+    /// Authoritative per-instance and canonical stream correlation values.
+    ///
+    /// This must remain private and non-replaceable by custom plugins. Public
+    /// metadata is only a compatibility projection of this lifecycle state.
+    correlation_ids: CorrelationIdState,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub listen_port: u16,
@@ -3442,6 +3539,47 @@ pub struct StreamConnectionContext {
 }
 
 impl StreamConnectionContext {
+    /// Create a stream plugin context with empty optional lifecycle state.
+    ///
+    /// External plugins and tests must use this constructor rather than a
+    /// struct literal because authoritative correlation ownership is private.
+    /// The public fields may still be populated or updated before hooks run;
+    /// if `client_ip` changes, replace `canonical_client_ip` with its default
+    /// value to force an independent typed-IP reparse.
+    pub fn new(
+        client_ip: String,
+        direct_client_ip: String,
+        proxy_id: String,
+        proxy_name: Option<String>,
+        listen_port: u16,
+        backend_scheme: BackendScheme,
+        consumer_index: Arc<ConsumerIndex>,
+    ) -> Self {
+        Self {
+            client_ip,
+            direct_client_ip,
+            canonical_client_ip: CanonicalClientIpCache::default(),
+            correlation_ids: CorrelationIdState::default(),
+            proxy_id,
+            proxy_name,
+            listen_port,
+            backend_scheme,
+            consumer_index,
+            identified_consumer: None,
+            authenticated_identity: None,
+            auth_method: None,
+            metadata: None,
+            admission_permits: Vec::new(),
+            tls_client_cert_der: None,
+            tls_client_cert_chain_der: None,
+            sni_hostname: None,
+            mesh_direction: None,
+            node_waypoint_policy_scope: None,
+            first_bytes: None,
+            first_bytes_kind: None,
+        }
+    }
+
     /// Return the authoritative stream client IP as a canonical typed address.
     ///
     /// The value is parsed at most once per TCP connection or UDP/DTLS session
@@ -3454,6 +3592,17 @@ impl StreamConnectionContext {
     #[doc(hidden)]
     pub fn canonical_client_ip_is_initialized(&self) -> bool {
         self.canonical_client_ip.is_initialized()
+    }
+
+    pub(crate) fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) {
+        let publish_canonical = self
+            .correlation_ids
+            .publish_correlation_id(instance_key, request_id.clone());
+        let metadata = self.metadata.get_or_insert_with(HashMap::new);
+        metadata.insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+        }
     }
 
     /// Return the stable authenticated identity for stream policies. A mapped
@@ -3474,7 +3623,25 @@ impl StreamConnectionContext {
 
     /// Take the metadata map, returning an empty map if never allocated.
     pub fn take_metadata(&mut self) -> HashMap<String, String> {
-        self.metadata.take().unwrap_or_default()
+        let mut metadata = self.metadata.take().unwrap_or_default();
+        self.correlation_ids.project_correlation_ids(&mut metadata);
+        metadata
+    }
+
+    /// Transfer plugin-writable metadata and private correlation ownership to a
+    /// session that can receive additional metadata before its terminal summary.
+    ///
+    /// UDP and DTLS keep the correlation state immutable after admission, then
+    /// re-project it after all per-datagram metadata has been merged. This avoids
+    /// cloning correlation values per datagram while preventing those hooks from
+    /// replacing the authoritative terminal values.
+    pub(crate) fn take_metadata_with_correlation_ids(
+        &mut self,
+    ) -> (HashMap<String, String>, CorrelationIdState) {
+        (
+            self.metadata.take().unwrap_or_default(),
+            std::mem::take(&mut self.correlation_ids),
+        )
     }
 
     pub(crate) fn add_admission_permit(&mut self, permit: StreamAdmissionPermit) {
@@ -3787,6 +3954,15 @@ pub trait Plugin: Send + Sync {
     /// Returns the plugin name.
     fn name(&self) -> &str;
 
+    /// Return the non-empty correlation header owned by this instance, or
+    /// `None` when it owns no correlation header. Plugin-cache admission trims
+    /// and ASCII-case-folds claims before rejecting empty, deployment-owned
+    /// `FERRUM_REAL_IP_HEADER`, or ambiguous writers.
+    #[doc(hidden)]
+    fn correlation_id_header_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Returns the execution priority (lower = runs first).
     ///
     /// Plugins are sorted by priority within each lifecycle phase.
@@ -4067,6 +4243,24 @@ pub trait Plugin: Send + Sync {
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Decorate the successful WebSocket handshake response before the
+    /// frontend commits it.
+    ///
+    /// H1 Upgrade and H2/H3 Extended CONNECT bypass the ordinary
+    /// `after_proxy` response lifecycle. This deliberately non-rejecting,
+    /// synchronous hook gives request-local header decorators an equivalent
+    /// boundary without introducing backend-handshake rollback or I/O after
+    /// the upstream has already accepted the session. Protocol-managed fields
+    /// are removed after the ordered hook chain, then the frontend restores
+    /// its authoritative Upgrade/subprotocol fields.
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
     }
 
     /// Returns `true` when this plugin defines deterministic response-header
@@ -5037,7 +5231,16 @@ pub fn create_plugin_with_http_client(
             config,
         )?))),
         "bot_detection" => Ok(Some(Arc::new(bot_detection::BotDetection::new(config)?))),
-        "correlation_id" => Ok(Some(Arc::new(correlation_id::CorrelationId::new(config)?))),
+        "correlation_id" => {
+            let plugin = match http_client.real_ip_header() {
+                Some(real_ip_header) => correlation_id::CorrelationId::new_with_real_ip_header(
+                    config,
+                    Some(real_ip_header),
+                )?,
+                None => correlation_id::CorrelationId::new(config)?,
+            };
+            Ok(Some(Arc::new(plugin)))
+        }
         "request_transformer" => Ok(Some(Arc::new(
             request_transformer::RequestTransformer::new(config)?,
         ))),
@@ -5275,7 +5478,8 @@ pub fn validate_plugin_config_with_policy(
     config: &Value,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
-    let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
+    let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
+        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header());
     validate_plugin_config_with_http_client(name, config, http_client)?;
     validate_plugin_config_policy_only(name, config, backend_allow_ips)
 }

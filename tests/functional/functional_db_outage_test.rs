@@ -273,7 +273,6 @@ async fn test_db_outage_proxy_continues_with_plugins() {
             "enabled": true,
             "config": {
                 "header_name": "x-correlation-id",
-                "generator": "uuid",
                 "echo_downstream": true
             }
         }),
@@ -551,7 +550,6 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
             "enabled": true,
             "config": {
                 "header_name": "x-request-id",
-                "generator": "uuid",
                 "echo_downstream": true
             }
         }))

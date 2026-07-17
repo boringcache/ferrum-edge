@@ -89,6 +89,8 @@ FERRUM_REAL_IP_HEADER="True-Client-IP"
 
 **Security note**: This header is only trusted when the direct TCP connection comes from a trusted proxy (as defined by `FERRUM_TRUSTED_PROXIES`). If a client connects directly and sends this header, the socket IP is kept rather than falling through to `X-Forwarded-For`.
 
+The effective header name is gateway-owned client-attribution state. Ferrum rejects any `correlation_id.header_name` (including a custom plugin correlation-capability claim) that matches it case-insensitively, preventing correlation processing from replacing the backend-visible attribution header. In CP/DP deployments this is an enforced cluster setting: every DP advertises its effective value during config subscription, and the CP refuses to distribute configuration when the value is missing or differs. Configure the same value (or no value) on every CP and DP.
+
 Values must contain exactly one parseable IP address or one parseable socket address whose host is an IP. Whitespace is trimmed, accepted values are normalized with Rust's `IpAddr` formatter, and any source port is discarded before the value is used in plugin context, rate-limit keys, and logs. For example, `2001:0db8:0000::0001` is stored as `2001:db8::1`, and CloudFront's `198.51.100.10:46532` is stored as `198.51.100.10`.
 
 ## Security Model

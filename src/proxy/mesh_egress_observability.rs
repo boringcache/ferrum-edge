@@ -64,32 +64,22 @@ impl CapturedMeshEgressLifecycle {
         }
 
         let client_ip = client_ip.to_string();
-        let mut stream_ctx = StreamConnectionContext {
-            client_ip: client_ip.clone(),
-            direct_client_ip: client_ip.clone(),
-            canonical_client_ip: Default::default(),
-            proxy_id: proxy.id.clone(),
-            proxy_name: Some(destination_service.to_string()),
-            listen_port: destination_port,
-            backend_scheme: proxy.effective_scheme(),
-            consumer_index: Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index))),
-            identified_consumer: None,
-            // NodeWaypoint TCP and Ambient UDP capture already verified the
-            // originating pod's identity before handing the flow here; carry
-            // it so workload_metrics attributes CLIENT spans/labels to the
-            // captured source workload rather than the waypoint/ztunnel.
-            authenticated_identity: asserted_source_identity.map(|identity| identity.to_string()),
-            auth_method: None,
-            metadata: None,
-            admission_permits: Vec::new(),
-            tls_client_cert_der: None,
-            tls_client_cert_chain_der: None,
-            sni_hostname: None,
-            mesh_direction: Some(MeshTrafficDirection::Outbound),
-            node_waypoint_policy_scope: None,
-            first_bytes: None,
-            first_bytes_kind: None,
-        };
+        let mut stream_ctx = StreamConnectionContext::new(
+            client_ip.clone(),
+            client_ip.clone(),
+            proxy.id.clone(),
+            Some(destination_service.to_string()),
+            destination_port,
+            proxy.effective_scheme(),
+            Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index))),
+        );
+        // NodeWaypoint TCP and Ambient UDP capture already verified the
+        // originating pod's identity before handing the flow here; carry
+        // it so workload_metrics attributes CLIENT spans/labels to the
+        // captured source workload rather than the waypoint/ztunnel.
+        stream_ctx.authenticated_identity =
+            asserted_source_identity.map(|identity| identity.to_string());
+        stream_ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
         let mut rejected = false;
         for plugin in &plugins {
             if matches!(
@@ -353,31 +343,21 @@ mod tests {
     }
 
     fn stream_context() -> StreamConnectionContext {
-        StreamConnectionContext {
-            client_ip: "10.0.0.2".to_string(),
-            direct_client_ip: "10.0.0.2".to_string(),
-            canonical_client_ip: Default::default(),
-            proxy_id: "mesh-egress".to_string(),
-            proxy_name: Some("orders.default.svc.cluster.local".to_string()),
-            listen_port: 5432,
-            backend_scheme: BackendScheme::Tcp,
-            consumer_index: Arc::new(ConsumerIndex::new(&[])),
-            identified_consumer: None,
-            authenticated_identity: None,
-            auth_method: None,
-            metadata: Some(std::collections::HashMap::from([(
-                "mesh.direction".to_string(),
-                "outbound".to_string(),
-            )])),
-            admission_permits: Vec::new(),
-            tls_client_cert_der: None,
-            tls_client_cert_chain_der: None,
-            sni_hostname: None,
-            mesh_direction: Some(MeshTrafficDirection::Outbound),
-            node_waypoint_policy_scope: None,
-            first_bytes: None,
-            first_bytes_kind: None,
-        }
+        let mut ctx = StreamConnectionContext::new(
+            "10.0.0.2".to_string(),
+            "10.0.0.2".to_string(),
+            "mesh-egress".to_string(),
+            Some("orders.default.svc.cluster.local".to_string()),
+            5432,
+            BackendScheme::Tcp,
+            Arc::new(ConsumerIndex::new(&[])),
+        );
+        ctx.metadata = Some(std::collections::HashMap::from([(
+            "mesh.direction".to_string(),
+            "outbound".to_string(),
+        )]));
+        ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+        ctx
     }
 
     #[tokio::test]

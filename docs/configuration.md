@@ -674,7 +674,7 @@ See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full TCP/UDP proxy documentation.
 | `FERRUM_ADD_VIA_HEADER` | No | `true` | Add `Via` on request and response paths |
 | `FERRUM_VIA_PSEUDONYM` | No | `ferrum-edge` | Pseudonym used in the `Via` header |
 | `FERRUM_ADD_FORWARDED_HEADER` | No | `false` | Add RFC 7239 `Forwarded` alongside `X-Forwarded-*` |
-| `FERRUM_REAL_IP_HEADER` | No | — | Authoritative real-IP header name (e.g., `CF-Connecting-IP`, `X-Real-IP`) |
+| `FERRUM_REAL_IP_HEADER` | No | — | Authoritative real-IP header name (e.g., `CF-Connecting-IP`, `X-Real-IP`). Its effective value is reserved from `correlation_id.header_name` case-insensitively so correlation processing cannot overwrite backend-visible client attribution. In CP/DP mode it is an enforced cluster-wide setting: every DP advertises its value and the CP rejects missing or mismatched advertisements before distributing config. Configure the same value (or no value) on every CP and DP. |
 
 OAuth2/OIDC authentication is configured through plugin configs rather than `FERRUM_*` variables. `oauth2_introspection`, `oidc_relying_party`, `jwks_auth`, and `jwt_auth` support issuer/audience constraints and claim-based authorization; see [plugins.md](plugins.md#authentication-plugins) and [oidc_relying_party.md](oidc_relying_party.md) for configuration examples.
 

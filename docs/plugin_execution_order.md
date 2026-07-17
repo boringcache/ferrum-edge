@@ -22,7 +22,10 @@ checks then pass through the request/header phases in strict order. Buffered
 responses run the body phases before logging; streamed non-buffered responses
 skip the buffered body phases and run a terminal stream hook before logging.
 WebSocket connections optionally enter a frame phase after the HTTP upgrade
-completes. Plugins only run in the phases they implement:
+completes. Successful H1/H2/H3 WebSocket handshakes run a synchronous,
+non-rejecting response-header decoration boundary in configured priority order
+before transport-owned handshake fields are restored. Plugins only run in the
+phases they implement:
 
 ```
 Request In
@@ -237,7 +240,7 @@ Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_va
 
 `waf` request metadata inspection (path, query, headers, cookies, and method) runs in the `authorize` phase at priority 2930, after authentication and earlier authorization plugins such as `access_control`, `mesh_authz`, `opa`, and consumer-aware `rate_limiting`. Authenticated proxies that reject during auth/authz therefore avoid WAF scan cost, while public/no-auth proxies still run WAF before backend dispatch. WAF request-body inspection remains on the final backend-visible request body.
 
-**Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS and UDP+DTLS listeners it runs after the frontend TLS/DTLS handshake and before the backend connection/session is opened, so plugins can inspect the client certificate without spending upstream capacity first. Frontend TLS/DTLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection/session immediately and do not dial the backend. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`. Built-in admission plugins can instead attach opaque connection permits; TCP runners release all permits in reverse order immediately when a later plugin rejects, and normal connection teardown releases any remaining permits exactly once.
+**Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS and UDP+DTLS listeners it runs after the frontend TLS/DTLS handshake and before the backend connection/session is opened, so plugins can inspect the client certificate without spending upstream capacity first. Frontend TLS/DTLS handshake failures do not fire stream plugins; plugin rejects close the frontend connection/session immediately and do not dial the backend. Plugins can also insert metadata (e.g., trace IDs) into `ctx.metadata`, which is carried through to `on_stream_disconnect`. Built-in correlation IDs remain in private lifecycle state and are authoritatively projected into terminal metadata after plugin-writable merges. Built-in admission plugins can instead attach opaque connection permits; TCP runners release all permits in reverse order immediately when a later plugin rejects, and normal connection teardown releases any remaining permits exactly once.
 
 **Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or a UDP/DTLS session expires, is cleaned up, or otherwise ends). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
 
@@ -282,6 +285,15 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 ## WebSocket Frame Lifecycle (`on_ws_frame`)
 
 WebSocket connections go through the normal HTTP plugin pipeline during the upgrade handshake — authentication, authorization, rate limiting, and all other HTTP phases execute before the connection is upgraded. Once the WebSocket upgrade completes, parser policies and message-level hooks kick in.
+
+Successful upgrade responses do not run the general asynchronous `after_proxy`
+chain. They run the ordered `apply_websocket_handshake_response_headers`
+boundary instead, with status 101 for H1 and 200 for H2/H3. The hook cannot
+reject or perform I/O after the backend has accepted the session. Ferrum then
+strips connection/framing/WebSocket transport fields, adds the authoritative
+H1 Upgrade fields or Extended CONNECT response, preserves the verified backend
+subprotocol, and appends any gateway-owned sticky cookie. `correlation_id`
+uses this boundary to echo generated and preserved IDs consistently.
 
 Plugins that opt into `on_ws_disconnect` receive exactly one terminal callback
 after both relay directions finish, including clean closes, typed errors, drain
@@ -431,7 +443,7 @@ Given all built-in plugins enabled, the execution order is:
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
 | 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect |
-| 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, on_stream_connect |
+| 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 3 | `cors` | 100 | on_request_received, after_proxy |
 | 4 | `request_termination` | 125 | on_request_received |
 | 5 | `mesh_outbound_registry` | 130 | on_request_received |

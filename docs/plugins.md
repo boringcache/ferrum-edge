@@ -787,7 +787,7 @@ Only set when the gateway itself could not communicate with the backend (or when
   "latency_plugin_external_io_ms": 0.0,
   "latency_gateway_overhead_ms": 0.88,
   "request_user_agent": "python-requests/2.31.0",
-  "metadata": {"x-correlation-id": "abc-123-def"}
+  "metadata": {"request_id": "abc-123-def"}
 }
 ```
 
@@ -842,7 +842,7 @@ Only set when the gateway itself could not communicate with the backend (or when
   "latency_plugin_external_io_ms": 0.0,
   "latency_gateway_overhead_ms": 0.85,
   "request_user_agent": "CFNetwork/1568.200.51",
-  "metadata": {"x-correlation-id": "h3-789-xyz"}
+  "metadata": {"request_id": "h3-789-xyz"}
 }
 ```
 
@@ -871,7 +871,7 @@ HTTP/3 uses the same `TransactionSummary` as HTTP/1.1 and HTTP/2. The frontend a
   "latency_gateway_overhead_ms": 0.70,
   "request_user_agent": "grpc-go/1.62.0",
   "metadata": {
-    "x-correlation-id": "grpc-456",
+    "request_id": "grpc-456",
     "grpc_service": "myapp.UserService",
     "grpc_method": "GetUser"
   }
@@ -902,7 +902,7 @@ gRPC errors return HTTP 200 with the error in `grpc-status`/`grpc-message` trail
   "latency_plugin_external_io_ms": 0.0,
   "latency_gateway_overhead_ms": 0.40,
   "request_user_agent": "Mozilla/5.0",
-  "metadata": {"x-correlation-id": "ws-101-abc"}
+  "metadata": {"request_id": "ws-101-abc"}
 }
 ```
 
@@ -1100,16 +1100,24 @@ The configuration object is closed: any key other than `redacted_headers` is rej
 
 ### `correlation_id`
 
-Generates and propagates correlation IDs for request tracing across services. When the inbound request already includes the configured header (and the value is no longer than 256 characters), the existing value is preserved and forwarded; otherwise the plugin generates a fresh UUID v4 and stores it in `ctx.metadata["request_id"]` for downstream logging plugins to pick up.
+Generates and propagates correlation IDs for request tracing across services. An inbound value is preserved only when it is non-empty, no longer than 256 bytes, and matches `[A-Za-z0-9._-]+`. UUIDs and ULID-style values are accepted; printable punctuation such as `order:123`, `Root=1-abc;Parent=def`, spaces, slashes, plus signs, and non-ASCII text are rejected. Every missing or rejected value is replaced by a fresh UUID v4; values are never truncated.
+
+The first configured `correlation_id` instance in lifecycle/priority order owns the canonical request ID consumed by built-in approval, chargeback, transaction, and WebSocket logging plugins. Every instance retains its authoritative resolved value in private typed request/session state and uses only that value for backend forwarding and downstream echo. The plugin projects those values into the compatibility metadata keys `request_id` and `correlation_id.instance.<lowercase-header-name>`; later plugin writes to those public keys cannot change authoritative forwarding, echo, or logged correlation values. Multiple headers therefore remain independent trust domains: a later client-preserved value cannot overwrite an earlier gateway-generated ID. Priority overrides explicitly select which instance owns the canonical `request_id` without collapsing the other headers.
+
+Canonical ownership is private request/session lifecycle state, not inferred from plugin-writable metadata. An earlier custom plugin therefore cannot claim ownership by pre-populating either `request_id` or the documented instance namespace. Effective instances on the same proxy chain that overlap on at least one supported protocol must normalize to distinct `header_name` values and must have distinct effective priorities; configure `priority_override` on all but at most one overlapping instance to make the canonical owner deterministic across storage backends and reloads. Admission and reload reject either ambiguous composition. The same header or priority remains valid on disjoint proxy chains and between custom owners whose supported protocol sets do not overlap.
+
+`ai_tool_governor` approval requests read private canonical correlation state first, then fall back to custom-plugin `request_id` and `correlation_id` metadata when no built-in producer claimed a canonical value. `api_chargeback_sink` reads canonical `request_id` first. Its older `x-request-id` and `correlation_id` metadata spellings remain fallback-only for compatibility with custom plugins that predate the canonical contract. WebSocket disconnect logging likewise prefers `request_id` and falls back to custom `correlation_id` metadata. Built-in producers and consumers use `request_id`.
 
 **Priority:** 50
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `header_name` | String | `x-request-id` | Header name used for inbound, outbound, and echoed IDs. Lowercased internally. Must be a non-empty valid HTTP header token (RFC 7230 §3.2.6) — non-string values, empty strings, and values containing separators like `:` are rejected at plugin load time. |
-| `echo_downstream` | bool | `true` | Include correlation ID in response headers. Non-boolean values are rejected at plugin load time. |
+| `header_name` | String or null | `x-request-id` | Header name used for inbound, outbound, and echoed IDs. Surrounding whitespace is trimmed and the name is lowercased internally. Must be a non-empty valid HTTP header token (RFC 7230 §3.2.6). Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing-context, gRPC status, WebSocket handshake, and internal marker names (`host`, `forwarded`, `via`, `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, `connection`, `content-encoding`, `content-length`, `early-data`, `expect`, `traceparent`, `tracestate`, `transfer-encoding`, `upgrade`, `grpc-status`, `x-grpc-web-mode`, `x-ferrum-original-content-encoding`, `sec-websocket-*`, and the other names listed in the OpenAPI schema) are rejected. The effective deployment-specific `FERRUM_REAL_IP_HEADER` value is also rejected case-insensitively so correlation cannot overwrite backend-visible client attribution; CP/DP deployments enforce one matching value across the config-sync handshake before distributing config. Security-sensitive request and response names (`authorization`, `cookie`, `set-cookie`, `www-authenticate`, `api-key`, `x-api-key`, `x-goog-api-key`, API/auth/CSRF/XSRF token aliases, forwarded authorization, and proxy equivalents) are also rejected so correlation processing cannot replace, copy, or echo credentials or authentication state. Null selects the default. |
+| `echo_downstream` | bool or null | `true` | Include the resolved ID in ordinary responses, plugin rejection responses, and successful H1 Upgrade/H2-H3 Extended CONNECT WebSocket handshakes. Null selects the default. |
 
-The plugin runs across all protocols (HTTP, gRPC, WebSocket, TCP, UDP). For stream protocols the ID is generated and stashed at `on_stream_connect`.
+The config itself must be a JSON object; top-level null and every other non-object value are rejected. The object is closed: keys other than `header_name` and `echo_downstream` are rejected deterministically rather than silently enabling defaults.
+
+The plugin runs across all protocols (HTTP, gRPC, WebSocket, TCP, UDP). For stream protocols each instance generates an isolated ID at `on_stream_connect`, and the first instance publishes the canonical `request_id`.
 
 ### `prometheus_metrics`
 

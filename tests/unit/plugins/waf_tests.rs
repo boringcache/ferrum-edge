@@ -2387,29 +2387,19 @@ use ferrum_edge::plugins::{
 use std::sync::Arc;
 
 fn stream_ctx(first_bytes: &[u8], kind: StreamBytesKind) -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: "203.0.113.10".to_string(),
-        direct_client_ip: "203.0.113.10".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "tcp-proxy".to_string(),
-        proxy_name: Some("TCP Proxy".to_string()),
-        listen_port: 9000,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ConsumerIndex::new(&[])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        // `.into()` infers `bytes::Bytes` from the field type — no extra dep.
-        first_bytes: Some(first_bytes.to_vec().into()),
-        first_bytes_kind: Some(kind),
-    }
+    let mut ctx = StreamConnectionContext::new(
+        "203.0.113.10".to_string(),
+        "203.0.113.10".to_string(),
+        "tcp-proxy".to_string(),
+        Some("TCP Proxy".to_string()),
+        9000,
+        BackendScheme::Tcp,
+        Arc::new(ConsumerIndex::new(&[])),
+    );
+    // `.into()` infers `bytes::Bytes` from the field type — no extra dep.
+    ctx.first_bytes = Some(first_bytes.to_vec().into());
+    ctx.first_bytes_kind = Some(kind);
+    ctx
 }
 
 fn udp_ctx(payload: &[u8], kind: StreamBytesKind) -> UdpDatagramContext<'_> {
