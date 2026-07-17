@@ -3316,13 +3316,8 @@ pub(crate) fn apply_effective_backend_scheme_headers(
     add_forwarded_header: bool,
 ) {
     let scheme = if request_is_secure { "https" } else { "http" };
-    let forwarded = add_forwarded_header.then(|| {
-        build_forwarded_value(
-            client_ip,
-            scheme,
-            headers.get("host").map(String::as_str),
-        )
-    });
+    let forwarded = add_forwarded_header
+        .then(|| build_forwarded_value(client_ip, scheme, headers.get("host").map(String::as_str)));
     headers.insert("x-forwarded-proto".to_string(), scheme.to_string());
     if let Some(forwarded) = forwarded {
         headers.insert("forwarded".to_string(), forwarded);
@@ -15813,9 +15808,7 @@ fn set_cookie_storage_key<'a>(
                     return None;
                 };
                 if set_cookie_domain_is_public_suffix(domain_text) {
-                    if !request_host
-                        .is_some_and(|host| host.eq_ignore_ascii_case(domain_text))
-                    {
+                    if !request_host.is_some_and(|host| host.eq_ignore_ascii_case(domain_text)) {
                         return None;
                     }
                     (None, true)
@@ -15881,8 +15874,7 @@ fn set_cookie_same_storage_key(
         request_is_secure,
         request_host,
         request_host_ip,
-    )
-    else {
+    ) else {
         return false;
     };
     let Some(candidate_key) = set_cookie_storage_key(
@@ -15891,8 +15883,7 @@ fn set_cookie_same_storage_key(
         request_is_secure,
         request_host,
         request_host_ip,
-    )
-    else {
+    ) else {
         return false;
     };
 
@@ -18628,8 +18619,7 @@ async fn handle_proxy_request_inner(
             }
         };
         let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
-        let mut websocket_proxy_headers =
-            owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
+        let mut websocket_proxy_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
         apply_effective_backend_scheme_headers(
             &mut websocket_proxy_headers,
             &ctx.client_ip,
@@ -18726,9 +18716,7 @@ async fn handle_proxy_request_inner(
             )
         });
     if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
-        let grpc_proxy_headers = owned_proxy_headers
-            .as_mut()
-            .unwrap_or(&mut ctx.headers);
+        let grpc_proxy_headers = owned_proxy_headers.as_mut().unwrap_or(&mut ctx.headers);
         apply_effective_backend_scheme_headers(
             grpc_proxy_headers,
             &ctx.client_ip,

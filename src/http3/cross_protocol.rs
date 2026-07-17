@@ -8219,7 +8219,10 @@ mod tests {
         )
         .build()
         .expect("request should build");
-        assert_eq!(header_value(&request, "x-forwarded-proto"), Some(&b"http"[..]));
+        assert_eq!(
+            header_value(&request, "x-forwarded-proto"),
+            Some(&b"http"[..])
+        );
         assert_eq!(
             header_value(&request, "forwarded"),
             Some(&b"for=203.0.113.1;proto=http;host=api.example"[..])
@@ -8234,7 +8237,9 @@ mod tests {
             /* is_early_data = */ false,
         );
         assert_eq!(
-            grpc_headers.get("x-forwarded-proto").map(|value| value.as_bytes()),
+            grpc_headers
+                .get("x-forwarded-proto")
+                .map(|value| value.as_bytes()),
             Some(&b"http"[..])
         );
         assert_eq!(
