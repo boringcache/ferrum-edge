@@ -4707,7 +4707,11 @@ fn test_duplicate_effective_correlation_headers_are_rejected() {
 #[test]
 fn test_equal_effective_correlation_priorities_are_rejected() {
     let config = make_config(
-        vec![make_proxy("p1", "/api", vec!["corr-internal", "corr-external"])],
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["corr-internal", "corr-external"],
+        )],
         vec![
             make_plugin_config_with_json(
                 "corr-internal",
