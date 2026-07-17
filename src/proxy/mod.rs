@@ -18559,12 +18559,6 @@ async fn handle_proxy_request_inner(
     // Early-prepared bodies already ran both hook phases above.
     let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
         .then(|| ctx.clone_for_final_request_body_hooks());
-    // Keep only the independently owned header map borrowed across dispatch.
-    // When no owned map exists, borrow `ctx.headers` at each use so final-body
-    // deadline provenance can still update the rest of `ctx` without cloning
-    // the hot-path request headers.
-    let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
-
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
     // (plaintext `http` or TLS `https`) can serve WebSocket upgrades; the
@@ -18619,7 +18613,10 @@ async fn handle_proxy_request_inner(
             }
         };
         let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
-        let mut websocket_proxy_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
+        let mut websocket_proxy_headers = owned_proxy_headers
+            .as_ref()
+            .unwrap_or(&ctx.headers)
+            .clone();
         apply_effective_backend_scheme_headers(
             &mut websocket_proxy_headers,
             &ctx.client_ip,
@@ -18716,14 +18713,16 @@ async fn handle_proxy_request_inner(
             )
         });
     if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
-        let grpc_proxy_headers = owned_proxy_headers.as_mut().unwrap_or(&mut ctx.headers);
-        apply_effective_backend_scheme_headers(
-            grpc_proxy_headers,
-            &ctx.client_ip,
-            ctx.request_is_secure,
-            state.add_forwarded_header,
-        );
-        let proxy_headers: &HashMap<String, String> = grpc_proxy_headers;
+        {
+            let grpc_proxy_headers = owned_proxy_headers.as_mut().unwrap_or(&mut ctx.headers);
+            apply_effective_backend_scheme_headers(
+                grpc_proxy_headers,
+                &ctx.client_ip,
+                ctx.request_is_secure,
+                state.add_forwarded_header,
+            );
+        }
+        let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
 
         // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
         // branch cannot dispatch over its secured transport (issue #2003):
@@ -21281,8 +21280,11 @@ async fn handle_proxy_request_inner(
         }
     }
 
-    let proxy_headers: &HashMap<String, String> =
-        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    // Keep only the independently owned header map borrowed across the
+    // selected generic dispatch. When no owned map exists, borrow
+    // `ctx.headers` at each use so final-body deadline provenance can still
+    // update the rest of `ctx` without cloning the hot-path request headers.
+    let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
 
     // Build backend URL (using upstream target if available)
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {

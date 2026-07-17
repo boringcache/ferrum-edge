@@ -7174,9 +7174,10 @@ mod tests {
 
     use super::{
         apply_buffered_grpc_plugin_reject, apply_buffered_plain_plugin_reject,
-        apply_h3_grpc_reject_metadata, build_plain_request_builder,
-        cross_protocol_header_write_disconnect_outcome, inspected_emitted_response_limit_exceeded,
-        normalize_h3_grpc_reject, record_cross_protocol_client_acquire_failure,
+        apply_h3_grpc_reject_metadata, build_h3_grpc_backend_headers,
+        build_plain_request_builder, cross_protocol_header_write_disconnect_outcome,
+        inspected_emitted_response_limit_exceeded, normalize_h3_grpc_reject,
+        record_cross_protocol_client_acquire_failure,
         record_cross_protocol_connection_start, reject_body_as_h3_grpc_message,
         release_cross_protocol_circuit_breaker_probe_on_admission_reject,
         replace_buffered_grpc_response_with_deadline, sanitize_h3_grpc_message_for_header,
