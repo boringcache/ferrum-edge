@@ -509,10 +509,7 @@ impl CpGrpcServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn check_real_ip_header_compatibility(
-        &self,
-        advertised: Option<&str>,
-    ) -> Result<(), Status> {
+    fn check_real_ip_header_compatibility(&self, advertised: Option<&str>) -> Result<(), Status> {
         let Some(advertised) = advertised else {
             return Err(Status::failed_precondition(
                 "DP did not advertise its effective FERRUM_REAL_IP_HEADER; upgrade or restart the DP with the current CP/DP ownership contract",
@@ -1736,8 +1733,7 @@ impl ConfigSync for CpGrpcServer {
         let req = request.get_ref();
         let dp_version = &req.ferrum_version;
         Self::check_version_compatibility(dp_version)?;
-        if let Err(status) =
-            self.check_real_ip_header_compatibility(req.real_ip_header.as_deref())
+        if let Err(status) = self.check_real_ip_header_compatibility(req.real_ip_header.as_deref())
         {
             Self::audit_tenant_subscription(
                 "ConfigSync.GetFullConfig",

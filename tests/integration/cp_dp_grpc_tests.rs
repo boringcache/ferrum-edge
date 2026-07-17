@@ -370,13 +370,10 @@ async fn start_test_cp_server_with_real_ip_header(
     real_ip_header: &str,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
-    let (server, _update_tx) =
-        CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
-            .real_ip_header(Some(real_ip_header.to_string()))
-            .build();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let (server, _update_tx) = CpGrpcServer::builder(config_arc, TEST_JWT_SECRET.to_string())
+        .real_ip_header(Some(real_ip_header.to_string()))
+        .build();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {
@@ -1351,10 +1348,7 @@ async fn test_cp_enforces_real_ip_header_ownership_contract_before_distribution(
         ))
         .await
         .unwrap_err();
-    assert_eq!(
-        full_config_status.code(),
-        tonic::Code::FailedPrecondition
-    );
+    assert_eq!(full_config_status.code(), tonic::Code::FailedPrecondition);
     assert!(full_config_status.message().contains("does not match"));
 
     let accepted = client
