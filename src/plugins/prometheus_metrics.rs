@@ -15,7 +15,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use super::mesh::prometheus_helpers::{self, MeshRequestKey};
-use super::{Direction, Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
+use super::{
+    AI_COST_SUBMICRO_SCALE, AiCost, Direction, Plugin, StreamTransactionSummary,
+    TransactionSummary, WsDisconnectContext,
+};
 use crate::ebpf::NodeAgentMetrics;
 use crate::retry::ErrorClass;
 
@@ -357,6 +360,73 @@ impl TimestampedCounter {
     }
 }
 
+/// Fixed-point cost counter that retains sub-micro remainders without reducing
+/// the supported whole-cost range. Both fields remain bounded atomics on the
+/// logging hot path; fractional carry is applied with a lock-free update.
+pub struct TimestampedCostCounter {
+    pub microunits: CachePadded<AtomicU64>,
+    pub submicrounits: CachePadded<AtomicU64>,
+    pub last_updated: CachePadded<AtomicU64>,
+}
+
+impl TimestampedCostCounter {
+    fn new(epoch: Instant) -> Self {
+        Self {
+            microunits: CachePadded::new(AtomicU64::new(0)),
+            submicrounits: CachePadded::new(AtomicU64::new(0)),
+            last_updated: CachePadded::new(AtomicU64::new(
+                epoch.elapsed().as_nanos() as u64
+            )),
+        }
+    }
+
+    fn add_microunits(&self, value: u64) {
+        let _ = self
+            .microunits
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(value))
+            });
+    }
+
+    fn add(&self, value: &AiCost, epoch: Instant) {
+        self.add_microunits(
+            value
+                .microunits
+                .saturating_add(value.submicrounits / AI_COST_SUBMICRO_SCALE),
+        );
+        let submicrounits = value.submicrounits % AI_COST_SUBMICRO_SCALE;
+        if submicrounits != 0 {
+            let mut carried = false;
+            let _ = self.submicrounits.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| {
+                    let sum = current + submicrounits;
+                    carried = sum >= AI_COST_SUBMICRO_SCALE;
+                    Some(sum % AI_COST_SUBMICRO_SCALE)
+                },
+            );
+            if carried {
+                self.add_microunits(1);
+            }
+        }
+        self.last_updated
+            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn nanos_since_update(&self, epoch: Instant) -> u64 {
+        let now = epoch.elapsed().as_nanos() as u64;
+        let last = self.last_updated.load(Ordering::Relaxed);
+        now.saturating_sub(last)
+    }
+
+    fn rounded_microunits(&self) -> u64 {
+        let whole = self.microunits.load(Ordering::Relaxed);
+        let remainder = self.submicrounits.load(Ordering::Relaxed);
+        whole.saturating_add(u64::from(remainder >= AI_COST_SUBMICRO_SCALE / 2))
+    }
+}
+
 /// Histogram with predefined buckets and a last-updated timestamp.
 pub struct HistogramBuckets {
     /// Bucket boundaries in the metric's native unit.
@@ -466,8 +536,8 @@ pub struct MetricsRegistry {
     pub ai_completion_tokens_counter: DashMap<AiUsageKey, TimestampedCounter>,
     /// Total tokens from one selected ai_token_metrics instance per request.
     pub ai_total_tokens_counter: DashMap<AiUsageKey, TimestampedCounter>,
-    /// Estimated configured-currency cost stored as integer micro-units.
-    pub ai_estimated_cost_microunits_counter: DashMap<AiUsageKey, TimestampedCounter>,
+    /// Estimated configured-currency cost with a retained sub-micro remainder.
+    pub ai_estimated_cost_counter: DashMap<AiUsageKey, TimestampedCostCounter>,
     /// Mesh request count by Istio/GAMMA RED label set.
     pub mesh_request_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Mesh request duration histogram by the same bounded RED label set.
@@ -591,7 +661,7 @@ impl MetricsRegistry {
             ai_prompt_tokens_counter: DashMap::new(),
             ai_completion_tokens_counter: DashMap::new(),
             ai_total_tokens_counter: DashMap::new(),
-            ai_estimated_cost_microunits_counter: DashMap::new(),
+            ai_estimated_cost_counter: DashMap::new(),
             mesh_request_counter: DashMap::new(),
             mesh_request_duration_buckets: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
@@ -1120,10 +1190,10 @@ impl MetricsRegistry {
                     .or_insert_with(|| TimestampedCounter::new(self.epoch))
                     .add(value, self.epoch);
             }
-            if let Some(value) = usage.cost_microunits {
-                self.ai_estimated_cost_microunits_counter
+            if let Some(value) = usage.cost.as_ref() {
+                self.ai_estimated_cost_counter
                     .entry(key)
-                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                    .or_insert_with(|| TimestampedCostCounter::new(self.epoch))
                     .add(value, self.epoch);
             }
         }
@@ -1235,7 +1305,6 @@ impl MetricsRegistry {
             &self.ai_prompt_tokens_counter,
             &self.ai_completion_tokens_counter,
             &self.ai_total_tokens_counter,
-            &self.ai_estimated_cost_microunits_counter,
         ] {
             counters.retain(|_, value| {
                 let keep = value.nanos_since_update(self.epoch) < ttl_nanos;
@@ -1245,6 +1314,13 @@ impl MetricsRegistry {
                 keep
             });
         }
+        self.ai_estimated_cost_counter.retain(|_, value| {
+            let keep = value.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
 
         self.mesh_request_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
@@ -1451,7 +1527,7 @@ impl MetricsRegistry {
             + self.ai_prompt_tokens_counter.len() * 180
             + self.ai_completion_tokens_counter.len() * 180
             + self.ai_total_tokens_counter.len() * 180
-            + self.ai_estimated_cost_microunits_counter.len() * 200
+            + self.ai_estimated_cost_counter.len() * 300
             + self.mesh_request_counter.len() * 600
             + self.mesh_request_duration_buckets.len() * 1800
             + self.stream_connection_counter.len() * 200
@@ -1547,14 +1623,14 @@ impl MetricsRegistry {
             &self.ai_total_tokens_counter,
             &ns_label,
         );
-        if !self.ai_estimated_cost_microunits_counter.is_empty() {
+        if !self.ai_estimated_cost_counter.is_empty() {
             output.push_str(
-                "# HELP ferrum_ai_estimated_cost_currency_units_total Estimated AI cost in the configured currency units, accumulated at six-decimal precision.\n",
+                "# HELP ferrum_ai_estimated_cost_currency_units_total Estimated AI cost in the configured currency units, retaining sub-micro precision and rounding the aggregate to six decimals.\n",
             );
             output.push_str("# TYPE ferrum_ai_estimated_cost_currency_units_total counter\n");
-            for entry in self.ai_estimated_cost_microunits_counter.iter() {
+            for entry in self.ai_estimated_cost_counter.iter() {
                 let key = entry.key();
-                let value = entry.value().value.load(Ordering::Relaxed);
+                let value = entry.value().rounded_microunits();
                 let proxy_id = escape_label_value(&key.proxy_id);
                 output.push_str(&format!(
                     "ferrum_ai_estimated_cost_currency_units_total{{proxy_id=\"{}\",provider=\"{}\"{}}} {}.{:06}\n",

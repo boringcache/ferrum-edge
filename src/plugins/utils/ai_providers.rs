@@ -53,10 +53,10 @@ impl AiTokenUsage {
         if newer.completion_tokens.is_some() {
             self.completion_tokens = newer.completion_tokens;
         }
-        self.total_tokens = if newer.total_tokens.is_some() {
-            newer.total_tokens
+        self.total_tokens = if let Some(total) = newer.total_tokens {
+            Some(total)
         } else if component_updated {
-            sum_pair(self.prompt_tokens, self.completion_tokens)
+            sum_pair(self.prompt_tokens, self.completion_tokens).or(self.total_tokens)
         } else {
             self.total_tokens
         };

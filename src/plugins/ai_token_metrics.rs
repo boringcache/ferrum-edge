@@ -39,7 +39,7 @@ use super::utils::ai_providers::{
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::sse::is_sse_request;
-use super::{AiUsageExport, Plugin, PluginResult, RequestContext};
+use super::{AiCost, AiUsageExport, Plugin, PluginResult, RequestContext};
 
 pub struct AiTokenMetrics {
     provider: String,
@@ -277,6 +277,71 @@ impl AiTokenMetrics {
 
         final_usage
     }
+    fn calculate_cost(
+        &self,
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+    ) -> Option<(f64, AiCost)> {
+        let prompt_cost = prompt_tokens
+            .zip(self.cost_per_prompt_token)
+            .map(|(tokens, rate)| tokens as f64 * rate);
+        let completion_cost = completion_tokens
+            .zip(self.cost_per_completion_token)
+            .map(|(tokens, rate)| tokens as f64 * rate);
+        if prompt_cost.is_none() && completion_cost.is_none() {
+            return None;
+        }
+
+        let total_cost = prompt_cost.unwrap_or(0.0) + completion_cost.unwrap_or(0.0);
+        if !total_cost.is_finite() || total_cost > MAX_COST_RATE {
+            return None;
+        }
+        Some((total_cost, AiCost::from_currency_units(total_cost)?))
+    }
+
+    fn provider_matches_export(&self, provider: &str) -> bool {
+        if self.provider == "auto" {
+            return true;
+        }
+        let family = match provider {
+            "openai" | "azure_openai" | "xai" | "deepseek" | "meta_llama"
+            | "hugging_face" => "openai",
+            "anthropic" => "anthropic",
+            "google" | "google_gemini" | "google_vertex" => "google",
+            "cohere" => "cohere",
+            "mistral" => "mistral",
+            "bedrock" | "aws_bedrock" => "bedrock",
+            _ => return false,
+        };
+        self.provider == family
+    }
+
+    /// Apply this instance's configured rates to a trusted federation usage
+    /// snapshot. Federation already parsed the provider response and publishes
+    /// typed provenance before its synthetic response enters body hooks, so no
+    /// public metadata or client-visible body needs to be trusted here.
+    fn price_federated_usage(&self, ctx: &mut RequestContext) {
+        let Some(mut usage) = ctx.authoritative_ai_usage_export() else {
+            return;
+        };
+        if !self.provider_matches_export(usage.provider) {
+            return;
+        }
+        let Some((total_cost, cost)) =
+            self.calculate_cost(usage.prompt_tokens, usage.completion_tokens)
+        else {
+            return;
+        };
+
+        ctx.metadata.insert(
+            self.estimated_cost_key.clone(),
+            format!("{total_cost:.6}"),
+        );
+        usage.prefix = Arc::clone(&self.metadata_prefix);
+        usage.cost = Some(cost);
+        ctx.stage_ai_usage_export(usage);
+    }
+
     /// Write extracted token usage into the request context metadata.
     fn write_metadata(&self, ctx: &mut RequestContext, usage: &AiTokenUsage) {
         if let Some(provider) = usage.provider {
@@ -306,26 +371,17 @@ impl AiTokenMetrics {
             ctx.metadata.insert(self.model_key.clone(), model.clone());
         }
 
-        // Calculate estimated cost only from components that are both present
-        // and priced. Missing/malformed usage must not invent a zero-cost event.
-        let prompt_cost = usage
-            .prompt_tokens
-            .zip(self.cost_per_prompt_token)
-            .map(|(tokens, rate)| tokens as f64 * rate);
-        let completion_cost = usage
-            .completion_tokens
-            .zip(self.cost_per_completion_token)
-            .map(|(tokens, rate)| tokens as f64 * rate);
-        let mut cost_microunits = None;
-        if prompt_cost.is_some() || completion_cost.is_some() {
-            let total_cost = prompt_cost.unwrap_or(0.0) + completion_cost.unwrap_or(0.0);
-            if total_cost.is_finite() && total_cost <= MAX_COST_RATE {
-                let formatted = format!("{:.6}", total_cost);
-                cost_microunits = parse_cost_microunits(&formatted);
-                ctx.metadata
-                    .insert(self.estimated_cost_key.clone(), formatted);
-            }
-        }
+        // Public per-request metadata retains its six-decimal contract, while
+        // the typed export keeps a sub-micro remainder for cumulative metrics.
+        let cost = self
+            .calculate_cost(usage.prompt_tokens, usage.completion_tokens)
+            .map(|(total_cost, cost)| {
+                ctx.metadata.insert(
+                    self.estimated_cost_key.clone(),
+                    format!("{total_cost:.6}"),
+                );
+                cost
+            });
         if let Some(provider) = usage.provider {
             ctx.stage_ai_usage_export(AiUsageExport {
                 prefix: Arc::clone(&self.metadata_prefix),
@@ -341,26 +397,10 @@ impl AiTokenMetrics {
                     None
                 },
                 total_tokens: usage.total_tokens,
-                cost_microunits,
+                cost,
             });
         }
     }
-}
-
-fn parse_cost_microunits(value: &str) -> Option<u64> {
-    let (whole, fraction) = value.split_once('.')?;
-    if fraction.len() != 6
-        || whole.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    whole
-        .parse::<u64>()
-        .ok()?
-        .checked_mul(1_000_000)?
-        .checked_add(fraction.parse::<u64>().ok()?)
 }
 
 fn metadata_key(prefix: &str, suffix: &str) -> String {
@@ -498,6 +538,7 @@ impl Plugin for AiTokenMetrics {
             .metadata
             .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
         {
+            self.price_federated_usage(ctx);
             debug!(
                 "ai_token_metrics: skipping synthetic short-circuit response (no model tokens consumed)"
             );

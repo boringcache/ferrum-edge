@@ -968,6 +968,42 @@ async fn anthropic_sse_without_message_start_keeps_explicit_partial_usage() {
 }
 
 #[tokio::test]
+async fn partial_sse_component_update_retains_earlier_authoritative_total() {
+    let plugin = AiTokenMetrics::new(&json!({
+        "provider": "openai",
+        "buffer_streaming_responses": true
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = concat!(
+        "data: {\"usage\":{\"total_tokens\":100}}\n\n",
+        "data: {\"usage\":{\"completion_tokens\":7}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    plugin
+        .on_response_body(&mut ctx, 200, &headers, body.as_bytes())
+        .await;
+
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("7")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("100")
+    );
+    assert!(!ctx.metadata.contains_key("ai_prompt_tokens"));
+    let export = ctx
+        .authoritative_ai_usage_export()
+        .expect("partial SSE usage must retain typed export provenance");
+    assert_eq!(export.prompt_tokens, None);
+    assert_eq!(export.completion_tokens, Some(7));
+    assert_eq!(export.total_tokens, Some(100));
+}
+
+#[tokio::test]
 async fn openai_responses_buffered_and_completed_sse_are_supported() {
     let buffered = json!({
         "id": "resp_123",

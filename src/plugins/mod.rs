@@ -730,13 +730,53 @@ fn parse_ipv4_client_ip_literal(client_ip: &str) -> Option<Ipv4Addr> {
 /// Prometheus token or cost export.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiCost {
+    /// Whole micro-units of configured currency.
+    pub microunits: u64,
+    /// Fractional micro-units at 10^-12 precision. Kept separate so the full
+    /// supported whole-cost range still fits in `u64`.
+    pub submicrounits: u64,
+}
+
+/// Number of fixed-point remainder units in one micro-unit.
+pub(crate) const AI_COST_SUBMICRO_SCALE: u64 = 1_000_000_000_000;
+
+impl AiCost {
+    pub(crate) fn from_currency_units(value: f64) -> Option<Self> {
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+
+        let scaled = value * 1_000_000.0;
+        if !scaled.is_finite() || scaled > u64::MAX as f64 {
+            return None;
+        }
+
+        let whole_microunits = scaled.floor();
+        let mut microunits = whole_microunits as u64;
+        let mut submicrounits = ((scaled - whole_microunits)
+            * AI_COST_SUBMICRO_SCALE as f64)
+            .round() as u64;
+        if submicrounits >= AI_COST_SUBMICRO_SCALE {
+            microunits = microunits.checked_add(1)?;
+            submicrounits -= AI_COST_SUBMICRO_SCALE;
+        }
+        Some(Self {
+            microunits,
+            submicrounits,
+        })
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiUsageExport {
     pub prefix: Arc<str>,
     pub provider: &'static str,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
-    pub cost_microunits: Option<u64>,
+    pub cost: Option<AiCost>,
 }
 
 impl AiUsageExport {
@@ -744,7 +784,7 @@ impl AiUsageExport {
         usize::from(self.prompt_tokens.is_some())
             + usize::from(self.completion_tokens.is_some())
             + usize::from(self.total_tokens.is_some())
-            + usize::from(self.cost_microunits.is_some())
+            + usize::from(self.cost.is_some())
     }
 }
 

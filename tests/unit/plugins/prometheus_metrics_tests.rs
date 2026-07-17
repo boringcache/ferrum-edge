@@ -8,8 +8,9 @@ use ferrum_edge::plugins::prometheus_metrics::{
     global_registry,
 };
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, AiUsageExport, Direction, Plugin, RequestContext, StreamTransactionSummary,
-    TransactionSummary, WsDisconnectContext, ai_token_metrics::AiTokenMetrics,
+    ALL_PROTOCOLS, AiCost, AiUsageExport, Direction, Plugin, RequestContext,
+    StreamTransactionSummary, TransactionSummary, WsDisconnectContext,
+    ai_token_metrics::AiTokenMetrics,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
@@ -1495,7 +1496,7 @@ fn federation_provider_aliases_use_bounded_ai_metric_families() {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: Some(1),
-            cost_microunits: None,
+            cost: None,
         });
         registry.record(&summary);
     }
@@ -1632,7 +1633,10 @@ fn ai_usage_recording_is_concurrent_reload_safe_and_invalidates_render_cache() {
                         prompt_tokens: Some(2),
                         completion_tokens: Some(1),
                         total_tokens: Some(3),
-                        cost_microunits: Some(1),
+                        cost: Some(AiCost {
+                            microunits: 1,
+                            submicrounits: 0,
+                        }),
                     });
                     registry.record(&summary);
                 }
@@ -1653,5 +1657,93 @@ fn ai_usage_recording_is_concurrent_reload_safe_and_invalidates_render_cache() {
     assert!(!reloaded.contains("namespace=\"before-reload\""));
     assert!(reloaded.contains(
         "ferrum_ai_estimated_cost_currency_units_total{proxy_id=\"concurrent-ai\",provider=\"anthropic\",namespace=\"after-reload\"} 0.000800"
+    ));
+}
+
+#[tokio::test]
+async fn submicro_request_costs_accumulate_before_aggregate_rounding() {
+    let plugin = AiTokenMetrics::new(&json!({"cost_per_prompt_token": 0.0000004})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    plugin
+        .on_response_body(
+            &mut ctx,
+            200,
+            &HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            br#"{"usage":{"prompt_tokens":1,"total_tokens":1}}"#,
+        )
+        .await;
+
+    // The per-request metadata contract is still six decimals, but the typed
+    // export retains the 0.4 micro-unit remainder for aggregate accounting.
+    assert_eq!(
+        ctx.metadata.get("ai_estimated_cost").map(String::as_str),
+        Some("0.000000")
+    );
+    let usage = ctx
+        .authoritative_ai_usage_export()
+        .expect("direct usage must carry typed provenance");
+    assert_eq!(
+        usage.cost,
+        Some(AiCost {
+            microunits: 0,
+            submicrounits: 400_000_000_000,
+        })
+    );
+
+    let registry = MetricsRegistry::new();
+    let mut summary = make_summary("submicro-ai", "POST", 200, 1.0, 1.0);
+    summary.ai_usage_export = Some(usage.clone());
+    registry.record(&summary);
+    assert!(registry.render_uncached().contains(
+        "ferrum_ai_estimated_cost_currency_units_total{proxy_id=\"submicro-ai\",provider=\"openai\"} 0.000000"
+    ));
+
+    registry.record(&summary);
+    assert!(registry.render_uncached().contains(
+        "ferrum_ai_estimated_cost_currency_units_total{proxy_id=\"submicro-ai\",provider=\"openai\"} 0.000001"
+    ));
+
+    for _ in 0..8 {
+        let mut summary = make_summary("submicro-ai", "POST", 200, 1.0, 1.0);
+        summary.ai_usage_export = Some(usage.clone());
+        registry.record(&summary);
+    }
+    let output = registry.render_uncached();
+    assert!(output.contains(
+        "ferrum_ai_estimated_cost_currency_units_total{proxy_id=\"submicro-ai\",provider=\"openai\"} 0.000004"
+    ));
+}
+
+#[test]
+fn cumulative_ai_cost_saturates_instead_of_wrapping() {
+    let registry = MetricsRegistry::new();
+    for cost in [
+        AiCost {
+            microunits: u64::MAX,
+            submicrounits: 0,
+        },
+        AiCost {
+            microunits: 1,
+            submicrounits: 999_999_999_999,
+        },
+    ] {
+        let mut summary = make_summary("saturated-ai", "POST", 200, 1.0, 1.0);
+        summary.ai_usage_export = Some(AiUsageExport {
+            prefix: Arc::from("ai"),
+            provider: "openai",
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            cost: Some(cost),
+        });
+        registry.record(&summary);
+    }
+
+    assert!(registry.render_uncached().contains(
+        "ferrum_ai_estimated_cost_currency_units_total{proxy_id=\"saturated-ai\",provider=\"openai\"} 18446744073709.551615"
     ));
 }

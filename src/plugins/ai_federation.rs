@@ -5818,7 +5818,7 @@ impl AiFederation {
             prompt_tokens: tokens.prompt_tokens,
             completion_tokens: tokens.completion_tokens,
             total_tokens: tokens.total_tokens,
-            cost_microunits: None,
+            cost: None,
         });
     }
 
