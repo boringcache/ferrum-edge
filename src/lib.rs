@@ -594,10 +594,8 @@ pub mod _test_support {
     }
 
     /// Exercise the production bounded WebSocket close/queued-echo path.
-    pub async fn send_bounded_ws_close_for_test<S>(
-        sink: &mut S,
-        close: Option<CloseFrame>,
-    ) where
+    pub async fn send_bounded_ws_close_for_test<S>(sink: &mut S, close: Option<CloseFrame>)
+    where
         S: Sink<Message, Error = WsError> + Unpin,
     {
         crate::proxy::send_bounded_ws_close(sink, close).await;

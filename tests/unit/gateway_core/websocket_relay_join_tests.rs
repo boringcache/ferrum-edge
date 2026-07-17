@@ -30,12 +30,12 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::Sink;
-use tokio_util::sync::CancellationToken;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
+use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_util::sync::CancellationToken;
 
 /// Sanity check: with `tokio::join!` + cancel-on-exit, the fast direction
 /// completes quickly and signals the slow direction, which exits via the
@@ -284,7 +284,10 @@ fn test_policy_close_publishes_cancellation_before_bounded_writes() {
         &cancel,
         Some(first.clone()),
     );
-    assert!(cancel.is_cancelled(), "policy cancellation must be published");
+    assert!(
+        cancel.is_cancelled(),
+        "policy cancellation must be published"
+    );
     assert_eq!(selected, Some(first.clone()));
 
     let retained = ferrum_edge::_test_support::publish_ws_policy_close_for_test(
@@ -303,10 +306,7 @@ struct PeerClosedSink {
 impl Sink<Message> for PeerClosedSink {
     type Error = WsError;
 
-    fn poll_ready(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
@@ -314,10 +314,7 @@ impl Sink<Message> for PeerClosedSink {
         Err(WsError::Protocol(ProtocolError::SendAfterClosing))
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.flushes.fetch_add(1, Ordering::SeqCst);
         if self.complete_flush {
             Poll::Ready(Ok(()))
@@ -326,10 +323,7 @@ impl Sink<Message> for PeerClosedSink {
         }
     }
 
-    fn poll_close(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 }

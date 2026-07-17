@@ -10938,9 +10938,7 @@ impl EffectiveWsSizeLimits {
     }
 }
 
-fn ws_close_write_error_kind(
-    error: &tokio_tungstenite::tungstenite::Error,
-) -> &'static str {
+fn ws_close_write_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
     use tokio_tungstenite::tungstenite::Error;
 
     match error {

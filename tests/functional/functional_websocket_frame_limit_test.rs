@@ -307,11 +307,7 @@ async fn functional_ws_message_size_limit_h3_sends_1009_to_both_peers() {
         H3WebSocketFrame::Close(payload) => payload,
         other => panic!("expected H3 graceful Close echo, got {other:?}"),
     };
-    assert_close_payload(
-        &graceful_echo_payload,
-        CloseCode::Normal,
-        graceful_reason,
-    );
+    assert_close_payload(&graceful_echo_payload, CloseCode::Normal, graceful_reason);
     assert_backend_close(&mut backend_closes, CloseCode::Normal, graceful_reason).await;
 
     let mut ws = retry_h3_websocket(&client, &url).await;
