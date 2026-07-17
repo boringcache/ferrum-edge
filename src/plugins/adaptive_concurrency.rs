@@ -12,7 +12,8 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::adaptive_concurrency::{
-    AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
+    AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimitExceeded,
+    AdaptiveConcurrencyLimiter,
 };
 use crate::plugins::{
     BackendAdmissionContext, BackendAdmissionDecision, HTTP_FAMILY_PROTOCOLS, Plugin,
@@ -95,22 +96,33 @@ impl Plugin for AdaptiveConcurrency {
             ctx.lb_generation,
         ) {
             Ok(permit) => BackendAdmissionDecision::Admit(permit),
-            Err(limit) => {
+            Err(AdaptiveConcurrencyLimitExceeded::TargetLimit {
+                current_in_flight,
+                limit,
+                expose_headers,
+            }) => {
                 let mut headers = HashMap::new();
-                if limit.expose_headers {
+                if expose_headers {
                     headers.insert(
                         "x-adaptive-concurrency-limit".to_string(),
-                        limit.limit.to_string(),
+                        limit.to_string(),
                     );
                     headers.insert(
                         "x-adaptive-concurrency-inflight".to_string(),
-                        limit.current_in_flight.to_string(),
+                        current_in_flight.to_string(),
                     );
                 }
                 BackendAdmissionDecision::Reject {
                     status_code: 503,
                     body: br#"{"error":"Upstream concurrency limit reached"}"#.to_vec(),
                     headers,
+                }
+            }
+            Err(AdaptiveConcurrencyLimitExceeded::GenerationHandoff) => {
+                BackendAdmissionDecision::Reject {
+                    status_code: 503,
+                    body: br#"{"error":"Upstream concurrency limit reached"}"#.to_vec(),
+                    headers: HashMap::new(),
                 }
             }
         }

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -151,86 +151,55 @@ fn assert_rejected(decision: BackendAdmissionDecision) {
     }
 }
 
+fn assert_generation_handoff_rejected_without_headers(decision: BackendAdmissionDecision) {
+    match decision {
+        BackendAdmissionDecision::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert!(
+                !headers.contains_key("x-adaptive-concurrency-limit"),
+                "a generation handoff has no truthful per-target limit"
+            );
+            assert!(
+                !headers.contains_key("x-adaptive-concurrency-inflight"),
+                "a generation handoff has no truthful per-target in-flight count"
+            );
+        }
+        _ => panic!("retired generation should be rejected"),
+    }
+}
+
 #[test]
-fn adaptive_concurrency_newer_writer_wins_after_drain_observation() {
-    let transition = Arc::new(AdaptiveConcurrencyTransitionHarness::new());
-
-    let first_writer = transition.begin_structural_reset();
-    assert!(transition.finish_reset(first_writer, true));
-    let request_observation = transition.observe();
-
-    // Deterministically place the newer writer after the request's DRAINING
-    // observation and before that request can claim/reset/reactivate it.
-    let writer_transition = Arc::clone(&transition);
-    let (writer_claimed_tx, writer_claimed_rx) = mpsc::sync_channel(0);
-    let writer = thread::spawn(move || {
-        let newer_writer = writer_transition.begin_structural_reset();
-        writer_claimed_tx
-            .send(newer_writer)
-            .expect("request side should receive the claimed writer epoch");
-    });
-    let newer_writer = writer_claimed_rx
-        .recv()
-        .expect("newer writer should claim its reset epoch");
-    writer
-        .join()
-        .expect("newer structural writer should not panic");
+fn adaptive_concurrency_structural_reset_owner_is_exclusive() {
+    let transition = AdaptiveConcurrencyTransitionHarness::new();
+    let writer = transition.begin_structural_reset();
     assert!(
-        transition
-            .try_begin_observed_drain_reset(request_observation)
-            .is_none(),
-        "a stale drain observation must not claim a newer writer's reset epoch"
+        transition.try_begin_structural_reset().is_none(),
+        "a second writer must not replace the active reset owner"
     );
     assert!(
         !transition.is_active(),
-        "the newer structural writer must remain fail-closed until it commits"
+        "admission must remain fail-closed until the reset owner commits"
     );
-    assert!(transition.finish_reset(newer_writer, false));
+    assert!(transition.finish_reset(writer));
     assert!(transition.is_active());
 }
 
 #[test]
-fn adaptive_concurrency_drain_reset_owner_cannot_be_overwritten_by_newer_writer() {
-    let transition = Arc::new(AdaptiveConcurrencyTransitionHarness::new());
-    let first_writer = transition.begin_structural_reset();
-    assert!(transition.finish_reset(first_writer, true));
-
-    let observed = transition.observe();
-    let request_reset = transition
-        .try_begin_observed_drain_reset(observed)
-        .expect("the request should own the observed drain epoch");
-
-    // Force a newer writer to attempt its claim while the request owns the
-    // exact RESETTING epoch. Unlike the old unconditional store, it cannot
-    // replace that ownership with an indistinguishable state value.
-    let writer_transition = Arc::clone(&transition);
-    let writer = thread::spawn(move || writer_transition.try_begin_structural_reset().is_some());
-    assert!(
-        !writer
-            .join()
-            .expect("newer structural writer should not panic"),
-        "a newer writer must wait for the exact reset owner to publish"
-    );
-    assert!(!transition.is_active());
-    assert!(transition.finish_reset(request_reset, false));
-
-    let newer_writer = transition.begin_structural_reset();
-    assert!(!transition.is_active());
-    assert!(transition.finish_reset(newer_writer, false));
-    assert!(transition.is_active());
-}
-
-#[test]
-fn adaptive_concurrency_ordinary_drain_completion_reactivates_its_exact_epoch() {
+fn adaptive_concurrency_stale_reset_token_cannot_reactivate_newer_writer() {
     let transition = AdaptiveConcurrencyTransitionHarness::new();
-    let writer = transition.begin_structural_reset();
-    assert!(transition.finish_reset(writer, true));
-
-    let observed = transition.observe();
-    let drain_reset = transition
-        .try_begin_observed_drain_reset(observed)
-        .expect("the unchanged draining epoch should be claimable");
-    assert!(transition.finish_reset(drain_reset, false));
+    let first_writer = transition.begin_structural_reset();
+    assert!(transition.finish_reset(first_writer));
+    let newer_writer = transition.begin_structural_reset();
+    assert!(
+        !transition.finish_reset(first_writer),
+        "an older epoch token must not reactivate a newer reset"
+    );
+    assert!(!transition.is_active());
+    assert!(transition.finish_reset(newer_writer));
     assert!(transition.is_active());
 }
 
@@ -346,7 +315,7 @@ fn adaptive_concurrency_concurrent_failure_backoff_stops_at_minimum() {
 }
 
 #[test]
-fn adaptive_concurrency_ignores_client_disconnect_samples() {
+fn adaptive_concurrency_ignores_client_deadline_even_with_synthetic_5xx() {
     let proxy = proxy();
     let limiter = AdaptiveConcurrencyLimiter::new(16);
     let config = limiter_config(4);
@@ -355,7 +324,10 @@ fn adaptive_concurrency_ignores_client_disconnect_samples() {
         .expect("request should be admitted");
 
     permit.record_backend_outcome(BackendAdmissionOutcome {
-        response_status: 499,
+        // The gRPC dispatch error path uses a synthetic 502 for permit
+        // accounting, but ClientDisconnect remains authoritative and must be
+        // checked before the generic >= 500 shrink branch.
+        response_status: 502,
         connection_error: true,
         error_class: Some(ErrorClass::ClientDisconnect),
         backend_elapsed: Duration::from_millis(50),
@@ -998,9 +970,9 @@ async fn adaptive_concurrency_global_route_refresh_preserves_unrelated_global_st
             ..
         }
     ));
-    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    let replacement_adaptive = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    drop(replacement_adaptive);
     drop(held);
-    drop(expect_admitted(acquire_from_cache(&cache, &reloaded)));
 }
 
 #[test]
@@ -1135,7 +1107,7 @@ fn adaptive_concurrency_scoped_detach_and_reattach_starts_fresh_state() {
 }
 
 #[test]
-fn adaptive_concurrency_structural_config_change_drains_old_key_space() {
+fn adaptive_concurrency_structural_config_change_does_not_wait_for_old_permits() {
     let config = cache_config(
         "proxy",
         json!({
@@ -1143,7 +1115,8 @@ fn adaptive_concurrency_structural_config_change_drains_old_key_space() {
             "min_limit": 1,
             "initial_limit": 2,
             "max_limit": 2,
-            "shadow_mode": true
+            "shadow_mode": true,
+            "expose_headers": true
         }),
     );
     let cache = PluginCache::new(&config).expect("initial cache should build");
@@ -1156,17 +1129,49 @@ fn adaptive_concurrency_structural_config_change_drains_old_key_space() {
         .rebuild(&reloaded)
         .expect("valid key-space change should publish");
 
-    // Structural transitions fail closed even in shadow mode: admitting under
-    // the replacement key space would otherwise omit this older live permit.
-    assert_rejected(acquire_from_cache(&cache, &reloaded));
-    drop(held);
+    // The replacement has an independent tracking space. A long-lived permit
+    // from the retired space must not pin the structural handoff.
     let new_generation = expect_admitted(acquire_from_cache(&cache, &reloaded));
-    assert_rejected(acquire_from_plugin(&old_view, &config.proxies[0], None));
+    assert_generation_handoff_rejected_without_headers(acquire_from_plugin(
+        &old_view,
+        &config.proxies[0],
+        None,
+    ));
     drop(new_generation);
+    drop(held);
+    drop(old_view);
 }
 
 #[test]
-fn adaptive_concurrency_transition_rejection_omits_per_target_headers() {
+fn adaptive_concurrency_lower_key_cap_uses_independent_tracking_space() {
+    let config = cache_config(
+        "proxy",
+        json!({
+            "max_tracked_keys": 2,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let old_view = adaptive_plugin_from_cache(&cache);
+    let retired_permit = expect_admitted(acquire_from_cache(&cache, &config));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[0].config["max_tracked_keys"] = json!(1);
+    cache
+        .rebuild(&reloaded)
+        .expect("lower key cap should publish an independent tracking space");
+
+    let replacement = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    assert_rejected(acquire_from_plugin(&old_view, &config.proxies[0], None));
+    drop(replacement);
+    drop(retired_permit);
+}
+
+#[test]
+fn adaptive_concurrency_replacement_uses_its_own_target_headers() {
     let config = cache_config(
         "proxy",
         json!({
@@ -1186,26 +1191,6 @@ fn adaptive_concurrency_transition_rejection_omits_per_target_headers() {
         .rebuild(&reloaded)
         .expect("structural key-space change should publish");
 
-    match acquire_from_cache(&cache, &reloaded) {
-        BackendAdmissionDecision::Reject {
-            status_code,
-            headers,
-            ..
-        } => {
-            assert_eq!(status_code, 503);
-            assert!(
-                !headers.contains_key("x-adaptive-concurrency-limit"),
-                "a policy-wide drain has no truthful per-target limit"
-            );
-            assert!(
-                !headers.contains_key("x-adaptive-concurrency-inflight"),
-                "a policy-wide drain has no truthful per-target in-flight count"
-            );
-        }
-        _ => panic!("replacement policy should reject during the structural drain"),
-    }
-
-    drop(held);
     let replacement_permit = expect_admitted(acquire_from_cache(&cache, &reloaded));
     match acquire_from_cache(&cache, &reloaded) {
         BackendAdmissionDecision::Reject {
@@ -1230,10 +1215,11 @@ fn adaptive_concurrency_transition_rejection_omits_per_target_headers() {
         _ => panic!("a genuine per-target limit rejection should expose target headers"),
     }
     drop(replacement_permit);
+    drop(held);
 }
 
 #[test]
-fn adaptive_concurrency_overlapping_structural_reloads_keep_newest_reset_authoritative() {
+fn adaptive_concurrency_overlapping_structural_reloads_remain_independent() {
     let config = cache_config(
         "proxy",
         json!({
@@ -1254,16 +1240,13 @@ fn adaptive_concurrency_overlapping_structural_reloads_keep_newest_reset_authori
         .rebuild(&first_reload)
         .expect("first structural generation should publish");
     let middle_view = adaptive_plugin_from_cache(&cache);
-    assert_rejected(acquire_from_cache(&cache, &first_reload));
+    let middle_permit = expect_admitted(acquire_from_cache(&cache, &first_reload));
 
     let mut newest_reload = first_reload.clone();
     newest_reload.plugin_configs[0].config["key_by"] = json!("upstream_target");
     cache
         .rebuild(&newest_reload)
         .expect("overlapping structural generation should publish");
-    assert_rejected(acquire_from_cache(&cache, &newest_reload));
-
-    drop(retired_permit);
     let newest_permit = expect_admitted(acquire_from_cache(&cache, &newest_reload));
     assert_rejected(acquire_from_plugin(&oldest_view, &config.proxies[0], None));
     assert_rejected(acquire_from_plugin(
@@ -1273,6 +1256,8 @@ fn adaptive_concurrency_overlapping_structural_reloads_keep_newest_reset_authori
     ));
     assert_rejected(acquire_from_cache(&cache, &newest_reload));
     drop(newest_permit);
+    drop(middle_permit);
+    drop(retired_permit);
 }
 
 #[test]
@@ -1287,7 +1272,7 @@ fn adaptive_concurrency_direct_target_reload_reclaims_retired_key_capacity() {
         }),
     );
     let cache = PluginCache::new(&config).expect("initial cache should build");
-    drop(expect_admitted(acquire_from_cache(&cache, &config)));
+    let retired_permit = expect_admitted(acquire_from_cache(&cache, &config));
 
     let mut reloaded = config.clone();
     reloaded.proxies[0].backend_host = "replacement.local".to_string();
@@ -1303,6 +1288,7 @@ fn adaptive_concurrency_direct_target_reload_reclaims_retired_key_capacity() {
     let held = expect_admitted(acquire_from_cache(&cache, &reloaded));
     assert_rejected(acquire_from_cache(&cache, &reloaded));
     drop(held);
+    drop(retired_permit);
 }
 
 #[test]
@@ -1313,7 +1299,8 @@ fn adaptive_concurrency_upstream_target_reload_reclaims_retired_key_capacity() {
             "max_tracked_keys": 1,
             "min_limit": 1,
             "initial_limit": 1,
-            "max_limit": 1
+            "max_limit": 1,
+            "expose_headers": true
         }),
     );
     config.proxies[0].upstream_id = Some("upstream-1".to_string());
@@ -1328,11 +1315,11 @@ fn adaptive_concurrency_upstream_target_reload_reclaims_retired_key_capacity() {
     let cache = PluginCache::new(&config).expect("initial cache should build");
     let first_target = config.upstreams[0].targets[0].clone();
     let plugin = adaptive_plugin_from_cache(&cache);
-    drop(expect_admitted(acquire_from_plugin(
+    let retired_permit = expect_admitted(acquire_from_plugin(
         &plugin,
         &config.proxies[0],
         Some(&first_target),
-    )));
+    ));
 
     let mut reloaded = config.clone();
     reloaded.upstreams[0].targets[0].host = "replacement.local".to_string();
@@ -1347,12 +1334,34 @@ fn adaptive_concurrency_upstream_target_reload_reclaims_retired_key_capacity() {
         &reloaded.proxies[0],
         Some(replacement_target),
     ));
-    assert_rejected(acquire_from_plugin(
+    match acquire_from_plugin(
         &replacement_plugin,
         &reloaded.proxies[0],
         Some(replacement_target),
-    ));
+    ) {
+        BackendAdmissionDecision::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert_eq!(
+                headers
+                    .get("x-adaptive-concurrency-limit")
+                    .map(String::as_str),
+                Some("1")
+            );
+            assert_eq!(
+                headers
+                    .get("x-adaptive-concurrency-inflight")
+                    .map(String::as_str),
+                Some("1")
+            );
+        }
+        _ => panic!("replacement target should enforce its independent limit"),
+    }
     drop(held);
+    drop(retired_permit);
 }
 
 #[test]
@@ -1479,7 +1488,8 @@ fn adaptive_concurrency_upstream_port_scope_change_resets_key_space() {
             "min_limit": 1,
             "initial_limit": 2,
             "max_limit": 2,
-            "shadow_mode": true
+            "shadow_mode": true,
+            "expose_headers": true
         }),
     );
     config.proxies[0].upstream_id = Some("upstream-1".to_string());
@@ -1501,9 +1511,10 @@ fn adaptive_concurrency_upstream_port_scope_change_resets_key_space() {
     );
     config.resolve_dispatch_port_overrides();
     let cache = PluginCache::new(&config).expect("initial cache should build");
+    let retired_view = adaptive_plugin_from_cache(&cache);
     let first_target = config.upstreams[0].targets[0].clone();
     let held = expect_admitted(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+        &retired_view,
         &config.proxies[0],
         Some(&first_target),
     ));
@@ -1520,17 +1531,31 @@ fn adaptive_concurrency_upstream_port_scope_change_resets_key_space() {
         .expect("effective upstream port lane change should publish");
 
     let second_target = &reloaded.upstreams[0].targets[1];
-    assert_rejected(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+    assert_generation_handoff_rejected_without_headers(acquire_from_plugin(
+        &retired_view,
+        &config.proxies[0],
+        Some(&first_target),
+    ));
+    let replacement_view = adaptive_plugin_from_cache(&cache);
+    let first_replacement = expect_admitted(acquire_from_plugin(
+        &replacement_view,
         &reloaded.proxies[0],
         Some(second_target),
     ));
-    drop(held);
-    drop(expect_admitted(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+    let second_replacement = expect_admitted(acquire_from_plugin(
+        &replacement_view,
         &reloaded.proxies[0],
         Some(second_target),
-    )));
+    ));
+    let shadow_replacement = expect_admitted(acquire_from_plugin(
+        &replacement_view,
+        &reloaded.proxies[0],
+        Some(second_target),
+    ));
+    drop(shadow_replacement);
+    drop(first_replacement);
+    drop(second_replacement);
+    drop(held);
 }
 
 #[test]
@@ -1891,7 +1916,8 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
             "min_limit": 1,
             "initial_limit": 2,
             "max_limit": 2,
-            "shadow_mode": true
+            "shadow_mode": true,
+            "expose_headers": true
         }),
     );
     config.plugin_configs.push(
@@ -1944,6 +1970,7 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
         &effective_proxy,
         None,
     )));
+    let retired_view = adaptive_plugin_from_cache(&cache);
 
     let mut replacement = normalized_equivalent.clone();
     replacement.plugin_configs[1].config["rules"][0]["destination"]["backend_tls"]["sni"] =
@@ -1956,17 +1983,31 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
             false,
         )
         .expect("changed TLS identity should publish");
-    assert_rejected(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+    assert_generation_handoff_rejected_without_headers(acquire_from_plugin(
+        &retired_view,
         &effective_proxy,
         None,
     ));
-    drop(held);
-    drop(expect_admitted(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+    let replacement_view = adaptive_plugin_from_cache(&cache);
+    let first_replacement = expect_admitted(acquire_from_plugin(
+        &replacement_view,
         &effective_proxy,
         None,
-    )));
+    ));
+    let second_replacement = expect_admitted(acquire_from_plugin(
+        &replacement_view,
+        &effective_proxy,
+        None,
+    ));
+    let shadow_replacement = expect_admitted(acquire_from_plugin(
+        &replacement_view,
+        &effective_proxy,
+        None,
+    ));
+    drop(shadow_replacement);
+    drop(first_replacement);
+    drop(second_replacement);
+    drop(held);
 }
 
 #[test]
@@ -2130,12 +2171,6 @@ fn adaptive_concurrency_route_priority_change_resets_winning_destination() {
 
     let mut first_effective_proxy = reloaded.proxies[0].clone();
     first_effective_proxy.backend_host = "first.local".to_string();
-    assert_rejected(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
-        &first_effective_proxy,
-        None,
-    ));
-    drop(held);
     let replacement = expect_admitted(acquire_from_plugin(
         &adaptive_plugin_from_cache(&cache),
         &first_effective_proxy,
@@ -2147,6 +2182,7 @@ fn adaptive_concurrency_route_priority_change_resets_winning_destination() {
         None,
     ));
     drop(replacement);
+    drop(held);
 }
 
 #[test]
@@ -2210,12 +2246,6 @@ fn adaptive_concurrency_route_association_order_resets_winning_destination() {
 
     let mut first_effective_proxy = reloaded.proxies[0].clone();
     first_effective_proxy.backend_host = "first.local".to_string();
-    assert_rejected(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
-        &first_effective_proxy,
-        None,
-    ));
-    drop(held);
     let replacement = expect_admitted(acquire_from_plugin(
         &adaptive_plugin_from_cache(&cache),
         &first_effective_proxy,
@@ -2227,6 +2257,7 @@ fn adaptive_concurrency_route_association_order_resets_winning_destination() {
         None,
     ));
     drop(replacement);
+    drop(held);
 }
 
 #[test]

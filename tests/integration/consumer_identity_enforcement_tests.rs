@@ -12,7 +12,7 @@
 //! PostgreSQL/MySQL behind dialect-specific SQL rendering.
 
 use chrono::Utc;
-use ferrum_edge::config::db_backend::DatabaseBackend;
+use ferrum_edge::config::db_backend::{BatchConfigWriteMode, DatabaseBackend};
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::Consumer;
 use std::collections::HashMap;
@@ -114,7 +114,10 @@ async fn update_introducing_cross_field_collision_is_rejected() {
         .expect("c2 must persist");
 
     let err = store
-        .update_consumer(&consumer_in("ferrum", "c2", "bob", Some("alice")))
+        .update_consumer(
+            &consumer_in("ferrum", "c2", "bob", Some("alice")),
+            &BatchConfigWriteMode::Admission,
+        )
         .await
         .expect_err("update stealing c1's username as custom_id must be rejected");
     assert_unique_violation(&err);
@@ -122,7 +125,10 @@ async fn update_introducing_cross_field_collision_is_rejected() {
     // The failed update must not have corrupted c2 or leaked identity rows:
     // c2 can still be updated to a non-colliding shape.
     let updated = store
-        .update_consumer(&consumer_in("ferrum", "c2", "bob", Some("bob-ext")))
+        .update_consumer(
+            &consumer_in("ferrum", "c2", "bob", Some("bob-ext")),
+            &BatchConfigWriteMode::Admission,
+        )
         .await
         .expect("non-colliding update must succeed");
     assert!(updated);
@@ -216,7 +222,10 @@ async fn phantom_update_returns_false_and_records_no_change() {
     // Updating a consumer that never existed must report not-found rather
     // than fabricating an upsert change record (issue #2122 DB-M4).
     let updated = store
-        .update_consumer(&consumer_in("ferrum", "ghost", "casper", None))
+        .update_consumer(
+            &consumer_in("ferrum", "ghost", "casper", None),
+            &BatchConfigWriteMode::Admission,
+        )
         .await
         .expect("phantom update must not error");
     assert!(!updated, "phantom update must report no match");

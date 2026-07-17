@@ -436,10 +436,10 @@ fn per_resource_version(resource: &XdsResource) -> String {
 /// Translate one Envoy `envoy.service.runtime.v3.Runtime` resource (one RTDS
 /// "layer") into a `MeshRuntimeOverlay`.
 ///
-/// This is the single decode site for RTDS resources. The overlay is then
-/// carried on `MeshSlice.runtime_overlay` and fanned out to consumers
-/// (fault injection, request/response transformer gates, tracing log level)
-/// at slice install via `runtime_overlay_consumers::apply_overlay`.
+/// This is the single decode site for one RTDS resource. The xDS accumulator
+/// sorts all Runtime resources by name before merging them onto
+/// `MeshSlice.runtime_overlay`. Fault percentages bind to the candidate
+/// request epoch; transformer gates and tracing publish after acceptance.
 ///
 /// Top-level fields in the Runtime's `layer` struct are flattened into
 /// `MeshRuntimeOverlay.fields` keyed by field name. Field values are mapped:

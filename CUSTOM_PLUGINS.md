@@ -310,9 +310,12 @@ plugin in priority/config order. Where that wait occurs depends on who owns the
 response body:
 
 - Buffered responses, buffered rejections/errors, and other synchronous
-  terminal paths await every `log()` hook before the handler returns the
-  response. Direct endpoint or filesystem I/O in the hook therefore adds
-  latency, and multiple slow hooks add that latency serially.
+  terminal paths normally await every `log()` hook before the handler returns
+  the response. Direct endpoint or filesystem I/O in the hook therefore adds
+  latency, and multiple slow hooks add that latency serially. Buffered H1/H2
+  requests with an active absolute gRPC deadline are the exception: Ferrum
+  moves their owned terminal log state to a five-second detached cleanup task
+  so a blocked sink cannot delay the terminal RPC response.
 - Hyper-owned streamed H1/H2 and gRPC bodies return from the handler before the
   body is complete. At terminal body completion, Ferrum spawns one task that
   awaits `on_response_stream_terminated()` and then all `log()` hooks in

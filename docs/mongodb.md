@@ -152,14 +152,16 @@ The driver resolves SRV records to discover all replica set members. No addition
 
 ### FERRUM_DB_FAILOVER_URLS (Standalone Fallback)
 
-`FERRUM_DB_FAILOVER_URLS` still works with MongoDB for standalone (non-replica-set) deployments where you have independent MongoDB instances:
+`FERRUM_DB_FAILOVER_URLS` still works with MongoDB for standalone (non-replica-set) endpoints that expose the same authoritative dataset:
 
 ```bash
 FERRUM_DB_URL="mongodb://primary-mongo:27017"
 FERRUM_DB_FAILOVER_URLS="mongodb://backup-mongo:27017"
 ```
 
-For replica sets, prefer listing all members in the primary URL instead of using `FERRUM_DB_FAILOVER_URLS`.
+Do not point these URLs at independent, unreplicated datasets: no datastore lock or
+write can serialize two divergent databases. For replica sets, list all members
+in the primary URL instead of using `FERRUM_DB_FAILOVER_URLS`.
 
 ## TLS
 
@@ -252,6 +254,36 @@ Admission checks that cannot be expressed as unique indexes (host-overlap route 
 **Standalone (convergent post-write reconciliation):** without transactions the gateway performs the check again *after* the write. Route conflicts resolve by deterministic loser-yield on `(created_at, _id)` — the losing document removes/restores itself and the request gets a 409; upstream delete-vs-reference races re-check after the delete and restore the upstream if a reference appeared. Every interleaving of one concurrent pair converges, but a narrow residual window remains — **replica sets are required for full concurrent-write safety**, consistent with the incremental-polling and multi-document-atomicity requirements above.
 
 Consumer identity uniqueness (issue #2121 — `id`/`username`/`custom_id` share one keyspace per namespace) needs no lock documents: it is enforced atomically by the `consumer_identity_index` collection's `_id = "{namespace}:{identity_value}"` uniqueness, reserved *before* the consumer write on standalone deployments and written in the same transaction on replica sets. Consumer documents themselves use `_id = "{namespace}:{id}"`, making consumer ids per-namespace.
+
+mTLS `san_dns` identity admission uses a separate majority-durable,
+non-expiring namespace mutex in `mtls_dns_admission_locks`. The connection
+bundle that acquires the mutex is pinned through the authoritative candidate
+read, protected mutation, and owner-qualified release; reconnect/failover is
+deferred while that generation is pinned. A cancelled, timed-out, or failed
+future before any protected mutation is dispatched starts bounded,
+owner-qualified mutex cleanup and releases the generation pin when cleanup
+settles. A cancellation after a mutation was dispatched has an uncertain write
+outcome, so Ferrum retains both the MongoDB mutex document and the process-local
+connection pin instead of deleting the fence from `Drop`. Verify the durable
+write outcome, stop or restart that admin process, and only then remove the exact
+owner-qualified mutex document. Definitive server rejections (including a
+duplicate-key loser) and definitively aborted transactions explicitly settle
+and release the mutex; they do not create a permanent operator-recovery fence.
+A settled operation also releases its process-local connection-generation pin
+when owner-qualified mutex cleanup fails or loses its acknowledgement. The
+durable document remains fail-closed when it still exists, cleanup status is
+logged for operator recovery, and reconnect/failover can recover the process;
+only an uncertain protected mutation retains both the fence and local pin.
+A restore keeps one pin and owner from its pre-clear rollback snapshot through
+the clear, all import batches, and any compensating replay. Credential endpoints
+likewise acquire that owner before reading the Consumer and borrow it for the
+write, so an unrelated credential update cannot resurrect a concurrently
+rotated mTLS identity from a stale full-Consumer snapshot.
+If a replica-set clear returns `UnknownTransactionCommitResult`, an immediate
+read that still sees the pre-restore resource counts does not prove abort: the
+delayed commit can become visible later on another pooled connection. Ferrum
+therefore retains the owner-qualified fence and generation pin for manual
+recovery instead of admitting writes that the delayed clear could erase.
 
 Both lock/guard collections hold tiny nonce documents (one per route bucket / referenced upstream) and are created explicitly at migration time because MongoDB < 4.4 cannot implicitly create collections inside transactions.
 

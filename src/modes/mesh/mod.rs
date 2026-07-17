@@ -1042,6 +1042,7 @@ fn prepare_normalized_gateway_config_for_mesh(
         // never push it BELOW what materialized.
         mesh.declared_ingress_http_ports = mesh_slice.declared_ingress_http_ports;
     }
+    materialize_fault_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
     config.normalize_fields();
     config.resolve_upstream_tls();
 
@@ -1446,6 +1447,78 @@ fn reconcile_mesh_upstream_timestamps(candidate: &mut GatewayConfig, previous: &
             upstream.created_at = old.created_at;
             upstream.updated_at = old.updated_at;
         }
+    }
+}
+
+/// Materialize RTDS percentages into candidate fault configs on the cold path.
+///
+/// A zero override removes that fault side. When both sides are removed, the
+/// candidate plugin is disabled for the generation; a later slice built from
+/// the operator's static config re-enables it when the zero override disappears.
+fn materialize_fault_runtime_overlay(
+    config: &mut GatewayConfig,
+    overlay: &crate::modes::mesh::config::MeshRuntimeOverlay,
+) {
+    use crate::plugins::fault_injection::runtime_overlay::{
+        FaultOverlayMaterialization, materialize_config,
+    };
+
+    for plugin in config
+        .plugin_configs
+        .iter_mut()
+        .filter(|plugin| plugin.enabled && plugin.plugin_name == "fault_injection")
+    {
+        if materialize_config(&mut plugin.config, overlay) == FaultOverlayMaterialization::Disabled
+        {
+            plugin.enabled = false;
+        }
+    }
+}
+
+/// Advance only the fault-plugin generations whose materialized config changed.
+///
+/// RTDS is not one of the mesh slice's version-coherence resource types, so an
+/// RTDS-only response can legitimately keep `GatewayConfig.loaded_at` stable.
+/// `ConfigDelta` detects plugin changes through `PluginConfig.updated_at`; this
+/// cold-path stamp makes the affected instances rebuild from their materialized
+/// effective config before `RequestEpoch` publishes the candidate. Unchanged
+/// and unrelated scopes retain their stateful plugin instances.
+fn reconcile_fault_plugin_generations(candidate: &mut GatewayConfig, previous: &GatewayConfig) {
+    let previous_plugins = previous
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "fault_injection")
+        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
+        .collect::<HashMap<_, _>>();
+
+    for plugin in candidate
+        .plugin_configs
+        .iter_mut()
+        .filter(|plugin| plugin.plugin_name == "fault_injection")
+    {
+        let Some(previous) = previous_plugins.get(&(plugin.namespace.as_str(), plugin.id.as_str()))
+        else {
+            continue;
+        };
+        if plugin.config == previous.config && plugin.enabled == previous.enabled {
+            // The candidate may have been reconstructed from the static mesh
+            // source timestamp while `previous` carries the synthetic stamp
+            // assigned to an earlier RTDS materialization. Preserve that
+            // accepted stamp when the effective config is identical so
+            // ConfigDelta does not rebuild the plugin or reset its sampler.
+            plugin.updated_at = previous.updated_at;
+            continue;
+        }
+
+        if plugin.updated_at != previous.updated_at {
+            continue;
+        }
+        let now = chrono::Utc::now();
+        plugin.updated_at = if now <= previous.updated_at {
+            previous.updated_at + chrono::Duration::nanoseconds(1)
+        } else {
+            now
+        };
     }
 }
 
@@ -13088,6 +13161,7 @@ async fn apply_mesh_slice_generation(
             // upstream keeps its fresh timestamp and still rebuilds exactly that
             // one LB. Must run BEFORE `update_config` computes the delta.
             reconcile_mesh_upstream_timestamps(&mut config, &previous_config);
+            reconcile_fault_plugin_generations(&mut config, &previous_config);
             // GAP-2M.4: build node-waypoint per-pod policy scopes before
             // config apply, but publish them only after update_config accepts
             // the candidate. Pre-swapping scopes can pair old policies with a
@@ -15169,6 +15243,7 @@ mod tests {
                     exposed_headers: Vec::new(),
                     max_age_seconds: None,
                     allow_credentials: None,
+                    unmatched_preflights: None,
                 },
             }],
             ..MeshSlice::default()
@@ -22387,6 +22462,143 @@ mod tests {
             config.upstreams[0].updated_at, loaded_at,
             "updated_at must NOT be clobbered to the stable loaded_at (same-slice-version re-applies would hide the change from ConfigDelta)"
         );
+    }
+
+    #[test]
+    fn fault_rtds_scope_change_creates_plugin_delta_without_touching_other_scopes() {
+        use crate::modes::mesh::config::RuntimeValue;
+
+        let generation = chrono::Utc::now() - chrono::Duration::seconds(10);
+        let fault_config = crate::config::types::PluginConfig {
+            id: "fault-checkout".to_string(),
+            plugin_name: "fault_injection".to_string(),
+            namespace: "default".to_string(),
+            config: serde_json::json!({
+                "abort": {"status_code": 503, "percentage": 10.0},
+                "runtime_overlay_scope": "checkout"
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: generation,
+            updated_at: generation,
+        };
+        let accepted = GatewayConfig {
+            plugin_configs: vec![fault_config],
+            mesh: Some(Box::new(MeshConfig::default())),
+            ..GatewayConfig::default()
+        };
+        let mut candidate = accepted.clone();
+        materialize_fault_runtime_overlay(
+            &mut candidate,
+            &crate::modes::mesh::config::MeshRuntimeOverlay {
+                fields: HashMap::from([(
+                    "ferrum.fault_injection.checkout.abort_percent".to_string(),
+                    RuntimeValue::Number(90.0),
+                )]),
+            },
+        );
+        reconcile_fault_plugin_generations(&mut candidate, &accepted);
+
+        assert_ne!(candidate.plugin_configs[0].updated_at, generation);
+        let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
+        assert_eq!(delta.modified_plugin_configs.len(), 1);
+        assert!(delta.global_plugin_configs_changed);
+
+        let mut repeated = accepted.clone();
+        materialize_fault_runtime_overlay(
+            &mut repeated,
+            &crate::modes::mesh::config::MeshRuntimeOverlay {
+                fields: HashMap::from([(
+                    "ferrum.fault_injection.checkout.abort_percent".to_string(),
+                    RuntimeValue::Number(90.0),
+                )]),
+            },
+        );
+        reconcile_fault_plugin_generations(&mut repeated, &candidate);
+        assert_eq!(
+            repeated.plugin_configs[0].updated_at, candidate.plugin_configs[0].updated_at,
+            "an unchanged effective RTDS generation must retain the accepted stamp"
+        );
+        let repeated_delta = crate::config_delta::ConfigDelta::compute(&candidate, &repeated);
+        assert!(repeated_delta.modified_plugin_configs.is_empty());
+        assert!(!repeated_delta.global_plugin_configs_changed);
+
+        let mut unrelated_only = accepted.clone();
+        materialize_fault_runtime_overlay(
+            &mut unrelated_only,
+            &crate::modes::mesh::config::MeshRuntimeOverlay {
+                fields: HashMap::from([(
+                    "ferrum.fault_injection.someone_else.abort_percent".to_string(),
+                    RuntimeValue::Number(75.0),
+                )]),
+            },
+        );
+        reconcile_fault_plugin_generations(&mut unrelated_only, &accepted);
+        assert_eq!(unrelated_only.plugin_configs[0].updated_at, generation);
+
+        let mut disabled = accepted.clone();
+        materialize_fault_runtime_overlay(
+            &mut disabled,
+            &crate::modes::mesh::config::MeshRuntimeOverlay {
+                fields: HashMap::from([(
+                    "ferrum.fault_injection.checkout.abort_percent".to_string(),
+                    RuntimeValue::Number(0.0),
+                )]),
+            },
+        );
+        reconcile_fault_plugin_generations(&mut disabled, &accepted);
+        assert!(!disabled.plugin_configs[0].enabled);
+        assert_ne!(disabled.plugin_configs[0].updated_at, generation);
+    }
+
+    #[test]
+    fn fault_rtds_numeric_equivalence_preserves_plugin_generation() {
+        use crate::modes::mesh::config::RuntimeValue;
+
+        let generation = chrono::Utc::now() - chrono::Duration::seconds(10);
+        let accepted = GatewayConfig {
+            plugin_configs: vec![crate::config::types::PluginConfig {
+                id: "fault-checkout".to_string(),
+                plugin_name: "fault_injection".to_string(),
+                namespace: "default".to_string(),
+                config: serde_json::json!({
+                    "abort": {"status_code": 503, "percentage": 50},
+                    "runtime_overlay_scope": "checkout"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: generation,
+                updated_at: generation,
+            }],
+            mesh: Some(Box::new(MeshConfig::default())),
+            ..GatewayConfig::default()
+        };
+        let mut candidate = accepted.clone();
+        materialize_fault_runtime_overlay(
+            &mut candidate,
+            &crate::modes::mesh::config::MeshRuntimeOverlay {
+                fields: HashMap::from([(
+                    "ferrum.fault_injection.checkout.abort_percent".to_string(),
+                    RuntimeValue::Number(50.0),
+                )]),
+            },
+        );
+        reconcile_fault_plugin_generations(&mut candidate, &accepted);
+
+        assert_eq!(candidate.plugin_configs[0].updated_at, generation);
+        assert_eq!(
+            candidate.plugin_configs[0].config,
+            accepted.plugin_configs[0].config
+        );
+        let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
+        assert!(delta.modified_plugin_configs.is_empty());
+        assert!(!delta.global_plugin_configs_changed);
     }
 
     /// Build a minimal mesh-style upstream with one target on `port`, stamped

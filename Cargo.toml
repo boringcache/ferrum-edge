@@ -347,7 +347,7 @@ time = "0.3"
 # combination. Pure proc-macro, zero runtime cost.
 paste = "1"
 # Simple HTTP server dependencies
-tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"] }
 
 # ── Vendored upstream patches ──────────────────────────────────────────────
 # We carry a vendored copy of reqwest 0.13.3 with PR seanmonstar/reqwest#3017

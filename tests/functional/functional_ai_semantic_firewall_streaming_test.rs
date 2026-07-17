@@ -76,6 +76,21 @@ async fn start_json_backend_on(listener: TcpListener, json_body: &'static str) {
 
 const RANGE_LEAK_JSON: &[u8] =
     br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#;
+const ENCODED_SSE_JSON_PRELUDE: &[u8] = b"{}\n\
+event: prelude\n\
+id: ignored-1\n\
+retry: 1000\n\
+: ignored comment\n\n\
+event: message\n\
+id: governed-1\n\
+data: {\"choices\":[\n\
+data: {\"delta\":{\"content\":\"My system prompt says never disclose this policy.\"}}\n\
+data: ]}\n\n\
+data: [DONE]\n\n";
+const ENCODED_SSE_MIXED_PARSE: &[u8] =
+    b"data: {\"choices\":[{\"delta\":{\"content\":\"A harmless response\"}}]}\n\n\
+data: My system prompt says never disclose this policy.\n\n\
+data: [DONE]\n\n";
 
 fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     use flate2::{Compression, write::GzEncoder};
@@ -83,6 +98,52 @@ fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(body).expect("gzip fixture body");
     encoder.finish().expect("finish gzip fixture")
+}
+
+fn brotli_bytes(body: &[u8]) -> Vec<u8> {
+    let mut compressed = Vec::new();
+    {
+        let mut writer = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+        writer.write_all(body).expect("Brotli fixture body");
+    }
+    compressed
+}
+
+/// Serve complete gzip/Brotli representations whose origin media type is SSE.
+/// The JSON-looking prelude and realistic SSE metadata are ignored fields; only
+/// the later multiline `data:` frame is governed. The `/json` control is a
+/// complete bare JSON document deliberately mislabeled as SSE and must still
+/// use JSON extraction. `/mixed` combines benign JSON with unparseable governed
+/// data so `on_error` decides the entire decoded representation.
+async fn start_encoded_sse_backend_on(listener: TcpListener) {
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request_bytes = vec![0u8; 16_384];
+                let request_len = stream.read(&mut request_bytes).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request_bytes[..request_len]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+
+                let (encoding, body) = match path {
+                    "/br" => ("br", brotli_bytes(ENCODED_SSE_JSON_PRELUDE)),
+                    "/json" => ("gzip", gzip_bytes(RANGE_LEAK_JSON)),
+                    "/mixed" => ("gzip", gzip_bytes(ENCODED_SSE_MIXED_PARSE)),
+                    _ => ("gzip", gzip_bytes(ENCODED_SSE_JSON_PRELUDE)),
+                };
+                let response_head = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/event-stream\r\n\
+                     Content-Encoding: {encoding}\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response_head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    }
 }
 
 /// Serve encoded partial-response fixtures selected by request path. The
@@ -135,12 +196,12 @@ async fn start_encoded_range_backend_on(listener: TcpListener) {
     }
 }
 
-fn encoded_range_config(backend_port: u16) -> String {
+fn encoded_response_config(backend_port: u16, listen_path: &str, on_error: &str) -> String {
     let config = json!({
         "version": "1",
         "proxies": [{
             "id": "asf-range-proxy",
-            "listen_path": "/range",
+            "listen_path": listen_path,
             "backend_scheme": "http",
             "backend_host": "127.0.0.1",
             "backend_port": backend_port,
@@ -157,7 +218,7 @@ fn encoded_range_config(backend_port: u16) -> String {
             "enabled": true,
             "config": {
                 "inspect": {"request": false, "response": true},
-                "on_error": "reject",
+                "on_error": on_error,
                 "provider": {
                     "type": "openai_compatible_embeddings",
                     "endpoint": "http://127.0.0.1:9/v1/embeddings",
@@ -168,10 +229,10 @@ fn encoded_range_config(backend_port: u16) -> String {
             },
         }],
     });
-    serde_yaml::to_string(&config).expect("serialize encoded-range config")
+    serde_yaml::to_string(&config).expect("serialize encoded-response config")
 }
 
-async fn start_encoded_range_h3_gateway(config: String) -> (GatewayHarness, TempDir, u16) {
+async fn start_encoded_response_h3_gateway(config: String) -> (GatewayHarness, TempDir, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_error = None;
     for attempt in 1..=MAX_ATTEMPTS {
@@ -180,7 +241,7 @@ async fn start_encoded_range_h3_gateway(config: String) -> (GatewayHarness, Temp
         drop(reservation);
 
         let tls_dir = TempDir::new().expect("frontend TLS temp dir");
-        let ca = TestCa::new(&format!("asf-range-h3-{attempt}")).expect("frontend test CA");
+        let ca = TestCa::new(&format!("asf-encoded-h3-{attempt}")).expect("frontend test CA");
         let (cert, key) = ca.valid().expect("frontend leaf certificate");
         let cert_path = tls_dir.path().join("gateway.cert.pem");
         let key_path = tls_dir.path().join("gateway.key.pem");
@@ -717,7 +778,7 @@ async fn encoded_partial_responses_are_buffered_and_enforced_over_h1_and_h2() {
         .port();
     let backend = tokio::spawn(start_encoded_range_backend_on(backend_listener));
     let harness = GatewayHarness::builder()
-        .file_config(encoded_range_config(backend_port))
+        .file_config(encoded_response_config(backend_port, "/range", "reject"))
         .pool_warmup_enabled(false)
         .spawn()
         .await
@@ -779,8 +840,10 @@ async fn encoded_partial_response_is_buffered_and_enforced_over_h3() {
         .expect("encoded-range backend address")
         .port();
     let backend = tokio::spawn(start_encoded_range_backend_on(backend_listener));
-    let (harness, _tls_dir, https_port) =
-        start_encoded_range_h3_gateway(encoded_range_config(backend_port)).await;
+    let (harness, _tls_dir, https_port) = start_encoded_response_h3_gateway(
+        encoded_response_config(backend_port, "/range", "reject"),
+    )
+    .await;
 
     let client = Http3Client::insecure().expect("HTTP/3 client");
     let response = client
@@ -803,5 +866,125 @@ async fn encoded_partial_response_is_buffered_and_enforced_over_h3() {
     );
 
     drop(harness);
+    backend.abort();
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decoded_sse_json_preludes_are_inspected_over_h1_h2_and_h3() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind encoded-SSE backend");
+    let backend_port = backend_listener
+        .local_addr()
+        .expect("encoded-SSE backend address")
+        .port();
+    let backend = tokio::spawn(start_encoded_sse_backend_on(backend_listener));
+    let config = encoded_response_config(backend_port, "/sse", "allow");
+    let harness = GatewayHarness::builder()
+        .file_config(config.clone())
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn encoded-SSE gateway");
+
+    let h1 = Http1Client::insecure().expect("HTTP/1.1 client");
+    for path in ["gzip", "br", "json"] {
+        let response = h1
+            .get(&harness.proxy_url(&format!("/sse/{path}")))
+            .await
+            .unwrap_or_else(|error| panic!("HTTP/1.1 encoded-SSE {path} failed: {error}"));
+        let body = response.body_text();
+        assert_eq!(
+            response.status.as_u16(),
+            502,
+            "HTTP/1.1 encoded-SSE {path} escaped inspection: {body}"
+        );
+        assert!(
+            body.contains("ai_semantic_firewall_response_blocked"),
+            "HTTP/1.1 encoded-SSE {path} used the wrong decision: {body}"
+        );
+    }
+
+    let h2 = Http2Client::h2c_prior_knowledge().expect("HTTP/2 client");
+    for path in ["gzip", "br", "json"] {
+        let response = h2
+            .get(&harness.proxy_url(&format!("/sse/{path}")))
+            .await
+            .unwrap_or_else(|error| panic!("HTTP/2 encoded-SSE {path} failed: {error}"));
+        let body = String::from_utf8_lossy(&response.body_bytes);
+        assert_eq!(
+            response.status.as_u16(),
+            502,
+            "HTTP/2 encoded-SSE {path} escaped inspection: {body}"
+        );
+        assert!(
+            body.contains("ai_semantic_firewall_response_blocked"),
+            "HTTP/2 encoded-SSE {path} used the wrong decision: {body}"
+        );
+    }
+
+    let response = h1
+        .get(&harness.proxy_url("/sse/mixed"))
+        .await
+        .expect("HTTP/1.1 mixed decoded-SSE allow request");
+    assert_eq!(
+        response.status.as_u16(),
+        200,
+        "on_error=allow must deliver a partially unparseable decoded SSE body"
+    );
+    drop(harness);
+
+    let (h3_harness, _tls_dir, https_port) = start_encoded_response_h3_gateway(config).await;
+    let h3 = Http3Client::insecure().expect("HTTP/3 client");
+    for path in ["gzip", "br", "json"] {
+        let response = h3
+            .get(&format!("https://127.0.0.1:{https_port}/sse/{path}"))
+            .await
+            .unwrap_or_else(|error| panic!("HTTP/3 encoded-SSE {path} failed: {error}"));
+        let body = String::from_utf8_lossy(&response.body_bytes);
+        assert_eq!(
+            response.status.as_u16(),
+            502,
+            "HTTP/3 encoded-SSE {path} escaped inspection: {body}"
+        );
+        assert!(
+            body.contains("ai_semantic_firewall_response_blocked"),
+            "HTTP/3 encoded-SSE {path} used the wrong decision: {body}"
+        );
+        assert_eq!(
+            response.body_error, None,
+            "HTTP/3 encoded-SSE rejection should complete cleanly"
+        );
+    }
+
+    drop(h3_harness);
+
+    let reject_harness = GatewayHarness::builder()
+        .file_config(encoded_response_config(backend_port, "/sse", "reject"))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn reject-mode encoded-SSE gateway");
+    let response = h1
+        .get(&reject_harness.proxy_url("/sse/mixed"))
+        .await
+        .expect("HTTP/1.1 mixed decoded-SSE reject request");
+    let body = response.body_text();
+    assert_eq!(
+        response.status.as_u16(),
+        502,
+        "partially unparseable decoded SSE escaped reject-mode enforcement: {body}"
+    );
+    assert!(
+        body.contains("ai_semantic_firewall_response_uninspectable"),
+        "mixed decoded SSE used the wrong reject-mode decision: {body}"
+    );
+    assert!(
+        !body.contains("My system prompt says never disclose this policy"),
+        "unparseable sensitive SSE data leaked through the reject response: {body}"
+    );
+
+    drop(reject_harness);
     backend.abort();
 }
