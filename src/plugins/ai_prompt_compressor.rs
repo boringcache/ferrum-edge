@@ -1032,6 +1032,12 @@ fn strip_all_markers(text: &str, open: &str, close: &str) -> String {
 /// are recognized through ordinary JSON escapes too (`\u003c`, `\/`, and mixed
 /// literal/escaped spellings), matching the decoded strings a provider sees.
 fn strip_markers_from_json_strings(body: &[u8], tags: &(String, String)) -> Option<Vec<u8>> {
+    // Validate once before the lexical pass. Scalar advancement below can then
+    // use UTF-8 lead-byte widths without revalidating every remaining suffix.
+    // The body is bounded by the caller, so this keeps the complete scan linear
+    // while preserving the fail-closed behavior for invalid UTF-8.
+    std::str::from_utf8(body).ok()?;
+
     let (open, close) = tags;
     let mut output = Vec::with_capacity(body.len());
     let mut cursor = 0usize;
@@ -1087,11 +1093,12 @@ fn strip_markers_from_json_strings(body: &[u8], tags: &(String, String)) -> Opti
 }
 
 fn json_string_end(body: &[u8], mut cursor: usize) -> Option<usize> {
-    // Each call advances monotonically to one string boundary, and the caller
-    // then advances past that string. Value contents are scanned once more for
-    // marker matches whose length is bounded by MAX_PRESERVE_TAG_NAME_BYTES
-    // plus fixed delimiters, so the complete sanitation pass remains linear in
-    // the bounded input size.
+    // Each call advances monotonically to one string boundary using the UTF-8
+    // validation performed once at scanner entry, and the caller then advances
+    // past that string. Value contents are scanned once more for marker matches
+    // whose length is bounded by MAX_PRESERVE_TAG_NAME_BYTES plus fixed
+    // delimiters, so the complete sanitation pass remains linear in the bounded
+    // input size.
     while cursor < body.len() {
         if body[cursor] == b'"' {
             return Some(cursor);
@@ -1165,11 +1172,20 @@ fn json_string_scalar_end(body: &[u8], start: usize) -> Option<usize> {
     if byte.is_ascii() {
         return Some(start + 1);
     }
-    let character = std::str::from_utf8(body.get(start..)?)
-        .ok()?
-        .chars()
-        .next()?;
-    Some(start + character.len_utf8())
+
+    // `strip_markers_from_json_strings` validates the complete body as UTF-8
+    // once before reaching this helper. Reject continuation and out-of-range
+    // lead bytes defensively, then advance in constant time without rescanning
+    // the remaining suffix for every non-ASCII scalar.
+    let width = match byte {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return None,
+    };
+    let end = start.checked_add(width)?;
+    body.get(start..end)?;
+    Some(end)
 }
 
 fn hex_digit(byte: u8) -> Option<u8> {

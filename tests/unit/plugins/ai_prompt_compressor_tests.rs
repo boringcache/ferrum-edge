@@ -1029,6 +1029,36 @@ async fn preserve_marker_cleanup_preserves_member_name_bytes_across_json_shapes(
 
 #[tokio::test]
 #[serial(ai_prompt_compressor_budget)]
+async fn preserve_marker_cleanup_scans_large_literal_unicode_strings_linearly() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let unicode_key = format!("{}<keep>key", "鍵".repeat(32_768));
+    let unicode_value = "値".repeat(32_768);
+    let raw = format!(
+        "{{\"messages\":[{{\"role\":\"user\",\"content\":\"short\"}}],\"{unicode_key}\":\"<keep>{unicode_value}</keep>\"}}"
+    );
+    let expected = format!(
+        "{{\"messages\":[{{\"role\":\"user\",\"content\":\"short\"}}],\"{unicode_key}\":\"{unicode_value}\"}}"
+    );
+
+    let output = plugin
+        .transform_request_body(
+            raw.as_bytes(),
+            Some("application/json"),
+            &json_headers(),
+        )
+        .await
+        .expect("large literal Unicode strings must be sanitized");
+
+    assert_eq!(output, expected.as_bytes());
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn preserve_markers_in_member_names_alone_do_not_trigger_a_rewrite() {
     let plugin = AiPromptCompressor::new(&json!({
         "preserve_tag": "keep",
