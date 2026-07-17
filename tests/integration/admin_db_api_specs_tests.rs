@@ -875,6 +875,103 @@ async fn restore_bundle_preserves_preexisting_proxy_when_later_insert_conflicts(
     assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
 }
 
+#[tokio::test]
+async fn restore_bundle_rejects_intervening_route_conflict_and_rolls_back() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let existing_proxy_id = uid("restore-route-existing");
+    let restored_proxy_id = uid("restore-route-candidate");
+    let restored_upstream_id = uid("restore-route-upstream");
+    let spec_id = uid("restore-route-spec");
+
+    let existing = make_proxy(&existing_proxy_id, ns);
+    store
+        .create_proxy(&existing)
+        .await
+        .expect("seed intervening route failed");
+
+    let mut restored_proxy = make_proxy(&restored_proxy_id, ns);
+    restored_proxy.api_spec_id = Some(spec_id.clone());
+    restored_proxy.listen_path = existing.listen_path.clone();
+    let mut restored_upstream = make_upstream(&restored_upstream_id, ns);
+    restored_upstream.api_spec_id = Some(spec_id.clone());
+    let bundle = ExtractedBundle {
+        proxy: restored_proxy,
+        upstream: Some(restored_upstream),
+        plugins: vec![],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &restored_proxy_id,
+        ns,
+        b"intervening route conflict",
+    );
+
+    let error = store
+        .restore_api_spec_bundle(&bundle, &spec, &[])
+        .await
+        .expect_err("overlapping intervening route must reject compensation");
+    assert!(
+        error.to_string().contains("overlapping hosts"),
+        "unexpected route-conflict error: {error:#}"
+    );
+    assert!(
+        store
+            .get_proxy(ns, &existing_proxy_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "intervening proxy must survive rejected compensation"
+    );
+    assert!(
+        store
+            .get_proxy(ns, &restored_proxy_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_upstream(ns, &restored_upstream_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "upstream inserted before route admission must roll back"
+    );
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_missing_hand_owned_upstream_reference() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-missing-upstream-proxy");
+    let missing_upstream_id = uid("restore-missing-upstream");
+    let spec_id = uid("restore-missing-upstream-spec");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.upstream_id = Some(missing_upstream_id);
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"missing hand-owned upstream");
+
+    assert!(
+        store
+            .restore_api_spec_bundle(&bundle, &spec, &[])
+            .await
+            .is_err(),
+        "compensation must reject a proxy whose hand-owned upstream disappeared"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+}
+
 // ---------------------------------------------------------------------------
 // replace_api_spec_bundle
 // ---------------------------------------------------------------------------

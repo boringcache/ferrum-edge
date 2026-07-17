@@ -9229,6 +9229,7 @@ mod inner {
                 let mut session = connection.client.start_session().await?;
                 let prepared_docs =
                     prepare_api_spec_restore_docs(bundle, spec, additional_plugins)?;
+                let guard_params = ProxyWriteGuardParams::from_proxy(&bundle.proxy);
                 let mut upsert_changes: Vec<(String, &'static str, String)> = Vec::new();
                 if let Some(upstream) = &bundle.upstream {
                     upsert_changes.push((
@@ -9257,10 +9258,19 @@ mod inner {
                             self,
                             connection,
                             prepared_docs,
+                            guard_params,
                             upsert_changes,
                             spec.namespace.clone(),
                         ),
-                        |s, (this, connection, prepared_docs, upsert_changes, namespace)| {
+                        |s,
+                         (
+                            this,
+                            connection,
+                            prepared_docs,
+                            guard_params,
+                            upsert_changes,
+                            namespace,
+                        )| {
                             Box::pin(async move {
                                 if let Some((_, doc)) = &prepared_docs.upstream {
                                     this.upstreams()
@@ -9268,6 +9278,17 @@ mod inner {
                                         .session(&mut *s)
                                         .await?;
                                 }
+                                // Compensation may follow an intervening
+                                // writer. Reapply the same in-session route
+                                // uniqueness and upstream-reference guards as
+                                // normal proxy creation before publishing the
+                                // restored proxy.
+                                this.ensure_proxy_admission_guards_in_session(
+                                    &mut *s,
+                                    guard_params,
+                                    None,
+                                )
+                                .await?;
                                 this.proxies()
                                     .insert_one(prepared_docs.proxy.1.clone())
                                     .session(&mut *s)
