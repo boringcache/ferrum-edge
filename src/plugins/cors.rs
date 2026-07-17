@@ -884,7 +884,13 @@ fn finalize_cors_response(
     let should_sanitize = ctx.cors_state.sanitize_response
         || ctx.cors_state.native_policy_seen
         || ctx.cors_state.istio_policy_seen;
-    if should_sanitize && !(is_rejection_path && ctx.cors_state.policy_count == 0) {
+    // Synthetic responses belong to translated Istio policy as soon as its
+    // request hook participates, including the no-Origin early return where no
+    // policy is counted. Native no-Origin short-circuits retain direct-plugin
+    // semantics; native requests with an Origin have a counted policy.
+    let policy_owns_rejection =
+        ctx.cors_state.policy_count > 0 || ctx.cors_state.istio_policy_seen;
+    if should_sanitize && (!is_rejection_path || policy_owns_rejection) {
         CorsPlugin::remove_access_control_headers(response_headers);
     }
     if ctx.cors_state.policy_count == 0 || !ctx.cors_state.response_allowed {

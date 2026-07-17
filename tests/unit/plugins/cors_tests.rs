@@ -1,6 +1,7 @@
 //! Tests for the CORS plugin
 
 use ferrum_edge::plugins::cors::CorsPlugin;
+use ferrum_edge::plugins::response_mock::ResponseMock;
 use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -675,6 +676,101 @@ async fn test_istio_forward_owns_access_control_headers_without_origin() {
     assert_no_access_control_headers(&response_headers);
     assert_eq!(response_headers.len(), 1);
     assert_eq!(response_headers["x-backend"], "ok");
+}
+
+#[tokio::test]
+async fn test_istio_policy_without_origin_strips_response_mock_access_control_headers() {
+    let cors = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example"],
+        "unmatched_preflights": "forward"
+    }))
+    .unwrap();
+    let response_mock = ResponseMock::new(&json!({
+        "rules": [{
+            "path": "/test",
+            "status_code": 202,
+            "body": "synthetic body",
+            "headers": {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Credentials": "true",
+                "X-Mock": "preserved"
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    assert!(matches!(
+        cors.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut request_headers = HashMap::new();
+    let (status_code, body, mut response_headers) =
+        match response_mock.before_proxy(&mut ctx, &mut request_headers).await {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => (status_code, body, headers),
+            _ => panic!("response_mock must short-circuit the request"),
+        };
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+
+    assert!(matches!(
+        cors.after_proxy(&mut ctx, status_code, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(status_code, 202);
+    assert_eq!(body, "synthetic body");
+    assert_no_access_control_headers(&response_headers);
+    assert_eq!(response_headers["x-mock"], "preserved");
+}
+
+#[tokio::test]
+async fn test_response_mock_headers_survive_rejection_without_cors_participation() {
+    let cors = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example"],
+        "unmatched_preflights": "forward"
+    }))
+    .unwrap();
+    let response_mock = ResponseMock::new(&json!({
+        "rules": [{
+            "path": "/test",
+            "status_code": 202,
+            "body": "synthetic body",
+            "headers": {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Credentials": "true",
+                "X-Mock": "preserved"
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    let mut request_headers = HashMap::new();
+    let (status_code, body, mut response_headers) =
+        match response_mock.before_proxy(&mut ctx, &mut request_headers).await {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => (status_code, body, headers),
+            _ => panic!("response_mock must short-circuit the request"),
+        };
+    let expected_headers = response_headers.clone();
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+
+    assert!(matches!(
+        cors.after_proxy(&mut ctx, status_code, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(status_code, 202);
+    assert_eq!(body, "synthetic body");
+    assert_eq!(response_headers, expected_headers);
 }
 
 #[test]
