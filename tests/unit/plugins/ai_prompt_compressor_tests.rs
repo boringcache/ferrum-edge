@@ -1046,11 +1046,7 @@ async fn preserve_marker_cleanup_scans_large_literal_unicode_strings_linearly() 
     );
 
     let output = plugin
-        .transform_request_body(
-            raw.as_bytes(),
-            Some("application/json"),
-            &json_headers(),
-        )
+        .transform_request_body(raw.as_bytes(), Some("application/json"), &json_headers())
         .await
         .expect("large literal Unicode strings must be sanitized");
 
