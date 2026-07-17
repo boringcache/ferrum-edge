@@ -86,6 +86,7 @@ fn test_constructor_rejects_invalid_header_name_chars() {
 #[test]
 fn test_constructor_rejects_protocol_managed_and_security_sensitive_header_names() {
     for header_name in [
+        "API-Key",
         "Authentication-Info",
         "Authorization",
         "Connection",
@@ -114,6 +115,9 @@ fn test_constructor_rejects_protocol_managed_and_security_sensitive_header_names
         "X-API-Key",
         "X-Auth-Token",
         "X-CSRF-Token",
+        "X-Forwarded-Authorization",
+        "X-Goog-API-Key",
+        "X-XSRF-Token",
     ] {
         let err = CorrelationId::new(&json!({"header_name": header_name}))
             .err()

@@ -1988,6 +1988,57 @@ async fn batch_admission_rejects_duplicate_effective_correlation_headers() {
 }
 
 #[tokio::test]
+async fn batch_admission_rejects_equal_effective_correlation_priorities() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let candidate = json!({
+        "proxies": [{
+            "id": "equal-correlation-priority-proxy",
+            "listen_path": "/equal-correlation-priority",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "equal-correlation-priority-first"},
+                {"plugin_config_id": "equal-correlation-priority-second"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "equal-correlation-priority-first",
+                "plugin_name": "correlation_id",
+                "scope": "proxy",
+                "proxy_id": "equal-correlation-priority-proxy",
+                "enabled": true,
+                "config": {"header_name": "x-internal-request-id"}
+            },
+            {
+                "id": "equal-correlation-priority-second",
+                "plugin_name": "correlation_id",
+                "scope": "proxy",
+                "proxy_id": "equal-correlation-priority-proxy",
+                "enabled": true,
+                "config": {"header_name": "x-external-request-id"}
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &candidate).await;
+
+    assert_eq!(
+        status, 400,
+        "equal correlation priorities were admitted: {body}"
+    );
+    assert!(
+        body.to_string().contains("duplicate effective priority 50"),
+        "unexpected correlation-priority admission response: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

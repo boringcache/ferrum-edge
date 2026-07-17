@@ -13,6 +13,7 @@ use super::{Plugin, PluginResult, REQUEST_ID_METADATA_KEY, RequestContext};
 const INSTANCE_METADATA_PREFIX: &str = "correlation_id.instance.";
 
 const RESERVED_HEADER_NAMES: &[&str] = &[
+    "api-key",
     "authentication-info",
     "authorization",
     "connection",
@@ -41,6 +42,9 @@ const RESERVED_HEADER_NAMES: &[&str] = &[
     "x-api-key",
     "x-auth-token",
     "x-csrf-token",
+    "x-forwarded-authorization",
+    "x-goog-api-key",
+    "x-xsrf-token",
 ];
 
 pub struct CorrelationId {

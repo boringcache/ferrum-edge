@@ -255,17 +255,25 @@ fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> R
 
 /// A correlation header names one trust-domain value. Allowing two instances
 /// to own the same normalized header would make their instance-scoped metadata
-/// and stream-generated IDs contradictory, so reject the chain before it is
-/// published.
+/// and stream-generated IDs contradictory. Equal priorities would make the
+/// canonical owner depend on storage/load order, so reject either ambiguity
+/// before the chain is published.
 fn validate_correlation_id_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
     let mut headers = HashSet::new();
-    for header_name in plugins
-        .iter()
-        .filter_map(|plugin| plugin.correlation_id_header_name())
-    {
+    let mut priorities = HashSet::new();
+    for plugin in plugins {
+        let Some(header_name) = plugin.correlation_id_header_name() else {
+            continue;
+        };
         if !headers.insert(header_name) {
             return Err(format!(
                 "correlation_id: duplicate effective header_name {header_name:?} on the same plugin chain; each correlation trust domain must use a distinct header"
+            ));
+        }
+        let priority = plugin.priority();
+        if !priorities.insert(priority) {
+            return Err(format!(
+                "correlation_id: duplicate effective priority {priority} on the same plugin chain; configure distinct effective priorities with priority_override so canonical ownership is deterministic"
             ));
         }
     }

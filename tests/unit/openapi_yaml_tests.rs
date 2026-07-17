@@ -1671,6 +1671,7 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "x:request-id"}),
         json!({"header_name": 42}),
         json!({"echo_downstream": "true"}),
+        json!({"header_name": "API-Key"}),
         json!({"header_name": "Authentication-Info"}),
         json!({"header_name": "Authorization"}),
         json!({"header_name": "Connection"}),
@@ -1700,6 +1701,9 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "X-API-Key"}),
         json!({"header_name": "X-Auth-Token"}),
         json!({"header_name": "X-CSRF-Token"}),
+        json!({"header_name": "X-Forwarded-Authorization"}),
+        json!({"header_name": "X-Goog-API-Key"}),
+        json!({"header_name": "X-XSRF-Token"}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
         assert!(

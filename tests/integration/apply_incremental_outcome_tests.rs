@@ -605,7 +605,7 @@ async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation()
         "x-external-correlation-id"
     );
 
-    let mut duplicate = valid;
+    let mut duplicate = valid.clone();
     duplicate.plugin_configs[1].config = serde_json::json!({
         "header_name": " X-Stable-Request-ID ",
         "echo_downstream": true
@@ -624,6 +624,24 @@ async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation()
     assert_eq!(
         state.config.load().plugin_configs[1].config["header_name"],
         "x-external-correlation-id"
+    );
+
+    let mut priority_tie = valid;
+    priority_tie.plugin_configs[1].priority_override = Some(40);
+    priority_tie.plugin_configs[1].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(priority_tie) else {
+        panic!("equal effective correlation priorities must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("correlation_id") && error.contains("duplicate effective priority 40")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].priority_override,
+        Some(40)
+    );
+    assert_eq!(
+        state.config.load().plugin_configs[1].priority_override,
+        Some(60)
     );
 
     let request_view = state.plugin_cache.request_view("p1", ProxyProtocol::Http);

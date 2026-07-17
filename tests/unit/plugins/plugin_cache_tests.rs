@@ -4705,6 +4705,36 @@ fn test_duplicate_effective_correlation_headers_are_rejected() {
 }
 
 #[test]
+fn test_equal_effective_correlation_priorities_are_rejected() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr-internal", "corr-external"])],
+        vec![
+            make_plugin_config_with_json(
+                "corr-internal",
+                "correlation_id",
+                json!({"header_name": "x-internal-request-id"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "corr-external",
+                "correlation_id",
+                json!({"header_name": "x-external-request-id"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("equal correlation priorities must fail closed");
+    assert!(error.contains("duplicate effective priority 50"));
+    assert!(error.contains("priority_override"));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
 fn test_same_correlation_header_on_disjoint_proxy_chains_is_allowed() {
     let config = make_config(
         vec![
