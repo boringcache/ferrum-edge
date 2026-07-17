@@ -5,23 +5,29 @@
 //!
 //! This plugin adds a custom `X-Custom-Gateway` header to every request
 //! before it is proxied to the backend, and echoes it back in the response.
-//! An optional `request_body_prefix` demonstrates request-body transformation
-//! capability metadata used by core composition validation.
+//! Optional `request_body_prefix`, `correlation_header_name`, and `protocol`
+//! fields demonstrate capability metadata used by core composition validation.
 //!
 //! The `create_plugin` function at the bottom is the only required entry
 //! point — the build script discovers this file automatically.
 
 use async_trait::async_trait;
-use http::HeaderValue;
+use http::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext, TransactionSummary};
+use crate::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
+    StreamConnectionContext, TCP_ONLY_PROTOCOLS, TransactionSummary,
+};
 
 pub struct ExamplePlugin {
     header_value: String,
     request_body_prefix: Option<Vec<u8>>,
+    correlation_header_name: Option<String>,
+    correlation_header_claim: Option<String>,
+    supported_protocols: &'static [ProxyProtocol],
 }
 
 const DEFAULT_HEADER_VALUE: &str = "ferrum-custom";
@@ -34,9 +40,12 @@ impl ExamplePlugin {
             .ok_or_else(|| "example_plugin config must be a JSON object".to_string())?;
 
         for key in config.keys() {
-            if !matches!(key.as_str(), "header_value" | "request_body_prefix") {
+            if !matches!(
+                key.as_str(),
+                "header_value" | "request_body_prefix" | "correlation_header_name" | "protocol"
+            ) {
                 return Err(format!(
-                    "example_plugin config contains unknown key '{key}'; expected only 'header_value' and 'request_body_prefix'"
+                    "example_plugin config contains unknown key '{key}'; expected only 'header_value', 'request_body_prefix', 'correlation_header_name', and 'protocol'"
                 ));
             }
         }
@@ -71,12 +80,57 @@ impl ExamplePlugin {
                 );
             }
         };
+        let (correlation_header_name, correlation_header_claim) = match config
+            .get("correlation_header_name")
+        {
+            None => (None, None),
+            Some(Value::String(value)) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(
+                        "example_plugin.correlation_header_name must not be empty".to_string(),
+                    );
+                }
+                let normalized = trimmed.to_ascii_lowercase();
+                let header_name = HeaderName::from_bytes(normalized.as_bytes()).map_err(|error| {
+                    format!(
+                        "example_plugin.correlation_header_name must be a valid HTTP header name: {error}"
+                    )
+                })?;
+                (
+                    Some(header_name.as_str().to_string()),
+                    Some(value.clone()),
+                )
+            }
+            Some(_) => {
+                return Err(
+                    "example_plugin.correlation_header_name must be a string when present"
+                        .to_string(),
+                );
+            }
+        };
+        let supported_protocols = match config.get("protocol") {
+            None => HTTP_ONLY_PROTOCOLS,
+            Some(Value::String(value)) if value == "http" => HTTP_ONLY_PROTOCOLS,
+            Some(Value::String(value)) if value == "tcp" => TCP_ONLY_PROTOCOLS,
+            Some(Value::String(value)) => {
+                return Err(format!(
+                    "example_plugin.protocol must be 'http' or 'tcp', got '{value}'"
+                ));
+            }
+            Some(_) => {
+                return Err("example_plugin.protocol must be a string when present".to_string());
+            }
+        };
         Ok(Self {
             // Read configuration from the plugin's JSON config.
             // In the gateway config, this would look like:
             //   { "plugin_name": "example_plugin", "config": { "header_value": "my-gateway" } }
             header_value,
             request_body_prefix,
+            correlation_header_name,
+            correlation_header_claim,
+            supported_protocols,
         })
     }
 }
@@ -86,6 +140,18 @@ impl Plugin for ExamplePlugin {
     /// Unique name for this plugin. Must match the file name (without .rs).
     fn name(&self) -> &str {
         "example_plugin"
+    }
+
+    fn correlation_id_header_name(&self) -> Option<&str> {
+        // Keep the configured whitespace and spelling at this capability
+        // boundary so the core validator remains defensive against third-party
+        // plugins that do not pre-normalize. Runtime header writes still use
+        // the validated, lowercase `correlation_header_name` above.
+        self.correlation_header_claim.as_deref()
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        self.supported_protocols
     }
 
     /// Execution priority. See `src/plugins/mod.rs` for the priority band guide:
@@ -131,6 +197,9 @@ impl Plugin for ExamplePlugin {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         headers.insert("x-custom-gateway".to_string(), self.header_value.clone());
+        if let Some(header_name) = &self.correlation_header_name {
+            headers.insert(header_name.clone(), self.header_value.clone());
+        }
         PluginResult::Continue
     }
 
@@ -147,6 +216,13 @@ impl Plugin for ExamplePlugin {
         Some(transformed)
     }
 
+    async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        if let Some(header_name) = &self.correlation_header_name {
+            ctx.insert_metadata(header_name.clone(), self.header_value.clone());
+        }
+        PluginResult::Continue
+    }
+
     /// Called after the backend response is received.
     /// Use this to add/modify response headers sent to the client.
     async fn after_proxy(
@@ -156,6 +232,9 @@ impl Plugin for ExamplePlugin {
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         response_headers.insert("x-custom-gateway".to_string(), self.header_value.clone());
+        if let Some(header_name) = &self.correlation_header_name {
+            response_headers.insert(header_name.clone(), self.header_value.clone());
+        }
         PluginResult::Continue
     }
 

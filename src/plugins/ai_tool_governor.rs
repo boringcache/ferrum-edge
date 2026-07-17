@@ -1241,12 +1241,17 @@ impl AiToolGovernor {
         model: Option<String>,
         provider: Option<&str>,
     ) -> CorrelationMeta {
+        let request_id = ctx
+            .canonical_correlation_id()
+            .or_else(|| {
+                [super::REQUEST_ID_METADATA_KEY, "correlation_id"]
+                    .into_iter()
+                    .filter_map(|key| ctx.metadata.get(key).map(String::as_str))
+                    .find(|value| !value.is_empty())
+            })
+            .unwrap_or_default();
         CorrelationMeta {
-            request_id: ctx
-                .metadata
-                .get("correlation_id")
-                .cloned()
-                .unwrap_or_default(),
+            request_id: request_id.to_string(),
             consumer: ctx.effective_identity().map(str::to_string),
             proxy: ctx
                 .matched_proxy

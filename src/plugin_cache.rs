@@ -16,7 +16,7 @@
 //! lists (including their stateful instances) and only rebuild affected proxies.
 
 use arc_swap::ArcSwap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -254,10 +254,84 @@ fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> R
     Ok(())
 }
 
+/// A correlation header names one trust-domain value. Allowing two instances
+/// that can execute for the same protocol to own the same normalized header
+/// would make their instance-scoped metadata and stream-generated IDs
+/// contradictory. Equal priorities would make the canonical owner depend on
+/// storage/load order. Reject either ambiguity before the chain is published,
+/// while allowing disjoint protocol owners that can never contend at runtime.
+pub(crate) fn validate_correlation_id_composition(
+    plugins: &[Arc<dyn Plugin>],
+    real_ip_header: Option<&str>,
+) -> Result<(), String> {
+    for protocol in ALL_PROXY_PROTOCOLS {
+        let mut headers = HashSet::new();
+        let mut priorities = HashSet::new();
+        for plugin in plugins
+            .iter()
+            .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+        {
+            let Some(header_name) = plugin.correlation_id_header_name() else {
+                continue;
+            };
+            // Custom plugins are expected to normalize this capability, but
+            // composition admission must not trust third-party implementations
+            // to trim or case-fold it. This allocation happens only while
+            // building/validating a cache generation, never on the request hot
+            // path.
+            let trimmed_header_name = header_name.trim();
+            if trimmed_header_name.is_empty() {
+                return Err(format!(
+                    "correlation_id: plugin {:?} returned an empty correlation_id_header_name capability claim for protocol {protocol:?}; return None when the plugin does not own a correlation header",
+                    plugin.name()
+                ));
+            }
+            let normalized_header_name = trimmed_header_name.to_ascii_lowercase();
+            if crate::plugins::correlation_id::is_reserved_header_name(&normalized_header_name) {
+                return Err(format!(
+                    "correlation_id: effective header_name {normalized_header_name:?} for plugin {:?} and protocol {protocol:?} violates reserved protocol-managed or security-sensitive header ownership",
+                    plugin.name()
+                ));
+            }
+            if real_ip_header
+                .is_some_and(|configured| normalized_header_name.eq_ignore_ascii_case(configured))
+            {
+                return Err(format!(
+                    "correlation_id: effective header_name {normalized_header_name:?} for plugin {:?} and protocol {protocol:?} conflicts with the effective FERRUM_REAL_IP_HEADER client-attribution header",
+                    plugin.name()
+                ));
+            }
+            if !headers.insert(normalized_header_name.clone()) {
+                return Err(format!(
+                    "correlation_id: duplicate effective header_name {normalized_header_name:?} for protocol {protocol:?} on the same plugin chain; each overlapping correlation trust domain must use a distinct header"
+                ));
+            }
+            let priority = plugin.priority();
+            if !priorities.insert(priority) {
+                return Err(format!(
+                    "correlation_id: duplicate effective priority {priority} for protocol {protocol:?} on the same plugin chain; configure distinct effective priorities with priority_override so canonical ownership is deterministic"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_plugin_composition(
+    plugins: &[Arc<dyn Plugin>],
+    real_ip_header: Option<&str>,
+) -> Result<(), String> {
+    validate_hmac_request_transform_composition(plugins)?;
+    validate_correlation_id_composition(plugins, real_ip_header)
+}
+
 #[async_trait]
 impl Plugin for PriorityOverridePlugin {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+    fn correlation_id_header_name(&self) -> Option<&str> {
+        self.inner.correlation_id_header_name()
     }
     fn priority(&self) -> u16 {
         self.priority
@@ -351,6 +425,18 @@ impl Plugin for PriorityOverridePlugin {
         backend_path: &str,
     ) -> PluginResult {
         self.inner.on_backend_path_resolved(ctx, backend_path).await
+    }
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner.apply_websocket_handshake_response_headers(
+            ctx,
+            response_status,
+            response_headers,
+        );
     }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();
@@ -943,8 +1029,7 @@ type RequestBufferingMap = HashMap<String, bool>;
 type WsFrameMap = HashMap<String, bool>;
 /// Map from proxy_group plugin_config_id to its shared plugin instance.
 type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
-type HmacCompositionPluginMap<'a> =
-    HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
+type CompositionPluginMap<'a> = HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct AdaptiveConcurrencyPolicyId {
@@ -2076,12 +2161,13 @@ struct ProxyGroupPluginInstance {
     config: PluginConfig,
 }
 
-/// Built-in plugin types whose constructed instance can participate in the
-/// HMAC request-body composition invariant. Keep this list aligned with
+/// Built-in plugin types whose constructed instances participate in a
+/// cross-plugin composition invariant. Keep the HMAC portion aligned with
 /// `Plugin::modifies_request_body()` implementations. Registered custom
 /// plugins are also constructed because their capability is defined by their
 /// `Plugin` implementation rather than a core allowlist.
-const HMAC_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
+const COMPOSITION_PLUGIN_NAMES: &[&str] = &[
+    "correlation_id",
     "hmac_auth",
     "request_transformer",
     "compression",
@@ -2093,24 +2179,34 @@ const HMAC_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "ai_request_guard",
 ];
 
-/// Validate the HMAC/request-body-transform invariant against a candidate
-/// config before an admin Proxy or PluginConfig write is persisted. Runtime
-/// cache construction repeats the same check as a fail-closed backstop.
-pub(crate) fn validate_hmac_request_transform_candidate(
+/// Validate cross-plugin composition invariants against a candidate config
+/// before an admin Proxy or PluginConfig write is persisted. Runtime cache
+/// construction repeats the same checks as a fail-closed backstop.
+pub(crate) fn validate_plugin_composition_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,
 ) -> Result<(), String> {
-    if !config
+    let has_hmac = config
         .plugin_configs
         .iter()
-        .any(|plugin| plugin.enabled && plugin.plugin_name == "hmac_auth")
-    {
+        .any(|plugin| plugin.enabled && plugin.plugin_name == "hmac_auth");
+    let has_correlation = config
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.enabled && plugin.plugin_name == "correlation_id");
+    let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
+    // A custom plugin's composition capabilities are known only after its
+    // registered factory constructs the Plugin implementation.
+    let has_custom_composition_candidate = config
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.enabled && custom_plugin_names.contains(&plugin.plugin_name.as_str()));
+    if !has_hmac && !has_correlation && !has_custom_composition_candidate {
         return Ok(());
     }
     let mut errors = Vec::new();
-    let mut global_plugins = Vec::new();
-    let mut scoped_plugins: HmacCompositionPluginMap<'_> = HashMap::new();
-    let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
+    let mut global_plugins: BTreeMap<&str, Vec<Arc<dyn Plugin>>> = BTreeMap::new();
+    let mut scoped_plugins: CompositionPluginMap<'_> = HashMap::new();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let current_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
@@ -2118,7 +2214,7 @@ pub(crate) fn validate_hmac_request_transform_candidate(
 
     for plugin_config in &config.plugin_configs {
         if !plugin_config.enabled
-            || (!HMAC_COMPOSITION_PLUGIN_NAMES.contains(&plugin_config.plugin_name.as_str())
+            || (!COMPOSITION_PLUGIN_NAMES.contains(&plugin_config.plugin_name.as_str())
                 && !custom_plugin_names.contains(&plugin_config.plugin_name.as_str()))
         {
             continue;
@@ -2133,7 +2229,10 @@ pub(crate) fn validate_hmac_request_transform_candidate(
             &mut staged_tcp_throttle_states,
         ) {
             Ok(Some(plugin)) if plugin_config.scope == PluginScope::Global => {
-                global_plugins.push(plugin);
+                global_plugins
+                    .entry(plugin_config.namespace.as_str())
+                    .or_default()
+                    .push(plugin);
             }
             Ok(Some(plugin)) => {
                 scoped_plugins.insert(
@@ -2147,7 +2246,10 @@ pub(crate) fn validate_hmac_request_transform_candidate(
     }
 
     for proxy in &config.proxies {
-        let mut merged = global_plugins.clone();
+        let mut merged = global_plugins
+            .get(proxy.namespace.as_str())
+            .cloned()
+            .unwrap_or_default();
         let global_ptrs: HashSet<usize> = merged
             .iter()
             .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
@@ -2170,20 +2272,22 @@ pub(crate) fn validate_hmac_request_transform_candidate(
             remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
             merged.push(Arc::clone(plugin));
         }
-        if let Err(error) = validate_hmac_request_transform_composition(&merged) {
+        if let Err(error) = validate_plugin_composition(&merged, http_client.real_ip_header()) {
             errors.push(format!("proxy_id={}: {error}", proxy.id));
         }
     }
 
-    if let Err(error) = validate_hmac_request_transform_composition(&global_plugins) {
-        errors.push(format!("global plugins: {error}"));
+    for (namespace, plugins) in &global_plugins {
+        if let Err(error) = validate_plugin_composition(plugins, http_client.real_ip_header()) {
+            errors.push(format!("global plugins namespace={namespace:?}: {error}"));
+        }
     }
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "{} HMAC request-transform composition error(s): {}",
+            "{} plugin composition error(s): {}",
             errors.len(),
             errors.join("; ")
         ))
@@ -3265,7 +3369,9 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
-            if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
+            if let Err(e) =
+                validate_plugin_composition(&global_plugins, self.http_client.real_ip_header())
+            {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
             Arc::new(global_plugins)
@@ -3519,7 +3625,8 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
+            if let Err(e) = validate_plugin_composition(&merged, self.http_client.real_ip_header())
+            {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
             new_map.insert(proxy.id.clone(), Arc::new(merged));
@@ -4088,7 +4195,7 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
+            if let Err(e) = validate_plugin_composition(&merged, http_client.real_ip_header()) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
 
@@ -4117,7 +4224,7 @@ impl PluginCache {
         if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
-        if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
+        if let Err(e) = validate_plugin_composition(&global_plugins, http_client.real_ip_header()) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
 

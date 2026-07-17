@@ -1,7 +1,9 @@
 //! Tests for the Correlation ID plugin
 
+use ferrum_edge::_test_support::clone_log_metadata;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, RequestContext, correlation_id::CorrelationId, priority,
+    ALL_PROTOCOLS, Plugin, REQUEST_ID_METADATA_KEY, RequestContext, correlation_id::CorrelationId,
+    priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -17,6 +19,45 @@ fn make_ctx() -> RequestContext {
 }
 
 // ── Constructor validation ──────────────────────────────────────────
+
+#[test]
+fn test_constructor_rejects_every_non_object_config_class() {
+    for config in [
+        json!(null),
+        json!([]),
+        json!("not-an-object"),
+        json!(42),
+        json!(true),
+    ] {
+        let err = CorrelationId::new(&config)
+            .err()
+            .expect("non-object config must be rejected");
+        assert_eq!(err, "correlation_id: config must be a JSON object");
+    }
+}
+
+#[test]
+fn test_constructor_rejects_one_and_multiple_unknown_fields_deterministically() {
+    let one = CorrelationId::new(&json!({"echo_downsteam": false}))
+        .err()
+        .expect("unknown field must be rejected");
+    assert_eq!(
+        one,
+        "correlation_id: unknown config field(s): echo_downsteam"
+    );
+
+    let multiple = CorrelationId::new(&json!({
+        "z_unknown": true,
+        "header_name": "x-request-id",
+        "a_unknown": false
+    }))
+    .err()
+    .expect("multiple unknown fields must be rejected");
+    assert_eq!(
+        multiple,
+        "correlation_id: unknown config field(s): a_unknown, z_unknown"
+    );
+}
 
 #[test]
 fn test_constructor_rejects_non_string_header_name() {
@@ -41,6 +82,95 @@ fn test_constructor_rejects_invalid_header_name_chars() {
         .err()
         .expect("colon in header name must be rejected");
     assert!(err.contains("not permitted"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_protocol_managed_and_security_sensitive_header_names() {
+    for header_name in [
+        "API-Key",
+        "Authentication-Info",
+        "Authorization",
+        "Connection",
+        "Content-Encoding",
+        "Content-Length",
+        "Cookie",
+        "Early-Data",
+        "Expect",
+        "Forwarded",
+        "Grpc-Message",
+        "Grpc-Status",
+        "Grpc-Status-Details-Bin",
+        "Host",
+        "Keep-Alive",
+        "Proxy-Authenticate",
+        "Proxy-Authentication-Info",
+        "Proxy-Authorization",
+        "Proxy-Connection",
+        "Sec-WebSocket-Accept",
+        "Sec-WebSocket-Extensions",
+        "Sec-WebSocket-Key",
+        "Sec-WebSocket-Protocol",
+        "Sec-WebSocket-Version",
+        "Set-Cookie",
+        "TE",
+        "Traceparent",
+        "Tracestate",
+        "Trailer",
+        "Transfer-Encoding",
+        "Upgrade",
+        "Via",
+        "WWW-Authenticate",
+        "X-API-Key",
+        "X-Auth-Token",
+        "X-CSRF-Token",
+        "X-Ferrum-Original-Content-Encoding",
+        "X-Forwarded-Authorization",
+        "X-Forwarded-For",
+        "X-Forwarded-Host",
+        "X-Forwarded-Proto",
+        "X-Goog-API-Key",
+        "X-Grpc-Web-Mode",
+        "X-XSRF-Token",
+    ] {
+        let err = CorrelationId::new(&json!({"header_name": header_name}))
+            .err()
+            .expect("reserved header must be rejected");
+        assert!(err.contains("protocol-managed"), "{header_name}: {err}");
+    }
+}
+
+#[test]
+fn test_constructor_rejects_effective_real_ip_header_case_insensitively() {
+    let error = ferrum_edge::_test_support::correlation_id_with_real_ip_header_for_test(
+        &json!({"header_name": " CF-Connecting-IP "}),
+        Some("cf-connecting-ip"),
+    )
+    .err()
+    .expect("configured real-IP header collision must fail closed");
+    assert!(error.contains("FERRUM_REAL_IP_HEADER"), "got: {error}");
+    assert!(error.contains("cf-connecting-ip"), "got: {error}");
+}
+
+#[test]
+fn test_constructor_rejects_default_header_when_used_for_real_ip() {
+    let error = ferrum_edge::_test_support::correlation_id_with_real_ip_header_for_test(
+        &json!({}),
+        Some("X-Request-ID"),
+    )
+    .err()
+    .expect("the default correlation header must not replace the real-IP header");
+    assert!(error.contains("FERRUM_REAL_IP_HEADER"), "got: {error}");
+    assert!(error.contains("x-request-id"), "got: {error}");
+}
+
+#[test]
+fn test_constructor_accepts_header_distinct_from_effective_real_ip_header() {
+    let plugin = ferrum_edge::_test_support::correlation_id_with_real_ip_header_for_test(
+        &json!({"header_name": "X-Request-ID"}),
+        Some("cloudfront-viewer-address"),
+    )
+    .expect("distinct correlation and real-IP headers must remain valid");
+    assert_eq!(plugin.correlation_id_header_name(), Some("x-request-id"));
 }
 
 #[test]
@@ -321,6 +451,27 @@ async fn test_replaces_inbound_id_with_obs_text_byte() {
     let new_id = ctx.headers.get("x-request-id").unwrap();
     assert_ne!(new_id, &unsafe_id, "ID with obs-text should be replaced");
     assert!(uuid::Uuid::parse_str(new_id).is_ok());
+}
+
+#[tokio::test]
+async fn test_replaces_inbound_id_with_printable_punctuation() {
+    for unsafe_id in [
+        "order:12345",
+        "Root=1-abc;Parent=def",
+        "trace/value+suffix",
+        "contains space",
+    ] {
+        let plugin = CorrelationId::new(&json!({})).unwrap();
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("x-request-id".to_string(), unsafe_id.to_string());
+
+        plugin.on_request_received(&mut ctx).await;
+
+        let replacement = ctx.headers.get("x-request-id").unwrap();
+        assert_ne!(replacement, unsafe_id);
+        assert!(uuid::Uuid::parse_str(replacement).is_ok());
+    }
 }
 
 #[tokio::test]
@@ -606,4 +757,193 @@ async fn test_full_lifecycle_generate_propagate_echo() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut response).await;
     plugin_utils::assert_continue(result);
     assert_eq!(response.get("x-req-id").unwrap(), &generated_id);
+}
+
+// ── Multi-instance trust isolation ──────────────────────────────────
+
+async fn assert_isolated_instances(external_first: bool) {
+    let internal = CorrelationId::new(&json!({
+        "header_name": "x-internal-request-id",
+        "echo_downstream": true
+    }))
+    .unwrap();
+    let external = CorrelationId::new(&json!({
+        "header_name": "x-external-correlation-id",
+        "echo_downstream": true
+    }))
+    .unwrap();
+    let ordered: [&CorrelationId; 2] = if external_first {
+        [&external, &internal]
+    } else {
+        [&internal, &external]
+    };
+
+    let mut ctx = make_ctx();
+    // An earlier custom plugin may use the generic consumer-facing key. That
+    // occupancy must not prevent the first correlation instance from claiming
+    // canonical ownership, while the second instance must still preserve it.
+    ctx.metadata.insert(
+        REQUEST_ID_METADATA_KEY.to_string(),
+        "pre-correlation-custom-value".to_string(),
+    );
+    ctx.metadata.insert(
+        "correlation_id.instance.spoofed-custom-value".to_string(),
+        "attacker-metadata".to_string(),
+    );
+    ctx.headers.insert(
+        "x-external-correlation-id".to_string(),
+        "attacker-preserved-id".to_string(),
+    );
+    for plugin in ordered {
+        plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+    }
+
+    let internal_id = ctx
+        .headers
+        .get("x-internal-request-id")
+        .expect("internal instance must generate an ID")
+        .clone();
+    assert!(uuid::Uuid::parse_str(&internal_id).is_ok());
+    assert_eq!(
+        ctx.headers
+            .get("x-external-correlation-id")
+            .map(String::as_str),
+        Some("attacker-preserved-id")
+    );
+    assert_ne!(internal_id, "attacker-preserved-id");
+
+    let expected_canonical = if external_first {
+        "attacker-preserved-id"
+    } else {
+        internal_id.as_str()
+    };
+    assert_eq!(
+        ctx.metadata
+            .get(REQUEST_ID_METADATA_KEY)
+            .map(String::as_str),
+        Some(expected_canonical),
+        "the first configured instance owns the canonical consumer metadata"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("correlation_id.instance.x-internal-request-id"),
+        Some(&internal_id)
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("correlation_id.instance.x-external-correlation-id")
+            .map(String::as_str),
+        Some("attacker-preserved-id")
+    );
+    assert!(
+        !ctx.metadata.contains_key("correlation_id.canonical_owner"),
+        "correlation ownership bookkeeping must not enter public metadata"
+    );
+
+    // A later plugin can write arbitrary public metadata names. Those writes
+    // must not replace the authoritative canonical or instance values used for
+    // backend propagation, response echo, or transaction summaries.
+    ctx.metadata.insert(
+        REQUEST_ID_METADATA_KEY.to_string(),
+        "poisoned-canonical-id".to_string(),
+    );
+    ctx.metadata.insert(
+        "correlation_id.instance.x-internal-request-id".to_string(),
+        "poisoned-internal-id".to_string(),
+    );
+    ctx.metadata.insert(
+        "correlation_id.instance.x-external-correlation-id".to_string(),
+        "poisoned-external-id".to_string(),
+    );
+
+    let mut backend_headers = HashMap::new();
+    for plugin in ordered {
+        plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+    }
+    assert_eq!(
+        backend_headers.get("x-internal-request-id"),
+        Some(&internal_id)
+    );
+    assert_eq!(
+        backend_headers
+            .get("x-external-correlation-id")
+            .map(String::as_str),
+        Some("attacker-preserved-id")
+    );
+
+    let logged = clone_log_metadata(&ctx);
+    assert_eq!(
+        logged.get(REQUEST_ID_METADATA_KEY).map(String::as_str),
+        Some(expected_canonical)
+    );
+    assert_eq!(
+        logged
+            .get("correlation_id.instance.x-internal-request-id")
+            .map(String::as_str),
+        Some(internal_id.as_str())
+    );
+    assert_eq!(
+        logged
+            .get("correlation_id.instance.x-external-correlation-id")
+            .map(String::as_str),
+        Some("attacker-preserved-id")
+    );
+
+    for status in [200, 403] {
+        let mut response_headers = HashMap::new();
+        for plugin in ordered {
+            plugin_utils::assert_continue(
+                plugin
+                    .after_proxy(&mut ctx, status, &mut response_headers)
+                    .await,
+            );
+        }
+        assert_eq!(
+            response_headers.get("x-internal-request-id"),
+            Some(&internal_id)
+        );
+        assert_eq!(
+            response_headers
+                .get("x-external-correlation-id")
+                .map(String::as_str),
+            Some("attacker-preserved-id")
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_multiple_instances_isolate_trust_domains_in_both_orders() {
+    assert_isolated_instances(false).await;
+    assert_isolated_instances(true).await;
+}
+
+// ── Successful WebSocket response propagation ──────────────────────
+
+#[tokio::test]
+async fn test_websocket_handshake_response_echoes_generated_and_preserved_ids() {
+    for status in [101, 200] {
+        for inbound in [None, Some("preserved-websocket-id")] {
+            let plugin = CorrelationId::new(&json!({})).unwrap();
+            let mut ctx = make_ctx();
+            if let Some(inbound) = inbound {
+                ctx.headers
+                    .insert("x-request-id".to_string(), inbound.to_string());
+            }
+            plugin.on_request_received(&mut ctx).await;
+
+            let expected = ctx
+                .metadata
+                .get(REQUEST_ID_METADATA_KEY)
+                .expect("canonical request ID")
+                .clone();
+            let mut response_headers = HashMap::new();
+            plugin.apply_websocket_handshake_response_headers(&ctx, status, &mut response_headers);
+            assert_eq!(response_headers.get("x-request-id"), Some(&expected));
+            if let Some(inbound) = inbound {
+                assert_eq!(expected, inbound);
+            } else {
+                assert!(uuid::Uuid::parse_str(&expected).is_ok());
+            }
+        }
+    }
 }

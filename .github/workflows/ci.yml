@@ -504,7 +504,7 @@ jobs:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below keeps all 73 test-file filters visible to the grep-based coverage
+    # below keeps all 74 test-file filters visible to the grep-based coverage
     # contract while balancing them across two runners. Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
     # make elapsed time, not CPU utilisation, the useful balancing signal.
@@ -543,6 +543,7 @@ jobs:
               integration::log_schema_registry_tests
               integration::deferred_log_tests
               integration::example_plugin_contract_tests
+              integration::ai_token_metrics_contract_tests
               integration::api_chargeback_sink_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_istio_status_tests

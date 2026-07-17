@@ -1,6 +1,6 @@
 ---
 name: sol-agents
-description: Dispatch and orchestrate external GPT-5.6 Sol Codex CLI agents for Ferrum Edge issues, PRs, review-feedback fixes, CI repair, and shepherding. Use when the user asks Codex or GPT to delegate to Sol or Codex CLI workers, run multiple GPT-5.6 Sol agents, select high/xhigh/max reasoning effort, resume interrupted Sol runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
+description: Dispatch and orchestrate external GPT-5.6 Sol Codex CLI agents for Ferrum Edge issues, PRs, review-feedback fixes, CI repair, and shepherding. Use when the user asks Codex or GPT to delegate to Sol or Codex CLI workers, run multiple GPT-5.6 Sol agents, select medium/high/xhigh reasoning effort, resume interrupted Sol runs, or drive agent-owned branches and PRs. Do not use for Codex-native collaboration subagents or ordinary single-agent work.
 ---
 
 # Sol agents
@@ -42,12 +42,13 @@ Do not discard unexplained changes in an existing worktree; reconstruct and pres
 
 ## Select effort deliberately
 
-- `high`: default for scoped fixes, review findings, tests, documentation, and CI repair with a
-  known failure mode.
-- `xhigh`: use for unfamiliar multi-module work, concurrency or lifecycle bugs, protocol
-  correctness, security boundaries, greenfield features, and difficult root-cause analysis.
-- `max`: reserve for the hardest deeply coupled work, repeated failure at `xhigh`, or an explicit
-  user override. Prefer one focused `max` worker over a fleet of them.
+- `medium`: use for easier tasks and quick singular code fixes — a single-file change, a mechanical
+  refactor, a documentation correction, or a review finding with an obvious and contained fix.
+- `high`: default. Use for challenging multi-step coding across interconnected components, where the
+  change touches several modules and the worker must reason about how they fit together.
+- `xhigh`: reserve for very high-stakes tasks that need lots of thinking — security boundaries,
+  concurrency and lifecycle bugs, protocol correctness, difficult root-cause analysis, or repeated
+  failure at `high`. Prefer one focused `xhigh` worker over a fleet of them.
 
 Honor an explicit user choice and record the selected level beside each worker. Keep the effort
 stable across initial and continuation rounds unless evidence or the user justifies changing it.
@@ -68,7 +69,7 @@ one long-lived execution session:
 <ABS_SKILL_DIR>/scripts/dispatch-agent.sh \
   --worktree <ABS_WORKTREE> \
   --prompt-file <ABS_PROMPT_FILE> \
-  --effort <high|xhigh|max>
+  --effort <medium|high|xhigh>
 ```
 
 The launcher pins `gpt-5.6-sol`, the reasoning effort, `danger-full-access`, the verified worktree
@@ -156,5 +157,5 @@ into prompts. Never put credentials, tokens, cookies, or secrets in prompts or w
 - No review response: verify the trigger, bot identity, availability, and head SHA before posting
   another trigger.
 - Model or effort mismatch: stop the worker, record the exact diagnostic, correct the launch
-  contract, and relaunch. Never claim `high`, `xhigh`, `max`, or `gpt-5.6-sol` without launch
+  contract, and relaunch. Never claim `medium`, `high`, `xhigh`, or `gpt-5.6-sol` without launch
   evidence.

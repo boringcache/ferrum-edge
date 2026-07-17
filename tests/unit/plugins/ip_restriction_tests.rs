@@ -13,28 +13,15 @@ fn create_context_with_ip(ip: &str) -> RequestContext {
 }
 
 fn create_stream_context_with_ip(ip: &str) -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: ip.to_string(),
-        direct_client_ip: ip.to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "test-proxy".to_string(),
-        proxy_name: Some("Test Proxy".to_string()),
-        listen_port: 8080,
-        backend_scheme: ferrum_edge::config::types::BackendScheme::Tcp,
-        consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    StreamConnectionContext::new(
+        ip.to_string(),
+        ip.to_string(),
+        "test-proxy".to_string(),
+        Some("Test Proxy".to_string()),
+        8080,
+        ferrum_edge::config::types::BackendScheme::Tcp,
+        Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    )
 }
 
 // ── Allow mode tests ────────────────────────────────────────────────
