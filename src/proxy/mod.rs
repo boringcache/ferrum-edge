@@ -10938,15 +10938,69 @@ impl EffectiveWsSizeLimits {
     }
 }
 
-async fn send_bounded_ws_close<S>(sink: &mut S, close: Option<CloseFrame>)
+fn ws_close_write_error_kind(
+    error: &tokio_tungstenite::tungstenite::Error,
+) -> &'static str {
+    use tokio_tungstenite::tungstenite::Error;
+
+    match error {
+        Error::ConnectionClosed => "connection_closed",
+        Error::AlreadyClosed => "already_closed",
+        Error::Io(_) => "io",
+        Error::Protocol(_) => "protocol",
+        Error::Capacity(_) => "capacity",
+        _ => "other",
+    }
+}
+
+pub(crate) async fn send_bounded_ws_close<S>(sink: &mut S, close: Option<CloseFrame>)
 where
-    S: Sink<Message> + Unpin,
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    let _ = crate::lazy_timeout::lazy_timeout(
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+    let result = crate::lazy_timeout::lazy_timeout(
         Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
-        sink.send(Message::Close(close)),
+        async {
+            match sink.send(Message::Close(close)).await {
+                Err(Error::Protocol(ProtocolError::SendAfterClosing)) => {
+                    // Reading a peer Close makes tungstenite queue the required
+                    // echo and enter ClosedByPeer. A second send is rejected,
+                    // so drive the already-queued control frame out instead.
+                    ("flush_queued_peer_echo", sink.flush().await)
+                }
+                result => ("send", result),
+            }
+        },
     )
     .await;
+
+    // Timeout is an expected teardown bound and stays quiet. Completed
+    // failures get a low-cardinality diagnostic without logging Close reasons
+    // or any peer-controlled payload.
+    if let Ok((phase, Err(error))) = result {
+        debug!(
+            phase,
+            error_kind = ws_close_write_error_kind(&error),
+            "Bounded WebSocket close write failed"
+        );
+    }
+}
+
+pub(crate) fn publish_ws_policy_close(
+    policy_close: &std::sync::OnceLock<CloseFrame>,
+    cancel: &tokio_util::sync::CancellationToken,
+    close: Option<CloseFrame>,
+) -> Option<CloseFrame> {
+    if let Some(details) = close {
+        let _ = policy_close.set(details);
+    }
+    // This helper is synchronous: callers cannot begin a bounded write until
+    // the first detailed Close is published and both relay halves can observe
+    // cancellation.
+    cancel.cancel();
+    policy_close.get().cloned()
 }
 
 /// Drain grace used after one WebSocket relay half exits and the other half is
@@ -11553,17 +11607,18 @@ where
                             // details and cancel both halves before any bounded polite write.
                             if let Message::Close(close_frame) = &outgoing {
                                 debug!("Plugin triggered close on client->backend frame");
-                                if let Some(details) = close_frame {
-                                    let _ = policy_close_ctb.set(details.clone());
-                                }
                                 // Publish the detailed Close first, then cancel before the
                                 // bounded destination write. The opposite half can therefore
                                 // notify the offending sender immediately even if this sink is
                                 // permanently backpressured.
-                                cancel_ctb.cancel();
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    close_frame.clone(),
+                                );
                                 send_bounded_ws_close(
                                     &mut backend_sink,
-                                    policy_close_ctb.get().cloned().or_else(|| close_frame.clone()),
+                                    close,
                                 )
                                 .await;
                                 break;
@@ -11652,15 +11707,14 @@ where
                                     max_size,
                                     "WebSocket size policy rejected input before forwarding"
                                 );
-                                let _ = policy_close_ctb.set(close);
                                 // Cancellation precedes the bounded polite write so policy
                                 // teardown cannot be held by a non-reading destination.
-                                cancel_ctb.cancel();
-                                send_bounded_ws_close(
-                                    &mut backend_sink,
-                                    policy_close_ctb.get().cloned(),
-                                )
-                                .await;
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
                                 retry::ErrorClass::RequestBodyTooLarge
                             } else {
                                 error!("Error receiving from client: {}", e);
@@ -11765,15 +11819,12 @@ where
                             // details and cancel both halves before any bounded polite write.
                             if let Message::Close(close_frame) = &outgoing {
                                 debug!("Plugin triggered close on backend->client frame");
-                                if let Some(details) = close_frame {
-                                    let _ = policy_close_btc.set(details.clone());
-                                }
-                                cancel_btc.cancel();
-                                send_bounded_ws_close(
-                                    &mut ws_sink,
-                                    policy_close_btc.get().cloned().or_else(|| close_frame.clone()),
-                                )
-                                .await;
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    close_frame.clone(),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
                                 break;
                             }
                             match &outgoing {
@@ -11856,13 +11907,12 @@ where
                                     max_size,
                                     "WebSocket size policy rejected input before forwarding"
                                 );
-                                let _ = policy_close_btc.set(close);
-                                cancel_btc.cancel();
-                                send_bounded_ws_close(
-                                    &mut ws_sink,
-                                    policy_close_btc.get().cloned(),
-                                )
-                                .await;
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
                                 retry::ErrorClass::ResponseBodyTooLarge
                             } else {
                                 error!("Error receiving from backend: {}", e);

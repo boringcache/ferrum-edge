@@ -23,11 +23,19 @@
 //! lock in the join-with-cancel-on-exit pattern so a future refactor can't
 //! silently revert to `tokio::select!` without failing these tests.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use futures_util::Sink;
 use tokio_util::sync::CancellationToken;
+use tokio_tungstenite::tungstenite::Error as WsError;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
+use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 /// Sanity check: with `tokio::join!` + cancel-on-exit, the fast direction
 /// completes quickly and signals the slow direction, which exits via the
@@ -256,43 +264,137 @@ async fn test_lazy_timeout_bounds_polite_close() {
     );
 }
 
-/// Policy rejection must publish its detailed Close and cancellation before
-/// awaiting even the bounded polite write. Otherwise a backpressured
-/// destination can retain the opposite relay half until the send completes.
+/// Policy publication is synchronous, retains the first detailed Close, and
+/// makes cancellation observable before the caller can start a bounded write.
 #[test]
 fn test_policy_close_publishes_cancellation_before_bounded_writes() {
-    let source = include_str!("../../../src/proxy/mod.rs");
+    let policy_close = std::sync::OnceLock::new();
+    let cancel = CancellationToken::new();
+    let first = CloseFrame {
+        code: CloseCode::Size,
+        reason: "first policy reason".into(),
+    };
+    let later = CloseFrame {
+        code: CloseCode::Policy,
+        reason: "later policy reason".into(),
+    };
 
-    for (start_marker, state, cancel, send) in [
-        (
-            "Plugin triggered close on client->backend frame",
-            "policy_close_ctb.set",
-            "cancel_ctb.cancel();",
-            "send_bounded_ws_close(",
-        ),
-        (
-            "Plugin triggered close on backend->client frame",
-            "policy_close_btc.set",
-            "cancel_btc.cancel();",
-            "send_bounded_ws_close(",
-        ),
-    ] {
-        let branch = source
-            .split_once(start_marker)
-            .unwrap_or_else(|| panic!("missing policy-close branch: {start_marker}"))
-            .1;
-        let state_index = branch.find(state).expect("detailed Close publication");
-        let cancel_index = branch.find(cancel).expect("policy cancellation");
-        let send_index = branch.find(send).expect("bounded policy Close write");
-        assert!(
-            state_index < cancel_index && cancel_index < send_index,
-            "{start_marker}: required order is detailed state -> cancellation -> bounded write"
-        );
+    let selected = ferrum_edge::_test_support::publish_ws_policy_close_for_test(
+        &policy_close,
+        &cancel,
+        Some(first.clone()),
+    );
+    assert!(cancel.is_cancelled(), "policy cancellation must be published");
+    assert_eq!(selected, Some(first.clone()));
+
+    let retained = ferrum_edge::_test_support::publish_ws_policy_close_for_test(
+        &policy_close,
+        &cancel,
+        Some(later),
+    );
+    assert_eq!(retained, Some(first), "the first detailed Close must win");
+}
+
+struct PeerClosedSink {
+    flushes: Arc<AtomicU64>,
+    complete_flush: bool,
+}
+
+impl Sink<Message> for PeerClosedSink {
+    type Error = WsError;
+
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
+
+    fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+        Err(WsError::Protocol(ProtocolError::SendAfterClosing))
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        self.flushes.fetch_add(1, Ordering::SeqCst);
+        if self.complete_flush {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Tungstenite queues a peer Close echo before returning the received Close.
+/// Its state then rejects a second send, so the relay must flush that queued
+/// echo instead of dropping the transport with an incomplete handshake.
+#[tokio::test]
+async fn test_bounded_close_flushes_peer_echo_after_send_after_closing() {
+    let flushes = Arc::new(AtomicU64::new(0));
+    let mut sink = PeerClosedSink {
+        flushes: Arc::clone(&flushes),
+        complete_flush: true,
+    };
+
+    ferrum_edge::_test_support::send_bounded_ws_close_for_test(
+        &mut sink,
+        Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "graceful".into(),
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        flushes.load(Ordering::SeqCst),
+        1,
+        "SendAfterClosing must drive the already-queued peer echo with flush"
+    );
+}
+
+/// The queued-echo fallback shares the production close deadline, so a peer
+/// that stops accepting bytes cannot stall relay teardown.
+#[tokio::test]
+async fn test_bounded_close_limits_stuck_peer_echo_flush() {
+    let flushes = Arc::new(AtomicU64::new(0));
+    let mut sink = PeerClosedSink {
+        flushes: Arc::clone(&flushes),
+        complete_flush: false,
+    };
+
+    let start = tokio::time::Instant::now();
+    ferrum_edge::_test_support::send_bounded_ws_close_for_test(&mut sink, None).await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(flushes.load(Ordering::SeqCst), 1);
+    assert!(
+        elapsed >= Duration::from_millis(90),
+        "queued peer echo flush returned before the production bound: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "queued peer echo flush exceeded the production teardown bound: {elapsed:?}"
+    );
 }
 
 /// Expected size-policy rejections are neutral policy outcomes rather than
 /// generic relay failures that can pollute backend alerts and health signals.
+///
+/// This is the one retained narrow source assertion: the directional class is
+/// stored in a private first-failure slot and becomes externally observable
+/// only after the full disconnect logger lifecycle. Functional tests cover the
+/// wire-level 1009 contract; widening the runtime API solely for this private
+/// bookkeeping check would be less representative than pinning these two
+/// assignments directly.
 #[test]
 fn test_size_policy_rejections_use_explicit_error_classes() {
     let source = include_str!("../../../src/proxy/mod.rs");

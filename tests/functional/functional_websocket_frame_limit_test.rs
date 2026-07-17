@@ -1,4 +1,4 @@
-//! Functional coverage for the global WebSocket frame-size limit.
+//! Functional coverage for global and plugin WebSocket frame-size limits.
 //!
 //! Plugin tests cover `ws_message_size_limiting`; this module exercises the
 //! protocol parser limit wired from `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`.
@@ -26,13 +26,13 @@ const MAX_FRAME_BYTES: &str = "16";
 
 #[ignore]
 #[tokio::test]
-async fn functional_websocket_frame_limit_h1_rejects_oversized_client_frame() {
+async fn functional_ws_message_size_limit_h1_preserves_close_and_rejects_oversized_frame() {
     let (backend_port, backend_messages, mut backend_closes, backend_task) =
         spawn_counting_ws_backend().await;
-    let mut gateway = frame_limit_gateway_builder(backend_port)
+    let mut gateway = plugin_frame_limit_gateway_builder(backend_port)
         .spawn()
         .await
-        .expect("start WebSocket frame-limit gateway");
+        .expect("start H1 plugin frame-limit gateway");
     gateway
         .wait_for_proxy_port(Duration::from_secs(5))
         .await
@@ -50,6 +50,12 @@ async fn functional_websocket_frame_limit_h1_rejects_oversized_client_frame() {
         })))
         .await
         .expect("send H1 graceful Close above application frame ceiling");
+    let graceful_echo = tokio::time::timeout(Duration::from_secs(2), graceful_ws.next())
+        .await
+        .expect("H1 graceful Close echo timed out")
+        .expect("H1 graceful stream ended before Close echo")
+        .expect("read H1 graceful Close echo");
+    assert_graceful_close_message(graceful_echo, graceful_reason);
     assert_backend_close(&mut backend_closes, CloseCode::Normal, graceful_reason).await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
@@ -186,6 +192,12 @@ async fn functional_ws_message_size_limit_h2_sends_1009_to_both_peers() {
         })))
         .await
         .expect("send H2 graceful Close above plugin frame ceiling");
+    let graceful_echo = tokio::time::timeout(Duration::from_secs(2), graceful_ws.next())
+        .await
+        .expect("H2 graceful Close echo timed out")
+        .expect("H2 graceful stream ended before Close echo")
+        .expect("read H2 graceful Close echo");
+    assert_graceful_close_message(graceful_echo, graceful_reason);
     assert_backend_close(&mut backend_closes, CloseCode::Normal, graceful_reason).await;
 
     ws.send(Message::Frame(Frame::message(
@@ -287,6 +299,19 @@ async fn functional_ws_message_size_limit_h3_sends_1009_to_both_peers() {
         .send_fragment(0x8, &graceful_payload, true)
         .await
         .expect("send H3 graceful Close above plugin frame ceiling");
+    let graceful_echo = tokio::time::timeout(Duration::from_secs(2), graceful_ws.recv_frame())
+        .await
+        .expect("H3 graceful Close echo timed out")
+        .expect("read H3 graceful Close echo");
+    let graceful_echo_payload = match graceful_echo {
+        H3WebSocketFrame::Close(payload) => payload,
+        other => panic!("expected H3 graceful Close echo, got {other:?}"),
+    };
+    assert_close_payload(
+        &graceful_echo_payload,
+        CloseCode::Normal,
+        graceful_reason,
+    );
     assert_backend_close(&mut backend_closes, CloseCode::Normal, graceful_reason).await;
 
     let mut ws = retry_h3_websocket(&client, &url).await;
@@ -347,7 +372,7 @@ async fn functional_ws_message_size_limit_h3_sends_1009_to_both_peers() {
         H3WebSocketFrame::Close(payload) => payload,
         other => panic!("expected H3 Close, got {other:?}"),
     };
-    assert_close_payload(&payload);
+    assert_close_payload(&payload, CloseCode::Size, "plugin frame limit");
     assert_backend_close(&mut backend_closes, CloseCode::Size, "plugin frame limit").await;
 
     gateway.shutdown();
@@ -497,12 +522,23 @@ async fn spawn_recording_close_ws_backend() -> (
     (port, close_rx, task)
 }
 
-fn assert_close_payload(payload: &[u8]) {
+fn assert_graceful_close_message(message: Message, expected_reason: &str) {
+    let Message::Close(Some(close)) = message else {
+        panic!("expected detailed graceful Close echo, got {message:?}");
+    };
+    assert_eq!(close.code, CloseCode::Normal);
+    assert_eq!(close.reason.as_str(), expected_reason);
+}
+
+fn assert_close_payload(payload: &[u8], expected_code: CloseCode, expected_reason: &str) {
     assert!(payload.len() >= 2, "close payload omitted status code");
-    assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 1009);
+    assert_eq!(
+        u16::from_be_bytes([payload[0], payload[1]]),
+        u16::from(expected_code)
+    );
     assert_eq!(
         std::str::from_utf8(&payload[2..]).expect("UTF-8 close reason"),
-        "plugin frame limit"
+        expected_reason
     );
 }
 
