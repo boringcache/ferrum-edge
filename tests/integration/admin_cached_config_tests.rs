@@ -2889,13 +2889,11 @@ async fn admin_rejects_custom_only_correlation_collision_before_persistence() {
         "custom correlation collision was admitted: {body:?}"
     );
     assert!(
-        body["validation_errors"]
-            .as_array()
-            .is_some_and(|errors| {
-                errors.iter().filter_map(Value::as_str).any(|error| {
-                    error.contains("duplicate effective header_name \"x-custom-correlation-id\"")
-                })
-            }),
+        body["validation_errors"].as_array().is_some_and(|errors| {
+            errors.iter().filter_map(Value::as_str).any(|error| {
+                error.contains("duplicate effective header_name \"x-custom-correlation-id\"")
+            })
+        }),
         "unexpected custom correlation admission response: {body:?}"
     );
     for id in ["custom-correlation-first", "custom-correlation-second"] {
