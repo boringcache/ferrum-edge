@@ -37,6 +37,46 @@ fn make_cors_ctx(method: &str, origin: &str) -> RequestContext {
     ctx
 }
 
+fn permissive_backend_cors_headers() -> HashMap<String, String> {
+    HashMap::from([
+        ("access-control-allow-origin".to_string(), "*".to_string()),
+        (
+            "access-control-allow-credentials".to_string(),
+            "true".to_string(),
+        ),
+        (
+            "access-control-allow-methods".to_string(),
+            "GET, POST, PUT, DELETE".to_string(),
+        ),
+        (
+            "access-control-allow-headers".to_string(),
+            "Authorization, X-Admin".to_string(),
+        ),
+        (
+            "access-control-expose-headers".to_string(),
+            "X-Secret".to_string(),
+        ),
+        (
+            "access-control-max-age".to_string(),
+            "99999".to_string(),
+        ),
+        (
+            "Access-Control-Allow-Private-Network".to_string(),
+            "true".to_string(),
+        ),
+        ("x-backend".to_string(), "ok".to_string()),
+    ])
+}
+
+fn assert_no_access_control_headers(headers: &HashMap<String, String>) {
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.to_ascii_lowercase().starts_with("access-control-")),
+        "backend Access-Control-* headers must be removed: {headers:?}"
+    );
+}
+
 // ── Config parsing ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -481,19 +521,8 @@ async fn test_preflight_continue_replaces_backend_policy_with_complete_gateway_p
         PluginResult::Continue
     ));
 
-    let mut response_headers = HashMap::from([
-        ("access-control-allow-origin".to_string(), "*".to_string()),
-        (
-            "access-control-allow-methods".to_string(),
-            "PUT, DELETE".to_string(),
-        ),
-        (
-            "access-control-allow-headers".to_string(),
-            "X-Custom, Authorization".to_string(),
-        ),
-        ("access-control-max-age".to_string(), "99999".to_string()),
-        ("vary".to_string(), "Accept-Encoding".to_string()),
-    ]);
+    let mut response_headers = permissive_backend_cors_headers();
+    response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
     assert!(matches!(
         plugin
             .after_proxy(&mut ctx, 202, &mut response_headers)
@@ -512,6 +541,7 @@ async fn test_preflight_continue_replaces_backend_policy_with_complete_gateway_p
         response_headers["access-control-expose-headers"],
         "X-Response"
     );
+    assert!(!response_headers.contains_key("Access-Control-Allow-Private-Network"));
     for token in [
         "Accept-Encoding",
         "Origin",
@@ -563,20 +593,11 @@ async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
         forward.on_request_received(&mut unmatched_preflight).await,
         PluginResult::Continue
     ));
-    let mut upstream_headers = HashMap::from([
-        ("x-backend".to_string(), "ok".to_string()),
-        (
-            "access-control-allow-origin".to_string(),
-            "https://other.example".to_string(),
-        ),
-        (
-            "access-control-allow-credentials".to_string(),
-            "true".to_string(),
-        ),
-    ]);
+    let mut upstream_headers = permissive_backend_cors_headers();
     let _ = forward
         .after_proxy(&mut unmatched_preflight, 299, &mut upstream_headers)
         .await;
+    assert_no_access_control_headers(&upstream_headers);
     assert_eq!(upstream_headers.len(), 1);
     assert_eq!(upstream_headers["x-backend"], "ok");
 
@@ -585,21 +606,12 @@ async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
         forward.on_request_received(&mut unmatched_actual).await,
         PluginResult::Continue
     ));
-    let mut actual_headers = HashMap::from([
-        (
-            "access-control-allow-origin".to_string(),
-            "https://other.example".to_string(),
-        ),
-        (
-            "access-control-allow-credentials".to_string(),
-            "true".to_string(),
-        ),
-    ]);
+    let mut actual_headers = permissive_backend_cors_headers();
     let _ = forward
         .after_proxy(&mut unmatched_actual, 200, &mut actual_headers)
         .await;
-    assert!(!actual_headers.contains_key("access-control-allow-origin"));
-    assert!(!actual_headers.contains_key("access-control-allow-credentials"));
+    assert_no_access_control_headers(&actual_headers);
+    assert_eq!(actual_headers["x-backend"], "ok");
 
     let mut matched_actual = make_cors_ctx("DELETE", "https://app.example");
     matched_actual
@@ -891,6 +903,38 @@ async fn test_non_cors_request_no_headers_added() {
         !response_headers.contains_key("access-control-allow-origin"),
         "No CORS headers without Origin"
     );
+}
+
+#[tokio::test]
+async fn test_native_policy_without_origin_still_strips_backend_access_control_headers() {
+    let plugin = CorsPlugin::new(&json!({"allowed_origins": ["*"]})).unwrap();
+    let mut ctx = make_ctx();
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut response_headers = permissive_backend_cors_headers();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+
+    assert_no_access_control_headers(&response_headers);
+    assert_eq!(response_headers["x-backend"], "ok");
+}
+
+#[tokio::test]
+async fn test_after_proxy_without_participating_policy_preserves_backend_headers() {
+    let plugin = CorsPlugin::new(&json!({"allowed_origins": ["*"]})).unwrap();
+    let mut ctx = make_ctx();
+    let mut response_headers = permissive_backend_cors_headers();
+    let expected = response_headers.clone();
+
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+
+    assert_eq!(response_headers, expected);
 }
 
 #[tokio::test]

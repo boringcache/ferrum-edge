@@ -624,9 +624,10 @@ impl Plugin for CorsPlugin {
         if !is_preflight {
             if !origin_allowed {
                 ctx.cors_state.response_allowed = false;
-                // Istio/Envoy forwards unmatched actual requests and leaves
-                // them without CORS response fields. Native direct-plugin
-                // policy retains its historical fail-closed 403.
+                // Istio/Envoy forwards unmatched actual requests. Ferrum
+                // preserves the upstream status/body but removes upstream
+                // CORS authorization fields. Native direct-plugin policy
+                // retains its historical fail-closed 403.
                 if self.unmatched_preflights != UnmatchedPreflights::Reject {
                     return self.maybe_finalize_request(ctx);
                 }
@@ -871,9 +872,9 @@ fn finalize_cors_response(
     // A configured gateway CORS policy must remain authoritative even when an
     // Istio policy forwards an unmatched request. Otherwise a permissive
     // backend could re-authorize a disallowed origin with its own CORS fields.
-    let should_sanitize = ctx.cors_state.native_policy_seen
-        || ctx.cors_state.istio_policy_seen
-        || ctx.cors_state.sanitize_response;
+    let should_sanitize = ctx.cors_state.sanitize_response
+        || ctx.cors_state.native_policy_seen
+        || ctx.cors_state.istio_policy_seen;
     if should_sanitize && !(is_rejection_path && ctx.cors_state.policy_count == 0) {
         CorsPlugin::remove_access_control_headers(response_headers);
     }
