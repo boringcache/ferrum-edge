@@ -147,7 +147,7 @@ fn ai_metadata_usage<'a>(
         }
 
         let Some(provider) = prefixed_metadata_value(metadata, prefix, "_provider")
-            .and_then(|value| ai_provider_label(value))
+            .and_then(ai_provider_label)
         else {
             continue;
         };
@@ -155,13 +155,13 @@ fn ai_metadata_usage<'a>(
             prefix,
             provider,
             prompt_tokens: prefixed_metadata_value(metadata, prefix, "_prompt_tokens")
-                .and_then(|value| parse_canonical_u64(value)),
+                .and_then(parse_canonical_u64),
             completion_tokens: prefixed_metadata_value(metadata, prefix, "_completion_tokens")
-                .and_then(|value| parse_canonical_u64(value)),
+                .and_then(parse_canonical_u64),
             total_tokens: prefixed_metadata_value(metadata, prefix, "_total_tokens")
-                .and_then(|value| parse_canonical_u64(value)),
+                .and_then(parse_canonical_u64),
             cost_microunits: prefixed_metadata_value(metadata, prefix, "_estimated_cost")
-                .and_then(|value| parse_cost_microunits(value)),
+                .and_then(parse_cost_microunits),
         };
         if candidate.completeness() == 0 {
             continue;
