@@ -260,28 +260,15 @@ async fn test_ip_restriction_stream_connect_allowed() {
     )
     .unwrap();
 
-    let mut ctx = StreamConnectionContext {
-        client_ip: "10.1.2.3".to_string(),
-        direct_client_ip: "10.1.2.3".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "test-proxy".to_string(),
-        proxy_name: Some("Test Proxy".to_string()),
-        listen_port: 5432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: empty_consumer_index(),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    let mut ctx = StreamConnectionContext::new(
+        "10.1.2.3".to_string(),
+        "10.1.2.3".to_string(),
+        "test-proxy".to_string(),
+        Some("Test Proxy".to_string()),
+        5432,
+        BackendScheme::Tcp,
+        empty_consumer_index(),
+    );
 
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert!(matches!(result, PluginResult::Continue));
@@ -295,28 +282,15 @@ async fn test_ip_restriction_stream_connect_denied() {
     )
     .unwrap();
 
-    let mut ctx = StreamConnectionContext {
-        client_ip: "192.168.1.1".to_string(),
-        direct_client_ip: "192.168.1.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "test-proxy".to_string(),
-        proxy_name: Some("Test Proxy".to_string()),
-        listen_port: 5432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: empty_consumer_index(),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    let mut ctx = StreamConnectionContext::new(
+        "192.168.1.1".to_string(),
+        "192.168.1.1".to_string(),
+        "test-proxy".to_string(),
+        Some("Test Proxy".to_string()),
+        5432,
+        BackendScheme::Tcp,
+        empty_consumer_index(),
+    );
 
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert!(matches!(
@@ -331,28 +305,15 @@ async fn test_ip_restriction_stream_connect_denied() {
 // ---- Stream hook behavior tests ----
 
 fn make_stream_ctx() -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: "10.1.2.3".to_string(),
-        direct_client_ip: "10.1.2.3".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "test-proxy".to_string(),
-        proxy_name: Some("Test Proxy".to_string()),
-        listen_port: 5432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: empty_consumer_index(),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    StreamConnectionContext::new(
+        "10.1.2.3".to_string(),
+        "10.1.2.3".to_string(),
+        "test-proxy".to_string(),
+        Some("Test Proxy".to_string()),
+        5432,
+        BackendScheme::Tcp,
+        empty_consumer_index(),
+    )
 }
 
 fn make_stream_summary() -> StreamTransactionSummary {
@@ -646,7 +607,7 @@ async fn test_stream_metadata_flows_from_connect_to_disconnect() {
 }
 
 #[tokio::test]
-async fn test_multiple_correlation_instances_keep_stream_ids_isolated() {
+async fn stream_correlation_ids_survive_public_client_ip_cache_replacement() {
     let first = make_plugin(
         "correlation_id",
         json!({"header_name": "x-internal-request-id"}),
@@ -694,6 +655,22 @@ async fn test_multiple_correlation_instances_keep_stream_ids_isolated() {
 
     let expected_internal = internal.clone();
     let expected_external = external.clone();
+    assert_eq!(
+        ctx.canonical_client_ip().map(|ip| ip.to_string()),
+        Some("10.1.2.3".to_string())
+    );
+
+    // Model a later custom plugin changing the public client identity and
+    // invalidating the typed-IP cache before poisoning public compatibility
+    // metadata. Correlation ownership must remain independent of both writes.
+    ctx.client_ip = "192.0.2.44".to_string();
+    ctx.canonical_client_ip = Default::default();
+    assert!(!ctx.canonical_client_ip_is_initialized());
+    assert_eq!(
+        ctx.canonical_client_ip().map(|ip| ip.to_string()),
+        Some("192.0.2.44".to_string()),
+        "resetting the public cache must reparse the changed client IP"
+    );
     ctx.insert_metadata(
         REQUEST_ID_METADATA_KEY.to_string(),
         "poisoned-canonical-id".to_string(),
@@ -705,6 +682,10 @@ async fn test_multiple_correlation_instances_keep_stream_ids_isolated() {
     ctx.insert_metadata(
         "correlation_id.instance.x-external-request-id".to_string(),
         "poisoned-external-id".to_string(),
+    );
+    ctx.insert_metadata(
+        "custom.unrelated".to_string(),
+        "survives-cache-reset".to_string(),
     );
     let metadata = ctx.take_metadata();
     assert_eq!(
@@ -719,10 +700,14 @@ async fn test_multiple_correlation_instances_keep_stream_ids_isolated() {
         metadata.get("correlation_id.instance.x-external-request-id"),
         Some(&expected_external)
     );
+    assert_eq!(
+        metadata.get("custom.unrelated").map(String::as_str),
+        Some("survives-cache-reset")
+    );
 }
 
 #[tokio::test]
-async fn udp_and_dtls_disconnect_summaries_restore_correlation_after_datagram_metadata() {
+async fn udp_and_dtls_restore_correlation_after_public_cache_and_metadata_mutation() {
     let first = make_plugin(
         "correlation_id",
         json!({"header_name": "x-internal-request-id"}),
@@ -761,6 +746,35 @@ async fn udp_and_dtls_disconnect_summaries_restore_correlation_after_datagram_me
         .get("correlation_id.instance.x-external-request-id")
         .expect("external instance correlation ID")
         .clone();
+
+    assert_eq!(
+        ctx.canonical_client_ip().map(|ip| ip.to_string()),
+        Some("10.1.2.3".to_string())
+    );
+    ctx.client_ip = "198.51.100.23".to_string();
+    ctx.canonical_client_ip = Default::default();
+    assert!(!ctx.canonical_client_ip_is_initialized());
+    assert_eq!(
+        ctx.canonical_client_ip().map(|ip| ip.to_string()),
+        Some("198.51.100.23".to_string()),
+        "UDP/DTLS client-IP cache invalidation must be independent"
+    );
+    ctx.insert_metadata(
+        REQUEST_ID_METADATA_KEY.to_string(),
+        "connect-poisoned-canonical".to_string(),
+    );
+    ctx.insert_metadata(
+        "correlation_id.instance.x-internal-request-id".to_string(),
+        "connect-poisoned-internal".to_string(),
+    );
+    ctx.insert_metadata(
+        "correlation_id.instance.x-external-request-id".to_string(),
+        "connect-poisoned-external".to_string(),
+    );
+    ctx.insert_metadata(
+        "post_connect_metadata".to_string(),
+        "post-connect-value".to_string(),
+    );
 
     let datagram_metadata = HashMap::from([
         (
@@ -829,7 +843,18 @@ async fn udp_and_dtls_disconnect_summaries_restore_correlation_after_datagram_me
                 .map(String::as_str),
             Some("retained-value")
         );
+        assert_eq!(
+            summary
+                .metadata
+                .get("post_connect_metadata")
+                .map(String::as_str),
+            Some("post-connect-value")
+        );
     }
+    assert!(
+        ctx.take_metadata().is_empty(),
+        "UDP/DTLS finalization must take authoritative correlation state exactly once"
+    );
 }
 
 // ---- WebSocket-only frame plugins ----

@@ -791,8 +791,8 @@ impl Plugin for MyStreamPlugin {
     ) -> PluginResult {
         // ctx.client_ip, ctx.proxy_id, ctx.listen_port, ctx.backend_scheme
         // ctx.tls_client_cert_der (available for TCP+TLS after handshake)
-        // ctx.metadata — shared between connect and disconnect
-        ctx.metadata.insert("connected_at".to_string(), "...".to_string());
+        // Metadata is shared between connect and disconnect.
+        ctx.insert_metadata("connected_at".to_string(), "...".to_string());
         PluginResult::Continue
     }
 
@@ -1058,25 +1058,28 @@ if let Some(val) = ctx.metadata.get("my_custom_field") {
 The `StreamConnectionContext` is passed to `on_stream_connect` for TCP/UDP stream proxies:
 
 ```rust
-pub struct StreamConnectionContext {
-    pub client_ip: String,
-    pub proxy_id: String,
-    pub proxy_name: Option<String>,
-    pub listen_port: u16,
-    pub backend_scheme: BackendScheme,
-    pub consumer_index: Arc<ConsumerIndex>,
-    pub identified_consumer: Option<Consumer>,
-    pub authenticated_identity: Option<String>,
-    /// Authentication mechanism that succeeded (e.g., "mtls_auth").
-    pub auth_method: Option<&'static str>,
-    pub metadata: HashMap<String, String>,
-    /// DER-encoded client cert from frontend TLS handshake (TCP+TLS only).
-    pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
-    pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-}
+let mut ctx = StreamConnectionContext::new(
+    client_ip,
+    direct_client_ip,
+    proxy_id,
+    proxy_name,
+    listen_port,
+    backend_scheme,
+    consumer_index,
+);
+
+ctx.authenticated_identity = Some("external-principal".to_string());
+ctx.insert_metadata("custom.key".to_string(), "value".to_string());
 ```
 
-Metadata set during `on_stream_connect` is carried through to `on_stream_disconnect` via `StreamTransactionSummary.metadata`.
+Runtime code creates the context, so custom plugins normally only read or update its public fields.
+External test harnesses must use `StreamConnectionContext::new`; struct literals are intentionally
+unsupported because authoritative stream correlation ownership is private lifecycle state. A plugin
+that changes the public `client_ip` may reset `canonical_client_ip` to `Default::default()` so typed
+client-IP policy reparses the new value. That reset does not erase correlation ownership. Metadata
+set during `on_stream_connect` is carried through to `on_stream_disconnect` via
+`StreamTransactionSummary.metadata`; built-in correlation values are authoritatively re-projected
+over plugin-writable compatibility metadata when the terminal summary is constructed.
 
 ## Transaction Summary
 

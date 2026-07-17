@@ -670,8 +670,10 @@ pub struct WsDisconnectContext {
 /// IPv4-mapped IPv6, and publishes the result here. Every later plugin instance
 /// performs only the lock-free `OnceLock::get_or_init` fast path. `None` is
 /// cached as well, preserving fail-closed behavior for malformed identities.
-/// The same private typed state retains authoritative correlation values;
-/// plugin-writable transaction metadata is only a compatibility projection.
+/// When embedded privately in [`RequestContext`], the same typed state also
+/// retains authoritative HTTP correlation values. Stream contexts keep their
+/// correlation lifecycle state separately so replacing this public cache to
+/// reparse a changed client IP cannot erase stream correlation ownership.
 #[derive(Debug, Clone, Default)]
 pub struct CanonicalClientIpCache {
     value: OnceLock<Option<IpAddr>>,
@@ -685,6 +687,24 @@ pub(crate) struct CorrelationIdState {
 }
 
 impl CorrelationIdState {
+    fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
+        let publish_canonical = self.canonical.is_none();
+        self.instances
+            .insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            self.canonical = Some(request_id);
+        }
+        publish_canonical
+    }
+
+    fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.instances.get(instance_key).map(String::as_str)
+    }
+
+    fn canonical_correlation_id(&self) -> Option<&str> {
+        self.canonical.as_deref()
+    }
+
     pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
         for (key, value) in &self.instances {
             metadata.insert(key.clone(), value.clone());
@@ -713,25 +733,15 @@ impl CanonicalClientIpCache {
     }
 
     fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
-        let publish_canonical = self.correlation_ids.canonical.is_none();
-        self.correlation_ids
-            .instances
-            .insert(instance_key.to_string(), request_id.clone());
-        if publish_canonical {
-            self.correlation_ids.canonical = Some(request_id);
-        }
-        publish_canonical
+        self.correlation_ids.publish_correlation_id(instance_key, request_id)
     }
 
     fn correlation_id(&self, instance_key: &str) -> Option<&str> {
-        self.correlation_ids
-            .instances
-            .get(instance_key)
-            .map(String::as_str)
+        self.correlation_ids.correlation_id(instance_key)
     }
 
     fn canonical_correlation_id(&self) -> Option<&str> {
-        self.correlation_ids.canonical.as_deref()
+        self.correlation_ids.canonical_correlation_id()
     }
 
     fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
@@ -3455,10 +3465,16 @@ pub struct StreamConnectionContext {
     /// `mesh_authz` to populate Istio's `source.ip` principal (socket peer)
     /// separately from `remote.ip` (forwarded/resolved address).
     pub direct_client_ip: String,
-    /// Shared typed plugin lifecycle state for stream policy instances.
-    /// Its fields and correlation ownership transition remain crate-private.
+    /// Shared typed client-IP cache for stream policy instances.
+    /// Replacing this cache after changing `client_ip` invalidates only typed
+    /// client-IP parsing; authoritative correlation ownership is independent.
     #[doc(hidden)]
     pub canonical_client_ip: CanonicalClientIpCache,
+    /// Authoritative per-instance and canonical stream correlation values.
+    ///
+    /// This must remain private and non-replaceable by custom plugins. Public
+    /// metadata is only a compatibility projection of this lifecycle state.
+    correlation_ids: CorrelationIdState,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub listen_port: u16,
@@ -3522,6 +3538,47 @@ pub struct StreamConnectionContext {
 }
 
 impl StreamConnectionContext {
+    /// Create a stream plugin context with empty optional lifecycle state.
+    ///
+    /// External plugins and tests must use this constructor rather than a
+    /// struct literal because authoritative correlation ownership is private.
+    /// The public fields may still be populated or updated before hooks run;
+    /// if `client_ip` changes, replace `canonical_client_ip` with its default
+    /// value to force an independent typed-IP reparse.
+    pub fn new(
+        client_ip: String,
+        direct_client_ip: String,
+        proxy_id: String,
+        proxy_name: Option<String>,
+        listen_port: u16,
+        backend_scheme: BackendScheme,
+        consumer_index: Arc<ConsumerIndex>,
+    ) -> Self {
+        Self {
+            client_ip,
+            direct_client_ip,
+            canonical_client_ip: CanonicalClientIpCache::default(),
+            correlation_ids: CorrelationIdState::default(),
+            proxy_id,
+            proxy_name,
+            listen_port,
+            backend_scheme,
+            consumer_index,
+            identified_consumer: None,
+            authenticated_identity: None,
+            auth_method: None,
+            metadata: None,
+            admission_permits: Vec::new(),
+            tls_client_cert_der: None,
+            tls_client_cert_chain_der: None,
+            sni_hostname: None,
+            mesh_direction: None,
+            node_waypoint_policy_scope: None,
+            first_bytes: None,
+            first_bytes_kind: None,
+        }
+    }
+
     /// Return the authoritative stream client IP as a canonical typed address.
     ///
     /// The value is parsed at most once per TCP connection or UDP/DTLS session
@@ -3538,7 +3595,7 @@ impl StreamConnectionContext {
 
     pub(crate) fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) {
         let publish_canonical = self
-            .canonical_client_ip
+            .correlation_ids
             .publish_correlation_id(instance_key, request_id.clone());
         let metadata = self.metadata.get_or_insert_with(HashMap::new);
         metadata.insert(instance_key.to_string(), request_id.clone());
@@ -3566,8 +3623,7 @@ impl StreamConnectionContext {
     /// Take the metadata map, returning an empty map if never allocated.
     pub fn take_metadata(&mut self) -> HashMap<String, String> {
         let mut metadata = self.metadata.take().unwrap_or_default();
-        self.canonical_client_ip
-            .project_correlation_ids(&mut metadata);
+        self.correlation_ids.project_correlation_ids(&mut metadata);
         metadata
     }
 
@@ -3583,7 +3639,7 @@ impl StreamConnectionContext {
     ) -> (HashMap<String, String>, CorrelationIdState) {
         (
             self.metadata.take().unwrap_or_default(),
-            std::mem::take(&mut self.canonical_client_ip.correlation_ids),
+            std::mem::take(&mut self.correlation_ids),
         )
     }
 

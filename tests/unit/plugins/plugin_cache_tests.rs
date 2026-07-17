@@ -183,28 +183,15 @@ fn make_udp_proxy(id: &str, plugin_ids: Vec<&str>, scheme: BackendScheme) -> Pro
 }
 
 fn make_tcp_stream_context(ip: &str) -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: ip.to_string(),
-        direct_client_ip: ip.to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "p1".to_string(),
-        proxy_name: Some("Proxy p1".to_string()),
-        listen_port: 15432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    StreamConnectionContext::new(
+        ip.to_string(),
+        ip.to_string(),
+        "p1".to_string(),
+        Some("Proxy p1".to_string()),
+        15432,
+        BackendScheme::Tcp,
+        Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    )
 }
 
 async fn run_tcp_connect_chain(

@@ -407,7 +407,7 @@ Each plugin declares which protocols it supports via `supported_protocols()`. On
 | `access_control` | `on_stream_connect` | Consumer allow/deny after a stream auth plugin identifies the caller |
 | `tcp_connection_throttle` | `on_stream_connect` + connection permit | Cap process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP. UDP/DTLS attachment is rejected; each replica enforces an independent limit |
 | `rate_limiting` | `on_stream_connect` | Connection/session rate limiting; consumer-aware when a stream identity exists |
-| `correlation_id` | `on_stream_connect` | Assign request ID to connection metadata |
+| `correlation_id` | `on_stream_connect` | Assign request ID to private connection state and terminal metadata |
 | `stdout_logging` | `on_stream_disconnect` | Log connection summary as JSON |
 | `http_logging` | `on_stream_disconnect` | Send connection summary to HTTP endpoint |
 | `tcp_logging` | `on_stream_disconnect` | Send connection summary to TCP/TLS endpoint |
