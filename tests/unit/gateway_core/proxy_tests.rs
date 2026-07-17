@@ -2394,17 +2394,17 @@ async fn test_auth_rejection_cookie_storage_key_rejects_nonmatching_public_suffi
 }
 
 #[tokio::test]
-async fn test_auth_rejection_cookie_storage_key_compares_host_only_by_effective_request_domain() {
+async fn test_auth_rejection_cookie_storage_key_preserves_distinct_host_only_and_domain_scopes() {
     for (authority, staged_cookie, selected_cookie) in [
         (
             "example.com",
-            "session=staged; Path=/",
-            "session=selected; Domain=example.com; Path=/",
+            "oidc_session=; Max-Age=0; Path=/",
+            "oidc_session=selected; Domain=example.com; Path=/",
         ),
         (
             "example.com:8443",
-            "session=staged; Domain=.EXAMPLE.COM; Path=/",
-            "session=selected; Path=/",
+            "rolling_session=rotated; Domain=.EXAMPLE.COM; Path=/",
+            "rolling_session=selected; Path=/",
         ),
     ] {
         let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
@@ -2426,11 +2426,12 @@ async fn test_auth_rejection_cookie_storage_key_compares_host_only_by_effective_
             run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
                 .await
                 .expect("both auth attempts must reject");
+        let expected = format!("{selected_cookie}\n{staged_cookie}");
 
         assert_eq!(
             headers.get("set-cookie").map(String::as_str),
-            Some(selected_cookie),
-            "host-only and explicit request-host Domain cookies must share the effective domain regardless of Domain case, a leading dot, or an authority port"
+            Some(expected.as_str()),
+            "a security-relevant staged cookie must coexist with a selected cookie using the opposite host-only/domain scope"
         );
     }
 }

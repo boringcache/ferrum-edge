@@ -175,7 +175,7 @@ pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
 /// One-shot handoff for requester-owned auth session state that changed before
 /// authentication attempts rejected. Distinct cookie storage keys are
 /// newline-joined; a later attempt replaces an earlier candidate with the same
-/// exact name/effective-domain/path/partitioned scope. The authentication phase
+/// exact name/domain/host-only/path/partitioned scope. The authentication phase
 /// removes this key on every exit: it attaches the cookies only to the final
 /// rejection and discards them when a later credential succeeds. The key
 /// contains "cookie" so metadata serialization still redacts the sealed values
@@ -16074,15 +16074,16 @@ struct SetCookieStorageKey<'a> {
     name: &'a str,
     domain: Option<CanonicalSetCookieDomain<'a>>,
     path: &'a str,
+    host_only: bool,
     partitioned: bool,
 }
 
 /// Return the effective RFC 10025 cookie storage key. Omitted Domain resolves
-/// to the exact validated request host used for browser cookie comparison, so
-/// host-only and explicit same-host Domain cookies compare by their effective
-/// domain. Omitted, empty, or non-absolute Path attributes use the request
-/// path's default directory. Partitioned cookies remain independent from
-/// otherwise equivalent unpartitioned cookies.
+/// to the exact validated request host used for browser cookie comparison while
+/// retaining its host-only state. Omitted, empty, or non-absolute Path
+/// attributes use the request path's default directory. Host-only and
+/// Partitioned cookies remain independent from otherwise equivalent domain and
+/// unpartitioned cookies.
 fn set_cookie_storage_key<'a>(
     set_cookie: &'a str,
     default_path: &'a str,
@@ -16212,6 +16213,7 @@ fn set_cookie_storage_key<'a>(
         name,
         domain,
         path,
+        host_only,
         partitioned,
     })
 }
@@ -16245,6 +16247,7 @@ fn set_cookie_same_storage_key(
 
     existing_key.name == candidate_key.name
         && existing_key.path == candidate_key.path
+        && existing_key.host_only == candidate_key.host_only
         && existing_key.partitioned == candidate_key.partitioned
         && match (existing_key.domain, candidate_key.domain) {
             (
