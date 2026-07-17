@@ -716,6 +716,13 @@ async fn assert_isolated_instances(external_first: bool) {
     };
 
     let mut ctx = make_ctx();
+    // An earlier custom plugin may use the generic consumer-facing key. That
+    // occupancy must not prevent the first correlation instance from claiming
+    // canonical ownership, while the second instance must still preserve it.
+    ctx.metadata.insert(
+        REQUEST_ID_METADATA_KEY.to_string(),
+        "pre-correlation-custom-value".to_string(),
+    );
     ctx.headers.insert(
         "x-external-correlation-id".to_string(),
         "attacker-preserved-id".to_string(),

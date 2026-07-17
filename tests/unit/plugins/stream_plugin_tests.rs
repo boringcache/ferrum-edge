@@ -655,6 +655,10 @@ async fn test_multiple_correlation_instances_keep_stream_ids_isolated() {
     )
     .unwrap();
     let mut ctx = make_stream_ctx();
+    ctx.insert_metadata(
+        REQUEST_ID_METADATA_KEY.to_string(),
+        "pre-correlation-custom-value".to_string(),
+    );
 
     assert!(matches!(
         first.on_stream_connect(&mut ctx).await,

@@ -11,6 +11,7 @@ use uuid::Uuid;
 use super::{Plugin, PluginResult, REQUEST_ID_METADATA_KEY, RequestContext};
 
 const INSTANCE_METADATA_PREFIX: &str = "correlation_id.instance.";
+const CANONICAL_OWNER_METADATA_KEY: &str = "correlation_id.canonical_owner";
 
 const PROTOCOL_MANAGED_HEADER_NAMES: &[&str] = &[
     "connection",
@@ -107,12 +108,19 @@ impl CorrelationId {
         })
     }
 
-    fn publish_request_id(&self, ctx: &mut RequestContext, request_id: String) {
-        ctx.metadata
-            .insert(self.instance_metadata_key.clone(), request_id.clone());
-        ctx.metadata
-            .entry(REQUEST_ID_METADATA_KEY.to_string())
-            .or_insert(request_id);
+    fn publish_request_id(&self, metadata: &mut HashMap<String, String>, request_id: String) {
+        metadata.insert(self.instance_metadata_key.clone(), request_id.clone());
+        // Generic metadata can be populated by earlier custom plugins. Only a
+        // correlation-specific claim proves that a correlation instance has
+        // selected the canonical consumer value. The first such instance
+        // replaces generic occupancy; later correlation instances preserve it.
+        if !metadata.contains_key(CANONICAL_OWNER_METADATA_KEY) {
+            metadata.insert(
+                CANONICAL_OWNER_METADATA_KEY.to_string(),
+                self.instance_metadata_key.clone(),
+            );
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+        }
     }
 
     fn request_id<'a>(&self, ctx: &'a RequestContext) -> Option<&'a String> {
@@ -179,10 +187,7 @@ impl Plugin for CorrelationId {
     ) -> super::PluginResult {
         let id = Uuid::new_v4().to_string();
         let metadata = ctx.metadata.get_or_insert_with(HashMap::new);
-        metadata.insert(self.instance_metadata_key.clone(), id.clone());
-        metadata
-            .entry(REQUEST_ID_METADATA_KEY.to_string())
-            .or_insert(id);
+        self.publish_request_id(metadata, id);
         super::PluginResult::Continue
     }
 
@@ -215,7 +220,7 @@ impl Plugin for CorrelationId {
         // first instance in configured lifecycle order also publishes the one
         // canonical consumer-facing request ID; later trust domains cannot
         // overwrite it.
-        self.publish_request_id(ctx, request_id);
+        self.publish_request_id(&mut ctx.metadata, request_id);
 
         PluginResult::Continue
     }

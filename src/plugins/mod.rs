@@ -205,7 +205,9 @@ pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
 /// correlation-ID instance in lifecycle order.
 ///
 /// Later instances retain their independently resolved values in
-/// header-scoped slots and must not overwrite this consumer-facing key.
+/// header-scoped slots and must not overwrite this consumer-facing key. The
+/// first correlation instance claims ownership independently of any generic
+/// metadata value an earlier custom plugin may have stored under this key.
 pub const REQUEST_ID_METADATA_KEY: &str = "request_id";
 
 /// gRPC-only (single protocol).
