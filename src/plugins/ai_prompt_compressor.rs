@@ -1023,8 +1023,9 @@ fn strip_all_markers(text: &str, open: &str, close: &str) -> String {
     out
 }
 
-/// Remove configured markers from JSON string literals without reserializing
-/// the surrounding value. The caller first validates and classifies the JSON,
+/// Remove configured markers from JSON string values without reserializing the
+/// surrounding value. Object member names are deliberately left untouched. The
+/// caller first validates and classifies the JSON,
 /// so this lexical pass can preserve whitespace, duplicate members, numeric
 /// spellings, and member order on sanitation-only fallbacks. Marker characters
 /// are recognized through ordinary JSON escapes too (`\u003c`, `\/`, and mixed
@@ -1041,7 +1042,23 @@ fn strip_markers_from_json_strings(body: &[u8], tags: &(String, String)) -> Opti
             let byte = body[cursor];
             output.push(byte);
             cursor += 1;
-            in_string = byte == b'"';
+            if byte == b'"' {
+                let string_start = cursor;
+                let string_end = json_string_end(body, string_start)?;
+                let mut next = string_end + 1;
+                while body.get(next).is_some_and(u8::is_ascii_whitespace) {
+                    next += 1;
+                }
+                // Preserve object member names byte-for-byte. Preserve markers
+                // are prompt annotations, never permission to manufacture a
+                // backend-visible field name after request policy has run.
+                if body.get(next) == Some(&b':') {
+                    output.extend_from_slice(&body[string_start..=string_end]);
+                    cursor = string_end + 1;
+                } else {
+                    in_string = true;
+                }
+            }
             continue;
         }
 
@@ -1066,6 +1083,16 @@ fn strip_markers_from_json_strings(body: &[u8], tags: &(String, String)) -> Opti
     }
 
     (changed && !in_string).then_some(output)
+}
+
+fn json_string_end(body: &[u8], mut cursor: usize) -> Option<usize> {
+    while cursor < body.len() {
+        if body[cursor] == b'"' {
+            return Some(cursor);
+        }
+        cursor = json_string_scalar_end(body, cursor)?;
+    }
+    None
 }
 
 fn match_json_string_ascii(body: &[u8], start: usize, expected: &[u8]) -> Option<usize> {

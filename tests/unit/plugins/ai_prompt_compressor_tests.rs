@@ -961,6 +961,28 @@ async fn escaped_preserve_markers_are_removed_without_json_canonicalization() {
 
 #[tokio::test]
 #[serial(ai_prompt_compressor_budget)]
+async fn preserve_marker_cleanup_never_rewrites_json_member_names() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let raw = br#"{"messages":[{"role":"user","content":"<keep>short</keep>"}],"tool<keep>s":[],"response_format<keep>":{"type":"json_object"}}"#;
+    let output = plugin
+        .transform_request_body(raw, Some("application/json"), &json_headers())
+        .await
+        .expect("prompt markers must be sanitized");
+
+    assert_eq!(
+        output,
+        br#"{"messages":[{"role":"user","content":"short"}],"tool<keep>s":[],"response_format<keep>":{"type":"json_object"}}"#,
+        "sanitation must not create backend-visible object members"
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn exponent_growth_within_hard_output_cap_keeps_successful_compression() {
     let plugin = compressor(5, 0.5);
     let padding = std::iter::repeat_n("1e8", 10_000)
