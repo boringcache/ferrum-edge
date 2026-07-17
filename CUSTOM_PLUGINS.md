@@ -276,7 +276,7 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `transform_request_body(&body, content_type)` | Pre-backend (buffered) | No | Rewrite request body before sending to backend |
 | `on_final_request_body(&headers, &body)` | Pre-backend (post-transform) | Yes | Validate the final request body after all transforms |
 | `after_proxy(&mut ctx, status, &mut headers)` | Post-backend | Yes | Transform response headers, reject responses |
-| `apply_websocket_handshake_response_headers(&mut ctx, status, &mut headers)` | Successful WebSocket handshake (H1 `101`; H2/H3 `200`) | No | Synchronously decorate successful handshake response headers in configured order. After this non-rejecting hook returns, proxy core scrubs transport-owned handshake/framing fields and reconstructs them authoritatively. |
+| `apply_websocket_handshake_response_headers(&ctx, status, &mut headers)` | Successful WebSocket handshake (H1 `101`; H2/H3 `200`) | No | Synchronously decorate successful handshake response headers in configured order. After this non-rejecting hook returns, proxy core scrubs transport-owned handshake/framing fields and reconstructs them authoritatively. |
 | `on_response_body(&mut ctx, status, &headers, &body)` | Post-backend (buffered) | Yes | Inspect buffered response body, extract metrics |
 | `transform_response_body(&body, content_type, &headers)` | Post-backend (buffered) | No | Rewrite response body before sending to client |
 | `on_final_response_body(&mut ctx, status, &headers, &body)` | Post-backend (post-transform) | Yes | Validate the final response body after all transforms |
