@@ -587,6 +587,10 @@ impl Plugin for PriorityOverridePlugin {
     fn needs_final_request_body_context(&self) -> bool {
         self.inner.needs_final_request_body_context()
     }
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+        self.inner
+            .requires_final_request_body_before_backend_dispatch()
+    }
     async fn transform_response_body(
         &self,
         body: &[u8],
@@ -2062,6 +2066,7 @@ impl PluginCapabilities {
     pub const HAS_BODY_BEFORE_AUTHORIZE: u16 = 1 << 10;
     pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
     pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
+    pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -2168,6 +2173,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.needs_final_request_body_context() {
             caps |= PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT;
+        }
+        if p.requires_final_request_body_before_backend_dispatch() {
+            caps |= PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH;
         }
         if p.requires_response_committed_hook() {
             caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;
