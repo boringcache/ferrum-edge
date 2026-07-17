@@ -58,9 +58,8 @@ fn test_supported_protocols_and_frame_parser_opt_in() {
 
 #[test]
 fn test_parser_only_plugin_is_excluded_from_message_hook_list() {
-    let plugin: Arc<dyn Plugin> = Arc::new(
-        WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 1024})).unwrap(),
-    );
+    let plugin: Arc<dyn Plugin> =
+        Arc::new(WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 1024})).unwrap());
     let (framing_plugins, frame_plugins) =
         ferrum_edge::_test_support::websocket_relay_plugin_names_for_test(&[plugin], true);
     assert_eq!(

@@ -35,7 +35,10 @@ async fn bind_ws_backend_listener() -> (u16, TcpListener) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind WS backend");
-    let port = listener.local_addr().expect("WS backend local address").port();
+    let port = listener
+        .local_addr()
+        .expect("WS backend local address")
+        .port();
     (port, listener)
 }
 

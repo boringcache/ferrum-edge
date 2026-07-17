@@ -615,10 +615,8 @@ pub mod _test_support {
         plugins: &[Arc<dyn crate::plugins::Plugin>],
         requires_websocket_framing: bool,
     ) -> (Vec<String>, Vec<String>) {
-        let (framing_plugins, frame_plugins) = crate::proxy::collect_websocket_relay_plugins(
-            plugins,
-            requires_websocket_framing,
-        );
+        let (framing_plugins, frame_plugins) =
+            crate::proxy::collect_websocket_relay_plugins(plugins, requires_websocket_framing);
         (
             framing_plugins
                 .iter()
