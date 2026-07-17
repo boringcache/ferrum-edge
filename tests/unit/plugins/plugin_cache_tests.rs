@@ -3231,10 +3231,7 @@ fn test_priority_override_preserves_ws_parser_policy_and_framing() {
         true,
     );
     limiter.priority_override = Some(101);
-    let config = make_config(
-        vec![make_proxy("p1", "/ws", vec!["ws1"])],
-        vec![limiter],
-    );
+    let config = make_config(vec![make_proxy("p1", "/ws", vec!["ws1"])], vec![limiter]);
     let cache = PluginCache::new(&config).unwrap();
     assert!(
         cache.requires_ws_frame_hooks("p1"),

@@ -18,9 +18,9 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
 const MAX_FRAME_BYTES: &str = "16";
 
@@ -317,7 +317,10 @@ async fn functional_ws_message_size_limit_h3_sends_1009_to_both_peers() {
         panic!("expected echoed H3 Close, got {graceful_reply:?}");
     };
     if graceful_reply.len() >= 2 {
-        assert_ne!(u16::from_be_bytes([graceful_reply[0], graceful_reply[1]]), 1009);
+        assert_ne!(
+            u16::from_be_bytes([graceful_reply[0], graceful_reply[1]]),
+            1009
+        );
     }
     assert_backend_close(&mut backend_closes, CloseCode::Normal, graceful_reason).await;
 
