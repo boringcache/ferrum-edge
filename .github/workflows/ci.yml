@@ -44,6 +44,9 @@ jobs:
       - name: Validate PR CI planner examples
         run: python3 .github/scripts/pr_ci_plan.py --self-test
 
+      - name: Verify ARM64 cross-build command policy
+        run: python3 .github/scripts/verify_cross_build_policy.py --self-test
+
       - name: Check PR diff hygiene
         if: github.event_name == 'pull_request'
         run: git diff --check "origin/${{ github.base_ref }}...HEAD"
