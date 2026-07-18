@@ -36,10 +36,20 @@ pub use registry::{
 /// Base `FERRUM_*` variables whose current value was materialized from an
 /// external secret source in this process.
 ///
-/// Only the key names are stored. The values live in the process environment
-/// already (startup writes them there with `set_var` before config is parsed),
-/// so [`redact_external_secret_values`] reads them back from there instead of
-/// keeping a second copy of secret material alive for the process lifetime.
+/// Only the key names are stored *here*. The values are read back from the
+/// process environment (startup writes them there with `set_var` before config
+/// is parsed) the first time redaction runs, which is what makes redaction
+/// key-tied rather than a guess about what looks secret.
+///
+/// That read-back is not copy-free, and pretending otherwise would be
+/// misleading: [`REDACTION_PLAN`] retains, for the process lifetime, the exact
+/// value of every externally resolved key plus the bounded set of derived forms
+/// from [`derive_candidates`] (trimmed, per-segment, case-normalized, and
+/// JSON-escaped). Matching a value that a validator re-rendered requires having
+/// that rendering to compare against, so the copies are the cost of the
+/// coverage. The tradeoff is deliberate and bounded: the plan is built once,
+/// deduplicated, and never rebuilt or extended, and the *environment* remains
+/// the only place the value is written or mutated.
 static EXTERNAL_SECRET_KEYS: std::sync::OnceLock<std::collections::BTreeSet<String>> =
     std::sync::OnceLock::new();
 
@@ -147,12 +157,51 @@ pub fn redact_external_secret_values(message: &str) -> String {
 ///
 /// This is the one place every tracing record is materialized as bytes
 /// (`logging::non_blocking::RecordWriter::submit`), so filtering here covers
-/// present and future log sites without auditing each one. Records are the
-/// JSON produced by the fmt layer; the escaped form of each value is a derived
-/// candidate so escaping cannot smuggle a value past the scan.
+/// present and future log sites without auditing each one.
+///
+/// # Why this boundary is structural, not textual
+///
+/// A record here is a complete JSON document: the fmt layer is configured
+/// `.json()` in `main::init_logging`, `stdout_logging` access records go
+/// through `NonBlockingSink::try_write_json`, and the sink's own failure notice
+/// is a JSON literal. Running the flat [`RedactionPlan::redact`] pass over
+/// those *serialized* bytes is not safe, because a resolved value has
+/// deliberately no minimum length and no required shape. A secret of `"`
+/// matches every structural quote in the record and a secret of `,`, `{`, or
+/// `:` matches every delimiter, so a textual pass rewrites JSON syntax into
+/// placeholder text and emits a line no log pipeline can parse; a secret equal
+/// to `level`, `target`, or `message` rewrites the schema's own field names.
+///
+/// So the record is parsed, redacted per *value*, and reserialized:
+///
+/// * object **keys** are never rewritten. They are the compile-time-static
+///   field names of the tracing/serde schema (plus, in access records, header
+///   names), never an interpolated config value, so they are not a leak
+///   channel — and rewriting one would silently change the record's schema for
+///   every downstream consumer. `level` stays `level` even when `level` is
+///   itself a resolved secret; its occurrences in *values* are still redacted.
+/// * string **values** are matched after unescaping, so JSON escaping cannot
+///   smuggle a value past the scan and the reserializer re-escapes correctly.
+///   (The escaped form stays a derived candidate for [`redact_external_secret_values`],
+///   which does filter raw text.)
+/// * numeric and boolean **values** are matched against their rendered form —
+///   an externally resolved port or flag is a scalar in the record, not a
+///   string — and a match replaces the whole scalar with the placeholder
+///   string.
+/// * field **order** is preserved (see [`LogJson`]), so a redacted record
+///   differs from an unredacted one only in the values that were redacted.
+///
+/// Fail-closed: a record that is not well-formed JSON, or that cannot be
+/// reserialized, cannot be sanitized without risking either a leak or a
+/// corrupt line, so it is replaced with [`WITHHELD_LOG_RECORD`] — a fixed,
+/// valid JSON line. The candidate is never emitted on any failure path. This
+/// costs the operator one anomalous diagnostic rather than a secret.
 ///
 /// Callers on the hot path pay one relaxed atomic load when no external secret
-/// was ever resolved.
+/// was ever resolved, and one allocation-free scan
+/// ([`RedactionPlan::contains_candidate`]) when one was but this record does
+/// not contain it — parsing and copying happen only for records that actually
+/// carry a resolved value.
 pub(crate) fn redact_log_record(record: &mut Vec<u8>) {
     if !REDACTION_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
         return;
@@ -160,18 +209,173 @@ pub(crate) fn redact_log_record(record: &mut Vec<u8>) {
     let Some(plan) = redaction_plan() else {
         return;
     };
+
+    let trailing_newline = record.last() == Some(&b'\n');
     // Scoped so the immutable borrow of `record` ends before the assignment.
-    let redacted = {
-        let Ok(text) = std::str::from_utf8(record) else {
-            return;
-        };
-        match plan.redact(text) {
-            std::borrow::Cow::Owned(owned) => Some(owned),
-            std::borrow::Cow::Borrowed(_) => None,
+    let outcome = match std::str::from_utf8(record) {
+        // Non-UTF-8 bytes cannot be scanned at all, so this record cannot be
+        // shown to be free of a resolved value. Unreachable for the three
+        // producers above; withhold rather than guess.
+        Err(_) => Some(withheld_record(trailing_newline)),
+        Ok(text) if plan.contains_candidate(text) => {
+            Some(match plan.redact_json_record(text) {
+                Some(mut redacted) => {
+                    if trailing_newline {
+                        redacted.push('\n');
+                    }
+                    redacted.into_bytes()
+                }
+                None => withheld_record(trailing_newline),
+            })
         }
+        // Nothing to redact: leave the record's bytes exactly as serialized.
+        Ok(_) => None,
     };
-    if let Some(redacted) = redacted {
-        *record = redacted.into_bytes();
+    if let Some(outcome) = outcome {
+        *record = outcome;
+    }
+}
+
+/// Emitted in place of a record that cannot be structurally sanitized.
+///
+/// Deliberately a valid JSON object carrying the same stable `level`/`target`/
+/// `message` keys the fmt layer emits, so a log pipeline sees a well-formed
+/// line it can account for instead of a silent gap or a parse error. It is a
+/// fixed literal with no interpolation, so it cannot itself carry a value.
+pub const WITHHELD_LOG_RECORD: &str = concat!(
+    r#"{"level":"WARN","target":"ferrum_edge::secrets","#,
+    r#""message":"log record withheld: it is not well-formed JSON and could not be checked for externally resolved secret values"}"#
+);
+
+fn withheld_record(trailing_newline: bool) -> Vec<u8> {
+    let mut bytes = WITHHELD_LOG_RECORD.as_bytes().to_vec();
+    if trailing_newline {
+        bytes.push(b'\n');
+    }
+    bytes
+}
+
+/// An order-preserving JSON document, used only by [`redact_log_record`].
+///
+/// `serde_json::Value` stores objects in a `BTreeMap` — the `preserve_order`
+/// feature is deliberately not enabled crate-wide, since it would change every
+/// admin API response body — so round-tripping a record through it would
+/// alphabetize the fields of every access-log line that happened to contain a
+/// resolved value. Redaction must change values and nothing else, so objects
+/// are held here as an ordered key/value list.
+///
+/// Depth is bounded by `serde_json`'s own recursion limit on the parse, which
+/// also bounds the redaction walk and the reserialization.
+enum LogJson {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(String),
+    Array(Vec<LogJson>),
+    Object(Vec<(String, LogJson)>),
+}
+
+impl<'de> serde::Deserialize<'de> for LogJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct LogJsonVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for LogJsonVisitor {
+            type Value = LogJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<LogJson, E> {
+                Ok(LogJson::Null)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<LogJson, E> {
+                Ok(LogJson::Bool(value))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<LogJson, E> {
+                Ok(LogJson::Number(value.into()))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<LogJson, E> {
+                Ok(LogJson::Number(value.into()))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<LogJson, E> {
+                serde_json::Number::from_f64(value)
+                    .map(LogJson::Number)
+                    .ok_or_else(|| E::custom("non-finite number"))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<LogJson, E> {
+                Ok(LogJson::String(value.to_string()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<LogJson, E> {
+                Ok(LogJson::String(value))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<LogJson, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(LogJson::Array(items))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<LogJson, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry::<String, LogJson>()? {
+                    entries.push(entry);
+                }
+                Ok(LogJson::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(LogJsonVisitor)
+    }
+}
+
+impl serde::Serialize for LogJson {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // `Serialize` is needed by name for the concrete `Number` below;
+        // method resolution on a generic parameter would not require it.
+        use serde::Serialize as _;
+        use serde::ser::{SerializeMap, SerializeSeq};
+
+        match self {
+            Self::Null => serializer.serialize_unit(),
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::Number(value) => value.serialize(serializer),
+            Self::String(value) => serializer.serialize_str(value),
+            Self::Array(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+            Self::Object(entries) => {
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
     }
 }
 
@@ -308,6 +512,83 @@ impl RedactionPlan {
         Self {
             candidates,
             first_bytes,
+        }
+    }
+
+    /// Allocation-free "is there anything to do here?" screen.
+    ///
+    /// [`redact_log_record`] runs per emitted record, and in a process that
+    /// *does* use external secrets the overwhelming majority of records still
+    /// contain no resolved value. This answers that question with the same
+    /// first-byte screen [`Self::redact`] uses and without parsing, copying, or
+    /// allocating, so only records that actually carry a value pay for the
+    /// JSON round trip.
+    fn contains_candidate(&self, text: &str) -> bool {
+        let bytes = text.as_bytes();
+        // Byte indexing is safe against UTF-8 boundaries here: every candidate
+        // is valid UTF-8, so its first byte is a leading byte, and a leading
+        // byte can never equal a continuation byte. A byte-prefix match
+        // therefore cannot start mid-character.
+        bytes.iter().enumerate().any(|(index, byte)| {
+            self.first_bytes[*byte as usize]
+                && self
+                    .candidates
+                    .iter()
+                    .any(|candidate| bytes[index..].starts_with(candidate.as_bytes()))
+        })
+    }
+
+    /// Parse one serialized log record, redact its values, and reserialize.
+    ///
+    /// `None` when the record is not well-formed JSON or cannot be
+    /// reserialized; the caller withholds the record rather than emitting
+    /// anything derived from it. See [`redact_log_record`] for why this is
+    /// structural rather than a text pass.
+    fn redact_json_record(&self, text: &str) -> Option<String> {
+        let mut document: LogJson = serde_json::from_str(text).ok()?;
+        self.redact_json_value(&mut document);
+        serde_json::to_string(&document).ok()
+    }
+
+    /// Redact values in place, leaving object keys and JSON structure alone.
+    fn redact_json_value(&self, value: &mut LogJson) {
+        // A matched scalar is replaced *after* the match, so the borrow of
+        // `value` taken by the pattern has ended by the time it is reassigned.
+        let scalar_matches = match value {
+            LogJson::String(text) => {
+                let redacted = match self.redact(text) {
+                    std::borrow::Cow::Owned(owned) => Some(owned),
+                    std::borrow::Cow::Borrowed(_) => None,
+                };
+                if let Some(redacted) = redacted {
+                    *text = redacted;
+                }
+                false
+            }
+            LogJson::Array(items) => {
+                for item in items.iter_mut() {
+                    self.redact_json_value(item);
+                }
+                false
+            }
+            // Keys are intentionally untouched: they are the schema's stable
+            // field names, not interpolated configuration.
+            LogJson::Object(entries) => {
+                for (_key, entry) in entries.iter_mut() {
+                    self.redact_json_value(entry);
+                }
+                false
+            }
+            // Scalars are unquoted in the record, so a resolved port or flag
+            // is matched against its rendered form. A hit replaces the whole
+            // scalar; partially rewriting a number would produce either a
+            // different number or invalid JSON.
+            LogJson::Bool(flag) => self.contains_candidate(if *flag { "true" } else { "false" }),
+            LogJson::Number(number) => self.contains_candidate(&number.to_string()),
+            LogJson::Null => false,
+        };
+        if scalar_matches {
+            *value = LogJson::String(EXTERNAL_SECRET_PLACEHOLDER.to_string());
         }
     }
 

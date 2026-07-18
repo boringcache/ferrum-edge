@@ -552,6 +552,14 @@ impl RecordWriter {
         // paths — stops echoing a value fetched from `_FILE`/`_VAULT`/`_AWS`/
         // `_AZURE`/`_GCP`. Costs one relaxed atomic load when no external
         // secret was resolved, which is every process that does not use them.
+        //
+        // Every producer that reaches here emits a JSON document (the fmt
+        // layer is `.json()`, access records go through `try_write_json`, and
+        // the failure notice above is a JSON literal), and the redactor treats
+        // it as one: it rewrites values only, never keys or syntax, and
+        // withholds a record it cannot parse. A resolved value has no minimum
+        // length, so a flat text substitution here would let a one-character
+        // secret rewrite the record's own delimiters.
         crate::secrets::redact_log_record(&mut self.bytes);
         if self.bytes.len() > self.sink.state.options.max_record_bytes {
             // Substitution can grow a record past the admission bound. Drop it

@@ -7,9 +7,10 @@
 //! keys all use a `FERRUM_REDACTION_FIXTURE_*` prefix that no real setting uses,
 //! so no other test's diagnostics are affected.
 
+use crate::unit::env_lock::ENV_LOCK;
 use ferrum_edge::secrets::{
-    EXTERNAL_SECRET_PLACEHOLDER, is_external_secret_key, record_external_secret_keys,
-    redact_external_secret_values,
+    EXTERNAL_SECRET_PLACEHOLDER, WITHHELD_LOG_RECORD, is_external_secret_key,
+    record_external_secret_keys, redact_external_secret_values,
 };
 use std::sync::Once;
 
@@ -32,25 +33,74 @@ const CASE_VALUE: &str = "lowercase-method-sentinel";
 const QUOTED_KEY: &str = "FERRUM_REDACTION_FIXTURE_QUOTED";
 const QUOTED_VALUE: &str = r#"quoted"secret\sentinel"#;
 
+/// A one-character secret. A resolved value has deliberately no minimum length,
+/// so this is a legitimate secret — and it is also the JSON string delimiter,
+/// which is what makes a flat text pass over a serialized record unsafe.
+const QUOTE_KEY: &str = "FERRUM_REDACTION_FIXTURE_QUOTE";
+const QUOTE_VALUE: &str = "\"";
+
+/// A secret that is a JSON structural delimiter.
+const DELIMITER_KEY: &str = "FERRUM_REDACTION_FIXTURE_DELIMITER";
+const DELIMITER_VALUE: &str = ",";
+
+/// A secret equal to one of the log schema's own field names. The *key* must
+/// survive; occurrences in values must not.
+const FIELD_NAME_KEY: &str = "FERRUM_REDACTION_FIXTURE_FIELD_NAME";
+const FIELD_NAME_VALUE: &str = "level";
+
+/// A secret that appears in a record as an unquoted JSON number — the shape a
+/// resolved port or limit produces.
+///
+/// Deliberately not a plausible port. Recording keys arms redaction for the
+/// whole `unit_tests` binary, so a realistic number like `8443` could match a
+/// scalar in an unrelated test's access-log record and rewrite it.
+const NUMBER_KEY: &str = "FERRUM_REDACTION_FIXTURE_NUMBER";
+const NUMBER_VALUE: &str = "918273645";
+
+const FIXTURES: [(&str, &str); 8] = [
+    (PLAIN_KEY, PLAIN_VALUE),
+    (LIST_KEY, LIST_VALUE),
+    (CASE_KEY, CASE_VALUE),
+    (QUOTED_KEY, QUOTED_VALUE),
+    (QUOTE_KEY, QUOTE_VALUE),
+    (DELIMITER_KEY, DELIMITER_VALUE),
+    (FIELD_NAME_KEY, FIELD_NAME_VALUE),
+    (NUMBER_KEY, NUMBER_VALUE),
+];
+
 static RECORDED: Once = Once::new();
 
+/// Arm process-wide redaction exactly once for the `unit_tests` binary.
+///
+/// The `Once` alone is not enough. `set_var` is a data race against *any*
+/// concurrent `getenv` anywhere in the process, and the `unit_tests` binary
+/// runs env-reading and env-mutating tests in parallel; a file-local `Once`
+/// serializes this file against itself but not against them. The shared
+/// [`ENV_LOCK`] is the process-wide serialization point every other
+/// env-touching unit test already acquires, so it is taken here too.
+///
+/// The lock is also held across the first redaction call, not just the
+/// `set_var` loop. The cached candidate plan is built lazily on first use by
+/// reading these variables back out of the environment, so that read is part of
+/// the same critical section — otherwise the plan could be built by a later
+/// test while an unrelated test is mid-`set_var`. Once the plan is cached
+/// nothing reads the environment again, so the individual tests below need no
+/// lock.
 fn arm_redaction() {
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     RECORDED.call_once(|| {
-        for (key, value) in [
-            (PLAIN_KEY, PLAIN_VALUE),
-            (LIST_KEY, LIST_VALUE),
-            (CASE_KEY, CASE_VALUE),
-            (QUOTED_KEY, QUOTED_VALUE),
-        ] {
-            // SAFETY: `Once` serializes this, it runs before any thread reads
-            // these names, and the names are fixture-only.
+        for (key, value) in FIXTURES {
+            // SAFETY: `ENV_LOCK` is held, so no other test is reading or
+            // writing the process environment concurrently. The names are
+            // fixture-only and no real setting uses this prefix.
             unsafe { std::env::set_var(key, value) };
         }
-        record_external_secret_keys(
-            [PLAIN_KEY, LIST_KEY, CASE_KEY, QUOTED_KEY]
-                .into_iter()
-                .map(str::to_string),
-        );
+        record_external_secret_keys(FIXTURES.iter().map(|(key, _)| key.to_string()));
+        // Force the lazily built candidate plan while the lock is still held,
+        // so its env read-back cannot race a concurrent mutation.
+        let _ = redact_external_secret_values("");
     });
 }
 
@@ -162,4 +212,276 @@ fn redaction_is_idempotent() {
     let twice = redact_external_secret_values(&once);
     assert_eq!(once, twice, "a second pass must be a no-op");
     assert!(once.contains(EXTERNAL_SECRET_PLACEHOLDER));
+}
+
+// ---------------------------------------------------------------------------
+// Serialization-boundary coverage, driven through the real sink.
+//
+// `secrets::redact_log_record` is crate-private, so these exercise it where it
+// actually runs: `NonBlockingSink` -> `RecordWriter::submit`, the single point
+// where a log record exists as complete bytes. That is the boundary the
+// structural (rather than textual) redaction exists to protect, and driving the
+// real sink also proves the substitution survives the queue/admission path.
+// ---------------------------------------------------------------------------
+
+use ferrum_edge::logging::non_blocking::EnqueueResult;
+use ferrum_edge::logging::{NonBlockingOptions, NonBlockingSink, SinkName};
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CapturedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Run `write` against a live sink and return everything the writer received.
+fn through_sink(write: impl FnOnce(&NonBlockingSink)) -> String {
+    arm_redaction();
+    let captured = CapturedWriter::default();
+    let output = Arc::clone(&captured.0);
+    let (sink, mut guard) = NonBlockingSink::spawn(
+        SinkName::Stdout,
+        captured,
+        NonBlockingOptions {
+            record_capacity: 16,
+            byte_capacity: 1 << 20,
+            max_record_bytes: 64 * 1024,
+            shutdown_timeout: std::time::Duration::from_secs(5),
+        },
+    )
+    .expect("sink spawns");
+
+    write(&sink);
+
+    assert!(guard.shutdown(), "the sink must drain before assertions");
+    let bytes = output
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    String::from_utf8(bytes).expect("sink output is UTF-8")
+}
+
+fn emit(sink: &NonBlockingSink, value: &serde_json::Value) {
+    assert_eq!(
+        sink.try_write_json(value).expect("fixture record serializes"),
+        EnqueueResult::Queued,
+        "the fixture record must be accepted, not dropped"
+    );
+}
+
+fn parse_record(line: &str) -> serde_json::Value {
+    serde_json::from_str(line.trim_end())
+        .unwrap_or_else(|error| panic!("emitted record must stay valid JSON ({error}): {line}"))
+}
+
+/// The headline defect: a resolved value has no minimum length, so a secret can
+/// be a single `"`. A flat text pass over the serialized record replaces every
+/// structural quote with the placeholder and emits a line nothing can parse.
+#[test]
+fn one_character_quote_secret_does_not_corrupt_the_record() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &serde_json::json!({
+                "level": "WARN",
+                "message": format!("value is {QUOTE_VALUE} here"),
+            }),
+        );
+    });
+
+    let record = parse_record(&line);
+    assert_eq!(record["level"], "WARN", "unrelated values must survive");
+    let message = record["message"].as_str().expect("message stays a string");
+    assert!(
+        !message.contains('"'),
+        "the resolved quote must not survive: {message}"
+    );
+    assert!(message.contains(EXTERNAL_SECRET_PLACEHOLDER));
+}
+
+/// Same class, via a delimiter: the object must keep exactly its three fields
+/// rather than having its separators rewritten into placeholder text.
+#[test]
+fn structural_delimiter_secret_does_not_rewrite_json_syntax() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &serde_json::json!({
+                "level": "INFO",
+                "message": format!("a{DELIMITER_VALUE}b"),
+                "target": "ferrum_edge::config",
+            }),
+        );
+    });
+
+    let record = parse_record(&line);
+    let object = record.as_object().expect("record is a JSON object");
+    assert_eq!(
+        object.len(),
+        3,
+        "structural delimiters must not be substituted: {line}"
+    );
+    assert_eq!(record["target"], "ferrum_edge::config");
+    let message = record["message"].as_str().expect("string value");
+    assert!(
+        !message.contains(','),
+        "the resolved delimiter must not survive: {message}"
+    );
+    assert!(message.contains(EXTERNAL_SECRET_PLACEHOLDER));
+}
+
+/// A secret equal to a schema field name must not rename the field. Keys are
+/// static field names, never interpolated config, so they are not a leak
+/// channel — but occurrences in *values* still are.
+#[test]
+fn field_name_secret_keeps_the_key_and_redacts_the_value() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &serde_json::json!({
+                "level": "WARN",
+                "message": format!("the {FIELD_NAME_VALUE} was resolved externally"),
+            }),
+        );
+    });
+
+    let record = parse_record(&line);
+    assert!(
+        record.get(FIELD_NAME_VALUE).is_some(),
+        "the `{FIELD_NAME_VALUE}` key must survive verbatim: {line}"
+    );
+    let message = record["message"].as_str().expect("string value");
+    assert!(
+        !message.contains(FIELD_NAME_VALUE),
+        "the resolved value must not survive in a value position: {message}"
+    );
+    assert!(message.contains(EXTERNAL_SECRET_PLACEHOLDER));
+}
+
+/// A resolved port reaches the record as an unquoted JSON number, so matching
+/// only inside string literals would miss it.
+#[test]
+fn numeric_scalar_values_are_redacted() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &serde_json::json!({
+                "level": "INFO",
+                "port": 918273645,
+                "tls": true,
+            }),
+        );
+    });
+
+    let record = parse_record(&line);
+    assert!(
+        !line.contains(NUMBER_VALUE),
+        "the resolved scalar must not survive: {line}"
+    );
+    assert_eq!(
+        record["port"],
+        serde_json::Value::String(EXTERNAL_SECRET_PLACEHOLDER.to_string())
+    );
+    assert_eq!(
+        record["tls"],
+        serde_json::Value::Bool(true),
+        "unrelated scalars must survive"
+    );
+}
+
+/// The record is JSON-escaped by the time it reaches the sink. Matching happens
+/// against the unescaped value and the reserializer re-escapes, so escaping can
+/// neither smuggle a value past the scan nor break the output.
+#[test]
+fn escaped_string_values_are_redacted_and_reescaped() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &serde_json::json!({
+                "level": "WARN",
+                "message": format!("saw {QUOTED_VALUE} in config"),
+            }),
+        );
+    });
+
+    let record = parse_record(&line);
+    let message = record["message"].as_str().expect("string value");
+    assert!(
+        !message.contains(QUOTED_VALUE),
+        "the escaped resolved value must not survive: {message}"
+    );
+    assert!(message.contains(EXTERNAL_SECRET_PLACEHOLDER));
+}
+
+/// Redaction is armed and the record is full of quotes, so it does take the
+/// parse/reserialize path — and must come out byte-for-byte identical,
+/// including field order. Otherwise every ordinary diagnostic in a process
+/// using external secrets would be silently rewritten.
+#[test]
+fn a_record_with_no_resolved_value_round_trips_unchanged() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &serde_json::json!({
+                "level": "INFO",
+                "message": "listening on 0.0.0.0:8080",
+                "target": "ferrum_edge::startup",
+            }),
+        );
+    });
+
+    assert_eq!(
+        line,
+        concat!(
+            r#"{"level":"INFO","message":"listening on 0.0.0.0:8080","#,
+            r#""target":"ferrum_edge::startup"}"#,
+            "\n"
+        )
+    );
+}
+
+/// Fail-closed: a record that is not well-formed JSON cannot be sanitized
+/// without either leaking or emitting a corrupt line, so it is replaced by a
+/// fixed, valid JSON notice. Nothing derived from the record is emitted.
+#[test]
+fn a_non_json_record_containing_a_resolved_value_is_withheld() {
+    let line = through_sink(|sink| {
+        assert_eq!(
+            sink.try_write_bytes(format!("not json at all: {PLAIN_VALUE}\n").as_bytes()),
+            EnqueueResult::Queued
+        );
+    });
+
+    assert!(
+        !line.contains(PLAIN_VALUE),
+        "the resolved value must not survive: {line}"
+    );
+    assert_eq!(line, format!("{WITHHELD_LOG_RECORD}\n"));
+    parse_record(&line);
+}
+
+/// A non-JSON record that contains nothing to redact is left alone — the
+/// withholding path must not swallow unrelated output.
+#[test]
+fn a_non_json_record_without_a_resolved_value_is_untouched() {
+    let line = through_sink(|sink| {
+        assert_eq!(
+            sink.try_write_bytes(b"plain operator output\n"),
+            EnqueueResult::Queued
+        );
+    });
+
+    assert_eq!(line, "plain operator output\n");
 }
