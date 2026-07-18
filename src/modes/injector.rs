@@ -760,15 +760,15 @@ fn build_tls_acceptor(
     //
     // `acme-tls/1` is deliberately RETAINED. The shared loader installs
     // `AcmeTlsAlpnResolver` for every listener it builds, so this acceptor can
-    // already serve an RFC 8737 validation certificate out of the global ACME
-    // order store — the resolver only does so for a ClientHello that offers
-    // `acme-tls/1` ALONE with matching SNI, which no Kubernetes API server
-    // sends. Dropping the protocol here would silently break TLS-ALPN-01
-    // renewal for an injector whose cert source is `acme://certificates/...`
-    // while leaving the resolver in place, so the advertisement and the
-    // serving path stay in agreement. An `acme-tls/1` connection carries no
-    // HTTP, so handing the post-handshake socket to the HTTP/1 builder is
-    // inert: the validator closes it, or the header read timeout does.
+    // serve an RFC 8737 validation certificate from a pending order already in
+    // the process-global ACME store — the resolver only does so for a
+    // ClientHello that offers `acme-tls/1` ALONE with matching SNI, which no
+    // Kubernetes API server sends. Dropping the protocol here would silently
+    // break that externally orchestrated TLS-ALPN-01 path while leaving the
+    // resolver in place, so the advertisement and serving path stay in
+    // agreement. An `acme-tls/1` connection carries no HTTP, so handing the
+    // post-handshake socket to the HTTP/1 builder is inert: the validator
+    // closes it, or the header read timeout does.
     let mut server_config = Arc::unwrap_or_clone(server_config);
     server_config.alpn_protocols = vec![
         b"http/1.1".to_vec(),
@@ -797,6 +797,12 @@ async fn serve_injector_connection<S>(
     if header_read_timeout_seconds > 0 {
         builder.timer(hyper_util::rt::TokioTimer::new());
         builder.header_read_timeout(std::time::Duration::from_secs(header_read_timeout_seconds));
+    } else {
+        // Pin the operator-facing `0 = disabled` contract explicitly. Hyper
+        // has its own default timeout, which happens to be inactive without a
+        // timer today; setting `None` prevents a future timer refactor from
+        // silently enabling that default for injector connections.
+        builder.header_read_timeout(None);
     }
     if let Err(e) = builder.serve_connection(io, svc).await {
         debug!(remote_addr = %remote_addr, error = %e, "Injector connection error");

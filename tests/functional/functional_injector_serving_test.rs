@@ -8,9 +8,9 @@
 //!   - the TLS acceptor advertises `http/1.1` and never negotiates `h2`, even
 //!     for a client that offers `h2` first (an HTTP/2-capable Kubernetes API
 //!     server would);
-//!   - it still advertises `acme-tls/1`, so an RFC 8737 TLS-ALPN-01 validator
-//!     can negotiate the ACME challenge protocol against an injector whose
-//!     cert source is ACME-issued;
+//!   - it still advertises `acme-tls/1`, loads a real pending order from the
+//!     managed store, and serves an RFC 8737 certificate carrying the critical
+//!     ACME identifier extension for that order;
 //!   - a nonzero `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` closes a connection
 //!     that trickles request headers, and `0` is the documented opt-out.
 //!
@@ -27,10 +27,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use ferrum_edge::tls::acme::{
+    AcmeHttp01OrderInput, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore,
+    AcmeTlsAlpn01ChallengeRecord,
+};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::ports::reserve_port;
@@ -45,6 +51,15 @@ const MAX_READINESS_PROBES: u32 = 100;
 /// Per-probe I/O budget. Bounds the readiness loop deterministically instead of
 /// letting a wedged listener stall the attempt.
 const PROBE_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hyper 1.x enables a 30-second default HTTP/1 header timeout whenever its
+/// builder has a timer. The zero-timeout regression waits beyond that default,
+/// so it would fail if injector serving stopped setting `None` explicitly and
+/// accidentally inherited Hyper's timeout during a future timer refactor.
+const ZERO_TIMEOUT_HEADER_DELAY: Duration = Duration::from_secs(31);
+
+const ACME_IDENTIFIER: &str = "localhost";
+const ACME_KEY_AUTHORIZATION: &str = "abc_DEF-123.injector-test-thumbprint";
 
 fn gateway_binary_path() -> String {
     std::env::var("CARGO_BIN_EXE_ferrum-edge")
@@ -74,10 +89,20 @@ impl Drop for InjectorGateway {
 
 /// Start the injector, retrying on a port that another test grabbed between
 /// our reservation and the child's bind.
-async fn start_injector(tls: bool, header_read_timeout_seconds: &str) -> InjectorGateway {
+async fn start_injector(
+    tls: bool,
+    header_read_timeout_seconds: &str,
+    seed_acme_tls_alpn_challenge: bool,
+) -> InjectorGateway {
     let mut last_error = String::new();
     for _ in 0..MAX_SPAWN_ATTEMPTS {
-        match try_start_injector(tls, header_read_timeout_seconds).await {
+        match try_start_injector(
+            tls,
+            header_read_timeout_seconds,
+            seed_acme_tls_alpn_challenge,
+        )
+        .await
+        {
             Ok(gateway) => return gateway,
             Err(error) => last_error = error,
         }
@@ -88,6 +113,7 @@ async fn start_injector(tls: bool, header_read_timeout_seconds: &str) -> Injecto
 async fn try_start_injector(
     tls: bool,
     header_read_timeout_seconds: &str,
+    seed_acme_tls_alpn_challenge: bool,
 ) -> Result<InjectorGateway, String> {
     let tmp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     let port = reserve_port()
@@ -147,6 +173,15 @@ async fn try_start_injector(
             .env("FERRUM_INJECTOR_ALLOW_PLAINTEXT", "true");
     }
 
+    if seed_acme_tls_alpn_challenge {
+        if !tls {
+            return Err(
+                "cannot seed a TLS-ALPN-01 challenge for a plaintext injector".to_string(),
+            );
+        }
+        seed_pending_tls_alpn_order(tmp.path())?;
+    }
+
     let child = command
         .spawn()
         .map_err(|e| format!("spawn injector: {e}"))?;
@@ -182,6 +217,38 @@ async fn try_start_injector(
     Err(format!(
         "injector never served an admission response on port {port}: {last_probe_error}"
     ))
+}
+
+/// Persist a real pending order before the child opens its process-global
+/// order store. This uses the same `AcmeOrderStore` mechanism as production
+/// order creation; the spawned binary then has to resolve the challenge from
+/// `acme-orders.json` and synthesize the RFC 8737 certificate itself.
+fn seed_pending_tls_alpn_order(store_dir: &std::path::Path) -> Result<(), String> {
+    let store = AcmeOrderStore::open(store_dir)
+        .map_err(|e| format!("open ACME order store: {e}"))?;
+    let order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        id: "injector-tls-alpn-order".to_string(),
+        certificate_id: Some("injector-certificate".to_string()),
+        domains: vec![ACME_IDENTIFIER.to_string()],
+        directory_url: "https://acme.test/directory".to_string(),
+        account_id: None,
+        account_credentials_json: None,
+        order_url: Some("https://acme.test/order/injector".to_string()),
+        status: AcmeOrderStatus::PendingChallenges,
+        http01_challenges: Vec::new(),
+        tls_alpn01_challenges: vec![AcmeTlsAlpn01ChallengeRecord {
+            identifier: ACME_IDENTIFIER.to_string(),
+            token: "abc_DEF-123".to_string(),
+            key_authorization: ACME_KEY_AUTHORIZATION.to_string(),
+        }],
+        dns01_challenges: Vec::new(),
+        error: None,
+    })
+    .map_err(|e| format!("build ACME order: {e}"))?;
+    store
+        .upsert_order(order, false)
+        .map_err(|e| format!("persist ACME order: {e}"))?;
+    Ok(())
 }
 
 fn child_exit_status(
@@ -320,6 +387,31 @@ async fn connect_tls(
     (negotiated, tls_stream)
 }
 
+/// Connect like an RFC 8737 validator: offer only `acme-tls/1` and accept the
+/// purpose-built self-signed validation certificate so the caller can inspect
+/// its ACME identifier extension.
+async fn connect_acme_tls(
+    gateway: &InjectorGateway,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    install_crypto_provider();
+    let mut client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ferrum_edge::tls::NoVerifier))
+        .with_no_client_auth();
+    client_config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+    let tcp = TcpStream::connect(("127.0.0.1", gateway.port))
+        .await
+        .expect("tcp connect to injector");
+    let server_name = rustls::pki_types::ServerName::try_from(ACME_IDENTIFIER.to_string())
+        .expect("ACME server name");
+    connector
+        .connect(server_name, tcp)
+        .await
+        .expect("TLS-ALPN-01 handshake with injector")
+}
+
 fn admission_review(uid: &str) -> String {
     json!({
         "apiVersion": "admission.k8s.io/v1",
@@ -349,7 +441,7 @@ fn mutate_request(body: &str) -> String {
 #[ignore]
 #[tokio::test]
 async fn functional_injector_tls_never_negotiates_h2_and_serves_admission() {
-    let gateway = start_injector(true, "10").await;
+    let gateway = start_injector(true, "10", false).await;
 
     // Offer h2 first, exactly as an HTTP/2-capable Kubernetes API server does.
     let offered = [b"h2".as_slice(), b"http/1.1".as_slice()];
@@ -384,25 +476,53 @@ async fn functional_injector_tls_never_negotiates_h2_and_serves_admission() {
 
 #[ignore]
 #[tokio::test]
-async fn functional_injector_tls_still_advertises_acme_tls_alpn() {
-    let gateway = start_injector(true, "10").await;
+async fn functional_injector_tls_serves_pending_acme_tls_alpn_challenge_certificate() {
+    let gateway = start_injector(true, "10", true).await;
 
     // An RFC 8737 TLS-ALPN-01 validator offers `acme-tls/1` alone. Dropping the
-    // protocol from the acceptor would fail this handshake outright and break
-    // ACME renewal for an injector using an `acme://` cert source, even though
-    // the shared loader's resolver can serve the challenge certificate.
-    let (negotiated, _tls_stream) = connect_tls(&gateway, &[b"acme-tls/1".as_slice()]).await;
+    // protocol from the acceptor would fail this handshake outright. The
+    // seeded pending order also makes this prove the resolver path rather than
+    // merely negotiating ALPN against the injector's fallback certificate.
+    let tls_stream = connect_acme_tls(&gateway).await;
+    let client_connection = &tls_stream.get_ref().1;
     assert_eq!(
-        negotiated.as_deref(),
+        client_connection.alpn_protocol(),
         Some(b"acme-tls/1".as_slice()),
         "injector must keep advertising acme-tls/1 for TLS-ALPN-01 validation"
+    );
+
+    let served_certificate = client_connection
+        .peer_certificates()
+        .and_then(|certificates| certificates.first())
+        .expect("injector served a TLS-ALPN-01 certificate");
+    let (_, served_certificate) = X509Certificate::from_der(served_certificate.as_ref())
+        .expect("parse TLS-ALPN-01 certificate");
+    let acme_identifier = served_certificate
+        .extensions()
+        .iter()
+        .find(|extension| extension.oid.to_id_string() == "1.3.6.1.5.5.7.1.31")
+        .expect("served certificate contains the ACME identifier extension");
+    assert!(
+        acme_identifier.critical,
+        "RFC 8737 requires the ACME identifier extension to be critical"
+    );
+
+    // The extension value is the DER encoding of an OCTET STRING containing
+    // SHA-256(keyAuthorization): 0x04, 0x20, then the 32-byte digest.
+    let mut expected_extension_value = vec![0x04, 0x20];
+    expected_extension_value
+        .extend_from_slice(&Sha256::digest(ACME_KEY_AUTHORIZATION.as_bytes()));
+    assert_eq!(
+        acme_identifier.value,
+        expected_extension_value.as_slice(),
+        "ACME identifier must bind the served certificate to the seeded pending order"
     );
 }
 
 #[ignore]
 #[tokio::test]
 async fn functional_injector_header_read_timeout_closes_trickling_connection() {
-    let gateway = start_injector(false, "1").await;
+    let gateway = start_injector(false, "1", false).await;
 
     // Taken before the connect so it can never postdate the server-side timer
     // this assertion compares against.
@@ -440,7 +560,7 @@ async fn functional_injector_header_read_timeout_closes_trickling_connection() {
 #[ignore]
 #[tokio::test]
 async fn functional_injector_header_read_timeout_zero_allows_slow_headers() {
-    let gateway = start_injector(false, "0").await;
+    let gateway = start_injector(false, "0", false).await;
 
     let body = admission_review("slow-headers");
     let mut stream = TcpStream::connect(("127.0.0.1", gateway.port))
@@ -450,11 +570,11 @@ async fn functional_injector_header_read_timeout_zero_allows_slow_headers() {
         .write_all(b"POST /mutate HTTP/1.1\r\nHost: localhost\r\n")
         .await
         .expect("write partial headers");
-    // Waiting out the default 10s budget would make the test needlessly slow;
-    // the point is that no timeout fires while the remaining headers are
-    // withheld well past the 1s budget the companion test proves is enforced
-    // when configured.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Hyper 1.x has its own 30-second default when a timer is installed. Wait
+    // beyond that default, then prove this connection still completes. This
+    // avoids a narrow wall-clock boundary assertion while catching both an
+    // accidental fallback to Hyper's default and an accidental 1s timeout.
+    tokio::time::sleep(ZERO_TIMEOUT_HEADER_DELAY).await;
     stream
         .write_all(
             format!(
