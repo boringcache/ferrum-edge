@@ -1084,6 +1084,40 @@ fn deadline_replacement_preserves_gateway_authored_set_cookie() {
     }
 }
 
+#[test]
+fn deadline_replacement_regenerates_canonical_grpc_web_framing_header() {
+    use ferrum_edge::_test_support::buffered_grpc_deadline_replacement_for_test;
+
+    for content_type in [
+        "application/grpc-web+proto",
+        "application/grpc-web-text+proto",
+    ] {
+        let response = buffered_grpc_deadline_replacement_for_test(
+            Some(content_type),
+            HashMap::from([("content-type".to_string(), "application/grpc".to_string())]),
+            HashMap::from([
+                // A completed gateway hook must not be able to override the
+                // canonical gRPC-Web framing marker on the terminal response.
+                ("x-grpc-web".to_string(), "0".to_string()),
+                ("x-correlation-id".to_string(), "request-123".to_string()),
+            ]),
+            b"discarded backend body".to_vec(),
+        );
+
+        assert_eq!(response.http_status, http::StatusCode::OK);
+        assert_eq!(
+            response.headers.get("x-grpc-web").map(String::as_str),
+            Some("1"),
+            "canonical gRPC-Web framing must survive a gateway hook writing x-grpc-web"
+        );
+        assert_eq!(
+            response.headers.get("x-correlation-id").map(String::as_str),
+            Some("request-123"),
+            "non-framing gateway decorations still survive alongside regenerated framing"
+        );
+    }
+}
+
 #[tokio::test]
 async fn deadline_replacement_keeps_exact_value_response_transformer_writes() {
     use ferrum_edge::_test_support::{
