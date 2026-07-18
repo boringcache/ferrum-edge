@@ -559,9 +559,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
             "username": "alice",
             "credentials": {"jwt": [unsupported]}
         }))
-        .expect(
-            "unsupported JWT Consumer still deserializes into the generic credential model",
-        );
+        .expect("unsupported JWT Consumer still deserializes into the generic credential model");
         assert!(
             invalid_runtime_jwt.validate_fields().is_err(),
             "an unsupported OpenAPI JWT form must also fail runtime validation: {unsupported}"

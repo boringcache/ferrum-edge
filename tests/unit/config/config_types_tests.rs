@@ -2158,8 +2158,7 @@ fn test_validate_fields_accepts_valid_jwt_secret() {
 #[test]
 fn test_validate_fields_rejects_unsupported_jwt_credential_shapes() {
     let valid_secret = "j".repeat(32);
-    let oversized_secret =
-        "j".repeat(ferrum_edge::config::types::MAX_CREDENTIAL_VALUE_LENGTH + 1);
+    let oversized_secret = "j".repeat(ferrum_edge::config::types::MAX_CREDENTIAL_VALUE_LENGTH + 1);
     let control_secret = format!("{}{}", valid_secret, '\u{0001}');
     for credential in [
         serde_json::json!({}),

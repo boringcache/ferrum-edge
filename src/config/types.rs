@@ -7013,10 +7013,7 @@ impl Consumer {
                         if value_length > MAX_CREDENTIAL_VALUE_LENGTH {
                             errors.push(format!(
                                 "{}.{} must not exceed {} characters (got {})",
-                                prefix,
-                                key,
-                                MAX_CREDENTIAL_VALUE_LENGTH,
-                                value_length
+                                prefix, key, MAX_CREDENTIAL_VALUE_LENGTH, value_length
                             ));
                         }
                         if contains_control_chars(s) {
