@@ -3553,13 +3553,14 @@ fn payload_persist_error_message(error: &anyhow::Error) -> String {
     if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
         return conflict.errors().join("; ");
     }
-    let raw = error.to_string();
-    if raw.contains(PROXY_ROUTE_CONFLICT_ERROR) {
+    // Classification walks the chain because stores wrap driver errors with
+    // their own context; rendering stays on constants and static strings.
+    if chain_has_proxy_route_conflict(error) {
         PROXY_ROUTE_CONFLICT_ERROR.to_string()
-    } else if is_unique_constraint_violation(&raw) {
+    } else if chain_has_unique_constraint_violation(error) {
         "Resource identity conflicts with an existing resource in the namespace".to_string()
     } else {
-        warn!("Batch persistence error in admin API: {:#}", error);
+        warn_persistence_failure_redacted("batch_persist", error);
         "Database unavailable — operation failed".to_string()
     }
 }
@@ -7029,6 +7030,45 @@ fn is_unique_constraint_violation(error_msg: &str) -> bool {
         || lower.contains("duplicate entry")
 }
 
+/// Chain-aware unique-constraint classification for the sanitizing responders.
+///
+/// Persistence layers wrap driver errors with their own context — a MongoDB
+/// replica-set write wraps an inner `E11000 duplicate key` with transaction
+/// context — so the chain's outermost message alone misses the violation and
+/// misroutes a conflict onto the generic branch. Only classification walks the
+/// chain; the matched cause's text is never rendered to a client or a log,
+/// because a duplicate-key message names the index and echoes the conflicting
+/// (credential-derived) key value.
+fn chain_has_unique_constraint_violation(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| is_unique_constraint_violation(&cause.to_string()))
+}
+
+/// Chain-aware match for the static proxy-route-conflict sentinel. Safe to
+/// classify deeply because callers render the constant, not the matched text.
+fn chain_has_proxy_route_conflict(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(PROXY_ROUTE_CONFLICT_ERROR))
+}
+
+/// Emit a persistence-failure diagnostic that carries no error text.
+///
+/// The repository rule forbids logging unredacted credential metadata, and
+/// these chains can contain DSNs, schema/index names, and duplicate-key values
+/// derived from consumer credentials. Operators get the failing surface and
+/// the chain depth — enough to time-correlate with the backend's own logs,
+/// which hold the detail — without persisting secret-bearing material here.
+fn warn_persistence_failure_redacted(surface: &'static str, error: &anyhow::Error) {
+    warn!(
+        surface = surface,
+        chain_depth = error.chain().count(),
+        "Persistence failure in admin API; error detail withheld (may contain \
+         credential-derived index values, schema names, or connection strings)"
+    );
+}
+
 /// Create a copy of the consumer with sensitive credential values redacted
 /// for safe inclusion in API responses.
 pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
@@ -7406,6 +7446,85 @@ mod tests {
         assert_eq!(
             payload_persist_error_message(&route),
             PROXY_ROUTE_CONFLICT_ERROR
+        );
+    }
+
+    #[test]
+    fn wrapped_duplicate_key_stays_a_sanitized_conflict() {
+        // MongoDB replica-set writes wrap the inner E11000 in transaction
+        // context. Shallow `to_string()` classification missed it, dropped the
+        // conflict onto the generic branch, and the generic branch then logged
+        // the whole chain — persisting the credential-derived index value.
+        let secret = "must-not-escape-keyauth-key-at-least-32-characters";
+        let inner = anyhow::anyhow!(
+            "E11000 duplicate key error collection: ferrum.consumers index: \
+             consumers_keyauth_key_ns_idx dup key: {{ credentials.keyauth.key: {} }}",
+            secret
+        );
+        let wrapped = inner.context("aborting transaction on ferrum_prod@mongo.internal:27017");
+
+        let message = crud::consumer_persist_error_message(&wrapped);
+        assert_eq!(
+            message,
+            "Consumer identity or credential conflicts with another Consumer in the namespace"
+        );
+        assert_eq!(
+            crud::consumer_persist_error_response(&wrapped).status(),
+            StatusCode::CONFLICT,
+            "wrapped duplicate keys must stay a 409, not become a 500"
+        );
+        for sentinel in [
+            secret,
+            "credentials.keyauth.key",
+            "consumers_keyauth_key_ns_idx",
+            "mongo.internal:27017",
+        ] {
+            assert!(
+                !message.contains(sentinel),
+                "response leaked {sentinel:?}: {message:?}"
+            );
+        }
+
+        // The batch/restore sanitizer classifies the same wrapped shape.
+        let batch = payload_persist_error_message(&wrapped);
+        assert_eq!(
+            batch,
+            "Resource identity conflicts with an existing resource in the namespace"
+        );
+        assert!(!batch.contains(secret));
+
+        // The proxy-route sentinel is likewise matched through wrapping.
+        let wrapped_route = anyhow::anyhow!("{}: listen_path /api", PROXY_ROUTE_CONFLICT_ERROR)
+            .context("insert into gateway.proxies failed on ferrum_prod@db.internal:5432");
+        assert_eq!(
+            payload_persist_error_message(&wrapped_route),
+            PROXY_ROUTE_CONFLICT_ERROR
+        );
+    }
+
+    #[test]
+    fn generic_wrapped_persistence_failure_returns_the_unavailable_body() {
+        // Secret-bearing context on a non-conflict failure: neither the body
+        // nor (by construction) the log carries any chain text.
+        let wrapped = anyhow::anyhow!("io error: connection reset by peer").context(
+            "postgres://ferrum:s3cr3t-db-password@db.internal:5432/ferrum_prod insert failed",
+        );
+
+        for message in [
+            crud::consumer_persist_error_message(&wrapped),
+            payload_persist_error_message(&wrapped),
+        ] {
+            assert_eq!(message, "Database unavailable — operation failed");
+            for sentinel in ["s3cr3t-db-password", "db.internal:5432", "ferrum_prod"] {
+                assert!(
+                    !message.contains(sentinel),
+                    "response leaked {sentinel:?}: {message:?}"
+                );
+            }
+        }
+        assert_eq!(
+            crud::consumer_persist_error_response(&wrapped).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

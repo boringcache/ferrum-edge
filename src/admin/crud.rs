@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, MutexGuard};
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::admin::AdminState;
@@ -1724,8 +1723,18 @@ pub(crate) trait AdminResource:
         // concurrent create winning the race after the precheck passed).
         // Surface the constraint message (it names the conflicting key);
         // everything else stays a redacted 500.
+        if let Some(conflict) = mtls_dns_identity_conflict(error) {
+            // Typed conflicts are classified anywhere in the chain, so render
+            // the conflict itself: `error.to_string()` is the chain's outermost
+            // message and would echo any driver/DSN/schema context a store
+            // wrapped above it.
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({ "error": conflict.to_string() }),
+            );
+        }
         let message = error.to_string();
-        if is_mtls_dns_identity_conflict(error) || super::is_unique_constraint_violation(&message) {
+        if super::is_unique_constraint_violation(&message) {
             super::json_response(StatusCode::CONFLICT, &json!({ "error": message }))
         } else {
             super::json_response(
@@ -1740,8 +1749,13 @@ pub(crate) trait AdminResource:
             super::mtls_dns_admission_unavailable_response()
         } else if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
             Self::map_after_validate_errors(conflict.errors())
-        } else if is_mtls_dns_identity_conflict(error) {
-            super::json_response(StatusCode::CONFLICT, &json!({"error": error.to_string()}))
+        } else if let Some(conflict) = mtls_dns_identity_conflict(error) {
+            // Render the typed conflict rather than the chain's outermost
+            // message; see `map_persist_db_error` above.
+            super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": conflict.to_string()}),
+            )
         } else {
             super::json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2126,7 +2140,7 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
         return super::mtls_dns_admission_unavailable_response();
     }
     let unique_conflict = is_mtls_dns_identity_conflict(error)
-        || super::is_unique_constraint_violation(&error.to_string());
+        || super::chain_has_unique_constraint_violation(error);
     let message = consumer_persist_error_message(error);
     let status = if unique_conflict {
         StatusCode::CONFLICT
@@ -2139,8 +2153,9 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
 /// Redact persistence-level diagnostics before they reach an admin response.
 /// MongoDB duplicate-key errors can echo indexed credential-derived values;
 /// callers need the conflict disposition, never credential or index metadata.
-/// Other backend failures are logged in full internally but return a generic
-/// body so schema, constraint, and driver details never reach the wire.
+/// Every branch renders a constant or an internally constructed typed message,
+/// and the fallback logs no error text at all, so neither the wire nor the
+/// admin log carries driver-provided material.
 pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
     if is_mtls_dns_admission_unavailable(error) {
         MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
@@ -2149,11 +2164,14 @@ pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
         // identities it names are internally constructed and not secrets, but
         // any driver context wrapped above it would be.
         conflict.to_string()
-    } else if super::is_unique_constraint_violation(&error.to_string()) {
+    } else if super::chain_has_unique_constraint_violation(error) {
+        // Chain-aware: a MongoDB replica-set write wraps the inner E11000 in
+        // transaction context, so matching only the outermost message would
+        // drop a credential-index conflict into the branch below.
         "Consumer identity or credential conflicts with another Consumer in the namespace"
             .to_string()
     } else {
-        warn!("Consumer persistence error in admin API: {:#}", error);
+        super::warn_persistence_failure_redacted("consumer_persist", error);
         "Database unavailable — operation failed".to_string()
     }
 }
@@ -4194,7 +4212,15 @@ impl AdminResource for Proxy {
                 &json!({"error": PROXY_ROUTE_CONFLICT_ERROR}),
             );
         }
-        if is_mtls_dns_identity_conflict(error) || super::is_unique_constraint_violation(&message) {
+        if let Some(conflict) = mtls_dns_identity_conflict(error) {
+            // Typed, chain-deep classification must render the typed message,
+            // not the outermost context; see the default `map_persist_db_error`.
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({ "error": conflict.to_string() }),
+            );
+        }
+        if super::is_unique_constraint_violation(&message) {
             return super::json_response(StatusCode::CONFLICT, &json!({ "error": message }));
         }
 
