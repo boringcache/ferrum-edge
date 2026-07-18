@@ -1545,7 +1545,7 @@ async fn deadline_replacement_preserves_rate_limiting_telemetry_on_exact_backend
         "rate_limiting",
         &json!({
             "expose_headers": true,
-            "limits": [{ "requests_per_minute": 60 }]
+            "limits": [{ "scope": "default", "requests_per_minute": 60 }]
         }),
     )
     .unwrap()

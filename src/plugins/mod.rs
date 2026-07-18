@@ -645,10 +645,34 @@ impl BufferedDeadlineResponseHeaderProvenance {
         is_owned: impl Fn(&str) -> bool,
         headers: &HashMap<String, String>,
     ) {
+        self.record_gateway_mutations_with_repartition(is_owned, |_| false, headers);
+    }
+
+    /// As [`Self::record_gateway_mutations`], plus `needs_repartition`: fields
+    /// whose backend baseline this same recording just narrowed
+    /// ([`Self::retire_backend_authored_elements`]) and which therefore must be
+    /// re-partitioned even though their live value is byte-identical to what was
+    /// last observed.
+    ///
+    /// The plain net-diff short-circuit is exactly the case the element
+    /// recorder exists to defend: a backend that pre-populates the identical
+    /// combined list leaves the gateway's write invisible, so without this the
+    /// retired baseline is never consulted and the configured elements are
+    /// dropped from the synthesized deadline response. A repartitioned field
+    /// takes the occurrence-partition branch, never the owned branch, so
+    /// backend-only elements sharing the field still cannot cross over.
+    fn record_gateway_mutations_with_repartition(
+        &mut self,
+        is_owned: impl Fn(&str) -> bool,
+        needs_repartition: impl Fn(&str) -> bool,
+        headers: &HashMap<String, String>,
+    ) {
         let current = Self::canonical_snapshot(headers);
         for (name, value) in &current {
             let owned = is_owned(name.as_str());
-            let changed = self.observed_headers.get(name) != Some(value) || owned;
+            let changed = self.observed_headers.get(name) != Some(value)
+                || owned
+                || needs_repartition(name.as_str());
             if !changed {
                 continue;
             }
@@ -2511,9 +2535,10 @@ impl RequestContext {
     /// tracking is also insufficient — a backend that pre-populates the
     /// identical combined list hides the write entirely, so the deadline rebuild
     /// silently drops the operator-configured elements. This retires one backend
-    /// baseline occurrence per authored element and then records normally, so
-    /// the ordinary occurrence partition credits exactly the gateway's
-    /// contribution and no backend-only element ever crosses over. See
+    /// baseline occurrence per authored element and then re-partitions the field
+    /// even when its live value is unchanged, so the ordinary occurrence
+    /// partition credits exactly the gateway's contribution and no backend-only
+    /// element ever crosses over. See
     /// [`BufferedDeadlineResponseHeaderProvenance::retire_backend_authored_elements`].
     ///
     /// `name` must already be canonical (lowercase). Like the sibling recorders
@@ -2528,7 +2553,15 @@ impl RequestContext {
         if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
             let state = Arc::make_mut(state);
             state.retire_backend_authored_elements(name, authored_elements);
-            state.record_gateway_mutations(|_| false, response_headers);
+            // Re-partition this field unconditionally: the exact-spoof case this
+            // recorder exists for leaves the live value byte-identical to the
+            // last observation, so the plain net-diff short-circuit would skip
+            // the field and the baseline just retired would never be consulted.
+            state.record_gateway_mutations_with_repartition(
+                |_| false,
+                |candidate| candidate == name,
+                response_headers,
+            );
         }
     }
 
