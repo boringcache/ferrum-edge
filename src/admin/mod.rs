@@ -69,6 +69,59 @@ pub struct CachedDbHealthResult {
 /// Duration for which a DB health check result is reused.
 const DB_HEALTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Bound on a single `/health`-driven database probe. A hung dependency must
+/// not hold the single-flight refresh lock (or the readiness signal) hostage;
+/// `SELECT 1` on a healthy path is sub-second.
+const DB_HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Return the cached DB connectivity signal, refreshing it when the entry is
+/// missing or older than `cache_ttl`. Fresh-cache hits are lock-free; on an
+/// empty or expired entry at most one caller runs `probe` (single-flight)
+/// while concurrent callers wait for and then share that result. Probe
+/// failures and timeouts cache `false`, preserving the previous per-request
+/// error semantics.
+pub async fn cached_db_health_connected<F, E>(
+    cache: &ArcSwap<Option<CachedDbHealthResult>>,
+    refresh_lock: &tokio::sync::Mutex<()>,
+    cache_ttl: std::time::Duration,
+    probe_timeout: std::time::Duration,
+    probe: F,
+) -> bool
+where
+    F: std::future::Future<Output = Result<(), E>>,
+{
+    if let Some(entry) = &**cache.load()
+        && entry.checked_at.elapsed() < cache_ttl
+    {
+        return entry.connected;
+    }
+    let _guard = refresh_lock.lock().await;
+    // Re-check after acquiring: a concurrent caller may have completed the
+    // refresh while we waited, in which case its result is shared without a
+    // second probe.
+    if let Some(entry) = &**cache.load()
+        && entry.checked_at.elapsed() < cache_ttl
+    {
+        return entry.connected;
+    }
+    let connected = match tokio::time::timeout(probe_timeout, probe).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_error)) => {
+            warn_persistence_failure_redacted("admin_health_database_query");
+            false
+        }
+        Err(_elapsed) => {
+            warn_persistence_failure_redacted("admin_health_database_query_timeout");
+            false
+        }
+    };
+    cache.store(Arc::new(Some(CachedDbHealthResult {
+        connected,
+        checked_at: Instant::now(),
+    })));
+    connected
+}
+
 /// Authorization policy for the observability scrape surfaces — `/metrics`, and
 /// the *detailed* views of `/health` and `/overload`.
 ///
@@ -243,6 +296,10 @@ pub struct AdminState {
     /// Cached DB health check result to avoid hitting the database on every
     /// `/health` request. Shared across clones via `Arc<ArcSwap<_>>`.
     pub cached_db_health: Arc<ArcSwap<Option<CachedDbHealthResult>>>,
+    /// Single-flight lock serializing refreshes of `cached_db_health`. Shared
+    /// across clones via `Arc` so at most one `/health`-driven database probe
+    /// runs per refresh window process-wide; fresh-cache hits never touch it.
+    pub db_health_refresh: Arc<tokio::sync::Mutex<()>>,
     /// Registry of connected DP nodes (CP mode only).
     pub dp_registry: Option<Arc<DpNodeRegistry>>,
     /// Registry of connected mesh config-stream nodes (CP mode only).
@@ -1005,47 +1062,18 @@ pub async fn handle_admin_request(
             "mode": state.mode
         });
 
-        // Check database connectivity if available (cached for 15s)
+        // Check database connectivity if available (cached for 15s; refreshes
+        // are single-flight so concurrent unauthenticated requests on an empty
+        // or expired cache cannot stampede the database pool)
         if let Some(db) = &state.db {
-            let cached = state.cached_db_health.load();
-            let db_connected = if let Some(ref entry) = **cached {
-                if entry.checked_at.elapsed() < DB_HEALTH_CACHE_TTL {
-                    // Cache hit — reuse the previous result
-                    entry.connected
-                } else {
-                    // Cache expired — re-check
-                    let connected = match db.health_check().await {
-                        Ok(()) => true,
-                        Err(_e) => {
-                            warn_persistence_failure_redacted("admin_health_database_query");
-                            false
-                        }
-                    };
-                    state
-                        .cached_db_health
-                        .store(Arc::new(Some(CachedDbHealthResult {
-                            connected,
-                            checked_at: Instant::now(),
-                        })));
-                    connected
-                }
-            } else {
-                // No cached result yet — first call
-                let connected = match db.health_check().await {
-                    Ok(()) => true,
-                    Err(_e) => {
-                        warn_persistence_failure_redacted("admin_health_database_query");
-                        false
-                    }
-                };
-                state
-                    .cached_db_health
-                    .store(Arc::new(Some(CachedDbHealthResult {
-                        connected,
-                        checked_at: Instant::now(),
-                    })));
-                connected
-            };
+            let db_connected = cached_db_health_connected(
+                &state.cached_db_health,
+                &state.db_health_refresh,
+                DB_HEALTH_CACHE_TTL,
+                DB_HEALTH_PROBE_TIMEOUT,
+                db.health_check(),
+            )
+            .await;
 
             if db_connected {
                 let mut db_info = json!({
