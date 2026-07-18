@@ -525,6 +525,9 @@ impl Plugin for PriorityOverridePlugin {
             .after_proxy(ctx, response_status, response_headers)
             .await
     }
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        self.inner.owns_deadline_response_header(ctx, name)
+    }
     fn is_initial_response_header_policy(&self) -> bool {
         self.inner.is_initial_response_header_policy()
     }
