@@ -774,6 +774,11 @@ Deletes the spec and cascades:
 - Spec-owned **proxy** is deleted → FK cascade removes its plugins (including any added manually after import).
 - Spec-owned **upstream** is deleted if present. Upstreams without `api_spec_id` survive.
 - Calling `DELETE /proxies/{id}` directly also removes the spec row via the `ON DELETE CASCADE` FK constraint.
+- Before a direct delete of an API-spec-owned proxy, Ferrum re-reads the
+  current upstream and every cascade plugin with ownership metadata intact.
+  Hand-owned rows remain hand-owned; foreign API-spec ownership, missing rows,
+  or an ownership/scope shape that atomic recovery cannot reproduce returns 400
+  without deleting the proxy.
 - If the cascade would leave an invalid aggregate plugin graph, the API returns
   422 with validation failures and no resources are deleted. Direct proxy or
   plugin-config deletion reports the equivalent precondition failure as 400.
@@ -794,9 +799,11 @@ Deletes the spec and cascades:
   uniqueness, namespace-wide guarded plugin composition, mTLS identity policy,
   and referenced-upstream existence are still rechecked inside the restore
   transaction after any intervening writer; a conflict rolls the complete
-  restore back. Standalone MongoDB cannot provide that boundary, so compensation
-  fails before writing and leaves the route deleted rather than publishing a
-  partially protected proxy.
+  restore back. Recovery validation uses the same configured backend egress
+  policy and real-IP header as normal admin plugin validation. Standalone
+  MongoDB cannot provide that boundary, so compensation fails before writing
+  and leaves the route deleted rather than publishing a partially protected
+  proxy.
 
 ### Cascade and ownership summary
 

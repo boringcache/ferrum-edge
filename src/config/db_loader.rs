@@ -1157,6 +1157,7 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         restored_proxy_id: &str,
+        validation_http_client: &crate::plugins::PluginHttpClient,
     ) -> Result<(), anyhow::Error> {
         let mut candidate = self
             .load_namespace_admission_policy_candidate_tx(tx, namespace)
@@ -1177,8 +1178,11 @@ impl DatabaseStore {
             "restore_api_spec_bundle",
             &recovered_graph,
         )?;
-        crate::config::db_backend::validate_api_spec_recovered_plugin_graph(&recovered_graph)
-            .await?;
+        crate::config::db_backend::validate_api_spec_recovered_plugin_graph(
+            &recovered_graph,
+            validation_http_client,
+        )
+        .await?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
             .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
@@ -6442,7 +6446,7 @@ impl DatabaseStore {
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
-        self.restore_api_spec_bundle_inner(bundle, spec, &[], &[], false)
+        self.restore_api_spec_bundle_inner(bundle, spec, &[], &[], None, false)
             .await
     }
 
@@ -6452,12 +6456,14 @@ impl DatabaseStore {
         spec: &crate::config::types::ApiSpec,
         additional_upstreams: &[crate::config::types::Upstream],
         additional_plugins: &[crate::config::types::PluginConfig],
+        validation_http_client: &crate::plugins::PluginHttpClient,
     ) -> Result<(), anyhow::Error> {
         self.restore_api_spec_bundle_inner(
             bundle,
             spec,
             additional_upstreams,
             additional_plugins,
+            Some(validation_http_client),
             true,
         )
         .await
@@ -6469,6 +6475,7 @@ impl DatabaseStore {
         spec: &crate::config::types::ApiSpec,
         additional_upstreams: &[crate::config::types::Upstream],
         additional_plugins: &[crate::config::types::PluginConfig],
+        validation_http_client: Option<&crate::plugins::PluginHttpClient>,
         compensation_restore: bool,
     ) -> Result<(), anyhow::Error> {
         use crate::config::types::{AuthMode, ResponseBodyMode};
@@ -6751,8 +6758,18 @@ impl DatabaseStore {
         // 4. INSERT api_specs row.
         self.insert_api_spec_tx(&mut tx, spec).await?;
         if compensation_restore {
-            self.validate_api_spec_restore_candidate_tx(&mut tx, &spec.namespace, &bundle.proxy.id)
-                .await?;
+            let validation_http_client = validation_http_client.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "restore_api_spec_bundle requires the configured plugin validation client"
+                )
+            })?;
+            self.validate_api_spec_restore_candidate_tx(
+                &mut tx,
+                &spec.namespace,
+                &bundle.proxy.id,
+                validation_http_client,
+            )
+            .await?;
         } else {
             // Preserve the normal submission contract: ordinary API-spec
             // writes run the same guarded admission checks as the other
@@ -8623,6 +8640,7 @@ impl DatabaseBackend for DatabaseStore {
         spec: &crate::config::types::ApiSpec,
         additional_upstreams: &[crate::config::types::Upstream],
         additional_plugins: &[crate::config::types::PluginConfig],
+        validation_http_client: &crate::plugins::PluginHttpClient,
     ) -> Result<(), anyhow::Error> {
         DatabaseStore::restore_api_spec_bundle(
             self,
@@ -8630,6 +8648,7 @@ impl DatabaseBackend for DatabaseStore {
             spec,
             additional_upstreams,
             additional_plugins,
+            validation_http_client,
         )
         .await
     }

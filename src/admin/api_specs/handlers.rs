@@ -497,11 +497,13 @@ async fn compensate_late_api_spec_delete(
             anyhow::bail!("late API-spec delete compensation validation returned an HTTP response")
         }
     }
+    let validation_http_client = crate::admin::plugin_validation_http_client(state);
     db.restore_api_spec_bundle(
         &previous_bundle,
         &previous_spec,
         &additional_upstreams,
         &additional_plugins,
+        &validation_http_client,
     )
     .await?;
     Ok(ApiSpecLateWriteRecovery::NotRetained)

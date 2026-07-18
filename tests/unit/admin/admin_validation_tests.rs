@@ -110,7 +110,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("late_delete_api_spec_snapshot("));
     assert!(crud_source.contains("db.get_api_spec_by_proxy(namespace, &previous.id)"));
     assert!(crud_source.contains(
-        "restore_api_spec_bundle(&bundle, spec, &additional_upstreams, &additional_plugins)"
+        "&api_spec_snapshot.additional_upstreams,"
     ));
     assert!(crud_source.contains("affected_upstreams"));
     assert!(crud_source.contains("task.abort();"));
@@ -254,7 +254,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
 }
 
 #[test]
-fn direct_api_spec_proxy_delete_uses_atomic_restore_contract() {
+fn direct_api_spec_proxy_delete_rereads_ownership_and_uses_atomic_restore() {
     let source = include_str!("../../../src/admin/crud.rs");
     let proxy_impl = source
         .find("impl AdminResource for Proxy")
@@ -268,15 +268,53 @@ fn direct_api_spec_proxy_delete_uses_atomic_restore_contract() {
         .map(|offset| compensation + offset)
         .expect("Proxy compensation must have a bounded source region");
     let recovery = &source[compensation..snapshot];
+    let snapshot_end = source[snapshot..]
+        .find("async fn check_uniqueness(")
+        .map(|offset| snapshot + offset)
+        .expect("Proxy snapshot must have a bounded source region");
+    let ownership_snapshot = &source[snapshot..snapshot_end];
 
     assert!(recovery.contains("proxy: previous.clone()"));
-    assert!(recovery.contains("!spec_plugin_ids.contains(plugin.id.as_str())"));
-    assert!(recovery.contains(".position(|affected| affected.id == upstream.id)"));
-    assert!(recovery.contains("affected_upstreams[existing_index] = upstream.clone()"));
-    assert!(recovery.contains(
-        "restore_api_spec_bundle(&bundle, spec, &additional_upstreams, &additional_plugins)"
-    ));
+    assert!(recovery.contains("api_spec_snapshot.upstream.clone()"));
+    assert!(recovery.contains("&api_spec_snapshot.additional_upstreams"));
+    assert!(recovery.contains("&api_spec_snapshot.additional_plugins"));
+    assert!(recovery.contains("&http_client"));
     assert!(!recovery.contains("db.submit_api_spec_bundle("));
+
+    assert!(ownership_snapshot.contains("db.get_upstream(namespace, current_upstream_id)"));
+    assert!(ownership_snapshot.contains("current.api_spec_id.is_none()"));
+    assert!(ownership_snapshot.contains(".get_plugin_config(namespace, plugin_id)"));
+    assert!(ownership_snapshot.contains("if let Some(owner) = plugin.api_spec_id.as_deref()"));
+    assert!(ownership_snapshot.contains("validate_api_spec_proxy_plugin_association("));
+    assert!(ownership_snapshot.contains("validate_api_spec_restore_inputs("));
+    assert!(ownership_snapshot.contains("additional_upstreams,"));
+    assert!(ownership_snapshot.contains("additional_plugins,"));
+}
+
+#[test]
+fn api_spec_restore_contract_requires_the_configured_validation_client() {
+    let backend = include_str!("../../../src/config/db_backend.rs");
+    let restore = backend
+        .find("async fn restore_api_spec_bundle(")
+        .expect("DatabaseBackend restore contract");
+    let replace = backend[restore..]
+        .find("async fn replace_api_spec_bundle(")
+        .map(|offset| restore + offset)
+        .expect("end of DatabaseBackend restore contract");
+    let contract = &backend[restore..replace];
+    assert!(contract.contains("validation_http_client: &PluginHttpClient"));
+
+    let recovered_graph = backend
+        .find("pub(crate) async fn validate_api_spec_recovered_plugin_graph(")
+        .expect("recovered plugin graph validator");
+    let restore_inputs = backend[recovered_graph..]
+        .find("pub(crate) fn validate_api_spec_restore_inputs(")
+        .map(|offset| recovered_graph + offset)
+        .expect("end of recovered plugin graph validator");
+    let validation = &backend[recovered_graph..restore_inputs];
+    assert!(validation.contains("http_client: &PluginHttpClient"));
+    assert!(validation.contains("let http_client = http_client.clone();"));
+    assert!(!validation.contains("PluginHttpClient::default()"));
 }
 
 #[test]

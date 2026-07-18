@@ -7,6 +7,7 @@
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
 };
+use crate::plugins::PluginHttpClient;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use percent_encoding::percent_decode_str;
@@ -78,10 +79,10 @@ pub(crate) fn api_spec_recovered_proxy_graph(
 /// transaction commits.
 pub(crate) async fn validate_api_spec_recovered_plugin_graph(
     candidate: &GatewayConfig,
+    http_client: &PluginHttpClient,
 ) -> Result<(), anyhow::Error> {
     let candidate = candidate.clone();
-    let http_client = crate::plugins::PluginHttpClient::default()
-        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header());
+    let http_client = http_client.clone();
     tokio::task::spawn_blocking(move || {
         crate::plugin_cache::validate_plugin_composition_candidate(&candidate, &http_client)
             .map_err(anyhow::Error::msg)?;
@@ -1341,13 +1342,16 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// SQL backends and replica-set MongoDB implement this transactionally for
     /// database and control-plane modes. A backend/topology without a
     /// multi-document transaction must return an error before its first write;
-    /// data-plane and file modes have no writable database path.
+    /// data-plane and file modes have no writable database path. Recovery-time
+    /// plugin construction must use `validation_http_client`, which is the same
+    /// configured egress-policy and real-IP client used by admin admission.
     async fn restore_api_spec_bundle(
         &self,
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &ApiSpec,
         additional_upstreams: &[Upstream],
         additional_plugins: &[PluginConfig],
+        validation_http_client: &PluginHttpClient,
     ) -> Result<(), anyhow::Error>;
 
     /// Atomically replace an existing api spec identified by `spec.id`.
