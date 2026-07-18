@@ -4405,11 +4405,17 @@ Request buffering is only enabled for matching JSON `POST` requests without a no
 | `target_ratio` | Number | `0.5` | Fraction of word-tokens to keep. `0.5` ≈ 50% reduction; `0.3` is more aggressive. Strictly between 0 and 1. |
 | `min_content_tokens` | Integer | `200` | Estimated-token floor per content string; shorter content is passed through unchanged. |
 | `max_scan_bytes` | Integer | `1048576` | Skip statistical compression when the request body exceeds this size; configured marker sanitation remains active through the hard 1 MiB body/output bound. |
-| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` is kept verbatim and the markers are stripped. At most 64 ASCII letters, digits, `-`, `_`. |
+| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` string values is kept verbatim and the markers are stripped. Object member names are never sanitized. At most 64 ASCII letters, digits, `-`, `_`. |
 
 The filter scores each word by stop-word membership, length, in-document rarity, and a proper-noun signal, then drops the lowest-scoring words until `target_ratio` is met. Fenced code blocks, inline code, URLs, numbers, `snake_case`/identifier tokens, uppercase acronyms, and negations (`not`, `never`, `cannot`, …) are always preserved. Token counts are estimated (~4 characters per token); no model tokenizer is embedded.
 
 Runs after `compression` so opt-in request decompression exposes plaintext prompt JSON before this plugin rewrites the authoritative request body. Its per-request gate buffers candidate JSON `POST` bodies; `before_proxy` rewrites `ctx.metadata["request_body"]` for already-plaintext compatibility and stores bounded private stage state; `transform_request_body_with_context` owns the authoritative upstream bytes and counters; and `on_final_request_body_with_context` rejects an unsanitizable decoded marker-bearing surface before dispatch. `ai_federation` consumes that final body after the transform, so plaintext and opt-in compressed uploads use the same governed representation. Only `messages[].content` and the legacy `prompt` are compressed; embeddings `input` and Anthropic top-level `system` are deliberately left intact. When a field is statistically rewritten, it records `ai_prompt_compressor.original_tokens`, `.compressed_tokens`, `.tokens_saved`, and `.fields_compressed` metadata for logging. See [`ai_prompt_compressor.md`](ai_prompt_compressor.md) for the full reference.
+
+When bounded work or output limits select the representation-preserving marker
+fallback, sanitation is value-only: configured markers are removed from JSON
+string values, while every object member name remains byte-for-byte unchanged,
+including escaped spellings, duplicate members, nesting, and surrounding
+whitespace. Invalid or truncated JSON is not admitted and is left untouched.
 
 ```yaml
 plugin_name: ai_prompt_compressor
