@@ -4879,9 +4879,10 @@ paths:
         structured 422 validation failure without deleting anything.
 
         If namespace admission is lost after deletion commits, SQL backends and
-        replica-set MongoDB compensate in one transaction: the upstream, proxy,
-        spec-owned and hand-owned cascade plugins, associations, API-spec row,
-        and config-change records are all restored or all remain deleted. The
+        replica-set MongoDB compensate in one transaction: the spec-owned and
+        current hand-owned upstream snapshots, proxy, spec-owned and hand-owned
+        cascade plugins, associations, API-spec row, and config-change records
+        are all restored or all remain deleted. The
         recovered proxy's current upstream, plugin-composition, and named-schema
         dependencies are revalidated before commit. A standalone MongoDB
         deployment fails closed before compensation writes because it cannot

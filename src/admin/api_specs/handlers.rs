@@ -439,6 +439,7 @@ async fn compensate_late_api_spec_delete(
     db: Arc<dyn DatabaseBackend>,
     previous_bundle: ExtractedBundle,
     previous_spec: ApiSpec,
+    additional_upstreams: Vec<Upstream>,
     additional_plugins: Vec<crate::config::types::PluginConfig>,
     state: &AdminState,
 ) -> Result<ApiSpecLateWriteRecovery, anyhow::Error> {
@@ -496,8 +497,13 @@ async fn compensate_late_api_spec_delete(
             anyhow::bail!("late API-spec delete compensation validation returned an HTTP response")
         }
     }
-    db.restore_api_spec_bundle(&previous_bundle, &previous_spec, &[], &additional_plugins)
-        .await?;
+    db.restore_api_spec_bundle(
+        &previous_bundle,
+        &previous_spec,
+        &additional_upstreams,
+        &additional_plugins,
+    )
+    .await?;
     Ok(ApiSpecLateWriteRecovery::NotRetained)
 }
 
@@ -3355,6 +3361,41 @@ pub async fn handle_delete_api_spec(
         Ok(upstream) => upstream,
         Err(error) => return Ok(error_response(error)),
     };
+    let additional_upstreams =
+        match existing_proxy.upstream_id.as_deref().filter(|upstream_id| {
+            existing_upstream.as_ref().map(|upstream| upstream.id.as_str()) != Some(*upstream_id)
+        }) {
+            Some(upstream_id) => match db.get_upstream(namespace, upstream_id).await {
+                Ok(Some(upstream)) if upstream.api_spec_id.is_none() => vec![upstream],
+                Ok(Some(upstream)) => {
+                    let error = format!(
+                        "API spec '{}' cannot snapshot current upstream '{}': it is owned by API spec '{}'",
+                        existing.id,
+                        upstream.id,
+                        upstream.api_spec_id.as_deref().unwrap_or("<unknown>")
+                    );
+                    return Ok(error_response(restore_snapshot_validation_failure(
+                        &existing,
+                        upstream.id,
+                        error,
+                    )));
+                }
+                Ok(None) => {
+                    return Ok(error_response(ApiSpecError::ValidationFailures {
+                        spec_version: existing.spec_version.clone(),
+                        failures: vec![ValidationFailure {
+                            resource_type: "upstream_graph",
+                            id: existing.proxy_id.clone(),
+                            errors: vec![format!(
+                                "proxy references missing upstream '{upstream_id}'"
+                            )],
+                        }],
+                    }));
+                }
+                Err(error) => return Ok(error_response(classify_db_error(error))),
+            },
+            None => Vec::new(),
+        };
     let existing_plugins = match db.list_spec_owned_plugin_configs(namespace, id).await {
         Ok(plugins) => plugins,
         Err(error) => return Ok(error_response(classify_db_error(error))),
@@ -3497,7 +3538,7 @@ pub async fn handle_delete_api_spec(
     if let Err(error) = validate_api_spec_restore_inputs(
         &previous_bundle,
         &existing,
-        &[],
+        &additional_upstreams,
         &additional_plugins,
         true,
     ) {
@@ -3592,6 +3633,7 @@ pub async fn handle_delete_api_spec(
                 compensation_db,
                 previous_bundle,
                 compensation_spec,
+                additional_upstreams,
                 additional_plugins,
                 &settlement_state,
             ),

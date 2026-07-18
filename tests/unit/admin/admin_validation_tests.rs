@@ -278,6 +278,22 @@ fn direct_api_spec_proxy_delete_uses_atomic_restore_contract() {
 }
 
 #[test]
+fn api_spec_delete_snapshots_current_hand_upstream_for_atomic_restore() {
+    let source = include_str!("../../../src/admin/api_specs/handlers.rs");
+    let delete_start = source
+        .find("pub async fn handle_delete_api_spec(")
+        .expect("API-spec DELETE handler");
+    let delete = &source[delete_start..];
+
+    assert!(delete.contains("existing_proxy.upstream_id.as_deref()"));
+    assert!(delete.contains("db.get_upstream(namespace, upstream_id)"));
+    assert!(delete.contains("upstream.api_spec_id.is_none()"));
+    assert!(delete.contains("&additional_upstreams,"));
+    assert!(delete.contains("compensate_late_api_spec_delete("));
+    assert!(delete.matches("additional_upstreams").count() >= 4);
+}
+
+#[test]
 fn test_batch_hmac_uniqueness_is_gated_on_submitted_hmac_consumers() {
     let source = include_str!("../../../src/admin/mod.rs");
     let gate = r#".any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())"#;
