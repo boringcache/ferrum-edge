@@ -1032,35 +1032,79 @@ fn strip_all_markers(text: &str, open: &str, close: &str) -> String {
 /// are recognized through ordinary JSON escapes too (`\u003c`, `\/`, and mixed
 /// literal/escaped spellings), matching the decoded strings a provider sees.
 fn strip_markers_from_json_strings(body: &[u8], tags: &(String, String)) -> Option<Vec<u8>> {
-    // Validate once before the lexical pass. Scalar advancement below can then
-    // use UTF-8 lead-byte widths without revalidating every remaining suffix.
-    // The body is bounded by the caller, so this keeps the complete scan linear
-    // while preserving the fail-closed behavior for invalid UTF-8.
-    std::str::from_utf8(body).ok()?;
+    // The zero-sized recorder is statically dispatched, so optimized runtime
+    // builds retain no counters, allocations, atomics, or instrumentation
+    // branches on the sanitation path.
+    let mut ignore_work = |_: usize| {};
+    strip_markers_from_json_strings_with_work(
+        body,
+        tags,
+        |candidate| std::str::from_utf8(candidate).ok(),
+        &mut ignore_work,
+    )
+}
+
+pub(crate) fn preserve_marker_sanitizer_work_for_test(
+    body: &[u8],
+    tags: &(String, String),
+) -> Option<(Vec<u8>, usize, usize)> {
+    let mut utf8_validation_bytes = 0usize;
+    let mut scalar_scan_bytes = 0usize;
+    let output = strip_markers_from_json_strings_with_work(
+        body,
+        tags,
+        |candidate| {
+            utf8_validation_bytes = utf8_validation_bytes.saturating_add(candidate.len());
+            std::str::from_utf8(candidate).ok()
+        },
+        &mut |bytes| {
+            scalar_scan_bytes = scalar_scan_bytes.saturating_add(bytes);
+        },
+    )?;
+    Some((output, utf8_validation_bytes, scalar_scan_bytes))
+}
+
+fn strip_markers_from_json_strings_with_work<'a, V, W>(
+    body: &'a [u8],
+    tags: &(String, String),
+    validate_utf8: V,
+    work: &mut W,
+) -> Option<Vec<u8>>
+where
+    V: FnOnce(&'a [u8]) -> Option<&'a str>,
+    W: FnMut(usize),
+{
+    // Validate once before the lexical pass, then retain the validated `str`
+    // type throughout the scanner. Scalar advancement below can use UTF-8
+    // lead-byte widths without revalidating every remaining suffix. The body is
+    // bounded by the caller, so this keeps the complete scan linear while
+    // preserving the fail-closed behavior for invalid UTF-8.
+    let body = validate_utf8(body)?;
+    let bytes = body.as_bytes();
 
     let (open, close) = tags;
-    let mut output = Vec::with_capacity(body.len());
+    let mut output = Vec::with_capacity(bytes.len());
     let mut cursor = 0usize;
     let mut in_string = false;
     let mut changed = false;
 
-    while cursor < body.len() {
+    while cursor < bytes.len() {
         if !in_string {
-            let byte = body[cursor];
+            let byte = bytes[cursor];
             output.push(byte);
             cursor += 1;
             if byte == b'"' {
                 let string_start = cursor;
-                let string_end = json_string_end(body, string_start)?;
+                let string_end = json_string_end(body, string_start, work)?;
                 let mut next = string_end + 1;
-                while body.get(next).is_some_and(u8::is_ascii_whitespace) {
+                while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
                     next += 1;
                 }
                 // Preserve object member names byte-for-byte. Preserve markers
                 // are prompt annotations, never permission to manufacture a
                 // backend-visible field name after request policy has run.
-                if body.get(next) == Some(&b':') {
-                    output.extend_from_slice(&body[string_start..=string_end]);
+                if bytes.get(next) == Some(&b':') {
+                    output.extend_from_slice(&bytes[string_start..=string_end]);
                     cursor = string_end + 1;
                 } else {
                     in_string = true;
@@ -1069,54 +1113,65 @@ fn strip_markers_from_json_strings(body: &[u8], tags: &(String, String)) -> Opti
             continue;
         }
 
-        if body[cursor] == b'"' {
+        if bytes[cursor] == b'"' {
             output.push(b'"');
             cursor += 1;
             in_string = false;
             continue;
         }
 
-        if let Some(end) = match_json_string_ascii(body, cursor, open.as_bytes())
-            .or_else(|| match_json_string_ascii(body, cursor, close.as_bytes()))
-        {
+        let marker_end = match_json_string_ascii(body, cursor, open.as_bytes(), work);
+        let marker_end = marker_end
+            .or_else(|| match_json_string_ascii(body, cursor, close.as_bytes(), work));
+        if let Some(end) = marker_end {
             cursor = end;
             changed = true;
             continue;
         }
 
-        let end = json_string_scalar_end(body, cursor)?;
-        output.extend_from_slice(&body[cursor..end]);
+        let end = json_string_scalar_end(body, cursor, work)?;
+        output.extend_from_slice(&bytes[cursor..end]);
         cursor = end;
     }
 
     (changed && !in_string).then_some(output)
 }
 
-fn json_string_end(body: &[u8], mut cursor: usize) -> Option<usize> {
+fn json_string_end<W: FnMut(usize)>(
+    body: &str,
+    mut cursor: usize,
+    work: &mut W,
+) -> Option<usize> {
     // Each call advances monotonically to one string boundary using the UTF-8
     // validation performed once at scanner entry, and the caller then advances
     // past that string. Value contents are scanned once more for marker matches
     // whose length is bounded by MAX_PRESERVE_TAG_NAME_BYTES plus fixed
     // delimiters, so the complete sanitation pass remains linear in the bounded
     // input size.
-    while cursor < body.len() {
-        if body[cursor] == b'"' {
+    let bytes = body.as_bytes();
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'"' {
             return Some(cursor);
         }
         // Validate escapes while locating the boundary even though callers
         // already require a successfully parsed JSON representation. This
         // keeps the lexical helper fail-closed on malformed or truncated input
         // and prevents an invalid escape from being accepted as part of a key.
-        let (_, end) = decode_json_string_ascii(body, cursor)?;
+        let (_, end) = decode_json_string_ascii(body, cursor, work)?;
         cursor = end;
     }
     None
 }
 
-fn match_json_string_ascii(body: &[u8], start: usize, expected: &[u8]) -> Option<usize> {
+fn match_json_string_ascii<W: FnMut(usize)>(
+    body: &str,
+    start: usize,
+    expected: &[u8],
+    work: &mut W,
+) -> Option<usize> {
     let mut cursor = start;
     for expected_byte in expected {
-        let (decoded, end) = decode_json_string_ascii(body, cursor)?;
+        let (decoded, end) = decode_json_string_ascii(body, cursor, work)?;
         if decoded != Some(*expected_byte) {
             return None;
         }
@@ -1125,14 +1180,19 @@ fn match_json_string_ascii(body: &[u8], start: usize, expected: &[u8]) -> Option
     Some(cursor)
 }
 
-fn decode_json_string_ascii(body: &[u8], start: usize) -> Option<(Option<u8>, usize)> {
-    let byte = *body.get(start)?;
+fn decode_json_string_ascii<W: FnMut(usize)>(
+    body: &str,
+    start: usize,
+    work: &mut W,
+) -> Option<(Option<u8>, usize)> {
+    let bytes = body.as_bytes();
+    let byte = *bytes.get(start)?;
     if byte != b'\\' {
-        let end = json_string_scalar_end(body, start)?;
+        let end = json_string_scalar_end(body, start, work)?;
         return Some(((byte.is_ascii()).then_some(byte), end));
     }
 
-    let escaped = *body.get(start + 1)?;
+    let escaped = *bytes.get(start + 1)?;
     let decoded = match escaped {
         b'"' => b'"',
         b'\\' => b'\\',
@@ -1143,10 +1203,11 @@ fn decode_json_string_ascii(body: &[u8], start: usize) -> Option<(Option<u8>, us
         b'r' => b'\r',
         b't' => b'\t',
         b'u' => {
-            let digits = body.get(start + 2..start + 6)?;
+            let digits = bytes.get(start + 2..start + 6)?;
             let scalar = digits.iter().try_fold(0u16, |value, byte| {
                 value.checked_mul(16)?.checked_add(hex_digit(*byte)? as u16)
             })?;
+            work(6);
             return Some((
                 (scalar <= u8::MAX as u16).then_some(scalar as u8),
                 start + 6,
@@ -1154,22 +1215,31 @@ fn decode_json_string_ascii(body: &[u8], start: usize) -> Option<(Option<u8>, us
         }
         _ => return None,
     };
+    work(2);
     Some((Some(decoded), start + 2))
 }
 
-fn json_string_scalar_end(body: &[u8], start: usize) -> Option<usize> {
-    let byte = *body.get(start)?;
+fn json_string_scalar_end<W: FnMut(usize)>(
+    body: &str,
+    start: usize,
+    work: &mut W,
+) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let byte = *bytes.get(start)?;
     if byte == b'\\' {
-        return match body.get(start + 1) {
-            Some(b'u') if body.get(start + 2..start + 6).is_some() => Some(start + 6),
+        let end = match bytes.get(start + 1) {
+            Some(b'u') if bytes.get(start + 2..start + 6).is_some() => Some(start + 6),
             Some(_) => Some(start + 2),
             None => None,
-        };
+        }?;
+        work(end.saturating_sub(start));
+        return Some(end);
     }
     if byte < 0x20 || byte == b'"' {
         return None;
     }
     if byte.is_ascii() {
+        work(1);
         return Some(start + 1);
     }
 
@@ -1184,7 +1254,8 @@ fn json_string_scalar_end(body: &[u8], start: usize) -> Option<usize> {
         _ => return None,
     };
     let end = start.checked_add(width)?;
-    body.get(start..end)?;
+    bytes.get(start..end)?;
+    work(width);
     Some(end)
 }
 

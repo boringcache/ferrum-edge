@@ -1,5 +1,6 @@
 //! Tests for the ai_prompt_compressor plugin.
 
+use ferrum_edge::_test_support::ai_prompt_compressor_marker_scan_work_for_test;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext,
     ai_prompt_compressor::AiPromptCompressor, compression::CompressionPlugin, priority,
@@ -1051,6 +1052,23 @@ async fn preserve_marker_cleanup_scans_large_literal_unicode_strings_linearly() 
         .expect("large literal Unicode strings must be sanitized");
 
     assert_eq!(output, expected.as_bytes());
+
+    let (instrumented_output, utf8_validation_bytes, scalar_scan_bytes) =
+        ai_prompt_compressor_marker_scan_work_for_test(raw.as_bytes(), "keep")
+            .expect("the instrumented production scanner must sanitize the same body");
+    assert_eq!(instrumented_output, expected.as_bytes());
+    // The scanner retains a validated `&str`; restoring validation of every
+    // remaining non-ASCII suffix would make this count quadratic.
+    assert_eq!(
+        utf8_validation_bytes,
+        raw.len(),
+        "UTF-8 validation must examine the bounded body exactly once"
+    );
+    assert!(
+        scalar_scan_bytes <= raw.len().saturating_mul(4),
+        "scalar scanner work must remain linear: {scalar_scan_bytes} units for {} input bytes",
+        raw.len()
+    );
 }
 
 #[tokio::test]
