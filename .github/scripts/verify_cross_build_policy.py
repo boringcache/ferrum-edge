@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import itertools
 import json
 import re
 import shlex
@@ -122,6 +123,70 @@ DOCKER_CONTEXT_STEP = (
     "docker-context/bin/${{ matrix.arch_dir }}/ferrum-cni\n"
     "          cp Dockerfile.release docker-context/Dockerfile\n"
 )
+# Freezing the artifact-selection steps alone still leaves the rest of the
+# Docker job free to rewrite the context they prepared: a pull request could
+# keep the matrix and both frozen steps byte-for-byte identical, add a second
+# download of the x86_64 artifact, and copy it over
+# `docker-context/bin/arm64/ferrum-edge` before the image is built. The
+# published ARM64 image would then contain the x86_64 binary with nothing in
+# the publish contract or the Cross scanner reporting it. The whole `steps:`
+# list of each publishing job is therefore frozen, so no later step can touch
+# the prepared per-arch binaries. Editing these jobs requires updating this
+# contract in the same commit.
+DOCKER_PUBLISH_STEPS_PREFIX = (
+    "    steps:\n"
+    "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6\n"
+    "\n"
+    "      - name: Download Linux binary\n"
+    "        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+    "        with:\n"
+)
+DOCKER_PUBLISH_STEPS_MIDDLE = (
+    "          path: downloaded-artifacts\n"
+    "\n"
+)
+DOCKER_PUBLISH_STEPS_TAIL = (
+    "\n"
+    "      - name: Set up Docker Buildx\n"
+    "        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4\n"
+    "\n"
+    "      - name: Log in to GitHub Container Registry\n"
+    "        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4\n"
+    "        with:\n"
+    "          registry: ghcr.io\n"
+    "          username: ${{ github.actor }}\n"
+    "          password: ${{ secrets.GITHUB_TOKEN }}\n"
+    "\n"
+    "      - name: Log in to Docker Hub\n"
+    "        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4\n"
+    "        with:\n"
+    "          username: ${{ secrets.DOCKERHUB_USERNAME }}\n"
+    "          password: ${{ secrets.DOCKERHUB_TOKEN }}\n"
+    "\n"
+    "      - name: Build and push per-platform digest\n"
+    "        id: build\n"
+    "        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7\n"
+    "        with:\n"
+    "          context: docker-context\n"
+    "          platforms: ${{ matrix.platform }}\n"
+    "          outputs: type=image,"
+    "\"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}\","
+    "push-by-digest=true,name-canonical=true,push=true\n"
+    "          provenance: false\n"
+    "\n"
+    "      - name: Export digest\n"
+    "        run: |\n"
+    "          mkdir -p /tmp/digests\n"
+    "          digest=\"${{ steps.build.outputs.digest }}\"\n"
+    "          touch \"/tmp/digests/${digest#sha256:}\"\n"
+    "\n"
+    "      - name: Upload digest\n"
+    "        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+    "        with:\n"
+    "          name: docker-digest-${{ matrix.arch_dir }}\n"
+    "          path: /tmp/digests/*\n"
+    "          if-no-files-found: error\n"
+)
 # The Docker jobs never name the protected ARM64 artifact literally. They
 # select it through matrix values that the download step and the context step
 # interpolate, so freezing the job's `needs`/`if` alone would still let a pull
@@ -179,6 +244,13 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
             ),
             "strategy": DOCKER_ARTIFACT_MATRIX,
+            "steps": (
+                DOCKER_PUBLISH_STEPS_PREFIX
+                + "          name: binary-${{ matrix.binary_target }}\n"
+                + DOCKER_PUBLISH_STEPS_MIDDLE
+                + DOCKER_CONTEXT_STEP
+                + DOCKER_PUBLISH_STEPS_TAIL
+            ),
         },
     },
     "release workflow": {
@@ -194,6 +266,13 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "build-release-arm64-cross]\n"
             ),
             "strategy": DOCKER_ARTIFACT_MATRIX,
+            "steps": (
+                DOCKER_PUBLISH_STEPS_PREFIX
+                + "          name: release-binaries-${{ matrix.binary_target }}\n"
+                + DOCKER_PUBLISH_STEPS_MIDDLE
+                + DOCKER_CONTEXT_STEP
+                + DOCKER_PUBLISH_STEPS_TAIL
+            ),
         },
     },
 }
@@ -574,9 +653,54 @@ RESOLVABLE_EXPRESSION_SCOPES = (
     "github.event.inputs.",
 )
 TARGET_ARGUMENT_FLAG = re.compile(r"--target(?:\s|=|$)")
-REMOTE_ACTION_FIELD = re.compile(
-    r"^(?P<lead> *)(?P<dash>-\s+)?(?:uses|'uses'|\"uses\")\s*:\s*(?P<value>.*)$"
+# Only these declaration blocks populate the resolvable expression scopes. A
+# step's `with:` mapping is an *argument* to an action, never a definition, so
+# collecting its keys would let a self-referential input such as
+# `target: ${{ matrix.target }}` shadow the real matrix value.
+EXPRESSION_DECLARATION_KEYS = frozenset({"env", "inputs", "matrix"})
+# A target can be assembled from several expressions at once, so every
+# combination is evaluated rather than one substitution at a time. Beyond this
+# many combinations the line is not enumerable and fails closed instead.
+EXPRESSION_COMBINATION_LIMIT = 4096
+# One YAML scalar, quoted or plain. Matching the whole quoted form (rather than
+# treating quotes as optional padding) is what lets the escape decoder run
+# before any Cross/target token is searched for.
+QUOTED_YAML_SCALAR = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"")
+YAML_SCALAR = r"'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|[A-Za-z0-9_.+-]+"
+STEP_INPUT_KEY = re.compile(rf"(?P<key>{YAML_SCALAR})\s*:")
+# Any mapping field on a step line, with the key captured for decoding. The
+# runner receives the decoded key, so `"uses"` is the `uses` field and
+# `"use-cross"` is the `use-cross` input.
+YAML_MAPPING_FIELD = re.compile(
+    rf"^(?P<lead> *)(?P<dash>-\s+)?(?P<key>{YAML_SCALAR})\s*:\s*(?P<value>.*)$"
 )
+# A YAML alias, anchor, or tag resolves elsewhere in the document, so a value
+# that starts with one is not the literal text it appears to be.
+YAML_INDIRECT_SCALAR = re.compile(r"^[*&!]")
+# `<<:` merges another mapping's keys into this one. The merged inputs reach
+# the action even though no line in the step spells them.
+YAML_MERGE_KEY = re.compile(r"(?:^|[\s{,])<<\s*:")
+YAML_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+YAML_DOUBLE_QUOTED_ESCAPES = {
+    "0": "\0",
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "\t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    "N": "\x85",
+    "_": "\xa0",
+    "L": chr(0x2028),
+    "P": chr(0x2029),
+}
 # A repo-controlled dispatcher runs recipes from a manifest the workflow never
 # names, so `run: make arm64` can reach Cross with no Cross token in the
 # workflow. Each dispatcher is mapped to the manifests it can execute; the
@@ -830,6 +954,74 @@ def decode_simple_yaml_key(line: str) -> tuple[int, str] | None:
     else:
         key = raw
     return len(match.group("indent")), key
+
+
+def decode_double_quoted_yaml(body: str) -> str:
+    """Decode the escape forms a YAML double-quoted scalar accepts.
+
+    GitHub Actions hands the action the decoded scalar, so
+    `"\\u0075se-cross"` is the `use-cross` input and
+    `"build --target aarch64-\\u0075nknown-linux-gnu"` is a build of the
+    protected target. Reading the raw source spelling instead would let either
+    hide behind an escape sequence.
+    """
+
+    decoded: list[str] = []
+    index = 0
+    while index < len(body):
+        character = body[index]
+        if character != "\\":
+            decoded.append(character)
+            index += 1
+            continue
+        index += 1
+        if index >= len(body):
+            break
+        marker = body[index]
+        index += 1
+        if marker in {"x", "u", "U"}:
+            width = {"x": 2, "u": 4, "U": 8}[marker]
+            digits = body[index : index + width]
+            if len(digits) == width and all(
+                digit in YAML_HEX_DIGITS for digit in digits
+            ):
+                index += width
+                try:
+                    decoded.append(chr(int(digits, 16)))
+                except ValueError:
+                    decoded.append(digits)
+                continue
+            decoded.append(marker)
+            continue
+        if marker == "\n":
+            # A line continuation drops the newline and the following indent.
+            while index < len(body) and body[index] in " \t":
+                index += 1
+            continue
+        decoded.append(YAML_DOUBLE_QUOTED_ESCAPES.get(marker, marker))
+    return "".join(decoded)
+
+
+def decode_yaml_scalar(raw: str) -> str:
+    """Return the value the Actions runner receives for one YAML scalar."""
+
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+        return raw[1:-1].replace("''", "'")
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        return decode_double_quoted_yaml(raw[1:-1])
+    return raw
+
+
+def decoded_yaml_text(text: str) -> str:
+    """Return a line with every quoted scalar replaced by its decoded value.
+
+    Searching both the raw line and this decoded form keeps the scanner honest
+    about quoting: neither spelling can hide a Cross token or the protected
+    target from the token checks that follow.
+    """
+
+    return QUOTED_YAML_SCALAR.sub(lambda match: decode_yaml_scalar(match.group(0)), text)
 
 
 def extract_job_block(
@@ -3219,13 +3411,17 @@ def step_block_bounds(
 
 
 def step_input_keys(text: str) -> list[str]:
-    """Return every mapping key on a step line, quoted or not.
+    """Return every mapping key on a step line, quoted or not, YAML-decoded.
 
-    `'use-cross': true` and `"use-cross": true` are the same YAML key as the
-    unquoted spelling, so an action input cannot be hidden behind quoting.
+    `'use-cross': true`, `"use-cross": true`, and `"\\u0075se-cross": true` are
+    all the same `use-cross` key once the runner has parsed the document, so an
+    action input cannot be hidden behind quoting or an escape sequence.
     """
 
-    return re.findall(r"['\"]?([A-Za-z0-9_.+-]+)['\"]?\s*:", text)
+    return [
+        decode_yaml_scalar(match.group("key"))
+        for match in STEP_INPUT_KEY.finditer(text)
+    ]
 
 
 def artifact_only_input_line(keys: list[str]) -> bool:
@@ -3249,7 +3445,12 @@ def literal_value_definitions(
     start: int,
     end: int,
 ) -> dict[str, set[str]]:
-    """Collect the literal value set each mapping key can take in a range."""
+    """Collect the literal value set each mapping key can take in a range.
+
+    Values are YAML-decoded, so a matrix entry written as
+    `target: "aarch64-\\u0075nknown-linux-gnu"` is collected as the protected
+    target rather than as its raw source spelling.
+    """
 
     definitions: dict[str, set[str]] = {}
     pending: tuple[str, int] | None = None
@@ -3266,29 +3467,68 @@ def literal_value_definitions(
             and indent > pending[1]
             and ":" not in stripped[2:]
         ):
-            item = stripped[2:].strip().strip("'\"")
+            item = decode_yaml_scalar(stripped[2:])
             if item:
                 definitions.setdefault(pending[0], set()).add(item)
             continue
-        entry = re.match(
-            r"^\s*(?:-\s+)?['\"]?([A-Za-z0-9_.+-]+)['\"]?\s*:\s*(.*)$",
-            text,
-        )
+        entry = YAML_MAPPING_FIELD.match(text)
         if entry is None:
             pending = None
             continue
-        name, raw = entry.group(1), entry.group(2).strip()
+        name = decode_yaml_scalar(entry.group("key"))
+        raw = entry.group("value").strip()
         if raw in {"", "|", ">", "|-", ">-", "|+", ">+"}:
             pending = (name, indent)
             continue
         pending = None
         if raw.startswith("[") and raw.endswith("]"):
             for item in raw[1:-1].split(","):
-                cleaned = item.strip().strip("'\"")
+                cleaned = decode_yaml_scalar(item)
                 if cleaned:
                     definitions.setdefault(name, set()).add(cleaned)
             continue
-        definitions.setdefault(name, set()).add(raw.strip("'\""))
+        definitions.setdefault(name, set()).add(decode_yaml_scalar(raw))
+    return definitions
+
+
+def declaration_definitions(
+    lines: list[str],
+    start: int,
+    end: int,
+) -> dict[str, set[str]]:
+    """Collect literal values from `matrix:`/`env:`/`inputs:` blocks only.
+
+    Only these declarations populate the resolvable expression scopes. A step's
+    `with:` mapping is an argument list handed to an action, never a definition,
+    so reading its keys as definitions would let a self-referential input such
+    as `target: ${{ matrix.target }}` define `target` as its own expression.
+    `expression_candidates()` then reports the name as unresolvable and the real
+    ARM64 matrix value is never compared.
+    """
+
+    definitions: dict[str, set[str]] = {}
+    offset = start
+    while offset < end:
+        decoded = decode_simple_yaml_key(lines[offset])
+        if decoded is None or decoded[1].lower() not in EXPRESSION_DECLARATION_KEYS:
+            offset += 1
+            continue
+        indent = decoded[0]
+        block_end = end
+        for probe in range(offset + 1, end):
+            text = lines[probe]
+            if not text.strip() or text.lstrip().startswith("#"):
+                continue
+            if len(text) - len(text.lstrip(" ")) <= indent:
+                block_end = probe
+                break
+        for name, values in literal_value_definitions(
+            lines,
+            offset + 1,
+            block_end,
+        ).items():
+            definitions.setdefault(name, set()).update(values)
+        offset = block_end
     return definitions
 
 
@@ -3300,7 +3540,8 @@ def workflow_scope_definitions(
 
     Matrix and environment names are resolved in the enclosing job first so an
     unrelated job's identically named key cannot widen or narrow the result,
-    with the workflow-level mapping merged in as a fallback.
+    with the workflow-level mapping merged in as a fallback. Only declaration
+    blocks are read; see `declaration_definitions()`.
     """
 
     jobs_index = next(
@@ -3336,9 +3577,9 @@ def workflow_scope_definitions(
                     len(lines),
                 ),
             )
-    definitions = literal_value_definitions(lines, start, end)
+    definitions = declaration_definitions(lines, start, end)
     if start != 0:
-        outer = literal_value_definitions(
+        outer = declaration_definitions(
             lines,
             0,
             jobs_index if jobs_index is not None else len(lines),
@@ -3354,16 +3595,25 @@ def expression_candidates(
 ) -> set[str] | None:
     """Resolve one `${{ }}` body to its literal values, or None if unknown.
 
-    Only the namespaces a workflow author populates can carry a build target.
-    `secrets.*`, `runner.*`, `github.*`, `steps.*`, and `needs.*` are not
-    workflow-authored value sets, so they resolve to nothing rather than
-    failing closed on every ordinary credential input.
+    Only `matrix`/`env`/`inputs` hold values this workflow declares, so only
+    those can be compared against the protected target. Every other namespace —
+    `steps.*`, `needs.*`, `secrets.*`, `runner.*`, `github.*` — carries a value
+    this scanner cannot see, so it resolves to *unknown* rather than to the
+    empty set. A prior step or job output can be set to the ARM64 target and
+    handed to a remote action as `--target ${{ steps.plan.outputs.target }}`,
+    which the runner expands but a scanner reading the expression as safely
+    empty would never record.
+
+    Unknown is not by itself a rejection: `expression_reaches_target()` only
+    fails closed on an unknown value when the surrounding input already
+    declares itself a build-target argument, so ordinary credential inputs such
+    as `password: ${{ secrets.GITHUB_TOKEN }}` stay editable.
     """
 
     body = body.strip()
     lowered = body.lower()
     if not any(lowered.startswith(name) for name in RESOLVABLE_EXPRESSION_SCOPES):
-        return set()
+        return None
     name = body.split(".")[-1].strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         return None
@@ -3385,33 +3635,60 @@ def expression_reaches_target(
     `args: build --target ${{ matrix.target }}` hands the action the ARM64
     target without any physical line containing it, so the expression is
     resolved against the matrix rather than compared as literal text.
+
+    Every expression on the line is expanded *together*, because the runner
+    concatenates them all before the action sees the value. Substituting one at
+    a time and dropping the rest would read
+    `args: build --target ${{ matrix.arch }}-${{ matrix.rest }}` with
+    `arch: [aarch64]` and `rest: [unknown-linux-gnu]` as two harmless fragments
+    even though it assembles the protected target at runtime.
     """
 
     expressions = list(WORKFLOW_EXPRESSION.finditer(text))
     if not expressions:
         return False
     unresolved = False
+    options: list[list[str]] = []
+    combinations = 1
     for expression in expressions:
         candidates = expression_candidates(expression.group("body"), definitions)
         if candidates is None:
             unresolved = True
-            continue
-        for candidate in candidates:
-            expanded = WORKFLOW_EXPRESSION.sub(
-                "",
-                text[: expression.start()] + candidate + text[expression.end() :],
-            )
+            # An unknown value contributes no literal text of its own, but the
+            # fragments around it are still joined the way the runner joins
+            # them.
+            resolved = [""]
+        else:
+            resolved = sorted(candidates) or [""]
+        combinations *= len(resolved)
+        if combinations > EXPRESSION_COMBINATION_LIMIT:
+            # Too many combinations to enumerate is not a proof of safety.
+            return True
+        options.append(resolved)
+
+    for combination in itertools.product(*options):
+        assembled: list[str] = []
+        cursor = 0
+        for expression, candidate in zip(expressions, combination):
+            assembled.append(text[cursor : expression.start()])
+            assembled.append(candidate)
+            cursor = expression.end()
+        assembled.append(text[cursor:])
+        expanded = "".join(assembled)
+        for variant in (expanded, decoded_yaml_text(expanded)):
             if (
-                TARGET in expanded
-                or EXPECTED_IMAGE in expanded
-                or STANDALONE_CROSS.search(candidate)
+                TARGET in variant
+                or EXPECTED_IMAGE in variant
+                or STANDALONE_CROSS.search(variant)
             ):
                 return True
     # A reference this workflow never defines cannot be shown to be free of the
     # protected target, so an input that already declares itself a build-target
     # argument fails closed rather than being read as benign.
+    stripped = WORKFLOW_EXPRESSION.sub("", text)
     return unresolved and bool(
-        TARGET_ARGUMENT_FLAG.search(WORKFLOW_EXPRESSION.sub("", text))
+        TARGET_ARGUMENT_FLAG.search(stripped)
+        or TARGET_ARGUMENT_FLAG.search(decoded_yaml_text(stripped))
     )
 
 
@@ -3430,24 +3707,39 @@ def remote_action_surface_lines(
     resolved at all fails closed.
 
     The whole step mapping is scanned, in any key order, with quoted keys,
-    flow mappings, folded double-quoted scalars, and matrix-derived target
-    expressions all read the way the Actions runner reads them.
+    flow mappings, folded double-quoted scalars, YAML escape sequences, and
+    matrix-derived target expressions all read the way the Actions runner reads
+    them. YAML aliases and merge keys resolve outside the step, so they are not
+    literal evidence of anything and fail closed.
+
+    A local `./` action is scanned as a file of its own, but the workflow's
+    `with:` values are part of its executable surface too — a composite action
+    with `run: ${{ inputs.cmd }}` executes whatever the call site passes — so
+    local steps get the same input rules with the reference itself exempt.
     """
 
     surfaces: dict[int, str] = {}
     errors: list[str] = []
     lines = contents.splitlines()
     for index, line in enumerate(lines):
-        match = REMOTE_ACTION_FIELD.match(line)
+        match = YAML_MAPPING_FIELD.match(line)
         if match is None:
             continue
-        value = re.sub(r"\s+#.*$", "", match.group("value")).strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1].strip()
-        if not value or value.startswith("./"):
-            # Local actions are extracted and scanned as files of their own.
+        if decode_yaml_scalar(match.group("key")) != "uses":
             continue
-        if "${{" in value or dynamic_shell_word(value):
+        raw_value = re.sub(r"\s+#.*$", "", match.group("value")).strip()
+        # An alias, anchor, or tag is resolved from elsewhere in the document,
+        # so `uses: *cargo_action` can reach a Cross-capable remote action while
+        # the line carries no Cross token at all. This is checked before quotes
+        # are removed, because `uses: "*cargo_action"` really is a literal.
+        indirect_reference = bool(YAML_INDIRECT_SCALAR.match(raw_value))
+        value = decode_yaml_scalar(raw_value)
+        local_action = value.startswith("./") and not indirect_reference
+        if not value:
+            continue
+        if not local_action and (
+            indirect_reference or "${{" in value or dynamic_shell_word(value)
+        ):
             surfaces[index] = f"remote-action-dynamic:{index + 1}"
             errors.append(
                 f"{source}:{index + 1} remote action references must be literal"
@@ -3457,9 +3749,11 @@ def remote_action_surface_lines(
             continue
 
         reason: str | None = None
-        if "cross" in re.split(r"[^A-Za-z0-9]+", value.lower()):
+        if not local_action and "cross" in re.split(r"[^A-Za-z0-9]+", value.lower()):
             reason = "reference"
-        artifact_transfer = bool(ARTIFACT_TRANSFER_ACTION.match(value))
+        artifact_transfer = not local_action and bool(
+            ARTIFACT_TRANSFER_ACTION.match(value)
+        )
 
         key_column = len(match.group("lead")) + len(match.group("dash") or "")
         start, end = step_block_bounds(
@@ -3480,6 +3774,13 @@ def remote_action_surface_lines(
             if stripped.startswith("#"):
                 continue
             text = re.sub(r"\s+#.*$", "", following)
+            if YAML_MERGE_KEY.search(text):
+                # `with: {<<: *cross_inputs}` merges another mapping's keys in
+                # before the action is invoked, so the inputs that actually
+                # reach it are not spelled anywhere in this step.
+                if reason is None:
+                    reason = "input-merge"
+                continue
             # Every key on the line is considered, so a flow mapping such as
             # `with: {use-cross: true}` is read like a block mapping.
             keys = step_input_keys(text)
@@ -3503,8 +3804,9 @@ def remote_action_surface_lines(
                 # cannot start a build. Everything else about them, including a
                 # `cross` executable token and every Cross-enabling input key,
                 # is still a surface.
-                if reason is None and (
-                    EXPECTED_IMAGE in text or STANDALONE_CROSS.search(text)
+                if reason is None and any(
+                    EXPECTED_IMAGE in variant or STANDALONE_CROSS.search(variant)
+                    for variant in (text, decoded_yaml_text(text))
                 ):
                     reason = "input-value"
                 continue
@@ -3517,16 +3819,26 @@ def remote_action_surface_lines(
             folded = re.sub(r"\\\r?\n[ \t]*", "", "\n".join(scanned))
             definitions = workflow_scope_definitions(lines, index)
             for text in (*scanned, *folded.splitlines()):
-                if TARGET in text or EXPECTED_IMAGE in text or (
-                    STANDALONE_CROSS.search(text)
-                ):
-                    reason = "input-value"
+                # The runner decodes a double-quoted scalar before the action
+                # sees it, so an `args:` value that spells part of the target
+                # with a `\u`/`\x` escape still reaches the protected target
+                # even though the raw source spelling does not contain it.
+                for variant in (text, decoded_yaml_text(text)):
+                    if (
+                        TARGET in variant
+                        or EXPECTED_IMAGE in variant
+                        or STANDALONE_CROSS.search(variant)
+                    ):
+                        reason = "input-value"
+                        break
+                if reason is not None:
                     break
                 if expression_reaches_target(text, definitions):
                     reason = "input-expression"
                     break
         if reason is not None:
-            surfaces[index] = f"remote-action:{value}:{reason}"
+            kind = "local-action" if local_action else "remote-action"
+            surfaces[index] = f"{kind}:{value}:{reason}"
     return surfaces, errors
 
 
@@ -5815,6 +6127,10 @@ def validate_trusted_policy_extraction(contents: str, source: str) -> list[str]:
         '--workflows-dir "$merge_base_workflows"',
         '--actions-dir "$merge_base_actions"',
         '--automation-dir "$merge_base_automation"',
+        # The exempt generated-output paths are only safe while the proposed
+        # tree does not commit them, and the reconstructed automation directory
+        # cannot show that, so the full proposed tree listing must be supplied.
+        '--proposed-tree-listing "${proposed_automation}.workspace-ls-tree"',
         # GitHub loads this workflow from the event base, so the extraction
         # contract itself cannot be re-executed from the live tip and must
         # instead fail closed once the trusted tip has moved it.
@@ -8492,6 +8808,107 @@ pre_build = []
             "          name: binary-${{ matrix.target }}\n",
             literal_matrix,
         ),
+        # A step or job output is set by code this scanner cannot read, so a
+        # build-target argument fed from one is unknown, not empty.
+        "step-output target argument": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          args: build --target ${{ steps.plan.outputs.target }}\n",
+            "",
+        ),
+        "job-output target argument": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          args: build --target ${{ needs.plan.outputs.target }}\n",
+            "",
+        ),
+        # The runner concatenates every expression on the line before the
+        # action sees it, so literal fragments assemble the protected target.
+        "target assembled from two matrix fragments": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          args: build --target ${{ matrix.arch }}-${{ matrix.rest }}\n",
+            "    strategy:\n"
+            "      matrix:\n"
+            "        arch: [aarch64]\n"
+            "        rest: [unknown-linux-gnu]\n",
+        ),
+        # A `with:` key is an argument, not a declaration. Reading it as one
+        # would let this self-referential input shadow the real matrix value.
+        "self-referential input shadowing the matrix": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          target: ${{ matrix.target }}\n",
+            literal_matrix,
+        ),
+        # The runner decodes escapes in a double-quoted key before the input
+        # name is resolved.
+        "escaped Cross input key": (
+            f"      - uses: {remote_action}\n"
+            "        with:\n"
+            '          "\\u0075se-cross": true\n',
+            "",
+        ),
+        "escaped uses key on a Cross action": (
+            f'      - "\\u0075ses": {remote_action}\n'
+            "        with:\n"
+            "          use-cross: true\n",
+            "",
+        ),
+        # ...and in a double-quoted value before the action receives it.
+        "escaped target argument value": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            '          args: "build --target aarch64-\\u0075nknown-linux-gnu"\n',
+            "",
+        ),
+        "escaped matrix target value": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          args: build --target ${{ matrix.target }}\n",
+            "    strategy:\n"
+            "      matrix:\n"
+            '        target: ["aarch64-\\u0075nknown-linux-gnu"]\n',
+        ),
+        # A merge key supplies inputs that are spelled nowhere in the step.
+        "merged remote-action inputs": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          <<: *cross_inputs\n",
+            "",
+        ),
+        "flow-mapping merged inputs": (
+            f"      - uses: {other_action}\n"
+            "        with: {<<: *cross_inputs}\n",
+            "",
+        ),
+        # An alias resolves to an anchor defined elsewhere in the document.
+        "aliased remote action reference": (
+            "      - uses: *cargo_action\n"
+            "        with:\n"
+            "          args: build\n",
+            "",
+        ),
+        "tagged remote action reference": (
+            "      - uses: !secret cargo_action\n"
+            "        with:\n"
+            "          args: build\n",
+            "",
+        ),
+        # A local composite action can interpolate a workflow input straight
+        # into its `run:`, so the call site's values are executable too.
+        "Cross command passed to a local action": (
+            "      - uses: ./.github/actions/build\n"
+            "        with:\n"
+            f"          cmd: cross build --target {TARGET}\n",
+            "",
+        ),
+        "target argument passed to a local action": (
+            "      - uses: ./.github/actions/build\n"
+            "        with:\n"
+            "          args: build --target ${{ matrix.target }}\n",
+            literal_matrix,
+        ),
     }
     for label, (body, extra) in hidden_surfaces.items():
         if not step_surface(body, extra):
@@ -9127,12 +9544,7 @@ pre_build = []
         + ci_publish_contract["docker"]["if"]
         + "    runs-on: ubuntu-latest\n"
         + ci_publish_contract["docker"]["strategy"]
-        + "    steps:\n"
-        + ci_publish_steps["Download Linux binary"]
-        + "\n"
-        + ci_publish_steps["Prepare Docker context"]
-        + "\n"
-        + "      - run: echo docker\n"
+        + ci_publish_contract["docker"]["steps"]
     )
     if validate_publish_control_contract(publish_workflow, "CI workflow"):
         failures.append("valid ARM64 publication dependency controls were rejected")
@@ -9163,6 +9575,56 @@ pre_build = []
         ),
     }
     for label, (original, replacement) in artifact_selection_edits.items():
+        tampered = publish_workflow.replace(original, replacement, 1)
+        if tampered == publish_workflow:
+            failures.append(f"{label} fixture did not change the workflow")
+            continue
+        if not validate_publish_control_contract(tampered, "CI workflow"):
+            failures.append(f"{label} was not rejected")
+        if not compare_pr_publish_control_contract(
+            publish_workflow,
+            tampered,
+            "CI workflow",
+        ):
+            failures.append(f"{label} was allowed by the merge-base comparison")
+
+    # Freezing the artifact-selection steps alone leaves the rest of the job
+    # able to rewrite the context they prepared. Every one of these keeps the
+    # matrix and both frozen steps byte-for-byte identical and still publishes
+    # an ARM64 image built from something other than the ARM64 artifact.
+    buildx_step = "      - name: Set up Docker Buildx\n"
+    context_mutations = {
+        "second download of the x86_64 artifact": (
+            buildx_step,
+            "      - name: Download other binary\n"
+            "        uses: actions/download-artifact"
+            "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+            "        with:\n"
+            "          name: binary-x86_64-unknown-linux-gnu\n"
+            "          path: other-artifacts\n"
+            "\n" + buildx_step,
+        ),
+        "later step overwrites the prepared arm64 binary": (
+            buildx_step,
+            "      - name: Patch context\n"
+            "        run: cp other/ferrum-edge "
+            "docker-context/bin/arm64/ferrum-edge\n"
+            "\n" + buildx_step,
+        ),
+        "context rewritten through a shell-assembled path": (
+            buildx_step,
+            "      - name: Patch context\n"
+            "        run: |\n"
+            "          prefix=docker-\n"
+            '          cp other/ferrum-edge "${prefix}context/bin/arm64/ferrum-edge"\n'
+            "\n" + buildx_step,
+        ),
+        "build repointed away from the prepared context": (
+            "          context: docker-context\n",
+            "          context: attacker-context\n",
+        ),
+    }
+    for label, (original, replacement) in context_mutations.items():
         tampered = publish_workflow.replace(original, replacement, 1)
         if tampered == publish_workflow:
             failures.append(f"{label} fixture did not change the workflow")
@@ -9231,6 +9693,26 @@ pre_build = []
     if not validate_publish_control_contract(duplicate_publish_needs, "CI workflow"):
         failures.append("duplicate publication needs field was not rejected")
 
+    # An exact generated-output path is exempt from the scanned automation
+    # roots only because a build produces it and no commit supplies it. The
+    # exemption must therefore be checked against the proposed tree, not
+    # against the reconstructed automation directory, which by construction
+    # holds only the approved roots and could never show a committed binary at
+    # the repository root.
+    if validate_generated_command_tree(
+        (".github/scripts/verify_cross_build_policy.py", "scripts/coverage.sh"),
+        "self-test tree",
+    ):
+        failures.append("a clean proposed tree was rejected")
+    for exempt_path in sorted(GENERATED_COMMAND_PATHS):
+        if not validate_generated_command_tree(
+            ("scripts/coverage.sh", exempt_path),
+            "self-test tree",
+        ):
+            failures.append(
+                f"committed generated command path {exempt_path!r} was not rejected"
+            )
+
     trusted_extraction_fixture = (
         'git fetch --no-tags origin '
         '"+refs/heads/${BASE_REF}:refs/remotes/trusted-base"\n'
@@ -9253,7 +9735,8 @@ pre_build = []
         '  --trusted-policy-workflow "$trusted_policy_workflow" \\\n'
         '  --workflows-dir "$merge_base_workflows" \\\n'
         '  --actions-dir "$merge_base_actions" \\\n'
-        '  --automation-dir "$merge_base_automation"\n'
+        '  --automation-dir "$merge_base_automation" \\\n'
+        '  --proposed-tree-listing "${proposed_automation}.workspace-ls-tree"\n'
         'if ! git ls-tree -rz --name-only "$commit" -- workflows > "$listing"; then\n'
         "  return 1\n"
         "fi\n"
@@ -9293,6 +9776,14 @@ pre_build = []
         "event-base trusted contract inputs": trusted_extraction_fixture.replace(
             '  --ci-workflow "$merge_base_ci" \\\n',
             "  --ci-workflow .github/workflows/ci.yml \\\n",
+        ),
+        # Without the proposed tree listing the exempt generated-output paths
+        # could never be checked for a committed file of the same name.
+        "dropped proposed tree listing": trusted_extraction_fixture.replace(
+            '  --automation-dir "$merge_base_automation" \\\n'
+            '  --proposed-tree-listing "${proposed_automation}'
+            '.workspace-ls-tree"\n',
+            '  --automation-dir "$merge_base_automation"\n',
         ),
     }.items():
         if not validate_trusted_policy_extraction(
@@ -9427,6 +9918,48 @@ def load_action_directory(
     return actions, errors
 
 
+def load_tree_listing(path: Path, label: str) -> tuple[tuple[str, ...], list[str]]:
+    """Load a NUL-separated `git ls-tree -rz --name-only` listing."""
+
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        return (), [f"cannot read {label}: {error}"]
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeError as error:
+        return (), [f"{label} is not valid UTF-8: {error}"]
+    return tuple(entry for entry in decoded.split("\0") if entry), []
+
+
+def validate_generated_command_tree(
+    tree_paths: tuple[str, ...],
+    label: str,
+) -> list[str]:
+    """Reject a committed file at any exempt generated-output path.
+
+    `GENERATED_COMMAND_PATHS` exempts a handful of exact paths from the scanned
+    automation roots because a build produces them at run time and no commit
+    can supply their contents. That reasoning only holds while the path is
+    absent from the tree. A pull request that commits an executable at
+    `conformance` or `ferrum-edge-linux-x86_64` and then runs `./conformance`
+    would otherwise be accepted unscanned, because the exemption is applied
+    before the path is ever looked for.
+
+    The check runs against the proposed repository tree listing rather than the
+    materialized `--automation-dir`: that directory is reconstructed from the
+    approved automation roots alone, so a presence check against it could never
+    observe a root-level committed binary and would be vacuous.
+    """
+
+    committed = sorted(set(tree_paths) & GENERATED_COMMAND_PATHS)
+    return [
+        f"{label} commits {path!r}, which the policy exempts only as an "
+        "uncommitted build output"
+        for path in committed
+    ]
+
+
 def load_automation_directory(
     path: Path,
     label: str,
@@ -9536,6 +10069,7 @@ def main() -> int:
     parser.add_argument("--proposed-actions-dir", type=Path)
     parser.add_argument("--merge-base-automation-dir", type=Path)
     parser.add_argument("--proposed-automation-dir", type=Path)
+    parser.add_argument("--proposed-tree-listing", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -9657,6 +10191,25 @@ def main() -> int:
             "must be supplied together"
         )
     elif all(path is not None for path in pr_paths):
+        # The exempt generated-output paths are only safe while nothing commits
+        # them, and the reconstructed automation directory cannot show that, so
+        # the proposed repository tree listing is required here.
+        if args.proposed_tree_listing is None:
+            failures.append(
+                "--proposed-tree-listing is required when comparing a pull "
+                "request against the trusted base"
+            )
+        else:
+            tree_paths, listing_failures = load_tree_listing(
+                args.proposed_tree_listing,
+                "proposed tree listing",
+            )
+            failures.extend(listing_failures)
+            if not listing_failures:
+                failures.extend(
+                    validate_generated_command_tree(tree_paths, "proposed tree")
+                )
+
         comparisons = (
             (
                 args.merge_base_ci_workflow,

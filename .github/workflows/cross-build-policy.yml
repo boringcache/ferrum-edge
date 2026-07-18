@@ -297,4 +297,5 @@ jobs:
             --merge-base-actions-dir "$merge_base_actions" \
             --proposed-actions-dir "$proposed_actions" \
             --merge-base-automation-dir "$merge_base_automation" \
-            --proposed-automation-dir "$proposed_automation"
+            --proposed-automation-dir "$proposed_automation" \
+            --proposed-tree-listing "${proposed_automation}.workspace-ls-tree"

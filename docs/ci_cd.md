@@ -469,22 +469,43 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   normalization, in block or flow mappings), or whose input values carry the
   protected ARM64 target, the pinned Cross image, or the `cross` executable is a
   build-execution surface; a dynamic `uses:` reference fails closed. Benign
-  pinned actions with unrelated inputs stay editable. The step is read as the
+  pinned actions with unrelated inputs stay editable. A local (`./`) action is
+  extracted and scanned as a file of its own, but the workflow's `with:` values
+  are part of its executable surface too — a composite action with
+  `run: ${{ inputs.cmd }}` executes whatever the call site passes — so a local
+  step's inputs are held to the same Cross-input, target, and expression rules;
+  only the `./` reference itself is exempt from the literal-reference check.
+  The step is read as the
   single YAML mapping it is, so key order does not matter: a `with:` block
   written **above** the `uses:` line is scanned exactly like one written below
-  it. Input keys are matched in their quoted spellings (`'use-cross'`,
-  `"use-cross"`) as well as unquoted, and a double-quoted scalar continued with
+  it. Keys and values are read the way the runner parses them, not as raw
+  source text: quoted spellings (`'use-cross'`, `"use-cross"`) and
+  double-quoted escape sequences (`"use-cross"`, `"uses"` written with an
+  escape, `args: "build --target aarch64-unknown-linux-gnu"`, and matrix
+  values collected from quoted scalars) are all decoded before any Cross or
+  target token is searched for. A double-quoted scalar continued with
   a trailing backslash is folded the way the runner folds it, so a target split
-  across two source lines is still detected. Input values are resolved rather
+  across two source lines is still detected. A YAML merge key
+  (`with: {<<: *cross_inputs}`) supplies inputs the step never spells and a
+  YAML alias, anchor, or tag on a `uses:` value (`uses: *cargo_action`)
+  resolves outside the step, so both fail closed rather than being read as the
+  literal text they appear to be. Input values are resolved rather
   than compared as literal text: an expression such as
   `args: build --target ${{ matrix.target }}` is expanded against the enclosing
-  job's matrix, `env`, and `inputs` definitions, and any expansion reaching the
-  protected target is a surface. A reference in one of those author-populated
-  scopes that the workflow never defines cannot be shown to be target-free, so
-  it fails closed whenever the same input already declares a `--target`
-  argument. `secrets.*`, `github.*`, `runner.*`, `steps.*`, and `needs.*` are
-  not author-populated value sets and resolve to nothing, so ordinary
-  credential and context inputs stay editable. One narrow exception
+  job's `matrix`, `env`, and `inputs` **declarations** — a step's `with:` keys
+  are arguments to an action, never definitions, so a self-referential input
+  such as `target: ${{ matrix.target }}` cannot shadow the real matrix value.
+  Every expression on a line is expanded *together*, because the runner
+  concatenates them all before the action sees the value, so
+  `--target ${{ matrix.arch }}-${{ matrix.rest }}` assembled from literal
+  fragments is caught; a line with more combinations than the enumeration limit
+  fails closed. Any expansion reaching the protected target is a surface.
+  A value this scanner cannot see is *unknown*, not empty: `secrets.*`,
+  `github.*`, `runner.*`, `steps.*`, and `needs.*` are not author-populated
+  value sets, and a prior step or job output can be set to the ARM64 target,
+  so an unknown value fails closed whenever the same input already declares a
+  `--target` argument. Ordinary credential and context inputs carry no target
+  argument and stay editable. One narrow exception
   exists so release downloads can be isolated to exact artifact names, which
   necessarily name the protected target: for `actions/upload-artifact` and
   `actions/download-artifact` **pinned to a full commit SHA**, the target
@@ -510,7 +531,17 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   `comparison-results/`, or `tmp/` is ignored by git, so a pull request can
   commit a script under any of them; such a script is ordinary repository code
   and is reported as outside the scanned automation roots unless it is one of
-  the exact allowlisted build outputs.
+  the exact allowlisted build outputs. Those exact allowlisted outputs are
+  exempt only while nothing commits them, so the pull-request comparison
+  additionally requires the full proposed repository tree listing
+  (`--proposed-tree-listing`, a `git ls-tree -rz --name-only` enumeration of the
+  proposed commit) and rejects any commit that adds a file at one of them.
+  Checking the materialized `--automation-dir` instead would be vacuous: that
+  directory is reconstructed from the approved automation roots alone and could
+  never show a committed executable at a repository-root path such as
+  `conformance` or `ferrum-edge-linux-x86_64`. The extraction contract requires
+  the listing to be passed, so a policy workflow that drops the flag is
+  rejected.
   Repo-controlled build dispatchers are followed rather than trusted: a step
   running `make`, `npm`/`pnpm`/`yarn`, `just`, or `task` resolves to the
   matching root or `-C`-relocated `Makefile`, `package.json` `scripts`,
@@ -543,7 +574,17 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   contract in both workflows. Without it a pull request could repoint the
   `linux/arm64` row at the x86_64 artifact and publish an ARM64 image
   containing the wrong binary while the protected ARM64 build still succeeded.
-  The rest of each Docker job stays editable.
+  Freezing those two steps alone would still leave the rest of the job able to
+  rewrite the context they prepared: a pull request could keep the matrix and
+  both steps byte-for-byte identical, add a second download of the x86_64
+  artifact, and copy it over `docker-context/bin/arm64/ferrum-edge` before the
+  image is built. The **entire `steps:` list** of each Docker publishing job is
+  therefore frozen as well, in both workflows and against both the pinned
+  contract and the merge base, so no later step — including one that assembles
+  the context path out of shell variables, or repoints the build's `context:`
+  input — can touch the prepared per-arch binaries. Editing a Docker publishing
+  job requires updating `PUBLISH_CONTROL_CONTRACTS` in the same commit; the
+  remaining publishing jobs stay editable.
 - `latest-release` and `create-release` download the five build artifacts by
   exact name instead of by a `binary-*`/`release-binaries-*` wildcard, so an
   unrelated job cannot contribute a colliding upload to a published release.
