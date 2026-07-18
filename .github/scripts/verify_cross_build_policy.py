@@ -5526,18 +5526,43 @@ pre_build = []
         ),
     }
     for benign_label, benign_line in benign_executor_lines.items():
+        benign_contents = f"#!/bin/sh\n{benign_line}\n"
         benign_errors = compare_pr_automation_collection(
             {"ci.yml": referenced_workflow},
             {"ci.yml": referenced_workflow},
             {"setup/action.yml": safe_action},
             {"setup/action.yml": safe_action},
             safe_automation,
-            {"scripts/safe.sh": f"#!/bin/sh\n{benign_line}\n"},
+            {"scripts/safe.sh": benign_contents},
             "self-test automation directory",
         )
         if benign_errors:
+            logical_benign = re.sub(r"\\\r?\n[ \t]*", "", benign_contents)
+            matching_variants = [
+                variant
+                for line in logical_scan_lines(logical_benign)
+                for variant in scan_variants(
+                    line,
+                    include_opaque_shell_executable=True,
+                )
+                if has_cross_command_context(
+                    variant,
+                    include_opaque_shell_executable=True,
+                )
+                or CROSS_ENVIRONMENT.search(variant)
+            ]
+            runtime_sensitive, runtime_errors = action_file_runtime_surface(
+                "scripts/safe.sh",
+                benign_contents,
+                include_opaque_shell_executable=True,
+            )
             failures.append(
-                f"benign {benign_label} was rejected: {'; '.join(benign_errors)}"
+                f"benign {benign_label} was rejected: {'; '.join(benign_errors)}; "
+                f"matching variants={matching_variants!r}; "
+                f"runtime sensitive={runtime_sensitive!r}; "
+                f"runtime errors={runtime_errors!r}; "
+                f"opaque inline={bool(OPAQUE_INLINE_SHELL.search(logical_benign))!r}; "
+                f"wrapped literal={bool(WRAPPED_LITERAL_CROSS.search(logical_benign))!r}"
             )
 
     python_automation_escapes(
