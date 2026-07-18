@@ -2932,6 +2932,37 @@ impl Plugin for HeaderCapturingCommittedHook {
     }
 }
 
+/// A committed-response observer that stays pending until the test releases it.
+/// Unlike [`StalledCommittedHook`] it can eventually complete, so the detached
+/// remainder of the hook chain actually runs once released. `Notify` stores a
+/// permit for `notify_one`, so the release is observed whether or not the hook
+/// has been polled yet — the deadline-bounded runner skips the inline poll when
+/// the budget is already exhausted.
+struct ReleasableCommittedHook {
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Plugin for ReleasableCommittedHook {
+    fn name(&self) -> &str {
+        "releasable_committed_hook"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        self.release.notified().await;
+    }
+}
+
 /// Codex finding: `Set-Cookie` provenance is matched by OCCURRENCE, not by value
 /// membership. A trusted hook that authors a cookie line byte-identical to one
 /// the backend already sent (a deterministic affinity cookie, or a session
@@ -3063,8 +3094,14 @@ async fn h3_reject_committed_deadline_preserves_direct_gateway_error_headers() {
 
     let captured = Arc::new(std::sync::Mutex::new(None));
     let completion = Arc::new(tokio::sync::Notify::new());
+    // The first hook must stall past the deadline but still be releasable: a
+    // never-completing hook would leave the detached cleanup awaiting it until
+    // its own bound expires, so the capturing hook behind it could never run.
+    let release = Arc::new(tokio::sync::Notify::new());
     let plugins: Vec<Arc<dyn Plugin>> = vec![
-        Arc::new(StalledCommittedHook),
+        Arc::new(ReleasableCommittedHook {
+            release: Arc::clone(&release),
+        }),
         Arc::new(HeaderCapturingCommittedHook {
             captured: Arc::clone(&captured),
             completion: Arc::clone(&completion),
@@ -3072,7 +3109,7 @@ async fn h3_reject_committed_deadline_preserves_direct_gateway_error_headers() {
     ];
 
     let mut ctx = create_grpc_context_with_timeout(None);
-    // Deadline already exhausted: the stalled hook cannot finish before it.
+    // Deadline already exhausted: the first hook cannot finish before it.
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
 
     // The header shape a direct mesh dispatch-required 502 hands over: entirely
@@ -3099,6 +3136,10 @@ async fn h3_reject_committed_deadline_preserves_direct_gateway_error_headers() {
         "the stalled committed hook must exhaust the RPC deadline and replace the response"
     );
 
+    // Deadline replacement has happened and the pending hook plus the remaining
+    // observers are now owned by detached cleanup. Releasing the first hook lets
+    // that cleanup continue into the capturing hook with the rebuilt response.
+    release.notify_one();
     tokio::time::timeout(std::time::Duration::from_secs(5), completion.notified())
         .await
         .expect("the detached committed hook must observe the rebuilt response");
