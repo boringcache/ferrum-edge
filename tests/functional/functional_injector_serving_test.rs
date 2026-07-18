@@ -236,8 +236,8 @@ async fn probe_injector_identity(gateway: &InjectorGateway, tls: bool) -> Result
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
         .ok_or_else(|| "probe response had no body".to_string())?;
-    let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| format!("probe body was not JSON: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("probe body was not JSON: {e}"))?;
     let patch = value
         .pointer("/response/patch")
         .and_then(serde_json::Value::as_str)
