@@ -1690,6 +1690,8 @@ The injector listens on `FERRUM_INJECTOR_LISTEN_ADDR` (default `0.0.0.0:9443`) a
 
 **TLS is required and fail-closed.** Kubernetes calls admission webhooks over HTTPS, so the injector requires both `FERRUM_INJECTOR_TLS_CERT_PATH` and `FERRUM_INJECTOR_TLS_KEY_PATH` and **refuses to start** when neither is set. For local development only, set `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` to serve plaintext HTTP; the injector logs a loud warning at startup in that mode. Setting only one of the cert/key pair is always a configuration error.
 
+**HTTP/1.1 only.** Every accepted connection is served by Hyper's HTTP/1 builder, so the injector's TLS acceptor advertises **only** `http/1.1` via ALPN — it never negotiates `h2` with an HTTP/2-capable Kubernetes API server (the shared TLS loader's `h2`/`acme-tls/1` offers are deliberately dropped for this listener). Connections are bounded by `FERRUM_MAX_CONNECTIONS`, the TLS handshake by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`, and the wait for HTTP/1 request headers by `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` (default `10`; `0` disables it), so trickled or withheld headers cannot hold the connection budget open indefinitely.
+
 **Request validation (fail-closed on injection).** The injector validates each AdmissionReview before injecting:
 
 - **Pod-kind check:** the request must target a core (`apiGroup: ""`) `Pod` — confirmed via `request.kind` (a `GroupVersionKind`) or, when `kind` is absent, the core `pods` `request.resource`. A mis-scoped `MutatingWebhookConfiguration` that routes other kinds (or a request carrying no kind/resource metadata) is **admitted with `allowed: true` and no patch**, and a warning is logged. The injector never patches an unknown kind.

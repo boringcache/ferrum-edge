@@ -757,8 +757,7 @@ fn build_tls_acceptor(
     // connection is served by Hyper's HTTP/1-only builder. Restrict ALPN to
     // http/1.1 so an HTTP/2-capable Kubernetes API server can never negotiate
     // h2 and then send an HTTP/2 preface to the HTTP/1 parser.
-    let mut server_config =
-        Arc::try_unwrap(server_config).unwrap_or_else(|shared| (*shared).clone());
+    let mut server_config = Arc::unwrap_or_clone(server_config);
     server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
 }
@@ -2545,6 +2544,9 @@ mod tests {
         config.http_header_read_timeout_seconds = 1;
         let (addr, server) = spawn_injector_test_server(config).await;
 
+        // Taken before the connect so it can never postdate the server-side
+        // timer that the assertion below compares against.
+        let started = std::time::Instant::now();
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(b"POST /mutate HTTP/1.1\r\nHost: localhost\r\n")
@@ -2558,6 +2560,15 @@ mod tests {
         assert!(
             read.is_ok(),
             "connection should be closed by the header read timeout, not hang"
+        );
+        // A close well before the configured budget would mean the connection
+        // was torn down for some other reason, making the assertion below
+        // vacuous. The bound is slightly under 1s only to absorb clock
+        // coarseness, not to tolerate an early close.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "connection closed after {elapsed:?}, before the 1s header read timeout could fire"
         );
         assert!(
             buf.is_empty(),
@@ -2594,9 +2605,10 @@ mod tests {
             .write_all(b"POST /mutate HTTP/1.1\r\nHost: localhost\r\n")
             .await
             .unwrap();
-        // Exceed the default 10s budget would take too long for a test; the
-        // point is that no timeout fires while we trickle the remaining
-        // headers well past the 1s budget used by the companion test.
+        // Waiting out the default 10s budget would make the test needlessly
+        // slow; the point is that no timeout fires while the remaining headers
+        // are withheld well past the 1s budget the companion test proves is
+        // enforced when configured.
         tokio::time::sleep(Duration::from_secs(2)).await;
         stream
             .write_all(
@@ -2613,7 +2625,8 @@ mod tests {
         let mut response = Vec::new();
         timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
             .await
-            .expect("server should respond after slow headers when the timeout is disabled");
+            .expect("server should respond after slow headers when the timeout is disabled")
+            .expect("reading the injector response must not fail");
         let response = String::from_utf8(response).unwrap();
         assert!(
             response.starts_with("HTTP/1.1 200 OK"),
@@ -2669,9 +2682,7 @@ mod tests {
         // Client offers h2 first, then http/1.1, like an HTTP/2-capable
         // Kubernetes API server would.
         let mut root_store = rustls::RootCertStore::empty();
-        root_store
-            .add(rustls::pki_types::CertificateDer::from(cert.der().clone()))
-            .unwrap();
+        root_store.add(cert.der().clone()).unwrap();
         let mut client_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
@@ -2711,7 +2722,8 @@ mod tests {
         let mut response = Vec::new();
         timeout(Duration::from_secs(10), reader.read_to_end(&mut response))
             .await
-            .expect("webhook response");
+            .expect("webhook response")
+            .expect("reading the injector TLS response must not fail");
         let response = String::from_utf8(response).unwrap();
         assert!(
             response.starts_with("HTTP/1.1 200 OK"),
