@@ -1794,11 +1794,7 @@ pub async fn run(
     } else {
         info!("Admin TLS not configured - HTTPS listener disabled");
     }
-    if env_config.admin_http_port == 0
-        && !(env_config.admin_tls_cert_path.is_some()
-            && env_config.admin_tls_key_path.is_some()
-            && env_config.admin_https_port != 0)
-    {
+    if env_config.admin_http_port == 0 && !env_config.admin_https_listener_enabled() {
         warn!(
             "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and admin HTTPS is not configured or disabled. The admin API is unreachable."
         );

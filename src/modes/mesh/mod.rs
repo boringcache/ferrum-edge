@@ -10518,7 +10518,11 @@ fn start_mesh_admin_listeners(
         info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext mesh admin HTTP listener disabled");
     }
 
-    if let (Some(admin_cert_path), Some(admin_key_path)) = (
+    // Admin HTTPS listener (only if TLS is configured and the port is not
+    // disabled — port 0 is the repository-wide disable sentinel).
+    if env_config.admin_https_port == 0 {
+        info!("FERRUM_ADMIN_HTTPS_PORT=0 — mesh admin HTTPS listener disabled");
+    } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
         &env_config.admin_tls_cert_path,
         &env_config.admin_tls_key_path,
     ) {
@@ -10591,9 +10595,9 @@ fn start_mesh_admin_listeners(
         info!("Mesh admin TLS not configured - HTTPS listener disabled");
     }
 
-    if env_config.admin_http_port == 0 && env_config.admin_tls_cert_path.is_none() {
+    if env_config.admin_http_port == 0 && !env_config.admin_https_listener_enabled() {
         warn!(
-            "No mesh admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and no admin TLS configured. The admin API is unreachable."
+            "No mesh admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and admin HTTPS not configured or FERRUM_ADMIN_HTTPS_PORT=0. The admin API is unreachable."
         );
     }
 
