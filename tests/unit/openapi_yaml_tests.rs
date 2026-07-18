@@ -184,10 +184,15 @@ fn admin_pagination_schema_matches_runtime_bounds_and_coercion() {
     let api_spec_response = spec
         .pointer("/components/schemas/ApiSpecListResponse")
         .expect("API-spec list response schema");
-    assert!(api_spec_response["required"]
-        .as_array()
-        .is_some_and(|required| required.contains(&json!("total"))));
-    assert_eq!(api_spec_response["properties"]["total"]["minimum"], json!(0));
+    assert!(
+        api_spec_response["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("total")))
+    );
+    assert_eq!(
+        api_spec_response["properties"]["total"]["minimum"],
+        json!(0)
+    );
 }
 
 #[test]

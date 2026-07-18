@@ -1429,12 +1429,8 @@ async fn test_pagination_limit_clamped_to_max() {
     assert_eq!(body["data"].as_array().unwrap().len(), 5);
     assert_eq!(body["pagination"]["limit"], 1000);
 
-    let (status, body, _) = admin_get(
-        &base_url,
-        "/proxies?limit=18446744073709551615",
-        &token,
-    )
-    .await;
+    let (status, body, _) =
+        admin_get(&base_url, "/proxies?limit=18446744073709551615", &token).await;
     assert_eq!(status, 200);
     assert_eq!(body["pagination"]["limit"], 1000);
 }

@@ -7063,8 +7063,7 @@ async fn handle_audit_list(
 
     match db.list_audit_events(namespace, &filter).await {
         Ok(result) => {
-            let next_offset =
-                advancing_u32_offset(filter.offset, result.items.len(), result.total);
+            let next_offset = advancing_u32_offset(filter.offset, result.items.len(), result.total);
             Ok(json_response(
                 StatusCode::OK,
                 &json!({
