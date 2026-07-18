@@ -76,18 +76,20 @@ const DB_HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// Return the cached DB connectivity signal, refreshing it when the entry is
 /// missing or older than `cache_ttl`. Fresh-cache hits are lock-free; on an
-/// empty or expired entry at most one caller runs `probe` (single-flight)
-/// while concurrent callers wait for and then share that result. Probe
-/// failures and timeouts cache `false`, preserving the previous per-request
-/// error semantics.
-pub async fn cached_db_health_connected<F, E>(
+/// empty or expired entry at most one caller invokes `probe_factory`
+/// (single-flight) while concurrent callers wait for and then share that
+/// result. Keeping the probe lazy avoids constructing an async-trait boxed
+/// future on either fresh-cache path. Probe failures and timeouts cache
+/// `false`, preserving the previous per-request error semantics.
+pub async fn cached_db_health_connected<P, F, E>(
     cache: &ArcSwap<Option<CachedDbHealthResult>>,
     refresh_lock: &tokio::sync::Mutex<()>,
     cache_ttl: std::time::Duration,
     probe_timeout: std::time::Duration,
-    probe: F,
+    probe_factory: P,
 ) -> bool
 where
+    P: FnOnce() -> F,
     F: std::future::Future<Output = Result<(), E>>,
 {
     if let Some(entry) = &**cache.load()
@@ -104,7 +106,7 @@ where
     {
         return entry.connected;
     }
-    let connected = match tokio::time::timeout(probe_timeout, probe).await {
+    let connected = match tokio::time::timeout(probe_timeout, probe_factory()).await {
         Ok(Ok(())) => true,
         Ok(Err(_error)) => {
             warn_persistence_failure_redacted("admin_health_database_query");
@@ -1071,7 +1073,7 @@ pub async fn handle_admin_request(
                 &state.db_health_refresh,
                 DB_HEALTH_CACHE_TTL,
                 DB_HEALTH_PROBE_TIMEOUT,
-                db.health_check(),
+                || db.health_check(),
             )
             .await;
 
