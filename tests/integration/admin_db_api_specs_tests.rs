@@ -1352,7 +1352,7 @@ async fn restore_bundle_preserves_preexisting_proxy_when_later_insert_conflicts(
     let spec = make_spec(&spec_id, &proxy_id, ns, b"pre-existing proxy conflict");
     assert!(
         store
-        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
+            .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
             .await
             .is_err()
     );
@@ -1461,7 +1461,7 @@ async fn restore_bundle_rejects_missing_hand_owned_upstream_reference() {
 
     assert!(
         store
-        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
+            .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
             .await
             .is_err(),
         "compensation must reject a proxy whose hand-owned upstream disappeared"
