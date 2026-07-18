@@ -3552,14 +3552,17 @@ paths:
         creation identity and ownership match the pre-delete snapshot; a same-ID
         replacement rejects recovery. The recovered proxy graph's current
         upstream, plugin-composition, and named-schema dependencies are
-        revalidated before commit. Standalone MongoDB fails closed before
+        revalidated before commit with the configured backend egress policy.
+        Before persistence, ownership-preserving reads reject a current
+        upstream or cascade plugin owned by another API spec so compensation
+        cannot relabel it as hand-owned. Standalone MongoDB fails closed before
         multi-document compensation writes.
       tags: [Proxies]
       responses:
         "204":
           description: Proxy deleted
         "400":
-          description: Deletion would leave an invalid plugin-composition graph, such as a global TCP connection throttle with no supported TCP/TCP+TLS target
+          description: Deletion would leave an invalid plugin-composition graph, such as a global TCP connection throttle with no supported TCP/TCP+TLS target, or a cascade resource is owned by another API spec
           content:
             application/json:
               schema:

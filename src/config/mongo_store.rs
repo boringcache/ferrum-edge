@@ -4086,6 +4086,7 @@ mod inner {
         session: &mut ClientSession,
         namespace: &str,
         restored_proxy_id: &str,
+        validation_http_client: &crate::plugins::PluginHttpClient,
     ) -> Result<(), anyhow::Error> {
         let proxies = store
             .load_full_proxies_opt_session(namespace, Some((connection, &mut *session)), true)
@@ -4125,8 +4126,11 @@ mod inner {
                 errors.join("; ")
             );
         }
-        crate::config::db_backend::validate_api_spec_recovered_plugin_graph(&recovered_graph)
-            .await?;
+        crate::config::db_backend::validate_api_spec_recovered_plugin_graph(
+            &recovered_graph,
+            validation_http_client,
+        )
+        .await?;
         crate::plugin_cache::validate_tcp_connection_throttle_attachments(&candidate).map_err(
             |errors| anyhow::Error::new(TcpConnectionThrottleAttachmentConflict::new(errors)),
         )?;
@@ -9223,6 +9227,7 @@ mod inner {
             spec: &ApiSpec,
             additional_upstreams: &[Upstream],
             additional_plugins: &[PluginConfig],
+            validation_http_client: &crate::plugins::PluginHttpClient,
         ) -> Result<(), anyhow::Error> {
             crate::config::db_backend::validate_api_spec_restore_inputs(
                 bundle,
@@ -9263,6 +9268,7 @@ mod inner {
 
             Self::run_mtls_dns_mutations(&mut mtls_leases, async {
                 let connection = self.connection();
+                let validation_http_client = validation_http_client.clone();
                 let mut session = connection.client.start_session().await?;
                 let prepared_docs = prepare_api_spec_restore_docs(
                     bundle,
@@ -9303,6 +9309,7 @@ mod inner {
                             upsert_changes,
                             spec.namespace.clone(),
                             bundle.proxy.id.clone(),
+                            validation_http_client,
                         ),
                         |s,
                          (
@@ -9313,6 +9320,7 @@ mod inner {
                             upsert_changes,
                             namespace,
                             restored_proxy_id,
+                            validation_http_client,
                         )| {
                             Box::pin(async move {
                                 if let Some((_, doc)) = &prepared_docs.upstream {
@@ -9398,6 +9406,7 @@ mod inner {
                                     &mut *s,
                                     namespace.as_str(),
                                     restored_proxy_id.as_str(),
+                                    &validation_http_client,
                                 )
                                 .await
                                 .map_err(|error| {

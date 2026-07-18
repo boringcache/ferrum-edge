@@ -78,10 +78,10 @@ pub(crate) fn api_spec_recovered_proxy_graph(
 /// transaction commits.
 pub(crate) async fn validate_api_spec_recovered_plugin_graph(
     candidate: &GatewayConfig,
+    http_client: &crate::plugins::PluginHttpClient,
 ) -> Result<(), anyhow::Error> {
     let candidate = candidate.clone();
-    let http_client = crate::plugins::PluginHttpClient::default()
-        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header());
+    let http_client = http_client.clone();
     tokio::task::spawn_blocking(move || {
         crate::plugin_cache::validate_plugin_composition_candidate(&candidate, &http_client)
             .map_err(anyhow::Error::msg)?;
@@ -1348,6 +1348,7 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         spec: &ApiSpec,
         additional_upstreams: &[Upstream],
         additional_plugins: &[PluginConfig],
+        validation_http_client: &crate::plugins::PluginHttpClient,
     ) -> Result<(), anyhow::Error>;
 
     /// Atomically replace an existing api spec identified by `spec.id`.

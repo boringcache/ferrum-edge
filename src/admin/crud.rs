@@ -711,6 +711,7 @@ async fn recover_late_resource_write<R: AdminResource>(
                         recovery
                             .delete_snapshots
                             .and_then(|snapshots| snapshots.api_spec),
+                        http_client,
                     )
                     .await?;
                 }
@@ -1172,6 +1173,104 @@ pub(crate) async fn validate_plugin_graph_proxy_deletion_candidate(
 
     let http_client = super::plugin_validation_http_client(state);
     validate_candidate_plugin_graph(&candidate, &http_client)
+}
+
+/// A direct proxy delete can cascade resources that the runtime snapshot
+/// deliberately exposes without API-spec ownership metadata. Re-read every
+/// resource that compensation would classify as hand-owned before persistence,
+/// while namespace admission is still held, so a foreign spec's resource can
+/// never be restored with its ownership stripped.
+async fn validate_direct_api_spec_proxy_delete_restore_ownership(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &Proxy,
+) -> Result<(), AfterValidateError> {
+    let spec = db
+        .get_api_spec_by_proxy(namespace, &proxy.id)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let Some(spec) = spec else {
+        if let Some(owner) = proxy.api_spec_id.as_deref() {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' is stamped to API spec '{}' but its owning API-spec metadata is missing",
+                proxy.id, owner
+            )]));
+        }
+        return Ok(());
+    };
+    if let Some(owner) = proxy.api_spec_id.as_deref()
+        && owner != spec.id
+    {
+        return Err(AfterValidateError::BadRequest(vec![format!(
+            "proxy '{}' is stamped to API spec '{}' but its owning metadata identifies API spec '{}'",
+            proxy.id, owner, spec.id
+        )]));
+    }
+    let snapshot = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let associated_ids = proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect::<HashSet<_>>();
+    let other_associated_ids = snapshot
+        .proxies
+        .iter()
+        .filter(|candidate| candidate.id != proxy.id)
+        .flat_map(|candidate| candidate.plugins.iter())
+        .map(|association| association.plugin_config_id.as_str())
+        .collect::<HashSet<_>>();
+
+    for snapshot_plugin in snapshot.plugin_configs.iter().filter(|plugin| {
+        plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+            || (plugin.scope == PluginScope::ProxyGroup
+                && associated_ids.contains(plugin.id.as_str())
+                && !other_associated_ids.contains(plugin.id.as_str()))
+    }) {
+        let Some(plugin) = db
+            .get_plugin_config(namespace, &snapshot_plugin.id)
+            .await
+            .map_err(AfterValidateError::Db)?
+        else {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' cascade plugin '{}' disappeared before API-spec restore ownership validation",
+                proxy.id, snapshot_plugin.id
+            )]));
+        };
+        if let Some(owner) = plugin.api_spec_id.as_deref()
+            && owner != spec.id
+        {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' cascade plugin '{}' is owned by API spec '{}', not owning API spec '{}'",
+                proxy.id, plugin.id, owner, spec.id
+            )]));
+        }
+    }
+
+    if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+        let Some(upstream) = db
+            .get_upstream(namespace, upstream_id)
+            .await
+            .map_err(AfterValidateError::Db)?
+        else {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' upstream '{}' disappeared before API-spec restore ownership validation",
+                proxy.id, upstream_id
+            )]));
+        };
+        if let Some(owner) = upstream.api_spec_id.as_deref()
+            && owner != spec.id
+        {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' upstream '{}' is owned by API spec '{}', not owning API spec '{}'",
+                proxy.id, upstream.id, owner, spec.id
+            )]));
+        }
+    }
+
+    Ok(())
 }
 
 /// Validate the post-mutation named log-schema graph for one namespace.
@@ -1665,6 +1764,7 @@ pub(crate) trait AdminResource:
         previous: &Self,
         _previous_snapshot: Option<&GatewayConfig>,
         _previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+        _http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<()> {
         Self::db_create(db, previous).await
     }
@@ -3235,6 +3335,7 @@ impl AdminResource for PluginConfig {
         previous: &Self,
         previous_snapshot: Option<&GatewayConfig>,
         _previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+        _http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<()> {
         let snapshot = previous_snapshot.ok_or_else(|| {
             anyhow::anyhow!("late plugin delete recovery is missing the namespace snapshot")
@@ -3756,6 +3857,7 @@ impl AdminResource for Proxy {
         previous: &Self,
         previous_snapshot: Option<&GatewayConfig>,
         previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+        http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<()> {
         let snapshot = previous_snapshot.ok_or_else(|| {
             anyhow::anyhow!("late proxy delete recovery is missing the namespace snapshot")
@@ -3850,8 +3952,14 @@ impl AdminResource for Proxy {
                 upstream: bundle_upstream,
                 plugins: spec_plugins,
             };
-            db.restore_api_spec_bundle(&bundle, spec, &additional_upstreams, &additional_plugins)
-                .await?;
+            db.restore_api_spec_bundle(
+                &bundle,
+                spec,
+                &additional_upstreams,
+                &additional_plugins,
+                &http_client,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -4172,6 +4280,7 @@ impl AdminResource for Proxy {
         existing: &Self,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
+        validate_direct_api_spec_proxy_delete_restore_ownership(db, namespace, existing).await?;
         validate_plugin_graph_proxy_deletion_candidate(db, state, namespace, &existing.id).await
     }
 

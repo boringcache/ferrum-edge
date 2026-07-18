@@ -49,6 +49,7 @@ use ferrum_edge::{
             ApiSpec, PluginAssociation, PluginConfig, PluginScope, Proxy, SpecFormat, Upstream,
         },
     },
+    plugins::PluginHttpClient,
 };
 use std::{
     collections::HashSet,
@@ -75,6 +76,10 @@ static COUNTER: AtomicU64 = AtomicU64::new(1);
 fn uid(prefix: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{n}")
+}
+
+fn restore_validation_http_client() -> PluginHttpClient {
+    PluginHttpClient::default()
 }
 
 /// Pool config with short timeouts for test speed.
@@ -546,6 +551,7 @@ async fn restore_bundle_preserves_complete_owned_and_hand_added_graph() {
             &spec,
             &[],
             std::slice::from_ref(&additional_plugin),
+            &restore_validation_http_client(),
         )
         .await
         .expect("atomic API-spec restore failed");
@@ -676,7 +682,13 @@ async fn restore_bundle_preserves_unattached_proxy_config_during_late_delete_com
     unattached.priority_override = Some(19);
 
     store
-        .restore_api_spec_bundle(&bundle, &spec, &[], std::slice::from_ref(&unattached))
+        .restore_api_spec_bundle(
+            &bundle,
+            &spec,
+            &[],
+            std::slice::from_ref(&unattached),
+            &restore_validation_http_client(),
+        )
         .await
         .expect("late-delete compensation must restore an unattached proxy config");
 
@@ -752,7 +764,7 @@ async fn restore_bundle_ignores_unrelated_malformed_plugin_association() {
     );
 
     store
-        .restore_api_spec_bundle(&bundle, &spec, &[], &[])
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
         .await
         .expect("unrelated repairable association must not block compensation");
 
@@ -795,11 +807,36 @@ fn mongo_restore_validation_uses_the_recovered_proxy_graph_projection() {
     assert!(validation.contains("recovered_graph.validate_plugin_references()"));
     assert!(validation.contains("load_full_upstreams_opt_session"));
     assert!(validation.contains("recovered_graph.validate_upstream_references()"));
-    assert!(validation.contains("validate_api_spec_recovered_plugin_graph(&recovered_graph)"));
+    assert!(validation.contains("validate_api_spec_recovered_plugin_graph("));
+    assert!(validation.contains("validation_http_client"));
     assert!(
         validation.contains("validate_tcp_connection_throttle_attachments(&candidate)"),
         "namespace-wide guarded composition validation must remain in force"
     );
+}
+
+#[test]
+fn recovery_graph_validation_uses_the_configured_admin_http_client() {
+    let shared = include_str!("../../src/config/db_backend.rs");
+    let validation_start = shared
+        .find("pub(crate) async fn validate_api_spec_recovered_plugin_graph(")
+        .expect("shared recovery graph validator");
+    let validation_end = shared[validation_start..]
+        .find("/// Validate the immutable identity")
+        .map(|offset| validation_start + offset)
+        .expect("end of shared recovery graph validator");
+    let validation = &shared[validation_start..validation_end];
+    assert!(validation.contains("http_client: &crate::plugins::PluginHttpClient"));
+    assert!(validation.contains("let http_client = http_client.clone();"));
+    assert!(!validation.contains("PluginHttpClient::default"));
+
+    let sql = include_str!("../../src/config/db_loader.rs");
+    assert!(sql.contains("validation_http_client: &crate::plugins::PluginHttpClient"));
+    assert!(sql.contains("&recovered_graph,\n            validation_http_client,"));
+
+    let handlers = include_str!("../../src/admin/api_specs/handlers.rs");
+    assert!(handlers.contains("plugin_validation_http_client(state)"));
+    assert!(handlers.contains("&validation_http_client,"));
 }
 
 #[tokio::test]
@@ -846,7 +883,13 @@ async fn restore_bundle_rolls_back_resources_associations_spec_and_changes_on_la
     let additional = make_plugin(additional_plugin_id, proxy_id, ns, None);
 
     let error = store
-        .restore_api_spec_bundle(&bundle, &spec, &[additional_upstream], &[additional])
+        .restore_api_spec_bundle(
+            &bundle,
+            &spec,
+            &[additional_upstream],
+            &[additional],
+            &restore_validation_http_client(),
+        )
         .await
         .expect_err("fault-injected restore must fail");
     assert!(
@@ -937,7 +980,13 @@ async fn restore_bundle_preserves_preexisting_shared_additional_upstream() {
     pre_delete_upstream.name = Some("stale pre-delete snapshot".to_string());
 
     store
-        .restore_api_spec_bundle(&bundle, &spec, &[pre_delete_upstream], &[])
+        .restore_api_spec_bundle(
+            &bundle,
+            &spec,
+            &[pre_delete_upstream],
+            &[],
+            &restore_validation_http_client(),
+        )
         .await
         .expect("restore must reuse the hand upstream retained by another proxy");
 
@@ -993,7 +1042,13 @@ async fn restore_bundle_rejects_recreated_additional_upstream_identity() {
     );
 
     let error = store
-        .restore_api_spec_bundle(&bundle, &spec, &[pre_delete_upstream], &[])
+        .restore_api_spec_bundle(
+            &bundle,
+            &spec,
+            &[pre_delete_upstream],
+            &[],
+            &restore_validation_http_client(),
+        )
         .await
         .expect_err("replacement upstream identity must reject compensation");
     assert!(
@@ -1043,7 +1098,7 @@ async fn restore_bundle_rejects_intervening_schema_dependency_removal() {
     );
 
     let error = store
-        .restore_api_spec_bundle(&bundle, &spec, &[], &[])
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
         .await
         .expect_err("missing current schema dependency must reject compensation");
     assert!(
@@ -1117,7 +1172,13 @@ async fn restore_bundle_rejects_invalid_additional_upstream_ownership_before_wri
         additional.api_spec_id = owner.map(str::to_string);
 
         let error = store
-            .restore_api_spec_bundle(&bundle, &spec, &[additional], &[])
+            .restore_api_spec_bundle(
+                &bundle,
+                &spec,
+                &[additional],
+                &[],
+                &restore_validation_http_client(),
+            )
             .await
             .expect_err("invalid additional upstream must fail before persistence");
         assert!(
@@ -1184,7 +1245,13 @@ async fn restore_bundle_rejects_overlapping_ids_and_foreign_ownership_before_wri
         let additional = make_plugin(&additional_id, &proxy_id, ns, additional_owner);
 
         let error = store
-            .restore_api_spec_bundle(&bundle, &spec, &[], &[additional])
+            .restore_api_spec_bundle(
+                &bundle,
+                &spec,
+                &[],
+                &[additional],
+                &restore_validation_http_client(),
+            )
             .await
             .expect_err("invalid restore input must fail");
         assert!(
@@ -1231,7 +1298,7 @@ async fn restore_bundle_rejects_wrong_preexisting_plugin_instance_and_rolls_back
     };
     let spec = make_spec(&spec_id, &proxy_id, ns, b"wrong plugin instance restore");
     let error = store
-        .restore_api_spec_bundle(&bundle, &spec, &[], &[])
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
         .await
         .expect_err("global plugin association must fail closed");
     assert!(
@@ -1285,7 +1352,7 @@ async fn restore_bundle_preserves_preexisting_proxy_when_later_insert_conflicts(
     let spec = make_spec(&spec_id, &proxy_id, ns, b"pre-existing proxy conflict");
     assert!(
         store
-            .restore_api_spec_bundle(&bundle, &spec, &[], &[])
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
             .await
             .is_err()
     );
@@ -1340,7 +1407,7 @@ async fn restore_bundle_rejects_intervening_route_conflict_and_rolls_back() {
     );
 
     let error = store
-        .restore_api_spec_bundle(&bundle, &spec, &[], &[])
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
         .await
         .expect_err("overlapping intervening route must reject compensation");
     assert!(
@@ -1394,7 +1461,7 @@ async fn restore_bundle_rejects_missing_hand_owned_upstream_reference() {
 
     assert!(
         store
-            .restore_api_spec_bundle(&bundle, &spec, &[], &[])
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
             .await
             .is_err(),
         "compensation must reject a proxy whose hand-owned upstream disappeared"
@@ -1448,7 +1515,7 @@ async fn restore_bundle_rejects_intervening_hand_owned_upstream_subset_change() 
     );
 
     let error = store
-        .restore_api_spec_bundle(&bundle, &spec, &[], &[])
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
         .await
         .expect_err("removed upstream subset must reject compensation");
     assert!(
@@ -1507,7 +1574,7 @@ async fn restore_bundle_rejects_intervening_hand_owned_mesh_retry_change() {
     );
 
     let error = store
-        .restore_api_spec_bundle(&bundle, &spec, &[], &[])
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
         .await
         .expect_err("new mesh transport/retry conflict must reject compensation");
     let message = error.to_string();

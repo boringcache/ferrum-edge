@@ -109,9 +109,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("late plugin delete compensation could not restore proxy"));
     assert!(crud_source.contains("late_delete_api_spec_snapshot("));
     assert!(crud_source.contains("db.get_api_spec_by_proxy(namespace, &previous.id)"));
-    assert!(crud_source.contains(
-        "restore_api_spec_bundle(&bundle, spec, &additional_upstreams, &additional_plugins)"
-    ));
+    assert!(crud_source.contains("db.restore_api_spec_bundle("));
+    assert!(crud_source.contains("&http_client,"));
     assert!(crud_source.contains("affected_upstreams"));
     assert!(crud_source.contains("task.abort();"));
     assert!(crud_source.contains("tokio::time::timeout("));
@@ -273,10 +272,20 @@ fn direct_api_spec_proxy_delete_uses_atomic_restore_contract() {
     assert!(recovery.contains("!spec_plugin_ids.contains(plugin.id.as_str())"));
     assert!(recovery.contains(".position(|affected| affected.id == upstream.id)"));
     assert!(recovery.contains("affected_upstreams[existing_index] = upstream.clone()"));
-    assert!(recovery.contains(
-        "restore_api_spec_bundle(&bundle, spec, &additional_upstreams, &additional_plugins)"
-    ));
+    assert!(recovery.contains("db.restore_api_spec_bundle("));
+    assert!(recovery.contains("&http_client,"));
     assert!(!recovery.contains("db.submit_api_spec_bundle("));
+
+    let ownership_validation = source
+        .find("async fn validate_direct_api_spec_proxy_delete_restore_ownership(")
+        .expect("direct proxy DELETE must validate authoritative restore ownership");
+    let ownership_validation = &source[ownership_validation..proxy_impl];
+    assert!(ownership_validation.contains(".get_plugin_config(namespace, &snapshot_plugin.id)"));
+    assert!(ownership_validation.contains(".get_upstream(namespace, upstream_id)"));
+    assert!(ownership_validation.contains("owner != spec.id"));
+    assert!(source[proxy_impl..].contains(
+        "validate_direct_api_spec_proxy_delete_restore_ownership(db, namespace, existing)"
+    ));
 }
 
 #[test]
