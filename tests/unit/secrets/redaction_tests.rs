@@ -10,7 +10,7 @@
 use crate::unit::env_lock::ENV_LOCK;
 use ferrum_edge::secrets::{
     EXTERNAL_SECRET_PLACEHOLDER, WITHHELD_LOG_RECORD, is_external_secret_key,
-    record_external_secret_keys, redact_external_secret_values,
+    record_external_secret_keys, redact_external_secret_values, withheld_log_record,
 };
 use std::sync::Once;
 
@@ -82,7 +82,45 @@ const BACKSPACE_VALUE: &str = "\u{8}";
 const NULL_KEY: &str = "FERRUM_REDACTION_FIXTURE_NULL";
 const NULL_VALUE: &str = "null";
 
-const FIXTURES: [(&str, &str); 11] = [
+/// A TLS source URI. A successful fetch is reported back by
+/// `SecretBackend::source` as `<provider>:<identifier>` — one colon, no `//` —
+/// and that rewritten string, not the value as materialized, is the
+/// `source_id` a PEM parse failure prints.
+const SOURCE_URI_KEY: &str = "FERRUM_REDACTION_FIXTURE_SOURCE_URI";
+const SOURCE_URI_VALUE: &str = "vault://secret/data/gw-sentinel#cert-sentinel";
+const SOURCE_URI_REPORTED: &str = "vault:secret/data/gw-sentinel#cert-sentinel";
+
+/// A `file://` TLS source, which validation reports by bare filesystem path
+/// with the scheme stripped entirely.
+const FILE_URI_KEY: &str = "FERRUM_REDACTION_FIXTURE_FILE_URI";
+const FILE_URI_VALUE: &str = "file:///run/secrets/cert-path-sentinel.pem";
+const FILE_URI_STRIPPED: &str = "/run/secrets/cert-path-sentinel.pem";
+
+/// A database URL. MongoDB TLS-conflict diagnostics render it through
+/// `db_backend::redact_url`, which scrubs the credentials but leaves the host,
+/// path, and remaining query of the resolved value in the message.
+const DB_URL_KEY: &str = "FERRUM_REDACTION_FIXTURE_DB_URL";
+const DB_URL_VALUE: &str =
+    "mongodb://user-sentinel:pass-sentinel@host-sentinel/db?authSource=admin-sentinel";
+
+/// A value that config parsing canonicalizes before logging it: leading zeros
+/// are gone by the time it is echoed as `configured=…`.
+///
+/// Deliberately not a plausible port or limit, for the same reason as
+/// [`NUMBER_VALUE`] — the canonical form is armed process-wide.
+const NUMBER_CANON_KEY: &str = "FERRUM_REDACTION_FIXTURE_NUMBER_CANON";
+const NUMBER_CANON_VALUE: &str = "0918273646";
+const NUMBER_CANON_RENDERED: &str = "918273646";
+
+/// A short exact secret that collides with the withheld-record template's own
+/// `target` value. The fail-closed replacement must not disclose it.
+///
+/// Safe to arm process-wide: no other record emitted through the sink in this
+/// binary carries this target (the fixtures above use `ferrum_edge::config`).
+const WITHHELD_TARGET_KEY: &str = "FERRUM_REDACTION_FIXTURE_WITHHELD_TARGET";
+const WITHHELD_TARGET_VALUE: &str = "ferrum_edge::secrets";
+
+const FIXTURES: [(&str, &str); 16] = [
     (PLAIN_KEY, PLAIN_VALUE),
     (LIST_KEY, LIST_VALUE),
     (CASE_KEY, CASE_VALUE),
@@ -94,6 +132,11 @@ const FIXTURES: [(&str, &str); 11] = [
     (TAB_KEY, TAB_VALUE),
     (BACKSPACE_KEY, BACKSPACE_VALUE),
     (NULL_KEY, NULL_VALUE),
+    (SOURCE_URI_KEY, SOURCE_URI_VALUE),
+    (FILE_URI_KEY, FILE_URI_VALUE),
+    (DB_URL_KEY, DB_URL_VALUE),
+    (NUMBER_CANON_KEY, NUMBER_CANON_VALUE),
+    (WITHHELD_TARGET_KEY, WITHHELD_TARGET_VALUE),
 ];
 
 static RECORDED: Once = Once::new();
@@ -497,8 +540,113 @@ fn a_non_json_record_containing_a_resolved_value_is_withheld() {
         !line.contains(PLAIN_VALUE),
         "the resolved value must not survive: {line}"
     );
-    assert_eq!(line, format!("{WITHHELD_LOG_RECORD}\n"));
+    assert_eq!(line, format!("{}\n", withheld_log_record()));
     parse_record(&line);
+}
+
+/// The withheld record is fixed, but "fixed" is not the same as "safe": an
+/// exact resolved value has no minimum length, and `WARN`, `secret`, `values`,
+/// and `ferrum_edge::secrets` are all values the template carries in its own
+/// fields. Emitting the template verbatim would disclose such a secret on the
+/// one path whose entire purpose is to withhold one.
+#[test]
+fn the_withheld_record_does_not_disclose_a_colliding_short_secret() {
+    let line = through_sink(|sink| {
+        assert_eq!(
+            sink.try_write_bytes(format!("not json at all: {PLAIN_VALUE}\n").as_bytes()),
+            EnqueueResult::Queued
+        );
+    });
+
+    let record = parse_record(&line);
+    let object = record.as_object().expect("record is a JSON object");
+    let discloses = object.values().any(|value| {
+        value
+            .as_str()
+            .is_some_and(|text| text.contains(WITHHELD_TARGET_VALUE))
+    });
+    assert!(
+        !discloses,
+        "the fail-closed replacement must not carry a colliding resolved value: {line}"
+    );
+    // The template itself does contain it, so the assertion above is only
+    // meaningful because redaction actually ran.
+    assert!(
+        WITHHELD_LOG_RECORD.contains(WITHHELD_TARGET_VALUE),
+        "fixture no longer collides with the template; pick a colliding value"
+    );
+    // Schema keys are untouched, so a log pipeline still sees the same shape.
+    assert!(object.contains_key("target") && object.contains_key("level"));
+    assert_eq!(
+        record["target"],
+        serde_json::Value::String(EXTERNAL_SECRET_PLACEHOLDER.to_string()),
+        "the colliding value must be replaced, not dropped: {line}"
+    );
+}
+
+/// A successful fetch is reported by a *rewritten* reference: `vault://x` is
+/// echoed back as `vault:x`. That transformed form is not the value as
+/// materialized, so exact matching alone lets a TLS parse failure print the
+/// operator's Vault path.
+#[test]
+fn a_provider_rewritten_source_reference_is_redacted() {
+    let message = redact_external_secret_values(&format!(
+        "Failed to parse PEM from {SOURCE_URI_REPORTED}: malformed"
+    ));
+    assert!(
+        !message.contains("gw-sentinel") && !message.contains("cert-sentinel"),
+        "the rewritten source reference must not survive: {message}"
+    );
+    assert!(
+        message.contains("Failed to parse PEM from") && message.contains("malformed"),
+        "the actionable diagnostic must survive: {message}"
+    );
+}
+
+/// A `file://` source is reported by bare path, the scheme stripped.
+#[test]
+fn a_scheme_stripped_file_source_is_redacted() {
+    let message =
+        redact_external_secret_values(&format!("Invalid certificate at {FILE_URI_STRIPPED}"));
+    assert!(
+        !message.contains("cert-path-sentinel"),
+        "the scheme-stripped path must not survive: {message}"
+    );
+    assert!(message.contains("Invalid certificate at"));
+}
+
+/// A database URL reaches the operator credential-redacted, which leaves the
+/// host, path, and query of the externally resolved value intact.
+#[test]
+fn a_credential_redacted_url_form_is_redacted() {
+    let rendered = ferrum_edge::config::db_backend::redact_url(DB_URL_VALUE);
+    assert!(
+        rendered != DB_URL_VALUE && rendered.contains("host-sentinel"),
+        "fixture must actually be transformed and still carry the host: {rendered}"
+    );
+
+    let message = redact_external_secret_values(&format!(
+        "MongoDB TLS options conflict for {rendered}: check tls settings"
+    ));
+    assert!(
+        !message.contains("host-sentinel") && !message.contains("admin-sentinel"),
+        "the credential-redacted URL must not survive: {message}"
+    );
+    assert!(message.contains("MongoDB TLS options conflict for"));
+}
+
+/// Typed parsing canonicalizes before logging: `03601` is warned about as
+/// `configured=3601`, which matches no exact-value candidate.
+#[test]
+fn a_canonicalized_numeric_rendering_is_redacted() {
+    let message = redact_external_secret_values(&format!(
+        "pool statement timeout configured={NUMBER_CANON_RENDERED}s"
+    ));
+    assert!(
+        !message.contains(NUMBER_CANON_RENDERED),
+        "the canonical numeric rendering must not survive: {message}"
+    );
+    assert!(message.contains("pool statement timeout configured="));
 }
 
 /// A non-JSON record that contains nothing to redact is left alone — the

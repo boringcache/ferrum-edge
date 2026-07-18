@@ -29,8 +29,8 @@ pub(crate) fn split_reference_field(reference: &str) -> (&str, Option<&str>) {
 
 #[allow(unused_imports)]
 pub use registry::{
-    ResolvedEnvSecrets, ResolvedSecret, resolve_all_env_secrets, resolve_external_reference,
-    resolve_secret,
+    EXTERNAL_SECRET_SUFFIXES, ResolvedEnvSecrets, ResolvedSecret, external_source_configured,
+    resolve_all_env_secrets, resolve_external_reference, resolve_secret,
 };
 
 /// Base `FERRUM_*` variables whose current value was materialized from an
@@ -195,9 +195,12 @@ pub fn redact_external_secret_values(message: &str) -> String {
 ///
 /// Fail-closed: a record that is not well-formed JSON, or that cannot be
 /// reserialized, cannot be sanitized without risking either a leak or a
-/// corrupt line, so it is replaced with [`WITHHELD_LOG_RECORD`] — a fixed,
-/// valid JSON line. The candidate is never emitted on any failure path. This
-/// costs the operator one anomalous diagnostic rather than a secret.
+/// corrupt line, so it is replaced with [`withheld_log_record`] — a fixed,
+/// valid JSON line whose own field values have themselves been through this
+/// same structural redaction, so a short exact secret that happens to equal
+/// `WARN` or `ferrum_edge::secrets` is not disclosed by the very record that
+/// exists to withhold one. The candidate is never emitted on any failure path.
+/// This costs the operator one anomalous diagnostic rather than a secret.
 ///
 /// Callers on the hot path pay one relaxed atomic load when no external secret
 /// was ever resolved, and one allocation-free scan
@@ -218,7 +221,7 @@ pub(crate) fn redact_log_record(record: &mut Vec<u8>) {
         // Non-UTF-8 bytes cannot be scanned at all, so this record cannot be
         // shown to be free of a resolved value. Unreachable for the three
         // producers above; withhold rather than guess.
-        Err(_) => Some(withheld_record(trailing_newline)),
+        Err(_) => Some(withheld_record(plan, trailing_newline)),
         Ok(text) if plan.contains_candidate(text) => Some(match plan.redact_json_record(text) {
             Some(mut redacted) => {
                 if trailing_newline {
@@ -226,7 +229,7 @@ pub(crate) fn redact_log_record(record: &mut Vec<u8>) {
                 }
                 redacted.into_bytes()
             }
-            None => withheld_record(trailing_newline),
+            None => withheld_record(plan, trailing_newline),
         }),
         // Nothing to redact: leave the record's bytes exactly as serialized.
         Ok(_) => None,
@@ -236,19 +239,49 @@ pub(crate) fn redact_log_record(record: &mut Vec<u8>) {
     }
 }
 
-/// Emitted in place of a record that cannot be structurally sanitized.
+/// Template for the record emitted in place of one that cannot be structurally
+/// sanitized.
 ///
 /// Deliberately a valid JSON object carrying the same stable `level`/`target`/
 /// `message` keys the fmt layer emits, so a log pipeline sees a well-formed
 /// line it can account for instead of a silent gap or a parse error. It is a
-/// fixed literal with no interpolation, so it cannot itself carry a value.
+/// fixed literal with no interpolation, so it cannot carry a value *derived*
+/// from the record it replaces.
+///
+/// It can still *collide* with one, though: a resolved value has deliberately
+/// no minimum length, so an exact secret of `WARN`, `secret`, `values`, or
+/// `ferrum_edge::secrets` is present verbatim in this literal's own field
+/// values. Emitting the template unchanged would therefore disclose a short
+/// exact secret on the one path that exists to prevent disclosure. So the
+/// template is passed through the *same* structural redaction as every other
+/// record when the plan is built, and [`withheld_log_record`] is what is
+/// actually emitted. See [`RedactionPlan::build`].
 pub const WITHHELD_LOG_RECORD: &str = concat!(
     r#"{"level":"WARN","target":"ferrum_edge::secrets","#,
     r#""message":"log record withheld: it is not well-formed JSON and could not be checked for externally resolved secret values"}"#
 );
 
-fn withheld_record(trailing_newline: bool) -> Vec<u8> {
-    let mut bytes = WITHHELD_LOG_RECORD.as_bytes().to_vec();
+/// Fallback when even [`WITHHELD_LOG_RECORD`] cannot be reserialized.
+///
+/// A valid, minimal, candidate-free JSON object. Its two bytes are JSON syntax
+/// rather than content derived from any value, exactly like the delimiters and
+/// schema keys the structural redactor already leaves alone.
+const MINIMAL_WITHHELD_LOG_RECORD: &str = "{}";
+
+/// The withheld-record line for this process, with any externally resolved
+/// value already removed from its field values.
+///
+/// Returns the bare template before redaction is armed, where there is nothing
+/// to collide with.
+pub fn withheld_log_record() -> &'static str {
+    match redaction_plan() {
+        Some(plan) => plan.withheld_record.as_str(),
+        None => WITHHELD_LOG_RECORD,
+    }
+}
+
+fn withheld_record(plan: &RedactionPlan, trailing_newline: bool) -> Vec<u8> {
+    let mut bytes = plan.withheld_record.as_bytes().to_vec();
     if trailing_newline {
         bytes.push(b'\n');
     }
@@ -404,12 +437,20 @@ fn redaction_plan() -> Option<&'static RedactionPlan> {
 ///    whole variable (`Invalid FERRUM_CP_NAMESPACES entry '...'`);
 /// 3. the ASCII upper/lowercase of each of the above, for case-normalizing
 ///    validators such as `FERRUM_TLS_EARLY_DATA_METHODS`;
-/// 4. the JSON-escaped body of each of the above, because the tracing fmt
+/// 4. the reference rewrites this codebase performs on a value that names a
+///    source — see [`derive_reference_forms`];
+/// 5. the canonical rendering of a value that is parsed into a scalar — see
+///    [`derive_scalar_forms`];
+/// 6. the ASCII upper/lowercase of each of the above (again, for 4 and 5), and
+/// 7. the JSON-escaped body of each of the above, because the tracing fmt
 ///    layer escapes the record before [`redact_log_record`] sees it.
 ///
-/// Bounded at `(2 + MAX_LIST_SEGMENTS) * 3 * 2` forms per value — a fixed
-/// ceiling, not a function of message size — so no configuration can turn
-/// candidate discovery into an amplification vector.
+/// Bounded at `(2 + MAX_LIST_SEGMENTS + MAX_REFERENCE_FORMS + MAX_SCALAR_FORMS)
+/// * 3 * 2` forms per value — a fixed ceiling, not a function of message size —
+/// so no configuration can turn candidate discovery into an amplification
+/// vector. Each derivation below is a single deterministic rewrite of the value
+/// itself, never a rewrite of another derived form, so the expansion stays
+/// additive rather than combinatorial.
 ///
 /// **Residual, deliberate:** a value with more than `MAX_LIST_SEGMENTS`
 /// comma-separated segments contributes no per-segment candidates. Such a value
@@ -431,6 +472,9 @@ fn derive_candidates(value: &str) -> Vec<String> {
         );
     }
 
+    forms.extend(derive_reference_forms(value));
+    forms.extend(derive_scalar_forms(value));
+
     let case_forms: Vec<String> = forms
         .iter()
         .flat_map(|form| [form.to_ascii_uppercase(), form.to_ascii_lowercase()])
@@ -443,6 +487,110 @@ fn derive_candidates(value: &str) -> Vec<String> {
         .collect();
     forms.extend(escaped_forms);
 
+    forms
+}
+
+/// Upper bound on the forms [`derive_reference_forms`] can return.
+const MAX_REFERENCE_FORMS: usize = 5;
+
+/// Rewrites this codebase performs on a resolved value that *names a source*,
+/// before printing it back to an operator.
+///
+/// An externally resolved variable is not always consumed as opaque material.
+/// `FERRUM_FRONTEND_TLS_CERT_PATH_FILE` can materialize a `vault://…` or
+/// `file://…` URI, and `FERRUM_DB_URL_FILE` materializes a database URL; both
+/// are then re-rendered by Ferrum itself before any diagnostic prints them, so
+/// the value *as materialized* is not the string the operator sees:
+///
+/// * `tls::source::CertSourceUri::parse` splits `<scheme>://<identifier>?<query>`
+///   and keeps only the identifier, and
+///   `secrets::registry::SecretBackend::source` renders the completed fetch as
+///   `<provider>:<identifier>` — one colon, no `//`. That is what lands in
+///   `MaterializedMaterial`'s `source_id` and what a PEM-parse failure prints.
+/// * a `file://` source is reported by its bare filesystem path, the scheme
+///   stripped entirely (`CertSource::Path` / `load_file_material`).
+/// * a database URL is echoed credential-redacted by
+///   `config::db_backend::redact_url` (MongoDB TLS-conflict diagnostics, driver
+///   error scrubbing), which rewrites userinfo and query values but leaves the
+///   host, path, and remaining query of the resolved value intact.
+///
+/// Each of these is a deterministic function of the value that this code
+/// already owns, so each is reproduced here rather than re-audited at every
+/// print site. Non-URI values fall through and contribute nothing: the scheme
+/// branch requires a literal `://` with an RFC-3986-shaped scheme, and
+/// `redact_url`'s `<invalid-url>` sentinel is deliberately dropped — admitting
+/// it would redact that fixed marker out of every unrelated diagnostic.
+fn derive_reference_forms(value: &str) -> Vec<String> {
+    let mut forms: Vec<String> = Vec::new();
+    let trimmed = value.trim();
+
+    if let Some((scheme, rest)) = trimmed.split_once("://")
+        && !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        let identifier = rest.split('?').next().unwrap_or(rest);
+        forms.push(format!("{scheme}:{identifier}"));
+        forms.push(identifier.to_string());
+        if identifier != rest {
+            forms.push(format!("{scheme}:{rest}"));
+            forms.push(rest.to_string());
+        }
+    }
+
+    if trimmed.contains("://") {
+        let redacted = crate::config::db_backend::redact_url(trimmed);
+        if redacted != trimmed && redacted != "<invalid-url>" {
+            forms.push(redacted);
+        }
+    }
+
+    debug_assert!(forms.len() <= MAX_REFERENCE_FORMS);
+    forms
+}
+
+/// Upper bound on the forms [`derive_scalar_forms`] can return.
+const MAX_SCALAR_FORMS: usize = 2;
+
+/// The canonical rendering of a resolved value that config parsing turns into a
+/// typed scalar.
+///
+/// `EnvConfig` does not echo most values as written; it parses them and then
+/// logs the parsed result. `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS_FILE=03601`
+/// is warned about as `configured=3601`, and `FERRUM_TLS_NO_VERIFY_FILE=1` is
+/// rendered `true` — neither of which is the string that was materialized, so
+/// neither would match an exact-value candidate.
+///
+/// Only the two canonicalizations Ferrum actually performs are reproduced: the
+/// boolean spellings `EnvValue for bool`/`AutoBool` accept (`true`/`1`,
+/// `false`/`0`, case-insensitive after `trim()`), and integer/float
+/// normalization through `Display`, which is what strips leading zeros, a `+`
+/// sign, and exponent notation. Both are derived candidates and so carry the
+/// 3-byte minimum, which is why a bare `1` contributes `true` but not `1`
+/// itself — the exact value already covers that, without the minimum.
+fn derive_scalar_forms(value: &str) -> Vec<String> {
+    let mut forms: Vec<String> = Vec::new();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return forms;
+    }
+
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" => forms.push("true".to_string()),
+        "false" | "0" => forms.push("false".to_string()),
+        _ => {}
+    }
+
+    if let Ok(integer) = trimmed.parse::<i128>() {
+        forms.push(integer.to_string());
+    } else if let Ok(float) = trimmed.parse::<f64>()
+        && float.is_finite()
+    {
+        forms.push(float.to_string());
+    }
+
+    debug_assert!(forms.len() <= MAX_SCALAR_FORMS);
     forms
 }
 
@@ -466,6 +614,11 @@ struct RedactionPlan {
     /// candidate list; with it the common no-match position costs one indexed
     /// bool load.
     first_bytes: [bool; 256],
+    /// [`WITHHELD_LOG_RECORD`] with its own field values already redacted
+    /// against `candidates`. Computed once here rather than per withheld
+    /// record, which keeps the fail-closed path allocation-cheap and, more
+    /// importantly, keeps it from depending on anything but the fixed template.
+    withheld_record: String,
 }
 
 impl RedactionPlan {
@@ -522,10 +675,26 @@ impl RedactionPlan {
             }
         }
 
-        Self {
+        let mut plan = Self {
             candidates,
             first_bytes,
-        }
+            withheld_record: String::new(),
+        };
+        // The fail-closed replacement is a record like any other: an exact
+        // secret with no minimum length can equal one of the template's own
+        // field values (`WARN`, `ferrum_edge::secrets`, `secret`, `values`), and
+        // emitting the template verbatim would then disclose it on the one path
+        // whose entire purpose is not to. Structural redaction rewrites those
+        // values and leaves the schema keys and JSON syntax alone, exactly as
+        // for a real record. Reserialization of a compile-time-constant valid
+        // JSON object cannot fail, but the fallback is a minimal object rather
+        // than the template so that "cannot sanitize" never means "emit
+        // unsanitized".
+        let withheld_record = plan
+            .redact_json_record(WITHHELD_LOG_RECORD)
+            .unwrap_or_else(|| MINIMAL_WITHHELD_LOG_RECORD.to_string());
+        plan.withheld_record = withheld_record;
+        plan
     }
 
     /// Allocation-free "is there anything to do here?" screen.
@@ -692,6 +861,111 @@ impl RedactionPlan {
 // carries `from_static_token()` for that injection.
 #[cfg(feature = "secrets-azure")]
 pub use azure::{AzureCredentials, parse_keyvault_reference as azure_parse_keyvault_reference};
+
+/// Candidate derivation is deliberately private — the whole point of
+/// [`RedactionPlan`] is that no caller can hand it a different candidate set —
+/// and arming the process-wide plan is a one-shot `OnceLock`, so the external
+/// suite can only exercise a single fixture set per test binary. These assert
+/// the *individual* derivations directly, which keeps them from having to arm
+/// candidates like `true` process-wide (that would rewrite unrelated boolean
+/// assertions in every other test in the binary). End-to-end coverage that the
+/// derived forms actually reach a diagnostic lives in
+/// `tests/unit/secrets/redaction_tests.rs`.
+#[cfg(test)]
+mod derivation_tests {
+    use super::{derive_reference_forms, derive_scalar_forms};
+
+    #[test]
+    fn provider_source_rendering_of_a_uri_is_derived() {
+        // `SecretBackend::source` renders the completed fetch with one colon
+        // and no `//`; that string becomes `MaterializedMaterial`'s source id
+        // and is what a PEM parse failure prints.
+        let forms = derive_reference_forms("vault://secret/data/gw#cert");
+        assert!(forms.contains(&"vault:secret/data/gw#cert".to_string()));
+        assert!(forms.contains(&"secret/data/gw#cert".to_string()));
+    }
+
+    #[test]
+    fn a_uri_query_is_dropped_the_way_cert_source_uri_drops_it() {
+        let forms = derive_reference_forms("vault://secret/data/gw?version=3");
+        // The identifier `CertSourceUri::parse` keeps...
+        assert!(forms.contains(&"vault:secret/data/gw".to_string()));
+        // ...and the value as written, which some sites echo whole.
+        assert!(forms.contains(&"vault:secret/data/gw?version=3".to_string()));
+    }
+
+    #[test]
+    fn file_uri_contributes_its_scheme_stripped_path() {
+        let forms = derive_reference_forms("file:///run/secrets/cert.pem");
+        assert!(
+            forms.contains(&"/run/secrets/cert.pem".to_string()),
+            "TLS validation reports a file source by bare path: {forms:?}"
+        );
+    }
+
+    #[test]
+    fn credential_redacted_url_form_is_derived() {
+        let forms = derive_reference_forms("mongodb://user:pass@secret-host/db?tls=true");
+        assert!(
+            forms
+                .iter()
+                .any(|form| form.contains("secret-host") && !form.contains("pass")),
+            "the credential-redacted rendering still exposes host/path: {forms:?}"
+        );
+    }
+
+    #[test]
+    fn non_uri_values_derive_no_reference_forms() {
+        for value in ["plain-secret", "/run/secrets/token", "not a url at all"] {
+            assert!(
+                derive_reference_forms(value).is_empty(),
+                "{value} produced spurious reference candidates"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_url_sentinel_is_never_admitted_as_a_candidate() {
+        // Redacting `<invalid-url>` out of unrelated diagnostics would be a
+        // pure loss: it is a fixed marker, not derived from the value.
+        for value in ["://", "http://[", "scheme://"] {
+            assert!(
+                !derive_reference_forms(value).contains(&"<invalid-url>".to_string()),
+                "{value} admitted the invalid-url sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_number_and_boolean_renderings_are_derived() {
+        // `configured=3601` after typed parsing, not the `03601` materialized.
+        assert!(derive_scalar_forms("03601").contains(&"3601".to_string()));
+        assert!(derive_scalar_forms(" 42 ").contains(&"42".to_string()));
+        // `FERRUM_TLS_NO_VERIFY=1` renders as `true`.
+        assert!(derive_scalar_forms("1").contains(&"true".to_string()));
+        assert!(derive_scalar_forms("0").contains(&"false".to_string()));
+        assert!(derive_scalar_forms("TRUE").contains(&"true".to_string()));
+    }
+
+    #[test]
+    fn non_scalar_and_non_finite_values_derive_nothing() {
+        for value in ["", "   ", "not-a-number", "inf", "NaN"] {
+            assert!(
+                derive_scalar_forms(value).is_empty(),
+                "{value} produced spurious scalar candidates"
+            );
+        }
+    }
+
+    #[test]
+    fn derivation_stays_within_its_declared_bounds() {
+        // The `debug_assert!`s inside each function are the live bound; this
+        // pins the worst case that exercises every branch at once.
+        let both = "https://user:pass@host/path?query=1";
+        assert!(derive_reference_forms(both).len() <= super::MAX_REFERENCE_FORMS);
+        assert!(derive_scalar_forms("1").len() <= super::MAX_SCALAR_FORMS);
+    }
+}
 
 #[cfg(all(test, any(feature = "secrets-aws", feature = "secrets-vault")))]
 mod tests {

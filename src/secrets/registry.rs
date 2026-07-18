@@ -423,6 +423,35 @@ fn unsupported_cloud_suffix(raw_key: &str) -> Option<(&'static str, &'static str
     None
 }
 
+/// Every suffix that names an external secret source for a base `FERRUM_*`
+/// variable, including providers this build may not have compiled in.
+///
+/// Deliberately not feature-gated. An unsupported suffix is a *fail-closed
+/// error* from [`resolve_all_env_secrets`], not an ignored variable, so callers
+/// asking "is this key sourced externally?" must answer the same way in every
+/// build — otherwise a binary without, say, `secrets-vault` would treat
+/// `FERRUM_CONF_PATH_VAULT` as absent and quietly take a different code path
+/// before the error is ever raised.
+pub const EXTERNAL_SECRET_SUFFIXES: [&str; 5] = ["_FILE", "_VAULT", "_AWS", "_AZURE", "_GCP"];
+
+/// True when `base_key`'s value is configured to come from an external secret
+/// source rather than from the environment directly.
+///
+/// Uses the same "non-empty means set" rule as discovery in
+/// [`resolve_all_env_secrets`], so the two cannot disagree about whether a
+/// source exists.
+pub fn external_source_configured(base_key: &str) -> bool {
+    EXTERNAL_SECRET_SUFFIXES.iter().any(|suffix| {
+        let suffixed_key = format!("{base_key}{suffix}");
+        if NON_SECRET_FILE_SUFFIX_KEYS.contains(&suffixed_key.as_str()) {
+            return false;
+        }
+        std::env::var(&suffixed_key)
+            .ok()
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
 fn unsupported_cloud_suffix_for_base_key(key: &str) -> Option<(&'static str, &'static str)> {
     for suffix in ["_AZURE", "_VAULT", "_AWS", "_GCP"] {
         let suffixed_key = format!("{key}{suffix}");
@@ -552,6 +581,20 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             .resolve_many(&backend_pending, fetch_timeout)
             .await?;
         for item in resolved {
+            // A process environment value cannot contain a NUL byte:
+            // `std::env::set_var` panics on one. Startup resolution now runs
+            // before any settings are parsed, so a `_FILE` source pointing at a
+            // binary blob — or a cloud backend returning one — would abort the
+            // process here instead of producing the sanitized resolution error
+            // `validate` exists to report. Reject it as an ordinary fetch
+            // failure, naming the base key and provider and never the value.
+            if item.value.contains('\0') {
+                return Err(format!(
+                    "Secret resolved for {} from {} contains a NUL byte and cannot be placed in the process environment.",
+                    item.base_key,
+                    backend.display_name()
+                ));
+            }
             if backend.log_loaded() {
                 results
                     .loaded_sources
@@ -918,7 +961,11 @@ impl SecretBackend for GcpBackend {
         secrets: &[PendingSecret],
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
-        let client = gcp::GcpClientWrapper::new().await?;
+        // Startup constructor: the endpoint override is read from the
+        // environment only, so building this client cannot prime
+        // `CONF_FILE_CACHE` before a `FERRUM_CONF_PATH_FILE` has been
+        // materialized. See `gcp::endpoint_override_from_env`.
+        let client = gcp::GcpClientWrapper::new_for_startup().await?;
         resolve_many_concurrent(
             secrets,
             timeout,

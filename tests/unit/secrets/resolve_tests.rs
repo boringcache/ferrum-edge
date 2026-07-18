@@ -252,6 +252,43 @@ fn test_resolve_all_env_secrets_orders_results_by_base_key() {
 }
 
 /// A source reference is as sensitive as the value it points at, so a failed
+/// A resolved value containing a NUL byte must fail as an ordinary, sanitized
+/// resolution error.
+///
+/// Process environment values cannot contain NUL: `std::env::set_var` panics on
+/// one. Startup resolution now runs before any settings are parsed, so a
+/// `_FILE` source pointing at binary material would abort `validate` outright —
+/// no exit code, no diagnostic — instead of reporting the bad local secret that
+/// `validate` exists to catch. The value itself is never named.
+#[test]
+fn test_resolve_all_env_secrets_rejects_nul_in_resolved_value() {
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(b"nul-sentinel-prefix\0nul-sentinel-suffix")
+        .unwrap();
+    file.flush().unwrap();
+
+    with_env_vars_async(
+        &[(
+            "FERRUM_TEST_SECRET_NUL_FILE",
+            file.path().to_str().unwrap(),
+        )],
+        || async {
+            let err = match resolve_all_env_secrets().await {
+                Ok(_) => panic!("expected a NUL-containing resolved value to fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("FERRUM_TEST_SECRET_NUL") && err.contains("NUL byte"),
+                "error must name the base key and the failure class: {err}"
+            );
+            assert!(
+                !err.contains("nul-sentinel-prefix") && !err.contains("nul-sentinel-suffix"),
+                "error must not disclose the resolved value: {err}"
+            );
+        },
+    );
+}
+
 /// `_FILE` fetch must name the variable and the `io::Error` reason but not the
 /// path.
 #[test]

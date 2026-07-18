@@ -122,6 +122,9 @@ pub fn resolve_settings_path(explicit: Option<&Path>) -> Option<PathBuf> {
     if std::env::var("FERRUM_CONF_PATH").is_ok() {
         return None;
     }
+    if externally_sourced("FERRUM_CONF_PATH") {
+        return None;
+    }
     let candidates = [
         "./ferrum.conf",
         "./config/ferrum.conf",
@@ -143,6 +146,9 @@ pub fn resolve_spec_path(explicit: Option<&Path>) -> Option<PathBuf> {
     if std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok() {
         return None;
     }
+    if externally_sourced("FERRUM_FILE_CONFIG_PATH") {
+        return None;
+    }
     let candidates = [
         "./resources.yaml",
         "./resources.json",
@@ -156,6 +162,29 @@ pub fn resolve_spec_path(explicit: Option<&Path>) -> Option<PathBuf> {
         .map(Path::new)
         .find(|p| p.exists())
         .map(PathBuf::from)
+}
+
+/// True when `base_key` is configured to come from an external secret source
+/// (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP`).
+///
+/// Smart discovery must yield to such a source. It runs in `main()` *before*
+/// startup secret resolution, so at this point a secret-backed
+/// `FERRUM_CONF_PATH`/`FERRUM_FILE_CONFIG_PATH` does not exist yet and the
+/// direct-variable check above sees nothing. Auto-setting a discovered
+/// `./ferrum.conf` there is then indistinguishable, to
+/// `secrets::resolve_all_env_secrets`, from an operator who set both — and it
+/// fails the whole command with `Multiple secret sources configured for
+/// FERRUM_CONF_PATH` in any working directory that merely happens to contain a
+/// settings or resources file.
+///
+/// Yielding is correct rather than merely convenient: a discovered default is
+/// the lowest-precedence source there is (`CLI > env > conf file > smart
+/// defaults`), below the suffixed variable in every ordering the docs promise.
+/// An **explicit** `-s`/`-c` path is handled before this check and still
+/// conflicts, because that is a genuine two-sources-for-one-key mistake the
+/// operator made and should be told about.
+fn externally_sourced(base_key: &str) -> bool {
+    crate::secrets::external_source_configured(base_key)
 }
 
 /// Resolve a user-provided path: absolute paths are kept as-is, relative paths
@@ -198,19 +227,32 @@ pub fn apply_run_overrides(args: &RunArgs) {
         unsafe { std::env::set_var("FERRUM_LOG_LEVEL", level) };
     }
 
-    // Infer file mode when a spec is available but no mode is configured.
-    if std::env::var("FERRUM_MODE").is_err() && std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok() {
-        // SAFETY: single-threaded context.
-        unsafe { std::env::set_var("FERRUM_MODE", "file") };
-    }
+    infer_file_mode();
 }
 
 /// Apply settings/spec overrides shared between `run` and `validate`.
 pub fn apply_validate_overrides(args: &ValidateArgs) {
     apply_common_overrides(args.settings.as_deref(), args.spec.as_deref());
 
-    // Infer file mode when a spec is available but no mode is configured.
-    if std::env::var("FERRUM_MODE").is_err() && std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok() {
+    infer_file_mode();
+}
+
+/// Infer file mode when a spec is available but no mode is configured.
+///
+/// "Available" includes a spec path that is *configured* but not yet
+/// materialized: this runs before startup secret resolution, so a
+/// `FERRUM_FILE_CONFIG_PATH_FILE` (or `_VAULT`/`_AWS`/`_AZURE`/`_GCP`) has not
+/// been written to `FERRUM_FILE_CONFIG_PATH` yet. Without this, sourcing the
+/// spec path from a secret would silently change the inferred mode compared to
+/// setting it directly — the same ordering blind spot `externally_sourced`
+/// closes for smart discovery.
+fn infer_file_mode() {
+    if std::env::var("FERRUM_MODE").is_ok() {
+        return;
+    }
+    if std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok()
+        || externally_sourced("FERRUM_FILE_CONFIG_PATH")
+    {
         // SAFETY: single-threaded context.
         unsafe { std::env::set_var("FERRUM_MODE", "file") };
     }

@@ -489,10 +489,25 @@ fn resolve_startup_secrets() -> Result<secrets::ResolvedEnvSecrets, String> {
         rt.block_on(secrets::resolve_all_env_secrets())?
     };
 
+    // `std::env::set_var` panics on a value containing a NUL byte, and a
+    // resolved value is attacker-adjacent input (a `_FILE` source pointing at a
+    // binary blob, a cloud backend handing back non-text material). Startup
+    // resolution now runs before any settings are parsed, so a panic here would
+    // abort `validate` before it could report anything at all. `registry`
+    // already rejects these as ordinary fetch failures; re-checking at the one
+    // site that actually calls `set_var` keeps that invariant local to the
+    // unsafe block that depends on it. The value is never named.
+    if let Some((base_key, _)) = resolved.vars.iter().find(|(_, v)| v.contains('\0')) {
+        return Err(format!(
+            "Secret resolved for {base_key} contains a NUL byte and cannot be placed in the process environment."
+        ));
+    }
+
     // SAFETY: Secret resolution completed before non-blocking logging or the
     // main multi-threaded runtime were created, and the temporary runtime
     // above has already been dropped. We mutate the environment before any
-    // later startup stage can spawn additional worker threads.
+    // later startup stage can spawn additional worker threads. Every value is
+    // NUL-free per the check above, so `set_var` cannot panic.
     unsafe {
         for (base_key, value) in &resolved.vars {
             std::env::set_var(base_key, value);

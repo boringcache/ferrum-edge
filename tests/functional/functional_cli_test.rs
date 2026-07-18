@@ -1004,6 +1004,142 @@ async fn functional_cli_validate_uses_settings_path_from_file_secret_source() {
     );
 }
 
+/// Smart path discovery must yield to a secret-backed settings path.
+///
+/// Discovery runs in `main()` *before* startup secret resolution, so a
+/// `FERRUM_CONF_PATH_FILE` has not been materialized yet and the
+/// "is `FERRUM_CONF_PATH` already set?" check sees nothing. Auto-setting a
+/// discovered `./ferrum.conf` there is indistinguishable, to
+/// `resolve_all_env_secrets`, from an operator who configured two sources — so
+/// before the fix, running `validate` in any directory that merely happens to
+/// contain a `ferrum.conf` failed the whole command with a multiple-sources
+/// error instead of using the secret-backed path the docs promise.
+///
+/// Non-vacuous by construction: the discovered `./ferrum.conf` carries an
+/// admin JWT secret that is *too short* for database mode, and the file behind
+/// `FERRUM_CONF_PATH_FILE` carries a valid one. Reaching "Validation passed."
+/// is only possible if the resolved path won.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_prefers_secret_settings_path_over_discovered_conf() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // The competing auto-discovered source: `./ferrum.conf` in the CWD.
+    std::fs::write(
+        temp_dir.path().join("ferrum.conf"),
+        "FERRUM_ADMIN_JWT_SECRET = too-short\n",
+    )
+    .unwrap();
+
+    let settings_path = temp_dir.path().join("resolved-ferrum.conf");
+    std::fs::write(
+        &settings_path,
+        "FERRUM_ADMIN_JWT_SECRET = settings-file-secret-with-well-over-32-bytes\n",
+    )
+    .unwrap();
+
+    let settings_pointer = temp_dir.path().join("settings-path-source");
+    std::fs::write(&settings_pointer, settings_path.to_str().unwrap()).unwrap();
+
+    let mut cmd = Command::new(binary_abs_path());
+    cmd.args(["validate"]);
+    apply_hermetic_validate_env(&mut cmd, &temp_dir);
+    cmd.env_remove("FERRUM_CONF_PATH");
+    cmd.env("FERRUM_CONF_PATH_FILE", settings_pointer.to_str().unwrap());
+
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("Multiple secret sources"),
+        "an auto-discovered default must not be treated as a competing \
+         user-provided source: stderr={stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "the secret-backed settings path must win over discovery: \
+         stdout={stdout}, stderr={stderr}"
+    );
+    assert!(stdout.contains("Validation passed."));
+    assert!(stdout.contains("Loaded FERRUM_CONF_PATH from file"));
+}
+
+/// The same yield, for the resources path — and for the file-mode inference
+/// that hangs off it.
+///
+/// `FERRUM_FILE_CONFIG_PATH_FILE` must both suppress `./resources.yaml`
+/// discovery and still count as "a spec is configured" for mode inference,
+/// which also runs before resolution. Non-vacuous twice over: the discovered
+/// `./resources.yaml` is unparseable, so validating it would fail, and no
+/// `FERRUM_MODE` is set, so reaching a spec check at all requires the
+/// inference to have seen the suffixed source.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_prefers_secret_spec_path_over_discovered_resources() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // The competing auto-discovered source, deliberately invalid.
+    std::fs::write(
+        temp_dir.path().join("resources.yaml"),
+        "this is not: [valid yaml: for ferrum\n",
+    )
+    .unwrap();
+
+    let spec_path = temp_dir.path().join("resolved-resources.yaml");
+    std::fs::write(
+        &spec_path,
+        "version: \"1\"\nproxies:\n  - id: resolved\n    listen_path: /resolved\n    \
+         backend_scheme: http\n    backend_host: localhost\n    backend_port: 3000\n\
+         consumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+
+    let spec_pointer = temp_dir.path().join("spec-path-source");
+    std::fs::write(&spec_pointer, spec_path.to_str().unwrap()).unwrap();
+
+    let mut cmd = hermetic_validate_command(&temp_dir, &[]);
+    cmd.env("FERRUM_FILE_CONFIG_PATH_FILE", spec_pointer.to_str().unwrap());
+
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("Multiple secret sources"),
+        "discovery must yield to the suffixed spec source: stderr={stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "the secret-backed spec path must win over discovery: \
+         stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("Mode: File"),
+        "a suffixed spec source must still infer file mode: {stdout}"
+    );
+    assert!(
+        stdout.contains("Proxies: 1"),
+        "the resolved spec must be the one validated: {stdout}"
+    );
+    // The resolved path is itself an externally resolved value, so the `Spec
+    // (...)` line withholds it rather than echoing it back.
+    assert!(
+        !stdout.contains(spec_path.to_str().unwrap()),
+        "the resolved spec path must not be echoed: {stdout}"
+    );
+}
+
 // ── run ─────────────────────────────────────────────────────────────────────
 
 #[ignore]
