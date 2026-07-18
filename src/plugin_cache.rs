@@ -3683,6 +3683,7 @@ impl PluginCache {
         .map(Some)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_delta_inner_with_country_mmdb_session(
         &self,
         current: &PluginCacheInner,
