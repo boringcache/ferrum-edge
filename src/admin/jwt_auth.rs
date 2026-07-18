@@ -193,10 +193,42 @@ impl JwtManager {
         // Decode and validate
         let token_data = decode::<AdminClaims>(token, &key, &validation)?;
 
-        // Enforce max TTL: reject tokens with excessive or non-positive lifetimes
+        // Enforce max TTL. `max_ttl_seconds == 0` is an intentional disable
+        // sentinel (documented for FERRUM_ADMIN_JWT_MAX_TTL) that skips the
+        // lifetime cap entirely. When enabled, the cap is enforced against
+        // verifier time as well as the nominal `exp - iat` lifetime so a
+        // future-shifted `iat` cannot extend real validity:
+        //   1. `exp - iat` must be positive and within the cap;
+        //   2. `iat` must not be later than verifier time plus the accepted
+        //      clock skew (the same leeway applied to `exp`/`nbf`);
+        //   3. `exp - now` must not exceed the cap plus skew, so shifting
+        //      both timestamps into the future cannot defeat the bound.
         if self.config.max_ttl_seconds > 0 {
-            let ttl = token_data.claims.exp - token_data.claims.iat;
-            if ttl <= 0 || ttl > self.config.max_ttl_seconds as i64 {
+            // Clamp rather than wrap for absurdly large configured values so
+            // the cap degrades to "effectively unlimited" instead of
+            // rejecting every token via a negative cast.
+            let max_ttl = i64::try_from(self.config.max_ttl_seconds).unwrap_or(i64::MAX);
+            let leeway = validation.leeway as i64;
+            let now = jsonwebtoken::get_current_timestamp() as i64;
+
+            let ttl = token_data.claims.exp.saturating_sub(token_data.claims.iat);
+            if ttl <= 0 || ttl > max_ttl {
+                return Err(jsonwebtoken::errors::Error::from(
+                    jsonwebtoken::errors::ErrorKind::InvalidToken,
+                ));
+            }
+
+            if token_data.claims.iat > now.saturating_add(leeway) {
+                // Issued-at in the future beyond accepted clock skew.
+                return Err(jsonwebtoken::errors::Error::from(
+                    jsonwebtoken::errors::ErrorKind::InvalidToken,
+                ));
+            }
+
+            let remaining = token_data.claims.exp.saturating_sub(now);
+            if remaining > max_ttl.saturating_add(leeway) {
+                // Remaining lifetime exceeds the configured maximum even
+                // though `exp - iat` looked acceptable (future-shifted iat).
                 return Err(jsonwebtoken::errors::Error::from(
                     jsonwebtoken::errors::ErrorKind::InvalidToken,
                 ));

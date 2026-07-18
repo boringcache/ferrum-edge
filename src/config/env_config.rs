@@ -998,7 +998,10 @@ pub struct EnvConfig {
     #[allow(dead_code)]
     pub admin_jwt_issuer: String,
     /// Maximum accepted TTL in seconds for externally minted Admin API JWT tokens.
-    /// Tokens with `exp - iat` above this value are rejected. Default: 3600.
+    /// Tokens whose nominal lifetime (`exp - iat`) or remaining lifetime
+    /// (`exp - now`) exceed this value, or whose `iat` is later than verifier
+    /// time plus clock-skew leeway, are rejected. `0` is an intentional
+    /// disable sentinel that skips the lifetime cap entirely. Default: 3600.
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
     #[allow(dead_code)]
     pub admin_jwt_max_ttl: u64,

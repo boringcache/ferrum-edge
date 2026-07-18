@@ -426,6 +426,154 @@ fn test_jwt_ttl_exceeds_max_rejected() {
     );
 }
 
+#[test]
+fn test_jwt_future_iat_within_cap_rejected() {
+    // The bypass from the issue: shift `iat` and `exp` far into the future
+    // while keeping `exp - iat` within the configured maximum and `nbf` at
+    // the current time. The nominal TTL check alone accepts this token even
+    // though it remains usable for years.
+    let config = JwtConfig {
+        secret: "test-secret".to_string(),
+        issuer: "test-issuer".to_string(),
+        audience: None,
+        max_ttl_seconds: 3600,
+        algorithm: Algorithm::HS256,
+    };
+
+    let manager = JwtManager::new(config);
+
+    let now = Utc::now();
+    let claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: (now + Duration::days(3650)).timestamp(), // ~10 years in the future
+        nbf: now.timestamp(),                          // immediately usable
+        exp: (now + Duration::days(3650) + Duration::seconds(3600)).timestamp(),
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({}),
+    };
+
+    let header = Header::new(Algorithm::HS256);
+    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let token = encode(&header, &claims, &key).unwrap();
+
+    let result = manager.verify_token(&token);
+    assert!(
+        result.is_err(),
+        "Token with a future-shifted iat must be rejected even when exp - iat is within the cap"
+    );
+}
+
+#[test]
+fn test_jwt_future_iat_beyond_clock_skew_rejected() {
+    let config = JwtConfig {
+        secret: "test-secret".to_string(),
+        issuer: "test-issuer".to_string(),
+        audience: None,
+        max_ttl_seconds: 3600,
+        algorithm: Algorithm::HS256,
+    };
+
+    let manager = JwtManager::new(config);
+
+    // jsonwebtoken's default leeway is 60 seconds; an iat further in the
+    // future than that skew must be rejected.
+    let now = Utc::now();
+    let claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: (now + Duration::seconds(600)).timestamp(),
+        nbf: now.timestamp(),
+        exp: (now + Duration::seconds(600 + 1800)).timestamp(),
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({}),
+    };
+
+    let header = Header::new(Algorithm::HS256);
+    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let token = encode(&header, &claims, &key).unwrap();
+
+    let result = manager.verify_token(&token);
+    assert!(
+        result.is_err(),
+        "Token with iat beyond the accepted clock skew should be rejected"
+    );
+}
+
+#[test]
+fn test_jwt_iat_within_clock_skew_accepted() {
+    let config = JwtConfig {
+        secret: "test-secret".to_string(),
+        issuer: "test-issuer".to_string(),
+        audience: None,
+        max_ttl_seconds: 3600,
+        algorithm: Algorithm::HS256,
+    };
+
+    let manager = JwtManager::new(config);
+
+    // A slightly future iat from a skewed-but-honest issuer clock remains
+    // acceptable (jsonwebtoken's default leeway is 60 seconds).
+    let now = Utc::now();
+    let claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: (now + Duration::seconds(30)).timestamp(),
+        nbf: now.timestamp(),
+        exp: (now + Duration::seconds(30 + 1800)).timestamp(),
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({}),
+    };
+
+    let header = Header::new(Algorithm::HS256);
+    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let token = encode(&header, &claims, &key).unwrap();
+
+    let result = manager.verify_token(&token);
+    assert!(
+        result.is_ok(),
+        "Token with iat within the accepted clock skew should be accepted: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_jwt_zero_max_ttl_disables_cap() {
+    // `0` is the documented disable sentinel: the lifetime cap is skipped
+    // entirely, so even a very long-lived (but unexpired) token verifies.
+    let config = JwtConfig {
+        secret: "test-secret".to_string(),
+        issuer: "test-issuer".to_string(),
+        audience: None,
+        max_ttl_seconds: 0,
+        algorithm: Algorithm::HS256,
+    };
+
+    let manager = JwtManager::new(config);
+
+    let now = Utc::now();
+    let claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: now.timestamp(),
+        nbf: now.timestamp(),
+        exp: (now + Duration::days(365)).timestamp(),
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({}),
+    };
+
+    let header = Header::new(Algorithm::HS256);
+    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let token = encode(&header, &claims, &key).unwrap();
+
+    let result = manager.verify_token(&token);
+    assert!(
+        result.is_ok(),
+        "max_ttl_seconds = 0 is the documented disable sentinel and must skip the cap: {:?}",
+        result.err()
+    );
+}
+
 // ── Optional audience (`aud`) enforcement ─────────────────────────────
 
 fn config_with_audience(audience: Option<&str>) -> JwtConfig {
