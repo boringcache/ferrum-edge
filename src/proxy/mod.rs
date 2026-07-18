@@ -8098,7 +8098,7 @@ impl ProxyState {
         // without synchronous file work.
         let prospective_delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
         let prospective_proxy_rebuilds =
-            prospective_delta.proxy_ids_needing_plugin_rebuild(&new_config);
+            prospective_delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
         if self.plugin_cache.country_mmdb_preload_required(
             &new_config,
             &prospective_proxy_rebuilds,
