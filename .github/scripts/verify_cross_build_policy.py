@@ -147,7 +147,12 @@ CROSS_COMMAND_CONTEXT = re.compile(
     r"env(?:\s+(?:--?[^\s]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+))*\s+"
     r"(?:cargo(?:\s+\+[^\s]+)?\s+)?cross|"
     r"cargo(?:\s+\+[^\s]+)?\s+cross"
-    r")(?=\s+\S)|cargo\s+install(?:\s+--[^\s]+)*\s+cross\b"
+    r")(?=\s+\S)|cargo\s+install"
+    r"(?:\s+--[^\s=]+(?:=[^\s]+|\s+(?!cross\b)[^\s]+)?)*\s+cross\b"
+)
+WRAPPED_LITERAL_CROSS = re.compile(
+    r"(?:\b(?:bash|sh)\s+-c\s+['\"][^'\"]*\bcross\s+|"
+    r"(?:^|\s)(?:/[^\s'\"]+)+/cross\s+)"
 )
 SHELL_INTERPOLATION = re.compile(
     r"\$\{[^{}\n]*\}|`[^`\n]*`|"
@@ -1358,12 +1363,16 @@ def generic_action_cross_surfaces(
     """Represent every Cross-sensitive local-action file by its full digest."""
 
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
-    sensitive = OPAQUE_INLINE_SHELL.search(logical_contents) is not None or any(
+    sensitive = (
+        OPAQUE_INLINE_SHELL.search(logical_contents) is not None
+        or WRAPPED_LITERAL_CROSS.search(logical_contents) is not None
+        or any(
         has_cross_command_context(variant) or CROSS_ENVIRONMENT.search(variant)
         for line in logical_contents.splitlines()
         for variant in scan_variants(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
+        )
         )
     )
     if not sensitive:
@@ -1396,7 +1405,7 @@ def automation_file_cross_surfaces(name: str, contents: str) -> tuple[str, ...]:
         )
     )
     if name.endswith(".py"):
-        _, process_failures = python_command_scripts(
+        process_commands, process_failures = python_command_scripts(
             contents,
             name,
             reject_dynamic_commands=True,
@@ -1404,6 +1413,12 @@ def automation_file_cross_surfaces(name: str, contents: str) -> tuple[str, ...]:
         if process_failures:
             digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
             surfaces.append(f"opaque-python-process:{digest}")
+        if any(
+            contains_literal_executable_cross(command)
+            for command in process_commands
+        ):
+            digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+            surfaces.append(f"literal-python-cross:{digest}")
     elif name.endswith((".js", ".mjs", ".cjs", ".rb", ".lua")) and (
         NON_PYTHON_PROCESS_DISPATCH.search(contents)
     ):
@@ -1903,12 +1918,29 @@ def validate_automation_collection(
         if (
             contents is not None
             and name.endswith((".sh", ".bash"))
-            and contains_literal_executable_cross(contents)
+            and (
+                contains_literal_executable_cross(contents)
+                or WRAPPED_LITERAL_CROSS.search(contents)
+            )
         ):
             errors.append(
                 f"{source}/{name} contains an unprotected Cross executable or "
                 "generated inline shell surface"
             )
+        elif contents is not None and name.endswith(".py"):
+            process_commands, process_failures = python_command_scripts(
+                contents,
+                f"{source}/{name}",
+            )
+            errors.extend(process_failures)
+            if any(
+                contains_literal_executable_cross(command)
+                for command in process_commands
+            ):
+                errors.append(
+                    f"{source}/{name} contains an unprotected literal Python "
+                    "Cross process call"
+                )
     return errors
 
 
@@ -2869,6 +2901,18 @@ pre_build = []
     ):
         failures.append("merge-base comparison allowed local-action Cross invocation")
 
+    for label, command in {
+        "wrapped Cross": "bash -c 'cross build --target aarch64-unknown-linux-gnu'",
+        "valued cargo install": "cargo install --version 0.2.5 cross",
+    }.items():
+        proposed_action = safe_action.replace("echo safe", command)
+        if not compare_pr_action_collection(
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": proposed_action},
+            "self-test local-action directory",
+        ):
+            failures.append(f"merge-base comparison allowed {label}")
+
     cross_action_environment = safe_action.replace(
         "echo safe",
         "echo CROSS_CONFIG=attacker.toml >> $GITHUB_ENV",
@@ -3093,6 +3137,24 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("Python process API escaped the scanned automation roots")
+
+    literal_cross_python = {
+        "scripts/safe.py": (
+            "import subprocess\n"
+            "subprocess.run(['cross', 'build', '--target', "
+            "'aarch64-unknown-linux-gnu'])\n"
+        )
+    }
+    if not compare_pr_automation_collection(
+        {"ci.yml": python_workflow},
+        {"ci.yml": python_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        benign_python_automation,
+        literal_cross_python,
+        "self-test automation directory",
+    ):
+        failures.append("literal Python subprocess Cross was not rejected")
 
     expanded_python_automation = {
         "scripts/safe.py": (
