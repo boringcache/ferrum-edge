@@ -460,6 +460,41 @@ where
     let _ = crate::logging::set_log_level_reloader(Box::new(EnvFilterReloader { handle }));
 }
 
+/// Resolve external secret suffixes (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`,
+/// `_GCP`) into their base `FERRUM_*` variables and apply the result to the
+/// process environment.
+///
+/// Runs on a temporary single-threaded runtime that is dropped before the
+/// environment is mutated, and must be called before non-blocking logging or
+/// any multi-threaded runtime exists. Shared by `run` and `validate` so both
+/// commands see identical configuration and identical resolution/conflict
+/// failures; secret values are never logged. The returned metadata lets the
+/// caller log which sources were loaded (never the values).
+fn resolve_startup_secrets() -> Result<secrets::ResolvedEnvSecrets, String> {
+    let resolved = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to create secret resolution runtime: {}", e))?;
+
+        rt.block_on(secrets::resolve_all_env_secrets())?
+    };
+
+    // SAFETY: Secret resolution completed before non-blocking logging or the
+    // main multi-threaded runtime were created, and the temporary runtime
+    // above has already been dropped. We mutate the environment before any
+    // later startup stage can spawn additional worker threads.
+    unsafe {
+        for (base_key, value) in &resolved.vars {
+            std::env::set_var(base_key, value);
+        }
+        for suffixed_key in &resolved.source_keys_to_remove {
+            std::env::remove_var(suffixed_key);
+        }
+    }
+    Ok(resolved)
+}
+
 /// Runs startup secret resolution, logging init, env-config parsing, and the
 /// gateway runtime. Returns the process exit code.
 ///
@@ -470,10 +505,16 @@ where
 /// these worker threads exist so the temporary runtime can fully shut down
 /// before unsafe env mutation.
 fn run_gateway(cli: &cli::Cli) -> i32 {
-    // Handle validate subcommand: load config, validate, exit.
-    // Runs after crypto + logging init so TLS cert checks and tracing work,
-    // but before secret resolution and the multi-threaded runtime.
+    // Handle validate subcommand: resolve secrets, load config, validate, exit.
+    // Runs after crypto init so TLS cert checks work, but before the
+    // multi-threaded runtime. External secret suffixes resolve with the same
+    // semantics as `run` so validation sees the identical configuration
+    // picture (and the same provider-conflict/fetch failures).
     if matches!(&cli.command, Some(cli::Command::Validate(_))) {
+        if let Err(error) = resolve_startup_secrets() {
+            emit_bootstrap_error("secret resolution failed", &[("error", error)]);
+            return 1;
+        }
         let _logging_guards = match init_logging() {
             Ok(guards) => guards,
             Err(error) => {
@@ -492,42 +533,13 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
 
     // Resolve secrets before initializing non-blocking logging so the
     // temporary runtime can shut down completely before env mutation.
-    let resolved = {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                emit_bootstrap_error(
-                    "failed to create secret resolution runtime",
-                    &[("error", e.to_string())],
-                );
-                return 1;
-            }
-        };
-
-        match rt.block_on(secrets::resolve_all_env_secrets()) {
-            Ok(resolved) => resolved,
-            Err(e) => {
-                emit_bootstrap_error("secret resolution failed", &[("error", e)]);
-                return 1;
-            }
+    let resolved = match resolve_startup_secrets() {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            emit_bootstrap_error("secret resolution failed", &[("error", error)]);
+            return 1;
         }
     };
-
-    // SAFETY: Secret resolution completed before non-blocking logging or the
-    // main multi-threaded runtime were created, and the temporary runtime
-    // above has already been dropped. We mutate the environment before any
-    // later startup stage can spawn additional worker threads.
-    unsafe {
-        for (base_key, value) in &resolved.vars {
-            std::env::set_var(base_key, value);
-        }
-        for suffixed_key in &resolved.source_keys_to_remove {
-            std::env::remove_var(suffixed_key);
-        }
-    }
 
     let _logging_guards = match init_logging() {
         Ok(guards) => guards,

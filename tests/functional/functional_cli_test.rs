@@ -296,6 +296,103 @@ async fn functional_cli_validate_with_settings() {
     assert!(stdout.contains("Validation passed."));
 }
 
+// ── validate: external secret suffixes ──────────────────────────────────────
+
+/// Database-mode validate needs an admin JWT secret and a DB URL; sqlite
+/// in-memory keeps the check hermetic.
+fn validate_database_mode_command(temp_dir: &TempDir) -> Command {
+    let mut cmd = Command::new(binary_path());
+    cmd.args(["validate"])
+        .env("FERRUM_MODE", "database")
+        .env("FERRUM_DB_URL", "sqlite::memory:")
+        // Database mode requires a file-backed DB URL directory to exist;
+        // sqlite::memory: has no such requirement, but keep HOME/TMPDIR
+        // inherited and isolate nothing else.
+        .current_dir(temp_dir.path());
+    cmd
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_resolves_file_secret_suffix() {
+    let temp_dir = TempDir::new().unwrap();
+    let secret_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&secret_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET_FILE",
+            secret_path.to_str().unwrap(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    assert!(
+        output.status.success(),
+        "validate must resolve FERRUM_ADMIN_JWT_SECRET_FILE like run does: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Validation passed."));
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_secret_source_conflict() {
+    let temp_dir = TempDir::new().unwrap();
+    let secret_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&secret_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+
+    // A base variable plus a suffixed source for the same key is a provider
+    // conflict that `run` rejects; validate must fail identically.
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "direct-secret-value-with-well-over-32-bytes",
+        )
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET_FILE",
+            secret_path.to_str().unwrap(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    assert!(
+        !output.status.success(),
+        "validate must reject conflicting secret sources like run does: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_fails_on_secret_resolution_error() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET_FILE",
+            temp_dir.path().join("does-not-exist").to_str().unwrap(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    assert!(
+        !output.status.success(),
+        "validate must fail when a suffixed secret source cannot be read: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ── run ─────────────────────────────────────────────────────────────────────
 
 #[ignore]
