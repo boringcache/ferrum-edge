@@ -6504,9 +6504,7 @@ impl DatabaseStore {
                 let existing_sql = if self.db_type == "sqlite" {
                     self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?")
                 } else {
-                    self.q(
-                        "SELECT id FROM upstreams WHERE id = ? AND namespace = ? FOR UPDATE",
-                    )
+                    self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ? FOR UPDATE")
                 };
                 let existing: Option<String> = sqlx::query_scalar(&existing_sql)
                     .bind(&u.id)
