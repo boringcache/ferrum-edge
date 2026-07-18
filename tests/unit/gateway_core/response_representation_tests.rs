@@ -648,7 +648,7 @@ async fn unprotected_responses_are_never_rejected_by_the_gate() {
             &mut headers,
             &mut body,
             None,
-        false,
+            false,
         )
         .await;
 
@@ -1118,7 +1118,9 @@ async fn representation_rejection_preserves_opt_in_reject_decorators() {
         Some("partial_representation")
     );
     assert_eq!(
-        headers.get("access-control-allow-origin").map(String::as_str),
+        headers
+            .get("access-control-allow-origin")
+            .map(String::as_str),
         Some("https://app.example"),
         "opt-in reject decorators must run for a representation error too"
     );
@@ -1151,7 +1153,10 @@ async fn native_grpc_representation_rejection_strips_backend_headers() {
     headers.insert("content-encoding".to_string(), "zstd".to_string());
     headers.insert("set-cookie".to_string(), "session=abc123".to_string());
     headers.insert("etag".to_string(), "\"backend-v1\"".to_string());
-    headers.insert("cache-control".to_string(), "public, max-age=600".to_string());
+    headers.insert(
+        "cache-control".to_string(),
+        "public, max-age=600".to_string(),
+    );
     let mut body = b"\x00\x00\x00\x00\x05hello".to_vec();
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
@@ -1166,7 +1171,10 @@ async fn native_grpc_representation_rejection_strips_backend_headers() {
     )
     .await;
 
-    assert!(replaced, "an undecodable claimed representation is rejected");
+    assert!(
+        replaced,
+        "an undecodable claimed representation is rejected"
+    );
     assert_eq!(
         status, 200,
         "a native gRPC error is trailers-only under HTTP 200"
