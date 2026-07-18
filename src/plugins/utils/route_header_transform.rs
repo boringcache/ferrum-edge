@@ -29,6 +29,7 @@
 //! should use `set`, which translates to `update`.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use http::header::HeaderName;
 use serde::{Deserialize, Serialize};
@@ -156,13 +157,36 @@ pub fn apply_route_header_transforms(
     rules: &[RouteHeaderTransformRule],
     headers: &mut HashMap<String, String>,
 ) {
+    apply_route_header_transforms_tracked(rules, headers, None);
+}
+
+/// [`apply_route_header_transforms`] with an optional sink recording the keys
+/// whose `add` rule actually INSERTED into an absent slot (rather than
+/// appending onto an existing value).
+///
+/// Such an insert writes the entire value, so it is a whole-value gateway
+/// write. gRPC-deadline provenance needs that distinction: after an
+/// `add`-following-`remove` sequence the final map can be byte-identical to
+/// the backend's, and the net-diff mutation tracking in
+/// `BufferedDeadlineResponseHeaderProvenance::record_gateway_mutations` would
+/// see no change and never credit the reintroduced gateway header — dropping it
+/// from a synthesized DEADLINE_EXCEEDED response. Appends are deliberately NOT
+/// recorded: they must stay on the append-partition branch so the backend
+/// portion of the value never crosses onto the deadline response.
+///
+/// Callers with no provenance to track pass `None` and stay allocation-free.
+pub fn apply_route_header_transforms_tracked(
+    rules: &[RouteHeaderTransformRule],
+    headers: &mut HashMap<String, String>,
+    mut inserted_keys: Option<&mut Vec<String>>,
+) {
     for rule in rules {
         match rule.operation {
             RouteHeaderTransformOp::Add => {
                 if let Some(value) = rule.value.as_ref() {
-                    headers
-                        .entry(rule.key.clone())
-                        .and_modify(|existing| {
+                    match headers.entry(rule.key.clone()) {
+                        Entry::Occupied(mut existing) => {
+                            let existing = existing.get_mut();
                             if existing.is_empty() {
                                 existing.push_str(value);
                             } else {
@@ -173,8 +197,14 @@ pub fn apply_route_header_transforms(
                                 }
                                 existing.push_str(value);
                             }
-                        })
-                        .or_insert_with(|| value.clone());
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(value.clone());
+                            if let Some(sink) = inserted_keys.as_mut() {
+                                sink.push(rule.key.clone());
+                            }
+                        }
+                    }
                 }
             }
             RouteHeaderTransformOp::Update => {

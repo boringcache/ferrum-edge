@@ -20,7 +20,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::types::{BackendScheme, GatewayConfig, PluginScope};
+use crate::config::types::{
+    BackendScheme, CountryMmdbLoadSession, GatewayConfig, MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES,
+    PluginScope,
+};
 use tracing::{error, warn};
 
 use crate::adaptive_concurrency::{
@@ -385,6 +388,9 @@ impl Plugin for PriorityOverridePlugin {
     fn name(&self) -> &str {
         self.inner.name()
     }
+    fn country_mmdb_snapshot(&self) -> Option<&crate::config::types::CountryMmdbSnapshot> {
+        self.inner.country_mmdb_snapshot()
+    }
     fn correlation_id_header_name(&self) -> Option<&str> {
         self.inner.correlation_id_header_name()
     }
@@ -524,6 +530,9 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .after_proxy(ctx, response_status, response_headers)
             .await
+    }
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        self.inner.owns_deadline_response_header(ctx, name)
     }
     fn is_initial_response_header_policy(&self) -> bool {
         self.inner.is_initial_response_header_policy()
@@ -1009,10 +1018,12 @@ fn create_tcp_connection_throttle_plugin(
 /// and required-plugin validation failures reject the whole cache generation.
 /// Optional plugins may be omitted only when their registration metadata allows
 /// fail-open behavior.
+#[allow(clippy::too_many_arguments)]
 fn try_create_plugin(
     pc: &PluginConfig,
     gateway_config: &GatewayConfig,
     http_client: &PluginHttpClient,
+    country_mmdb_load_session: &CountryMmdbLoadSession,
     current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
     staged_adaptive_states: &mut AdaptiveConcurrencyInstanceMap,
     current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
@@ -1026,6 +1037,12 @@ fn try_create_plugin(
             current_adaptive_states,
             staged_adaptive_states,
         )
+    } else if pc.plugin_name == "geo_restriction" {
+        crate::plugins::geo_restriction::GeoRestriction::new_with_load_session(
+            &pc.config,
+            country_mmdb_load_session,
+        )
+        .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else if pc.plugin_name == "serverless_function" {
         crate::plugins::serverless_function::ServerlessFunction::new_with_instance_id(
             &pc.config,
@@ -1121,6 +1138,172 @@ type WsFrameMap = HashMap<String, bool>;
 type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
 type SecurityCompositionPluginMap<'a> =
     HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CountryMmdbPluginId {
+    namespace: String,
+    plugin_config_id: String,
+}
+
+type CountryMmdbPluginInstanceMap = HashMap<CountryMmdbPluginId, Arc<dyn Plugin>>;
+
+fn country_mmdb_plugin_id(plugin_config: &PluginConfig) -> CountryMmdbPluginId {
+    CountryMmdbPluginId {
+        namespace: plugin_config.namespace.clone(),
+        plugin_config_id: plugin_config.id.clone(),
+    }
+}
+
+fn country_mmdb_plugin_is_active(config: &GatewayConfig, plugin_config: &PluginConfig) -> bool {
+    if !plugin_config.enabled || plugin_config.plugin_name != "geo_restriction" {
+        return false;
+    }
+    match &plugin_config.scope {
+        PluginScope::Global => true,
+        PluginScope::Proxy => plugin_config.proxy_id.as_ref().is_some_and(|proxy_id| {
+            config.proxies.iter().any(|proxy| {
+                &proxy.id == proxy_id
+                    && proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == plugin_config.id)
+            })
+        }),
+        PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+            proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == plugin_config.id)
+        }),
+    }
+}
+
+/// Whether an incremental cache stage would construct at least one active geo
+/// plugin and therefore needs an off-thread MMDB validation handoff first.
+fn country_mmdb_preload_required_for_scope(
+    config: &GatewayConfig,
+    proxy_ids_to_rebuild: &HashSet<String>,
+    rebuild_globals: bool,
+) -> bool {
+    config.plugin_configs.iter().any(|plugin_config| {
+        country_mmdb_plugin_is_active(config, plugin_config)
+            && country_mmdb_plugin_is_in_rebuild_scope(
+                config,
+                plugin_config,
+                proxy_ids_to_rebuild,
+                rebuild_globals,
+            )
+    })
+}
+
+fn country_mmdb_plugin_is_in_rebuild_scope(
+    config: &GatewayConfig,
+    plugin_config: &PluginConfig,
+    proxy_ids_to_rebuild: &HashSet<String>,
+    rebuild_globals: bool,
+) -> bool {
+    match &plugin_config.scope {
+        PluginScope::Global => rebuild_globals,
+        PluginScope::Proxy => plugin_config
+            .proxy_id
+            .as_ref()
+            .is_some_and(|proxy_id| proxy_ids_to_rebuild.contains(proxy_id)),
+        PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+            proxy_ids_to_rebuild.contains(&proxy.id)
+                && proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == plugin_config.id)
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_create_plugin_for_cache(
+    plugin_config: &PluginConfig,
+    gateway_config: &GatewayConfig,
+    http_client: &PluginHttpClient,
+    country_mmdb_load_session: &CountryMmdbLoadSession,
+    forced_country_mmdb_instances: Option<&CountryMmdbPluginInstanceMap>,
+    country_mmdb_instances: &mut CountryMmdbPluginInstanceMap,
+    current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
+    staged_adaptive_states: &mut AdaptiveConcurrencyInstanceMap,
+    current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
+    staged_tcp_throttle_states: &mut TcpConnectionThrottleInstanceMap,
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    let country_mmdb_id = (plugin_config.plugin_name == "geo_restriction")
+        .then(|| country_mmdb_plugin_id(plugin_config));
+    let plugin = if let Some(forced) = forced_country_mmdb_instances
+        && let Some(country_mmdb_id) = &country_mmdb_id
+        && let Some(plugin) = forced.get(country_mmdb_id)
+    {
+        Some(Arc::clone(plugin))
+    } else {
+        try_create_plugin(
+            plugin_config,
+            gateway_config,
+            http_client,
+            country_mmdb_load_session,
+            current_adaptive_states,
+            staged_adaptive_states,
+            current_tcp_throttle_states,
+            staged_tcp_throttle_states,
+        )?
+    };
+    if let (Some(country_mmdb_id), Some(plugin)) = (country_mmdb_id, &plugin) {
+        country_mmdb_instances.insert(country_mmdb_id, Arc::clone(plugin));
+    }
+    Ok(plugin)
+}
+
+fn replace_country_mmdb_instances(
+    plugins: &PluginList,
+    replacements: &HashMap<usize, Arc<dyn Plugin>>,
+) -> (PluginList, bool) {
+    let mut changed = false;
+    let plugins = plugins
+        .iter()
+        .map(|plugin| {
+            let pointer = Arc::as_ptr(plugin) as *const () as usize;
+            if let Some(replacement) = replacements.get(&pointer) {
+                changed = true;
+                Arc::clone(replacement)
+            } else {
+                Arc::clone(plugin)
+            }
+        })
+        .collect();
+    (Arc::new(plugins), changed)
+}
+
+fn country_mmdb_snapshot_bytes(
+    proxy_plugins: &ProxyPluginMap,
+    global_plugins: &[Arc<dyn Plugin>],
+) -> Result<u64, String> {
+    let mut snapshots = HashSet::new();
+    let mut bytes = 0u64;
+    for plugin in global_plugins
+        .iter()
+        .chain(proxy_plugins.values().flat_map(|plugins| plugins.iter()))
+    {
+        let Some(snapshot) = plugin.country_mmdb_snapshot() else {
+            continue;
+        };
+        let pointer = snapshot as *const _ as usize;
+        if !snapshots.insert(pointer) {
+            continue;
+        }
+        bytes = bytes.checked_add(snapshot.size_bytes()).ok_or_else(|| {
+            "MaxMind database resulting-generation snapshot size overflow".to_string()
+        })?;
+        if bytes > MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES {
+            return Err(format!(
+                "MaxMind database aggregate snapshot budget exceeded: the resulting plugin-cache generation retains {bytes} bytes across distinct snapshots; maximum aggregate size is {MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES} bytes"
+            ));
+        }
+    }
+    Ok(bytes)
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct AdaptiveConcurrencyPolicyId {
@@ -2295,6 +2478,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
+    let country_mmdb_load_session = CountryMmdbLoadSession::default();
     let current_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
     let mut staged_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
 
@@ -2325,6 +2509,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
                 plugin_config,
                 config,
                 http_client,
+                &country_mmdb_load_session,
                 &current_adaptive_states,
                 &mut staged_adaptive_states,
                 &current_tcp_throttle_states,
@@ -2784,6 +2969,12 @@ pub(crate) struct PluginCacheInner {
     /// ID. Replacement plugin objects share these limiters so live permits and
     /// learned target state remain coherent across cache generations.
     adaptive_concurrency_instances: AdaptiveConcurrencyInstanceMap,
+    /// Live geo plugin instances keyed by stable config identity. This lets an
+    /// accepted MMDB-only validation generation replace exactly the geo
+    /// snapshots while retaining every unrelated stateful plugin instance.
+    country_mmdb_instances: CountryMmdbPluginInstanceMap,
+    /// Deduplicated immutable MMDB bytes retained by this cache generation.
+    country_mmdb_snapshot_bytes: u64,
     /// Stable process-local TCP throttle accounting keyed by namespace +
     /// plugin config ID. Replacement plugin objects share these maps so live
     /// connection permits remain counted across cache generations.
@@ -2804,6 +2995,8 @@ impl PluginCacheInner {
         global_requires_ws_frame: bool,
         proxy_group_plugins: ProxyGroupInstanceMap,
         adaptive_concurrency_instances: AdaptiveConcurrencyInstanceMap,
+        country_mmdb_instances: CountryMmdbPluginInstanceMap,
+        country_mmdb_snapshot_bytes: u64,
         tcp_connection_throttle_instances: TcpConnectionThrottleInstanceMap,
     ) -> Self {
         Self {
@@ -2818,6 +3011,8 @@ impl PluginCacheInner {
             global_requires_ws_frame,
             proxy_group_plugins,
             adaptive_concurrency_instances,
+            country_mmdb_instances,
+            country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
         }
     }
@@ -3209,6 +3404,13 @@ pub struct PluginCache {
     http_client: PluginHttpClient,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CountryMmdbLoadMode {
+    Standard,
+    NodeLocalRefresh,
+    PreloadedOnly,
+}
+
 fn validate_prometheus_metrics_ownership(config: &GatewayConfig) -> Result<(), String> {
     let mut enabled = config
         .plugin_configs
@@ -3288,6 +3490,8 @@ impl PluginCache {
             global_needs_ws_frame,
             proxy_group_plugins,
             adaptive_concurrency_instances,
+            country_mmdb_instances,
+            country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
         ) = Self::build_cache(
             config,
@@ -3309,6 +3513,8 @@ impl PluginCache {
             global_needs_ws_frame,
             proxy_group_plugins,
             adaptive_concurrency_instances,
+            country_mmdb_instances,
+            country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
         )))
     }
@@ -3381,6 +3587,30 @@ impl PluginCache {
         Ok(())
     }
 
+    /// Whether the exact delta-build scope, including adaptive-concurrency
+    /// route-definition expansion, reconstructs an active geo plugin.
+    pub(crate) fn country_mmdb_preload_required(
+        &self,
+        config: &GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<String>,
+        rebuild_globals: bool,
+    ) -> bool {
+        let current = self.inner.load();
+        let mut expanded_proxy_ids = proxy_ids_to_rebuild.clone();
+        let mut rebuild_adaptive_globals = false;
+        include_adaptive_concurrency_route_rebuilds(
+            &current.adaptive_concurrency_instances,
+            config,
+            &mut expanded_proxy_ids,
+            &mut rebuild_adaptive_globals,
+        );
+        country_mmdb_preload_required_for_scope(
+            config,
+            &expanded_proxy_ids,
+            rebuild_globals || rebuild_adaptive_globals,
+        )
+    }
+
     /// Incrementally update the plugin cache, only rebuilding plugins for
     /// proxies identified in `proxy_ids_to_rebuild`. All other proxy plugin
     /// lists — including their stateful plugin instances (rate limiters, etc.)
@@ -3388,6 +3618,11 @@ impl PluginCache {
     ///
     /// Also rebuilds global plugins if `rebuild_globals` is true (i.e., a
     /// global-scoped plugin config was added/modified/removed).
+    /// `CountryMmdbLoadMode::NodeLocalRefresh` additionally rebuilds every
+    /// active country MMDB instance for DP full snapshots whose CP source
+    /// cannot hand off node-local validation snapshots. `PreloadedOnly`
+    /// forbids synchronous MMDB loading during an incremental async cache stage
+    /// and refreshes only geo instances inside that stage's rebuild scope.
     /// Returns `Err` if any enabled plugin config cannot be resolved or fails
     /// validation during incremental update, matching the behavior of `rebuild()`.
     pub(crate) fn build_delta_inner(
@@ -3397,8 +3632,80 @@ impl PluginCache {
         proxy_ids_to_rebuild: &HashSet<String>,
         removed_proxy_ids: &[String],
         rebuild_globals: bool,
+        country_mmdb_load_mode: CountryMmdbLoadMode,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
+        let paths = config.country_mmdb_file_dependency_paths();
+        let restrict_country_mmdb_refresh_to_rebuild_scope =
+            matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
+        let country_mmdb_load_session = match country_mmdb_load_mode {
+            CountryMmdbLoadMode::NodeLocalRefresh if !paths.is_empty() => {
+                CountryMmdbLoadSession::for_node_local_refresh(&paths)?
+            }
+            CountryMmdbLoadMode::PreloadedOnly => CountryMmdbLoadSession::claim_preloaded(&paths)?,
+            CountryMmdbLoadMode::Standard | CountryMmdbLoadMode::NodeLocalRefresh => {
+                CountryMmdbLoadSession::claim(&paths)?
+            }
+        };
+        self.build_delta_inner_with_country_mmdb_session(
+            current,
+            config,
+            proxy_ids_to_rebuild,
+            removed_proxy_ids,
+            rebuild_globals,
+            &country_mmdb_load_session,
+            restrict_country_mmdb_refresh_to_rebuild_scope,
+        )
+    }
+
+    /// Refresh country MMDB plugins even when the serialized gateway config has
+    /// no delta. Serving modes normally require an accepted validation handoff;
+    /// DP full snapshots set `force_node_local_refresh` because CP intentionally
+    /// skips node-local file validation and therefore cannot create one.
+    /// Returning `None` means there was no handoff and no forced refresh, so the
+    /// caller may keep the live plugin snapshot unchanged.
+    pub(crate) fn build_country_mmdb_reload_inner(
+        &self,
+        current: &PluginCacheInner,
+        config: &GatewayConfig,
+        force_node_local_refresh: bool,
+    ) -> Result<Option<Arc<PluginCacheInner>>, String> {
+        validate_prometheus_metrics_ownership(config)?;
+        let paths = config.country_mmdb_file_dependency_paths();
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        let country_mmdb_load_session = if force_node_local_refresh {
+            CountryMmdbLoadSession::for_node_local_refresh(&paths)?
+        } else {
+            CountryMmdbLoadSession::claim(&paths)?
+        };
+        if !country_mmdb_load_session.refresh_country_mmdb_plugins() {
+            return Ok(None);
+        }
+        self.build_delta_inner_with_country_mmdb_session(
+            current,
+            config,
+            &HashSet::new(),
+            &[],
+            false,
+            &country_mmdb_load_session,
+            false,
+        )
+        .map(Some)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_delta_inner_with_country_mmdb_session(
+        &self,
+        current: &PluginCacheInner,
+        config: &GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<String>,
+        removed_proxy_ids: &[String],
+        rebuild_globals: bool,
+        country_mmdb_load_session: &CountryMmdbLoadSession,
+        restrict_country_mmdb_refresh_to_rebuild_scope: bool,
+    ) -> Result<Arc<PluginCacheInner>, String> {
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
@@ -3409,16 +3716,87 @@ impl PluginCache {
             &mut proxy_ids_to_rebuild,
             &mut rebuild_adaptive_globals,
         );
-        let global_plugins_changed = rebuild_globals || rebuild_adaptive_globals;
+        let mut global_plugins_changed = rebuild_globals || rebuild_adaptive_globals;
         let mut adaptive_concurrency_instances =
             retained_adaptive_concurrency_states(&current.adaptive_concurrency_instances, config);
         let mut tcp_connection_throttle_instances = retained_tcp_connection_throttle_states(
             &current.tcp_connection_throttle_instances,
             config,
         );
+        let force_country_mmdb_refresh = country_mmdb_load_session.refresh_country_mmdb_plugins();
+        let active_country_mmdb_configs: HashMap<CountryMmdbPluginId, &PluginConfig> = config
+            .plugin_configs
+            .iter()
+            .filter(|plugin_config| country_mmdb_plugin_is_active(config, plugin_config))
+            .map(|plugin_config| (country_mmdb_plugin_id(plugin_config), plugin_config))
+            .collect();
+        let mut forced_country_mmdb_instances = CountryMmdbPluginInstanceMap::new();
+        if force_country_mmdb_refresh {
+            for (id, plugin_config) in
+                active_country_mmdb_configs
+                    .iter()
+                    .filter(|(_, plugin_config)| {
+                        !restrict_country_mmdb_refresh_to_rebuild_scope
+                            || country_mmdb_plugin_is_in_rebuild_scope(
+                                config,
+                                plugin_config,
+                                &proxy_ids_to_rebuild,
+                                rebuild_globals,
+                            )
+                    })
+            {
+                match try_create_plugin(
+                    plugin_config,
+                    config,
+                    &self.http_client,
+                    country_mmdb_load_session,
+                    &current.adaptive_concurrency_instances,
+                    &mut adaptive_concurrency_instances,
+                    &current.tcp_connection_throttle_instances,
+                    &mut tcp_connection_throttle_instances,
+                ) {
+                    Ok(Some(plugin)) => {
+                        forced_country_mmdb_instances.insert(id.clone(), plugin);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        error!("Config reload: {}", error);
+                        plugin_errors.push(error);
+                    }
+                }
+            }
+        }
+        let mut country_mmdb_instances: CountryMmdbPluginInstanceMap = current
+            .country_mmdb_instances
+            .iter()
+            .filter(|(id, _)| active_country_mmdb_configs.contains_key(*id))
+            .map(|(id, plugin)| (id.clone(), Arc::clone(plugin)))
+            .collect();
+        if force_country_mmdb_refresh {
+            country_mmdb_instances.extend(forced_country_mmdb_instances.clone());
+        }
+        let forced_country_mmdb_instances =
+            force_country_mmdb_refresh.then_some(&forced_country_mmdb_instances);
+        let country_mmdb_replacements: HashMap<usize, Arc<dyn Plugin>> =
+            if let Some(forced) = forced_country_mmdb_instances {
+                current
+                    .country_mmdb_instances
+                    .iter()
+                    .filter_map(|(id, plugin)| {
+                        forced.get(id).map(|replacement| {
+                            (
+                                Arc::as_ptr(plugin) as *const () as usize,
+                                Arc::clone(replacement),
+                            )
+                        })
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            };
 
         // Rebuild globals if any global plugin config changed
-        let new_globals = if rebuild_globals {
+        let mut new_globals = if rebuild_globals {
             let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
 
             // Stage the named-schema registry first so subsequent global /
@@ -3443,10 +3821,13 @@ impl PluginCache {
                 if pc.plugin_name != "transaction_log_schema" {
                     continue;
                 }
-                match try_create_plugin(
+                match try_create_plugin_for_cache(
                     pc,
                     config,
                     &self.http_client,
+                    country_mmdb_load_session,
+                    forced_country_mmdb_instances,
+                    &mut country_mmdb_instances,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
                     &current.tcp_connection_throttle_instances,
@@ -3471,10 +3852,13 @@ impl PluginCache {
                     continue; // already constructed
                 }
                 if pc.scope == PluginScope::Global {
-                    match try_create_plugin(
+                    match try_create_plugin_for_cache(
                         pc,
                         config,
                         &self.http_client,
+                        country_mmdb_load_session,
+                        forced_country_mmdb_instances,
+                        &mut country_mmdb_instances,
                         &current.adaptive_concurrency_instances,
                         &mut adaptive_concurrency_instances,
                         &current.tcp_connection_throttle_instances,
@@ -3523,10 +3907,13 @@ impl PluginCache {
                 {
                     continue;
                 }
-                match try_create_plugin(
+                match try_create_plugin_for_cache(
                     pc,
                     config,
                     &self.http_client,
+                    country_mmdb_load_session,
+                    forced_country_mmdb_instances,
+                    &mut country_mmdb_instances,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
                     &current.tcp_connection_throttle_instances,
@@ -3551,6 +3938,12 @@ impl PluginCache {
         } else {
             Arc::clone(&current.global_plugins)
         };
+        if force_country_mmdb_refresh {
+            let (replaced_globals, changed) =
+                replace_country_mmdb_instances(&new_globals, &country_mmdb_replacements);
+            new_globals = replaced_globals;
+            global_plugins_changed |= changed;
+        }
 
         // Build index of proxy-scoped plugin configs for efficient lookup
         let mut proxy_scoped_configs: HashMap<&str, Vec<&crate::config::types::PluginConfig>> =
@@ -3599,6 +3992,12 @@ impl PluginCache {
                 {
                     return None;
                 }
+                if pc.plugin_name == "geo_restriction"
+                    && forced_country_mmdb_instances
+                        .is_some_and(|forced| forced.contains_key(&country_mmdb_plugin_id(pc)))
+                {
+                    return None;
+                }
                 if same_proxy_group_plugin_config(&existing.config, pc) {
                     Some((id.clone(), existing.clone()))
                 } else {
@@ -3606,6 +4005,22 @@ impl PluginCache {
                 }
             })
             .collect();
+        if let Some(forced) = forced_country_mmdb_instances {
+            for (id, plugin_config) in &active_country_mmdb_configs {
+                if plugin_config.scope != PluginScope::ProxyGroup {
+                    continue;
+                }
+                if let Some(plugin) = forced.get(id) {
+                    group_plugin_instances.insert(
+                        plugin_config.id.clone(),
+                        ProxyGroupPluginInstance {
+                            plugin: Arc::clone(plugin),
+                            config: (*plugin_config).clone(),
+                        },
+                    );
+                }
+            }
+        }
 
         // Clone the current map and patch it
         let mut new_map: HashMap<String, Arc<Vec<Arc<dyn Plugin>>>> = current.proxy_plugins.clone();
@@ -3636,10 +4051,13 @@ impl PluginCache {
             if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
-                        match try_create_plugin(
+                        match try_create_plugin_for_cache(
                             pc,
                             config,
                             &self.http_client,
+                            country_mmdb_load_session,
+                            forced_country_mmdb_instances,
+                            &mut country_mmdb_instances,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
                             &current.tcp_connection_throttle_instances,
@@ -3704,10 +4122,13 @@ impl PluginCache {
                         remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
                         merged.push(plugin);
                     } else {
-                        match try_create_plugin(
+                        match try_create_plugin_for_cache(
                             pc,
                             config,
                             &self.http_client,
+                            country_mmdb_load_session,
+                            forced_country_mmdb_instances,
+                            &mut country_mmdb_instances,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
                             &current.tcp_connection_throttle_instances,
@@ -3767,6 +4188,21 @@ impl PluginCache {
             new_map.insert(proxy.id.clone(), Arc::new(merged));
         }
 
+        // An accepted file-dependency generation is independent of serialized
+        // ConfigDelta timestamps. Patch unchanged proxy views by old geo Arc
+        // identity so only geo instances change and unrelated state survives.
+        let mut proxy_ids_to_refresh = proxy_ids_to_rebuild.clone();
+        if force_country_mmdb_refresh {
+            for (proxy_id, plugins) in &mut new_map {
+                let (replacement, changed) =
+                    replace_country_mmdb_instances(plugins, &country_mmdb_replacements);
+                if changed {
+                    *plugins = replacement;
+                    proxy_ids_to_refresh.insert(proxy_id.clone());
+                }
+            }
+        }
+
         // Update buffering maps for changed proxies
         let mut new_buffering: BufferingMap = current.requires_buffering.clone();
         let mut new_req_buffering: RequestBufferingMap = current.requires_request_buffering.clone();
@@ -3777,7 +4213,7 @@ impl PluginCache {
             new_ws_frame.remove(id);
         }
         for proxy in &config.proxies {
-            if proxy_ids_to_rebuild.contains(&proxy.id)
+            if proxy_ids_to_refresh.contains(&proxy.id)
                 && let Some(plugins) = new_map.get(&proxy.id)
             {
                 new_buffering.insert(
@@ -3814,6 +4250,23 @@ impl PluginCache {
             ));
         }
 
+        let country_mmdb_snapshot_bytes = match country_mmdb_snapshot_bytes(&new_map, &new_globals)
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if rebuild_globals {
+                    crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                        |registry_error| {
+                            format!(
+                                "Config reload rejected: {error}; registry abort also failed: {registry_error}"
+                            )
+                        },
+                    )?;
+                }
+                return Err(format!("Config reload rejected: {error}"));
+            }
+        };
+
         if let Err(error) = start_background_tasks(&new_map, &new_globals) {
             if rebuild_globals {
                 crate::plugins::utils::log_schema::registry::abort_reload().map_err(
@@ -3836,7 +4289,7 @@ impl PluginCache {
             new_grpc_web_proxy.remove(id);
         }
         for proxy in &config.proxies {
-            if proxy_ids_to_rebuild.contains(&proxy.id)
+            if proxy_ids_to_refresh.contains(&proxy.id)
                 && let Some(plugins) = new_map.get(&proxy.id)
             {
                 let mut inner = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
@@ -3907,6 +4360,8 @@ impl PluginCache {
             new_global_requires_ws_frame,
             group_plugin_instances,
             adaptive_concurrency_instances,
+            country_mmdb_instances,
+            country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
         )))
     }
@@ -3925,6 +4380,7 @@ impl PluginCache {
             proxy_ids_to_rebuild,
             removed_proxy_ids,
             rebuild_globals,
+            CountryMmdbLoadMode::Standard,
         )?;
 
         // Single atomic swap — readers see old or new, never a partial state.
@@ -4087,6 +4543,12 @@ impl PluginCache {
         total
     }
 
+    /// Deduplicated immutable country-MMDB bytes retained by the live cache
+    /// generation. Exposed for diagnostics and admission regression tests.
+    pub fn country_mmdb_snapshot_bytes(&self) -> u64 {
+        self.inner.load().country_mmdb_snapshot_bytes
+    }
+
     /// Number of proxy entries in the cache (for testing).
     #[allow(dead_code)]
     pub fn proxy_count(&self) -> usize {
@@ -4111,14 +4573,19 @@ impl PluginCache {
             bool,
             ProxyGroupInstanceMap,
             AdaptiveConcurrencyInstanceMap,
+            CountryMmdbPluginInstanceMap,
+            u64,
             TcpConnectionThrottleInstanceMap,
         ),
         String,
     > {
+        let country_mmdb_load_session =
+            CountryMmdbLoadSession::claim(&config.country_mmdb_file_dependency_paths())?;
         // Step 1: Create all enabled global plugins (shared across proxies)
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
         let mut adaptive_concurrency_instances =
             retained_adaptive_concurrency_states(current_adaptive_states, config);
+        let mut country_mmdb_instances = CountryMmdbPluginInstanceMap::new();
         let mut tcp_connection_throttle_instances =
             retained_tcp_connection_throttle_states(current_tcp_throttle_states, config);
 
@@ -4154,10 +4621,13 @@ impl PluginCache {
             if pc.plugin_name != "transaction_log_schema" {
                 continue;
             }
-            match try_create_plugin(
+            match try_create_plugin_for_cache(
                 pc,
                 config,
                 http_client,
+                &country_mmdb_load_session,
+                None,
+                &mut country_mmdb_instances,
                 current_adaptive_states,
                 &mut adaptive_concurrency_instances,
                 current_tcp_throttle_states,
@@ -4181,10 +4651,13 @@ impl PluginCache {
                 continue; // already constructed above
             }
             if pc.scope == PluginScope::Global {
-                match try_create_plugin(
+                match try_create_plugin_for_cache(
                     pc,
                     config,
                     http_client,
+                    &country_mmdb_load_session,
+                    None,
+                    &mut country_mmdb_instances,
                     current_adaptive_states,
                     &mut adaptive_concurrency_instances,
                     current_tcp_throttle_states,
@@ -4241,10 +4714,13 @@ impl PluginCache {
             if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
-                        match try_create_plugin(
+                        match try_create_plugin_for_cache(
                             pc,
                             config,
                             http_client,
+                            &country_mmdb_load_session,
+                            None,
+                            &mut country_mmdb_instances,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
                             current_tcp_throttle_states,
@@ -4285,10 +4761,13 @@ impl PluginCache {
                         merged.push(plugin);
                     } else {
                         // First proxy to reference this group plugin — create the instance
-                        match try_create_plugin(
+                        match try_create_plugin_for_cache(
                             pc,
                             config,
                             http_client,
+                            &country_mmdb_load_session,
+                            None,
+                            &mut country_mmdb_instances,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
                             current_tcp_throttle_states,
@@ -4393,6 +4872,23 @@ impl PluginCache {
             ));
         }
 
+        let country_mmdb_snapshot_bytes = match country_mmdb_snapshot_bytes(
+            &proxy_map,
+            &global_plugins,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                    |registry_error| {
+                        format!(
+                            "Gateway startup aborted: {error}; registry abort also failed: {registry_error}"
+                        )
+                    },
+                )?;
+                return Err(format!("Gateway startup aborted: {error}"));
+            }
+        };
+
         if let Err(error) = start_background_tasks(&proxy_map, &global_plugins) {
             crate::plugins::utils::log_schema::registry::abort_reload().map_err(
                 |registry_error| {
@@ -4430,6 +4926,8 @@ impl PluginCache {
             global_needs_ws_frame,
             group_plugin_instances,
             adaptive_concurrency_instances,
+            country_mmdb_instances,
+            country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
         ))
     }

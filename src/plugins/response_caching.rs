@@ -1525,6 +1525,16 @@ impl Plugin for ResponseCaching {
         PluginResult::Continue
     }
 
+    /// `x-cache-status` is an unconditional gateway `insert`, so a backend that
+    /// sends the identical value (`MISS` is trivially guessable) hides the write
+    /// from net-diff mutation tracking — and a later body/committed hook that
+    /// exhausts the gRPC deadline would then rebuild the DEADLINE_EXCEEDED
+    /// response without it. Declared owned only when the header is actually
+    /// configured to be written.
+    fn owns_deadline_response_header(&self, _ctx: &RequestContext, name: &str) -> bool {
+        self.config.add_cache_status_header && name.eq_ignore_ascii_case("x-cache-status")
+    }
+
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,

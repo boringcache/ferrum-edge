@@ -303,6 +303,28 @@ impl Plugin for RateLimiting {
         inject_rate_limit_headers_from_metadata(&ctx.metadata, response_headers);
         PluginResult::Continue
     }
+
+    /// These telemetry writes are unconditional `insert`s of a gateway-computed
+    /// value, so a backend that pre-populates the identical bytes makes them
+    /// invisible to net-diff mutation tracking. Without this declaration, a
+    /// later body/committed hook that exhausts the gRPC deadline would rebuild
+    /// the DEADLINE_EXCEEDED response with the operator's rate-limit telemetry
+    /// silently dropped. Mirrors `ai_rate_limiter`: sourced from the same
+    /// [`EXPOSED_RATELIMIT_HEADERS`] table `after_proxy` writes from so the two
+    /// cannot drift apart, and gated on the same `expose_headers` +
+    /// metadata-presence conditions so nothing is claimed that was not actually
+    /// written on this request.
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        if !self.expose_headers {
+            return false;
+        }
+        for &(meta_key, header_name) in EXPOSED_RATELIMIT_HEADERS {
+            if name.eq_ignore_ascii_case(header_name) && ctx.metadata.contains_key(meta_key) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn parse_limit_by(object: &serde_json::Map<String, Value>) -> Result<LimitBy, String> {
@@ -631,20 +653,25 @@ fn ip_key(client_ip: &str) -> String {
     prefixed_key("ip:", client_ip)
 }
 
+/// Metadata key -> response header for the telemetry `expose_headers` publishes.
+///
+/// x-ratelimit-identity is intentionally NOT mapped: injecting the limiter key
+/// here would echo the gateway's internal consumer/SPIFFE identity to the
+/// downstream client (after_proxy) — an information-disclosure surface.
+///
+/// Shared by the injection site and `owns_deadline_response_header` so the
+/// written set and the declared-owned set cannot drift apart.
+static EXPOSED_RATELIMIT_HEADERS: &[(&str, &str)] = &[
+    ("ratelimit_limit", "x-ratelimit-limit"),
+    ("ratelimit_remaining", "x-ratelimit-remaining"),
+    ("ratelimit_window", "x-ratelimit-window"),
+];
+
 fn inject_rate_limit_headers_from_metadata(
     metadata: &HashMap<String, String>,
     headers: &mut HashMap<String, String>,
 ) {
-    // x-ratelimit-identity is intentionally NOT mapped: injecting the limiter key
-    // here would echo the gateway's internal consumer/SPIFFE identity to the
-    // downstream client (after_proxy) — an information-disclosure surface.
-    static KEYS: &[(&str, &str)] = &[
-        ("ratelimit_limit", "x-ratelimit-limit"),
-        ("ratelimit_remaining", "x-ratelimit-remaining"),
-        ("ratelimit_window", "x-ratelimit-window"),
-    ];
-
-    for &(meta_key, header_name) in KEYS {
+    for &(meta_key, header_name) in EXPOSED_RATELIMIT_HEADERS {
         if let Some(value) = metadata.get(meta_key) {
             headers.insert(header_name.to_string(), value.clone());
         }

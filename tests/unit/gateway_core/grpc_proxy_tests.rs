@@ -12,6 +12,7 @@ use ferrum_edge::plugins::{
 };
 use ferrum_edge::proxy::build_backend_url;
 use ferrum_edge::proxy::grpc_proxy;
+use ferrum_edge::proxy::headers::merge_proxy_headers_and_strip_for_grpc;
 use serde_json::json;
 
 fn test_proxy() -> Proxy {
@@ -83,6 +84,50 @@ fn headers_with_content_type(ct: &str) -> hyper::HeaderMap {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-type", ct.parse().unwrap());
     headers
+}
+
+#[test]
+fn native_grpc_strips_raw_geo_assertion_before_authoritative_merge() {
+    let mut raw_headers = hyper::HeaderMap::new();
+    raw_headers.append("x-geo-country", "attacker-first".parse().unwrap());
+    raw_headers.append("x-geo-country", "attacker-second".parse().unwrap());
+
+    merge_proxy_headers_and_strip_for_grpc(&mut raw_headers, &HashMap::new());
+    assert!(!raw_headers.contains_key("x-geo-country"));
+
+    let mut raw_headers = hyper::HeaderMap::new();
+    raw_headers.insert("x-geo-country", "attacker".parse().unwrap());
+    let proxy_headers = HashMap::from([("x-geo-country".to_string(), "SE".to_string())]);
+
+    merge_proxy_headers_and_strip_for_grpc(&mut raw_headers, &proxy_headers);
+    assert_eq!(
+        raw_headers
+            .get("x-geo-country")
+            .and_then(|value| value.to_str().ok()),
+        Some("SE")
+    );
+}
+
+#[test]
+fn h3_grpc_bridge_preserves_trusted_geo_assertion_on_both_dispatch_paths() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let helper = source
+        .split("fn trusted_plugin_assertion_proxy_headers")
+        .nth(1)
+        .and_then(|tail| tail.split("/// Stream a live gRPC backend response").next())
+        .expect("trusted H3 gRPC assertion helper source section");
+
+    assert!(
+        helper.contains("key.eq_ignore_ascii_case(\"x-geo-country\")"),
+        "the H3 gRPC assertion bridge must retain the authoritative geo result"
+    );
+    assert_eq!(
+        source
+            .matches("trusted_plugin_assertion_proxy_headers(proxy_headers)")
+            .count(),
+        2,
+        "both buffered and streaming H3-to-gRPC dispatches must use the trusted assertion map"
+    );
 }
 
 // --- is_grpc_content_type detection tests ---
