@@ -2438,6 +2438,153 @@ async fn api_spec_delete_rejects_foreign_owned_cascade_plugin_without_retagging(
 }
 
 #[tokio::test]
+async fn direct_proxy_delete_rejects_foreign_owned_cascade_plugin_without_retagging() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("direct-foreign-plugin-proxy");
+
+    let (post_status, post_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id")
+        .to_string();
+    let plugin_id = uid("direct-foreign-plugin");
+    let plugin = manual_proxy_plugin(&plugin_id, &proxy_id, "stdout_logging", json!({}));
+    attach_manual_proxy_plugin(&store, &proxy_id, &plugin).await;
+
+    let foreign_spec_id = uid("direct-foreign-plugin-owner");
+    sqlx::query("UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?")
+        .bind(&foreign_spec_id)
+        .bind("ferrum")
+        .bind(&plugin_id)
+        .execute(&store.pool())
+        .await
+        .expect("inject foreign API-spec ownership");
+
+    let (delete_status, delete_body) = client.delete_json(&format!("/proxies/{proxy_id}")).await;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "foreign-owned cascade plugin must block direct proxy deletion: {delete_body}"
+    );
+    let error = delete_body["error"]
+        .as_str()
+        .expect("direct delete ownership error");
+    assert!(error.contains(&proxy_id));
+    assert!(error.contains(&plugin_id));
+    assert!(error.contains(&spec_id));
+    assert!(error.contains(&foreign_spec_id));
+    assert!(store.get_api_spec("ferrum", &spec_id).await.unwrap().is_some());
+    assert!(store.get_proxy("ferrum", &proxy_id).await.unwrap().is_some());
+    let preserved_plugin = store
+        .get_plugin_config("ferrum", &plugin_id)
+        .await
+        .unwrap()
+        .expect("rejected direct delete must preserve plugin");
+    assert_eq!(
+        preserved_plugin.api_spec_id.as_deref(),
+        Some(foreign_spec_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn direct_proxy_delete_rejects_foreign_upstream_then_allows_hand_owned_graph() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("direct-foreign-upstream-proxy");
+
+    let (post_status, post_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id")
+        .to_string();
+
+    let upstream_id = uid("direct-hand-upstream");
+    let upstream: Upstream = serde_json::from_value(json!({
+        "id": upstream_id,
+        "namespace": "ferrum",
+        "targets": [{"host": "manual.internal", "port": 443}]
+    }))
+    .expect("hand-owned upstream");
+    store
+        .create_upstream(&upstream)
+        .await
+        .expect("create hand-owned upstream");
+    let mut drifted_proxy = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .expect("get spec proxy")
+        .expect("spec proxy exists");
+    drifted_proxy.upstream_id = Some(upstream_id.clone());
+    store
+        .update_proxy(&drifted_proxy)
+        .await
+        .expect("point proxy at hand-owned upstream");
+
+    let plugin_id = uid("direct-hand-plugin");
+    let plugin = manual_proxy_plugin(&plugin_id, &proxy_id, "stdout_logging", json!({}));
+    attach_manual_proxy_plugin(&store, &proxy_id, &plugin).await;
+
+    let foreign_spec_id = uid("direct-foreign-upstream-owner");
+    sqlx::query("UPDATE upstreams SET api_spec_id = ? WHERE namespace = ? AND id = ?")
+        .bind(&foreign_spec_id)
+        .bind("ferrum")
+        .bind(&upstream_id)
+        .execute(&store.pool())
+        .await
+        .expect("inject foreign upstream ownership");
+
+    let (rejected_status, rejected_body) =
+        client.delete_json(&format!("/proxies/{proxy_id}")).await;
+    assert_eq!(
+        rejected_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "foreign-owned upstream must block direct proxy deletion: {rejected_body}"
+    );
+    let error = rejected_body["error"]
+        .as_str()
+        .expect("direct delete upstream ownership error");
+    assert!(error.contains(&proxy_id));
+    assert!(error.contains(&upstream_id));
+    assert!(error.contains(&spec_id));
+    assert!(error.contains(&foreign_spec_id));
+    assert!(store.get_api_spec("ferrum", &spec_id).await.unwrap().is_some());
+    assert!(store.get_proxy("ferrum", &proxy_id).await.unwrap().is_some());
+
+    sqlx::query("UPDATE upstreams SET api_spec_id = NULL WHERE namespace = ? AND id = ?")
+        .bind("ferrum")
+        .bind(&upstream_id)
+        .execute(&store.pool())
+        .await
+        .expect("restore hand-owned upstream shape");
+
+    let (delete_status, delete_body) = client.delete_json(&format!("/proxies/{proxy_id}")).await;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::NO_CONTENT,
+        "legitimate hand-owned upstream and plugin must pass direct delete preflight: {delete_body}"
+    );
+    assert!(store.get_api_spec("ferrum", &spec_id).await.unwrap().is_none());
+    assert!(store.get_proxy("ferrum", &proxy_id).await.unwrap().is_none());
+    let preserved_upstream = store
+        .get_upstream("ferrum", &upstream_id)
+        .await
+        .unwrap()
+        .expect("hand-owned upstream must survive proxy deletion");
+    assert!(preserved_upstream.api_spec_id.is_none());
+}
+
+#[tokio::test]
 async fn post_rejects_hmac_request_body_transformer_composition() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;

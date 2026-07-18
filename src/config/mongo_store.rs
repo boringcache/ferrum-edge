@@ -9269,6 +9269,7 @@ mod inner {
 
             Self::run_mtls_dns_mutations(&mut mtls_leases, async {
                 let connection = self.connection();
+                let validation_http_client = validation_http_client.clone();
                 let mut session = connection.client.start_session().await?;
                 let prepared_docs = prepare_api_spec_restore_docs(
                     bundle,

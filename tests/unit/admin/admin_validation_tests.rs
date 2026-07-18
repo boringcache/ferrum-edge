@@ -109,9 +109,9 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("late plugin delete compensation could not restore proxy"));
     assert!(crud_source.contains("late_delete_api_spec_snapshot("));
     assert!(crud_source.contains("db.get_api_spec_by_proxy(namespace, &previous.id)"));
-    assert!(crud_source.contains(
-        "&api_spec_snapshot.additional_upstreams,"
-    ));
+    assert!(crud_source.contains("&api_spec_snapshot.additional_upstreams,"));
+    assert!(crud_source.contains("db.restore_api_spec_bundle("));
+    assert!(crud_source.contains("&http_client,"));
     assert!(crud_source.contains("affected_upstreams"));
     assert!(crud_source.contains("task.abort();"));
     assert!(crud_source.contains("tokio::time::timeout("));
@@ -289,6 +289,17 @@ fn direct_api_spec_proxy_delete_rereads_ownership_and_uses_atomic_restore() {
     assert!(ownership_snapshot.contains("validate_api_spec_restore_inputs("));
     assert!(ownership_snapshot.contains("additional_upstreams,"));
     assert!(ownership_snapshot.contains("additional_plugins,"));
+
+    let ownership_validation = source
+        .find("async fn validate_direct_api_spec_proxy_delete_restore_ownership(")
+        .expect("direct proxy DELETE must validate authoritative restore ownership");
+    let ownership_validation = &source[ownership_validation..proxy_impl];
+    assert!(ownership_validation.contains(".get_plugin_config(namespace, &snapshot_plugin.id)"));
+    assert!(ownership_validation.contains(".get_upstream(namespace, upstream_id)"));
+    assert!(ownership_validation.contains("owner != spec.id"));
+    assert!(source[proxy_impl..].contains(
+        "validate_direct_api_spec_proxy_delete_restore_ownership(db, namespace, existing)"
+    ));
 }
 
 #[test]
