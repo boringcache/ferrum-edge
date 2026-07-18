@@ -1023,6 +1023,134 @@ async fn buffered_deadline_keeps_only_provenance_owned_gateway_headers() {
 }
 
 #[tokio::test]
+async fn buffered_deadline_uses_private_state_for_multiple_correlation_instances() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
+        transform_buffered_response_body_with_deadline_for_test,
+    };
+
+    let default = create_plugin("correlation_id", &json!({}))
+        .unwrap()
+        .unwrap();
+    let custom = create_plugin(
+        "correlation_id",
+        &json!({ "header_name": "x-custom-request-id" }),
+    )
+    .unwrap()
+    .unwrap();
+    let echo_disabled = create_plugin(
+        "correlation_id",
+        &json!({
+            "header_name": "x-disabled-request-id",
+            "echo_downstream": false
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let unexecuted = create_plugin(
+        "correlation_id",
+        &json!({ "header_name": "x-unexecuted-request-id" }),
+    )
+    .unwrap()
+    .unwrap();
+    let after_proxy_plugins = vec![
+        Arc::clone(&default),
+        Arc::clone(&custom),
+        Arc::clone(&echo_disabled),
+        unexecuted,
+    ];
+
+    for grpc_web_content_type in [
+        None,
+        Some("application/grpc-web+proto"),
+        Some("application/grpc-web-text+proto"),
+    ] {
+        let mut ctx = create_grpc_context_with_timeout(None);
+        for (name, value) in [
+            ("x-request-id", "default-request-id"),
+            ("x-custom-request-id", "custom-request-id"),
+            ("x-disabled-request-id", "disabled-request-id"),
+        ] {
+            ctx.headers.insert(name.to_string(), value.to_string());
+        }
+        for correlation in [&default, &custom, &echo_disabled] {
+            assert_continue(correlation.on_request_received(&mut ctx).await);
+        }
+
+        // Public metadata is a mutable compatibility projection. Ownership of
+        // the exact-value echoes must remain tied to each instance's private
+        // request lifecycle state even if another plugin removes that view.
+        ctx.metadata.retain(|name, _| {
+            name != "request_id" && !name.starts_with("correlation_id.instance.")
+        });
+        set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+        let mut headers = HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            (
+                "x-request-id".to_string(),
+                "default-request-id".to_string(),
+            ),
+            (
+                "x-custom-request-id".to_string(),
+                "custom-request-id".to_string(),
+            ),
+            (
+                "x-disabled-request-id".to_string(),
+                "disabled-request-id".to_string(),
+            ),
+            (
+                "x-unexecuted-request-id".to_string(),
+                "unexecuted-request-id".to_string(),
+            ),
+        ]);
+        assert!(
+            !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers)
+                .await
+        );
+        set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+        let mut status = 200;
+        let mut body = b"discarded backend response".to_vec();
+        let transform_plugins: Vec<Arc<dyn Plugin>> =
+            vec![Arc::new(StalledResponseTransformer)];
+
+        assert!(
+            transform_buffered_response_body_with_deadline_for_test(
+                &transform_plugins,
+                &mut ctx,
+                &mut status,
+                &mut headers,
+                &mut body,
+                grpc_web_content_type,
+            )
+            .await
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers.get("x-request-id").map(String::as_str),
+            Some("default-request-id")
+        );
+        assert_eq!(
+            headers.get("x-custom-request-id").map(String::as_str),
+            Some("custom-request-id")
+        );
+        assert!(!headers.contains_key("x-disabled-request-id"));
+        assert!(!headers.contains_key("x-unexecuted-request-id"));
+        if let Some(content_type) = grpc_web_content_type {
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some(content_type)
+            );
+            assert_eq!(headers.get("x-grpc-web").map(String::as_str), Some("1"));
+            assert!(!headers.contains_key("grpc-status"));
+        } else {
+            assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+            assert!(body.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
     use ferrum_edge::_test_support::{
         run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,

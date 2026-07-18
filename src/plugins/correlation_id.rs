@@ -298,7 +298,7 @@ impl Plugin for CorrelationId {
 
     fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
         self.echo_downstream
-            && ctx.metadata.contains_key("request_id")
+            && self.request_id(ctx).is_some()
             && name.eq_ignore_ascii_case(&self.header_name)
     }
 }
