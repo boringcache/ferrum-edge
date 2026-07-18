@@ -2957,7 +2957,7 @@ impl AdminResource for Upstream {
         db.list_upstreams_paginated(
             namespace,
             pagination.query_limit_i64(),
-            pagination.offset as i64,
+            pagination.query_offset_i64(),
         )
         .await
     }
@@ -3212,7 +3212,7 @@ impl AdminResource for PluginConfig {
         db.list_plugin_configs_paginated(
             namespace,
             pagination.query_limit_i64(),
-            pagination.offset as i64,
+            pagination.query_offset_i64(),
         )
         .await
     }
@@ -3706,7 +3706,7 @@ impl AdminResource for Proxy {
         db.list_proxies_paginated(
             namespace,
             pagination.query_limit_i64(),
-            pagination.offset as i64,
+            pagination.query_offset_i64(),
         )
         .await
     }
@@ -4303,7 +4303,7 @@ impl AdminResource for Consumer {
         db.list_consumers_paginated(
             namespace,
             pagination.query_limit_i64(),
-            pagination.offset as i64,
+            pagination.query_offset_i64(),
         )
         .await
     }

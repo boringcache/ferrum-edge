@@ -632,6 +632,12 @@ async fn handle_admin_connection(
 }
 
 /// Pagination parameters parsed from query string.
+///
+/// An omitted `limit` applies [`DEFAULT_PAGE_SIZE`] — list endpoints never
+/// return unbounded collections (`GET /backup` is the intentional full-export
+/// mechanism). `offset` is bounded at parse time to the backend-safe `i64`
+/// range so later conversions cannot wrap negative (which MongoDB would then
+/// reinterpret as a huge `u64` skip).
 pub(crate) struct PaginationParams {
     offset: usize,
     limit: Option<usize>,
@@ -642,44 +648,78 @@ const MAX_PAGE_SIZE: usize = 1000;
 
 impl PaginationParams {
     fn in_memory_limit(&self) -> usize {
-        self.limit.unwrap_or(usize::MAX)
+        self.limit.unwrap_or(DEFAULT_PAGE_SIZE)
     }
 
     pub(crate) fn query_limit_i64(&self) -> i64 {
-        self.limit.map(|limit| limit as i64).unwrap_or(i64::MAX)
+        self.limit
+            .map(|limit| limit as i64)
+            .unwrap_or(DEFAULT_PAGE_SIZE as i64)
     }
 
-    fn response_limit(&self, total: usize) -> usize {
-        self.limit
-            .unwrap_or_else(|| total.saturating_sub(self.offset))
+    /// Offset as a backend-safe `i64`. Bounded at parse time, so this cast
+    /// can never wrap.
+    pub(crate) fn query_offset_i64(&self) -> i64 {
+        self.offset as i64
+    }
+
+    fn response_limit(&self) -> usize {
+        self.limit.unwrap_or(DEFAULT_PAGE_SIZE)
     }
 }
 
-fn parse_pagination(uri: &hyper::Uri) -> PaginationParams {
+/// Reject malformed or out-of-range pagination input with `400` rather than
+/// silently coercing, clamping, or wrapping it.
+fn invalid_pagination_response(field: &str, reason: &str) -> Box<Response<Full<Bytes>>> {
+    Box::new(json_response(
+        StatusCode::BAD_REQUEST,
+        &json!({"error": format!("Invalid {field} pagination parameter: {reason}")}),
+    ))
+}
+
+fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<Full<Bytes>>>> {
     let mut offset = 0usize;
     let mut limit = None;
     if let Some(query) = uri.query() {
-        for pair in query.split('&') {
-            let mut parts = pair.splitn(2, '=');
-            if let (Some(key), Some(val)) = (parts.next(), parts.next()) {
-                match key {
-                    "offset" => {
-                        offset = val.parse().unwrap_or(0);
+        for (key, val) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "offset" => {
+                    let parsed: u64 = val.parse().map_err(|_| {
+                        invalid_pagination_response("offset", "must be a non-negative integer")
+                    })?;
+                    if parsed > i64::MAX as u64 {
+                        return Err(invalid_pagination_response(
+                            "offset",
+                            "exceeds the maximum supported value",
+                        ));
                     }
-                    "limit" => {
-                        let parsed = val.parse().unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
-                        limit = Some(if parsed == 0 {
-                            DEFAULT_PAGE_SIZE
-                        } else {
-                            parsed
-                        });
-                    }
-                    _ => {}
+                    offset = usize::try_from(parsed).map_err(|_| {
+                        invalid_pagination_response("offset", "exceeds the maximum supported value")
+                    })?;
                 }
+                "limit" => {
+                    let parsed: u64 = val.parse().map_err(|_| {
+                        invalid_pagination_response("limit", "must be a non-negative integer")
+                    })?;
+                    // `0` keeps the documented "server default" meaning; values
+                    // above the maximum are capped, both per openapi.yaml.
+                    let parsed = if parsed == 0 {
+                        DEFAULT_PAGE_SIZE
+                    } else {
+                        usize::try_from(parsed.min(MAX_PAGE_SIZE as u64)).map_err(|_| {
+                            invalid_pagination_response(
+                                "limit",
+                                "exceeds the maximum supported value",
+                            )
+                        })?
+                    };
+                    limit = Some(parsed);
+                }
+                _ => {}
             }
         }
     }
-    PaginationParams { offset, limit }
+    Ok(PaginationParams { offset, limit })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -824,7 +864,7 @@ fn paginate_response(items: &Value, pagination: &PaginationParams) -> Value {
         "data": paginated,
         "pagination": {
             "offset": pagination.offset,
-            "limit": pagination.response_limit(total),
+            "limit": pagination.response_limit(),
             "total": total
         }
     })
@@ -840,7 +880,7 @@ fn paginate_db_response<T: Serialize>(
         "data": items,
         "pagination": {
             "offset": pagination.offset,
-            "limit": pagination.response_limit(total.max(0) as usize),
+            "limit": pagination.response_limit(),
             "total": total
         }
     })
@@ -978,6 +1018,12 @@ pub async fn handle_admin_request(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| q.to_string());
+    // Parsed here but NOT resolved until after the admin JWT gate below: a
+    // malformed `limit`/`offset` must not turn an unauthenticated request into
+    // a `400` before authentication runs. That ordering would both leak
+    // validation before authn and break the always-unauthenticated,
+    // always-minimal observability tier (`/live` must answer `{"status":"ok"}`
+    // even when the query string is garbage).
     let pagination = parse_pagination(req.uri());
     // Extracted once: used both for observability-detail tiering below and the
     // main admin JWT gate further down.
@@ -1317,6 +1363,13 @@ pub async fn handle_admin_request(
                 &json!({"error": format!("Token verification failed: {}", msg)}),
             ));
         }
+    };
+
+    // Authentication has passed, so malformed pagination can now surface as
+    // `400` without preempting the `401` above.
+    let pagination = match pagination {
+        Ok(pagination) => pagination,
+        Err(response) => return Ok(*response),
     };
 
     // API chargeback endpoint. Chargeback output contains customer/business data,
@@ -6860,16 +6913,9 @@ fn parse_audit_filter(
                             .with_timezone(&Utc),
                     );
                 }
-                "limit" => {
-                    let parsed = value.parse::<usize>().map_err(|_| {
-                        Box::new(json_response(
-                            StatusCode::BAD_REQUEST,
-                            &json!({"error": "Invalid audit limit"}),
-                        ))
-                    })?;
-                    filter.limit = parsed.clamp(1, MAX_PAGE_SIZE) as u32;
-                }
-                "offset" => {}
+                // `limit`/`offset` are owned by `parse_pagination`, which has
+                // already validated and bounded them into `pagination`.
+                "limit" | "offset" => {}
                 _ => {}
             }
         }
@@ -7422,22 +7468,25 @@ mod tests {
     }
 
     #[test]
-    fn unpaginated_response_returns_all_items() {
+    fn unpaginated_response_applies_default_page_size() {
         let uri: hyper::Uri = "/proxies".parse().unwrap();
-        let pagination = parse_pagination(&uri);
+        let pagination = parse_pagination(&uri).expect("no query string is valid");
         let items = json!((0..150).collect::<Vec<_>>());
 
         let response = paginate_response(&items, &pagination);
 
-        assert_eq!(response["data"].as_array().unwrap().len(), 150);
-        assert_eq!(response["pagination"]["limit"], 150);
-        assert_eq!(pagination.query_limit_i64(), i64::MAX);
+        // An omitted limit applies the 100-item default instead of returning
+        // the whole collection (GET /backup is the full-export mechanism).
+        assert_eq!(response["data"].as_array().unwrap().len(), 100);
+        assert_eq!(response["pagination"]["limit"], 100);
+        assert_eq!(response["pagination"]["total"], 150);
+        assert_eq!(pagination.query_limit_i64(), 100);
     }
 
     #[test]
     fn explicit_limit_still_caps_response() {
         let uri: hyper::Uri = "/proxies?limit=25&offset=10".parse().unwrap();
-        let pagination = parse_pagination(&uri);
+        let pagination = parse_pagination(&uri).expect("valid pagination");
         let items = json!((0..150).collect::<Vec<_>>());
 
         let response = paginate_response(&items, &pagination);
@@ -7446,6 +7495,52 @@ mod tests {
         assert_eq!(response["pagination"]["offset"], 10);
         assert_eq!(response["pagination"]["limit"], 25);
         assert_eq!(pagination.query_limit_i64(), 25);
+        assert_eq!(pagination.query_offset_i64(), 10);
+    }
+
+    #[test]
+    fn pagination_limit_zero_uses_default_and_large_values_cap() {
+        let uri: hyper::Uri = "/proxies?limit=0".parse().unwrap();
+        let pagination = parse_pagination(&uri).expect("limit=0 keeps default meaning");
+        assert_eq!(pagination.query_limit_i64(), DEFAULT_PAGE_SIZE as i64);
+
+        let uri: hyper::Uri = "/proxies?limit=5000".parse().unwrap();
+        let pagination = parse_pagination(&uri).expect("above-max limit caps");
+        assert_eq!(pagination.query_limit_i64(), MAX_PAGE_SIZE as i64);
+    }
+
+    #[test]
+    fn pagination_rejects_malformed_and_overflowing_values() {
+        for uri in [
+            "/proxies?offset=abc",
+            "/proxies?offset=-1",
+            "/proxies?offset=1.5",
+            "/proxies?limit=abc",
+            "/proxies?limit=-1",
+            // i64::MAX + 1 wrapped negative in the old `as i64` cast and
+            // became a huge MongoDB u64 skip.
+            "/proxies?offset=9223372036854775808",
+            // usize::MAX / u64::MAX likewise exceeds the backend-safe range.
+            "/proxies?offset=18446744073709551615",
+            "/proxies?limit=184467440737095516160",
+        ] {
+            let uri: hyper::Uri = uri.parse().unwrap();
+            let Err(response) = parse_pagination(&uri) else {
+                panic!("malformed/overflowing input must be rejected: {uri}");
+            };
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "malformed input must be rejected with 400: {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn pagination_offset_at_i64_max_is_backend_safe() {
+        let uri: hyper::Uri = "/proxies?offset=9223372036854775807".parse().unwrap();
+        let pagination = parse_pagination(&uri).expect("i64::MAX offset is backend-safe");
+        assert_eq!(pagination.query_offset_i64(), i64::MAX);
     }
 
     #[test]

@@ -273,8 +273,10 @@ JWKS-capable plugin fields can reference `managed://jwks/{id}#jwks` once the plu
 
 ## Proxies
 
+List endpoints return a paginated envelope `{ "data": [...], "pagination": { "offset", "limit", "total" } }` and accept `limit`/`offset` query parameters. An omitted `limit` applies the default of 100 (maximum 1000; `GET /backup` is the intentional full-export mechanism), `0` is coerced to the default, and values above 1000 are capped. Malformed or negative values, and offsets beyond `2^63 - 1`, are rejected with `400`.
+
 ```bash
-# List all proxies
+# List proxies (first page)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies
 
 # Create a proxy
@@ -381,7 +383,7 @@ Ordinary Consumer responses omit the entire `basicauth` credential type; JWT, HM
 # List available plugin types
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins
 
-# List all plugin configs
+# List plugin configs (first page)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins/config
 
 # Create plugin config
@@ -403,7 +405,7 @@ Plugin-config reads by `viewer` and `operator` roles use the same redacted proje
 ## Upstreams
 
 ```bash
-# List all upstreams
+# List upstreams (first page)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams
 
 # Create an upstream (load-balanced backend group)
@@ -477,7 +479,7 @@ See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
 When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. Partial `POST /batch` mutations that return `207 Multi-Status` emit an audit event when at least one resource was changed. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values.
 
-`GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters.
+`GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters. `limit`/`offset` follow the same bounds as every other list endpoint (default 100, maximum 1000, malformed or out-of-range values rejected with `400`); the audit response keeps its own `{ "items", "limit", "offset", "next_offset", "total" }` envelope.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \

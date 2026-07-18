@@ -1069,7 +1069,7 @@ async fn audit_list_rejects_offset_above_backend_range() {
 }
 
 #[tokio::test]
-async fn audit_list_clamps_zero_limit_to_one() {
+async fn audit_list_coerces_zero_limit_to_server_default() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
     let (base, _shutdown) = start_admin(state).await;
@@ -1078,7 +1078,10 @@ async fn audit_list_clamps_zero_limit_to_one() {
     let (status, body) = get_json(&base, "/audit?limit=0", &admin).await;
 
     assert_eq!(status, 200, "zero limit body: {body:?}");
-    assert_eq!(body["limit"], 1);
+    // `/audit` shares the canonical pagination parser, so `limit=0` means the
+    // documented server default (100) here exactly as it does on every other
+    // list endpoint — it is no longer re-parsed into a 1-item clamp.
+    assert_eq!(body["limit"], 100);
 }
 
 #[tokio::test]

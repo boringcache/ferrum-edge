@@ -1283,7 +1283,8 @@ async fn test_list_proxies_without_pagination_returns_envelope() {
     assert!(body["data"].is_array(), "Should have data field");
     assert_eq!(body["data"].as_array().unwrap().len(), 5);
     assert_eq!(body["pagination"]["offset"], 0);
-    assert_eq!(body["pagination"]["limit"], 5);
+    // An omitted limit reports the server default (100), not the result count.
+    assert_eq!(body["pagination"]["limit"], 100);
     assert_eq!(body["pagination"]["total"], 5);
 }
 
@@ -1388,6 +1389,40 @@ async fn test_pagination_limit_clamped_to_max() {
     // Should still return all 5 (since 5 < 1000)
     assert_eq!(body["data"].as_array().unwrap().len(), 5);
     assert_eq!(body["pagination"]["limit"], 1000);
+}
+
+#[tokio::test]
+async fn test_malformed_pagination_is_rejected_with_400() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for query in [
+        "/proxies?limit=abc",
+        "/proxies?limit=-1",
+        "/proxies?offset=abc",
+        "/proxies?offset=-1",
+        // i64::MAX + 1: wrapped negative under the old `as i64` cast and became
+        // an enormous MongoDB u64 skip.
+        "/proxies?offset=9223372036854775808",
+    ] {
+        let (status, body, _) = admin_get(&base_url, query, &token).await;
+        assert_eq!(status, 400, "{query} must be rejected: {body:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_malformed_pagination_does_not_preempt_authentication() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+
+    // Pagination is validated only after the admin JWT gate, so an
+    // unauthenticated caller still gets 401 rather than a 400 that would leak
+    // input validation ahead of authentication.
+    let (status, body, _) = admin_get(&base_url, "/proxies?limit=abc", "not-a-valid-token").await;
+    assert_eq!(status, 401, "unauthenticated caller must get 401: {body:?}");
 }
 
 // ---- Batch endpoint tests ----

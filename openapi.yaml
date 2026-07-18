@@ -5052,9 +5052,10 @@ components:
         minimum: 0
         default: 0
       description: |
-        Number of items to skip. Invalid values are treated as `0`. List
-        endpoints return a paginated envelope containing `data` and
-        `pagination` fields even when this parameter is omitted.
+        Number of items to skip. Non-integer, negative, or values beyond the
+        backend-safe range (`2^63 - 1`) are rejected with `400` rather than
+        coerced. List endpoints return a paginated envelope containing `data`
+        and `pagination` fields even when this parameter is omitted.
 
     PaginationLimit:
       name: limit
@@ -5064,10 +5065,13 @@ components:
         type: integer
         minimum: 1
         maximum: 1000
+        default: 100
       description: |
-        Maximum number of items to return. When omitted, the server returns all
-        matching items. Explicit invalid values or `0` are coerced to the server
-        default of 100. Values above 1000 are capped at 1000.
+        Maximum number of items to return. When omitted, the server applies the
+        default of 100; list endpoints never return unbounded collections
+        (`GET /backup` is the intentional full-export mechanism). `0` is
+        coerced to the default of 100, and values above 1000 are capped at
+        1000. Non-integer or negative values are rejected with `400`.
         List endpoints return a paginated envelope containing `data` and
         `pagination` fields even when this parameter is omitted.
 
