@@ -12002,8 +12002,8 @@ pre_build = []
         + ci_publish_contract["latest-release"]["needs"]
         + ci_publish_contract["latest-release"]["if"]
         + "    runs-on: ubuntu-latest\n"
-        + "    steps:\n"
-        + "      - run: echo latest\n"
+        + ci_publish_contract["latest-release"]["steps"]
+        + "\n"
         + "  docker:\n"
         + ci_publish_contract["docker"]["needs"]
         + ci_publish_contract["docker"]["if"]
@@ -12015,13 +12015,22 @@ pre_build = []
         + ci_publish_contract["docker-manifest"]["needs"]
         + ci_publish_contract["docker-manifest"]["if"]
         + "    runs-on: ubuntu-latest\n"
+        + ci_publish_contract["docker-manifest"]["steps"]
+        + "\n"
+        # A job with no publication contract at all, so the fixture can still
+        # show that unrelated implementation edits stay editable now that every
+        # wildcard-publishing job freezes its whole step list.
+        + "  unrelated:\n"
+        + "    runs-on: ubuntu-latest\n"
         + "    steps:\n"
-        + ci_manifest_steps["Download digests"]
-        + "\n"
-        + ci_manifest_steps["Create and push multi-arch manifest (Docker Hub)"]
-        + "\n"
-        + ci_manifest_steps["Create and push multi-arch manifest (GHCR)"]
+        + "      - run: echo latest\n"
     )
+    for manifest_step_name, manifest_step_body in ci_manifest_steps.items():
+        if manifest_step_body not in ci_publish_contract["docker-manifest"]["steps"]:
+            failures.append(
+                f"CI docker-manifest step {manifest_step_name!r} is not covered "
+                "by the frozen manifest step list"
+            )
     if validate_publish_control_contract(publish_workflow, "CI workflow"):
         failures.append("valid ARM64 publication dependency controls were rejected")
 
@@ -12559,7 +12568,9 @@ pre_build = []
         failures.append("flow-spelled local action outside .github/actions was accepted")
     if reference_result("      - {uses: ./.github/actions/setup}\n")[2]:
         failures.append("flow-spelled permitted local action was rejected")
-    if "evil.sh" not in reference_result("      - {run: ./evil.sh}\n")[0]:
+    if "scripts/safe.sh" not in reference_result(
+        "      - {run: ./scripts/safe.sh}\n"
+    )[0]:
         failures.append("flow-spelled run script was not followed")
 
     # `defaults: {run: {shell: python}}` selects the same interpreter the block
