@@ -42,16 +42,10 @@ async fn burst(
     let results = futures::future::join_all((0..8).map(|_| {
         let factory_calls = Arc::clone(factory_calls);
         let probe_calls = Arc::clone(probe_calls);
-        cached_db_health_connected(
-            cache,
-            refresh_lock,
-            TTL,
-            PROBE_TIMEOUT,
-            move || {
-                factory_calls.fetch_add(1, Ordering::SeqCst);
-                ok_probe(probe_calls, Duration::ZERO)
-            },
-        )
+        cached_db_health_connected(cache, refresh_lock, TTL, PROBE_TIMEOUT, move || {
+            factory_calls.fetch_add(1, Ordering::SeqCst);
+            ok_probe(probe_calls, Duration::ZERO)
+        })
     }))
     .await;
     assert!(results.iter().all(|connected| *connected));
@@ -152,13 +146,9 @@ async fn failed_probe_caches_failure_for_the_window() {
 
     let results = futures::future::join_all((0..8).map(|_| {
         let probe_calls = Arc::clone(&probe_calls);
-        cached_db_health_connected(
-            &cache,
-            &refresh_lock,
-            TTL,
-            PROBE_TIMEOUT,
-            move || failing_probe(probe_calls),
-        )
+        cached_db_health_connected(&cache, &refresh_lock, TTL, PROBE_TIMEOUT, move || {
+            failing_probe(probe_calls)
+        })
     }))
     .await;
     assert!(results.iter().all(|connected| !*connected));
@@ -168,13 +158,9 @@ async fn failed_probe_caches_failure_for_the_window() {
     // get the coarse not-connected signal without re-hitting the database.
     let results = futures::future::join_all((0..8).map(|_| {
         let probe_calls = Arc::clone(&probe_calls);
-        cached_db_health_connected(
-            &cache,
-            &refresh_lock,
-            TTL,
-            PROBE_TIMEOUT,
-            move || failing_probe(probe_calls),
-        )
+        cached_db_health_connected(&cache, &refresh_lock, TTL, PROBE_TIMEOUT, move || {
+            failing_probe(probe_calls)
+        })
     }))
     .await;
     assert!(results.iter().all(|connected| !*connected));
@@ -219,13 +205,9 @@ async fn hung_probe_is_abandoned_at_the_timeout() {
 
     // The timeout outcome is cached for the window, so a follow-up caller is
     // answered without another doomed probe.
-    let connected = cached_db_health_connected(
-        &cache,
-        &refresh_lock,
-        TTL,
-        PROBE_TIMEOUT,
-        || ok_probe(Arc::clone(&probe_calls), Duration::ZERO),
-    )
+    let connected = cached_db_health_connected(&cache, &refresh_lock, TTL, PROBE_TIMEOUT, || {
+        ok_probe(Arc::clone(&probe_calls), Duration::ZERO)
+    })
     .await;
     assert!(!connected);
     assert_eq!(probe_calls.load(Ordering::SeqCst), 1);
