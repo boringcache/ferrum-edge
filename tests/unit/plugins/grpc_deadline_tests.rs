@@ -1087,10 +1087,7 @@ async fn buffered_deadline_uses_private_state_for_multiple_correlation_instances
 
         let mut headers = HashMap::from([
             ("content-type".to_string(), "application/grpc".to_string()),
-            (
-                "x-request-id".to_string(),
-                "default-request-id".to_string(),
-            ),
+            ("x-request-id".to_string(), "default-request-id".to_string()),
             (
                 "x-custom-request-id".to_string(),
                 "custom-request-id".to_string(),
@@ -1111,8 +1108,7 @@ async fn buffered_deadline_uses_private_state_for_multiple_correlation_instances
         set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
         let mut status = 200;
         let mut body = b"discarded backend response".to_vec();
-        let transform_plugins: Vec<Arc<dyn Plugin>> =
-            vec![Arc::new(StalledResponseTransformer)];
+        let transform_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledResponseTransformer)];
 
         assert!(
             transform_buffered_response_body_with_deadline_for_test(
