@@ -1198,8 +1198,8 @@ fn mongo_restore_keeps_additional_upstreams_inside_the_transaction() {
     assert!(restore.contains("prepared_docs.additional_upstreams"));
     assert!(restore.contains("validate_api_spec_retained_upstream_identity("));
     assert!(restore.contains("validation_http_client: &crate::plugins::PluginHttpClient"));
-    assert!(restore.contains("let validation_http_client = validation_http_client.clone()"));
-    assert!(restore.contains("&validation_http_client,"));
+    assert!(restore.contains("validate_api_spec_restore_candidate_in_session("));
+    assert!(restore.contains("validation_http_client,"));
     assert!(!restore.contains("PluginHttpClient::default()"));
     assert!(restore.contains("record_config_change_in_session("));
 }

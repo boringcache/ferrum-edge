@@ -9255,7 +9255,6 @@ mod inner {
             let mut mtls_leases = self
                 .acquire_mtls_dns_admission_leases(std::iter::once(spec.namespace.as_str()))
                 .await?;
-            let validation_http_client = validation_http_client.clone();
             self.validate_plugin_graph_admission_candidate(&spec.namespace, |candidate| {
                 candidate.proxies.push(bundle.proxy.clone());
                 candidate
@@ -9269,7 +9268,6 @@ mod inner {
 
             Self::run_mtls_dns_mutations(&mut mtls_leases, async {
                 let connection = self.connection();
-                let validation_http_client = validation_http_client.clone();
                 let mut session = connection.client.start_session().await?;
                 let prepared_docs = prepare_api_spec_restore_docs(
                     bundle,
@@ -9407,7 +9405,7 @@ mod inner {
                                     &mut *s,
                                     namespace.as_str(),
                                     restored_proxy_id.as_str(),
-                                    &validation_http_client,
+                                    validation_http_client,
                                 )
                                 .await
                                 .map_err(|error| {
