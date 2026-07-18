@@ -1006,6 +1006,7 @@ fn create_tcp_connection_throttle_plugin(
 /// and required-plugin validation failures reject the whole cache generation.
 /// Optional plugins may be omitted only when their registration metadata allows
 /// fail-open behavior.
+#[allow(clippy::too_many_arguments)]
 fn try_create_plugin(
     pc: &PluginConfig,
     gateway_config: &GatewayConfig,
@@ -4209,7 +4210,13 @@ impl PluginCache {
             Ok(bytes) => bytes,
             Err(error) => {
                 if rebuild_globals {
-                    crate::plugins::utils::log_schema::registry::abort_reload();
+                    crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                        |registry_error| {
+                            format!(
+                                "Config reload rejected: {error}; registry abort also failed: {registry_error}"
+                            )
+                        },
+                    )?;
                 }
                 return Err(format!("Config reload rejected: {error}"));
             }
@@ -4824,7 +4831,13 @@ impl PluginCache {
             match country_mmdb_snapshot_bytes(&proxy_map, &global_plugins) {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    crate::plugins::utils::log_schema::registry::abort_reload();
+                    crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                        |registry_error| {
+                            format!(
+                                "Gateway startup aborted: {error}; registry abort also failed: {registry_error}"
+                            )
+                        },
+                    )?;
                     return Err(format!("Gateway startup aborted: {error}"));
                 }
             };
