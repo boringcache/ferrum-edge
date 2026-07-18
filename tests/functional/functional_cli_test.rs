@@ -415,9 +415,31 @@ async fn functional_cli_validate_resolves_file_secret_suffix() {
     // "Validation passed." is if the `_FILE` source was actually materialized
     // into the base variable.
     assert!(stdout.contains("Validation passed."));
+    // The report is part of validate's stdout report block, not a tracing
+    // record: `init_logging()` defaults `FERRUM_LOG_LEVEL` to `warn` and
+    // `validate` has no `-v/--verbose` flag, so an `info!` would be
+    // unreachable. The hermetic helper's `env_clear()` drops `RUST_LOG` and
+    // `FERRUM_LOG_LEVEL` and pins an empty settings file, so this asserts the
+    // *default* invocation is visible — it cannot pass via an inherited
+    // verbosity setting.
+    assert!(
+        stdout.contains("External secrets: OK"),
+        "validate must print the external-secret report block by default: {stdout}"
+    );
     assert!(
         stdout.contains("Loaded FERRUM_ADMIN_JWT_SECRET from file"),
-        "validate must report the non-secret base variable and provider after logging initializes: {stdout}"
+        "validate must report the non-secret base variable and provider: {stdout}"
+    );
+    assert!(
+        stdout.contains("Resolved 1 env var(s) from external secret sources"),
+        "validate must report the resolved-source count: {stdout}"
+    );
+    // Only the base variable and provider name are reportable. The source
+    // reference (the file path) is as sensitive as the value it points at.
+    assert!(
+        !stdout.contains(secret_path.to_str().unwrap())
+            && !String::from_utf8_lossy(&output.stderr).contains(secret_path.to_str().unwrap()),
+        "source references must never be reported: {stdout}"
     );
     // The resolved value must never be echoed on either stream.
     let stderr = String::from_utf8_lossy(&output.stderr);

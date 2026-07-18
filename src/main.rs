@@ -496,7 +496,17 @@ fn resolve_startup_secrets() -> Result<secrets::ResolvedEnvSecrets, String> {
     Ok(resolved)
 }
 
-/// Report non-secret startup resolution metadata after tracing is initialized.
+/// Report non-secret startup resolution metadata for `run`, after tracing is
+/// initialized.
+///
+/// Serving modes are long-lived log producers, so this stays on the structured
+/// `info!` path and inherits `FERRUM_LOG_LEVEL`/`RUST_LOG` like every other
+/// startup record. `validate` deliberately does not use this path — see
+/// [`print_resolved_secret_sources`].
+///
+/// Only base variable names and backend display names are emitted. Secret
+/// values and source references (file paths, Vault paths, cloud resource IDs)
+/// are never included.
 fn log_resolved_secret_sources(resolved: &secrets::ResolvedEnvSecrets) {
     for (base_key, backend_name) in &resolved.loaded_sources {
         info!("Loaded {} from {}", base_key, backend_name);
@@ -507,6 +517,45 @@ fn log_resolved_secret_sources(resolved: &secrets::ResolvedEnvSecrets) {
             resolved.vars.len()
         );
     }
+}
+
+/// Print the external-secret resolution report as part of `validate`'s
+/// operator-facing stdout report.
+///
+/// `validate` is a one-shot reporting command: every other thing it tells the
+/// operator (`Settings (ferrum.conf): OK`, `Mode:`, `Spec (...): OK`,
+/// `Validation passed.`) is an unconditional `println!`, not a tracing record.
+/// The secret-source report is the same kind of output and is emitted the same
+/// way, for three reasons:
+///
+/// 1. **It would otherwise be invisible.** `init_logging()` defaults
+///    `FERRUM_LOG_LEVEL` to `warn`, so an `info!` record is filtered out of a
+///    default `ferrum-edge validate`. Unlike `run`, `validate` has no
+///    `-v/--verbose` flag (`ValidateArgs`), so there is no in-band way to raise
+///    the level — verbosity-gating this report would make it unreachable for
+///    the operators the report exists for.
+/// 2. **It is deterministically flushed.** `println!` goes straight to the
+///    process stdout `LineWriter` and is flushed at the newline, so the report
+///    cannot be lost to the non-blocking tracing sink's guard-drop drain racing
+///    `std::process::exit()`.
+/// 3. **Ordering is stable.** It lands with the rest of the validate report on
+///    the same writer, rather than interleaving across two writers on one fd.
+///
+/// Only base variable names and backend display names are printed. Secret
+/// values and source references are never included, exactly as in
+/// [`log_resolved_secret_sources`].
+fn print_resolved_secret_sources(resolved: &secrets::ResolvedEnvSecrets) {
+    if resolved.vars.is_empty() {
+        return;
+    }
+    println!("External secrets: OK");
+    for (base_key, backend_name) in &resolved.loaded_sources {
+        println!("  Loaded {} from {}", base_key, backend_name);
+    }
+    println!(
+        "  Resolved {} env var(s) from external secret sources",
+        resolved.vars.len()
+    );
 }
 
 /// Runs startup secret resolution, logging init, env-config parsing, and the
@@ -539,7 +588,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 return 1;
             }
         };
-        log_resolved_secret_sources(&resolved);
+        // Printed after logging init so any warning emitted by a later stage
+        // still has a live subscriber, and before `execute_validate()` so the
+        // report reads in resolution order: secrets, then settings, then spec.
+        print_resolved_secret_sources(&resolved);
         match cli::execute_validate() {
             Ok(()) => return 0,
             Err(e) => {
