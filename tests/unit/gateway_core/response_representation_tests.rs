@@ -71,7 +71,14 @@ async fn run_backend_transform(
     status: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
-) -> (bool, bool, u16, HashMap<String, String>, Vec<u8>, Option<String>) {
+) -> (
+    bool,
+    bool,
+    u16,
+    HashMap<String, String>,
+    Vec<u8>,
+    Option<String>,
+) {
     let plugins = redacting_plugins();
     let mut ctx = make_ctx();
     let mut status = status;
@@ -113,12 +120,8 @@ async fn identity_json_body_is_redacted_and_representation_metadata_is_invalidat
     headers.insert("last-modified".to_string(), modified);
     headers.insert("accept-ranges".to_string(), "bytes".to_string());
 
-    let (replaced, transformed, status, headers, body, reason) = run_backend_transform(
-        200,
-        headers,
-        br#"{"secret":"hunter2","keep":1}"#.to_vec(),
-    )
-    .await;
+    let (replaced, transformed, status, headers, body, reason) =
+        run_backend_transform(200, headers, br#"{"secret":"hunter2","keep":1}"#.to_vec()).await;
 
     assert!(!replaced, "a clean redaction must not replace the response");
     assert!(transformed, "the configured body rule must have applied");
@@ -151,12 +154,8 @@ async fn gzip_encoded_body_is_decoded_redacted_and_served_as_identity() {
     let mut headers = json_headers();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
 
-    let (replaced, transformed, status, headers, body, reason) = run_backend_transform(
-        200,
-        headers,
-        gzip(br#"{"secret":"hunter2","keep":1}"#),
-    )
-    .await;
+    let (replaced, transformed, status, headers, body, reason) =
+        run_backend_transform(200, headers, gzip(br#"{"secret":"hunter2","keep":1}"#)).await;
 
     assert!(!replaced);
     assert!(transformed, "gzip body must be decoded and redacted");
@@ -204,12 +203,8 @@ async fn unsupported_coding_is_rejected_not_forwarded() {
     let mut headers = json_headers();
     headers.insert("content-encoding".to_string(), "zstd".to_string());
 
-    let (replaced, transformed, status, _, body, reason) = run_backend_transform(
-        200,
-        headers,
-        br#"{"secret":"hunter2"}"#.to_vec(),
-    )
-    .await;
+    let (replaced, transformed, status, _, body, reason) =
+        run_backend_transform(200, headers, br#"{"secret":"hunter2"}"#.to_vec()).await;
 
     assert!(replaced, "an undecodable protected body must be replaced");
     assert!(!transformed);
@@ -258,12 +253,8 @@ async fn excessively_stacked_codings_are_rejected() {
         "gzip, gzip, gzip, gzip, gzip".to_string(),
     );
 
-    let (replaced, _, status, _, body, reason) = run_backend_transform(
-        200,
-        headers,
-        gzip(br#"{"secret":"hunter2"}"#),
-    )
-    .await;
+    let (replaced, _, status, _, body, reason) =
+        run_backend_transform(200, headers, gzip(br#"{"secret":"hunter2"}"#)).await;
 
     assert!(replaced);
     assert_eq!(status, 502);
@@ -313,12 +304,8 @@ async fn protected_206_range_fragment_is_rejected_and_never_relabeled_200() {
     let mut headers = json_headers();
     headers.insert("content-range".to_string(), "bytes 0-19/512".to_string());
 
-    let (replaced, transformed, status, headers, body, reason) = run_backend_transform(
-        206,
-        headers,
-        br#"{"secret":"hunter2","keep":1}"#.to_vec(),
-    )
-    .await;
+    let (replaced, transformed, status, headers, body, reason) =
+        run_backend_transform(206, headers, br#"{"secret":"hunter2","keep":1}"#.to_vec()).await;
 
     assert!(replaced, "a protected fragment must be rejected");
     assert!(!transformed);
@@ -341,12 +328,8 @@ async fn protected_226_delta_is_rejected_and_never_relabeled_200() {
     headers.insert("im".to_string(), "feed".to_string());
     headers.insert("delta-base".to_string(), "\"v1\"".to_string());
 
-    let (replaced, _, status, _, body, reason) = run_backend_transform(
-        226,
-        headers,
-        br#"{"secret":"hunter2","keep":1}"#.to_vec(),
-    )
-    .await;
+    let (replaced, _, status, _, body, reason) =
+        run_backend_transform(226, headers, br#"{"secret":"hunter2","keep":1}"#.to_vec()).await;
 
     assert!(replaced);
     assert_ne!(status, 200);
@@ -380,7 +363,10 @@ async fn fragment_hidden_by_a_rewritten_status_is_still_rejected() {
     )
     .await;
 
-    assert!(replaced, "the snapshot must still prove this was a fragment");
+    assert!(
+        replaced,
+        "the snapshot must still prove this was a fragment"
+    );
     assert_eq!(
         representation_rejection_reason_for_test(&ctx),
         Some("partial_representation")
