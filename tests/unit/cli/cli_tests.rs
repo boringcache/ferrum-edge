@@ -506,10 +506,7 @@ fn test_execute_reload_no_pid_when_no_process_running() {
 
 /// Spawn a one-shot plaintext server on loopback, run `execute_health`, and
 /// return the CLI result plus the captured request line.
-fn run_health_against_plain_server<F>(
-    live: bool,
-    serve: F,
-) -> (Result<(), String>, String)
+fn run_health_against_plain_server<F>(live: bool, serve: F) -> (Result<(), String>, String)
 where
     F: FnOnce(&mut std::net::TcpStream) + Send + 'static,
 {
@@ -542,10 +539,7 @@ where
 }
 
 /// Spawn a one-shot plaintext server that replies with `response`.
-fn run_health_against_response(
-    live: bool,
-    response: &[u8],
-) -> (Result<(), String>, String) {
+fn run_health_against_response(live: bool, response: &[u8]) -> (Result<(), String>, String) {
     use std::io::Write;
 
     let response = response.to_vec();
@@ -565,7 +559,9 @@ fn run_health_against_tls_response(response: &[u8]) -> Result<(), String> {
         rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate TLS key");
     let params =
         rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("certificate params");
-    let certificate = params.self_signed(&key_pair).expect("self-sign certificate");
+    let certificate = params
+        .self_signed(&key_pair)
+        .expect("self-sign certificate");
 
     let certificate_pem = certificate.pem();
     let mut certificate_reader = certificate_pem.as_bytes();
@@ -764,12 +760,7 @@ fn test_execute_health_rejects_invalid_http_versions() {
 
 #[test]
 fn test_execute_health_rejects_missing_or_malformed_status_codes() {
-    for status_line in [
-        "HTTP/1.1",
-        "HTTP/1.1 OK",
-        "HTTP/1.1 20",
-        "HTTP/1.1 2000",
-    ] {
+    for status_line in ["HTTP/1.1", "HTTP/1.1 OK", "HTTP/1.1 20", "HTTP/1.1 2000"] {
         let response = format!("{status_line}\r\n\r\n");
         let (result, _) = run_health_against_response(false, response.as_bytes());
         assert!(result.is_err(), "{status_line:?} must be rejected");
@@ -812,23 +803,25 @@ fn test_execute_health_rejects_malformed_header_syntax() {
 
 #[test]
 fn test_execute_health_rejects_invalid_utf8_response_head() {
-    let (result, _) = run_health_against_response(
-        false,
-        b"HTTP/1.1 200 OK\r\nX-Invalid: \xff\r\n\r\n",
-    );
+    let (result, _) =
+        run_health_against_response(false, b"HTTP/1.1 200 OK\r\nX-Invalid: \xff\r\n\r\n");
     let error = result.expect_err("invalid UTF-8 in a response head must fail");
     assert!(error.contains("not valid UTF-8"), "{error}");
 }
 
 #[test]
 fn test_execute_health_escapes_untrusted_status_text() {
-    let (result, _) = run_health_against_response(
-        false,
-        b"HTTP/1.1 503 unsafe\x1b[31mreason\r\n\r\n",
-    );
+    let (result, _) =
+        run_health_against_response(false, b"HTTP/1.1 503 unsafe\x1b[31mreason\r\n\r\n");
     let error = result.expect_err("status controls must fail closed");
-    assert!(!error.contains('\x1b'), "raw escape reached error text: {error:?}");
-    assert!(error.contains("\\u{1b}"), "escape was not rendered safely: {error}");
+    assert!(
+        !error.contains('\x1b'),
+        "raw escape reached error text: {error:?}"
+    );
+    assert!(
+        error.contains("\\u{1b}"),
+        "escape was not rendered safely: {error}"
+    );
 }
 
 #[test]
@@ -836,8 +829,14 @@ fn test_execute_health_escapes_non200_reason_text() {
     let response = "HTTP/1.1 503 unsafe\u{85}reason\r\n\r\n";
     let (result, _) = run_health_against_response(false, response.as_bytes());
     let error = result.expect_err("503 must be unhealthy");
-    assert!(!error.contains('\u{85}'), "raw control reached error text: {error:?}");
-    assert!(error.contains("\\u{85}"), "reason was not rendered safely: {error}");
+    assert!(
+        !error.contains('\u{85}'),
+        "raw control reached error text: {error:?}"
+    );
+    assert!(
+        error.contains("\\u{85}"),
+        "reason was not rendered safely: {error}"
+    );
 }
 
 #[test]
@@ -876,9 +875,8 @@ fn test_execute_health_enforces_one_overall_response_deadline() {
 
 #[test]
 fn test_execute_health_tls_uses_shared_interim_response_parser() {
-    let result = run_health_against_tls_response(
-        b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200\r\n\r\n",
-    );
+    let result =
+        run_health_against_tls_response(b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200\r\n\r\n");
     assert!(
         result.is_ok(),
         "TLS must accept the same bounded interim/final framing: {result:?}"

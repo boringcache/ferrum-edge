@@ -472,10 +472,7 @@ where
             ));
         }
 
-        while let Some(section_end) = buffered
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-        {
+        while let Some(section_end) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
             let section_len = section_end + 4;
             let response = parse_response_head_section(&buffered[..section_len])?;
             drop(buffered.drain(..section_len));
@@ -507,9 +504,7 @@ where
             .min(HEALTH_RESPONSE_HEAD_MAX_BYTES - total_bytes_read);
         match reader.read(&mut chunk[..read_limit]) {
             Ok(0) => {
-                return Err(
-                    "Unexpected EOF before a complete final HTTP response head".to_string(),
-                );
+                return Err("Unexpected EOF before a complete final HTTP response head".to_string());
             }
             Ok(read) => {
                 if std::time::Instant::now() >= deadline {
@@ -586,9 +581,11 @@ fn parse_response_status_line(status_line: &str) -> Result<u16, String> {
 
     // Exactly three ASCII digits are in 000..=999, so this conversion is
     // infallible and always fits in u16.
-    Ok(u16::from(code[0] - b'0') * 100
-        + u16::from(code[1] - b'0') * 10
-        + u16::from(code[2] - b'0'))
+    Ok(
+        u16::from(code[0] - b'0') * 100
+            + u16::from(code[1] - b'0') * 10
+            + u16::from(code[2] - b'0'),
+    )
 }
 
 fn validate_response_header_line(header: &str) -> Result<(), String> {
