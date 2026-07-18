@@ -3,6 +3,8 @@
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     plugin_cache_with_real_ip_header_for_test,
+    run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
+    transform_buffered_response_body_with_deadline_for_test,
     validate_correlation_id_composition_with_real_ip_header_for_test,
     validate_plugin_composition_candidate_with_real_ip_header_for_test,
 };
@@ -46,6 +48,25 @@ impl Plugin for RawCorrelationClaimPlugin {
 
     fn correlation_id_header_name(&self) -> Option<&str> {
         Some(self.claim)
+    }
+}
+
+struct StalledDeadlineResponseTransformer;
+
+#[async_trait::async_trait]
+impl Plugin for StalledDeadlineResponseTransformer {
+    fn name(&self) -> &str {
+        "stalled_deadline_response_transformer"
+    }
+
+    async fn transform_response_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        std::future::pending().await
     }
 }
 
@@ -3821,6 +3842,78 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
     assert_eq!(plugins[0].name(), "stdout_logging");
+}
+
+#[tokio::test]
+async fn priority_overridden_correlation_retains_owned_deadline_header() {
+    let mut correlation = make_plugin_config_with_json(
+        "correlation",
+        "correlation_id",
+        json!({ "header_name": "x-correlation-id" }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    correlation.priority_override = Some(777);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["correlation"])],
+        vec![correlation],
+    );
+    let cache = PluginCache::new(&config).expect("priority-overridden correlation cache");
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 777);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers.insert(
+        "x-correlation-id".to_string(),
+        "client-request-id".to_string(),
+    );
+    assert!(matches!(
+        run_request_received_chain(&plugins, &mut ctx).await,
+        PluginResult::Continue
+    ));
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (
+            "x-correlation-id".to_string(),
+            "client-request-id".to_string(),
+        ),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&plugins, &mut ctx, 200, &mut headers).await,
+        "correlation decoration must not reject the backend response"
+    );
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    let transform_plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(StalledDeadlineResponseTransformer)];
+
+    assert!(
+        transform_buffered_response_body_with_deadline_for_test(
+            &transform_plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+        )
+        .await
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-correlation-id").map(String::as_str),
+        Some("client-request-id"),
+        "the real priority wrapper must delegate exact-value deadline ownership"
+    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert!(body.is_empty());
 }
 
 #[tokio::test]

@@ -203,8 +203,11 @@ with the native trailer map.
 When an absolute deadline instead replaces an uncommitted buffered response,
 the H3 native and cross-protocol paths use the same gateway-header provenance
 boundary as H1/H2. The pristine backend view is captured before response hooks;
-only output from completed gateway hooks (including configurable correlation
-fields), plus exact `Vary: Origin`, can cross into the terminal response.
+only non-terminal-owned output from completed gateway hooks (including
+configurable correlation fields), plus exact `Vary: Origin`, can cross into the
+terminal response. Cache state, discarded-representation metadata, transport
+framing, and prior gRPC terminal fields are removed even when a gateway hook
+wrote them.
 Backend-supplied safe-looking trace/CORS names, arbitrary metadata, cookies,
 credentials, and discarded-representation fields do not become trusted by
 name. Native gRPC and binary/text gRPC-Web framing are regenerated after this
