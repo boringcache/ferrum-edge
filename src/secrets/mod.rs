@@ -351,9 +351,6 @@ impl serde::Serialize for LogJson {
     where
         S: serde::Serializer,
     {
-        // `Serialize` is needed by name for the concrete `Number` below;
-        // method resolution on a generic parameter would not require it.
-        use serde::Serialize as _;
         use serde::ser::{SerializeMap, SerializeSeq};
 
         match self {
