@@ -9310,7 +9310,7 @@ mod inner {
                             connection,
                             prepared_docs,
                             guard_params,
-                            ref mut upsert_changes,
+                            upsert_changes,
                             namespace,
                             restored_proxy_id,
                         )| {
