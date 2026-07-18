@@ -29,7 +29,7 @@ use crate::admin::{AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, SortOrder,
     is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
-    tcp_connection_throttle_attachment_conflict,
+    tcp_connection_throttle_attachment_conflict, validate_api_spec_restore_inputs,
 };
 use crate::config::types::{ApiSpec, PluginAssociation, PluginScope, Upstream};
 use crate::util::body_limit::is_length_limit_error;
@@ -3397,10 +3397,16 @@ pub async fn handle_delete_api_spec(
                 ))));
             }
             Ok(None) => {
-                return Ok(error_response(ApiSpecError::Internal(format!(
-                    "API spec '{}' delete snapshot lost associated plugin '{}' before persistence",
-                    existing.id, plugin_id
-                ))));
+                return Ok(error_response(ApiSpecError::ValidationFailures {
+                    spec_version: existing.spec_version.clone(),
+                    failures: vec![ValidationFailure {
+                        resource_type: "plugin_graph",
+                        id: existing.proxy_id.clone(),
+                        errors: vec![format!(
+                            "proxy association references missing plugin '{plugin_id}'"
+                        )],
+                    }],
+                }));
             }
             Err(error) => return Ok(error_response(classify_db_error(error))),
         }
@@ -3410,6 +3416,21 @@ pub async fn handle_delete_api_spec(
         upstream: existing_upstream,
         plugins: existing_plugins,
     };
+    if let Err(error) = validate_api_spec_restore_inputs(
+        &previous_bundle,
+        &existing,
+        &additional_plugins,
+        true,
+    ) {
+        return Ok(error_response(ApiSpecError::ValidationFailures {
+            spec_version: existing.spec_version.clone(),
+            failures: vec![ValidationFailure {
+                resource_type: "restore_snapshot",
+                id: existing.proxy_id.clone(),
+                errors: vec![error.to_string()],
+            }],
+        }));
+    }
 
     match crate::admin::crud::validate_plugin_graph_proxy_deletion_candidate(
         db.as_ref(),

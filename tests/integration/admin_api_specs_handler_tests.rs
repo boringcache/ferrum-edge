@@ -1914,6 +1914,111 @@ async fn api_spec_delete_accepts_unattached_proxy_scoped_cascade_plugin() {
 }
 
 #[tokio::test]
+async fn api_spec_delete_rejects_cascade_plugins_that_atomic_restore_cannot_recreate() {
+    for (scope, expected_error) in [
+        ("global", "is global and cannot be associated"),
+        ("proxy_group", "proxy-group plugin"),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir).await;
+        let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+        let client = AdminClient::new(base);
+        let proxy_id = uid("malformed-cascade-proxy");
+        let spec = minimal_json_spec(&proxy_id);
+
+        let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+        assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+        let spec_id = post_body["id"]
+            .as_str()
+            .expect("created API spec returns id")
+            .to_string();
+        let plugin_id = uid("malformed-cascade-plugin");
+        store
+            .create_plugin_config(&manual_proxy_plugin(
+                &plugin_id,
+                &proxy_id,
+                "stdout_logging",
+                json!({}),
+            ))
+            .await
+            .expect("create hand-owned proxy plugin");
+        sqlx::query("UPDATE plugin_configs SET scope = ? WHERE namespace = ? AND id = ?")
+            .bind(scope)
+            .bind("ferrum")
+            .bind(&plugin_id)
+            .execute(&store.pool())
+            .await
+            .expect("inject malformed cascade scope");
+
+        let (delete_status, delete_body) = client
+            .delete_json(&format!("/api-specs/{spec_id}"))
+            .await;
+        assert_eq!(
+            delete_status,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "{scope} plugin with proxy_id must fail closed: {delete_body}"
+        );
+        assert_eq!(delete_body["error"], "Spec validation failed");
+        assert_eq!(
+            delete_body["failures"][0]["resource_type"],
+            "restore_snapshot"
+        );
+        assert!(
+            delete_body["failures"][0]["errors"][0]
+                .as_str()
+                .is_some_and(|error| error.contains(expected_error)),
+            "unexpected restore-snapshot failure: {delete_body}"
+        );
+        assert!(
+            store
+                .get_api_spec("ferrum", &spec_id)
+                .await
+                .expect("read preserved API spec")
+                .is_some(),
+            "rejected delete must preserve the API spec"
+        );
+        assert!(
+            store
+                .get_proxy("ferrum", &proxy_id)
+                .await
+                .expect("read preserved proxy")
+                .is_some(),
+            "rejected delete must preserve the proxy"
+        );
+        assert!(
+            store
+                .get_plugin_config("ferrum", &plugin_id)
+                .await
+                .expect("read preserved malformed plugin")
+                .is_some(),
+            "rejected delete must preserve the malformed plugin for repair"
+        );
+    }
+}
+
+#[test]
+fn api_spec_delete_maps_missing_embedded_plugin_association_to_422() {
+    let source = include_str!("../../src/admin/api_specs/handlers.rs");
+    let association_check = source
+        .find("for association in &existing_proxy.plugins {")
+        .expect("API-spec delete must inspect embedded proxy associations");
+    let restore_snapshot = source[association_check..]
+        .find("let previous_bundle = ExtractedBundle")
+        .map(|offset| association_check + offset)
+        .expect("association validation must precede the restore snapshot");
+    let association_check = &source[association_check..restore_snapshot];
+
+    assert!(association_check.contains("Ok(None) =>"));
+    assert!(association_check.contains("ApiSpecError::ValidationFailures"));
+    assert!(association_check.contains("resource_type: \"plugin_graph\""));
+    assert!(association_check.contains("proxy association references missing plugin"));
+    assert!(
+        !association_check.contains("delete snapshot lost associated plugin"),
+        "persistent Mongo embedded-reference corruption must not be reported as a race"
+    );
+}
+
+#[tokio::test]
 async fn api_spec_delete_rejects_foreign_owned_cascade_plugin_without_retagging() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
