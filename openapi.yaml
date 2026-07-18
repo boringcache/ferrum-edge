@@ -5038,13 +5038,23 @@ components:
         |----------|---------|-------------|
         | `FERRUM_ADMIN_JWT_SECRET` | *(required)* | Signing key (minimum 32 characters) |
         | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
-        | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds) |
+        | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds); `0` disables the cap |
 
         Tokens must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a
-        string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER`; `exp -
-        iat` must not exceed `FERRUM_ADMIN_JWT_MAX_TTL`; `nbf` and `exp` are
-        validated. Required `role` claim values are `viewer`, `operator`, and
-        `admin`. Tokens without a valid `role` claim are rejected.
+        string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER`; `nbf`
+        and `exp` are validated. `FERRUM_ADMIN_JWT_MAX_TTL` is enforced against
+        verifier time, not just the claims, counting the accepted clock-skew
+        leeway (60 seconds) exactly once: `exp - iat` must be positive and
+        within the maximum, `iat` must not be later than verifier time plus the
+        leeway, `exp - now` must stay within the maximum plus that same leeway,
+        and `exp` must still be in the future at verifier time (no expiry
+        grace on the cap path). Effective maximum real validity is
+        `FERRUM_ADMIN_JWT_MAX_TTL + 60s`, so future-shifted timestamps cannot
+        extend a token's real lifetime. A configured value above
+        `9223372036854775807` is rejected at startup as invalid rather than
+        treated as unlimited. Required `role` claim values are `viewer`,
+        `operator`, and `admin`. Tokens without a valid `role` claim are
+        rejected.
 
     metricsBearerAuth:
       type: http
