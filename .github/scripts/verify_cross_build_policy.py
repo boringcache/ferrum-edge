@@ -5408,13 +5408,17 @@ pre_build = []
         "          print('attacker.sh is fixture data, not a command')\n"
         "          PY",
     )
-    if validate_automation_collection(
+    benign_heredoc_errors = validate_automation_collection(
         {"ci.yml": benign_heredoc_workflow},
         {"setup/action.yml": safe_action},
         safe_automation,
         "self-test automation directory",
-    ):
-        failures.append("benign inline-program data was treated as an executable path")
+    )
+    if benign_heredoc_errors:
+        failures.append(
+            "benign inline-program data was treated as an executable path: "
+            + "; ".join(benign_heredoc_errors)
+        )
 
     benign_python_automation = {
         "scripts/safe.py": (
