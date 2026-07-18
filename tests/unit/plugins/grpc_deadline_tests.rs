@@ -384,6 +384,24 @@ impl Plugin for SlowRejectDecorator {
     }
 }
 
+struct StalledAfterProxyDecorator;
+
+#[async_trait::async_trait]
+impl Plugin for StalledAfterProxyDecorator {
+    fn name(&self) -> &str {
+        "stalled_after_proxy_decorator"
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        std::future::pending().await
+    }
+}
+
 struct StalledContextFreeBodyTransformer;
 
 #[async_trait::async_trait]
@@ -1020,6 +1038,198 @@ async fn buffered_deadline_keeps_only_provenance_owned_gateway_headers() {
             }
         }
     }
+}
+
+#[test]
+fn deadline_replacement_preserves_gateway_authored_set_cookie() {
+    use ferrum_edge::_test_support::buffered_grpc_deadline_replacement_for_test;
+
+    for content_type in [None, Some("application/grpc-web+proto")] {
+        let response = buffered_grpc_deadline_replacement_for_test(
+            content_type,
+            HashMap::from([
+                ("content-type".to_string(), "application/grpc".to_string()),
+                // A backend-supplied cookie the gateway never re-authors must
+                // still be dropped: it never enters gateway provenance.
+                ("set-cookie".to_string(), "backend=stale".to_string()),
+                ("x-backend-secret".to_string(), "leak".to_string()),
+            ]),
+            HashMap::from([
+                // Gateway-authored session refresh (e.g. `oidc_relying_party`
+                // rotating the session cookie on its reject path). The client
+                // must receive this even on a terminal DEADLINE_EXCEEDED.
+                (
+                    "set-cookie".to_string(),
+                    "session=refreshed; HttpOnly; Path=/".to_string(),
+                ),
+                ("x-correlation-id".to_string(), "request-123".to_string()),
+            ]),
+            b"discarded backend body".to_vec(),
+        );
+
+        assert_eq!(response.http_status, http::StatusCode::OK);
+        assert_eq!(
+            response.headers.get("set-cookie").map(String::as_str),
+            Some("session=refreshed; HttpOnly; Path=/"),
+            "a gateway-authored session cookie must survive the deadline rebuild"
+        );
+        assert_eq!(
+            response.headers.get("x-correlation-id").map(String::as_str),
+            Some("request-123")
+        );
+        assert!(
+            !response.headers.contains_key("x-backend-secret"),
+            "backend-only fields must never cross deadline replacement"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deadline_replacement_keeps_exact_value_response_transformer_writes() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
+        transform_buffered_response_body_with_deadline_for_test,
+    };
+    use ferrum_edge::plugins::utils::route_header_transform::{
+        RawRouteHeaderTransformRule, parse_route_header_transforms,
+    };
+
+    for grpc_web_content_type in [None, Some("application/grpc-web+proto")] {
+        let response_transformer = create_plugin(
+            "response_transformer",
+            &json!({
+                "rules": [{
+                    "operation": "update",
+                    "target": "header",
+                    "key": "x-rt-exact",
+                    "value": "gateway-value"
+                }]
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        let after_proxy_plugins = vec![response_transformer];
+        let transform_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledResponseTransformer)];
+
+        let route_rules = parse_route_header_transforms(
+            &[RawRouteHeaderTransformRule {
+                operation: "update".to_string(),
+                target: "header".to_string(),
+                key: "x-route-exact".to_string(),
+                value: Some("route-value".to_string()),
+            }],
+            "route_override",
+        )
+        .unwrap();
+
+        let mut ctx = create_grpc_context_with_timeout(None);
+        set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+        ctx.route_override_response_transform = Some(Arc::new(route_rules));
+
+        // The backend pre-populates BOTH decorations with the exact value the
+        // trusted `update` writes, so mutation tracking alone cannot see the
+        // gateway write and would drop it without ownership recording.
+        let mut headers = HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("x-rt-exact".to_string(), "gateway-value".to_string()),
+            ("x-route-exact".to_string(), "route-value".to_string()),
+        ]);
+        assert!(
+            !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+            "response transformer must not reject the buffered response"
+        );
+
+        set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+        let mut status = 200;
+        let mut body = b"discarded backend response".to_vec();
+        assert!(
+            transform_buffered_response_body_with_deadline_for_test(
+                &transform_plugins,
+                &mut ctx,
+                &mut status,
+                &mut headers,
+                &mut body,
+                grpc_web_content_type,
+            )
+            .await
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers.get("x-rt-exact").map(String::as_str),
+            Some("gateway-value"),
+            "an exact-value static `update` write must survive the deadline rebuild"
+        );
+        assert_eq!(
+            headers.get("x-route-exact").map(String::as_str),
+            Some("route-value"),
+            "an exact-value route-override `update` write must survive the deadline rebuild"
+        );
+    }
+}
+
+#[tokio::test]
+async fn buffered_after_proxy_deadline_preserves_completed_decorators_on_rejection() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_reject_for_test, set_grpc_deadline_budget_for_test,
+    };
+
+    let correlation = create_plugin("correlation_id", &json!({}))
+        .unwrap()
+        .unwrap();
+    let decorator: Arc<dyn Plugin> = Arc::new(TrustedResponseHeaderDecorator {
+        headers: HashMap::from([(
+            "x-completed-decorator".to_string(),
+            "gateway-output".to_string(),
+        )]),
+    });
+    // correlation (owns its echoed id) and a non-replacing decorator both
+    // complete, then a later after_proxy hook exhausts the RPC deadline.
+    let plugins = vec![
+        Arc::clone(&correlation),
+        decorator,
+        Arc::new(StalledAfterProxyDecorator) as Arc<dyn Plugin>,
+    ];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    ctx.headers
+        .insert("x-request-id".to_string(), "client-request-id".to_string());
+    assert_continue(correlation.on_request_received(&mut ctx).await);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("x-backend-secret".to_string(), "leak".to_string()),
+    ]);
+
+    let (status, body, headers) =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers)
+            .await
+            .expect("a stalled after_proxy hook must terminate as a deadline rejection");
+
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Deadline exceeded at gateway")
+    );
+    // A completed non-replacing decorator does not re-run on the reject path,
+    // so its output can survive the terminal deadline rejection only through
+    // the provenance recorded on the buffered path.
+    assert_eq!(
+        headers.get("x-completed-decorator").map(String::as_str),
+        Some("gateway-output"),
+        "a completed decorator must survive a later after_proxy hook's deadline expiry"
+    );
+    assert_eq!(
+        headers.get("x-request-id").map(String::as_str),
+        Some("client-request-id"),
+        "a completed owning decorator must survive the terminal deadline rejection"
+    );
+    assert!(
+        !headers.contains_key("x-backend-secret"),
+        "backend-only fields must never cross deadline replacement"
+    );
 }
 
 #[tokio::test]

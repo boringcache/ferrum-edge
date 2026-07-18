@@ -204,13 +204,20 @@ When an absolute deadline instead replaces an uncommitted buffered response,
 the H3 native and cross-protocol paths use the same gateway-header provenance
 boundary as H1/H2. The pristine backend view is captured before response hooks;
 only non-terminal-owned output from completed gateway hooks (including
-configurable correlation fields), plus exact `Vary: Origin`, can cross into the
-terminal response. Cache state, discarded-representation metadata, transport
-framing, and prior gRPC terminal fields are removed even when a gateway hook
-wrote them.
+configurable correlation fields, exact-value `update` writes a hook declares it
+owns, and a gateway hook's own `Set-Cookie`), plus exact `Vary: Origin`, can
+cross into the terminal response. Because ownership is declared rather than
+inferred from a value diff, a backend cannot suppress an owned gateway write by
+pre-populating the identical key/value. If a completed decorator chain is
+followed by a later hook that itself exhausts the deadline, the terminal
+rejection keeps the gateway output already recorded rather than restarting from
+the deadline error headers. Cache state, discarded-representation metadata,
+transport framing, and prior gRPC terminal fields are removed even when a
+gateway hook wrote them.
 Backend-supplied safe-looking trace/CORS names, arbitrary metadata, cookies,
 credentials, and discarded-representation fields do not become trusted by
-name. Native gRPC and binary/text gRPC-Web framing are regenerated after this
+name — a backend-supplied cookie is never gateway output and never crosses.
+Native gRPC and binary/text gRPC-Web framing are regenerated after this
 sanitation, then deterministic initial-response policy is reapplied.
 
 After route resolution, HTTP/3 method-filter errors and native-gRPC gateway

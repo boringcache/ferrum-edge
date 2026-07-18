@@ -352,6 +352,15 @@ impl BufferedDeadlineResponseHeaderProvenance {
                     .any(|token| token.trim().eq_ignore_ascii_case("origin"))
         });
 
+        // `gateway_headers` already holds only gateway-authored output, so this
+        // strip governs gateway-produced values, not backend leakage. It removes
+        // transport/framing fields and stale cache/representation metadata that
+        // must never ride a synthesized DEADLINE_EXCEEDED response. `set-cookie`
+        // is deliberately absent: a trusted hook (e.g. `oidc_relying_party`'s
+        // refreshed session cookie) authors it precisely so the client applies
+        // the update, and a backend-supplied cookie never reaches
+        // `gateway_headers` (it is not a gateway mutation), so retaining
+        // gateway-authored `set-cookie` cannot re-open backend cookie leakage.
         *headers = self.gateway_headers.clone();
         headers.retain(|name, _| {
             ![
@@ -389,7 +398,6 @@ impl BufferedDeadlineResponseHeaderProvenance {
                 "proxy-status",
                 "repr-digest",
                 "retry-after",
-                "set-cookie",
                 "surrogate-control",
                 "te",
                 "trailer",
@@ -405,6 +413,23 @@ impl BufferedDeadlineResponseHeaderProvenance {
             headers.insert("vary".to_string(), "Origin".to_string());
         }
         self.observed_headers = Self::canonical_snapshot(headers);
+    }
+
+    /// Transition an in-flight buffered-response provenance into a gateway
+    /// rejection without discarding decorations that completed hooks already
+    /// recorded. The rejection headers are freshly generated gateway output, so
+    /// they join `gateway_headers`, while previously recorded gateway output
+    /// (correlation, CORS, ...) is preserved for a terminal deadline rebuild.
+    /// The observed baseline resets to the rejection headers so any non-replacing
+    /// reject hook that runs next is tracked by mutation. When no gateway output
+    /// was recorded yet, `gateway_headers` is empty and this is identical to
+    /// starting a fresh [`Self::gateway_rejection`].
+    fn adopt_gateway_rejection(&mut self, headers: &HashMap<String, String>) {
+        let rejection = Self::canonical_snapshot(headers);
+        for (name, value) in &rejection {
+            self.gateway_headers.insert(name.clone(), value.clone());
+        }
+        self.observed_headers = rejection;
     }
 
     fn sync_terminal_headers(&mut self, headers: &HashMap<String, String>) {
@@ -1849,13 +1874,25 @@ impl RequestContext {
         &mut self,
         response_headers: &HashMap<String, String>,
     ) {
-        self.buffered_deadline_response_header_provenance = (self.grpc_deadline_at.is_some()
-            || self.gateway_deadline_response_selected)
-            .then(|| {
-                Arc::new(BufferedDeadlineResponseHeaderProvenance::gateway_rejection(
-                    response_headers,
-                ))
-            });
+        if !(self.grpc_deadline_at.is_some() || self.gateway_deadline_response_selected) {
+            self.buffered_deadline_response_header_provenance = None;
+            return;
+        }
+        match self.buffered_deadline_response_header_provenance.as_mut() {
+            // A rejection generated after the buffered-response path already ran
+            // trusted `after_proxy` hooks — for example a later hook exhausting
+            // the RPC deadline, which converts into a fresh
+            // `grpc_deadline_exceeded_plugin_result()` — must not throw away the
+            // gateway decorations those completed hooks recorded. Fold the new
+            // rejection headers into the existing gateway-owned set instead of
+            // restarting provenance from the rejection headers alone.
+            Some(state) => Arc::make_mut(state).adopt_gateway_rejection(response_headers),
+            None => {
+                self.buffered_deadline_response_header_provenance = Some(Arc::new(
+                    BufferedDeadlineResponseHeaderProvenance::gateway_rejection(response_headers),
+                ));
+            }
+        }
     }
 
     /// Record the header result of one completed trusted gateway phase.
@@ -1883,6 +1920,38 @@ impl RequestContext {
             .collect::<Vec<_>>();
         if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
             Arc::make_mut(state).record_gateway_mutations(&plugin_owned_headers, response_headers);
+        }
+    }
+
+    /// Whether backend/gateway deadline-response provenance is being tracked for
+    /// this request. Trusted response hooks consult this to skip the
+    /// [`Self::record_deadline_owned_response_headers`] bookkeeping (and its
+    /// allocation) on the common path that has no absolute RPC deadline.
+    pub(crate) fn has_buffered_deadline_response_header_provenance(&self) -> bool {
+        self.buffered_deadline_response_header_provenance.is_some()
+    }
+
+    /// Record response-header keys a completed trusted hook authoritatively
+    /// wrote even when the value matches what the backend already supplied
+    /// (e.g. a `response_transformer` `update` rule or route override). Mutation
+    /// tracking alone drops such a write, so a backend that pre-populates the
+    /// identical key/value could otherwise suppress the gateway decoration on a
+    /// terminal deadline rebuild. Declaring the keys owned keeps them in
+    /// `gateway_headers`. Names are lowercased to match the canonical snapshot.
+    pub(crate) fn record_deadline_owned_response_headers(
+        &mut self,
+        owned_header_names: &[String],
+        response_headers: &HashMap<String, String>,
+    ) {
+        if self.buffered_deadline_response_header_provenance.is_none() {
+            return;
+        }
+        let owned = owned_header_names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
+            Arc::make_mut(state).record_gateway_mutations(&owned, response_headers);
         }
     }
 

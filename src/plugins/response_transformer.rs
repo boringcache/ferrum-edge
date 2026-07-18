@@ -70,6 +70,12 @@ struct HeaderRule {
 
 pub struct ResponseTransformer {
     header_rules: Vec<HeaderRule>,
+    /// Pre-lowercased keys of static `update` rules. These are unconditional
+    /// gateway overwrites, so a completed `after_proxy` owns them on a gRPC
+    /// deadline rebuild even when the backend pre-populated the identical value
+    /// (mutation tracking alone cannot see an exact-value write). Precomputed
+    /// once so the deadline-provenance path allocates nothing per request.
+    static_update_keys: Vec<String>,
     body_rules: Vec<BodyRule>,
     /// When `Some`, the plugin reads
     /// `ferrum.response_transformer.<scope>.enabled` from the mesh
@@ -426,8 +432,15 @@ impl ResponseTransformer {
             }
         };
 
+        let static_update_keys = header_rules
+            .iter()
+            .filter(|rule| rule.operation == HeaderOp::Update)
+            .map(|rule| rule.key.clone())
+            .collect::<Vec<_>>();
+
         Ok(Self {
             header_rules,
+            static_update_keys,
             body_rules,
             runtime_overlay_scope,
             default_enabled,
@@ -537,8 +550,30 @@ impl Plugin for ResponseTransformer {
         // instance in the chain does not re-apply the same list.
         let route_rules: Option<Arc<Vec<RouteHeaderTransformRule>>> =
             ctx.route_override_response_transform.take();
-        if let Some(route_rules) = route_rules {
+        if let Some(route_rules) = route_rules.as_ref() {
             apply_route_header_transforms(route_rules.as_ref(), response_headers);
+        }
+        // Declare unconditional `update` writes (static and route-override) as
+        // gateway-owned for a gRPC deadline rebuild. `update` overwrites with
+        // the configured value, so a backend that pre-populated the identical
+        // key/value must not be able to suppress the decoration on a synthesized
+        // DEADLINE_EXCEEDED response — mutation tracking cannot see an
+        // exact-value write. `add`/`rename` header changes are already visible
+        // to mutation tracking, and the provenance state exists only for
+        // deadline-bound buffered responses (gated here to avoid per-request
+        // allocation otherwise).
+        if ctx.has_buffered_deadline_response_header_provenance() {
+            let mut owned = self.static_update_keys.clone();
+            if let Some(route_rules) = route_rules.as_ref() {
+                for rule in route_rules.iter() {
+                    if rule.operation == RouteHeaderTransformOp::Update {
+                        owned.push(rule.key.clone());
+                    }
+                }
+            }
+            if !owned.is_empty() {
+                ctx.record_deadline_owned_response_headers(&owned, response_headers);
+            }
         }
         PluginResult::Continue
     }

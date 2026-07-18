@@ -1340,6 +1340,21 @@ pub mod _test_support {
             .is_some()
     }
 
+    /// Like [`run_after_proxy_hooks_for_test`] but surfaces the terminal
+    /// rejection parts (status, body, headers) when an `after_proxy` hook
+    /// rejects or exhausts the RPC deadline, so tests can assert which gateway
+    /// decorations survive onto the synthesized DEADLINE_EXCEEDED response.
+    pub async fn run_after_proxy_hooks_reject_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
+        crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
+            .await
+            .map(|reject| (reject.status_code, reject.body, reject.headers))
+    }
+
     pub async fn transform_buffered_response_body_with_deadline_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
