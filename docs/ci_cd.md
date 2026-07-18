@@ -687,6 +687,61 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   Block-scalar bodies are left alone — `- {a: b}` inside a `run: |` script is a
   shell argument, not a step — and a malformed flow collection is reported rather
   than read as an absent one.
+- The two protected workflows reach the trusted pull-request gate only through
+  their own comparison, because `ci.yml` and `release.yml` are excluded from the
+  generic workflow collection. That comparison read only the raw rendering, so a
+  flow-spelled step outside the protected ARM64 job produced no surface on either
+  side and compared equal. The proposed and merge-base copies of both workflows
+  are now scanned through the same flow-normalized second pass the absolute
+  contract uses, and the digest-ownership scan the comparison already ran against
+  the proposed tree is repeated over that rendering. **Deliberate boundary:** the
+  hash-frozen protected job, top-level `env`, and trigger stay *comparisons*
+  against the live trusted base rather than absolute re-validations of the
+  proposed file, so a base that predates the contract — or the bootstrap commit
+  that introduces it — is not retroactively frozen. Everything that is a policy
+  rule rather than a base-relative digest is enforced against the proposed tree
+  directly.
+- A repo-local composite action is checked for digest uploads on the **proposed**
+  side of a pull request, not only in the trusted baseline. Adding an
+  `actions/upload-artifact` step named `docker-digest-*` to an existing action
+  such as `setup-sccache` introduces no Cross token, so the Cross-surface
+  comparison sees no change; the action would pass the gate and then contribute
+  an extra digest to the wildcard manifest job on the next `main` or tag run. The
+  guard is absolute rather than compared, because a local action may never own a
+  digest name at all, and it runs over the flow rendering as well.
+- Committed Python bytecode is rejected instead of being skipped by suffix. A
+  `.pyc` under a scanned automation root is executable automation that no reader
+  here can inspect, and `cd scripts && python evil.pyc` is a spelling the command
+  scanner did not even recognize, so Cross or publishing code inside the bytecode
+  was never examined. Bytecode operands are now recognized and rejected wherever
+  they are invoked, committed `.pyc`/`.pyo` paths are rejected from the proposed
+  tree listing and from every git-reconstructed automation tree — including
+  nested `__pycache__` directories — and the live working copy still ignores the
+  interpreter's own untracked cache, which `git ls-tree` never reports, so a
+  generated file cannot produce a false positive.
+- A relative command operand is resolved from the directory the shell is
+  actually in. `cd docs; bash scripts/coverage.sh` runs `docs/scripts/coverage.sh`,
+  but the tracked directory was previously applied only to slashless names, so
+  the policy recorded and scanned the approved-root `scripts/coverage.sh` while
+  the runner executed an unscanned same-name path. Every relative repository
+  command now inherits the tracked directory, `..` is normalized across nested
+  and repeated `cd`s instead of discarding the directory state, and anything that
+  leaves the tree — an absolute path, `~`, `cd -`, an expansion, a conditional
+  `cd`, or a traversal above the repository root — fails closed. Absolute
+  handling and correct root-relative resolution are unchanged.
+- `python -m <module>` is an executable repository dispatch. Only inline `-c`
+  programs were extracted, so `python -m cross build --target
+  aarch64-unknown-linux-gnu` read as a benign Python invocation even though
+  Python loads a module from the checkout. Interpreter options are now parsed
+  through `-m` — including bundled clusters (`-Im`), attached modules (`-mpkg`),
+  and operand-taking options (`-W`, `-X`) — and a literal module is resolved
+  against the tracked directory to `<module>.py` or `<module>/__main__.py`, which
+  must be a scanned automation file. A computed module name, an unmodeled option
+  that could move the module slot, an unknown working directory, or a module that
+  resolves outside the approved roots all fail closed. Modules that ship with the
+  interpreter or an installed tool (`py_compile`, `pip`, `venv`, `unittest`,
+  `json.tool`, and the rest of the allowlist) stay usable, and `-c`, `-`, and
+  ordinary script-path invocations are untouched.
 - `rustup run <toolchain> <command>` executes its command operand like `nice` or
   `timeout`, with a mandatory toolchain operand in between, so executable
   dispatch follows it: `rustup run stable ./cross build --target ...` is read as

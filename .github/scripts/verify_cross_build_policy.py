@@ -1054,9 +1054,44 @@ GENERATED_SCRIPT_PREFIXES = (
     "tmp/",
 )
 IGNORED_AUTOMATION_SUFFIXES = frozenset(
-    {".gif", ".jpeg", ".jpg", ".pdf", ".png", ".pyc", ".webp"}
+    {".gif", ".jpeg", ".jpg", ".pdf", ".png", ".webp"}
 )
 IGNORED_AUTOMATION_DIRECTORIES = frozenset({"__pycache__"})
+# Compiled Python is executable automation that no scanner in this file can
+# read: `python evil.pyc` loads and runs it, but the source-level readers see
+# only binary. Skipping the suffix therefore hid a Cross or publishing surface
+# instead of clearing one. Bytecode is ignored only in the live working
+# directory, where the interpreter creates it as an untracked build product; in
+# any git-reconstructed tree its presence means a commit supplied it, which is
+# rejected outright.
+PYTHON_BYTECODE_SUFFIXES = frozenset({".pyc", ".pyo"})
+# `python -m <module>` loads repository code from the checkout without ever
+# naming a path, so an unrecognized module is an unscannable dispatch. Only
+# modules that ship with the interpreter or with an installed tool are exempt;
+# everything else must resolve to a scanned repository file.
+PYTHON_DISPATCH_MODULE_ALLOWLIST = frozenset(
+    {
+        "build",
+        "compileall",
+        "ensurepip",
+        "http.server",
+        "json.tool",
+        "pip",
+        "platform",
+        "py_compile",
+        "pydoc",
+        "pytest",
+        "site",
+        "sysconfig",
+        "unittest",
+        "venv",
+    }
+)
+# Interpreter options that may precede `-m`. Options that consume a separate
+# operand are listed so the operand is not mistaken for the module name; any
+# option outside this model leaves the dispatch opaque and fails closed.
+PYTHON_VALUE_OPTIONS = frozenset({"-W", "-X", "--check-hash-based-pycs"})
+PYTHON_FLAG_OPTION = re.compile(r"^-[bBdEiIOqsSuvx]+$")
 LOCAL_ACTION_REFERENCE = re.compile(
     r"^\s*(?:-\s*)?(?:uses|'uses'|\"uses\")\s*:\s*"
     r"(?P<quote>['\"]?)(?P<path>\./[A-Za-z0-9._+@~ /-]+)"
@@ -1082,7 +1117,8 @@ LOCAL_COMMAND_REFERENCE = re.compile(
     r"\{[A-Za-z_][A-Za-z0-9_]*\})/)?"
     r"(?:'[A-Za-z0-9._+@~ /-]+'|\"[A-Za-z0-9._+@~ /-]+\"|"
     r"[A-Za-z0-9._+@~-]+(?:/[A-Za-z0-9._+@~-]+)+|"
-    r"[A-Za-z0-9._+@~-]+\.(?:sh|bash|py|rb|pl|awk|php|R|js|mjs|cjs|ts|ps1)))|"
+    r"[A-Za-z0-9._+@~-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|js|mjs|cjs|ts|"
+    r"ps1)))|"
     r"(?P<interpreter>bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|pypy[0-9]*|"
     r"ruby|node|perl|php|Rscript|deno|bun|pwsh|powershell|busybox\s+sh|"
     r"awk\s+-f|source|\.)"
@@ -1091,13 +1127,14 @@ LOCAL_COMMAND_REFERENCE = re.compile(
     r"\{[A-Za-z_][A-Za-z0-9_]*\})/)?"
     r"(?:'[A-Za-z0-9._+@~ /-]+'|\"[A-Za-z0-9._+@~ /-]+\"|"
     r"[A-Za-z0-9._+@~-]+(?:/[A-Za-z0-9._+@~-]+)+|"
-    r"[A-Za-z0-9._+@~-]+\.(?:sh|bash|py|rb|pl|awk|php|R|js|mjs|cjs|ts|ps1)))|"
+    r"[A-Za-z0-9._+@~-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|js|mjs|cjs|ts|"
+    r"ps1)))|"
     r"(?P<direct>(?:'\./[A-Za-z0-9._+@~ /-]+'|"
     r"\"\./[A-Za-z0-9._+@~ /-]+\"|\./[A-Za-z0-9._+@~/-]+))|"
-    r"(?P<bare>(?:'[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|py|rb|pl|awk|php|R|"
-    r"js|mjs|cjs|ts|ps1)'|\"[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|py|rb|pl|"
+    r"(?P<bare>(?:'[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|"
+    r"js|mjs|cjs|ts|ps1)'|\"[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|"
     r"awk|php|R|js|mjs|cjs|ts|ps1)\"|[A-Za-z0-9._+@~-]+"
-    r"(?:/[A-Za-z0-9._+@~-]+)+\.(?:sh|bash|py|rb|pl|awk|php|R|js|mjs|"
+    r"(?:/[A-Za-z0-9._+@~-]+)+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|js|mjs|"
     r"cjs|ts|ps1))))"
 )
 YAML_RUN_FIELD = re.compile(
@@ -1431,6 +1468,24 @@ CD_COMMAND = re.compile(
     r"cd(?:\s+--)?\s+"
     r"(?P<path>'[^'\n;&|]+'|\"[^\"\n;&|]+\"|[^\s'\";&|]+)"
 )
+PYTHON_MODULE_DISPATCH = re.compile(
+    COMMAND_START_CONTEXT
+    + WRAPPER_PREFIX
+    + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+    + ENV_PREFIX
+    + r"?"
+    + TOOL_PATH_PREFIX
+    + r"(?P<interpreter>python(?:\d+(?:\.\d+)*)?|pypy\d*)"
+    r"(?![A-Za-z0-9_.-])(?P<arguments>[^\n;&|]*)"
+)
+PYTHON_MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+# `-m` ends interpreter option parsing, so it may also close a bundled cluster
+# (`python -Im pkg`) or carry the module in the same word (`python -mpkg`).
+PYTHON_MODULE_FLAG_WORD = re.compile(r"(?:^|\s)-[bBdEiIOqsSuvx]*m")
+PYTHON_SELECTOR_WORD = re.compile(r"-[bBdEiIOqsSuvx]*(?P<selector>[cm])")
+# Options that stop the search instead of leaving it opaque: each one either
+# supplies the program itself or exits, so no `-m` can follow.
+PYTHON_TERMINAL_OPTIONS = frozenset({"-", "-c", "-h", "--help", "-V", "--version"})
 
 
 def exact_keys(value: Any, expected: set[str], location: str) -> list[str]:
@@ -2517,7 +2572,17 @@ def compare_pr_publish_control_contract(
     # wildcard collects, so the proposed tree is checked for ownership directly
     # instead of only being compared field by field against the merge base.
     errors.extend(digest_artifact_ownership_errors(proposed_contents, source))
-    return errors
+    # The raw scan reads a key only where it starts a line, so the same upload
+    # spelled `with: {name: docker-digest-evil}` declares no key anywhere and is
+    # invisible to it. The block rendering restores the keys.
+    errors.extend(
+        flow_normalized_findings(
+            proposed_contents,
+            source,
+            digest_artifact_ownership_errors,
+        )
+    )
+    return list(dict.fromkeys(errors))
 
 
 def extract_top_level_block(
@@ -6359,7 +6424,29 @@ def compare_pr_action_collection(
                 f"{source}/{name} cannot add or change Cross executable/"
                 "configuration surfaces"
             )
-    return errors
+        # Comparing Cross surfaces says nothing about digest artifacts: a step
+        # that uploads `docker-digest-*` from a composite action carries no
+        # Cross token at all, so it compares equal and still feeds the wildcard
+        # manifest download on the next main or tag run. The trusted baseline
+        # gets this guard from `validate_action_collection`; the proposed tree
+        # needs it directly. It is absolute rather than compared because a local
+        # action may never own a digest name, so there is no benign baseline to
+        # preserve.
+        if not name.lower().endswith((".yml", ".yaml")):
+            continue
+        proposed_contents = proposed_actions.get(name)
+        if proposed_contents is None:
+            continue
+        label = f"proposed {source}/{name}"
+        errors.extend(local_action_digest_upload_errors(proposed_contents, label))
+        errors.extend(
+            flow_normalized_findings(
+                proposed_contents,
+                label,
+                local_action_digest_upload_errors,
+            )
+        )
+    return list(dict.fromkeys(errors))
 
 
 def normalize_repository_path(raw: str) -> str | None:
@@ -6394,6 +6481,97 @@ def repository_path_has_dot_dot(raw: str) -> bool:
     if variable_prefix is not None:
         raw = raw[variable_prefix.end() :]
     return ".." in PurePosixPath(raw).parts
+
+
+def resolve_directory_change(current: str, raw: str) -> str | None:
+    """Resolve a literal `cd` operand against the tracked directory.
+
+    A relative `cd` moves from wherever the shell already is, so `cd a` then
+    `cd b` lands in `a/b` rather than in `b`. Resolving each operand against the
+    tracked directory keeps repeated and nested changes accurate, and lets `..`
+    be normalized instead of abandoning the directory state entirely. Anything
+    that leaves the repository tree — an absolute path, a home reference, `cd -`,
+    an expansion, or a traversal above the root — returns `None` so callers fail
+    closed rather than resolve a command against a guessed directory.
+    """
+
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+        raw = raw[1:-1]
+    if not raw or raw.startswith(("~", "$", "-")):
+        return None
+    candidate = PurePosixPath(raw)
+    if candidate.is_absolute():
+        return None
+    parts = list(PurePosixPath(current).parts) if current else []
+    for part in candidate.parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                return None
+            parts.pop()
+            continue
+        parts.append(part)
+    return PurePosixPath(*parts).as_posix() if parts else ""
+
+
+def python_dispatch_module(arguments: str) -> tuple[str | None, bool]:
+    """Return the literal module a Python invocation runs with `-m`, plus opacity.
+
+    `python -m pkg` loads `pkg` from the current checkout without naming a path,
+    so it is an executable repository dispatch that the path-based scanners never
+    see. Only the option forms modeled here are resolvable; an option outside the
+    model may or may not consume the following word, which would move the module
+    slot, so those fail closed.
+    """
+
+    words = shell_tokens(arguments)
+    if words is None:
+        # An unbalanced quote means the scan is looking at one physical slice of
+        # a program that spans lines, which is ordinary for an inline `-c` body.
+        # Only a visible module selector makes that ambiguity a dispatch, so a
+        # plain unterminated quote stays benign instead of freezing the file.
+        return None, PYTHON_MODULE_FLAG_WORD.search(arguments) is not None
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in PYTHON_TERMINAL_OPTIONS:
+            return None, False
+        # `-c` and `-m` both end option parsing and both may close a bundled
+        # cluster, so whichever appears first decides whether the rest of the
+        # command line is an inline program or a module name.
+        selector = PYTHON_SELECTOR_WORD.match(word)
+        if selector is not None:
+            if selector.group("selector") == "c":
+                return None, False
+            attached = word[selector.end() :]
+            if attached:
+                candidate = attached
+            elif index + 1 < len(words):
+                candidate = words[index + 1]
+            else:
+                return None, True
+            if not PYTHON_MODULE_NAME.fullmatch(candidate):
+                # A computed module name selects unknowable code.
+                return None, True
+            return candidate, False
+        if word in PYTHON_VALUE_OPTIONS:
+            index += 2
+            continue
+        if any(
+            word.startswith(f"{option}=") or (len(option) == 2 and word.startswith(option))
+            for option in PYTHON_VALUE_OPTIONS
+        ):
+            index += 1
+            continue
+        if PYTHON_FLAG_OPTION.fullmatch(word):
+            index += 1
+            continue
+        if word.startswith("-"):
+            return None, True
+        # The first ordinary word is the script operand, so no module dispatch.
+        return None, False
+    return None, False
 
 
 def repository_command_line(line: str) -> str:
@@ -7728,7 +7906,7 @@ def block_automation_references(
                     ):
                         current = None
                         continue
-                    current = normalize_repository_path(directory_path)
+                    current = resolve_directory_change(current, directory_path)
                 return current
 
             def directory_before(position: int) -> str | None:
@@ -7768,18 +7946,34 @@ def block_automation_references(
                     continue
                 if command_path in GENERATED_COMMAND_PATHS:
                     continue
+                # The shell resolves every relative operand from the directory it
+                # is currently in, not from the repository root, so `cd docs`
+                # followed by `bash scripts/coverage.sh` runs
+                # `docs/scripts/coverage.sh`. Applying the tracked directory only
+                # to slashless names recorded and scanned the wrong file, which
+                # let an approved-root script stand in for an unscanned same-name
+                # path elsewhere in the tree.
                 effective_directory = directory_before(match.start())
-                if "/" not in command_path and effective_directory is None:
+                if effective_directory is None:
                     errors.append(
                         f"{source}:{line_number} repository command has ambiguous "
                         "working-directory state"
                     )
                     continue
-                if "/" not in command_path and effective_directory:
+                if effective_directory:
                     command_path = (
                         PurePosixPath(effective_directory) / command_path
                     ).as_posix()
                 if command_path in GENERATED_COMMAND_PATHS:
+                    continue
+                if PurePosixPath(command_path).suffix.lower() in (
+                    PYTHON_BYTECODE_SUFFIXES
+                ):
+                    errors.append(
+                        f"{source}:{line_number} runs Python bytecode "
+                        f"{command_path!r}; compiled automation cannot be scanned "
+                        "for Cross or publishing surfaces"
+                    )
                     continue
                 if command_path.startswith(APPROVED_AUTOMATION_ROOTS):
                     references.add(command_path)
@@ -7788,6 +7982,47 @@ def block_automation_references(
                         f"{source}:{line_number} repository command {command_path!r} "
                         "is outside the scanned automation roots"
                     )
+
+            # `python -m pkg` runs repository code chosen by module name rather
+            # than by path, so the path scanners above never see it. Resolve the
+            # module against the tracked directory and require it to land on a
+            # scanned automation file; anything unresolvable fails closed.
+            for match in PYTHON_MODULE_DISPATCH.finditer(normalized_line):
+                module, opaque = python_dispatch_module(match.group("arguments"))
+                if opaque:
+                    errors.append(
+                        f"{source}:{line_number} has a Python module dispatch this "
+                        "policy cannot resolve to repository code"
+                    )
+                    continue
+                if module is None or module in PYTHON_DISPATCH_MODULE_ALLOWLIST:
+                    continue
+                effective_directory = directory_before(match.start())
+                if effective_directory is None:
+                    errors.append(
+                        f"{source}:{line_number} Python module dispatch {module!r} "
+                        "has ambiguous working-directory state"
+                    )
+                    continue
+                relative = module.replace(".", "/")
+                resolved = (
+                    (PurePosixPath(effective_directory) / relative).as_posix()
+                    if effective_directory
+                    else relative
+                )
+                # Either spelling of an executable module can satisfy the
+                # dispatch, so both are offered and whichever exists is scanned.
+                candidates = (f"{resolved}.py", f"{resolved}/__main__.py")
+                if not all(
+                    candidate.startswith(APPROVED_AUTOMATION_ROOTS)
+                    for candidate in candidates
+                ):
+                    errors.append(
+                        f"{source}:{line_number} Python module dispatch {module!r} "
+                        "resolves outside the scanned automation roots"
+                    )
+                    continue
+                dispatcher_groups.add("|".join(candidates))
 
             for match in BUILD_DISPATCHER.finditer(normalized_line):
                 arguments = match.group("arguments")
@@ -7916,7 +8151,12 @@ def reachable_automation_references(
     pending: list[str] = []
 
     def follow_dispatchers(groups: set[str], origin: str) -> None:
-        """Resolve each dispatcher to whichever of its manifests exists."""
+        """Resolve each dispatch to whichever of its candidate files exists.
+
+        Build dispatchers name a manifest and `python -m` names a module, but
+        both select one file out of a fixed candidate set, so both are followed
+        here and both fail closed when no candidate is scannable.
+        """
 
         for group in sorted(groups):
             candidates = group.split("|")
@@ -7925,7 +8165,7 @@ def reachable_automation_references(
                 pending.extend(present)
                 continue
             errors.append(
-                f"{origin} runs a repository build dispatcher whose manifest "
+                f"{origin} runs a repository dispatch whose target "
                 f"({candidates[0]!r}) is missing from the scanned automation "
                 "roots"
             )
@@ -8325,12 +8565,69 @@ def validate_workflow_contract(
     return errors
 
 
+def pr_workflow_job_surfaces(
+    contents: str,
+    source: str,
+    job_name: str,
+) -> tuple[tuple[str, ...], list[str]]:
+    """Collect one protected workflow's unprotected Cross surfaces, flow included.
+
+    `validate_workflow_contract` rescans the flow-normalized rendering because
+    every scan in this file reads a key only where it starts a line, which a flow
+    mapping never does. The pull-request comparison read only the raw rendering,
+    so a step spelled `- {run: cross build --target aarch64-unknown-linux-gnu}`
+    produced no surface on either side, compared equal, and passed. The
+    normalized pass can only add surfaces, so nothing previously rejected becomes
+    acceptable.
+    """
+
+    surfaces, failures = unprotected_cross_surfaces(
+        contents,
+        source,
+        job_name,
+        required_job=False,
+        include_opaque_shell_executable=True,
+    )
+    normalized, mapping, flow_failures = flow_normalized_workflow(contents, source)
+    failures = [*failures, *flow_failures]
+    if normalized is not None:
+        flow_surfaces, flow_surface_failures = unprotected_cross_surfaces(
+            normalized,
+            source,
+            job_name,
+            required_job=False,
+            include_opaque_shell_executable=True,
+        )
+        failures.extend(
+            remap_flow_normalized_errors(flow_surface_failures, source, mapping)
+        )
+        surfaces = tuple(dict.fromkeys([*surfaces, *flow_surfaces]))
+    return surfaces, failures
+
+
 def compare_pr_workflow_job(
     merge_base_contents: str,
     proposed_contents: str,
     source: str,
     job_name: str,
 ) -> list[str]:
+    """Hold a protected workflow to the trusted contract across a pull request.
+
+    `ci.yml` and `release.yml` are excluded from the generic workflow collection,
+    so everything outside the protected ARM64 job reaches the trusted gate only
+    here. Policy rules — unprotected Cross surfaces, digest-namespace ownership,
+    and planner isolation — are therefore enforced against the proposed file
+    itself, through the same flow-normalized rendering the absolute contract uses.
+
+    Deliberate boundary: the hash-frozen protected job, top-level `env`, and
+    trigger stay comparisons against the live trusted base rather than absolute
+    re-validations of the proposed file. Re-running the pinned digests here would
+    also freeze a base that predates the contract, and the bootstrap commit that
+    introduces it, neither of which a pull request can be held responsible for.
+    Equality with the trusted base already prevents a pull request from moving
+    any of the three.
+    """
+
     baseline, failures = extract_job_block(
         merge_base_contents,
         f"merge-base {source}",
@@ -8384,19 +8681,15 @@ def compare_pr_workflow_job(
                 "because it schedules the protected ARM64 invocation"
             )
 
-    baseline_surfaces, baseline_surface_failures = unprotected_cross_surfaces(
+    baseline_surfaces, baseline_surface_failures = pr_workflow_job_surfaces(
         merge_base_contents,
         f"merge-base {source}",
         job_name,
-        required_job=False,
-        include_opaque_shell_executable=True,
     )
-    proposed_surfaces, proposed_surface_failures = unprotected_cross_surfaces(
+    proposed_surfaces, proposed_surface_failures = pr_workflow_job_surfaces(
         proposed_contents,
         f"proposed {source}",
         job_name,
-        required_job=False,
-        include_opaque_shell_executable=True,
     )
     errors.extend(baseline_surface_failures)
     errors.extend(proposed_surface_failures)
@@ -9072,6 +9365,131 @@ pre_build = []
     ):
         failures.append("merge-base comparison allowed a newly added protected job")
 
+    # `ci.yml` and `release.yml` are excluded from the generic workflow
+    # comparison, so everything outside the protected ARM64 job reaches the
+    # trusted gate only through this function. Every scan it calls reads a key
+    # where it starts a line, which a flow mapping never does, so a flow-spelled
+    # step produced no surface on either side and compared equal. These are the
+    # unprotected-execution, publish-control, and trigger surfaces Codex named,
+    # each spelled the way the raw scan cannot see.
+    flow_cross_job = benign_workflow.replace(
+        "\n  unrelated:\n",
+        "\n  flow-cross:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: cross build --target aarch64-unknown-linux-gnu}]\n"
+        "\n  unrelated:\n",
+        1,
+    )
+    if not compare_pr_workflow_job(
+        workflow,
+        flow_cross_job,
+        "current workflow",
+        "protected-arm",
+    ):
+        failures.append(
+            "merge-base comparison allowed a flow-spelled unprotected Cross build"
+        )
+    flow_cross_environment = benign_workflow.replace(
+        "\n  unrelated:\n",
+        "\n  flow-env:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    env: {CROSS_CONFIG: attacker.toml}\n"
+        "    steps:\n"
+        "      - run: echo staged\n"
+        "\n  unrelated:\n",
+        1,
+    )
+    if not compare_pr_workflow_job(
+        workflow,
+        flow_cross_environment,
+        "current workflow",
+        "protected-arm",
+    ):
+        failures.append(
+            "merge-base comparison allowed a flow-spelled unprotected Cross "
+            "configuration input"
+        )
+    # A flow-spelled digest upload names no key at the start of any line, so the
+    # ownership scan the comparison already ran on the proposed tree could not
+    # see it. It reaches the wildcard manifest download exactly as the block
+    # spelling does.
+    flow_digest_workflow = benign_workflow.replace(
+        "\n  unrelated:\n",
+        "\n  flow-upload:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - {uses: actions/upload-artifact@v7, with: {name: docker-digest-evil}}\n"
+        "\n  unrelated:\n",
+        1,
+    )
+    if not compare_pr_workflow_job(
+        workflow,
+        flow_digest_workflow,
+        "release workflow",
+        "protected-arm",
+    ):
+        failures.append(
+            "merge-base comparison allowed a flow-spelled unprotected digest upload"
+        )
+    # The block spelling of the same upload was already rejected; keeping it here
+    # proves the flow pass added coverage rather than replacing it.
+    block_digest_workflow = benign_workflow.replace(
+        "\n  unrelated:\n",
+        "\n  block-upload:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/upload-artifact@v7\n"
+        "        with:\n"
+        "          name: docker-digest-evil\n"
+        "\n  unrelated:\n",
+        1,
+    )
+    if not compare_pr_workflow_job(
+        workflow,
+        block_digest_workflow,
+        "release workflow",
+        "protected-arm",
+    ):
+        failures.append(
+            "merge-base comparison allowed a block-spelled unprotected digest upload"
+        )
+    # Ordinary workflow edits outside the protected job, the frozen publication
+    # contracts, and the digest namespace must stay available: the contract
+    # freezes the ARM64 boundary, not routine CI maintenance.
+    benign_added_job = benign_workflow.replace(
+        "\n  unrelated:\n",
+        "\n  extra-tests:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/upload-artifact@" + ("c" * 40) + "\n"
+        "        with:\n"
+        "          name: coverage-report\n"
+        "\n  unrelated:\n",
+        1,
+    )
+    if compare_pr_workflow_job(
+        workflow,
+        benign_added_job,
+        "release workflow",
+        "protected-arm",
+    ):
+        failures.append("merge-base comparison rejected an unrelated added job")
+    benign_flow_job = benign_workflow.replace(
+        "\n  unrelated:\n",
+        "\n  flow-tests:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{run: echo flow-safe}]\n"
+        "\n  unrelated:\n",
+        1,
+    )
+    if compare_pr_workflow_job(
+        workflow,
+        benign_flow_job,
+        "release workflow",
+        "protected-arm",
+    ):
+        failures.append("merge-base comparison rejected a benign flow-spelled step")
+
     safe_extra_workflow = (
         "name: Coverage\n"
         "on: [pull_request]\n"
@@ -9515,6 +9933,78 @@ pre_build = []
         "self-test local-action directory",
     ):
         failures.append("merge-base comparison allowed variable local-action Cross")
+
+    # A digest upload added to an existing local action carries no Cross token at
+    # all, so the Cross-surface comparison sees no change. Without the ownership
+    # guard on the proposed tree, the action passed the trusted pull-request gate
+    # and then contributed an extra artifact to the wildcard manifest download on
+    # the next main or tag run.
+    digest_upload_action = (
+        "name: Safe local action\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - shell: bash\n"
+        "      run: echo safe\n"
+        "    - uses: actions/upload-artifact@" + ("b" * 40) + "\n"
+        "      with:\n"
+        "        name: docker-digest-evil\n"
+    )
+    flow_digest_upload_action = (
+        "name: Safe local action\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - shell: bash\n"
+        "      run: echo safe\n"
+        "    - {uses: actions/upload-artifact@v7, with: {name: docker-digest-evil}}\n"
+    )
+    unpinned_digest_upload_action = digest_upload_action.replace(
+        "actions/upload-artifact@" + ("b" * 40),
+        "Actions/Upload-Artifact@v7",
+    )
+    new_digest_upload_action = digest_upload_action.replace(
+        "docker-digest-evil",
+        "docker-ebpf-digest-evil",
+    )
+    for digest_label, proposed_action in (
+        ("block-spelled", digest_upload_action),
+        ("flow-spelled", flow_digest_upload_action),
+        ("unpinned case-varied", unpinned_digest_upload_action),
+        ("second-namespace", new_digest_upload_action),
+    ):
+        if not compare_pr_action_collection(
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": proposed_action},
+            "self-test local-action directory",
+        ):
+            failures.append(
+                f"merge-base comparison allowed a {digest_label} local-action digest "
+                "upload"
+            )
+    # A newly added action file is reachable the moment a workflow calls it, so
+    # the guard cannot depend on the file already existing in the baseline.
+    if not compare_pr_action_collection(
+        {"setup/action.yml": safe_action},
+        {
+            "setup/action.yml": safe_action,
+            "sccache/action.yml": digest_upload_action,
+        },
+        "self-test local-action directory",
+    ):
+        failures.append("merge-base comparison allowed a newly added digest-upload action")
+    # Uploading anything outside the frozen digest namespace stays available to
+    # ordinary local actions.
+    benign_upload_action = digest_upload_action.replace(
+        "docker-digest-evil",
+        "coverage-report",
+    )
+    if compare_pr_action_collection(
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": benign_upload_action},
+        "self-test local-action directory",
+    ):
+        failures.append("merge-base comparison rejected a benign local-action upload")
 
     referenced_workflow = (
         "name: Referenced automation\n"
@@ -12284,6 +12774,134 @@ pre_build = []
                 f"committed generated command path {exempt_path!r} was not rejected"
             )
 
+    # Committed Python bytecode is executable automation no reader here can
+    # inspect. The tree listing is the only view that separates a commit from an
+    # interpreter cache, so the rejection lives there and cannot fire on a
+    # generated `__pycache__` that git never reports.
+    for bytecode_path in (
+        "scripts/evil.pyc",
+        "scripts/__pycache__/evil.cpython-312.pyc",
+        "tests/performance/nested/__pycache__/helper.pyo",
+    ):
+        if not validate_generated_command_tree(
+            ("scripts/coverage.sh", bytecode_path),
+            "self-test tree",
+        ):
+            failures.append(
+                f"committed Python bytecode {bytecode_path!r} was not rejected"
+            )
+    if validate_generated_command_tree(
+        ("scripts/coverage.sh", "scripts/helper.py", "docs/pyc-notes.md"),
+        "self-test tree",
+    ):
+        failures.append("a tree with only Python source was rejected")
+
+    def command_reference_result(program: str) -> tuple[set[str], set[str], list[str]]:
+        return local_automation_references(
+            "name: Commands\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  build:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - run: |\n"
+            + "".join(f"          {line}\n" for line in program.splitlines()),
+            "self-test command workflow",
+            workflow_source=True,
+        )
+
+    # A relative operand is resolved by the shell from wherever it already is,
+    # so a tracked directory must apply to paths that contain a slash exactly as
+    # it applies to bare names. Recording `scripts/coverage.sh` for
+    # `cd docs; bash scripts/coverage.sh` scanned an approved-root script while
+    # the runner executed an unscanned `docs/` path of the same name.
+    relocated_references, _, relocated_errors = command_reference_result(
+        "cd docs; bash scripts/coverage.sh"
+    )
+    if "scripts/coverage.sh" in relocated_references:
+        failures.append("a relocated slash path was recorded as a root-relative script")
+    if not relocated_errors:
+        failures.append("a relative script under a changed directory was accepted")
+    for escaping_program in (
+        "cd docs\nbash scripts/coverage.sh",
+        "cd docs && sudo bash scripts/coverage.sh",
+        "cd tests\ncd ../docs\nbash scripts/coverage.sh",
+        'cd "$WORKDIR"\nbash scripts/coverage.sh',
+        "cd ..\nbash scripts/coverage.sh",
+        "cd ~\nbash scripts/coverage.sh",
+    ):
+        if not command_reference_result(escaping_program)[2]:
+            failures.append(
+                f"relative command resolution accepted {escaping_program!r}"
+            )
+    # Correct resolution must still be recorded rather than frozen: these are the
+    # spellings ordinary repository automation uses.
+    for benign_program, expected_reference in (
+        ("bash scripts/coverage.sh", "scripts/coverage.sh"),
+        ("cd scripts\ncd ..\nbash scripts/coverage.sh", "scripts/coverage.sh"),
+        ("cd tests\ncd performance\nbash run_perf_test.sh", "tests/performance/run_perf_test.sh"),
+        ("cd tests/performance\nbash ./run_perf_test.sh", "tests/performance/run_perf_test.sh"),
+    ):
+        benign_references, _, benign_errors = command_reference_result(benign_program)
+        if benign_errors:
+            failures.append(f"benign relative command {benign_program!r} was rejected")
+        if expected_reference not in benign_references:
+            failures.append(
+                f"benign relative command {benign_program!r} did not resolve to "
+                f"{expected_reference!r}"
+            )
+
+    # Bytecode invoked by name is never loaded or scanned, so the invocation is
+    # rejected wherever it appears rather than silently skipped by suffix.
+    for bytecode_program in (
+        "python3 scripts/evil.pyc",
+        "cd scripts\npython evil.pyc",
+        "cd scripts && python3 evil.pyc",
+        "sudo python3 scripts/evil.pyo",
+    ):
+        if not command_reference_result(bytecode_program)[2]:
+            failures.append(f"Python bytecode invocation {bytecode_program!r} was accepted")
+    if command_reference_result("python3 scripts/coverage.py")[2]:
+        failures.append("a Python source invocation was rejected as bytecode")
+
+    # `python -m pkg` runs repository code without naming a path. It must resolve
+    # to a scanned file or fail closed, while interpreter and tool modules stay
+    # usable.
+    for module_program in (
+        "python3 -m cross build --target aarch64-unknown-linux-gnu",
+        "python3 -I -m cross build",
+        "python3 -Im cross",
+        "python3 -mcross",
+        "sudo python3 -m cross",
+        "cd scripts\npython3 -m ..cross",
+        'python3 -m "$MODULE"',
+        "python3 -W ignore -m cross",
+        'cd "$WORKDIR"\npython3 -m helper',
+    ):
+        if not command_reference_result(module_program)[2]:
+            failures.append(f"Python module dispatch {module_program!r} was accepted")
+    scripted_dispatchers = command_reference_result("cd scripts\npython3 -m helper")[1]
+    if "scripts/helper.py|scripts/helper/__main__.py" not in scripted_dispatchers:
+        failures.append(
+            "a module dispatch inside an approved root did not resolve to its "
+            "candidate repository files"
+        )
+    for benign_module_program in (
+        "python3 -m py_compile scripts/coverage.py",
+        "python3 -I -m py_compile scripts/coverage.py",
+        "python3 -m pip install --require-hashes -r requirements.txt",
+        "python3 -m venv .venv",
+        "python3 -c 'import json; print(json.dumps({}))'",
+        "python3 -I -c 'import sys; print(sys.version)'",
+        "python3 - <<'PY'\nprint('safe')\nPY",
+        "python3 .github/scripts/coverage_plan.py --self-test",
+        "need python3",
+    ):
+        if command_reference_result(benign_module_program)[2]:
+            failures.append(
+                f"benign Python invocation {benign_module_program!r} was rejected"
+            )
+
     trusted_extraction_fixture = (
         'git fetch --no-tags origin '
         '"+refs/heads/${BASE_REF}:refs/remotes/trusted-base"\n'
@@ -12793,8 +13411,16 @@ def load_action_directory(
     *,
     ignored_suffixes: frozenset[str] = frozenset(),
     ignored_directories: frozenset[str] = frozenset(),
+    committed_tree: bool = False,
 ) -> tuple[dict[str, str], list[str]]:
-    """Load every repo-local action file without following filesystem aliases."""
+    """Load every repo-local action file without following filesystem aliases.
+
+    `committed_tree` marks a directory reconstructed from git rather than the
+    live working copy. Python bytecode in the working copy is an untracked
+    interpreter cache, but in a reconstructed tree it can only be there because
+    a commit supplied it, and compiled automation is unreadable by every scanner
+    in this file, so it is rejected instead of skipped.
+    """
 
     if path.is_symlink() or not path.is_dir():
         return {}, [f"{label} must be a non-symlink directory"]
@@ -12814,9 +13440,19 @@ def load_action_directory(
             if entry.is_symlink():
                 errors.append(f"{label}/{relative} must not be a symlink")
             elif entry.is_dir():
-                if entry.name not in ignored_directories:
+                # A cache directory is skipped only in the live working copy;
+                # a committed one is descended into so the bytecode it hides is
+                # reported rather than ignored along with the directory.
+                if committed_tree or entry.name not in ignored_directories:
                     directories.append(entry)
             elif entry.is_file():
+                if entry.suffix.lower() in PYTHON_BYTECODE_SUFFIXES:
+                    if committed_tree:
+                        errors.append(
+                            f"{label}/{relative} commits Python bytecode, which no "
+                            "scanner can read for Cross or publishing surfaces"
+                        )
+                    continue
                 if entry.suffix.lower() in ignored_suffixes:
                     continue
                 contents, failures = load_workflow(entry, f"{label}/{relative}")
@@ -12864,16 +13500,29 @@ def validate_generated_command_tree(
     """
 
     committed = sorted(set(tree_paths) & GENERATED_COMMAND_PATHS)
-    return [
+    errors = [
         f"{label} commits {path!r}, which the policy exempts only as an "
         "uncommitted build output"
         for path in committed
     ]
+    # Python bytecode is executable automation that no reader in this file can
+    # inspect, and the listing is the one view that distinguishes a commit from
+    # an interpreter cache: `git ls-tree` never reports an untracked
+    # `__pycache__`, so rejecting here cannot fire on a generated file.
+    errors.extend(
+        f"{label} commits Python bytecode {path!r}, which no scanner can read "
+        "for Cross or publishing surfaces"
+        for path in sorted(tree_paths)
+        if PurePosixPath(path).suffix.lower() in PYTHON_BYTECODE_SUFFIXES
+    )
+    return errors
 
 
 def load_automation_directory(
     path: Path,
     label: str,
+    *,
+    committed_tree: bool = False,
 ) -> tuple[dict[str, str], list[str]]:
     """Load the approved repo-script roots with repository-relative keys."""
 
@@ -12888,6 +13537,7 @@ def load_automation_directory(
             f"{label}/{root_name}",
             ignored_suffixes=IGNORED_AUTOMATION_SUFFIXES,
             ignored_directories=IGNORED_AUTOMATION_DIRECTORIES,
+            committed_tree=committed_tree,
         )
         errors.extend(failures)
         for name, contents in loaded.items():
@@ -13172,10 +13822,12 @@ def main() -> int:
         merge_base_actions, merge_base_action_failures = load_action_directory(
             args.merge_base_actions_dir,
             "merge-base local-action directory",
+            committed_tree=True,
         )
         proposed_actions, proposed_action_failures = load_action_directory(
             args.proposed_actions_dir,
             "proposed local-action directory",
+            committed_tree=True,
         )
         failures.extend(merge_base_action_failures)
         failures.extend(proposed_action_failures)
@@ -13194,11 +13846,13 @@ def main() -> int:
             load_automation_directory(
                 args.merge_base_automation_dir,
                 "merge-base automation directory",
+                committed_tree=True,
             )
         )
         proposed_automation, proposed_automation_failures = load_automation_directory(
             args.proposed_automation_dir,
             "proposed automation directory",
+            committed_tree=True,
         )
         failures.extend(merge_base_automation_failures)
         failures.extend(proposed_automation_failures)
