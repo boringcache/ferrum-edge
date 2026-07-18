@@ -291,6 +291,10 @@ impl SchemaSerializable for TransactionSummary {
                 None => Ok(()),
             },
             "response_status_code" => map.serialize_entry(out_key, &self.response_status_code),
+            "grpc_status" => match self.grpc_status() {
+                Some(value) => map.serialize_entry(out_key, &value),
+                None => Ok(()),
+            },
             "latency_total_ms" => map.serialize_entry(out_key, &self.latency_total_ms),
             "latency_gateway_processing_ms" => {
                 map.serialize_entry(out_key, &self.latency_gateway_processing_ms)
@@ -406,9 +410,7 @@ impl SchemaSerializable for TransactionSummary {
                 Ok(true)
             }
             DerivedKind::Outcome => {
-                let is_error = self.response_status_code >= 500
-                    || self.error_class.is_some()
-                    || self.body_error_class.is_some();
+                let is_error = self.response_status_code >= 500 || self.is_terminal_failure();
                 map.serialize_entry(out_key, if is_error { "error" } else { "ok" })?;
                 Ok(true)
             }

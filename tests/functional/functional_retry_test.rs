@@ -703,7 +703,7 @@ async fn retry_on_connect_failure_fires_with_empty_methods_and_statuses() {
     };
 
     // The gateway emits every attempt line before the client's 502 returns,
-    // but they flush through tracing-appender's non-blocking writer
+    // but they flush through the bounded non-blocking process-log worker
     // afterward, so a single post-response snapshot races that flush and can
     // under-count. Poll until the 4 expected lines land, then stabilize: a
     // bare poll-until-≥4 would return the instant the 4th line flushed and
