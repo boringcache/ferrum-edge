@@ -7781,7 +7781,7 @@ pre_build = []
     # operand, so a benign program must stay readable while a Cross one is
     # still caught.
     benign_attached_option = {
-        "scripts/safe.sh": "#!/bin/sh\nperl -e'print \"safe\"'\n"
+        "scripts/safe.sh": "#!/bin/sh\nperl -e'print 1'\n"
     }
     attached_option_errors = compare_pr_automation_collection(
         {"ci.yml": referenced_workflow},
@@ -7873,13 +7873,34 @@ pre_build = []
         ),
         "PowerShell computed call operator": "& $tool build",
     }.items():
+        # Assert through the PowerShell reader itself, not through the
+        # surrounding lexical rules, so the fixture cannot pass vacuously.
+        powershell_programs, powershell_interpreter_errors = workflow_run_programs(
+            powershell_workflow.replace("BODY", powershell_body),
+            "self-test powershell workflow",
+        )
+        if [language for language, _ in powershell_programs] != ["powershell"]:
+            failures.append(
+                f"{powershell_label} body was not read as PowerShell: "
+                f"{powershell_programs!r}"
+            )
+            continue
+        powershell_sensitive, powershell_body_errors = runtime_program_cross_surface(
+            powershell_programs,
+            "self-test powershell workflow",
+            include_opaque_shell_executable=True,
+        )
+        if not powershell_sensitive and not powershell_body_errors and not (
+            powershell_interpreter_errors
+        ):
+            failures.append(f"{powershell_label} was not protected")
         surfaces, errors = generic_workflow_cross_surfaces(
             powershell_workflow.replace("BODY", powershell_body),
             "self-test powershell workflow",
             include_opaque_shell_executable=True,
         )
         if not surfaces and not errors:
-            failures.append(f"{powershell_label} was not protected")
+            failures.append(f"{powershell_label} was not protected end to end")
     benign_powershell = (
         '$ErrorActionPreference = "Stop"\n'
         '          $root = Join-Path $env:RUNNER_TEMP "protoc"\n'
@@ -7892,16 +7913,28 @@ pre_build = []
         "          $root | Out-File -Append -FilePath $env:GITHUB_PATH "
         "-Encoding utf8"
     )
-    benign_surfaces, benign_powershell_errors = generic_workflow_cross_surfaces(
+    # Assert on the interpreter itself. The surrounding lexical rule that
+    # substitutes Cross into every opaque expansion is deliberately unchanged
+    # here, so the PowerShell reader is what must stay quiet on an ordinary
+    # body modelled on the real `shell: pwsh` steps in ci.yml/release.yml.
+    benign_programs, benign_interpreter_errors = workflow_run_programs(
         powershell_workflow.replace("BODY", benign_powershell),
+        "self-test powershell workflow",
+    )
+    if [language for language, _ in benign_programs] != ["powershell"]:
+        failures.append(
+            f"benign PowerShell body was not read as PowerShell: {benign_programs!r}"
+        )
+    benign_sensitive, benign_powershell_errors = runtime_program_cross_surface(
+        benign_programs,
         "self-test powershell workflow",
         include_opaque_shell_executable=True,
     )
-    if benign_surfaces or benign_powershell_errors:
+    if benign_sensitive or benign_interpreter_errors or benign_powershell_errors:
         failures.append(
             "benign PowerShell workflow body was rejected: "
-            f"surfaces={benign_surfaces!r}; "
-            f"errors={benign_powershell_errors!r}"
+            f"sensitive={benign_sensitive!r}; "
+            f"errors={benign_interpreter_errors + benign_powershell_errors!r}"
         )
 
     folded_action = (
@@ -8430,6 +8463,19 @@ pre_build = []
         'extract_workflows "$trusted_base" "$merge_base_workflows"\n'
         'extract_actions "$trusted_base" "$merge_base_actions"\n'
         'extract_automation "$trusted_base" "$merge_base_automation"\n'
+        'git show "$trusted_base:.github/scripts/verify_cross_build_policy.py"\n'
+        'git show "$trusted_base:.github/workflows/cross-build-policy.yml"\n'
+        'if ! git diff --no-ext-diff --quiet "$BASE_SHA" "$trusted_base" \\\n'
+        '  -- ".github/workflows/cross-build-policy.yml"; then\n'
+        "  exit 1\n"
+        "fi\n"
+        'python3 -I "$trusted_verifier" \\\n'
+        '  --ci-workflow "$merge_base_ci" \\\n'
+        '  --release-workflow "$merge_base_release" \\\n'
+        '  --trusted-policy-workflow "$trusted_policy_workflow" \\\n'
+        '  --workflows-dir "$merge_base_workflows" \\\n'
+        '  --actions-dir "$merge_base_actions" \\\n'
+        '  --automation-dir "$merge_base_automation"\n'
         'if ! git ls-tree -rz --name-only "$commit" -- workflows > "$listing"; then\n'
         "  return 1\n"
         "fi\n"
@@ -8457,6 +8503,25 @@ pre_build = []
         "self-test trusted policy",
     ):
         failures.append("stale merge-base extraction was not rejected")
+    for extraction_label, unpinned_extraction in {
+        "event-base verifier execution": trusted_extraction_fixture.replace(
+            'python3 -I "$trusted_verifier"',
+            "python3 -I .github/scripts/verify_cross_build_policy.py",
+        ),
+        "unauthenticated extraction contract": trusted_extraction_fixture.replace(
+            'if ! git diff --no-ext-diff --quiet "$BASE_SHA" "$trusted_base" \\\n',
+            "if false; then\n",
+        ),
+        "event-base trusted contract inputs": trusted_extraction_fixture.replace(
+            '  --ci-workflow "$merge_base_ci" \\\n',
+            "  --ci-workflow .github/workflows/ci.yml \\\n",
+        ),
+    }.items():
+        if not validate_trusted_policy_extraction(
+            unpinned_extraction,
+            "self-test trusted policy",
+        ):
+            failures.append(f"{extraction_label} was not rejected")
     for label, stale_baseline in {
         "stale event-base workflow extraction": (
             'extract_workflows "$trusted_base" "$merge_base_workflows"',

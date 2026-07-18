@@ -400,42 +400,58 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          # The closed, auditable published asset set. Each entry names the
-          # exact trusted artifact directory and the exact file inside it, so a
+          # The closed, auditable published asset set. Each entry names one
+          # exact trusted artifact directory and one exact file inside it, so a
           # colliding or extra upload can neither add nor replace an asset.
-          trusted_assets=(
-            "release-binaries-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64"
-            "release-binaries-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64"
-            "release-binaries-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64"
-            "release-binaries-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64"
-            "release-binaries-x86_64-apple-darwin/ferrum-edge-macos-x86_64"
-            "release-binaries-aarch64-apple-darwin/ferrum-edge-macos-aarch64"
-            "release-binaries-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe"
-          )
-          expected=()
-          for asset in "${trusted_assets[@]}"; do
-            for candidate in "$asset" "$asset.sha256"; do
-              source_path="downloaded-artifacts/${candidate}"
-              if [ ! -f "$source_path" ] || [ -L "$source_path" ]; then
-                echo "::error::missing trusted release asset ${candidate}" >&2
-                exit 1
-              fi
-              cp "$source_path" "release-assets/$(basename "$candidate")"
-              expected+=("$(basename "$candidate")")
-            done
-          done
+          copy_trusted_asset() {
+            if [ ! -f "downloaded-artifacts/$1" ] || [ -L "downloaded-artifacts/$1" ]; then
+              echo "::error::missing trusted release asset $1" >&2
+              exit 1
+            fi
+            cp "downloaded-artifacts/$1" "release-assets/$2"
+          }
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64 ferrum-edge-linux-x86_64
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64.sha256 ferrum-edge-linux-x86_64.sha256
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64 ferrum-cni-linux-x86_64
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64.sha256 ferrum-cni-linux-x86_64.sha256
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64 ferrum-edge-linux-aarch64
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64.sha256 ferrum-edge-linux-aarch64.sha256
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64 ferrum-cni-linux-aarch64
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64.sha256 ferrum-cni-linux-aarch64.sha256
+          copy_trusted_asset release-binaries-x86_64-apple-darwin/ferrum-edge-macos-x86_64 ferrum-edge-macos-x86_64
+          copy_trusted_asset release-binaries-x86_64-apple-darwin/ferrum-edge-macos-x86_64.sha256 ferrum-edge-macos-x86_64.sha256
+          copy_trusted_asset release-binaries-aarch64-apple-darwin/ferrum-edge-macos-aarch64 ferrum-edge-macos-aarch64
+          copy_trusted_asset release-binaries-aarch64-apple-darwin/ferrum-edge-macos-aarch64.sha256 ferrum-edge-macos-aarch64.sha256
+          copy_trusted_asset release-binaries-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe ferrum-edge-windows-x86_64.exe
+          copy_trusted_asset release-binaries-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe.sha256 ferrum-edge-windows-x86_64.exe.sha256
           # Publishing must be exactly the trusted set, never whatever the
           # download happened to produce.
-          published_list="$(cd release-assets && ls -A | LC_ALL=C sort)"
-          expected_list="$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)"
-          if [ "$published_list" != "$expected_list" ]; then
+          cat > "$RUNNER_TEMP/expected-assets" <<'ASSETS'
+          ferrum-edge-linux-x86_64
+          ferrum-edge-linux-x86_64.sha256
+          ferrum-cni-linux-x86_64
+          ferrum-cni-linux-x86_64.sha256
+          ferrum-edge-linux-aarch64
+          ferrum-edge-linux-aarch64.sha256
+          ferrum-cni-linux-aarch64
+          ferrum-cni-linux-aarch64.sha256
+          ferrum-edge-macos-x86_64
+          ferrum-edge-macos-x86_64.sha256
+          ferrum-edge-macos-aarch64
+          ferrum-edge-macos-aarch64.sha256
+          ferrum-edge-windows-x86_64.exe
+          ferrum-edge-windows-x86_64.exe.sha256
+ASSETS
+          LC_ALL=C sort -o "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/expected-assets"
+          ls -A release-assets | LC_ALL=C sort > "$RUNNER_TEMP/published-assets"
+          if ! diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/published-assets"; then
             echo "::error::published release asset set drifted from the trusted set" >&2
-            printf 'published:\n%s\nexpected:\n%s\n' "$published_list" "$expected_list" >&2
             exit 1
           fi
-          (cd release-assets && sha256sum -c ./*.sha256)
+          cd release-assets
+          sha256sum -c ./*.sha256
+          cd ..
           ls -la release-assets/
-
       - name: Generate release notes
         id: release_notes
         env:
