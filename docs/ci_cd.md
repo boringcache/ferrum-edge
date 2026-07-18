@@ -58,8 +58,8 @@ adding, removing, or materially changing a workflow.
 ```
 Pull Request
     ├─► Trusted Cross Build Policy (`pull_request_target`, base code only)
-            └─► Validate proposed Cross.toml, Cargo metadata, workflows, and
-                repo-local action invocation surfaces as hostile data
+            └─► Validate proposed Cross/Cargo config, workflows, repo-local
+                actions, and referenced scripts as hostile data
     ├─► CI plan
             ├─► Docs/license/agent-only: lightweight Tests aggregate
             └─► Full CI
@@ -365,25 +365,36 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   `workspace.metadata.cross` in table, dotted-key, quoted-key, or inline-table
   form. Unrelated package/workspace metadata, dependency, and version edits
   remain permitted.
+- `.cargo/config` is forbidden, and `.cargo/config.toml` is parsed as a complete
+  allowlist. The existing build wrapper/incremental values and every target
+  linker/rustflags table are exact; only bounded retry and boolean HTTP
+  multiplexing transport tuning may vary. Extra build, target, runner, rustc,
+  workspace-wrapper, env, alias, credential, registry, or future root keys fail
+  closed instead of becoming an alternate executable/toolchain surface.
 - `build-arm64-cross` in `ci.yml` and `build-release-arm64-cross` in
   `release.yml` are isolated from the shared native matrix. Their exact job
   blocks, inherited top-level `env` mappings, and workflow trigger blocks are
   hashed by the trusted verifier, and merge-base comparison rejects any
   PR-authored mutation while allowing unrelated workflow jobs to evolve. Every
   `.yml` and `.yaml` file directly under `.github/workflows`, plus every regular
-  file recursively under `.github/actions`, is also compared as a collection,
-  so a PR cannot move or add an invocation in a different workflow or a
-  repo-local action. Any new or changed Cross executable/configuration token
-  outside the isolated jobs is rejected, including quoted or nested
+  file recursively under `.github/actions`, is also compared as a collection.
+  The complete `.github/scripts`, `comparison`, `scripts`, `tests/k8s`, and
+  `tests/performance` automation roots are semantically compared, and literal
+  repo-script edges are resolved transitively; local actions outside
+  `.github/actions` and repo commands outside those scanned roots are rejected.
+  This prevents moving an invocation into another workflow, action, or helper
+  script without freezing benign script edits. Any new or changed Cross
+  executable/configuration token outside the isolated jobs is rejected,
+  including `env`-wrapped and Cargo-subcommand forms, quoted or nested
   shell/GitHub-interpolated executable spellings, literal or command-position
   dynamic GitHub expressions before any Cargo-compatible subcommand or
   toolchain selector, shell-variable executable indirection, partial or whole
   opaque command substitutions, Bash brace expansions and ANSI-C escapes, and
   Cross environment aliases; Bash backslash-newline continuations are
-  normalized before scanning. Cross-sensitive jobs and local-action files are
-  represented by full digests, while unrelated workflow and action additions
-  or edits remain permitted. The isolated jobs use only pinned external setup
-  actions before revalidation.
+  normalized before scanning. Cross-sensitive jobs, local-action files, and
+  reachable scripts are represented by full digests, while unrelated workflow,
+  action, and script additions or edits remain permitted. The isolated jobs use
+  only pinned external setup actions before revalidation.
 - The `needs` fields that connect ARM64 artifacts to `latest-release`, CI and
   release Docker publishing, and `create-release` are separately protected;
   the CI publishers' success conditions are protected too. Only those direct
@@ -399,9 +410,11 @@ boundary therefore uses a complete allowlist rather than a field denylist:
 The trusted `pull_request_target` job checks out only the base SHA with
 read-only contents permission. It fetches the PR head without checking it out,
 requires the fetched object to equal the immutable head SHA from the triggering
-event, then extracts `Cross.toml`, `Cargo.toml`, and the complete proposed and
-merge-base workflow and repo-local action directories as hostile data, and
-runs only the base branch's verifier. The verifier and trusted workflow are
+event, then extracts `Cross.toml`, `Cargo.toml`, `.cargo/config.toml`, the
+complete proposed and merge-base workflow and repo-local action directories,
+and the approved automation roots as hostile data, and runs only the base
+branch's verifier. A proposed legacy `.cargo/config` is surfaced and rejected.
+The verifier and trusted workflow are
 compared with `HEAD...FETCH_HEAD`, preserving merge-base behavior for stale
 branches while rejecting a PR-authored modification, mode change, rename, or
 deletion. On pull requests, the ordinary `CI Plan` executes the base branch's

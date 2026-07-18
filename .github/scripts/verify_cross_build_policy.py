@@ -9,7 +9,7 @@ import json
 import re
 import sys
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -42,6 +42,26 @@ EXPECTED_PASSTHROUGH = (
     "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++",
     "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar",
 )
+EXPECTED_CARGO_BUILD = {
+    "rustc-wrapper": "sccache",
+    "incremental": False,
+}
+EXPECTED_CARGO_TARGETS = {
+    "x86_64-unknown-linux-gnu": {
+        "linker": "clang",
+        "rustflags": ["-C", "link-arg=-fuse-ld=mold"],
+    },
+    "aarch64-unknown-linux-gnu": {
+        "linker": "clang",
+        "rustflags": ["-C", "link-arg=-fuse-ld=mold"],
+    },
+    "aarch64-apple-darwin": {
+        "rustflags": ["-C", "link-arg=-fuse-ld=lld"],
+    },
+    "x86_64-apple-darwin": {
+        "rustflags": ["-C", "link-arg=-fuse-ld=lld"],
+    },
+}
 
 # These hashes cover the isolated jobs that prepare and invoke Cross, the
 # top-level env mappings inherited by those jobs, and the workflow triggers
@@ -120,8 +140,13 @@ CROSS_ENVIRONMENT = re.compile(
 CROSS_COMMAND_CONTEXT = re.compile(
     r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;|\|)\s*|"
     r"\b(?:if|elif|while|until|then|do|else|time|command|exec|sudo|nohup)\s+)"
-    r"(?:\(\s*)?cross(?=\s+\S)|"
-    r"cargo\s+install(?:\s+--[^\s]+)*\s+cross\b"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+    r"(?:\(\s*)?(?:"
+    r"cross|"
+    r"env(?:\s+(?:--?[^\s]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+))*\s+"
+    r"(?:cargo(?:\s+\+[^\s]+)?\s+)?cross|"
+    r"cargo(?:\s+\+[^\s]+)?\s+cross"
+    r")(?=\s+\S)|cargo\s+install(?:\s+--[^\s]+)*\s+cross\b"
 )
 SHELL_INTERPOLATION = re.compile(
     r"\$\{[^{}\n]*\}|`[^`\n]*`|"
@@ -129,6 +154,54 @@ SHELL_INTERPOLATION = re.compile(
 )
 WORKFLOW_FILENAME = re.compile(r"^[A-Za-z0-9._-]+\.(?:yml|yaml)$")
 PROTECTED_WORKFLOW_FILENAMES = frozenset({"ci.yml", "release.yml"})
+APPROVED_AUTOMATION_ROOTS = (
+    ".github/scripts/",
+    "comparison/",
+    "scripts/",
+    "tests/k8s/",
+    "tests/performance/",
+)
+GENERATED_COMMAND_PATHS = frozenset(
+    {
+        "target/ci-release/ferrum-edge",
+        "tests/performance/target/release/backend_server",
+        "target/release/ferrum-edge",
+        "target/release/proto_backend",
+        "ferrum-edge-linux-x86_64",
+        "conformance",
+    }
+)
+GENERATED_SCRIPT_PREFIXES = (
+    "RUNNER_TEMP/",
+    "trusted_dir/",
+    "target/",
+    "results/",
+    "coverage-report/",
+    "benchmark-results/",
+    "comparison-results/",
+    "tmp/",
+)
+LOCAL_ACTION_REFERENCE = re.compile(
+    r"\buses\s*:\s*(?P<quote>['\"]?)(?P<path>\./[A-Za-z0-9._/-]+)"
+    r"(?P=quote)(?=\s*(?:#|$))"
+)
+LOCAL_COMMAND_REFERENCE = re.compile(
+    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;|\|)\s*|\$\(\s*|"
+    r"\b(?:if|elif|while|until|then|do|else)\s+)"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+    r"(?:\(\s*)?"
+    r"(?:env(?:\s+(?:--?[^\s]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+))*\s+)?"
+    r"(?:(?:bash|sh|python|python3|ruby|node|source|\.)"
+    r"(?:\s+--?[^\s]+)*\s+"
+    r"(?P<interpreted>[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+)|"
+    r"(?P<direct>\./[A-Za-z0-9._/-]+)|"
+    r"(?P<bare>[A-Za-z0-9_-]+/[A-Za-z0-9._/-]+))"
+)
+LOCAL_SCRIPT_LITERAL = re.compile(
+    r"(?<![A-Za-z0-9._/-])"
+    r"(?P<path>(?:\./)?[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+"
+    r"\.(?:sh|py|rb))"
+)
 
 
 def exact_keys(value: Any, expected: set[str], location: str) -> list[str]:
@@ -233,6 +306,47 @@ def validate_cargo_configuration(parsed: Any) -> list[str]:
                 f"Cargo.toml {owner}.metadata.cross is forbidden; all Cross "
                 "configuration must be present in the fully allowlisted Cross.toml"
             )
+    return errors
+
+
+def validate_cargo_tool_configuration(parsed: Any) -> list[str]:
+    """Allowlist Cargo config fields that the protected Cross build consumes."""
+
+    errors = exact_keys(parsed, {"build", "target", "net", "http"}, ".cargo config")
+    if errors:
+        return errors
+
+    build = parsed["build"]
+    errors.extend(exact_keys(build, set(EXPECTED_CARGO_BUILD), ".cargo config build"))
+    if not errors and build != EXPECTED_CARGO_BUILD:
+        errors.append(
+            ".cargo config build must retain the approved rustc-wrapper and "
+            "incremental values"
+        )
+
+    targets = parsed["target"]
+    errors.extend(
+        exact_keys(targets, set(EXPECTED_CARGO_TARGETS), ".cargo config target")
+    )
+    if not errors and targets != EXPECTED_CARGO_TARGETS:
+        errors.append(
+            ".cargo config target tables must exactly match the approved linker/"
+            "rustflags contract"
+        )
+
+    net = parsed["net"]
+    errors.extend(exact_keys(net, {"git-fetch-with-cli", "retry"}, ".cargo config net"))
+    if not errors:
+        if net["git-fetch-with-cli"] is not True:
+            errors.append(".cargo config net.git-fetch-with-cli must remain true")
+        retry = net["retry"]
+        if isinstance(retry, bool) or not isinstance(retry, int) or not 0 <= retry <= 100:
+            errors.append(".cargo config net.retry must be an integer from 0 through 100")
+
+    http = parsed["http"]
+    errors.extend(exact_keys(http, {"multiplexing"}, ".cargo config http"))
+    if not errors and not isinstance(http["multiplexing"], bool):
+        errors.append(".cargo config http.multiplexing must be a boolean")
     return errors
 
 
@@ -1209,6 +1323,187 @@ def compare_pr_action_collection(
     return errors
 
 
+def normalize_repository_path(raw: str) -> str | None:
+    value = raw[2:] if raw.startswith("./") else raw
+    candidate = PurePosixPath(value)
+    if (
+        not value
+        or candidate.is_absolute()
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+    ):
+        return None
+    return candidate.as_posix()
+
+
+def local_automation_references(
+    contents: str,
+    source: str,
+) -> tuple[set[str], list[str]]:
+    """Collect canonical repo scripts and reject unscanned local actions/commands."""
+
+    references: set[str] = set()
+    errors: list[str] = []
+    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    for line_number, line in enumerate(logical_contents.splitlines(), start=1):
+        if re.search(r"\buses\s*:\s*['\"]?\./", line):
+            match = LOCAL_ACTION_REFERENCE.search(line)
+            if match is None:
+                errors.append(
+                    f"{source}:{line_number} has a non-canonical local action reference"
+                )
+            else:
+                action_path = normalize_repository_path(match.group("path"))
+                if action_path is None or not action_path.startswith(".github/actions/"):
+                    errors.append(
+                        f"{source}:{line_number} local actions must be under "
+                        ".github/actions"
+                    )
+
+        for match in LOCAL_SCRIPT_LITERAL.finditer(line):
+            script_path = normalize_repository_path(match.group("path"))
+            if script_path is None:
+                errors.append(
+                    f"{source}:{line_number} has a non-canonical script path"
+                )
+            elif script_path.startswith(GENERATED_SCRIPT_PREFIXES):
+                continue
+            elif script_path.startswith(APPROVED_AUTOMATION_ROOTS):
+                references.add(script_path)
+            else:
+                errors.append(
+                    f"{source}:{line_number} script {script_path!r} is outside "
+                    "the scanned automation roots"
+                )
+
+        for match in LOCAL_COMMAND_REFERENCE.finditer(line):
+            raw_command_path = (
+                match.group("interpreted")
+                or match.group("direct")
+                or match.group("bare")
+            )
+            if raw_command_path.endswith("/"):
+                continue
+            command_path = normalize_repository_path(raw_command_path)
+            if command_path is None:
+                errors.append(
+                    f"{source}:{line_number} has a non-canonical repository command"
+                )
+                continue
+            if command_path in GENERATED_COMMAND_PATHS:
+                continue
+            if command_path.startswith(APPROVED_AUTOMATION_ROOTS):
+                references.add(command_path)
+            else:
+                errors.append(
+                    f"{source}:{line_number} repository command {command_path!r} is "
+                    "outside the scanned automation roots"
+                )
+    return references, errors
+
+
+def reachable_automation_references(
+    sources: dict[str, str],
+    automation: dict[str, str],
+    label: str,
+) -> tuple[set[str], list[str]]:
+    """Follow literal repo-script execution edges from workflows and actions."""
+
+    reachable: set[str] = set()
+    errors: list[str] = []
+    pending: list[str] = []
+    for name, contents in sorted(sources.items()):
+        references, failures = local_automation_references(contents, f"{label}/{name}")
+        errors.extend(failures)
+        pending.extend(sorted(references))
+
+    while pending:
+        name = pending.pop()
+        if name in reachable:
+            continue
+        reachable.add(name)
+        contents = automation.get(name)
+        if contents is None:
+            errors.append(f"{label} references missing automation file {name!r}")
+            continue
+        references, failures = local_automation_references(
+            contents,
+            f"{label}/{name}",
+        )
+        errors.extend(failures)
+        pending.extend(sorted(references - reachable))
+    return reachable, errors
+
+
+def validate_automation_collection(
+    workflows: dict[str, str],
+    actions: dict[str, str],
+    automation: dict[str, str],
+    source: str,
+) -> list[str]:
+    sources = {
+        **{f"workflows/{name}": contents for name, contents in workflows.items()},
+        **{f"actions/{name}": contents for name, contents in actions.items()},
+    }
+    _, errors = reachable_automation_references(sources, automation, source)
+    return errors
+
+
+def compare_pr_automation_collection(
+    merge_base_workflows: dict[str, str],
+    proposed_workflows: dict[str, str],
+    merge_base_actions: dict[str, str],
+    proposed_actions: dict[str, str],
+    merge_base_automation: dict[str, str],
+    proposed_automation: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Reject new Cross surfaces in transitively invoked repository scripts."""
+
+    baseline_sources = {
+        **{
+            f"workflows/{name}": contents
+            for name, contents in merge_base_workflows.items()
+        },
+        **{f"actions/{name}": contents for name, contents in merge_base_actions.items()},
+    }
+    proposed_sources = {
+        **{f"workflows/{name}": contents for name, contents in proposed_workflows.items()},
+        **{f"actions/{name}": contents for name, contents in proposed_actions.items()},
+    }
+    _, baseline_errors = reachable_automation_references(
+        baseline_sources,
+        merge_base_automation,
+        f"merge-base {source}",
+    )
+    _, proposed_errors = reachable_automation_references(
+        proposed_sources,
+        proposed_automation,
+        f"proposed {source}",
+    )
+    errors = [*baseline_errors, *proposed_errors]
+    if errors:
+        return errors
+
+    # Compare every file in the narrowly approved automation roots. This also
+    # covers scripts selected through an existing trusted variable or sourced
+    # transitively without freezing files whose Cross surface remains empty.
+    for name in sorted(set(merge_base_automation) | set(proposed_automation)):
+        baseline_surfaces = generic_action_cross_surfaces(
+            merge_base_automation.get(name, ""),
+            include_opaque_shell_executable=True,
+        )
+        proposed_surfaces = generic_action_cross_surfaces(
+            proposed_automation.get(name, ""),
+            include_opaque_shell_executable=True,
+        )
+        if baseline_surfaces != proposed_surfaces:
+            errors.append(
+                f"{source}/{name} cannot add or change Cross executable/"
+                "configuration surfaces"
+            )
+    return errors
+
+
 def validate_workflow_contract(
     contents: str,
     source: str,
@@ -1582,6 +1877,90 @@ pre_build = []
         if not parse_failures:
             failures.append(f"{name} was not rejected")
 
+    valid_cargo_tool: dict[str, Any] = {
+        "build": dict(EXPECTED_CARGO_BUILD),
+        "target": {
+            name: {
+                key: list(value) if isinstance(value, list) else value
+                for key, value in settings.items()
+            }
+            for name, settings in EXPECTED_CARGO_TARGETS.items()
+        },
+        "net": {"git-fetch-with-cli": True, "retry": 10},
+        "http": {"multiplexing": False},
+    }
+    if validate_cargo_tool_configuration(valid_cargo_tool):
+        failures.append("valid .cargo/config.toml policy was rejected")
+    benign_cargo_tool = {
+        **valid_cargo_tool,
+        "net": {**valid_cargo_tool["net"], "retry": 20},
+        "http": {"multiplexing": True},
+    }
+    if validate_cargo_tool_configuration(benign_cargo_tool):
+        failures.append("benign Cargo transport tuning was rejected")
+
+    cargo_tool_bypasses = {
+        "custom rustc": {
+            **valid_cargo_tool,
+            "build": {**valid_cargo_tool["build"], "rustc": "./ci/rustc"},
+        },
+        "workspace rustc wrapper": {
+            **valid_cargo_tool,
+            "build": {
+                **valid_cargo_tool["build"],
+                "rustc-workspace-wrapper": "./ci/wrapper",
+            },
+        },
+        "default build target": {
+            **valid_cargo_tool,
+            "build": {**valid_cargo_tool["build"], "target": TARGET},
+        },
+        "target runner": {
+            **valid_cargo_tool,
+            "target": {
+                **valid_cargo_tool["target"],
+                TARGET: {
+                    **valid_cargo_tool["target"][TARGET],
+                    "runner": "./ci/runner",
+                },
+            },
+        },
+        "changed target linker": {
+            **valid_cargo_tool,
+            "target": {
+                **valid_cargo_tool["target"],
+                TARGET: {
+                    **valid_cargo_tool["target"][TARGET],
+                    "linker": "./ci/linker",
+                },
+            },
+        },
+        "Cargo environment table": {
+            **valid_cargo_tool,
+            "env": {"CROSS_CONFIG": "attacker.toml"},
+        },
+        "Cargo alias table": {
+            **valid_cargo_tool,
+            "alias": {"build": "cross build"},
+        },
+    }
+    for name, parsed in cargo_tool_bypasses.items():
+        if not validate_cargo_tool_configuration(parsed):
+            failures.append(f"{name} Cargo config bypass was not rejected")
+
+    malformed_cargo_tool = {
+        "duplicate Cargo build table": (
+            "[build]\nrustc-wrapper='sccache'\n[build]\nincremental=false\n"
+        ),
+        "duplicate Cargo rustc key": (
+            "[build]\nrustc-wrapper='sccache'\nrustc-wrapper='./ci/wrapper'\n"
+        ),
+    }
+    for name, contents in malformed_cargo_tool.items():
+        _, parse_failures = parse_toml(contents, f"self-test {name}")
+        if not parse_failures:
+            failures.append(f"{name} was not rejected")
+
     protected_block = """  protected-arm:
     runs-on: ubuntu-latest
     defaults:
@@ -1734,6 +2113,21 @@ pre_build = []
             "echo safe",
             "cargo install cr$(printf '\\157')ss && "
             "cr$(printf '\\157')ss build --target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected env-wrapped command substitution": workflow.replace(
+            "echo safe",
+            "env -i cr$(printf '\\157')ss build "
+            "--target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected assignment-wrapped command substitution": workflow.replace(
+            "echo safe",
+            "SAFE=value cr$(printf '\\157')ss build "
+            "--target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected Cargo-wrapped command substitution": workflow.replace(
+            "echo safe",
+            "cargo cr$(printf '\\157')ss build "
+            "--target aarch64-unknown-linux-gnu",
         ),
         "unprotected whole command substitution": workflow.replace(
             "echo safe",
@@ -2036,6 +2430,101 @@ pre_build = []
     ):
         failures.append("merge-base comparison allowed variable local-action Cross")
 
+    referenced_workflow = (
+        "name: Referenced automation\n"
+        "jobs:\n"
+        "  safe:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: ./.github/actions/setup\n"
+        "      - run: bash scripts/safe.sh\n"
+    )
+    safe_automation = {"scripts/safe.sh": "#!/bin/sh\necho safe\n"}
+    if validate_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("safe referenced automation was rejected")
+
+    external_action_workflow = referenced_workflow.replace(
+        "./.github/actions/setup",
+        "./ci/cross-action",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": external_action_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("local action outside .github/actions was not rejected")
+
+    external_script_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "./ci/arm64.sh",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": external_script_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("repository script outside scanned roots was not rejected")
+
+    benign_automation_edit = {"scripts/safe.sh": "#!/bin/sh\necho still-safe\n"}
+    if compare_pr_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        benign_automation_edit,
+        "self-test automation directory",
+    ):
+        failures.append("benign referenced-script edit was rejected")
+
+    cross_automation = {
+        "scripts/safe.sh": (
+            "#!/bin/sh\ncross build --target aarch64-unknown-linux-gnu\n"
+        )
+    }
+    if not compare_pr_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        cross_automation,
+        "self-test automation directory",
+    ):
+        failures.append("referenced-script Cross invocation was not rejected")
+
+    transitive_workflow = referenced_workflow.replace(
+        "scripts/safe.sh",
+        "scripts/parent.sh",
+    )
+    baseline_transitive = {
+        "scripts/parent.sh": "#!/bin/sh\nbash scripts/child.sh\n",
+        "scripts/child.sh": "#!/bin/sh\necho safe\n",
+    }
+    proposed_transitive = {
+        **baseline_transitive,
+        "scripts/child.sh": (
+            "#!/bin/sh\ncross build --target aarch64-unknown-linux-gnu\n"
+        ),
+    }
+    if not compare_pr_automation_collection(
+        {"ci.yml": transitive_workflow},
+        {"ci.yml": transitive_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        baseline_transitive,
+        proposed_transitive,
+        "self-test automation directory",
+    ):
+        failures.append("transitive referenced-script Cross invocation was not rejected")
+
     ci_publish_contract = PUBLISH_CONTROL_CONTRACTS["CI workflow"]
     publish_workflow = (
         "name: Publish fixture\n"
@@ -2172,10 +2661,39 @@ def load_action_directory(
     return actions, errors
 
 
+def load_automation_directory(
+    path: Path,
+    label: str,
+) -> tuple[dict[str, str], list[str]]:
+    """Load the approved repo-script roots with repository-relative keys."""
+
+    if path.is_symlink() or not path.is_dir():
+        return {}, [f"{label} must be a non-symlink directory"]
+    automation: dict[str, str] = {}
+    errors: list[str] = []
+    for root_name in APPROVED_AUTOMATION_ROOTS:
+        root = path / root_name.rstrip("/")
+        loaded, failures = load_action_directory(root, f"{label}/{root_name}")
+        errors.extend(failures)
+        for name, contents in loaded.items():
+            automation[f"{root_name}{name}"] = contents
+    return automation, errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path("Cross.toml"))
     parser.add_argument("--cargo-config", type=Path, default=Path("Cargo.toml"))
+    parser.add_argument(
+        "--cargo-tool-config",
+        type=Path,
+        default=Path(".cargo/config.toml"),
+    )
+    parser.add_argument(
+        "--cargo-legacy-config",
+        type=Path,
+        default=Path(".cargo/config"),
+    )
     parser.add_argument(
         "--ci-workflow", type=Path, default=Path(".github/workflows/ci.yml")
     )
@@ -2198,10 +2716,13 @@ def main() -> int:
         type=Path,
         default=Path(".github/actions"),
     )
+    parser.add_argument("--automation-dir", type=Path, default=Path("."))
     parser.add_argument("--merge-base-workflows-dir", type=Path)
     parser.add_argument("--proposed-workflows-dir", type=Path)
     parser.add_argument("--merge-base-actions-dir", type=Path)
     parser.add_argument("--proposed-actions-dir", type=Path)
+    parser.add_argument("--merge-base-automation-dir", type=Path)
+    parser.add_argument("--proposed-automation-dir", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -2216,6 +2737,16 @@ def main() -> int:
     failures.extend(cargo_failures)
     if not cargo_failures:
         failures.extend(validate_cargo_configuration(cargo_config))
+
+    cargo_tool_config, cargo_tool_failures = load_toml(args.cargo_tool_config)
+    failures.extend(cargo_tool_failures)
+    if not cargo_tool_failures:
+        failures.extend(validate_cargo_tool_configuration(cargo_tool_config))
+    if args.cargo_legacy_config.exists():
+        failures.append(
+            f"legacy Cargo config {args.cargo_legacy_config} is forbidden; use only "
+            "the allowlisted .cargo/config.toml"
+        )
 
     workflow_inputs = (
         (args.ci_workflow, *WORKFLOW_CONTRACTS[0]),
@@ -2260,6 +2791,25 @@ def main() -> int:
     if not action_directory_failures:
         failures.extend(validate_action_collection(actions, "local-action directory"))
 
+    automation, automation_directory_failures = load_automation_directory(
+        args.automation_dir,
+        "automation directory",
+    )
+    failures.extend(automation_directory_failures)
+    if (
+        not workflow_directory_failures
+        and not action_directory_failures
+        and not automation_directory_failures
+    ):
+        failures.extend(
+            validate_automation_collection(
+                workflows,
+                actions,
+                automation,
+                "automation directory",
+            )
+        )
+
     pr_paths = (
         args.merge_base_ci_workflow,
         args.proposed_ci_workflow,
@@ -2269,12 +2819,15 @@ def main() -> int:
         args.proposed_workflows_dir,
         args.merge_base_actions_dir,
         args.proposed_actions_dir,
+        args.merge_base_automation_dir,
+        args.proposed_automation_dir,
     )
     if any(path is not None for path in pr_paths) and not all(
         path is not None for path in pr_paths
     ):
         failures.append(
-            "all merge-base/proposed workflow arguments must be supplied together"
+            "all merge-base/proposed workflow, action, and automation arguments "
+            "must be supplied together"
         )
     elif all(path is not None for path in pr_paths):
         comparisons = (
@@ -2344,14 +2897,51 @@ def main() -> int:
                 )
             )
 
+        assert args.merge_base_automation_dir is not None
+        assert args.proposed_automation_dir is not None
+        merge_base_automation, merge_base_automation_failures = (
+            load_automation_directory(
+                args.merge_base_automation_dir,
+                "merge-base automation directory",
+            )
+        )
+        proposed_automation, proposed_automation_failures = load_automation_directory(
+            args.proposed_automation_dir,
+            "proposed automation directory",
+        )
+        failures.extend(merge_base_automation_failures)
+        failures.extend(proposed_automation_failures)
+        if not any(
+            (
+                merge_base_directory_failures,
+                proposed_directory_failures,
+                merge_base_action_failures,
+                proposed_action_failures,
+                merge_base_automation_failures,
+                proposed_automation_failures,
+            )
+        ):
+            failures.extend(
+                compare_pr_automation_collection(
+                    merge_base_workflows,
+                    proposed_workflows,
+                    merge_base_actions,
+                    proposed_actions,
+                    merge_base_automation,
+                    proposed_automation,
+                    "automation directory",
+                )
+            )
+
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     if failures:
         return 1
 
     print(
-        "ARM64 Cross 0.2.5 configuration, Cargo metadata, and isolated "
-        "workflow/local-action invocations match the complete trusted policy."
+        "ARM64 Cross 0.2.5/Cargo configuration and isolated workflow, "
+        "local-action, and referenced-script invocations match the complete "
+        "trusted policy."
     )
     return 0
 
