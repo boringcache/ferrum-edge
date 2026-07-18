@@ -2068,7 +2068,10 @@ fn candidate_serverless_composition_uses_pure_capabilities_not_runtime_credentia
     let runtime_error = PluginCache::new(&config)
         .err()
         .expect("runtime construction must still reject malformed credentials");
-    assert!(runtime_error.contains("aws_access_key_id"), "{runtime_error}");
+    assert!(
+        runtime_error.contains("aws_access_key_id"),
+        "{runtime_error}"
+    );
 }
 
 #[test]
@@ -2098,12 +2101,13 @@ fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egr
             ),
         ],
     );
-    let order_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
-        &unsafe_order,
-        None,
-    )
-    .expect_err("pure terminate capability must retain dedup ordering enforcement");
-    assert!(order_error.contains("request_deduplication"), "{order_error}");
+    let order_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&unsafe_order, None)
+            .expect_err("pure terminate capability must retain dedup ordering enforcement");
+    assert!(
+        order_error.contains("request_deduplication"),
+        "{order_error}"
+    );
 
     let unsafe_body = make_config(
         vec![make_proxy("p1", "/api", vec!["function", "transform"])],
@@ -2135,11 +2139,9 @@ fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egr
             ),
         ],
     );
-    let body_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
-        &unsafe_body,
-        None,
-    )
-    .expect_err("pure forward_body capability must retain body-view enforcement");
+    let body_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&unsafe_body, None)
+            .expect_err("pure forward_body capability must retain body-view enforcement");
     assert!(body_error.contains("request-body"), "{body_error}");
 }
 

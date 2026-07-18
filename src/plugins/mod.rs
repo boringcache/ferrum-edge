@@ -1866,12 +1866,8 @@ impl RequestContext {
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
-            ai_response_guard_replay_redactions: self
-                .ai_response_guard_replay_redactions
-                .clone(),
-            ai_tool_governor_replay_redactions: self
-                .ai_tool_governor_replay_redactions
-                .clone(),
+            ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
+            ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),

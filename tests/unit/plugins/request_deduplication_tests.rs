@@ -554,10 +554,15 @@ async fn committed_replay_runs_current_ai_response_redaction() {
         .await;
 
     match finalize_plugin_rejection_for_test(&plugins, &mut replay_ctx, replay).await {
-        PluginResult::RejectBinary { status_code, body, .. } => {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
             assert_eq!(status_code, 200);
             let body = String::from_utf8(body.to_vec()).unwrap();
-            assert!(!body.contains("user@example.com"), "stale PII replayed: {body}");
+            assert!(
+                !body.contains("user@example.com"),
+                "stale PII replayed: {body}"
+            );
             assert!(body.contains("[REDACTED:pii:email]"), "{body}");
         }
         other => panic!("expected redacted finalized replay, got {other:?}"),
@@ -637,10 +642,15 @@ async fn committed_replay_runs_current_tool_argument_redaction() {
         .await;
 
     match finalize_plugin_rejection_for_test(&plugins, &mut replay_ctx, replay).await {
-        PluginResult::RejectBinary { status_code, body, .. } => {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
             assert_eq!(status_code, 200);
             let body = String::from_utf8(body.to_vec()).unwrap();
-            assert!(!body.contains("sk-STALESECRET123"), "stale tool secret replayed: {body}");
+            assert!(
+                !body.contains("sk-STALESECRET123"),
+                "stale tool secret replayed: {body}"
+            );
             assert!(body.contains("[REDACTED_TOOL_ARG:secret]"), "{body}");
         }
         other => panic!("expected governed finalized replay, got {other:?}"),
@@ -655,8 +665,10 @@ async fn committed_replay_fails_closed_when_required_transform_cannot_rewrite() 
         "POST".to_string(),
         "/api".to_string(),
     );
-    let mut first_headers =
-        HashMap::from([("idempotency-key".to_string(), "failed-redaction".to_string())]);
+    let mut first_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "failed-redaction".to_string(),
+    )]);
     assert!(matches!(
         dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
         PluginResult::Continue
@@ -678,15 +690,19 @@ async fn committed_replay_fails_closed_when_required_transform_cannot_rewrite() 
         "POST".to_string(),
         "/api".to_string(),
     );
-    let mut replay_headers =
-        HashMap::from([("idempotency-key".to_string(), "failed-redaction".to_string())]);
+    let mut replay_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "failed-redaction".to_string(),
+    )]);
     let replay = dedup
         .before_proxy(&mut replay_ctx, &mut replay_headers)
         .await;
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(FailingMandatoryReplayTransform)];
 
     match finalize_plugin_rejection_for_test(&plugins, &mut replay_ctx, replay).await {
-        PluginResult::RejectBinary { status_code, body, .. } => {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
             assert_eq!(status_code, 502);
             assert_eq!(&body[..], br#"{"error":"response redaction failed"}"#);
         }
