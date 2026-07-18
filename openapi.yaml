@@ -4993,13 +4993,18 @@ components:
         |----------|---------|-------------|
         | `FERRUM_ADMIN_JWT_SECRET` | *(required)* | Signing key (minimum 32 characters) |
         | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
-        | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds) |
+        | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds); `0` disables the cap |
 
         Tokens must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a
-        string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER`; `exp -
-        iat` must not exceed `FERRUM_ADMIN_JWT_MAX_TTL`; `nbf` and `exp` are
-        validated. Required `role` claim values are `viewer`, `operator`, and
-        `admin`. Tokens without a valid `role` claim are rejected.
+        string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER`; `nbf`
+        and `exp` are validated. `FERRUM_ADMIN_JWT_MAX_TTL` is enforced against
+        verifier time, not just the claims: `exp - iat` must be positive and
+        within the maximum, `iat` must not be later than verifier time plus the
+        accepted clock-skew leeway (60 seconds), and `exp - now` must stay
+        within the maximum plus that leeway — so future-shifted timestamps
+        cannot extend a token's real lifetime. Required `role` claim values are
+        `viewer`, `operator`, and `admin`. Tokens without a valid `role` claim
+        are rejected.
 
     metricsBearerAuth:
       type: http
