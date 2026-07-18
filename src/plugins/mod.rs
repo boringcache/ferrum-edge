@@ -458,10 +458,9 @@ impl BufferedDeadlineResponseHeaderProvenance {
     /// treated as gateway-authored, which is the deliberate trade for not
     /// silently destroying deterministic gateway cookies.
     ///
-    /// Implemented by [`Self::gateway_surplus_value`], which compares per-line
-    /// occurrence counts rather than materializing a consumed-set, so a
-    /// deadline-tracked response with a long hook chain stays allocation-free
-    /// here (cookie-line counts are tiny).
+    /// Implemented by [`Self::gateway_surplus_value`], which partitions by
+    /// per-line occurrence count in a single linear pass (cookie-line counts are
+    /// tiny, and the whole path runs only for a deadline-tracked response).
     ///
     /// Surplus filtering is the APPEND defence, so it is deliberately NOT
     /// consulted for a field a trusted hook authoritatively OWNS. Ownership is
@@ -473,15 +472,14 @@ impl BufferedDeadlineResponseHeaderProvenance {
     fn gateway_set_cookie_value(&self, value: &str) -> Option<String> {
         if self.backend_set_cookie_lines.is_empty() {
             // No backend contributed to this response (a gateway rejection), so
-            // every line is gateway-authored. Skips the per-line recount below.
+            // every line is gateway-authored. Skips the partition below entirely.
             return Some(value.to_string());
         }
-        Self::gateway_surplus_value(value, "\n", |line| {
-            self.backend_set_cookie_lines
-                .iter()
-                .filter(|backend| backend.as_str() == line)
-                .count()
-        })
+        Self::gateway_surplus_value(
+            value,
+            "\n",
+            self.backend_set_cookie_lines.iter().map(String::as_str),
+        )
     }
 
     /// The ordinary-header counterpart of [`Self::gateway_set_cookie_value`]:
@@ -506,45 +504,47 @@ impl BufferedDeadlineResponseHeaderProvenance {
         let Some(backend_value) = self.backend_headers.get(name) else {
             return Some(value.to_string());
         };
-        Self::gateway_surplus_value(value, ",", |element| {
-            backend_value
-                .split(',')
-                .filter(|backend| *backend == element)
-                .count()
-        })
+        Self::gateway_surplus_value(value, ",", backend_value.split(','))
     }
 
     /// Occurrence-surplus partition shared by the `Set-Cookie` (newline-joined
     /// lines) and ordinary list-valued (comma-joined elements) paths.
     ///
     /// An element survives only to the extent the live value carries MORE
-    /// occurrences of it than `backend_occurrences` reports for the backend
-    /// baseline. Returns `None` when nothing gateway-authored remains, so the
-    /// caller drops the field rather than crossing backend data onto the
-    /// deadline response. Implemented by recounting rather than materializing a
-    /// consumed-set, so a long hook chain stays allocation-free here (per-field
-    /// element counts are tiny).
-    fn gateway_surplus_value(
+    /// occurrences of it than the backend baseline supplied. Returns `None` when
+    /// nothing gateway-authored remains, so the caller drops the field rather
+    /// than crossing backend data onto the deadline response.
+    ///
+    /// Runs in a single linear pass over both sides. The backend baseline is
+    /// folded into an occurrence BUDGET keyed by element, and each live element
+    /// either consumes one unit of that budget (a backend-supplied occurrence,
+    /// dropped) or is surplus (gateway-authored, kept). The earlier formulation
+    /// re-split the live value once per element to recount how often the element
+    /// appeared before it, which is O(n^2) in the element count — and the
+    /// element count is backend-controlled, since a backend can return a
+    /// comma-list header with arbitrarily many elements and any gateway append
+    /// to that field then forces the scan. The budget is exactly equivalent:
+    /// consuming one unit per occurrence drops the first `k` copies for a
+    /// baseline count of `k` and keeps the rest, which is what the recount's
+    /// `seen_before >= k` test computed.
+    fn gateway_surplus_value<'a>(
         value: &str,
         separator: &str,
-        backend_occurrences: impl Fn(&str) -> usize,
+        backend_elements: impl Iterator<Item = &'a str>,
     ) -> Option<String> {
-        let gateway_elements = value
-            .split(separator)
-            .enumerate()
-            .filter(|(index, element)| {
-                // Occurrences of this same element earlier in the live value.
-                // Once the backend baseline's count is used up, further copies
-                // are the gateway-authored surplus.
-                let seen_before = value
-                    .split(separator)
-                    .take(*index)
-                    .filter(|earlier| earlier == element)
-                    .count();
-                seen_before >= backend_occurrences(element)
-            })
-            .map(|(_, element)| element)
-            .collect::<Vec<_>>();
+        let mut backend_budget: HashMap<&str, usize> = HashMap::new();
+        for element in backend_elements {
+            *backend_budget.entry(element).or_insert(0) += 1;
+        }
+        let mut gateway_elements = Vec::new();
+        for element in value.split(separator) {
+            match backend_budget.get_mut(element) {
+                // Still covered by the backend baseline: this occurrence came
+                // from the backend and must not cross onto the deadline response.
+                Some(remaining) if *remaining > 0 => *remaining -= 1,
+                _ => gateway_elements.push(element),
+            }
+        }
         (!gateway_elements.is_empty()).then(|| gateway_elements.join(separator))
     }
 
@@ -2430,14 +2430,21 @@ impl RequestContext {
         if self.buffered_deadline_response_header_provenance.is_none() {
             return;
         }
+        // Owned names are BORROWED from the response map and matched
+        // case-insensitively against the canonical (lowercase) snapshot, rather
+        // than being lowercased into fresh `String`s. Most plugins own nothing,
+        // so the common case is an empty collect with no per-name allocation at
+        // all; a declaring plugin allocates one small `Vec<&str>` instead of one
+        // `String` per response header. Same matching helper as
+        // `record_deadline_owned_response_headers`, so the two cannot diverge.
         let plugin_owned_headers = response_headers
             .keys()
             .filter(|name| plugin.owns_deadline_response_header(self, name))
-            .map(|name| name.to_ascii_lowercase())
+            .map(String::as_str)
             .collect::<Vec<_>>();
         if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
             Arc::make_mut(state).record_gateway_mutations(
-                |name| plugin_owned_headers.iter().any(|d| d.as_str() == name),
+                |name| header_name_is_declared(&plugin_owned_headers, name),
                 response_headers,
             );
         }

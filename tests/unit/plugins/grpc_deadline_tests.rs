@@ -1652,7 +1652,8 @@ async fn deadline_replacement_keeps_configured_grpc_web_expose_headers_on_exact_
             ),
         ]);
         assert!(
-            !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+            !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers)
+                .await,
             "grpc_web after_proxy must not reject the response"
         );
 
