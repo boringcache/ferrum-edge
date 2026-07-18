@@ -342,11 +342,9 @@ impl Drop for NamespaceConfigAdmissionGuard {
                 .await
                 {
                     Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            namespace = %namespace,
-                            %error,
-                            "Failed to release namespace config admission lease; expiry will recover it"
+                    Ok(Err(_error)) => {
+                        super::warn_persistence_failure_redacted(
+                            "namespace_admission_lease_release",
                         );
                     }
                     Err(_) => {
@@ -375,11 +373,9 @@ async fn release_namespace_config_admission_claim(
     .await
     {
         Ok(Ok(_)) => {}
-        Ok(Err(error)) => tracing::warn!(
-            %namespace,
-            %error,
-            "Failed to release {context}; expiry will recover it"
-        ),
+        Ok(Err(_error)) => {
+            super::warn_persistence_failure_redacted("namespace_admission_claim_release");
+        }
         Err(_) => tracing::warn!(
             %namespace,
             "Timed out releasing {context}; expiry will recover it"
@@ -533,21 +529,17 @@ pub(crate) async fn lock_namespace_config_admission(
                         );
                         return;
                     }
-                    Err(error) => {
+                    Err(_error) => {
                         if Instant::now() + CONFIG_ADMISSION_LEASE_RETRY_INTERVAL >= valid_until {
                             renew_valid.store(false, Ordering::Release);
                             let _ = lease_state_tx.send(0);
-                            tracing::error!(
-                                namespace = %renew_namespace,
-                                %error,
-                                "Namespace config admission lease expired after renewal failures"
+                            super::error_persistence_failure_redacted(
+                                "namespace_admission_lease_renewal_expired",
                             );
                             return;
                         }
-                        tracing::debug!(
-                            namespace = %renew_namespace,
-                            %error,
-                            "Namespace config admission lease renewal failed; retrying before expiry"
+                        super::debug_persistence_failure_redacted(
+                            "namespace_admission_lease_renewal_retry",
                         );
                         tokio::select! {
                             changed = stop_rx.changed() => {
@@ -776,7 +768,7 @@ async fn persist_create_to_settlement<R: AdminResource>(
         .await
     {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
             Ok(()) => {
                 let lost_generation = guard
                     .as_ref()
@@ -799,11 +791,11 @@ async fn persist_create_to_settlement<R: AdminResource>(
                 {
                     Ok(true) => Ok(()),
                     Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                        "namespace config admission was lost during create; the late write was compensated: {error}"
+                        "namespace config admission was lost during create; the late write was compensated"
                     ))),
-                    Err(recovery_error) => {
+                    Err(_recovery_error) => {
                         Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                            "namespace config admission was lost during create and recovery failed: {recovery_error}; original error: {error}"
+                            "namespace config admission was lost during create and recovery failed"
                         )))
                     }
                 }
@@ -846,7 +838,7 @@ async fn persist_update_to_settlement<R: AdminResource>(
         .await
     {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
             Ok(false) => Ok(false),
             Ok(true) => {
                 let lost_generation = guard
@@ -870,11 +862,11 @@ async fn persist_update_to_settlement<R: AdminResource>(
                 {
                     Ok(true) => Ok(true),
                     Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                        "namespace config admission was lost during update; the late write was compensated: {error}"
+                        "namespace config admission was lost during update; the late write was compensated"
                     ))),
-                    Err(recovery_error) => {
+                    Err(_recovery_error) => {
                         Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                            "namespace config admission was lost during update and recovery failed: {recovery_error}; original error: {error}"
+                            "namespace config admission was lost during update and recovery failed"
                         )))
                     }
                 }
@@ -919,7 +911,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
     .await
     {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
             Ok(false) => Ok(false),
             Ok(true) => {
                 let lost_generation = guard
@@ -948,11 +940,11 @@ async fn persist_delete_to_settlement<R: AdminResource>(
                 {
                     Ok(true) => Ok(true),
                     Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                        "namespace config admission was lost during delete; the late write was compensated: {error}"
+                        "namespace config admission was lost during delete; the late write was compensated"
                     ))),
-                    Err(recovery_error) => {
+                    Err(_recovery_error) => {
                         Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                            "namespace config admission was lost during delete and recovery failed: {recovery_error}; original error: {error}"
+                            "namespace config admission was lost during delete and recovery failed"
                         )))
                     }
                 }
@@ -986,15 +978,10 @@ async fn finish_write_success<R: AdminResource>(
     existing: Option<&R>,
     action: WriteAction<'_>,
 ) {
-    if let Err(error) =
+    if let Err(_error) =
         R::after_write(db.as_ref(), state, namespace, resource, existing, action).await
     {
-        tracing::warn!(
-            "Post-write hook failed for {} '{}': {}",
-            R::RESOURCE_NAME,
-            resource.id(),
-            error
-        );
+        super::warn_persistence_failure_redacted("admin_resource_post_write_hook");
     }
 
     let (audit_action, diff) = match action {
@@ -1721,8 +1708,8 @@ pub(crate) trait AdminResource:
         // raceable, so the DB constraint is the authoritative backstop (e.g.
         // reusing a proxy/upstream id that exists in another namespace, or a
         // concurrent create winning the race after the precheck passed).
-        // Surface the constraint message (it names the conflicting key);
-        // everything else stays a redacted 500.
+        // Preserve the 409 disposition without surfacing driver-owned
+        // constraint, key, schema, or duplicate-value text.
         if let Some(conflict) = mtls_dns_identity_conflict(error) {
             // Typed conflicts are classified anywhere in the chain, so render
             // the conflict itself: `error.to_string()` is the chain's outermost
@@ -1733,9 +1720,11 @@ pub(crate) trait AdminResource:
                 &json!({ "error": conflict.to_string() }),
             );
         }
-        let message = error.to_string();
-        if super::is_unique_constraint_violation(&message) {
-            super::json_response(StatusCode::CONFLICT, &json!({ "error": message }))
+        if super::chain_has_unique_constraint_violation(error) {
+            super::json_response(
+                StatusCode::CONFLICT,
+                &json!({ "error": super::RESOURCE_IDENTITY_CONFLICT_MESSAGE }),
+            )
         } else {
             super::json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1892,11 +1881,7 @@ pub(crate) async fn handle_list<R: AdminResource>(
                 if !R::allow_cached_read_fallback(&error) {
                     return Ok(R::map_precheck_db_error(&error));
                 }
-                tracing::warn!(
-                    "Database unavailable for list {}, falling back to cached config: {}",
-                    R::RESOURCE_NAME,
-                    error
-                );
+                super::warn_persistence_failure_redacted("admin_resource_list_cached_fallback");
             }
         }
     }
@@ -1943,11 +1928,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
                 if !R::allow_cached_read_fallback(&error) {
                     return Ok(R::map_precheck_db_error(&error));
                 }
-                tracing::warn!(
-                    "Database unavailable for get {}, falling back to cached config: {}",
-                    R::RESOURCE_NAME,
-                    error
-                );
+                super::warn_persistence_failure_redacted("admin_resource_get_cached_fallback");
             }
         }
     }
@@ -2171,8 +2152,7 @@ pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
         "Consumer identity or credential conflicts with another Consumer in the namespace"
             .to_string()
     } else {
-        super::warn_persistence_failure_redacted("consumer_persist", error);
-        "Database unavailable — operation failed".to_string()
+        super::redacted_persistence_error_message("consumer_persist", error).to_string()
     }
 }
 
@@ -3080,13 +3060,21 @@ impl AdminResource for Upstream {
         if is_mtls_dns_admission_unavailable(error) {
             return super::mtls_dns_admission_unavailable_response();
         }
-        let error_text = error.to_string();
-        if error_text.contains("referenced by one or more proxies")
-            || error_text.contains("referenced by mesh_route_dispatch plugin_config")
-        {
+        let error_chain_contains = |needle| {
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains(needle))
+        };
+        if error_chain_contains("referenced by one or more proxies") {
             return super::json_response(
                 StatusCode::CONFLICT,
-                &json!({"error": format!("{}", error)}),
+                &json!({"error": "Upstream is referenced by one or more proxies and cannot be deleted"}),
+            );
+        }
+        if error_chain_contains("referenced by mesh_route_dispatch plugin_config") {
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"}),
             );
         }
         super::json_response(
@@ -4205,8 +4193,7 @@ impl AdminResource for Proxy {
         if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
             return Self::map_after_validate_errors(conflict.errors());
         }
-        let message = error.to_string();
-        if message.contains(PROXY_ROUTE_CONFLICT_ERROR) {
+        if super::chain_has_proxy_route_conflict(error) {
             return super::json_response(
                 StatusCode::CONFLICT,
                 &json!({"error": PROXY_ROUTE_CONFLICT_ERROR}),
@@ -4220,8 +4207,11 @@ impl AdminResource for Proxy {
                 &json!({ "error": conflict.to_string() }),
             );
         }
-        if super::is_unique_constraint_violation(&message) {
-            return super::json_response(StatusCode::CONFLICT, &json!({ "error": message }));
+        if super::chain_has_unique_constraint_violation(error) {
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({ "error": super::RESOURCE_IDENTITY_CONFLICT_MESSAGE }),
+            );
         }
 
         super::json_response(

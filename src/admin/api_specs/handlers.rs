@@ -95,10 +95,12 @@ enum ApiSpecLateWriteRecovery {
 
 fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
     if is_mtls_dns_admission_unavailable(&e) {
-        return ApiSpecError::AdmissionUnavailable(e.to_string());
+        return ApiSpecError::AdmissionUnavailable(
+            "namespace config admission unavailable".to_string(),
+        );
     }
     if is_mtls_dns_identity_conflict(&e) {
-        return ApiSpecError::Conflict(e.to_string());
+        return ApiSpecError::Conflict("mTLS DNS identity conflict".to_string());
     }
     if let Some(conflict) = tcp_connection_throttle_attachment_conflict(&e) {
         return ApiSpecError::PluginComposition(conflict.errors().to_vec());
@@ -111,8 +113,13 @@ fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
         return ApiSpecError::NotFound;
     }
 
-    let msg = e.to_string();
-    classify_db_error_str(&msg)
+    for cause in e.chain() {
+        let classified = classify_db_error_str(&cause.to_string());
+        if !matches!(classified, ApiSpecError::Internal(_)) {
+            return classified;
+        }
+    }
+    ApiSpecError::Internal("database operation failed".to_string())
 }
 
 fn classify_db_error_str(msg: &str) -> ApiSpecError {
@@ -122,18 +129,18 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
         || lower.contains("duplicate key")
         || lower.contains("duplicate entry")
     {
-        ApiSpecError::Conflict(msg.to_string())
+        ApiSpecError::Conflict("resource conflict".to_string())
     } else if msg.contains("MongoDB document limit") {
         ApiSpecError::MongoDocTooLarge
     } else if lower.contains("foreign key constraint")
         || lower.contains("foreign key")
         || lower.contains("references a")
     {
-        ApiSpecError::Unprocessable(msg.to_string())
+        ApiSpecError::Unprocessable("referential integrity violation".to_string())
     } else if is_row_missing_error_message(&lower) {
         ApiSpecError::NotFound
     } else {
-        ApiSpecError::Internal(msg.to_string())
+        ApiSpecError::Internal("database operation failed".to_string())
     }
 }
 
@@ -168,10 +175,9 @@ where
         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(result)) => {
             result.map_err(classify_db_error)
         }
-        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
-            tracing::warn!(
-                %error,
-                "API-spec persistence completed after namespace config admission was lost"
+        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => {
+            crate::admin::warn_persistence_failure_redacted(
+                "api_spec_namespace_admission_lost",
             );
             match result {
                 Ok(result) => {
@@ -181,18 +187,21 @@ where
                         db, namespace,
                     )
                     .await
-                    .map_err(|recovery_error| {
-                        tracing::error!(
-                            %recovery_error,
-                            "Failed to reacquire API-spec namespace admission after a late write"
+                    .map_err(|_recovery_error| {
+                        crate::admin::error_persistence_failure_redacted(
+                            "api_spec_namespace_admission_reacquire_after_late_write",
                         );
-                        ApiSpecError::AdmissionUnavailable(recovery_error.to_string())
+                        ApiSpecError::AdmissionUnavailable(
+                            "namespace config admission unavailable".to_string(),
+                        )
                     })?;
                     if recovery_guard.immediately_succeeds_generation(lost_generation) {
                         return Ok(result);
                     }
                     if !compensate_after_intervening_write {
-                        return Err(ApiSpecError::AdmissionUnavailable(error.to_string()));
+                        return Err(ApiSpecError::AdmissionUnavailable(
+                            "namespace config admission unavailable".to_string(),
+                        ));
                     }
                     match recovery_guard
                         .run_to_completion_while_held(compensation)
@@ -206,38 +215,37 @@ where
                         ))) => {}
                         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
                             result: Ok(_),
-                            error: recovery_error,
+                            error: _,
                         }) => {
-                            tracing::error!(
-                                %recovery_error,
-                                "API-spec late-write compensation lost namespace admission"
+                            crate::admin::error_persistence_failure_redacted(
+                                "api_spec_late_write_compensation_admission_lost",
                             );
                         }
-                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Err(
-                            recovery_error,
-                        )))
+                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Err(_)))
                         | Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
-                            result: Err(recovery_error),
+                            result: Err(_),
                             ..
                         })
-                        | Err(recovery_error) => {
-                            tracing::error!(
-                                %recovery_error,
-                                "API-spec late-write compensation failed"
+                        | Err(_) => {
+                            crate::admin::error_persistence_failure_redacted(
+                                "api_spec_late_write_compensation",
                             );
                         }
                     }
-                    Err(ApiSpecError::AdmissionUnavailable(error.to_string()))
+                    Err(ApiSpecError::AdmissionUnavailable(
+                        "namespace config admission unavailable".to_string(),
+                    ))
                 }
                 Err(error) => Err(classify_db_error(error)),
             }
         }
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "API-spec persistence could not start with namespace config admission held"
+        Err(_error) => {
+            crate::admin::warn_persistence_failure_redacted(
+                "api_spec_namespace_admission_before_persist",
             );
-            Err(ApiSpecError::AdmissionUnavailable(error.to_string()))
+            Err(ApiSpecError::AdmissionUnavailable(
+                "namespace config admission unavailable".to_string(),
+            ))
         }
     }
 }
@@ -564,8 +572,8 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::NOT_FOUND,
             &json!({"error": "API spec not found"}),
         ),
-        ApiSpecError::Conflict(detail) => {
-            tracing::warn!("api-spec conflict (raw DB error): {}", detail);
+        ApiSpecError::Conflict(_detail) => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_conflict");
             json_resp(
                 StatusCode::CONFLICT,
                 &json!({
@@ -577,8 +585,8 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::PAYLOAD_TOO_LARGE,
             &json!({"error": "Spec document exceeds MongoDB document size limit"}),
         ),
-        ApiSpecError::Unprocessable(detail) => {
-            tracing::warn!("api-spec unprocessable (raw DB error): {}", detail);
+        ApiSpecError::Unprocessable(_detail) => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_unprocessable");
             json_resp(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &json!({
@@ -600,15 +608,12 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "No database configured"}),
         ),
-        ApiSpecError::AdmissionUnavailable(detail) => {
-            tracing::warn!(
-                "api-spec namespace admission temporarily unavailable: {}",
-                detail
-            );
+        ApiSpecError::AdmissionUnavailable(_detail) => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_admission_unavailable");
             crate::admin::mtls_dns_admission_unavailable_response()
         }
-        ApiSpecError::Internal(msg) => {
-            tracing::error!("api-specs internal error: {}", msg);
+        ApiSpecError::Internal(_msg) => {
+            crate::admin::error_persistence_failure_redacted("api_spec_internal");
             json_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": "Internal server error"}),
@@ -2828,10 +2833,12 @@ pub async fn handle_post_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+            Err(_error) => {
+                crate::admin::warn_persistence_failure_redacted(
+                    "api_spec_namespace_admission_acquire",
+                );
                 return Ok(error_response(ApiSpecError::AdmissionUnavailable(
-                    error.to_string(),
+                    "namespace config admission unavailable".to_string(),
                 )));
             }
         };
@@ -2990,10 +2997,12 @@ pub async fn handle_put_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+            Err(_error) => {
+                crate::admin::warn_persistence_failure_redacted(
+                    "api_spec_namespace_admission_acquire",
+                );
                 return Ok(error_response(ApiSpecError::AdmissionUnavailable(
-                    error.to_string(),
+                    "namespace config admission unavailable".to_string(),
                 )));
             }
         };
@@ -3336,10 +3345,12 @@ pub async fn handle_delete_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+            Err(_error) => {
+                crate::admin::warn_persistence_failure_redacted(
+                    "api_spec_namespace_admission_acquire",
+                );
                 return Ok(error_response(ApiSpecError::AdmissionUnavailable(
-                    error.to_string(),
+                    "namespace config admission unavailable".to_string(),
                 )));
             }
         };

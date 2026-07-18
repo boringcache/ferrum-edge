@@ -1169,6 +1169,67 @@ pub mod _test_support {
         crate::admin::crud::consumer_persist_error_response(&error)
     }
 
+    pub fn admin_consumer_persistence_response_for_test(
+        raw_backend_detail: &str,
+    ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+        let error = anyhow::anyhow!(raw_backend_detail.to_string());
+        crate::admin::crud::consumer_persist_error_response(&error)
+    }
+
+    pub fn admin_batch_persistence_message_for_test(raw_backend_detail: &str) -> String {
+        let error = anyhow::anyhow!(raw_backend_detail.to_string());
+        crate::admin::payload_persist_error_message(&error)
+    }
+
+    pub fn admin_recovery_persistence_message_for_test(raw_backend_detail: &str) -> String {
+        let error = anyhow::anyhow!(raw_backend_detail.to_string());
+        crate::admin::redacted_recovery_error_message(
+            "external_recovery_regression",
+            "failed to clear existing config",
+            &error,
+        )
+    }
+
+    pub fn admin_database_error_body_for_test(raw_backend_detail: &str) -> serde_json::Value {
+        crate::admin::db_error_response(&raw_backend_detail)
+    }
+
+    pub fn admin_wrapped_mtls_conflict_message_for_test(raw_backend_detail: &str) -> String {
+        let conflict = crate::config::db_backend::MtlsDnsIdentityConflict::new(vec![
+            "consumers edge-a and edge-b share mTLS DNS identity svc.internal".to_string(),
+        ]);
+        let error = anyhow::Error::new(conflict).context(raw_backend_detail.to_string());
+        crate::admin::payload_persist_error_message(&error)
+    }
+
+    pub fn admin_wrapped_mtls_conflict_response_for_test(
+        raw_backend_detail: &str,
+    ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+        let conflict = crate::config::db_backend::MtlsDnsIdentityConflict::new(vec![
+            "consumers edge-a and edge-b share mTLS DNS identity svc.internal".to_string(),
+        ]);
+        let error = anyhow::Error::new(conflict).context(raw_backend_detail.to_string());
+        crate::admin::crud::consumer_persist_error_response(&error)
+    }
+
+    pub fn admin_throttle_conflict_message_for_test(raw_backend_detail: &str) -> String {
+        let conflict =
+            crate::config::db_backend::TcpConnectionThrottleAttachmentConflict::new(vec![
+                "PluginConfig 'throttle-a' cannot attach to UDP proxy 'edge-a'".to_string(),
+            ]);
+        let error = anyhow::Error::new(conflict).context(raw_backend_detail.to_string());
+        crate::admin::payload_persist_error_message(&error)
+    }
+
+    pub fn admin_proxy_route_conflict_message_for_test(raw_backend_detail: &str) -> String {
+        let error = anyhow::anyhow!(
+            "{}: {}",
+            crate::config::db_backend::PROXY_ROUTE_CONFLICT_ERROR,
+            raw_backend_detail
+        );
+        crate::admin::payload_persist_error_message(&error)
+    }
+
     pub fn mysql_mtls_dns_admission_lock_insert_sql() -> &'static str {
         crate::config::db_loader::MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL
     }
