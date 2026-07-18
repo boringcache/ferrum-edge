@@ -294,15 +294,16 @@ LOCAL_COMMAND_REFERENCE = re.compile(
     + r"?"
     r"(?:(?:bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|pypy[0-9]*|ruby|node|"
     r"perl|php|Rscript|deno|bun|pwsh|powershell|busybox\s+sh|awk\s+-f)"
-    r"(?:\s+--?[^\s]+)*\s*(?:[0-9]+)?<(?![<&])\s*"
+    r"(?:\s+--?[^\s]+)*\s*(?:[0-9]+)?(?<!<)<(?![<&])\s*"
     r"(?P<redirected>(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|"
     r"\{[A-Za-z_][A-Za-z0-9_]*\})/)?"
     r"(?:'[A-Za-z0-9._+@~ /-]+'|\"[A-Za-z0-9._+@~ /-]+\"|"
     r"[A-Za-z0-9._+@~-]+(?:/[A-Za-z0-9._+@~-]+)+|"
     r"[A-Za-z0-9._+@~-]+\.(?:sh|bash|py|rb|pl|awk|php|R|js|mjs|cjs|ts|ps1)))|"
-    r"(?:bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|pypy[0-9]*|ruby|node|"
-    r"perl|php|Rscript|deno|bun|pwsh|powershell|busybox\s+sh|awk\s+-f|source|\.)"
-    r"(?:\s+--?[^\s]+)*\s+"
+    r"(?P<interpreter>bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|pypy[0-9]*|"
+    r"ruby|node|perl|php|Rscript|deno|bun|pwsh|powershell|busybox\s+sh|"
+    r"awk\s+-f|source|\.)"
+    r"(?P<interpreter_options>(?:\s+--?[^\s]+)*)\s+"
     r"(?P<interpreted>(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|"
     r"\{[A-Za-z_][A-Za-z0-9_]*\})/)?"
     r"(?:'[A-Za-z0-9._+@~ /-]+'|\"[A-Za-z0-9._+@~ /-]+\"|"
@@ -3378,6 +3379,50 @@ def runtime_program_cross_surface(
     return sensitive, errors
 
 
+def literal_nested_shell_programs(value: str) -> tuple[str, ...]:
+    """Return literal programs passed to sh-family `-c` command modes."""
+
+    tokens = shell_tokens(value)
+    if tokens is None:
+        return ()
+    statements: list[tuple[str, ...]] = []
+    current: list[str] = []
+    depth = 0
+    for token in tokens:
+        if token == "(":
+            depth += 1
+        elif token == ")" and depth:
+            depth -= 1
+        if token in {";", ";;", "&&", "||", "&"} and depth == 0:
+            if current:
+                statements.append(tuple(current))
+            current = []
+        else:
+            current.append(token)
+    if current:
+        statements.append(tuple(current))
+
+    programs: list[str] = []
+    for statement in statements:
+        for segment in split_shell_pipeline(statement):
+            index, executes = executable_index(segment)
+            if not executes or index >= len(segment):
+                continue
+            if tool_name(segment[index]) not in {
+                "ash",
+                "bash",
+                "dash",
+                "ksh",
+                "sh",
+                "zsh",
+            }:
+                continue
+            program, opaque, _ = shell_invocation_mode(segment, index)
+            if program is not None and not opaque and not dynamic_shell_word(program):
+                programs.append(program)
+    return tuple(programs)
+
+
 def action_file_runtime_surface(
     name: str,
     contents: str,
@@ -3541,15 +3586,24 @@ def local_automation_references(
             shell_lines, shell_failures = shell_command_lines(program, source)
             errors.extend(shell_failures)
             command_lines.extend(shell_lines)
+            pending_programs.extend(
+                ("shell", nested_program)
+                for shell_line in shell_lines
+                for nested_program in literal_nested_shell_programs(shell_line)
+            )
             heredoc_programs, heredoc_failures = executable_heredocs(program, source)
             errors.extend(heredoc_failures)
             pending_programs.extend(heredoc_programs)
 
         working_directory: str | None = ""
-        control_depth = 0
+        control_stack: list[str | None] = []
         for line_number, line in enumerate(command_lines, start=1):
             normalized_line = repository_command_line(line)
             directory_matches = list(CD_COMMAND.finditer(normalized_line))
+            opened_controls = len(
+                re.findall(r"\b(?:if|while|until|for|case)\b", normalized_line)
+            )
+            control_stack.extend([working_directory] * opened_controls)
 
             def directory_after(
                 initial: str | None,
@@ -3564,8 +3618,7 @@ def local_automation_references(
                     before_cd = matched[:path_offset].rsplit("cd", maxsplit=1)[0]
                     after_path = normalized_line[directory_match.end("path") :]
                     conditional = bool(
-                        control_depth
-                        or re.search(
+                        re.search(
                             r"(?:&&|\|\||\||\b(?:if|elif|while|until|for|case|"
                             r"then|do|else)\b)",
                             before_cd,
@@ -3590,6 +3643,14 @@ def local_automation_references(
                 )
 
             for match in LOCAL_COMMAND_REFERENCE.finditer(normalized_line):
+                inline_options = match.group("interpreter_options") or ""
+                if match.group("interpreted") and re.search(
+                    r"(?:^|\s)--?(?:c|lc|ec|e|[cC]ommand|[eE]val)(?:\s|$)",
+                    inline_options,
+                ):
+                    # The following word is inline source code, not a repository
+                    # path. Nested literal shell programs are queued separately.
+                    continue
                 raw_command_path = (
                     match.group("redirected")
                     or match.group("interpreted")
@@ -3733,13 +3794,20 @@ def local_automation_references(
                 )
                 dispatcher_groups.add("|".join(candidates))
             working_directory = directory_after(working_directory, directory_matches)
-            opened_controls = len(
-                re.findall(r"\b(?:if|while|until|for|case)\b", normalized_line)
-            )
+            if re.search(r"\b(?:else|elif)\b", normalized_line) and control_stack:
+                branch_start = control_stack[-1]
+                if working_directory != branch_start:
+                    working_directory = None
             closed_controls = len(
                 re.findall(r"\b(?:fi|done|esac)\b", normalized_line)
             )
-            control_depth = max(0, control_depth + opened_controls - closed_controls)
+            for _ in range(min(closed_controls, len(control_stack))):
+                branch_start = control_stack.pop()
+                working_directory = (
+                    branch_start
+                    if working_directory == branch_start
+                    else None
+                )
     return references, dispatcher_groups, errors
 
 
@@ -4994,6 +5062,7 @@ pre_build = []
         "Deno": "deno ci/unsafe.ts",
         "Bun": "bun ci/unsafe.ts",
         "BusyBox shell": "busybox sh ci/unsafe.sh",
+        "nested shell interpreter": "sh -c 'dash ci/unsafe.sh'",
     }
     for interpreter_label, command in interpreter_references.items():
         interpreter_workflow = referenced_workflow.replace(
@@ -5066,6 +5135,22 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("conditional working-directory state was not rejected")
+
+    loop_local_cd_workflow = referenced_workflow.replace(
+        "run: bash scripts/safe.sh",
+        "run: |\n"
+        "          for item in one; do\n"
+        "            cd scripts\n"
+        "            bash safe.sh\n"
+        "          done",
+    )
+    if validate_automation_collection(
+        {"ci.yml": loop_local_cd_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("known in-loop working-directory state was rejected")
 
     quoted_heredoc_prose = referenced_workflow.replace(
         "run: bash scripts/safe.sh",
