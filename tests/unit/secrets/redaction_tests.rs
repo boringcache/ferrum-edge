@@ -303,7 +303,8 @@ fn through_sink(write: impl FnOnce(&NonBlockingSink)) -> String {
 
 fn emit(sink: &NonBlockingSink, value: &serde_json::Value) {
     assert_eq!(
-        sink.try_write_json(value).expect("fixture record serializes"),
+        sink.try_write_json(value)
+            .expect("fixture record serializes"),
         EnqueueResult::Queued,
         "the fixture record must be accepted, not dropped"
     );

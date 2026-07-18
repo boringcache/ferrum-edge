@@ -219,17 +219,15 @@ pub(crate) fn redact_log_record(record: &mut Vec<u8>) {
         // shown to be free of a resolved value. Unreachable for the three
         // producers above; withhold rather than guess.
         Err(_) => Some(withheld_record(trailing_newline)),
-        Ok(text) if plan.contains_candidate(text) => {
-            Some(match plan.redact_json_record(text) {
-                Some(mut redacted) => {
-                    if trailing_newline {
-                        redacted.push('\n');
-                    }
-                    redacted.into_bytes()
+        Ok(text) if plan.contains_candidate(text) => Some(match plan.redact_json_record(text) {
+            Some(mut redacted) => {
+                if trailing_newline {
+                    redacted.push('\n');
                 }
-                None => withheld_record(trailing_newline),
-            })
-        }
+                redacted.into_bytes()
+            }
+            None => withheld_record(trailing_newline),
+        }),
         // Nothing to redact: leave the record's bytes exactly as serialized.
         Ok(_) => None,
     };
