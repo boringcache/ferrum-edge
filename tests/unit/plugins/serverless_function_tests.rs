@@ -2355,6 +2355,92 @@ async fn test_encoded_or_unavailable_body_fails_before_external_egress() {
 }
 
 #[tokio::test]
+async fn test_original_content_encoding_marker_fails_before_external_egress() {
+    // Mirror of `ORIGIN_ENCODED_REQUEST_METADATA_KEY` (pub(crate) in proxy). A
+    // header-only request_transformer that removed/renamed Content-Encoding
+    // before this plugin leaves the transformed header map identity-clean, but
+    // the init-time marker preserves the original non-identity coding.
+    const ORIGIN_ENCODED_REQUEST_METADATA_KEY: &str = "ferrum:origin_encoded_request";
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_body": true,
+            "on_error": "continue"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.request_body_bytes = Some(Bytes::from_static(b"opaque-compressed"));
+    // The live header map carries NO content-encoding (a transformer stripped
+    // it), yet the original request declared one — captured in the marker.
+    ctx.metadata.insert(
+        ORIGIN_ENCODED_REQUEST_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::Reject { body, .. } => {
+            assert!(body.contains("encoded_request_body_unsupported"));
+        }
+        other => panic!("stripped-but-original encoding must fail closed, got {other:?}"),
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_query_transform_marker_fails_before_external_egress() {
+    // Mirror of `QUERY_PARAMS_TRANSFORMED_METADATA_KEY` (pub(crate) in proxy).
+    const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_query_params": true,
+            "on_error": "continue"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    // A raw query that is otherwise perfectly valid for forwarding — the reject
+    // is driven solely by the request_transformer query-transform marker.
+    ctx.set_raw_query_string("page=1&sort=asc".to_string());
+    ctx.metadata.insert(
+        QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::Reject { body, .. } => {
+            assert!(body.contains("query_params_transformed"));
+        }
+        other => panic!("transformed-query composition must fail closed, got {other:?}"),
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_ambiguous_query_fails_before_external_egress() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};

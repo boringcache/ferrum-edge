@@ -946,6 +946,196 @@ async fn terminal_serverless_encoded_body_releases_dedup_owner() {
 }
 
 #[tokio::test]
+async fn terminal_serverless_origin_encoded_marker_releases_dedup_owner() {
+    // A header-only request_transformer that stripped Content-Encoding leaves
+    // the live header map identity-clean, but the init-time marker preserves the
+    // original non-identity coding, so the serverless egress still fails closed —
+    // and because nothing external ran, the dedup in-flight lock is released.
+    const ORIGIN_ENCODED_REQUEST_METADATA_KEY: &str = "ferrum:origin_encoded_request";
+
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://function.example/invoke",
+            "mode": "terminate",
+            "forward_body": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.request_body_bytes = Some(Bytes::from_static(b"opaque-compressed"));
+    ctx.metadata.insert(
+        ORIGIN_ENCODED_REQUEST_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    // No content-encoding on the live map — the transformer removed it.
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "stripped".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("stripped-but-original encoding must reject, got {other:?}"),
+        };
+    assert!(body.contains("encoded_request_body_unsupported"));
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    retry_ctx.request_body_bytes = Some(Bytes::from_static(b"opaque-compressed"));
+    let mut retry_headers =
+        HashMap::from([("idempotency-key".to_string(), "stripped".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn terminal_serverless_query_transform_releases_dedup_owner() {
+    // A request_transformer query rule recorded a decoded-query transform that
+    // the raw-query payload cannot faithfully honor. The serverless egress fails
+    // closed before any external call, so the dedup in-flight lock is released.
+    const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
+
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://function.example/invoke",
+            "mode": "terminate",
+            "forward_query_params": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    // Raw query is otherwise valid; the transform marker alone drives the reject.
+    ctx.set_raw_query_string("page=1&sort=asc".to_string());
+    ctx.metadata.insert(
+        QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "transformed".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("transformed-query composition must reject, got {other:?}"),
+        };
+    assert!(body.contains("query_params_transformed"));
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    retry_ctx.set_raw_query_string("page=1&sort=asc".to_string());
+    retry_ctx.metadata.insert(
+        QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let mut retry_headers =
+        HashMap::from([("idempotency-key".to_string(), "transformed".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn terminal_serverless_pre_wire_invocation_failure_releases_dedup_owner() {
+    // A proven pre-wire transport failure (connection refused: nothing reached
+    // the function) must release the dedup in-flight lock rather than retain the
+    // anticipatory side-effect marker, so an identical retry is not blocked/
+    // replayed until inflight_ttl for an operation that never ran.
+    let closed_addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    // Listener dropped above — the port is now refused.
+
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("http://{closed_addr}/invoke"),
+            "mode": "terminate",
+            "timeout_ms": 2000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "pre-wire".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("pre-wire failure must reject, got {other:?}"),
+        };
+    assert!(body.contains("invocation_failed"));
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers =
+        HashMap::from([("idempotency-key".to_string(), "pre-wire".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};

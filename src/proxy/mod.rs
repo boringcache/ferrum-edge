@@ -303,6 +303,34 @@ pub(crate) const LATER_STRONG_ETAG_RESPONSE_METADATA_KEY: &str =
 /// or renames `Cache-Control` before compression's own `before_proxy` hook.
 pub(crate) const NO_TRANSFORM_REQUEST_METADATA_KEY: &str = "ferrum:no_transform_request";
 
+/// Marker recorded in `ctx.metadata` when the ORIGINAL client request declared a
+/// non-identity `Content-Encoding`, captured before any `before_proxy` hook can
+/// mutate request headers. `serverless_function` reads this so a header-only
+/// `request_transformer` (priority 3000) that removes or renames
+/// `Content-Encoding` before the serverless egress (priority 3025) cannot smuggle
+/// the original compressed body past the fail-closed encoded-body boundary — the
+/// buffered `ctx.request_body_bytes` are the original client bytes, so their
+/// content coding is described by the original request headers, not the
+/// transformed map the plugin receives.
+pub(crate) const ORIGIN_ENCODED_REQUEST_METADATA_KEY: &str = "ferrum:origin_encoded_request";
+
+/// Marker recorded in `ctx.metadata` when a `request_transformer` query rule
+/// actually mutated `ctx.query_params` (add/remove/update/rename). Query
+/// transformations operate on the decoded parameter map, which cannot be
+/// reconciled with `serverless_function`'s raw-query payload without losing the
+/// raw plus/duplicate/decode/auth-strip invariants the raw path exists to
+/// preserve, so the serverless egress fails closed on the composition rather than
+/// emitting a payload that silently ignores the operator's query transform.
+pub(crate) const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
+
+/// True when a `Content-Encoding` field-line declares a coding other than
+/// `identity`. Whitespace-only and empty values are treated as encoded
+/// (fail-closed): a present-but-empty encoding is malformed and cannot be proven
+/// to describe identity-coded bytes.
+pub(crate) fn content_encoding_declares_non_identity(value: &str) -> bool {
+    !value.trim().eq_ignore_ascii_case("identity")
+}
+
 pub(crate) fn stamp_original_request_metadata(ctx: &mut RequestContext) {
     let raw_has_no_transform = ctx
         .raw_header_values("cache-control")
@@ -310,6 +338,26 @@ pub(crate) fn stamp_original_request_metadata(ctx: &mut RequestContext) {
     if raw_has_no_transform || headers_have_cache_control_directive(&ctx.headers, "no-transform") {
         ctx.metadata.insert(
             NO_TRANSFORM_REQUEST_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+
+    // Capture the original non-identity content coding before any before_proxy
+    // header transform can drop it. Check raw field-lines first (the pristine
+    // wire header, available here because `set_raw_headers` runs immediately
+    // before this) and fall back to the materialized map for paths that already
+    // consumed the raw headers.
+    let raw_declares_encoding = ctx
+        .raw_header_values("content-encoding")
+        .any(content_encoding_declares_non_identity);
+    let materialized_declares_encoding = ctx
+        .headers
+        .get("content-encoding")
+        .map(String::as_str)
+        .is_some_and(content_encoding_declares_non_identity);
+    if raw_declares_encoding || materialized_declares_encoding {
+        ctx.metadata.insert(
+            ORIGIN_ENCODED_REQUEST_METADATA_KEY.to_string(),
             "true".to_string(),
         );
     }

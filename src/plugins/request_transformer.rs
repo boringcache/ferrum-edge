@@ -432,31 +432,48 @@ impl Plugin for RequestTransformer {
                 }
             }
         }
+        let mut query_mutated = false;
         for rule in &self.query_rules {
             match rule.operation {
                 QueryOp::Add => {
                     if let Some(ref val) = rule.value {
+                        let before = ctx.query_params.len();
                         ctx.query_params
                             .entry(rule.key.clone())
                             .or_insert_with(|| val.clone());
+                        query_mutated |= ctx.query_params.len() != before;
                     }
                 }
                 QueryOp::Update => {
                     if let Some(ref val) = rule.value {
                         ctx.query_params.insert(rule.key.clone(), val.clone());
+                        query_mutated = true;
                     }
                 }
                 QueryOp::Remove => {
-                    ctx.query_params.remove(&rule.key);
+                    query_mutated |= ctx.query_params.remove(&rule.key).is_some();
                 }
                 QueryOp::Rename => {
                     if let Some(ref new_key) = rule.new_key
                         && let Some(val) = ctx.query_params.remove(&rule.key)
                     {
                         ctx.query_params.insert(new_key.clone(), val);
+                        query_mutated = true;
                     }
                 }
             }
+        }
+        if query_mutated {
+            // Signal the decoded-query transform so a downstream raw-query
+            // consumer (`serverless_function`) can fail closed rather than emit a
+            // payload rebuilt from the untransformed raw query string. The
+            // transform lands on `ctx.query_params`, which the backend request
+            // URL does not re-serialize, so this marker is the only faithful
+            // record that operator query intent diverged from the raw wire query.
+            ctx.metadata.insert(
+                crate::proxy::QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
         }
         // Per-rule header transforms published by `mesh_route_dispatch`
         // run AFTER this plugin's static rules so route-level writes win on

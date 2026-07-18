@@ -107,6 +107,14 @@ struct InvocationFailure {
     code: &'static str,
     operator_detail: String,
     must_reject: bool,
+    /// True when the failure is proven to have occurred before any request bytes
+    /// could reach the function: payload serialization, provider request signing,
+    /// or a transport class that never went on the wire (connect refused/timeout,
+    /// DNS, TLS, pool/port exhaustion, or an egress-policy denial). Such a failure
+    /// caused no external side effect, so a terminate-mode dedup owner marked in
+    /// anticipation of the call must be released rather than retained until TTL.
+    /// Defaults to `false` so ambiguous/post-wire outcomes stay fail-closed.
+    proven_pre_wire: bool,
 }
 
 impl InvocationFailure {
@@ -115,6 +123,17 @@ impl InvocationFailure {
             code,
             operator_detail: operator_detail.into(),
             must_reject: false,
+            proven_pre_wire: false,
+        }
+    }
+
+    /// A failure proven to have occurred before any request reached the function.
+    fn pre_wire(code: &'static str, operator_detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            operator_detail: operator_detail.into(),
+            must_reject: false,
+            proven_pre_wire: true,
         }
     }
 
@@ -123,7 +142,15 @@ impl InvocationFailure {
             code,
             operator_detail: operator_detail.into(),
             must_reject: true,
+            // Governed-input rejections happen in `build_invocation_payload`,
+            // before the outbound call, so no external side effect can exist.
+            proven_pre_wire: true,
         }
+    }
+
+    fn with_pre_wire(mut self, proven_pre_wire: bool) -> Self {
+        self.proven_pre_wire = proven_pre_wire;
+        self
     }
 }
 
@@ -573,7 +600,7 @@ impl ServerlessFunction {
 
         // Forward request body
         if self.forward_body {
-            reject_encoded_request_body(proxy_headers)?;
+            reject_encoded_request_body(ctx, proxy_headers)?;
             let empty_body = Bytes::new();
             let body = if let Some(body) = ctx.request_body_bytes.as_ref() {
                 body
@@ -621,7 +648,7 @@ impl ServerlessFunction {
         ctx: &RequestContext,
     ) -> Result<(u16, HashMap<String, String>, Bytes), InvocationFailure> {
         let payload_bytes = serde_json::to_vec(payload).map_err(|_| {
-            InvocationFailure::new(
+            InvocationFailure::pre_wire(
                 "payload_serialization_failed",
                 "failed to serialize function payload",
             )
@@ -642,7 +669,7 @@ impl ServerlessFunction {
                     let auth_headers =
                         sign_aws_request(aws, &self.function_url, &payload_bytes, &now).map_err(
                             |_| {
-                                InvocationFailure::new(
+                                InvocationFailure::pre_wire(
                                     "request_signing_failed",
                                     "failed to sign AWS Lambda invocation",
                                 )
@@ -669,14 +696,27 @@ impl ServerlessFunction {
 
         let response = self
             .http_client
-            .execute_redacted_tracked(
+            .execute_redacted_tracked_classified(
                 request,
                 "serverless_function",
                 &self.function_display_url,
                 &ctx.plugin_http_call_ns,
             )
             .await
-            .map_err(|detail| InvocationFailure::new("invocation_failed", detail))?;
+            .map_err(|failure| {
+                // `request_reached_wire` is the authoritative provider-I/O
+                // boundary: a false value proves no request bytes reached the
+                // function (request-build failure, connect refused/timeout, DNS,
+                // TLS, pool/port exhaustion, or an egress-policy denial), so the
+                // dedup owner can be released instead of retained. A true value
+                // (timeout after send, reset mid-response, etc.) is an ambiguous
+                // outcome and stays fail-closed.
+                InvocationFailure::new(
+                    "invocation_failed",
+                    format!("{} invoking serverless function", failure.error_class),
+                )
+                .with_pre_wire(!failure.request_reached_wire)
+            })?;
 
         let status = response.status().as_u16();
         let lambda_function_error = self.provider == Provider::AwsLambda
@@ -910,9 +950,28 @@ fn encode_metadata_segment(segment: &str) -> String {
     encoded
 }
 
-fn reject_encoded_request_body(headers: &HashMap<String, String>) -> Result<(), InvocationFailure> {
+fn reject_encoded_request_body(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> Result<(), InvocationFailure> {
+    // The buffered body in `ctx.request_body_bytes` is the ORIGINAL client body,
+    // so its content coding is described by the ORIGINAL request headers. A
+    // header-only `request_transformer` (priority 3000) that removed or renamed
+    // `Content-Encoding` before this serverless egress (priority 3025) leaves the
+    // transformed `headers` map identity-clean while the compressed bytes remain;
+    // the init-time marker preserves that original state so the boundary cannot be
+    // bypassed by an earlier header transform.
+    if ctx
+        .metadata
+        .contains_key(crate::proxy::ORIGIN_ENCODED_REQUEST_METADATA_KEY)
+    {
+        return Err(InvocationFailure::governed_input(
+            "encoded_request_body_unsupported",
+            "governed request body used a non-identity content-encoding",
+        ));
+    }
     if let Some(encoding) = headers.get("content-encoding")
-        && !encoding.trim().eq_ignore_ascii_case("identity")
+        && crate::proxy::content_encoding_declares_non_identity(encoding)
     {
         return Err(InvocationFailure::governed_input(
             "encoded_request_body_unsupported",
@@ -925,6 +984,24 @@ fn reject_encoded_request_body(headers: &HashMap<String, String>) -> Result<(), 
 fn unambiguous_query_params(
     ctx: &RequestContext,
 ) -> Result<serde_json::Map<String, Value>, InvocationFailure> {
+    // A `request_transformer` (priority 3000) query rule that ran before this
+    // serverless egress (priority 3025) recorded its add/remove/update/rename on
+    // the decoded `ctx.query_params` map. The function payload is rebuilt from the
+    // raw query string to preserve plus/duplicate/decode/auth-strip invariants,
+    // and that raw representation cannot faithfully honor a decoded-parameter
+    // transform without reintroducing the ambiguity the raw path exists to
+    // eliminate (for example resurrecting a `token` the operator removed). Fail
+    // closed on the composition rather than emit a payload that silently ignores
+    // the transform.
+    if ctx
+        .metadata
+        .contains_key(crate::proxy::QUERY_PARAMS_TRANSFORMED_METADATA_KEY)
+    {
+        return Err(InvocationFailure::governed_input(
+            "query_params_transformed",
+            "query forwarding cannot reconcile a request_transformer query transform with the raw-query payload",
+        ));
+    }
     let mut ordered = BTreeMap::new();
     if let Some(raw_query) = ctx.raw_query_string() {
         // Authentication plugins retain the original raw query for security
@@ -2001,6 +2078,18 @@ impl Plugin for ServerlessFunction {
 
         let (status, response_headers, body) = match self.invoke(&payload, ctx).await {
             Ok(result) => result,
+            Err(failure) if failure.proven_pre_wire => {
+                // The outbound request never reached the function, so no external
+                // side effect occurred. Undo the anticipatory terminate-mode
+                // side-effect provenance and release the dedup marker like any
+                // other pre-invocation rejection, so an identical retry can
+                // proceed instead of being blocked/replayed until inflight_ttl.
+                let owners: Vec<u64> = ctx.request_deduplication_states.keys().copied().collect();
+                for owner in owners {
+                    ctx.serverless_external_side_effect_owners.remove(&owner);
+                }
+                return self.pre_invocation_failure_result(ctx, failure);
+            }
             Err(failure) => return self.failure_result(ctx, failure),
         };
         ctx.metadata
