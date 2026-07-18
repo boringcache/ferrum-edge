@@ -2031,12 +2031,116 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
 
     assert!(candidate.contains("crate::custom_plugins::custom_plugin_names()"));
     assert!(candidate.contains("is_security_composition_candidate_plugin("));
+    assert!(candidate.contains("security_composition_capabilities("));
+    assert!(candidate.contains("ServerlessSecurityCompositionPlugin"));
     assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
     assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
-    assert!(
-        !candidate.contains("forward_body"),
-        "candidate validation must not be gated on a built-in serverless config field"
+}
+
+#[test]
+fn candidate_serverless_composition_uses_pure_capabilities_not_runtime_credentials() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "function"])],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "function",
+                "serverless_function",
+                json!({
+                    "provider": "aws_lambda",
+                    "mode": "terminate",
+                    "aws_access_key_id": 7
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
     );
+
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+        .expect("candidate composition must not construct an environment-bound AWS client");
+    let runtime_error = PluginCache::new(&config)
+        .err()
+        .expect("runtime construction must still reject malformed credentials");
+    assert!(runtime_error.contains("aws_access_key_id"), "{runtime_error}");
+}
+
+#[test]
+fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egress() {
+    let mut terminal = make_plugin_config_with_json(
+        "function",
+        "serverless_function",
+        json!({
+            "provider": "aws_lambda",
+            "mode": "terminate",
+            "aws_access_key_id": 7
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    terminal.priority_override = Some(2700);
+    let unsafe_order = make_config(
+        vec![make_proxy("p1", "/api", vec!["function", "dedup"])],
+        vec![
+            terminal,
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let order_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &unsafe_order,
+        None,
+    )
+    .expect_err("pure terminate capability must retain dedup ordering enforcement");
+    assert!(order_error.contains("request_deduplication"), "{order_error}");
+
+    let unsafe_body = make_config(
+        vec![make_proxy("p1", "/api", vec!["function", "transform"])],
+        vec![
+            make_plugin_config_with_json(
+                "function",
+                "serverless_function",
+                json!({
+                    "provider": "aws_lambda",
+                    "forward_body": true,
+                    "aws_access_key_id": 7
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "x",
+                        "value": true
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let body_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &unsafe_body,
+        None,
+    )
+    .expect_err("pure forward_body capability must retain body-view enforcement");
+    assert!(body_error.contains("request-body"), "{body_error}");
 }
 
 #[test]

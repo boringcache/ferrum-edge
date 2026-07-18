@@ -14470,10 +14470,14 @@ async fn apply_synthetic_response_body_hooks(
 
     let content_type = response_headers.get("content-type").cloned();
     let ct_ref = content_type.as_deref();
-    if !ctx.deduplication_replay_response_finalized
-        && crate::plugins::response_body_rewrite_allowed(*response_status)
-    {
+    if crate::plugins::response_body_rewrite_allowed(*response_status) {
+        let mut mandatory_replay_transform_failed = None;
         for plugin in plugins.iter() {
+            let mandatory_replay_transform = ctx.deduplication_replay_response_finalized
+                && plugin.requires_replay_response_body_transform(ctx);
+            if ctx.deduplication_replay_response_finalized && !mandatory_replay_transform {
+                continue;
+            }
             let deadline = ctx.grpc_deadline_at();
             let transformed = match crate::plugins::await_grpc_deadline(
                 deadline,
@@ -14487,6 +14491,10 @@ async fn apply_synthetic_response_body_hooks(
             .await
             {
                 Ok(transformed) => transformed,
+                Err(()) if mandatory_replay_transform => {
+                    mandatory_replay_transform_failed = Some(plugin.name());
+                    break;
+                }
                 Err(()) => break,
             };
             if let Some(transformed) = transformed {
@@ -14498,7 +14506,25 @@ async fn apply_synthetic_response_body_hooks(
                     ctx,
                     response_headers,
                 );
+            } else if mandatory_replay_transform {
+                mandatory_replay_transform_failed = Some(plugin.name());
+                break;
             }
+        }
+        if let Some(plugin_name) = mandatory_replay_transform_failed {
+            warn!(
+                plugin = plugin_name,
+                "Mandatory replay response redaction transform failed; rejecting response"
+            );
+            *response_body = rebuild_plugin_rejection_response_headers(
+                response_status,
+                response_headers,
+                RejectedResponseParts {
+                    status_code: 502,
+                    body: br#"{"error":"response redaction failed"}"#.to_vec(),
+                    headers: HashMap::new(),
+                },
+            );
         }
     }
 

@@ -15672,8 +15672,11 @@ components:
         are revalidated as the exact combined list returned downstream.
         Complete signed paths match at
         slash-delimited segment boundaries even with added prefix or descendant
-        segments, not inside arbitrary substrings. Both non-empty components
-        of every configured query pair are protected credential scalars: a key
+        segments, not inside arbitrary substrings. The complete slash-trimmed
+        signed path is also protected when copied exactly into either side of a
+        decoded query pair; longer scalar lookalikes remain observable. Both
+        non-empty components of every configured query pair are protected
+        credential scalars: a key
         remains protected whether it is key-only (`?SIGNED_TOKEN=`) or paired
         with a value (`?SIGNED_TOKEN=1`), and a non-empty value is protected
         independently. Exact ASCII-case-insensitive URI scheme copies are also
@@ -15704,18 +15707,24 @@ components:
         and enforcing
         redaction-dependent plugins reject governed content when those bytes
         cannot be safely rewritten.
-        Proven pre-invocation payload-validation and unsupported-gRPC
-        rejections release every acquired deduplication owner after commit;
-        uncertain post-invocation failures retain their protection.
+        Proven pre-invocation payload-validation, unsupported-gRPC, DNS-policy,
+        and literal-IP-policy rejections release every acquired deduplication
+        owner after commit. Real remote 502 responses remain application
+        responses; uncertain post-invocation failures retain their protection.
         Deduplicated terminal replays preserve the final status/body but use
         sanitized headers: session/authentication fields, Retry-After,
         trace/correlation fields, and rate-limit counters are not replayed. The
-        stored body is already finalized and bypasses presentation transforms
-        on replay while remaining subject to response inspection and final-body
-        validation.
+        stored body is already finalized and bypasses ordinary presentation
+        transforms on replay while remaining subject to response inspection and
+        final-body validation. A current-policy redaction decision runs only its
+        required transform and fails closed with 502 if rewriting cannot
+        complete.
         If request_deduplication is attached, every same-protocol instance must
         have a strictly lower effective priority than terminate mode; candidate
-        admission rejects equal or reversed ordering before persistence.
+        admission rejects equal or reversed ordering before persistence. This
+        candidate check derives static serverless capabilities without resolving
+        CP-local cloud credentials; runtime construction still validates the
+        node-local credentials and environment fail closed.
         HEAD/204/205/304 bodies are empty. Automatic redirects are disabled;
         pre_proxy accepts only 2xx as approval, while terminate may
         intentionally return only final 2xx-5xx statuses (200-599).
@@ -18609,7 +18618,7 @@ components:
 
     RequestDeduplicationConfig:
       type: object
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass presentation transforms on replay while remaining subject to response inspection and final-body validation. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
       properties:
         header_name:
           type: string

@@ -17,6 +17,7 @@ use regex::{NoExpand, Regex, RegexSet};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
@@ -26,6 +27,8 @@ use super::utils::sse::{
     parse_sse_data_frames_checked,
 };
 use super::{Plugin, PluginResult, RequestContext};
+
+static NEXT_RESPONSE_GUARD_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// JSON object keys that are structural metadata (IDs, timestamps, model
 /// names, roles, etc.) and must never be redacted, even in `ScanMode::All`.
@@ -103,6 +106,7 @@ enum ScanMode {
 }
 
 pub struct AiResponseGuard {
+    instance_id: u64,
     action: GuardAction,
     pii_patterns: Vec<ContentPattern>,
     blocked_phrases: Vec<ContentPattern>,
@@ -361,6 +365,7 @@ impl AiResponseGuard {
         })?;
 
         Ok(Self {
+            instance_id: NEXT_RESPONSE_GUARD_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             action,
             pii_patterns,
             blocked_phrases,
@@ -1064,6 +1069,10 @@ impl AiResponseGuard {
                 }
                 ctx.metadata
                     .insert("ai_response_guard_redacted".to_string(), detected.join(","));
+                if ctx.deduplication_replay_response_finalized {
+                    ctx.ai_response_guard_replay_redactions
+                        .insert(self.instance_id);
+                }
                 PluginResult::Continue
             }
         }
@@ -1753,6 +1762,11 @@ impl Plugin for AiResponseGuard {
         }
 
         serde_json::to_vec(&json).ok()
+    }
+
+    fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
+        ctx.ai_response_guard_replay_redactions
+            .contains(&self.instance_id)
     }
 
     fn on_response_body_transformed(

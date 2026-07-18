@@ -171,6 +171,32 @@ enum InvocationMode {
     Terminate,
 }
 
+fn parse_invocation_mode(config: &Value) -> Result<InvocationMode, String> {
+    match config.get("mode") {
+        Some(Value::String(s)) => match s.as_str() {
+            "pre_proxy" => Ok(InvocationMode::PreProxy),
+            "terminate" => Ok(InvocationMode::Terminate),
+            other => Err(format!(
+                "serverless_function: unknown mode '{other}' (expected 'pre_proxy' or 'terminate')"
+            )),
+        },
+        None => Ok(InvocationMode::PreProxy),
+        Some(_) => Err("serverless_function: 'mode' must be a string".to_string()),
+    }
+}
+
+/// Parse only the static capabilities used by cross-plugin composition
+/// admission. This deliberately does not resolve provider credentials or any
+/// node-local environment values.
+pub(crate) fn security_composition_capabilities(config: &Value) -> Result<(bool, bool), String> {
+    if !config.is_object() {
+        return Err("serverless_function: config must be an object".to_string());
+    }
+    let mode = parse_invocation_mode(config)?;
+    let forward_body = optional_bool(config, "forward_body")?.unwrap_or(false);
+    Ok((forward_body, mode == InvocationMode::Terminate))
+}
+
 /// What to do when the function call fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ErrorAction {
@@ -281,21 +307,7 @@ impl ServerlessFunction {
         // Strict mode validation. Silently defaulting an unknown value (e.g.
         // a typo'd "terminat") to `pre_proxy` would mask configuration errors
         // and silently change semantic intent.
-        let mode = match config.get("mode") {
-            Some(Value::String(s)) => match s.as_str() {
-                "pre_proxy" => InvocationMode::PreProxy,
-                "terminate" => InvocationMode::Terminate,
-                other => {
-                    return Err(format!(
-                        "serverless_function: unknown mode '{other}' (expected 'pre_proxy' or 'terminate')"
-                    ));
-                }
-            },
-            None => InvocationMode::PreProxy,
-            Some(_) => {
-                return Err("serverless_function: 'mode' must be a string".to_string());
-            }
-        };
+        let mode = parse_invocation_mode(config)?;
 
         let forward_body = optional_bool(config, "forward_body")?.unwrap_or(false);
         let forward_query_params = optional_bool(config, "forward_query_params")?.unwrap_or(false);
@@ -1236,6 +1248,11 @@ impl FunctionDestination {
                 || self
                     .sensitive_query_scalars()
                     .any(|component| candidate.0 == component || candidate.1 == component)
+                || self.sensitive_path.as_deref().is_some_and(|path| {
+                    let protected_path = path.trim_matches('/');
+                    !protected_path.is_empty()
+                        && (candidate.0 == protected_path || candidate.1 == protected_path)
+                })
         }) {
             return true;
         }

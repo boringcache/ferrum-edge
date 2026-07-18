@@ -52,6 +52,38 @@ struct PriorityOverridePlugin {
     priority: u16,
 }
 
+/// Pure capability view used by candidate admission. Runtime construction of
+/// `serverless_function` resolves node-local credentials and environment, which
+/// must happen only where the data-plane plugin instance will execute.
+struct ServerlessSecurityCompositionPlugin {
+    priority: u16,
+    forward_body: bool,
+    terminate: bool,
+}
+
+#[async_trait]
+impl Plugin for ServerlessSecurityCompositionPlugin {
+    fn name(&self) -> &str {
+        "serverless_function"
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        crate::plugins::HTTP_GRPC_PROTOCOLS
+    }
+
+    fn egresses_request_body_before_finalization(&self) -> bool {
+        self.forward_body
+    }
+
+    fn requires_prior_request_deduplication(&self) -> bool {
+        self.terminate
+    }
+}
+
 /// Per-chain CORS wrapper. It avoids mutating a shared plugin instance when a
 /// proxy-group or global CORS policy participates in a multiple-instance chain
 /// for only some proxies.
@@ -724,6 +756,9 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await
+    }
+    fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
+        self.inner.requires_replay_response_body_transform(ctx)
     }
     fn on_response_body_transformed(
         &self,
@@ -2260,15 +2295,31 @@ pub(crate) fn validate_plugin_security_composition_candidate(
         {
             continue;
         }
-        match try_create_plugin(
-            plugin_config,
-            config,
-            http_client,
-            &current_adaptive_states,
-            &mut staged_adaptive_states,
-            &current_tcp_throttle_states,
-            &mut staged_tcp_throttle_states,
-        ) {
+        let created = if plugin_config.plugin_name == "serverless_function" {
+            crate::plugins::serverless_function::security_composition_capabilities(
+                &plugin_config.config,
+            )
+            .map(|(forward_body, terminate)| {
+                Some(Arc::new(ServerlessSecurityCompositionPlugin {
+                    priority: plugin_config
+                        .priority_override
+                        .unwrap_or(crate::plugins::priority::SERVERLESS_FUNCTION),
+                    forward_body,
+                    terminate,
+                }) as Arc<dyn Plugin>)
+            })
+        } else {
+            try_create_plugin(
+                plugin_config,
+                config,
+                http_client,
+                &current_adaptive_states,
+                &mut staged_adaptive_states,
+                &current_tcp_throttle_states,
+                &mut staged_tcp_throttle_states,
+            )
+        };
+        match created {
             Ok(Some(plugin)) if plugin_config.scope == PluginScope::Global => {
                 global_plugins
                     .entry(plugin_config.namespace.as_str())
@@ -2357,10 +2408,11 @@ fn remove_shadowed_global_plugin(
 }
 
 /// Cross-plugin composition candidate validation. The security composition
-/// candidate walker constructs every composition-relevant plugin once and runs
-/// both the security-sensitive ordering/body-view invariants and the
-/// correlation-header invariants, so this remains the single admission
-/// entrypoint for both concerns.
+/// candidate walker constructs every composition-relevant plugin once, except
+/// for the environment-bound serverless plugin whose static capability view is
+/// sufficient, and runs both the security-sensitive ordering/body-view
+/// invariants and the correlation-header invariants. This remains the single
+/// admission entrypoint for both concerns.
 pub(crate) fn validate_plugin_composition_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,

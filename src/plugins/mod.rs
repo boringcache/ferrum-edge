@@ -1090,6 +1090,15 @@ pub struct RequestContext {
     /// instances may coexist on one proxy and must never consume each other's
     /// dedup state.
     pub(crate) ai_tool_governor_response_hashes: HashMap<u64, String>,
+    /// `ai_response_guard` instances that inspected an already-finalized
+    /// deduplication replay and found content requiring a current-policy
+    /// redaction transform. Kept outside public metadata so response data or a
+    /// custom plugin cannot opt a replay into or out of mandatory rewriting.
+    pub(crate) ai_response_guard_replay_redactions: HashSet<u64>,
+    /// `ai_tool_governor` equivalent of
+    /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
+    /// governor from consuming another instance's transform requirement.
+    pub(crate) ai_tool_governor_replay_redactions: HashSet<u64>,
     /// Per-instance governed-call identity multisets (identity hash -> count),
     /// the one-for-one skip ledgers final re-checks consume. Kept off
     /// `metadata` for the same reason as the response hashes.
@@ -1115,8 +1124,10 @@ pub struct RequestContext {
         HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
     /// Whether `request_deduplication` supplied an already-finalized committed
     /// representation for this request. The shared synthetic rejection path
-    /// must not run presentation transforms over it again. Inspection and
-    /// final-body validation still run over the replayed client representation.
+    /// must not run ordinary presentation transforms over it again. Inspection
+    /// and final-body validation still run over the replayed client
+    /// representation, and a current redaction decision can require its own
+    /// transform or fail closed.
     /// Kept private so request metadata cannot suppress response inspection.
     pub(crate) deduplication_replay_response_finalized: bool,
     /// Deduplication instances whose in-flight ownership can be released after
@@ -1496,6 +1507,8 @@ impl RequestContext {
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
             ai_tool_governor_response_hashes: HashMap::new(),
+            ai_response_guard_replay_redactions: HashSet::new(),
+            ai_tool_governor_replay_redactions: HashSet::new(),
             ai_tool_governor_call_hashes: HashMap::new(),
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
@@ -1853,6 +1866,12 @@ impl RequestContext {
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
+            ai_response_guard_replay_redactions: self
+                .ai_response_guard_replay_redactions
+                .clone(),
+            ai_tool_governor_replay_redactions: self
+                .ai_tool_governor_replay_redactions
+                .clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
@@ -4952,6 +4971,19 @@ pub trait Plugin: Send + Sync {
     ) -> Option<Vec<u8>> {
         self.transform_response_body(body, content_type, response_headers)
             .await
+    }
+
+    /// Whether this plugin's response inspection just determined that its
+    /// transform is required to make an already-finalized deduplication replay
+    /// safe under current policy.
+    ///
+    /// Ordinary presentation transforms do not run twice over replayed bytes.
+    /// A plugin returning true here is therefore making a fail-closed security
+    /// claim: its transform must return replacement bytes before delivery. As
+    /// with every response-body hook, the plugin must also advertise response
+    /// buffering through `requires_response_body_buffering()`.
+    fn requires_replay_response_body_transform(&self, _ctx: &RequestContext) -> bool {
+        false
     }
 
     /// Called immediately after this plugin returns a transformed response

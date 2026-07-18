@@ -2624,6 +2624,16 @@ impl Plugin for AiToolGovernor {
             );
             return self.reject(&batch);
         }
+        if ctx.deduplication_replay_response_finalized
+            && self.engine.mode == Mode::Enforce
+            && batch
+                .per_call
+                .iter()
+                .any(|decision| !decision.redact_patterns.is_empty())
+        {
+            ctx.ai_tool_governor_replay_redactions
+                .insert(self.instance_id);
+        }
         // Record the governed calls with multiset counts so the final re-check
         // skips them one-for-one. Approval-capable calls use correlation-aware
         // identities; deterministic `redact_args` calls use name/args only.
@@ -2705,6 +2715,11 @@ impl Plugin for AiToolGovernor {
             return Some(rewritten);
         }
         None
+    }
+
+    fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
+        ctx.ai_tool_governor_replay_redactions
+            .contains(&self.instance_id)
     }
 
     /// Re-run the deterministic response policy on the FINAL client-visible body.

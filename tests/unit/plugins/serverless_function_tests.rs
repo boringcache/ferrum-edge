@@ -1302,6 +1302,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "copied-query-path-other-host",
         "copied-query-path-parameter",
         "copied-query-encoded-path-delimiter",
+        "copied-signed-path-query-value",
+        "copied-signed-path-query-key",
+        "copied-signed-path-query-value-encoded",
         "key-only-query-renamed-value",
         "key-only-query-copied-key",
         "key-only-query-path",
@@ -1342,6 +1345,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-query-value-lookalike",
         "benign-query-path-lookalike",
         "benign-query-path-parameter-lookalike",
+        "benign-signed-path-query-value-lookalike",
         "benign-key-only-query-lookalike",
         "benign-leading-slash-scalar-suffix-lookalike",
         "benign-trailing-slash-scalar-prefix-lookalike",
@@ -1432,6 +1436,12 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "nested-path-after-base-directory" | "benign-nested-path-after-base-directory" => {
                 format!("{}/api/signed?code=secret", server.uri())
             }
+            "copied-signed-path-query-value"
+            | "copied-signed-path-query-key"
+            | "copied-signed-path-query-value-encoded"
+            | "benign-signed-path-query-value-lookalike" => {
+                format!("{}/api/signed-token", server.uri())
+            }
             _ => format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri()),
         };
         let location = match case {
@@ -1493,6 +1503,15 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "copied-query-encoded-path-delimiter" => {
                 "https://redirect.example/next%3Fleak%3Dsecret/value".to_string()
+            }
+            "copied-signed-path-query-value" => {
+                "https://redirect.example/next?leak=api/signed-token".to_string()
+            }
+            "copied-signed-path-query-key" => {
+                "https://redirect.example/next?api/signed-token=other".to_string()
+            }
+            "copied-signed-path-query-value-encoded" => {
+                "https://redirect.example/next?leak=api%252Fsigned-token".to_string()
             }
             "key-only-query-renamed-value" => {
                 "https://redirect.example/next?leak=SIGNED_TOKEN".to_string()
@@ -1572,6 +1591,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-query-path-parameter-lookalike" => {
                 "https://redirect.example/next;leak=secret/value-extra".to_string()
+            }
+            "benign-signed-path-query-value-lookalike" => {
+                "https://redirect.example/next?leak=api/signed-token-extra".to_string()
             }
             "benign-key-only-query-lookalike" => {
                 "https://redirect.example/next?leak=SIGNED_TOKEN_EXTRA".to_string()

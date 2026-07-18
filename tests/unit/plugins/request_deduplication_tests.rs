@@ -8,6 +8,9 @@ use ferrum_edge::_test_support::{
     request_deduplication_redis_payload_for_test, request_deduplication_request_identity_for_test,
     request_deduplication_with_instance_id_for_test,
 };
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+use ferrum_edge::plugins::ai_response_guard::AiResponseGuard;
+use ferrum_edge::plugins::ai_tool_governor::AiToolGovernor;
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::serverless_function::ServerlessFunction;
 use ferrum_edge::plugins::{
@@ -20,6 +23,32 @@ use std::sync::Arc;
 use tokio::sync::Barrier;
 
 struct AppendingResponseTransform;
+
+struct FailingMandatoryReplayTransform;
+
+#[async_trait]
+impl Plugin for FailingMandatoryReplayTransform {
+    fn name(&self) -> &str {
+        "failing_mandatory_replay_transform"
+    }
+
+    fn requires_replay_response_body_transform(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true
+    }
+
+    async fn transform_response_body(
+        &self,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+}
 
 #[async_trait]
 impl Plugin for AppendingResponseTransform {
@@ -482,6 +511,189 @@ async fn committed_replay_skips_second_response_body_transform() {
     }
 }
 
+#[tokio::test]
+async fn committed_replay_runs_current_ai_response_redaction() {
+    let dedup = make_plugin(json!({}));
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let stale_body = br#"{"choices":[{"message":{"content":"Contact user@example.com"}}]}"#;
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "guard-replay".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, 200, &response_headers, stale_body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let guard = AiResponseGuard::new(&json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }))
+    .unwrap();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(guard)];
+    let mut replay_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    let mut replay_headers =
+        HashMap::from([("idempotency-key".to_string(), "guard-replay".to_string())]);
+    let replay = dedup
+        .before_proxy(&mut replay_ctx, &mut replay_headers)
+        .await;
+
+    match finalize_plugin_rejection_for_test(&plugins, &mut replay_ctx, replay).await {
+        PluginResult::RejectBinary { status_code, body, .. } => {
+            assert_eq!(status_code, 200);
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(!body.contains("user@example.com"), "stale PII replayed: {body}");
+            assert!(body.contains("[REDACTED:pii:email]"), "{body}");
+        }
+        other => panic!("expected redacted finalized replay, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn committed_replay_runs_current_tool_argument_redaction() {
+    let dedup = make_plugin(json!({}));
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let stale_body = json!({
+        "id": "chatcmpl-replay",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "filesystem.write",
+                        "arguments": "{\"token\":\"sk-STALESECRET123\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string()
+    .into_bytes();
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "governor-replay".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, 200, &response_headers, &stale_body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let governor = AiToolGovernor::new(
+        &json!({
+            "default_action": "allow",
+            "tools": {
+                "filesystem.write": {
+                    "action": "redact_args",
+                    "blocked_arg_patterns": [{
+                        "name": "secret",
+                        "regex": "sk-[A-Za-z0-9]+"
+                    }]
+                }
+            }
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(governor)];
+    let mut replay_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    let mut replay_headers =
+        HashMap::from([("idempotency-key".to_string(), "governor-replay".to_string())]);
+    let replay = dedup
+        .before_proxy(&mut replay_ctx, &mut replay_headers)
+        .await;
+
+    match finalize_plugin_rejection_for_test(&plugins, &mut replay_ctx, replay).await {
+        PluginResult::RejectBinary { status_code, body, .. } => {
+            assert_eq!(status_code, 200);
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(!body.contains("sk-STALESECRET123"), "stale tool secret replayed: {body}");
+            assert!(body.contains("[REDACTED_TOOL_ARG:secret]"), "{body}");
+        }
+        other => panic!("expected governed finalized replay, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn committed_replay_fails_closed_when_required_transform_cannot_rewrite() {
+    let dedup = make_plugin(json!({}));
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "failed-redaction".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(
+                &mut first_ctx,
+                200,
+                &HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+                b"sensitive replay",
+            )
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut replay_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut replay_headers =
+        HashMap::from([("idempotency-key".to_string(), "failed-redaction".to_string())]);
+    let replay = dedup
+        .before_proxy(&mut replay_ctx, &mut replay_headers)
+        .await;
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(FailingMandatoryReplayTransform)];
+
+    match finalize_plugin_rejection_for_test(&plugins, &mut replay_ctx, replay).await {
+        PluginResult::RejectBinary { status_code, body, .. } => {
+            assert_eq!(status_code, 502);
+            assert_eq!(&body[..], br#"{"error":"response redaction failed"}"#);
+        }
+        other => panic!("required replay rewrite must fail closed, got {other:?}"),
+    }
+}
+
 // Marker set by the proxy on `ctx.metadata` while the response-body hooks run
 // over a synthetic 2xx plugin short-circuit body (mirrors
 // `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
@@ -649,13 +861,13 @@ async fn external_operation_completed_publishes_non_replayable_tombstone_at_comm
 }
 
 #[tokio::test]
-async fn terminal_serverless_non_2xx_is_stored_at_response_commit() {
+async fn terminal_serverless_remote_502_is_stored_at_response_commit() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(429).set_body_string("executed-once"))
+        .respond_with(ResponseTemplate::new(502).set_body_string("executed-once"))
         .mount(&server)
         .await;
     let dedup = make_plugin(json!({}));
@@ -691,7 +903,7 @@ async fn terminal_serverless_non_2xx_is_stored_at_response_commit() {
         } => (status_code, headers, body),
         other => panic!("expected terminal serverless response, got {other:?}"),
     };
-    assert_eq!(status, 429);
+    assert_eq!(status, 502);
     assert!(dedup.requires_response_committed_hook());
     dedup
         .on_response_committed(&mut first_ctx, status, &response_headers, &body)
@@ -710,7 +922,7 @@ async fn terminal_serverless_non_2xx_is_stored_at_response_commit() {
             body,
             headers,
         } => {
-            assert_eq!(status_code, 429);
+            assert_eq!(status_code, 502);
             assert_eq!(&body[..], b"executed-once");
             assert_eq!(
                 headers.get("x-idempotent-replayed").map(String::as_str),
@@ -1129,6 +1341,58 @@ async fn terminal_serverless_pre_wire_invocation_failure_releases_dedup_owner() 
     );
     let mut retry_headers =
         HashMap::from([("idempotency-key".to_string(), "pre-wire".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn terminal_serverless_literal_ip_egress_denial_releases_dedup_owner() {
+    let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "http://169.254.169.254/invoke",
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default_with_backend_allow_ips(policy),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers =
+        HashMap::from([("idempotency-key".to_string(), "literal-denial".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("literal-IP denial must reject pre-wire, got {other:?}"),
+        };
+    assert!(body.contains("invocation_failed"));
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers =
+        HashMap::from([("idempotency-key".to_string(), "literal-denial".to_string())]);
     assert!(matches!(
         dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
         PluginResult::Continue
