@@ -1776,7 +1776,7 @@ async fn deadline_replacement_keeps_base_grpc_web_expose_list_under_partial_gate
             );
         }
         assert!(
-            tokens.iter().any(|token| *token == "x-only-custom"),
+            tokens.contains(&"x-only-custom"),
             "the gateway's own expose value must still merge in: {exposed:?}"
         );
     }
