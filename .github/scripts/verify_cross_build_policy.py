@@ -251,6 +251,13 @@ OPAQUE_INLINE_SHELL = re.compile(
     r"\beval\s+[^\n]*\$\(|"
     r"(?:\bsource|(?<!\S)\.)\s+<\()"
 )
+OPAQUE_ARM_CROSS_EXECUTION = re.compile(
+    r"(?:^\s*|(?:&&|\|\||;|\|)\s*|\b(?:then|do|else)\s+)"
+    r"(?:\(\s*)?['\"]?\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|"
+    r"[A-Za-z_][A-Za-z0-9_]*)['\"]?\s+"
+    r"(?:\+[^\s]+\s+)?(?:build|rustc|run|test|check|clippy|doc|bench)\b"
+    r"[^\n]*--target(?:=|\s+)aarch64-unknown-linux-gnu\b"
+)
 NON_PYTHON_PROCESS_DISPATCH = re.compile(
     r"(?:(?:\bchild_process|require\(['\"]child_process['\"]\))\s*\.\s*"
     r"(?:exec|execFile|fork|spawn)(?:Sync)?\s*\(|"
@@ -1133,7 +1140,9 @@ def contains_cross_surface(
     """Return whether lexical normalization exposes a Cross-controlled input."""
 
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
-    if OPAQUE_INLINE_SHELL.search(logical_contents):
+    if OPAQUE_INLINE_SHELL.search(logical_contents) or (
+        OPAQUE_ARM_CROSS_EXECUTION.search(logical_contents)
+    ):
         return True
     return any(
         STANDALONE_CROSS.search(variant) or CROSS_ENVIRONMENT.search(variant)
@@ -1209,7 +1218,9 @@ def unprotected_cross_surfaces(
         job_digests[name] = hashlib.sha256(block_contents.encode("utf-8")).hexdigest()
 
         logical_contents = re.sub(r"\\\r?\n[ \t]*", "", block_contents)
-        if OPAQUE_INLINE_SHELL.search(logical_contents):
+        if OPAQUE_INLINE_SHELL.search(logical_contents) or (
+            OPAQUE_ARM_CROSS_EXECUTION.search(logical_contents)
+        ):
             sensitive_jobs.add(name)
             continue
         for logical_line in logical_contents.splitlines():
@@ -1226,7 +1237,9 @@ def unprotected_cross_surfaces(
     top_level_surfaces: list[str] = []
     for index, line in enumerate(lines):
         line_surfaces: set[str] = set()
-        if OPAQUE_INLINE_SHELL.search(line):
+        if OPAQUE_INLINE_SHELL.search(line) or OPAQUE_ARM_CROSS_EXECUTION.search(
+            line
+        ):
             line_surfaces.add("opaque-inline-shell")
         for variant in scan_variants(
             line,
@@ -2004,7 +2017,7 @@ def validate_workflow_contract(
         source,
         job_name,
         required_job=True,
-        include_opaque_shell_executable=True,
+        include_opaque_shell_executable=False,
     )
     errors.extend(surface_failures)
     if surfaces:
