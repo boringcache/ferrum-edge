@@ -15474,8 +15474,9 @@ fn replace_buffered_response_with_representation_error(
 
     if let Some(content_type) = grpc_web_response_content_type {
         // Same header discipline as every other buffered terminal response:
-        // drop entity/representation headers, keep CORS/Vary decorators.
-        retain_deadline_response_decorators(response_headers);
+        // rebuild from provenance-known gateway output so no entity header
+        // describing the rejected representation survives onto the error.
+        ctx.retain_deadline_response_gateway_headers(response_headers);
         let mut response = crate::plugins::grpc_web::error_response_for_content_type(
             content_type,
             grpc_proxy::grpc_status::INTERNAL,
@@ -15490,6 +15491,7 @@ fn replace_buffered_response_with_representation_error(
         *response_headers = response.headers;
         *response_body = response.body;
         *response_status = StatusCode::OK.as_u16();
+        ctx.sync_deadline_response_terminal_headers(response_headers);
         insert_grpc_error_metadata(
             &mut ctx.metadata,
             grpc_proxy::grpc_status::INTERNAL,
@@ -15504,6 +15506,7 @@ fn replace_buffered_response_with_representation_error(
         );
         response_body.clear();
         *response_status = StatusCode::OK.as_u16();
+        ctx.sync_deadline_response_terminal_headers(response_headers);
         insert_grpc_error_metadata(
             &mut ctx.metadata,
             grpc_proxy::grpc_status::INTERNAL,
@@ -15533,6 +15536,7 @@ fn replace_buffered_response_with_representation_error(
 /// `Enforce` with decoded bytes it installs the identity-coded body first, so
 /// every transform in the phase sees exactly the representation the gate proved
 /// inspectable.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn admit_buffered_response_body_transforms(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -15607,6 +15611,14 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     grpc_web_response_content_type: Option<&str>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> (bool, bool) {
+    // Provenance is established before the gate, exactly as it is before the
+    // deadline replacement path: a representation rejection is a gateway-authored
+    // terminal response, so it must keep the gateway's own decorators (CORS,
+    // tracing, request-id) and shed backend entity headers. Header changes the
+    // gate itself makes are safe under this baseline — dropping a backend-authored
+    // `Content-Encoding` after a decode cannot be resurrected by a later rebuild,
+    // which replays gateway output only.
+    ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
     let rewrite_allowed = match admit_buffered_response_body_transforms(
         plugins,
         ctx,
@@ -15618,15 +15630,8 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         initial_response_header_policy_plugins,
     ) {
         BufferedTransformAdmission::Proceed { rewrite_allowed } => rewrite_allowed,
-        // The response has already been replaced with the representation error;
-        // deadline header provenance describes a response that no longer exists.
         BufferedTransformAdmission::Rejected => return (true, false),
     };
-    // Provenance baseline is taken after the gate so it describes the bytes the
-    // transforms actually see: when the gate decoded an encoded body it dropped
-    // the stale `Content-Encoding` and recomputed `Content-Length`, and a later
-    // deadline rebuild must not resurrect headers describing the encoded form.
-    ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
     if !rewrite_allowed {
         return (false, false);
     }

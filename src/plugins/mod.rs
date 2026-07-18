@@ -5845,8 +5845,7 @@ pub trait Plugin: Send + Sync {
     /// the policy was genuinely applied. The shared representation gate
     /// (`response_representation`) uses this to decide whether an encoded,
     /// partial, or non-parseable representation is an ordinary pass-through or a
-    /// fail-closed rejection — see
-    /// [`crate::plugins::response_representation::evaluate_response_body_policy_posture`].
+    /// fail-closed rejection.
     ///
     /// Return `false` whenever the configured policy would decline this response
     /// anyway (no rules configured, a runtime kill-switch disabled the scope, or
