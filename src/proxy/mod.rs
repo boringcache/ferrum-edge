@@ -15568,9 +15568,10 @@ async fn replace_buffered_response_with_representation_error(
         rejection.reason().to_string(),
     );
 
-    let native_grpc = response_headers
-        .get("content-type")
-        .is_some_and(|value| backend_dispatch::is_native_grpc_content_type(value.as_bytes()));
+    // Response hooks are allowed to remove or relabel Content-Type. Keep the
+    // error wire shape tied to the immutable inbound classification instead of
+    // reclassifying the post-policy response header map.
+    let native_grpc_request = ctx.is_native_grpc_request();
 
     // Both gRPC branches below rebuild from provenance-known gateway output.
     // The backend lifecycle seeded replacement provenance before response
@@ -15578,7 +15579,7 @@ async fn replace_buffered_response_with_representation_error(
     // covers deadline-only and direct helper paths. With no state recorded,
     // `retain_deadline_response_gateway_headers` still clears the map wholesale
     // rather than trusting backend fields by name.
-    if grpc_web_response_content_type.is_some() || native_grpc {
+    if grpc_web_response_content_type.is_some() || native_grpc_request {
         ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
     }
 
@@ -15607,7 +15608,7 @@ async fn replace_buffered_response_with_representation_error(
             grpc_proxy::grpc_status::INTERNAL,
             REPRESENTATION_UNINSPECTABLE_MESSAGE,
         );
-    } else if native_grpc {
+    } else if native_grpc_request {
         // Same discipline as the gRPC-Web branch above and as the deadline
         // replacement: shed everything that is not provenance-known gateway
         // output BEFORE synthesizing the trailers-only error. Otherwise backend

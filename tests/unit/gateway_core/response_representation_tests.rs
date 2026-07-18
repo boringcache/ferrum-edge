@@ -23,9 +23,11 @@ use ferrum_edge::_test_support::{
     discard_grpc_application_trailers_after_body_rewrite_for_test,
     finalize_selected_buffered_grpc_terminal_response_for_test,
     representation_rejection_reason_for_test, run_after_proxy_hooks_for_test,
-    set_grpc_deadline_budget_for_test, stamp_original_response_metadata_for_test,
+    set_grpc_deadline_budget_for_test, set_request_http_flavor_for_test,
+    stamp_original_response_metadata_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
+use ferrum_edge::HttpFlavor;
 use ferrum_edge::plugins::{
     Plugin, PluginResult, RequestContext, response_transformer::ResponseTransformer,
 };
@@ -1147,6 +1149,7 @@ async fn native_grpc_representation_rejection_strips_backend_headers() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ClaimEverythingPolicy)];
 
     let mut ctx = make_ctx();
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Grpc);
     let mut status = 200;
     let mut headers = HashMap::from([(
         "content-type".to_string(),
@@ -1203,6 +1206,71 @@ async fn native_grpc_representation_rejection_strips_backend_headers() {
     }
 }
 
+/// Native gRPC rejection shaping is request provenance, not response metadata.
+/// A real `after_proxy` header policy may remove Content-Type before the body
+/// gate rejects the backend representation; the rejection must still use the
+/// trailers-only native gRPC wire shape rather than falling through to JSON 502.
+#[tokio::test]
+async fn native_grpc_rejection_survives_after_proxy_content_type_removal() {
+    let remove_content_type = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "header", "key": "Content-Type"}
+        ]
+    }))
+    .expect("header policy must be valid");
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(remove_content_type),
+        Arc::new(ClaimEverythingPolicy),
+    ];
+
+    let mut ctx = make_ctx();
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Grpc);
+    let mut status = 200;
+    let mut headers = HashMap::from([
+        (
+            "content-type".to_string(),
+            "application/grpc+proto".to_string(),
+        ),
+        ("content-encoding".to_string(), "zstd".to_string()),
+    ]);
+    let mut body = b"backend-response".to_vec();
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    assert!(
+        !run_after_proxy_hooks_for_test(&plugins, &mut ctx, status, &mut headers).await,
+        "the header policy must not reject the response"
+    );
+    assert!(
+        !headers.contains_key("content-type"),
+        "the regression requires Content-Type to be absent before the gate"
+    );
+
+    let (replaced, transformed) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(replaced, "the claimed unsupported coding must be rejected");
+    assert!(!transformed);
+    assert_eq!(status, 200, "native gRPC errors stay under HTTP 200");
+    assert!(body.is_empty(), "native gRPC errors are trailers-only");
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("13"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("response representation could not be inspected")
+    );
+    assert_eq!(
+        representation_rejection_reason_for_test(&ctx),
+        Some("unsupported_content_coding")
+    );
+}
+
 /// The rejection retain step must use provenance captured before response
 /// decorators, even when there is no RPC deadline. Otherwise the fail-closed
 /// fallback clears both backend metadata and the gateway's CORS/correlation/
@@ -1216,6 +1284,14 @@ async fn grpc_representation_rejection_preserves_decorators_with_or_without_dead
             let plugins: Vec<Arc<dyn Plugin>> =
                 vec![Arc::new(ClaimEverythingPolicy), Arc::new(RejectDecorator)];
             let mut ctx = make_ctx();
+            set_request_http_flavor_for_test(
+                &mut ctx,
+                if grpc_web_content_type.is_some() {
+                    HttpFlavor::Plain
+                } else {
+                    HttpFlavor::Grpc
+                },
+            );
             if deadline_active {
                 set_grpc_deadline_budget_for_test(&mut ctx, Some(10_000));
             }
