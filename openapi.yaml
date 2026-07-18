@@ -17049,7 +17049,7 @@ components:
           minLength: 1
           maxLength: 64
           pattern: '^[A-Za-z0-9_-]+$'
-          description: "Optional marker name. Text wrapped in <TAG>...</TAG> is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Nested spans are flattened while preserving their text; unmatched and JSON-escaped markers are stripped deterministically from every admitted request family even when statistical compression is skipped. Name may contain at most 64 ASCII letters, digits, '-', and '_'."
+          description: "Optional marker name. Text wrapped in <TAG>...</TAG> in JSON string values is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Preserve-marker sanitation applies only to string values: object member-name bytes are preserved and names are never sanitized, including marker-shaped or escaped content. Nested spans are flattened while preserving their text; unmatched and JSON-escaped markers in values are stripped deterministically from every admitted request family even when statistical compression is skipped. Name may contain at most 64 ASCII letters, digits, '-', and '_'."
         request_family:
           type: string
           enum: [auto, chat_completions, text_completions]
