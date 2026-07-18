@@ -14478,7 +14478,7 @@ fn should_apply_synthetic_response_body_hooks(
 /// session cookie, `response_transformer` route overrides) lands on the final
 /// response exactly once instead of being consumed by an earlier pass and lost
 /// when this path replaces the response.
-async fn apply_synthetic_response_body_hooks(
+pub(crate) async fn apply_synthetic_response_body_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     response_status: &mut u16,
