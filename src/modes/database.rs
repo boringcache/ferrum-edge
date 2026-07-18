@@ -1685,112 +1685,111 @@ pub async fn run(
         info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
     }
 
-    // Admin HTTPS listener (only if TLS is configured)
-    if let (Some(admin_cert_path), Some(admin_key_path)) = (
+    // Admin HTTPS listener (only if TLS is configured and the port is not
+    // disabled — port 0 is the repository-wide disable sentinel).
+    if env_config.admin_https_port == 0 {
+        info!("FERRUM_ADMIN_HTTPS_PORT=0 — admin HTTPS listener disabled");
+    } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
         &env_config.admin_tls_cert_path,
         &env_config.admin_tls_key_path,
     ) {
-        if env_config.admin_https_port == 0 {
-            info!("FERRUM_ADMIN_HTTPS_PORT=0 — admin HTTPS listener disabled");
-        } else {
-            let admin_https_addr: SocketAddr =
-                env_config.admin_socket_addr(env_config.admin_https_port);
-            let admin_https_shutdown = shutdown_tx.subscribe();
+        let admin_https_addr: SocketAddr =
+            env_config.admin_socket_addr(env_config.admin_https_port);
+        let admin_https_shutdown = shutdown_tx.subscribe();
 
-            // Load admin TLS configuration
-            let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-            let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
-                admin_cert_path,
-                admin_key_path,
-                admin_client_ca_bundle,
-                env_config.admin_tls_ocsp_response_source.as_deref(),
-                env_config.admin_tls_no_verify,
-                &tls_policy,
-                env_config.tls_cert_expiry_warning_days,
-                &crls,
-            ) {
-                Ok(config) => {
-                    if admin_client_ca_bundle.is_some() {
-                        info!(
-                            "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
-                        );
-                    } else if env_config.admin_tls_no_verify {
-                        warn!(
-                            "Admin TLS configuration loaded with certificate verification DISABLED (testing mode)"
-                        );
-                    } else {
-                        info!(
-                            "Admin TLS configuration loaded without client certificate verification (HTTPS available)"
-                        );
-                    }
-                    config
-                }
-                Err(e) => {
-                    let startup_err = anyhow::anyhow!("Invalid admin TLS configuration: {}", e);
-                    error!("Failed to load admin TLS configuration: {}", e);
-                    if let Err(listener_err) = shutdown_database_runtime_tasks(
-                        &shutdown_tx,
-                        &proxy_state,
-                        handles,
-                        background_handles,
-                    )
-                    .await
-                    {
-                        return Err(
-                            listener_err.context(format!("Gateway startup failed: {startup_err}"))
-                        );
-                    }
-                    return Err(startup_err);
-                }
-            };
-
-            // Wire opt-in admin frontend TLS live reload (no early-data / no
-            // kTLS — admin doesn't apply those opt-ins).
-            let mut admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
-                admin_tls_config.clone(),
-                &env_config,
-                &tls_policy,
-                &crls,
-                Some(shutdown_tx.subscribe()),
-            );
-            if admin_reload_handles.watcher_handle.is_some() {
-                info!("Frontend TLS live reload enabled for admin HTTPS");
-            }
-            if let Some(handle) = admin_reload_handles.watcher_handle.take() {
-                background_handles.push(handle);
-            }
-            let admin_tls_slot = admin_reload_handles.slot.clone();
-
-            let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
-            let admin_https_limiter = admin_conn_limiter.clone();
-            let admin_https_handle = tokio::spawn(async move {
-                info!("Starting Admin HTTPS listener on {}", admin_https_addr);
-                let result = if let Some(slot) = admin_tls_slot {
-                    admin::start_admin_listener_with_dynamic_tls_and_signal(
-                        admin_https_addr,
-                        admin_state_for_https,
-                        admin_https_shutdown,
-                        slot,
-                        Some(admin_https_started_tx),
-                        admin_https_limiter,
-                    )
-                    .await
+        // Load admin TLS configuration
+        let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
+        let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
+            admin_cert_path,
+            admin_key_path,
+            admin_client_ca_bundle,
+            env_config.admin_tls_ocsp_response_source.as_deref(),
+            env_config.admin_tls_no_verify,
+            &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            &crls,
+        ) {
+            Ok(config) => {
+                if admin_client_ca_bundle.is_some() {
+                    info!(
+                        "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
+                    );
+                } else if env_config.admin_tls_no_verify {
+                    warn!(
+                        "Admin TLS configuration loaded with certificate verification DISABLED (testing mode)"
+                    );
                 } else {
-                    admin::start_admin_listener_with_tls_and_signal(
-                        admin_https_addr,
-                        admin_state_for_https,
-                        admin_https_shutdown,
-                        Some(admin_tls_config),
-                        Some(admin_https_started_tx),
-                        admin_https_limiter,
-                    )
-                    .await
-                };
-                result.context("Admin HTTPS listener failed")
-            });
-            handles.push(("Admin HTTPS listener".to_string(), admin_https_handle));
-            startup_signals.push(("Admin HTTPS listener".to_string(), admin_https_started_rx));
+                    info!(
+                        "Admin TLS configuration loaded without client certificate verification (HTTPS available)"
+                    );
+                }
+                config
+            }
+            Err(e) => {
+                let startup_err = anyhow::anyhow!("Invalid admin TLS configuration: {}", e);
+                error!("Failed to load admin TLS configuration: {}", e);
+                if let Err(listener_err) = shutdown_database_runtime_tasks(
+                    &shutdown_tx,
+                    &proxy_state,
+                    handles,
+                    background_handles,
+                )
+                .await
+                {
+                    return Err(
+                        listener_err.context(format!("Gateway startup failed: {startup_err}"))
+                    );
+                }
+                return Err(startup_err);
+            }
+        };
+
+        // Wire opt-in admin frontend TLS live reload (no early-data / no
+        // kTLS — admin doesn't apply those opt-ins).
+        let mut admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
+            admin_tls_config.clone(),
+            &env_config,
+            &tls_policy,
+            &crls,
+            Some(shutdown_tx.subscribe()),
+        );
+        if admin_reload_handles.watcher_handle.is_some() {
+            info!("Frontend TLS live reload enabled for admin HTTPS");
         }
+        if let Some(handle) = admin_reload_handles.watcher_handle.take() {
+            background_handles.push(handle);
+        }
+        let admin_tls_slot = admin_reload_handles.slot.clone();
+
+        let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
+        let admin_https_limiter = admin_conn_limiter.clone();
+        let admin_https_handle = tokio::spawn(async move {
+            info!("Starting Admin HTTPS listener on {}", admin_https_addr);
+            let result = if let Some(slot) = admin_tls_slot {
+                admin::start_admin_listener_with_dynamic_tls_and_signal(
+                    admin_https_addr,
+                    admin_state_for_https,
+                    admin_https_shutdown,
+                    slot,
+                    Some(admin_https_started_tx),
+                    admin_https_limiter,
+                )
+                .await
+            } else {
+                admin::start_admin_listener_with_tls_and_signal(
+                    admin_https_addr,
+                    admin_state_for_https,
+                    admin_https_shutdown,
+                    Some(admin_tls_config),
+                    Some(admin_https_started_tx),
+                    admin_https_limiter,
+                )
+                .await
+            };
+            result.context("Admin HTTPS listener failed")
+        });
+        handles.push(("Admin HTTPS listener".to_string(), admin_https_handle));
+        startup_signals.push(("Admin HTTPS listener".to_string(), admin_https_started_rx));
     } else {
         info!("Admin TLS not configured - HTTPS listener disabled");
     }

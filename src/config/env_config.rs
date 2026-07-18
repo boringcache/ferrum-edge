@@ -3606,11 +3606,13 @@ impl EnvConfig {
     ///
     /// This predicate is deliberately EnvConfig-only, so it does not describe
     /// listeners the process did not bind. Embedded file mode
-    /// (`file::serve` with `ServeOptions.admin_https`) keeps a caller-owned,
-    /// already-bound HTTPS socket even under port 0: a pre-bound listener wins
-    /// over the port setting, and suppressing it would close a socket the
-    /// embedder owns. The `ferrum-edge` binary never passes one, so for the
-    /// binary this predicate alone decides the listener.
+    /// (`file::serve` with `ServeOptions.admin_https`) can serve a caller-owned,
+    /// already-bound HTTPS socket under port 0 when both admin TLS paths are
+    /// configured: the pre-bound listener wins over the port setting, loads
+    /// the TLS material, and sets up frontend TLS live reload, starting the
+    /// watcher when enabled. Without both TLS paths, file mode drops the socket
+    /// unused. The `ferrum-edge` binary never passes a pre-bound socket, so for
+    /// the binary this predicate alone decides the listener.
     ///
     /// It is also config-level, and therefore says nothing about
     /// `secrets::resolve_all_env_secrets()`, which runs before `EnvConfig` is

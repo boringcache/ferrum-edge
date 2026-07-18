@@ -70,9 +70,11 @@ pub struct ServeOptions {
     /// Plaintext admin port. `None` disables the plaintext admin listener.
     pub admin_http: Option<TcpListener>,
     /// TLS admin port. `None` disables the HTTPS admin listener even when
-    /// admin TLS material is configured; `Some` enables it even when
-    /// `FERRUM_ADMIN_HTTPS_PORT=0` would otherwise disable it, because a
-    /// caller-owned FD takes precedence over the port setting.
+    /// admin TLS material is configured. `Some` requests that the caller-owned
+    /// FD take precedence over `FERRUM_ADMIN_HTTPS_PORT=0`, but the socket is
+    /// served only when both admin TLS paths are configured; that path loads
+    /// the TLS material and sets up frontend TLS live reload, starting the
+    /// watcher when enabled. Without both paths, the socket is dropped unused.
     pub admin_https: Option<TcpListener>,
     /// Pre-built admin JWT manager. When `None`, `serve` reads the JWT
     /// secret/issuer/ttl from environment variables (same as the binary
@@ -980,7 +982,10 @@ pub async fn serve(
     // Port 0 is the repository-wide disable sentinel, with one documented
     // exception: a pre-bound socket supplied through `ServeOptions` wins over
     // the port setting (per-listener precedence — the caller already owns the
-    // FD). Only in-process embedders/tests can supply one; `file::run` passes
+    // FD). It is served only when both admin TLS paths are configured; that
+    // path loads the material and sets up frontend TLS live reload, starting
+    // the watcher when enabled. Otherwise the socket is dropped unused. Only
+    // in-process embedders/tests can supply one; `file::run` passes
     // `ServeOptions::default()`, so for the binary this is exactly
     // "`FERRUM_ADMIN_HTTPS_PORT != 0`". Documented in `ferrum.conf` and
     // `docs/configuration.md` alongside the sentinel.

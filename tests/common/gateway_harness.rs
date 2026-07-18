@@ -1027,35 +1027,57 @@ async fn wait_for_health_inner(
     admin_port: u16,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
-    let deadline = Instant::now() + timeout;
-    let mut last_observation = String::from("no response yet");
-    loop {
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "gateway admin /health did not become ready on port {} within {:?} (last observation: {})",
-                admin_port, timeout, last_observation
-            )
-            .into());
-        }
-        match client.get(&health_url).send().await {
-            Ok(r) if r.status().is_success() => return Ok(()),
-            Ok(r) => {
-                last_observation = format!("HTTP {}", r.status());
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Err(err) => {
-                last_observation = err.to_string();
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        }
-    }
+    wait_for_health_target(admin_port, timeout, HealthWaitTarget::SuccessfulResponse).await
 }
 
 async fn wait_for_ready_inner(
     admin_port: u16,
     timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_health_target(admin_port, timeout, HealthWaitTarget::ReadyFlag).await
+}
+
+#[derive(Clone, Copy)]
+enum HealthWaitTarget {
+    SuccessfulResponse,
+    ReadyFlag,
+}
+
+impl HealthWaitTarget {
+    fn timeout_description(self) -> &'static str {
+        match self {
+            Self::SuccessfulResponse => "become ready",
+            Self::ReadyFlag => "report ready",
+        }
+    }
+
+    async fn evaluate(self, response: reqwest::Response) -> Result<(), String> {
+        match self {
+            Self::SuccessfulResponse if response.status().is_success() => Ok(()),
+            Self::SuccessfulResponse => Err(format!("HTTP {}", response.status())),
+            Self::ReadyFlag => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                // `ready` is part of the unauthenticated `/health` tier
+                // (status + ready), so no admin JWT is needed here.
+                let ready = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| value.get("ready").and_then(|ready| ready.as_bool()))
+                    .unwrap_or(false);
+                if status.is_success() && ready {
+                    Ok(())
+                } else {
+                    Err(format!("HTTP {}: {}", status, body))
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_health_target(
+    admin_port: u16,
+    timeout: Duration,
+    target: HealthWaitTarget,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let health_url = format!("http://127.0.0.1:{}/health", admin_port);
     let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
@@ -1064,32 +1086,19 @@ async fn wait_for_ready_inner(
     loop {
         if Instant::now() >= deadline {
             return Err(format!(
-                "gateway admin /health did not report ready on port {} within {:?} (last observation: {})",
-                admin_port, timeout, last_observation
+                "gateway admin /health did not {} on port {} within {:?} (last observation: {})",
+                target.timeout_description(), admin_port, timeout, last_observation
             )
             .into());
         }
         match client.get(&health_url).send().await {
-            Ok(r) => {
-                let status = r.status();
-                let body = r.text().await.unwrap_or_default();
-                // `ready` is part of the unauthenticated `/health` tier
-                // (status + ready), so no admin JWT is needed here.
-                let ready = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| v.get("ready").and_then(|r| r.as_bool()))
-                    .unwrap_or(false);
-                if status.is_success() && ready {
-                    return Ok(());
-                }
-                last_observation = format!("HTTP {}: {}", status, body);
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Err(err) => {
-                last_observation = err.to_string();
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
+            Ok(response) => match target.evaluate(response).await {
+                Ok(()) => return Ok(()),
+                Err(observation) => last_observation = observation,
+            },
+            Err(err) => last_observation = err.to_string(),
         }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
