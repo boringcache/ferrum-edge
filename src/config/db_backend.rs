@@ -472,6 +472,16 @@ pub fn is_mtls_dns_identity_conflict(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<MtlsDnsIdentityConflict>())
 }
 
+/// Borrow the typed conflict itself so responders can render *its* `Display`
+/// rather than the anyhow chain's outermost message. Classification matches
+/// anywhere in the chain, so rendering the outermost error would echo any
+/// driver-provided context a future caller attaches above the conflict.
+pub fn mtls_dns_identity_conflict(error: &anyhow::Error) -> Option<&MtlsDnsIdentityConflict> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<MtlsDnsIdentityConflict>())
+}
+
 /// A datastore-serialized candidate would leave an enabled
 /// `tcp_connection_throttle` attached only to unsupported protocols (global
 /// scope) or directly attached to an unsupported proxy (proxy/proxy-group
