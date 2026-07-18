@@ -3,7 +3,6 @@
 //! collapse to one backend probe per refresh window, fresh-cache hits must not
 //! probe at all, and a hung probe must be abandoned at the explicit timeout.
 
-use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -16,15 +15,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 type HealthCache = ArcSwap<Option<CachedDbHealthResult>>;
 
-fn ok_probe(
-    probe_calls: Arc<AtomicUsize>,
-    latency: Duration,
-) -> impl Future<Output = Result<(), std::io::Error>> {
-    async move {
-        probe_calls.fetch_add(1, Ordering::SeqCst);
-        tokio::time::sleep(latency).await;
-        Ok(())
-    }
+async fn ok_probe(probe_calls: Arc<AtomicUsize>, latency: Duration) -> Result<(), std::io::Error> {
+    probe_calls.fetch_add(1, Ordering::SeqCst);
+    tokio::time::sleep(latency).await;
+    Ok(())
 }
 
 async fn burst(
