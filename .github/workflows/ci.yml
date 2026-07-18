@@ -3661,22 +3661,23 @@ jobs:
           copy_trusted_asset binary-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe.sha256 ferrum-edge-windows-x86_64.exe.sha256
           # Publishing must be exactly the trusted set, never whatever the
           # download happened to produce.
-          cat > "$RUNNER_TEMP/expected-assets" <<'ASSETS'
-          ferrum-edge-linux-x86_64
-          ferrum-edge-linux-x86_64.sha256
-          ferrum-cni-linux-x86_64
-          ferrum-cni-linux-x86_64.sha256
-          ferrum-edge-linux-aarch64
-          ferrum-edge-linux-aarch64.sha256
-          ferrum-cni-linux-aarch64
-          ferrum-cni-linux-aarch64.sha256
-          ferrum-edge-macos-x86_64
-          ferrum-edge-macos-x86_64.sha256
-          ferrum-edge-macos-aarch64
-          ferrum-edge-macos-aarch64.sha256
-          ferrum-edge-windows-x86_64.exe
-          ferrum-edge-windows-x86_64.exe.sha256
-ASSETS
+          printf '%s
+' \
+            ferrum-cni-linux-aarch64 \
+            ferrum-cni-linux-aarch64.sha256 \
+            ferrum-cni-linux-x86_64 \
+            ferrum-cni-linux-x86_64.sha256 \
+            ferrum-edge-linux-aarch64 \
+            ferrum-edge-linux-aarch64.sha256 \
+            ferrum-edge-linux-x86_64 \
+            ferrum-edge-linux-x86_64.sha256 \
+            ferrum-edge-macos-aarch64 \
+            ferrum-edge-macos-aarch64.sha256 \
+            ferrum-edge-macos-x86_64 \
+            ferrum-edge-macos-x86_64.sha256 \
+            ferrum-edge-windows-x86_64.exe \
+            ferrum-edge-windows-x86_64.exe.sha256 \
+            > "$RUNNER_TEMP/expected-assets"
           LC_ALL=C sort -o "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/expected-assets"
           ls -A release-assets | LC_ALL=C sort > "$RUNNER_TEMP/published-assets"
           if ! diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/published-assets"; then
