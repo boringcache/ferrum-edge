@@ -3546,8 +3546,10 @@ paths:
         transaction to restore the stamped spec resources, an orphaned
         hand-owned upstream, hand-owned cascade plugins, associations, and
         config-change records together. A shared hand-owned upstream that
-        remained live is reused rather than inserted again. The recovered proxy
-        graph's current upstream, plugin-composition, and named-schema dependencies are
+        remained live is reused rather than inserted again only when its stable
+        creation identity and ownership match the pre-delete snapshot; a same-ID
+        replacement rejects recovery. The recovered proxy graph's current
+        upstream, plugin-composition, and named-schema dependencies are
         revalidated before commit. Standalone MongoDB fails closed before
         multi-document compensation writes.
       tags: [Proxies]

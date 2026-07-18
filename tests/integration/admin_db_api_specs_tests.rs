@@ -961,6 +961,54 @@ async fn restore_bundle_preserves_preexisting_shared_additional_upstream() {
 }
 
 #[tokio::test]
+async fn restore_bundle_rejects_recreated_additional_upstream_identity() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let upstream_id = uid("restore-recreated-hand-upstream");
+    let proxy_id = uid("restore-recreated-proxy");
+    let spec_id = uid("restore-recreated-spec");
+
+    let recreated_upstream = make_upstream(&upstream_id, ns);
+    store
+        .create_upstream(&recreated_upstream)
+        .await
+        .expect("create intervening replacement upstream");
+    let mut pre_delete_upstream = recreated_upstream.clone();
+    pre_delete_upstream.created_at =
+        recreated_upstream.created_at - chrono::Duration::seconds(1);
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.upstream_id = Some(upstream_id.clone());
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        b"reject upstream recreated after orphan cascade",
+    );
+
+    let error = store
+        .restore_api_spec_bundle(&bundle, &spec, &[pre_delete_upstream], &[])
+        .await
+        .expect_err("replacement upstream identity must reject compensation");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match its pre-delete identity"),
+        "unexpected replacement-upstream error: {error:#}"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+    assert!(store.get_upstream(ns, &upstream_id).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn restore_bundle_rejects_intervening_schema_dependency_removal() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
@@ -1022,7 +1070,7 @@ fn mongo_restore_keeps_additional_upstreams_inside_the_transaction() {
 
     assert!(restore.contains("prepare_api_spec_restore_docs("));
     assert!(restore.contains("prepared_docs.additional_upstreams"));
-    assert!(restore.contains("if existing.is_none()"));
+    assert!(restore.contains("validate_api_spec_retained_upstream_identity("));
     assert!(restore.contains("record_config_change_in_session("));
 }
 

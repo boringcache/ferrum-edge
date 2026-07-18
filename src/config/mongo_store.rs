@@ -9338,17 +9338,33 @@ mod inner {
                                         })
                                         .session(&mut *s)
                                         .await?;
-                                    if existing.is_none() {
-                                        this.upstreams()
-                                            .insert_one(doc.clone())
-                                            .session(&mut *s)
-                                            .await?;
-                                        upsert_changes.push((
-                                            upstream_namespace.to_string(),
-                                            "upstream",
-                                            upstream_id.clone(),
-                                        ));
+                                    if let Some(existing) = existing {
+                                        let existing = doc_to_upstream(existing).map_err(|error| {
+                                            mongodb::error::Error::custom(error.to_string())
+                                        })?;
+                                        let expected = doc_to_upstream(doc.clone()).map_err(
+                                            |error| {
+                                                mongodb::error::Error::custom(error.to_string())
+                                            },
+                                        )?;
+                                        crate::config::db_backend::validate_api_spec_retained_upstream_identity(
+                                            &expected,
+                                            &existing,
+                                        )
+                                        .map_err(|error| {
+                                            mongodb::error::Error::custom(error.to_string())
+                                        })?;
+                                        continue;
                                     }
+                                    this.upstreams()
+                                        .insert_one(doc.clone())
+                                        .session(&mut *s)
+                                        .await?;
+                                    upsert_changes.push((
+                                        upstream_namespace.to_string(),
+                                        "upstream",
+                                        upstream_id.clone(),
+                                    ));
                                 }
                                 // Compensation may follow an intervening
                                 // writer. Reapply the same in-session route

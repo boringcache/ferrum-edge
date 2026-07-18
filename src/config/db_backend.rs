@@ -104,12 +104,11 @@ pub(crate) async fn validate_api_spec_recovered_plugin_graph(
 /// Validate the immutable identity and ownership boundaries of an API-spec
 /// bundle before a backend starts an atomic restore.
 ///
-/// A restore deliberately uses plain inserts rather than upserts. These checks
-/// make that contract explicit: normal submissions must be unstamped, while
-/// compensation resources must be stamped with this spec, while compensating
-/// upstreams and plugins preserve their exact ownership. Existing rows are left
-/// for the backend's uniqueness constraints and transaction-candidate
-/// validation to reject.
+/// A restore deliberately avoids upserts. These checks make that contract
+/// explicit: normal submissions must be unstamped, compensation resources must
+/// be stamped with this spec, and compensating upstreams and plugins preserve
+/// their exact ownership. Backends may reuse an additional hand-owned upstream
+/// only after validating its stable pre-delete identity.
 pub(crate) fn validate_api_spec_restore_inputs(
     bundle: &crate::admin::api_specs::ExtractedBundle,
     spec: &ApiSpec,
@@ -307,6 +306,26 @@ pub(crate) fn validate_api_spec_restore_inputs(
         }
     }
 
+    Ok(())
+}
+
+/// Prove that an additional hand-owned upstream still present during
+/// compensation is the row captured before deletion, rather than a replacement
+/// created by an intervening writer after an orphan cascade removed it.
+pub(crate) fn validate_api_spec_retained_upstream_identity(
+    expected: &Upstream,
+    existing: &Upstream,
+) -> Result<(), anyhow::Error> {
+    if existing.id != expected.id
+        || existing.namespace != expected.namespace
+        || existing.api_spec_id != expected.api_spec_id
+        || existing.created_at != expected.created_at
+    {
+        anyhow::bail!(
+            "API-spec restore additional upstream '{}' does not match its pre-delete identity",
+            expected.id
+        );
+    }
     Ok(())
 }
 

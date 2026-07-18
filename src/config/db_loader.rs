@@ -6502,16 +6502,20 @@ impl DatabaseStore {
         {
             if allow_existing {
                 let existing_sql = if self.db_type == "sqlite" {
-                    self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?")
+                    self.q("SELECT * FROM upstreams WHERE id = ? AND namespace = ?")
                 } else {
-                    self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ? FOR UPDATE")
+                    self.q("SELECT * FROM upstreams WHERE id = ? AND namespace = ? FOR UPDATE")
                 };
-                let existing: Option<String> = sqlx::query_scalar(&existing_sql)
+                let existing: Option<AnyRow> = sqlx::query(&existing_sql)
                     .bind(&u.id)
                     .bind(&u.namespace)
                     .fetch_optional(&mut *tx)
                     .await?;
-                if existing.is_some() {
+                if let Some(existing) = existing {
+                    let existing = row_to_upstream(&existing)?;
+                    crate::config::db_backend::validate_api_spec_retained_upstream_identity(
+                        u, &existing,
+                    )?;
                     continue;
                 }
                 inserted_additional_upstream_ids.insert(u.id.clone());
