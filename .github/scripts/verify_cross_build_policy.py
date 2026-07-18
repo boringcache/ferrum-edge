@@ -4746,7 +4746,7 @@ def unprotected_cross_surfaces(
             sensitive_jobs.add(job_name_for_line)
             job_reasons.setdefault(
                 job_name_for_line,
-                ", ".join(sorted(line_surfaces))[:160],
+                f"line {index + 1}: {line.strip()[:160]!r}",
             )
 
     job_surfaces = [
@@ -4779,6 +4779,7 @@ def generic_workflow_cross_surfaces(
     source: str,
     *,
     include_opaque_shell_executable: bool = False,
+    reasons: dict[str, str] | None = None,
 ) -> tuple[tuple[str, ...], list[str]]:
     """Scan a workflow that must not contain any Cross-controlled surface."""
 
@@ -4805,6 +4806,7 @@ def generic_workflow_cross_surfaces(
         "__no_unprotected_cross_job__",
         required_job=False,
         include_opaque_shell_executable=include_opaque_shell_executable,
+        reasons=reasons,
     )
     if runtime_sensitive and not surfaces:
         surfaces = (f"runtime:{hashlib.sha256(contents.encode()).hexdigest()}",)
@@ -4823,19 +4825,30 @@ def validate_workflow_collection(
     for name, contents in sorted(workflows.items()):
         if name in PROTECTED_WORKFLOW_FILENAMES:
             continue
+        surface_reasons: dict[str, str] = {}
         surfaces, failures = generic_workflow_cross_surfaces(
             contents,
             f"{source}/{name}",
+            reasons=surface_reasons,
         )
         errors.extend(failures)
         if surfaces:
             located = cross_surface_line_report(contents)
             if not located:
-                # The file was rejected by a whole-file signal — a remote
-                # action or a resolved run program — rather than by a line.
-                located = " (" + ", ".join(
-                    surface[:160] for surface in surfaces[:3]
-                ) + ")"
+                # The file was rejected by a job- or whole-file signal — a
+                # remote action or a resolved run program — rather than by a
+                # line of its own source.
+                described = [
+                    (
+                        f"{surface.split(':')[1]}: "
+                        f"{surface_reasons[surface.split(':')[1]]}"
+                        if surface.startswith("job:")
+                        and surface.split(":")[1] in surface_reasons
+                        else surface[:160]
+                    )
+                    for surface in surfaces[:3]
+                ]
+                located = " (" + ", ".join(described) + ")"
             errors.append(
                 f"{source}/{name} contains an unprotected Cross executable or "
                 "configuration input" + located
@@ -5206,6 +5219,10 @@ def quote_aware_heredoc_starts(line: str) -> tuple[tuple[int, str], ...]:
 
     starts: list[tuple[int, str]] = []
     quote: str | None = None
+    # A command substitution re-enters shell context, so quoting resets inside
+    # it. `apply_configmap "$ctx" name "$(cat <<YAML` really does open a
+    # heredoc even though an unclosed double quote precedes it.
+    substitutions: list[str | None] = []
     escaped = False
     index = 0
     while index < len(line):
@@ -5216,6 +5233,15 @@ def quote_aware_heredoc_starts(line: str) -> tuple[tuple[int, str], ...]:
             continue
         if character == "\\" and quote != "'":
             escaped = True
+            index += 1
+            continue
+        if quote != "'" and line.startswith("$(", index):
+            substitutions.append(quote)
+            quote = None
+            index += 2
+            continue
+        if character == ")" and quote is None and substitutions:
+            quote = substitutions.pop()
             index += 1
             continue
         if quote is not None:
@@ -9278,7 +9304,6 @@ pre_build = []
         surfaces, errors = generic_workflow_cross_surfaces(
             markdown_workflow.replace("BODY", body),
             "self-test markdown workflow",
-            include_opaque_shell_executable=True,
         )
         if surfaces or errors:
             failures.append(f"{label} was rejected")
