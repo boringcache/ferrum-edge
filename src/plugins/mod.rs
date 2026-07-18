@@ -322,6 +322,28 @@ pub(crate) fn response_body_rewrite_allowed(response_status: u16) -> bool {
     !matches!(response_status, 206 | 226)
 }
 
+/// Drop every response header that describes the *previous* bytes.
+///
+/// Validators (`ETag`, `Last-Modified`), digests/checksums (`Digest`,
+/// `Content-Digest`, `Content-MD5`, vendor checksum families), content-bound
+/// signatures, and range/delta metadata are all bound to a specific octet
+/// sequence. Once the gateway changes the client-visible bytes, keeping them
+/// would hand the client a validator for a representation it never receives —
+/// corrupting cache revalidation and integrity checks.
+///
+/// This is deliberately shared rather than inlined: **every** point that changes
+/// the client-visible bytes must invalidate identically. Today that is a
+/// permitted body rewrite ([`finalize_response_body_transformation`]) and a
+/// representation decode
+/// ([`response_representation::install_decoded_response_body`]) — including a
+/// decode whose transform phase then matches no rule, which still replaces
+/// encoded bytes with identity bytes and so still invalidates.
+pub(crate) fn invalidate_content_bound_response_headers(
+    response_headers: &mut HashMap<String, String>,
+) {
+    response_headers.retain(|name, _| !is_transform_invalidated_response_header(name));
+}
+
 /// Finalize one successful buffered response-body transformation.
 ///
 /// Every protocol path calls this immediately after replacing the bytes and
@@ -330,13 +352,16 @@ pub(crate) fn response_body_rewrite_allowed(response_status: u16) -> bool {
 /// so an individual transformer cannot accidentally leave stale metadata. The
 /// plugin-specific hook runs afterward and may attach metadata it recomputed
 /// for the new representation. Returning `None` from the transform skips this
-/// function, preserving untouched response semantics.
+/// function, preserving untouched response semantics — except that a
+/// representation *decode* invalidates at the decode itself (see
+/// [`invalidate_content_bound_response_headers`]), because it has already
+/// changed the client-visible octets whether or not a rule then matches.
 pub(crate) fn finalize_response_body_transformation(
     plugin: &dyn Plugin,
     ctx: &mut RequestContext,
     response_headers: &mut HashMap<String, String>,
 ) {
-    response_headers.retain(|name, _| !is_transform_invalidated_response_header(name));
+    invalidate_content_bound_response_headers(response_headers);
     plugin.on_response_body_transformed(ctx, response_headers);
 }
 

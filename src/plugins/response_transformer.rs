@@ -581,20 +581,30 @@ impl Plugin for ResponseTransformer {
         //     `return None` in `transform_response_body`;
         //   * SSE, which `should_buffer_response_body` keeps out of the buffered
         //     path entirely, so no transform ever runs over it.
-        // The media-type condition requires a *positive* JSON `Content-Type`.
-        // A non-JSON type is a documented decline (the configured rules address
-        // JSON fields). An ABSENT type is treated the same way, deliberately: the
-        // gate would otherwise have to parse every untyped body as JSON and
-        // reject the ones that are not, which turns ordinary untyped responses —
-        // minimal error pages, redirect bodies, plain-text health output — into
-        // 502s without protecting anything, since no JSON field rule can be
-        // proven to target an untyped document in the first place. This shares
-        // the (pre-existing) property that a backend which mislabels or omits
-        // `Content-Type` is outside what this policy can enforce.
+        // The media-type condition mirrors `transform_response_body` EXACTLY,
+        // and that symmetry is the whole point: this predicate must claim every
+        // response the transform would actually rewrite, or the gate declines to
+        // inspect bytes the enforcer then fails to parse — which is the very
+        // `None`-conflation bypass the gate exists to close.
+        //
+        // So an ABSENT `Content-Type` is claimed, because the transform treats
+        // it as JSON (`if let Some(ct) = content_type && !is_json => None`, i.e.
+        // `None` falls through to `apply_body_rules`). Declining it here while
+        // the enforcer accepts it would let an untyped `gzip`/`206`/malformed
+        // response carry a protected field straight past a configured redaction.
+        // A non-JSON type stays a documented decline, matching the same early
+        // return in the transform.
+        //
+        // Consequence, accepted deliberately: an untyped response that is not
+        // parseable JSON is now rejected rather than forwarded when a body
+        // policy is configured. That is the fail-closed direction, and it only
+        // affects proxies that configured a body redaction *and* have a backend
+        // that omits `Content-Type` — an operator-visible backend defect, not
+        // ordinary traffic.
         !self.body_rules.is_empty()
             && self.rules_enabled()
             && !super::utils::sse::is_sse_request(ctx)
-            && response_content_type.is_some_and(body_transform::is_json_content_type)
+            && response_content_type.is_none_or(body_transform::is_json_content_type)
     }
 
     async fn after_proxy(

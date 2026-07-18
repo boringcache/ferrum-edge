@@ -1484,6 +1484,10 @@ pub mod _test_support {
     /// returns the full `(response_replaced, body_transformed)` pair, so a test
     /// can distinguish "the gate rejected and replaced the response" from "the
     /// transforms ran and rewrote the body" from "nothing happened".
+    ///
+    /// `response_body_rejected` is the production flag every buffered path
+    /// maintains: `false` while the bytes are still the backend's, `true` once an
+    /// `on_response_body` hook replaced them with a gateway-authored rejection.
     pub async fn transform_buffered_response_body_with_deadline_full_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -1491,10 +1495,12 @@ pub mod _test_support {
         response_headers: &mut HashMap<String, String>,
         response_body: &mut Vec<u8>,
         grpc_web_response_content_type: Option<&str>,
+        response_body_rejected: bool,
     ) -> (bool, bool) {
         crate::proxy::transform_buffered_response_body_with_deadline(
             plugins,
             ctx,
+            crate::proxy::buffered_response_representation_origin(response_body_rejected),
             response_status,
             response_headers,
             response_body,
@@ -1642,6 +1648,9 @@ pub mod _test_support {
         crate::proxy::transform_buffered_response_body_with_deadline(
             plugins,
             ctx,
+            // These helpers publish a real backend response, matching every
+            // production caller that has not seen an `on_response_body` reject.
+            crate::proxy::buffered_response_representation_origin(false),
             response_status,
             response_headers,
             response_body,

@@ -23,7 +23,9 @@ use ferrum_edge::_test_support::{
     stamp_original_response_metadata_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
-use ferrum_edge::plugins::{Plugin, RequestContext, response_transformer::ResponseTransformer};
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, RequestContext, response_transformer::ResponseTransformer,
+};
 use serde_json::json;
 
 /// A `response_transformer` whose only job is to strip a secret field, i.e. the
@@ -93,6 +95,7 @@ async fn run_backend_transform(
         &mut headers,
         &mut body,
         None,
+        false,
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
@@ -285,6 +288,7 @@ async fn origin_encoding_is_read_from_the_snapshot_not_the_mutated_live_header()
         &mut headers,
         &mut body,
         None,
+        false,
     )
     .await;
 
@@ -361,6 +365,7 @@ async fn fragment_hidden_by_a_rewritten_status_is_still_rejected() {
         &mut headers,
         &mut body,
         None,
+        false,
     )
     .await;
 
@@ -553,6 +558,7 @@ async fn unstamped_backend_response_cannot_prove_its_representation_and_is_rejec
         &mut headers,
         &mut body,
         None,
+        false,
     )
     .await;
 
@@ -641,6 +647,7 @@ async fn unprotected_responses_are_never_rejected_by_the_gate() {
             &mut headers,
             &mut body,
             None,
+        false,
         )
         .await;
 
@@ -678,20 +685,88 @@ async fn bom_prefixed_json_is_rejected_rather_than_leniently_accepted() {
     assert_secret_not_forwarded(&body);
 }
 
-/// A response with no `Content-Type` at all must not become a 502. Untyped
-/// bodies (minimal error pages, redirect bodies, plain-text health output) are
-/// outside what a JSON field policy can enforce, exactly like a mislabeled one.
-#[tokio::test]
-async fn untyped_response_is_not_claimed_and_is_forwarded_unchanged() {
-    let original = b"<html><body>backend error</body></html>".to_vec();
-    let (replaced, transformed, status, _, body, reason) =
-        run_backend_transform(200, HashMap::new(), original.clone()).await;
+// ---------------------------------------------------------------------------
+// Absent `Content-Type`: the claim predicate must match the enforcer exactly.
+//
+// `transform_response_body` treats `None` as JSON — it only declines on a
+// *present* non-JSON type — and calls `apply_body_rules`. A claim predicate that
+// declined `None` would leave untyped bodies un-inspected by the gate while the
+// enforcer still tried (and silently failed) to parse them, which is the exact
+// `None`-conflation bypass the gate exists to close.
+// ---------------------------------------------------------------------------
 
-    assert!(!replaced, "an untyped body must not be rejected");
-    assert!(!transformed);
+/// The bypass itself: an untyped **gzip** body carrying a protected field. The
+/// gate must claim it, decode it, and let the redaction apply — never forward
+/// the encoded protected bytes because the backend omitted `Content-Type`.
+#[tokio::test]
+async fn untyped_encoded_body_is_claimed_decoded_and_redacted() {
+    let headers = HashMap::from([("content-encoding".to_string(), "gzip".to_string())]);
+
+    let (replaced, transformed, status, headers, body, reason) =
+        run_backend_transform(200, headers, gzip(br#"{"secret":"hunter2","keep":1}"#)).await;
+
+    assert!(!replaced, "a decodable untyped JSON body must be served");
+    assert!(
+        transformed,
+        "the configured body rule must apply to an untyped JSON document"
+    );
     assert_eq!(status, 200);
     assert_eq!(reason, None);
-    assert_eq!(body, original);
+    assert_secret_not_forwarded(&body);
+    assert!(String::from_utf8_lossy(&body).contains("keep"));
+    assert!(!headers.contains_key("content-encoding"));
+}
+
+/// An untyped body the enforcer cannot parse must be rejected, not forwarded.
+/// Forwarding is what made this a bypass: `apply_body_rules` returns `None`, the
+/// lifecycle reads "no rule matched", and the protected value ships.
+#[tokio::test]
+async fn untyped_unparseable_body_is_rejected_not_forwarded() {
+    let original = br#"{"secret":"hunter2", TRUNCATED"#.to_vec();
+    let (replaced, transformed, status, _, body, reason) =
+        run_backend_transform(200, HashMap::new(), original).await;
+
+    assert!(
+        replaced,
+        "an untyped body the enforcer cannot parse must not be forwarded"
+    );
+    assert!(!transformed);
+    assert_eq!(status, 502);
+    assert_eq!(reason.as_deref(), Some("unparseable_document"));
+    assert_secret_not_forwarded(&body);
+}
+
+/// An untyped **fragment** is claimed too, so the partial-representation
+/// rejection applies to it exactly as it does to a typed one.
+#[tokio::test]
+async fn untyped_partial_representation_is_rejected() {
+    let headers = HashMap::from([("content-range".to_string(), "bytes 0-19/512".to_string())]);
+    let (replaced, _, status, _, body, reason) =
+        run_backend_transform(206, headers, br#"{"secret":"hunter2"}"#.to_vec()).await;
+
+    assert!(replaced);
+    assert_eq!(status, 502);
+    assert_eq!(reason.as_deref(), Some("partial_representation"));
+    assert_secret_not_forwarded(&body);
+}
+
+/// The ordinary case: an untyped body that *is* parseable JSON is transformed
+/// like any other claimed document, matching what the enforcer already did.
+#[tokio::test]
+async fn untyped_transformable_json_body_is_redacted() {
+    let (replaced, transformed, status, _, body, reason) = run_backend_transform(
+        200,
+        HashMap::new(),
+        br#"{"secret":"hunter2","keep":1}"#.to_vec(),
+    )
+    .await;
+
+    assert!(!replaced);
+    assert!(transformed);
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_secret_not_forwarded(&body);
+    assert!(String::from_utf8_lossy(&body).contains("keep"));
 }
 
 /// A non-JSON media type is a documented decline for this policy, not an
@@ -747,6 +822,7 @@ async fn multiple_transformer_instances_all_apply_to_a_decoded_body() {
         &mut headers,
         &mut body,
         None,
+        false,
     )
     .await;
 
@@ -789,6 +865,7 @@ async fn grpc_web_representation_rejection_uses_the_grpc_web_error_shape() {
         &mut headers,
         &mut body,
         Some("application/grpc-web+proto"),
+        false,
     )
     .await;
 
@@ -810,6 +887,391 @@ async fn grpc_web_representation_rejection_uses_the_grpc_web_error_shape() {
     assert!(
         !headers.contains_key("content-range"),
         "the replacement must not carry the fragment's range metadata"
+    );
+    assert_secret_not_forwarded(&body);
+}
+
+// ---------------------------------------------------------------------------
+// A decode is itself a change to the client-visible bytes.
+// ---------------------------------------------------------------------------
+
+/// Regression: a claimed gzip body that decodes cleanly but that **no** body
+/// rule happens to change never reaches `finalize_response_body_transformation`,
+/// so the invalidation has to happen at the decode. Otherwise the client is
+/// served identity bytes carrying the origin's validator for the *encoded* ones —
+/// a strong `ETag`/`Digest` describing a representation it never receives, which
+/// corrupts cache revalidation and integrity checks.
+#[tokio::test]
+async fn decoded_body_invalidates_validators_even_when_no_rule_matches() {
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("etag".to_string(), "\"gzipped-v1\"".to_string());
+    headers.insert("content-digest".to_string(), "sha-256=:abc:".to_string());
+    headers.insert("content-md5".to_string(), "deadbeef".to_string());
+    let modified = "Tue, 15 Nov 2022 12:45:26 GMT".to_string();
+    headers.insert("last-modified".to_string(), modified);
+    headers.insert("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string());
+
+    // No `secret` key, so the configured `remove` rule matches nothing.
+    let plaintext = br#"{"keep":1}"#;
+    let (replaced, transformed, status, headers, body, reason) =
+        run_backend_transform(200, headers, gzip(plaintext)).await;
+
+    assert!(!replaced, "a decodable, unmatched document must be served");
+    assert!(
+        !transformed,
+        "no rule matched, so this is the transform no-op path under test"
+    );
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_eq!(
+        body, plaintext,
+        "the client receives the decoded identity bytes"
+    );
+    assert!(
+        !headers.contains_key("content-encoding"),
+        "decoded bytes must not still claim a content coding"
+    );
+    for stale in [
+        "etag",
+        "content-digest",
+        "content-md5",
+        "last-modified",
+        "x-amz-checksum-crc32",
+    ] {
+        assert!(
+            !headers.contains_key(stale),
+            "`{stale}` described the encoded bytes and must not survive the decode"
+        );
+    }
+    assert_eq!(
+        headers.get("content-length"),
+        Some(&body.len().to_string()),
+        "content-length must describe the decoded bytes"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Backend fragment evidence is status-semantic, not header-presence.
+// ---------------------------------------------------------------------------
+
+/// A complete `416` status document. RFC 9110 §15.5.17 defines
+/// `Content-Range: bytes */<len>` there as reporting the selected
+/// representation's length — it does not make the body a range slice. Rejecting
+/// it would fail closed on an ordinary backend error while protecting nothing,
+/// since the body is a complete, fully inspectable document.
+#[tokio::test]
+async fn complete_416_with_unsatisfied_range_header_is_inspected_not_rejected() {
+    let mut headers = json_headers();
+    headers.insert("content-range".to_string(), "bytes */2048".to_string());
+
+    let (replaced, transformed, status, headers, body, reason) =
+        run_backend_transform(416, headers, br#"{"secret":"hunter2","keep":1}"#.to_vec()).await;
+
+    assert!(
+        !replaced,
+        "a complete 416 error document must not become a 502"
+    );
+    assert!(
+        transformed,
+        "the configured policy must be applied to it, not bypassed"
+    );
+    assert_eq!(status, 416, "the backend's own status must survive");
+    assert_eq!(reason, None);
+    assert_secret_not_forwarded(&body);
+    assert!(String::from_utf8_lossy(&body).contains("keep"));
+    assert!(
+        !headers.contains_key("content-range"),
+        "the permitted rewrite must invalidate the stale range metadata"
+    );
+}
+
+/// The same rule across the rest of the non-2xx category: a `503` echoing a
+/// stale `IM` field is an error document, not a delta.
+#[tokio::test]
+async fn complete_non_2xx_with_stale_delta_header_is_inspected_not_rejected() {
+    let mut headers = json_headers();
+    headers.insert("im".to_string(), "feed".to_string());
+    headers.insert("delta-base".to_string(), "\"base-v1\"".to_string());
+
+    let (replaced, transformed, status, headers, body, reason) =
+        run_backend_transform(503, headers, br#"{"secret":"hunter2","keep":1}"#.to_vec()).await;
+
+    assert!(!replaced);
+    assert!(transformed);
+    assert_eq!(status, 503);
+    assert_eq!(reason, None);
+    assert_secret_not_forwarded(&body);
+    for stale in ["im", "delta-base"] {
+        assert!(!headers.contains_key(stale));
+    }
+}
+
+/// The narrowing must not weaken real fragment rejection. A backend `2xx`
+/// carrying range or delta metadata is still exactly the shape a relabeled
+/// fragment takes, and is still rejected.
+#[tokio::test]
+async fn backend_2xx_carrying_fragment_metadata_is_still_rejected() {
+    for header in ["content-range", "im"] {
+        let mut headers = json_headers();
+        let value = if header == "content-range" {
+            "bytes 0-19/512"
+        } else {
+            "feed"
+        };
+        headers.insert(header.to_string(), value.to_string());
+
+        let (replaced, _, status, _, body, reason) =
+            run_backend_transform(200, headers, br#"{"secret":"hunter2"}"#.to_vec()).await;
+
+        assert!(replaced, "a 200 bearing `{header}` must still be rejected");
+        assert_eq!(status, 502);
+        assert_eq!(reason.as_deref(), Some("partial_representation"));
+        assert_secret_not_forwarded(&body);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test-only plugins for the rejection-shape findings.
+// ---------------------------------------------------------------------------
+
+/// An opt-in reject decorator, standing in for the CORS / correlation-ID /
+/// security-header plugins that set `applies_after_proxy_on_reject`.
+struct RejectDecorator;
+
+impl Plugin for RejectDecorator {
+    fn name(&self) -> &str {
+        "test_reject_decorator"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        response_headers.insert(
+            "access-control-allow-origin".to_string(),
+            "https://app.example".to_string(),
+        );
+        PluginResult::Continue
+    }
+}
+
+/// A body policy that claims every response regardless of media type. Real
+/// `response_transformer` declines non-JSON, so this is the only way to drive a
+/// claimed **native gRPC** response into the gate — the composition the native
+/// branch of the rejection path exists for.
+struct ClaimEverythingPolicy;
+
+impl Plugin for ClaimEverythingPolicy {
+    fn name(&self) -> &str {
+        "test_claim_everything_policy"
+    }
+
+    fn enforces_response_body_policy(
+        &self,
+        _ctx: &RequestContext,
+        _response_content_type: Option<&str>,
+    ) -> bool {
+        true
+    }
+}
+
+/// A representation rejection is a gateway-authored terminal response, so it must
+/// keep the same opt-in reject decorators an ordinary body reject keeps. Dropping
+/// `Access-Control-Allow-Origin` here while every other gateway rejection keeps it
+/// makes the error unreadable to a browser client.
+#[tokio::test]
+async fn representation_rejection_preserves_opt_in_reject_decorators() {
+    let mut plugins = redacting_plugins();
+    plugins.push(Arc::new(RejectDecorator));
+
+    let mut ctx = make_ctx();
+    let mut status = 206;
+    let mut headers = json_headers();
+    headers.insert("content-range".to_string(), "bytes 0-19/512".to_string());
+    headers.insert("etag".to_string(), "\"fragment-v1\"".to_string());
+    let mut body = br#"{"secret":"hunter2"}"#.to_vec();
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(replaced);
+    assert_eq!(status, 502);
+    assert_eq!(
+        representation_rejection_reason_for_test(&ctx),
+        Some("partial_representation")
+    );
+    assert_eq!(
+        headers.get("access-control-allow-origin").map(String::as_str),
+        Some("https://app.example"),
+        "opt-in reject decorators must run for a representation error too"
+    );
+    // ...without letting the rejected representation's own headers survive.
+    for leaked in ["content-range", "etag"] {
+        assert!(
+            !headers.contains_key(leaked),
+            "backend `{leaked}` must not survive onto the gateway error"
+        );
+    }
+    assert_secret_not_forwarded(&body);
+}
+
+/// The native gRPC branch must shed backend headers before synthesizing its
+/// trailers-only `INTERNAL`, exactly as the gRPC-Web branch and the deadline
+/// replacement do. Otherwise `set-cookie`, validators, and cache directives
+/// describing the *rejected* representation ride out on a gateway-authored error.
+#[tokio::test]
+async fn native_grpc_representation_rejection_strips_backend_headers() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ClaimEverythingPolicy)];
+
+    let mut ctx = make_ctx();
+    let mut status = 200;
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc+proto".to_string(),
+    )]);
+    // An unsupported coding is the rejection trigger; the rest is backend
+    // metadata that must not survive.
+    headers.insert("content-encoding".to_string(), "zstd".to_string());
+    headers.insert("set-cookie".to_string(), "session=abc123".to_string());
+    headers.insert("etag".to_string(), "\"backend-v1\"".to_string());
+    headers.insert("cache-control".to_string(), "public, max-age=600".to_string());
+    let mut body = b"\x00\x00\x00\x00\x05hello".to_vec();
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(replaced, "an undecodable claimed representation is rejected");
+    assert_eq!(
+        status, 200,
+        "a native gRPC error is trailers-only under HTTP 200"
+    );
+    assert_eq!(
+        representation_rejection_reason_for_test(&ctx),
+        Some("unsupported_content_coding")
+    );
+    assert!(
+        body.is_empty(),
+        "a trailers-only gRPC error carries no body"
+    );
+    assert!(
+        headers.contains_key("grpc-status"),
+        "the gRPC terminal status must be present"
+    );
+    for leaked in ["set-cookie", "etag", "cache-control", "content-encoding"] {
+        assert!(
+            !headers.contains_key(leaked),
+            "backend `{leaked}` survived onto a gateway-authored gRPC error"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// An earlier body rejection must survive the gate.
+// ---------------------------------------------------------------------------
+
+/// Once `on_response_body` has replaced the backend response with a plugin
+/// rejection, the buffered bytes are the gateway's own. Judging them against the
+/// *replaced* backend's snapshot would decode a body that was never encoded — or,
+/// as here, reject a legitimate gateway `403` as a `206` fragment and overwrite it
+/// with a generic `502`, destroying the very rejection the policy asked for.
+#[tokio::test]
+async fn earlier_body_rejection_survives_the_representation_gate() {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+
+    // The backend response really was an encoded fragment...
+    let mut backend_headers = json_headers();
+    backend_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    backend_headers.insert("content-range".to_string(), "bytes 0-19/512".to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, 206, &backend_headers);
+
+    // ...but `on_response_body` already replaced it with a gateway rejection.
+    let rejection_body = br#"{"error":"forbidden","keep":1}"#.to_vec();
+    let mut status = 403;
+    let mut headers = json_headers();
+    let mut body = rejection_body.clone();
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        true,
+    )
+    .await;
+
+    assert!(
+        !replaced,
+        "a gateway-authored rejection must not be overwritten by a representation error"
+    );
+    assert_eq!(status, 403, "the plugin's rejection status must survive");
+    assert_eq!(
+        representation_rejection_reason_for_test(&ctx),
+        None,
+        "the replaced backend's representation is no longer under inspection"
+    );
+    assert_eq!(body, rejection_body, "the rejection body must survive");
+}
+
+/// The control for the case above: the identical backend snapshot, with the
+/// backend response still in place, is still rejected. The provenance switch
+/// must not become a way to skip the gate on real backend bytes.
+#[tokio::test]
+async fn backend_bytes_under_the_same_snapshot_are_still_rejected() {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-range".to_string(), "bytes 0-19/512".to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, 206, &headers);
+
+    let mut status = 206;
+    let mut body = gzip(br#"{"secret":"hunter2"}"#);
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(replaced);
+    assert_eq!(status, 502);
+    assert_eq!(
+        representation_rejection_reason_for_test(&ctx),
+        Some("partial_representation")
     );
     assert_secret_not_forwarded(&body);
 }

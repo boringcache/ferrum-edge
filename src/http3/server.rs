@@ -6336,6 +6336,12 @@ async fn handle_h3_request(
             );
         }
 
+        // Set once an `on_response_body` hook replaces the backend response with a
+        // gateway-authored rejection. From that point the buffered bytes are the
+        // gateway's own, so the representation gate must judge them as such
+        // instead of against the replaced backend response's snapshot.
+        let mut response_body_rejected = false;
+
         // on_response_body hooks — only for buffered responses when plugins exist.
         // Mirrors the HTTP/1.1 path in proxy/mod.rs.
         if !after_proxy_rejected && !plugins.is_empty() {
@@ -6413,6 +6419,7 @@ async fn handle_h3_request(
                 .await;
                 // Backend trailers no longer describe this (rejected) response.
                 response_trailers = None;
+                response_body_rejected = true;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
@@ -6424,6 +6431,7 @@ async fn handle_h3_request(
                 crate::proxy::transform_buffered_response_body_with_deadline(
                     &plugins,
                     &mut ctx,
+                    crate::proxy::buffered_response_representation_origin(response_body_rejected),
                     &mut response_status,
                     &mut response_headers,
                     &mut response_body,

@@ -2754,6 +2754,10 @@ where
                     initial_response_header_policy_plugins,
                 )
                 .await;
+                // Set once an `on_response_body` hook replaces the backend
+                // response with a gateway-authored rejection; from that point the
+                // buffered bytes are the gateway's own.
+                let mut response_body_rejected = false;
                 for plugin in plugins {
                     let result = plugin
                         .on_response_body(ctx, response_status, &response_headers, &response_body)
@@ -2771,6 +2775,7 @@ where
                                 &mut response_body,
                             )
                             .await;
+                            response_body_rejected = true;
                             break;
                         }
                     }
@@ -2785,13 +2790,15 @@ where
                 let admission = crate::proxy::admit_buffered_response_body_transforms(
                     plugins,
                     ctx,
-                    crate::plugins::response_representation::RepresentationOrigin::Backend,
+                    crate::proxy::buffered_response_representation_origin(response_body_rejected),
                     &mut response_status,
                     &mut response_headers,
                     &mut response_body,
                     grpc_web_response_content_type,
                     &[],
-                );
+                    true,
+                )
+                .await;
                 if matches!(
                     admission,
                     crate::proxy::BufferedTransformAdmission::Proceed {
@@ -4537,6 +4544,10 @@ where
             {
                 response_trailers.clear();
             }
+            // Set once an `on_response_body` hook replaces the backend response
+            // with a gateway-authored rejection; from that point the buffered
+            // bytes are the gateway's own.
+            let mut response_body_rejected = false;
             for plugin in plugins.iter() {
                 let result = match crate::plugins::await_grpc_deadline(
                     ctx.grpc_deadline_at(),
@@ -4574,6 +4585,7 @@ where
                         )
                         .await;
                         buffered_initial_response_header_policy_state = None;
+                        response_body_rejected = true;
                         break;
                     }
                 }
@@ -4596,13 +4608,15 @@ where
             let admission = crate::proxy::admit_buffered_response_body_transforms(
                 plugins,
                 ctx,
-                crate::plugins::response_representation::RepresentationOrigin::Backend,
+                crate::proxy::buffered_response_representation_origin(response_body_rejected),
                 &mut response_status,
                 &mut plugin_response_headers,
                 &mut response_body,
                 grpc_web_response_content_type,
                 initial_response_header_policy_plugins,
-            );
+                true,
+            )
+            .await;
             if matches!(
                 admission,
                 crate::proxy::BufferedTransformAdmission::Rejected
