@@ -1950,9 +1950,8 @@ async fn api_spec_delete_rejects_cascade_plugins_that_atomic_restore_cannot_recr
             .await
             .expect("inject malformed cascade scope");
 
-        let (delete_status, delete_body) = client
-            .delete_json(&format!("/api-specs/{spec_id}"))
-            .await;
+        let (delete_status, delete_body) =
+            client.delete_json(&format!("/api-specs/{spec_id}")).await;
         assert_eq!(
             delete_status,
             reqwest::StatusCode::UNPROCESSABLE_ENTITY,
