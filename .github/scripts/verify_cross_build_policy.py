@@ -13,6 +13,7 @@ import re
 import shlex
 import sys
 import tomllib
+from collections.abc import Callable, Iterable
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -232,7 +233,16 @@ DIGEST_ARTIFACT_OWNERS = {
         "docker-ebpf-digest-": ("docker-ebpf",),
     },
 }
-UPLOAD_ARTIFACT_ACTION = re.compile(r"^actions/upload-artifact@[0-9a-f]{40}\b")
+# Ownership of the digest namespace does not depend on how the uploading action
+# is pinned. `actions/upload-artifact@v7` uploads exactly what the SHA-pinned
+# spelling uploads and is matched by exactly the same `docker-digest-*` wildcard,
+# so every ref — tag, branch, SHA, or none at all — is checked. Action
+# references are case-insensitive to the runner, so the owner match is too.
+UPLOAD_ARTIFACT_ACTION = re.compile(r"^actions/upload-artifact(?:@|\s*$)", re.IGNORECASE)
+# A repo-local composite action is a step like any other and can run the upload
+# itself. The calling job is not knowable from the action file, so a local action
+# is never a digest owner.
+LOCAL_ACTION_STEP_REFERENCE = re.compile(r"^\.{1,2}/")
 # The Docker jobs never name the protected ARM64 artifact literally. They
 # select it through matrix values that the download step and the context step
 # interpolate, so freezing the job's `needs`/`if` alone would still let a pull
@@ -299,8 +309,503 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
     },
 }
 
-# Only the publication-control fields that consume the protected ARM64
-# artifacts are frozen. The rest of each publishing job remains editable.
+# The publishing jobs consume their inputs by wildcard: `files: release-assets/*`
+# and `gh release create ... release-assets/*` publish whatever the job left in
+# that directory, and `docker buildx imagetools create ... $(printf ... *)`
+# publishes whatever digest files the download produced. Freezing only the
+# download list or only the `needs` graph therefore leaves the rest of the job
+# free to add a wildcard download, copy an extra file into `release-assets`, or
+# hard-code an additional digest into a published manifest tag — each of which
+# reaches the published artifact set without touching a protected ARM64 build.
+# Any step of these jobs can write into the wildcard, including a step whose
+# stated purpose is release notes, so the whole `steps:` list is the contract.
+# Changing one is a trusted-base change, exactly like the protected build job.
+
+CI_LATEST_RELEASE_STEPS = r"""    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      # Download exactly the five trusted build artifacts by name. A wildcard
+      # pattern would also accept any other artifact whose name happened to
+      # start with the same prefix, so an unrelated job could contribute files
+      # to the published `latest` release.
+      - name: Download native binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: binary-x86_64-unknown-linux-gnu
+          path: downloaded-artifacts/binary-x86_64-unknown-linux-gnu
+
+      - name: Download protected ARM64 binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: binary-aarch64-unknown-linux-gnu
+          path: downloaded-artifacts/binary-aarch64-unknown-linux-gnu
+
+      - name: Download macOS x86_64 binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: binary-x86_64-apple-darwin
+          path: downloaded-artifacts/binary-x86_64-apple-darwin
+
+      - name: Download macOS aarch64 binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: binary-aarch64-apple-darwin
+          path: downloaded-artifacts/binary-aarch64-apple-darwin
+
+      - name: Download Windows binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: binary-x86_64-pc-windows-msvc
+          path: downloaded-artifacts/binary-x86_64-pc-windows-msvc
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          # The closed, auditable published asset set. Each entry names one
+          # exact trusted artifact directory and one exact file inside it, so a
+          # colliding or extra upload can neither add nor replace an asset.
+          copy_trusted_asset() {
+            if [ ! -f "downloaded-artifacts/$1" ] || [ -L "downloaded-artifacts/$1" ]; then
+              echo "::error::missing trusted release asset $1" >&2
+              exit 1
+            fi
+            cp "downloaded-artifacts/$1" "release-assets/$2"
+            echo "$2" >> "$RUNNER_TEMP/expected-assets"
+          }
+          : > "$RUNNER_TEMP/expected-assets"
+          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64 ferrum-edge-linux-x86_64
+          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64.sha256 ferrum-edge-linux-x86_64.sha256
+          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64 ferrum-cni-linux-x86_64
+          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64.sha256 ferrum-cni-linux-x86_64.sha256
+          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64 ferrum-edge-linux-aarch64
+          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64.sha256 ferrum-edge-linux-aarch64.sha256
+          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64 ferrum-cni-linux-aarch64
+          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64.sha256 ferrum-cni-linux-aarch64.sha256
+          copy_trusted_asset binary-x86_64-apple-darwin/ferrum-edge-macos-x86_64 ferrum-edge-macos-x86_64
+          copy_trusted_asset binary-x86_64-apple-darwin/ferrum-edge-macos-x86_64.sha256 ferrum-edge-macos-x86_64.sha256
+          copy_trusted_asset binary-aarch64-apple-darwin/ferrum-edge-macos-aarch64 ferrum-edge-macos-aarch64
+          copy_trusted_asset binary-aarch64-apple-darwin/ferrum-edge-macos-aarch64.sha256 ferrum-edge-macos-aarch64.sha256
+          copy_trusted_asset binary-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe ferrum-edge-windows-x86_64.exe
+          copy_trusted_asset binary-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe.sha256 ferrum-edge-windows-x86_64.exe.sha256
+          # Publishing must be exactly the trusted set, never whatever the
+          # download happened to produce.
+          LC_ALL=C sort -o "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/expected-assets"
+          ls -A release-assets | LC_ALL=C sort > "$RUNNER_TEMP/published-assets"
+          if ! diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/published-assets"; then
+            echo "::error::published release asset set drifted from the trusted set" >&2
+            exit 1
+          fi
+          cd release-assets
+          sha256sum -c ./*.sha256
+          cd ..
+          ls -la release-assets/
+      - name: Create or update latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Delete existing latest release and tag
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+
+          # Build release notes
+          cat > notes.md << 'NOTES'
+          ## Latest Development Build
+
+          Auto-built from the latest commit on `main` (${{ github.sha }}).
+
+          For stable releases, download a versioned tag (e.g., `v1.0.0`).
+
+          ### Binaries
+
+          | Platform | Binary |
+          |----------|--------|
+          | Linux x86_64 | `ferrum-edge-linux-x86_64` |
+          | Linux x86_64 CNI plugin | `ferrum-cni-linux-x86_64` |
+          | Linux ARM64 | `ferrum-edge-linux-aarch64` |
+          | Linux ARM64 CNI plugin | `ferrum-cni-linux-aarch64` |
+          | macOS x86_64 | `ferrum-edge-macos-x86_64` |
+          | macOS ARM64 (Apple Silicon) | `ferrum-edge-macos-aarch64` |
+          | Windows x86_64 | `ferrum-edge-windows-x86_64.exe` |
+
+          ### Docker
+
+          ```bash
+          docker pull ferrumedge/ferrum-edge:latest
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
+          ```
+
+          ### Checksums
+
+          ```
+          NOTES
+          cat release-assets/*.sha256 >> notes.md
+          echo '```' >> notes.md
+
+          # Create the release
+          gh release create latest \
+            --title "Latest Build ($(date -u +%Y-%m-%d))" \
+            --notes-file notes.md \
+            --prerelease \
+            --target "${{ github.sha }}" \
+            release-assets/*
+"""
+
+CI_DOCKER_MANIFEST_STEPS = r"""    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests
+          pattern: docker-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest (Docker Hub)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ferrumedge/ferrum-edge:latest \
+            -t ferrumedge/ferrum-edge:main-${{ github.sha }} \
+            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)
+
+      - name: Create and push multi-arch manifest (GHCR)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository }}:latest \
+            -t ghcr.io/${{ github.repository }}:main-${{ github.sha }} \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+"""
+
+RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      # Download exactly the five trusted build artifacts by name. A wildcard
+      # pattern would also accept any other artifact whose name happened to
+      # start with the same prefix, so an unrelated job could contribute files
+      # to a published release.
+      - name: Download native release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-binaries-x86_64-unknown-linux-gnu
+          path: downloaded-artifacts/release-binaries-x86_64-unknown-linux-gnu
+
+      - name: Download protected ARM64 release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-binaries-aarch64-unknown-linux-gnu
+          path: downloaded-artifacts/release-binaries-aarch64-unknown-linux-gnu
+
+      - name: Download macOS x86_64 release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-binaries-x86_64-apple-darwin
+          path: downloaded-artifacts/release-binaries-x86_64-apple-darwin
+
+      - name: Download macOS aarch64 release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-binaries-aarch64-apple-darwin
+          path: downloaded-artifacts/release-binaries-aarch64-apple-darwin
+
+      - name: Download Windows release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-binaries-x86_64-pc-windows-msvc
+          path: downloaded-artifacts/release-binaries-x86_64-pc-windows-msvc
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          # The closed, auditable published asset set. Each entry names one
+          # exact trusted artifact directory and one exact file inside it, so a
+          # colliding or extra upload can neither add nor replace an asset.
+          copy_trusted_asset() {
+            if [ ! -f "downloaded-artifacts/$1" ] || [ -L "downloaded-artifacts/$1" ]; then
+              echo "::error::missing trusted release asset $1" >&2
+              exit 1
+            fi
+            cp "downloaded-artifacts/$1" "release-assets/$2"
+            echo "$2" >> "$RUNNER_TEMP/expected-assets"
+          }
+          : > "$RUNNER_TEMP/expected-assets"
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64 ferrum-edge-linux-x86_64
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64.sha256 ferrum-edge-linux-x86_64.sha256
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64 ferrum-cni-linux-x86_64
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64.sha256 ferrum-cni-linux-x86_64.sha256
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64 ferrum-edge-linux-aarch64
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64.sha256 ferrum-edge-linux-aarch64.sha256
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64 ferrum-cni-linux-aarch64
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64.sha256 ferrum-cni-linux-aarch64.sha256
+          copy_trusted_asset release-binaries-x86_64-apple-darwin/ferrum-edge-macos-x86_64 ferrum-edge-macos-x86_64
+          copy_trusted_asset release-binaries-x86_64-apple-darwin/ferrum-edge-macos-x86_64.sha256 ferrum-edge-macos-x86_64.sha256
+          copy_trusted_asset release-binaries-aarch64-apple-darwin/ferrum-edge-macos-aarch64 ferrum-edge-macos-aarch64
+          copy_trusted_asset release-binaries-aarch64-apple-darwin/ferrum-edge-macos-aarch64.sha256 ferrum-edge-macos-aarch64.sha256
+          copy_trusted_asset release-binaries-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe ferrum-edge-windows-x86_64.exe
+          copy_trusted_asset release-binaries-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe.sha256 ferrum-edge-windows-x86_64.exe.sha256
+          # Publishing must be exactly the trusted set, never whatever the
+          # download happened to produce.
+          LC_ALL=C sort -o "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/expected-assets"
+          ls -A release-assets | LC_ALL=C sort > "$RUNNER_TEMP/published-assets"
+          if ! diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/published-assets"; then
+            echo "::error::published release asset set drifted from the trusted set" >&2
+            exit 1
+          fi
+          cd release-assets
+          sha256sum -c ./*.sha256
+          cd ..
+          ls -la release-assets/
+      - name: Generate release notes
+        id: release_notes
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+
+          cat > RELEASE_NOTES.md << NOTES
+          # Release $TAG_NAME
+
+          ## Binaries
+
+          Pre-built binaries for all supported platforms:
+
+          | Platform | Binary |
+          |----------|--------|
+          | Linux x86_64 | \`ferrum-edge-linux-x86_64\` |
+          | Linux x86_64 CNI plugin | \`ferrum-cni-linux-x86_64\` |
+          | Linux ARM64 | \`ferrum-edge-linux-aarch64\` |
+          | Linux ARM64 CNI plugin | \`ferrum-cni-linux-aarch64\` |
+          | macOS x86_64 | \`ferrum-edge-macos-x86_64\` |
+          | macOS ARM64 (Apple Silicon) | \`ferrum-edge-macos-aarch64\` |
+          | Windows x86_64 | \`ferrum-edge-windows-x86_64.exe\` |
+
+          ## Docker
+
+          \`\`\`bash
+          docker pull ferrumedge/ferrum-edge:$TAG_NAME
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME
+          \`\`\`
+
+          The default image ships the no-op **mock** eBPF capture backend. For
+          real ambient / node-waypoint eBPF capture, pull the **Linux-only**
+          \`-ebpf\` variant (built with \`--features ebpf\`; requires kernel
+          ≥ 5.7 with cgroup v2 + bpffs). Capabilities depend on the kernel: on
+          **≥ 5.8** use \`CAP_BPF\`/\`CAP_PERFMON\`/\`CAP_NET_ADMIN\`; on the
+          **5.7.x** window use \`CAP_SYS_ADMIN\` + \`CAP_NET_ADMIN\` instead,
+          because \`CAP_BPF\`/\`CAP_PERFMON\` were only split out of
+          \`CAP_SYS_ADMIN\` in 5.8 — see
+          [docs/node_agent_security.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent_security.md).
+          On a node whose kernel/cgroup/bpffs probe fails, the \`-ebpf\` pod
+          **exits** (default \`FERRUM_NODE_AGENT_FALLBACK_MODE=fail\`) rather than
+          degrading. The published \`-ebpf\` image is **distroless** — it has no
+          \`/bin/sh\` and no \`iptables\`, and the fallback runs commands via
+          \`sh -c\`, so \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` on the
+          published image **crash-loops**. To use the iptables fallback, build a
+          custom runtime image that adds \`/bin/sh\` + \`iptables\`/\`ip6tables\`
+          (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)),
+          then set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back to
+          host iptables capture:
+
+          \`\`\`bash
+          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
+          \`\`\`
+
+          ## Checksums
+
+          Verify the integrity of downloaded binaries:
+
+          \`\`\`
+          NOTES
+
+          cat release-assets/*.sha256 >> RELEASE_NOTES.md
+
+          cat >> RELEASE_NOTES.md << 'NOTES'
+          ```
+
+          ## Usage
+
+          Download the binary for your platform and make it executable:
+
+          ```bash
+          chmod +x ferrum-edge-linux-x86_64
+          FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=config.yaml ./ferrum-edge-linux-x86_64 run
+          ```
+
+          See [README.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/README.md) for configuration and usage instructions.
+          NOTES
+
+      - name: Create Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        with:
+          tag_name: ${{ steps.release_notes.outputs.TAG_NAME }}
+          body_path: RELEASE_NOTES.md
+          files: release-assets/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+"""
+
+RELEASE_DOCKER_MANIFEST_STEPS = r"""    steps:
+      - name: Extract version tag
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+          VERSION="${TAG_NAME#v}"
+          MAJOR_MINOR="${VERSION%.*}"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "MAJOR_MINOR=$MAJOR_MINOR" >> $GITHUB_OUTPUT
+
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests
+          pattern: docker-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest (Docker Hub)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.TAG_NAME }} \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.VERSION }} \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.MAJOR_MINOR }} \
+            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)
+
+      - name: Create and push multi-arch manifest (GHCR)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG_NAME }} \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }} \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.MAJOR_MINOR }} \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+
+  # ── eBPF capture image variant (`-ebpf` suffix) ────────────────────────────
+  # The default `docker` job above ships the historical multi-platform image
+  # built from pre-built `--features cloud-secrets` binaries, where the
+  # node-agent / node-waypoint capture path runs the no-op MOCK eBPF backend
+  # (attaches nothing, sets `ferrum_mesh_node_topology_degraded`). This second,
+  # `-ebpf`-suffixed variant ships the REAL aya-based capture backend.
+  #
+  # It is LINUX-ONLY: real capture needs the aya kernel loader, which compiles
+  # only on Linux with `--features ebpf`, plus the compiled `ferrum-ebpf` BPF
+  # ELF embedded in the image. Unlike the default job (which copies a pre-built
+  # binary into Dockerfile.release), this variant builds from source with the
+  # root `Dockerfile`, which BOTH builds the `--build-arg FEATURES=...,ebpf`
+  # binary AND compiles+COPYs the BPF ELF via its `ebpf-builder` stage. Each
+  # platform builds natively (no QEMU) so the from-source Rust + nightly eBPF
+  # build stays within sane time limits.
+  #
+  # The default image is unchanged: a variant build failure never blocks the
+  # default `:<tag>` image or the binary assets (those flow through `docker` /
+  # `docker-manifest`). It DOES gate the GitHub Release, because `create-release`
+  # `needs: docker-ebpf-manifest` — the release notes advertise the `-ebpf` tags,
+  # so the release must not publish until those manifests actually exist.
+"""
+
+RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
+      - name: Extract version tag
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+          VERSION="${TAG_NAME#v}"
+          MAJOR_MINOR="${VERSION%.*}"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "MAJOR_MINOR=$MAJOR_MINOR" >> $GITHUB_OUTPUT
+
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests
+          pattern: docker-ebpf-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch eBPF manifest (Docker Hub)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.TAG_NAME }}-ebpf \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.VERSION }}-ebpf \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf \
+            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)
+
+      - name: Create and push multi-arch eBPF manifest (GHCR)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG_NAME }}-ebpf \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}-ebpf \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+"""
+
+# The publication-control fields that gate the protected ARM64 artifacts are
+# frozen, and so is the full step list of every job that publishes by wildcard.
 PUBLISH_CONTROL_CONTRACTS = {
     "CI workflow": {
         "latest-release": {
@@ -311,6 +816,7 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "needs.build-arm64-cross.result == 'success' && "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
             ),
+            "steps": CI_LATEST_RELEASE_STEPS,
         },
         "docker": {
             "needs": "    needs: [test, build-binaries, build-arm64-cross]\n",
@@ -335,6 +841,7 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "    if: always() && needs.docker.result == 'success' && "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
             ),
+            "steps": CI_DOCKER_MANIFEST_STEPS,
         },
     },
     "release workflow": {
@@ -343,6 +850,7 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "    needs: [build-release-binaries, build-release-arm64-cross, "
                 "docker-manifest, docker-ebpf-manifest]\n"
             ),
+            "steps": RELEASE_CREATE_RELEASE_STEPS,
         },
         "docker": {
             "needs": (
@@ -360,6 +868,7 @@ PUBLISH_CONTROL_CONTRACTS = {
         },
         "docker-manifest": {
             "needs": "    needs: docker\n",
+            "steps": RELEASE_DOCKER_MANIFEST_STEPS,
         },
         "docker-ebpf": {
             "needs": "    needs: validate-release-sha\n",
@@ -381,6 +890,7 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "    needs: [build-release-binaries, docker-manifest, "
                 "docker-ebpf]\n"
             ),
+            "steps": RELEASE_DOCKER_EBPF_MANIFEST_STEPS,
         },
     },
 }
@@ -1195,6 +1705,390 @@ def decoded_yaml_text(text: str) -> str:
     return QUOTED_YAML_SCALAR.sub(lambda match: decode_yaml_scalar(match.group(0)), text)
 
 
+# ── Shared YAML flow normalization ─────────────────────────────────────────
+#
+# Every scan in this file reads workflow text line by line: a key is only a key
+# when it starts a line, and a step is only a step when a `-` opens it. That is
+# true of block YAML and false of flow YAML. `- {uses: ./evil}`,
+# `with: {name: docker-digest-evil}`, and `defaults: {run: {shell: python}}` are
+# the same documents to the runner as their block spellings, so each individual
+# scanner that only reads block layout has the same blind spot, and closing them
+# one regex at a time only ever covers the spellings someone thought to write
+# down.
+#
+# Rather than teach every loop a second syntax, the flow spellings are rendered
+# once into the block lines they are equivalent to, and the existing scanners are
+# then run a second time over that rendering. The raw pass is untouched, so no
+# anchor, alias, merge-key, expression, literal-value-set, shell, local-action,
+# artifact-ownership, generated-command, or frozen-contract check is weakened or
+# replaced — the normalized pass can only add findings. Reported line numbers are
+# mapped back to the physical line the flow construct opened on.
+FLOW_COLLECTION_VALUE = re.compile(r"^[{\[]")
+
+
+def flow_collection_entries(body: str) -> list[str] | None:
+    """Split a flow collection's interior into its top-level entries.
+
+    Quoting, nesting, and `${{ ... }}` expressions all carry separators that do
+    not end an entry, so a plain `split(",")` would cut `{a: 1, b: 2}` out of its
+    parent and read `${{ fromJSON(x)[0] }}` as two fragments. `None` means the
+    text is not a well-formed flow collection, which callers treat as a failure
+    rather than as an absence of entries.
+    """
+
+    entries: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(body):
+        character = body[index]
+        if quote is not None:
+            if quote == '"' and character == "\\" and index + 1 < len(body):
+                current.append(character)
+                current.append(body[index + 1])
+                index += 2
+                continue
+            current.append(character)
+            if character == quote:
+                if (
+                    quote == "'"
+                    and index + 1 < len(body)
+                    and body[index + 1] == "'"
+                ):
+                    current.append("'")
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if body.startswith("${{", index):
+            end = body.find("}}", index)
+            if end == -1:
+                return None
+            current.append(body[index : end + 2])
+            index = end + 2
+            continue
+        if character in "'\"":
+            quote = character
+            current.append(character)
+            index += 1
+            continue
+        if character in "{[":
+            depth += 1
+        elif character in "}]":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif character == "," and depth == 0:
+            entries.append("".join(current))
+            current = []
+            index += 1
+            continue
+        current.append(character)
+        index += 1
+    if quote is not None or depth != 0:
+        return None
+    entries.append("".join(current))
+    return [entry.strip() for entry in entries if entry.strip()]
+
+
+def flow_entry_pair(entry: str) -> tuple[str, str] | None:
+    """Split one flow entry into its key and value at the separating colon.
+
+    Only a top-level colon separates a flow pair, so the colon inside
+    `image: ghcr.io/x:v1` or inside a nested collection must not be mistaken for
+    it. `None` means the entry is not a `key: value` pair — a merge key, an
+    alias, or a bare sequence item — and the caller keeps the text verbatim so
+    the alias and merge-key checks still see it.
+    """
+
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(entry):
+        character = entry[index]
+        if quote is not None:
+            if quote == '"' and character == "\\" and index + 1 < len(entry):
+                index += 2
+                continue
+            if character == quote:
+                if (
+                    quote == "'"
+                    and index + 1 < len(entry)
+                    and entry[index + 1] == "'"
+                ):
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if entry.startswith("${{", index):
+            end = entry.find("}}", index)
+            if end == -1:
+                return None
+            index = end + 2
+            continue
+        if character in "'\"":
+            quote = character
+            index += 1
+            continue
+        if character in "{[":
+            depth += 1
+        elif character in "}]":
+            depth -= 1
+        elif character == ":" and depth == 0:
+            key = entry[:index].strip()
+            rest = entry[index + 1 :].strip()
+            # YAML needs a space after a plain-scalar key, and allows the value
+            # to abut a quoted key or a nested collection.
+            if (
+                not rest
+                or entry[index + 1 : index + 2] in {" ", "\t", ""}
+                or FLOW_COLLECTION_VALUE.match(rest) is not None
+                or (key[-1:] in {"'", '"'})
+            ):
+                return key, rest
+        index += 1
+    return None
+
+
+def expand_flow_pairs(indent: int, entries: list[str]) -> list[str] | None:
+    """Render the entries of one flow mapping as block lines at `indent`."""
+
+    pad = " " * indent
+    rendered: list[str] = []
+    for entry in entries:
+        pair = flow_entry_pair(entry)
+        if pair is None:
+            # `<<: *defaults`, `*alias`, and anything else that is not a plain
+            # pair is emitted verbatim so the indirection checks still match it.
+            rendered.append(f"{pad}{entry}")
+            continue
+        expanded = expand_flow_value(indent, pair[0], pair[1])
+        if expanded is None:
+            return None
+        rendered.extend(expanded)
+    return rendered
+
+
+def expand_flow_sequence_item(indent: int, item: str) -> list[str] | None:
+    """Render one flow sequence item as a `-` entry at `indent`."""
+
+    pad = " " * indent
+    if not item.startswith("{"):
+        return [f"{pad}- {item}"]
+    if not item.endswith("}"):
+        return None
+    entries = flow_collection_entries(item[1:-1])
+    if entries is None:
+        return None
+    if not entries:
+        return [f"{pad}- {{}}"]
+    body = expand_flow_pairs(indent + 2, entries)
+    if body is None:
+        return None
+    # The first key of a mapping item shares the dash's line, which is what puts
+    # every key of the step at the dash column + 2 for the indent arithmetic the
+    # block scanners already do.
+    body[0] = f"{pad}- " + body[0][indent + 2 :]
+    return body
+
+
+def expand_flow_value(indent: int, key: str, value: str) -> list[str] | None:
+    """Render one `key: <flow value>` pair as the block lines it stands for."""
+
+    pad = " " * indent
+    if value.startswith("{"):
+        if not value.endswith("}"):
+            return None
+        entries = flow_collection_entries(value[1:-1])
+        if entries is None:
+            return None
+        body = expand_flow_pairs(indent + 2, entries)
+        if body is None:
+            return None
+        return [f"{pad}{key}:", *body]
+    if value.startswith("["):
+        if not value.endswith("]"):
+            return None
+        items = flow_collection_entries(value[1:-1])
+        if items is None:
+            return None
+        rendered = [f"{pad}{key}:"]
+        for item in items:
+            expanded = expand_flow_sequence_item(indent + 2, item)
+            if expanded is None:
+                return None
+            rendered.extend(expanded)
+        return rendered
+    return [f"{pad}{key}: {value}" if value else f"{pad}{key}:"]
+
+
+def flow_region_text(lines: list[str], start: int, opening: str) -> tuple[int, str]:
+    """Collect a flow collection that may span several source lines.
+
+    Returns the last line the collection occupies and the collection joined into
+    one logical string, mirroring how the runner reads it.
+    """
+
+    collected: list[str] = []
+    depth = 0
+    quote: str | None = None
+    end = start
+    for offset in range(start, len(lines)):
+        text = opening if offset == start else lines[offset]
+        collected.append(text.strip())
+        for character in text:
+            if quote is not None:
+                if character == quote:
+                    quote = None
+                continue
+            if character in "'\"":
+                quote = character
+            elif character in "{[":
+                depth += 1
+            elif character in "}]":
+                depth -= 1
+        end = offset
+        if depth <= 0:
+            break
+    return end, " ".join(collected)
+
+
+def flow_normalized_lines(
+    lines: list[str],
+    source: str,
+) -> tuple[tuple[tuple[int, str], ...] | None, list[str]]:
+    """Rewrite every flow construct into the block lines the runner sees.
+
+    Returns `(pairs, failures)` where each pair is `(physical line index,
+    rendered line)`. `None` means the document contains no flow construct and
+    the second pass can be skipped entirely. Block-scalar bodies are passed
+    through untouched: a `run: |` script is shell text, and `- {a: b}` inside it
+    is an argument, not a step.
+    """
+
+    scalar_bodies = block_scalar_body_lines(lines)
+    rendered: list[tuple[int, str]] = []
+    failures: list[str] = []
+    changed = False
+    index = 0
+    while index < len(lines):
+        raw = lines[index]
+        if index in scalar_bodies:
+            rendered.append((index, raw))
+            index += 1
+            continue
+        sequence = YAML_FLOW_SEQUENCE_ENTRY.match(raw)
+        field = YAML_MAPPING_FIELD.match(raw)
+        opening: str | None = None
+        lead = 0
+        key: str | None = None
+        dash = ""
+        if sequence is not None and sequence.group("flow").startswith("{"):
+            opening = sequence.group("flow")
+            lead = len(sequence.group("lead"))
+        elif field is not None:
+            value = re.sub(r"\s+#.*$", "", field.group("value")).strip()
+            # A flow *sequence* of plain scalars — `needs: [a, b]`, `on: [push]`
+            # — declares no step and no run body, so rewriting it would only
+            # churn the scan for no coverage. A sequence that carries a mapping
+            # can hold a step and is expanded.
+            if FLOW_COLLECTION_VALUE.match(value) is not None and (
+                value.startswith("{") or "{" in value
+            ):
+                opening = value
+                lead = len(field.group("lead")) + len(field.group("dash") or "")
+                key = field.group("key")
+                dash = field.group("lead") + (field.group("dash") or "")
+        if opening is None:
+            rendered.append((index, raw))
+            index += 1
+            continue
+        end, text = flow_region_text(lines, index, opening)
+        if key is None:
+            expanded = expand_flow_sequence_item(lead, text)
+        else:
+            expanded = expand_flow_value(lead, key, text)
+            if expanded is not None and field is not None and field.group("dash"):
+                # A `- with: {...}` entry opens a sequence item; dropping the
+                # dash would erase the step boundary the block scanners key on.
+                expanded[0] = dash + expanded[0][lead:]
+        if expanded is None:
+            failures.append(
+                f"{source}:{index + 1} has a malformed YAML flow collection"
+            )
+            for offset in range(index, end + 1):
+                rendered.append((offset, lines[offset]))
+            index = end + 1
+            continue
+        changed = True
+        rendered.extend((index, line) for line in expanded)
+        index = end + 1
+    if not changed:
+        return None, failures
+    return tuple(rendered), failures
+
+
+def flow_normalized_workflow(
+    contents: str,
+    source: str,
+) -> tuple[str | None, tuple[int, ...], list[str]]:
+    """Return the flow-normalized rendering of a workflow and its line map."""
+
+    try:
+        pairs, failures = flow_normalized_lines(contents.splitlines(), source)
+    except RecursionError:
+        return None, (), [f"{source} has an unreadably nested YAML flow collection"]
+    if pairs is None:
+        return None, (), failures
+    return (
+        "\n".join(line for _, line in pairs) + "\n",
+        tuple(physical for physical, _ in pairs),
+        failures,
+    )
+
+
+def remap_flow_normalized_errors(
+    errors: Iterable[str],
+    source: str,
+    mapping: tuple[int, ...],
+) -> list[str]:
+    """Rewrite normalized-pass line numbers back to physical source lines."""
+
+    def remap(match: re.Match[str]) -> str:
+        index = int(match.group("line")) - 1
+        if 0 <= index < len(mapping):
+            return f"{match.group('prefix')}{mapping[index] + 1}"
+        return match.group(0)
+
+    pattern = re.compile(
+        rf"(?P<prefix>{re.escape(source)}:|\bline )(?P<line>[0-9]+)"
+    )
+    return [pattern.sub(remap, error) for error in errors]
+
+
+def flow_normalized_findings(
+    contents: str,
+    source: str,
+    validator: Callable[[str, str], list[str]],
+) -> list[str]:
+    """Run a text validator over the flow-normalized rendering of `contents`.
+
+    The raw pass is run by the caller and is not replaced. This only adds what
+    the block-only scanners cannot see, with line numbers mapped back.
+    """
+
+    normalized, mapping, failures = flow_normalized_workflow(contents, source)
+    if normalized is None:
+        return failures
+    return [
+        *failures,
+        *remap_flow_normalized_errors(validator(normalized, source), source, mapping),
+    ]
+
+
 def extract_job_block(
     contents: str,
     source: str,
@@ -1411,6 +2305,78 @@ def uploaded_artifact_names(
     return tuple(values) if values else ("artifact",)
 
 
+def upload_artifact_steps(
+    lines: list[str],
+    start: int,
+    end: int,
+) -> tuple[tuple[int, tuple[str, ...]], ...]:
+    """Return every artifact-upload step in a line range with the names it declares."""
+
+    steps: list[tuple[int, tuple[str, ...]]] = []
+    for index in range(start, end):
+        match = YAML_MAPPING_FIELD.match(lines[index])
+        if match is None:
+            continue
+        if decode_yaml_scalar(match.group("key")) != "uses":
+            continue
+        reference = decode_yaml_scalar(
+            re.sub(r"\s+#.*$", "", match.group("value")).strip()
+        )
+        if not UPLOAD_ARTIFACT_ACTION.match(reference):
+            continue
+        key_column = len(match.group("lead")) + len(match.group("dash") or "")
+        block_start, block_end = step_block_bounds(
+            lines,
+            index,
+            key_column,
+            has_dash=bool(match.group("dash")),
+        )
+        steps.append(
+            (index, uploaded_artifact_names(lines, block_start, block_end, key_column))
+        )
+    return tuple(steps)
+
+
+def digest_artifact_prefixes() -> tuple[str, ...]:
+    """Return every artifact prefix a published manifest collects by wildcard."""
+
+    return tuple(
+        sorted(
+            {
+                prefix
+                for owners in DIGEST_ARTIFACT_OWNERS.values()
+                for prefix in owners
+            }
+        )
+    )
+
+
+def local_action_digest_upload_errors(contents: str, source: str) -> list[str]:
+    """Reject a digest upload hidden inside a repo-local composite action.
+
+    A composite action runs as a step of whatever job calls it, and artifacts are
+    scoped to the workflow run, so an upload here reaches the wildcard manifest
+    download exactly as a job-level upload does. Which job calls the action is
+    not knowable from the action file, so the frozen job owners cannot be checked
+    and a local action is never permitted to produce a digest artifact.
+    """
+
+    lines = contents.splitlines()
+    errors: list[str] = []
+    for index, names in upload_artifact_steps(lines, 0, len(lines)):
+        for prefix in digest_artifact_prefixes():
+            for name in names:
+                if not artifact_name_can_match(name, prefix):
+                    continue
+                errors.append(
+                    f"{source}:{index + 1} uploads artifact {name!r}, which the "
+                    f"frozen {prefix}* digest manifest pattern can match; a "
+                    "local action may not produce a digest artifact the "
+                    "published manifests consume"
+                )
+    return errors
+
+
 def digest_artifact_ownership_errors(contents: str, source: str) -> list[str]:
     """Reject any job outside the frozen producers that can feed a manifest.
 
@@ -1427,25 +2393,7 @@ def digest_artifact_ownership_errors(contents: str, source: str) -> list[str]:
     errors: list[str] = []
     lines = contents.splitlines()
     for job_name, job_start, job_end in workflow_job_ranges(lines):
-        for index in range(job_start, job_end):
-            match = YAML_MAPPING_FIELD.match(lines[index])
-            if match is None:
-                continue
-            if decode_yaml_scalar(match.group("key")) != "uses":
-                continue
-            reference = decode_yaml_scalar(
-                re.sub(r"\s+#.*$", "", match.group("value")).strip()
-            )
-            if not UPLOAD_ARTIFACT_ACTION.match(reference):
-                continue
-            key_column = len(match.group("lead")) + len(match.group("dash") or "")
-            start, end = step_block_bounds(
-                lines,
-                index,
-                key_column,
-                has_dash=bool(match.group("dash")),
-            )
-            names = uploaded_artifact_names(lines, start, end, key_column)
+        for index, names in upload_artifact_steps(lines, job_start, job_end):
             for prefix, allowed in owners.items():
                 if job_name in allowed:
                     continue
@@ -1496,7 +2444,17 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
                     "the trusted ARM64 publication artifact-selection contract"
                 )
     errors.extend(digest_artifact_ownership_errors(contents, source))
-    return errors
+    # A step may declare its inputs as `with: {name: docker-digest-evil}`, which
+    # names no key at the start of any line. The same ownership scan run over the
+    # block rendering sees it.
+    errors.extend(
+        flow_normalized_findings(
+            contents,
+            source,
+            digest_artifact_ownership_errors,
+        )
+    )
+    return list(dict.fromkeys(errors))
 
 
 def compare_pr_publish_control_contract(
@@ -1928,6 +2886,67 @@ def skip_env_prefix(tokens: tuple[str, ...], index: int) -> int:
     return index
 
 
+# `rustup run <toolchain> <command>...` execs an arbitrary program with the
+# toolchain's bin directory ahead of PATH, so it dispatches exactly like `nice`
+# or `timeout` — but with a mandatory toolchain operand in between. Every other
+# documented subcommand manages toolchains and components and runs nothing the
+# caller names, so following them would only invent executables.
+RUSTUP_NON_DISPATCH_SUBCOMMANDS = frozenset(
+    {
+        "check",
+        "completions",
+        "component",
+        "default",
+        "doc",
+        "docs",
+        "help",
+        "install",
+        "man",
+        "override",
+        "self",
+        "set",
+        "show",
+        "target",
+        "toolchain",
+        "uninstall",
+        "update",
+        "which",
+    }
+)
+
+
+def rustup_run_operand(tokens: tuple[str, ...], index: int) -> int | None:
+    """Return the token index of the program a `rustup` invocation executes.
+
+    `None` means this invocation runs nothing the caller named. A subcommand
+    that is not a literal is not assumed to be harmless: the operand slot is
+    returned so the opaque-executable analysis reads it.
+    """
+
+    def skip_options(position: int) -> int:
+        while position < len(tokens) and tokens[position].startswith("-"):
+            if tokens[position] == "--":
+                return position + 1
+            position += 1
+        return position
+
+    position = skip_options(index + 1)
+    if position >= len(tokens):
+        return None
+    subcommand = tool_name(tokens[position])
+    if subcommand in RUSTUP_NON_DISPATCH_SUBCOMMANDS:
+        return None
+    if subcommand != "run":
+        # A dynamic or unrecognized subcommand may still be `run`.
+        return position
+    position = skip_options(position + 1)
+    # The toolchain operand sits between the subcommand and the command.
+    position += 1
+    if position >= len(tokens):
+        return None
+    return position
+
+
 def skip_wrapper_prefixes(tokens: tuple[str, ...], index: int) -> tuple[int, bool]:
     """Unwrap commands that execute their final command operand."""
 
@@ -1960,8 +2979,16 @@ def skip_wrapper_prefixes(tokens: tuple[str, ...], index: int) -> tuple[int, boo
         "--signal",
         "--user",
     }
-    while index < len(tokens) and tool_name(tokens[index]) in wrappers:
+    while index < len(tokens) and (
+        tool_name(tokens[index]) in wrappers or tool_name(tokens[index]) == "rustup"
+    ):
         wrapper = tool_name(tokens[index])
+        if wrapper == "rustup":
+            operand = rustup_run_operand(tokens, index)
+            if operand is None:
+                return len(tokens), False
+            index = skip_redirections_and_assignments(tokens, operand)
+            continue
         index += 1
         if wrapper == "command" and index < len(tokens) and tokens[index] in {
             "-V",
@@ -4906,6 +5933,33 @@ def generic_workflow_cross_surfaces(
     return surfaces, list(dict.fromkeys([*errors, *surface_errors]))
 
 
+def flow_normalized_workflow_surfaces(
+    contents: str,
+    source: str,
+    *,
+    include_opaque_shell_executable: bool = False,
+) -> tuple[tuple[str, ...], list[str]]:
+    """Rescan a workflow's flow constructs through their block rendering.
+
+    `- {run: ./evil.sh}` and `- {uses: ./evil-action}` are steps the block-only
+    extractors never enter, so the whole generic scan is repeated against the
+    rendering rather than teaching each extractor a second syntax.
+    """
+
+    normalized, mapping, failures = flow_normalized_workflow(contents, source)
+    if normalized is None:
+        return (), failures
+    surfaces, errors = generic_workflow_cross_surfaces(
+        normalized,
+        source,
+        include_opaque_shell_executable=include_opaque_shell_executable,
+    )
+    return surfaces, [
+        *failures,
+        *remap_flow_normalized_errors(errors, source, mapping),
+    ]
+
+
 def validate_workflow_collection(
     workflows: dict[str, str],
     source: str,
@@ -4922,7 +5976,13 @@ def validate_workflow_collection(
             f"{source}/{name}",
             reasons=surface_reasons,
         )
+        flow_surfaces, flow_failures = flow_normalized_workflow_surfaces(
+            contents,
+            f"{source}/{name}",
+        )
+        surfaces = tuple(dict.fromkeys([*surfaces, *flow_surfaces]))
         errors.extend(failures)
+        errors.extend(flow_failures)
         if surfaces:
             located = cross_surface_line_report(contents)
             if not located:
@@ -4972,6 +6032,20 @@ def compare_pr_workflow_collection(
             f"proposed {source}/{name}",
             include_opaque_shell_executable=True,
         )
+        baseline_flow, baseline_flow_failures = flow_normalized_workflow_surfaces(
+            baseline_contents,
+            f"merge-base {source}/{name}",
+            include_opaque_shell_executable=True,
+        )
+        proposed_flow, proposed_flow_failures = flow_normalized_workflow_surfaces(
+            proposed_contents,
+            f"proposed {source}/{name}",
+            include_opaque_shell_executable=True,
+        )
+        baseline_surfaces = tuple(dict.fromkeys([*baseline_surfaces, *baseline_flow]))
+        proposed_surfaces = tuple(dict.fromkeys([*proposed_surfaces, *proposed_flow]))
+        baseline_failures = [*baseline_failures, *baseline_flow_failures]
+        proposed_failures = [*proposed_failures, *proposed_flow_failures]
         errors.extend(baseline_failures)
         errors.extend(proposed_failures)
         if not baseline_failures and not proposed_failures:
@@ -5028,6 +6102,23 @@ def generic_action_cross_surfaces(
                 )
             )
         )
+    if not sensitive and name.lower().endswith((".yml", ".yaml")):
+        # A composite action may spell its steps as flow mappings too, so the
+        # same scan is repeated over the block rendering. The digest stays the
+        # digest of the real file so pull-request comparison is unaffected.
+        normalized, _, flow_failures = flow_normalized_workflow(contents, name)
+        if flow_failures:
+            sensitive = True
+        elif normalized is not None:
+            sensitive = bool(
+                generic_action_cross_surfaces(
+                    normalized,
+                    name=name,
+                    include_opaque_shell_executable=(
+                        include_opaque_shell_executable
+                    ),
+                )
+            )
     if not sensitive:
         return ()
     digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
@@ -5232,7 +6323,18 @@ def validate_action_collection(actions: dict[str, str], source: str) -> list[str
                 f"{source}/{name} contains an unprotected Cross executable or "
                 "configuration input"
             )
-    return errors
+        if not name.lower().endswith((".yml", ".yaml")):
+            continue
+        label = f"{source}/{name}"
+        errors.extend(local_action_digest_upload_errors(contents, label))
+        errors.extend(
+            flow_normalized_findings(
+                contents,
+                label,
+                local_action_digest_upload_errors,
+            )
+        )
+    return list(dict.fromkeys(errors))
 
 
 def compare_pr_action_collection(
@@ -6451,6 +7553,41 @@ def local_automation_references(
     *,
     workflow_source: bool,
 ) -> tuple[set[str], set[str], list[str]]:
+    """Collect repo scripts and local actions from block and flow YAML alike.
+
+    `- {uses: ./evil-action}` and `- {run: ./evil.sh}` declare no key at the
+    start of any line, so the block pass below cannot enter them. The same pass
+    is repeated over the flow-normalized rendering, which is only built for YAML
+    sources — a shell script has no flow mappings to render.
+    """
+
+    references, dispatchers, errors = block_automation_references(
+        contents,
+        source,
+        workflow_source=workflow_source,
+    )
+    if not workflow_source:
+        return references, dispatchers, errors
+    normalized, mapping, failures = flow_normalized_workflow(contents, source)
+    errors.extend(failures)
+    if normalized is not None:
+        flow_references, flow_dispatchers, flow_errors = block_automation_references(
+            normalized,
+            source,
+            workflow_source=True,
+        )
+        references |= flow_references
+        dispatchers |= flow_dispatchers
+        errors.extend(remap_flow_normalized_errors(flow_errors, source, mapping))
+    return references, dispatchers, list(dict.fromkeys(errors))
+
+
+def block_automation_references(
+    contents: str,
+    source: str,
+    *,
+    workflow_source: bool,
+) -> tuple[set[str], set[str], list[str]]:
     """Collect canonical repo scripts and reject unscanned local actions/commands.
 
     Returns the literal script references, the build-dispatcher manifest
@@ -7146,6 +8283,26 @@ def validate_workflow_contract(
         reasons=surface_reasons,
     )
     errors.extend(surface_failures)
+    # The protected job is frozen by digest, but the rest of the file is not, so
+    # a flow-spelled step elsewhere in it gets the same rescan the generic
+    # workflows get.
+    normalized, mapping, flow_failures = flow_normalized_workflow(contents, source)
+    errors.extend(flow_failures)
+    if normalized is not None:
+        flow_reasons: dict[str, str] = {}
+        flow_surfaces, flow_surface_failures = unprotected_cross_surfaces(
+            normalized,
+            source,
+            job_name,
+            required_job=True,
+            include_opaque_shell_executable=False,
+            reasons=flow_reasons,
+        )
+        errors.extend(
+            remap_flow_normalized_errors(flow_surface_failures, source, mapping)
+        )
+        surface_reasons.update(flow_reasons)
+        surfaces = tuple(dict.fromkeys([*surfaces, *flow_surfaces]))
     if surfaces:
         # Name what was matched: a bare rejection leaves the author to
         # rediscover which job and which line the scan read.
@@ -11234,6 +12391,344 @@ pre_build = []
         "self-test trusted policy",
     ):
         failures.append("unchecked process-substitution extraction was not rejected")
+
+    # ── Flow-spelled YAML is the same document as block-spelled YAML ───────
+    #
+    # Every scan below is line-oriented, so each one independently loses sight
+    # of a step written as `- {uses: ...}` or an input written as
+    # `with: {name: ...}`. The invariant these fixtures pin is not that nine
+    # particular spellings are rejected but that a flow spelling and its block
+    # equivalent reach the same verdict, which is what the shared normalization
+    # layer provides. Benign flow spellings must stay accepted, or the layer
+    # would just be a blanket rejection of valid YAML.
+
+    def digest_ownership(contents: str, source: str = "CI workflow") -> list[str]:
+        """Mirror the ownership pass `validate_publish_control_contract` runs."""
+
+        return [
+            *digest_artifact_ownership_errors(contents, source),
+            *flow_normalized_findings(
+                contents,
+                source,
+                digest_artifact_ownership_errors,
+            ),
+        ]
+
+    def digest_workflow(job: str, upload: str) -> str:
+        return (
+            "name: Digest\n"
+            "on: [push]\n"
+            "jobs:\n"
+            f"  {job}:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n" + upload
+        )
+
+    pinned_upload = "actions/upload-artifact@" + ("a" * 40)
+    block_upload = (
+        f"      - uses: {pinned_upload}\n"
+        "        with:\n"
+        "          name: docker-digest-evil\n"
+    )
+    flow_input_upload = (
+        f"      - uses: {pinned_upload}\n"
+        "        with: {name: docker-digest-evil, if-no-files-found: error}\n"
+    )
+    flow_step_upload = (
+        f"      - {{uses: {pinned_upload}, "
+        "with: {name: docker-digest-evil}}\n"
+    )
+    unpinned_upload = (
+        "      - uses: actions/upload-artifact@v7\n"
+        "        with:\n"
+        "          name: docker-digest-evil\n"
+    )
+    for upload_label, upload_body in (
+        ("block-form digest upload", block_upload),
+        ("flow-input digest upload", flow_input_upload),
+        ("flow-step digest upload", flow_step_upload),
+        ("unpinned digest upload", unpinned_upload),
+    ):
+        if not digest_ownership(digest_workflow("evil", upload_body)):
+            failures.append(
+                f"{upload_label} outside the docker job was not rejected"
+            )
+        if digest_ownership(digest_workflow("docker", upload_body)):
+            failures.append(f"{upload_label} by its frozen owner was rejected")
+    for benign_label, benign_name in (
+        ("unrelated artifact name", "coverage-report"),
+        ("differing literal prefix", "binary-x86_64-unknown-linux-gnu"),
+    ):
+        benign_body = (
+            f"      - uses: {pinned_upload}\n"
+            f"        with: {{name: {benign_name}}}\n"
+        )
+        if digest_ownership(digest_workflow("evil", benign_body)):
+            failures.append(f"flow-spelled {benign_label} was rejected")
+
+    # A composite action runs as a step of whichever job calls it, so the
+    # frozen owners cannot be checked from the action file and no local action
+    # may produce a digest artifact at all.
+    for action_label, action_upload in (
+        ("block", block_upload),
+        ("flow-input", flow_input_upload),
+        ("flow-step", flow_step_upload),
+        ("unpinned", unpinned_upload),
+    ):
+        digest_action = (
+            "name: Digest\n"
+            "runs:\n"
+            "  using: composite\n"
+            "  steps:\n" + action_upload
+        )
+        if not validate_action_collection(
+            {"digest/action.yml": digest_action},
+            "self-test action directory",
+        ):
+            failures.append(
+                f"{action_label} digest upload inside a local action was not "
+                "rejected"
+            )
+    if validate_action_collection(
+        {
+            "digest/action.yml": (
+                "name: Digest\n"
+                "runs:\n"
+                "  using: composite\n"
+                "  steps:\n"
+                f"      - uses: {pinned_upload}\n"
+                "        with: {name: coverage-report}\n"
+            )
+        },
+        "self-test action directory",
+    ):
+        failures.append("benign local-action artifact upload was rejected")
+
+    # A flow-spelled step must reach the same local-action and repository-script
+    # decisions as the block spelling it is equivalent to.
+    def reference_workflow(steps: str) -> str:
+        return (
+            "name: Refs\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  build:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n" + steps
+        )
+
+    def reference_result(steps: str) -> tuple[set[str], set[str], bool]:
+        references, dispatchers, errors = local_automation_references(
+            reference_workflow(steps),
+            "self-test reference workflow",
+            workflow_source=True,
+        )
+        return references, dispatchers, bool(errors)
+
+    for spelling_label, block_step, flow_step in (
+        (
+            "local action outside .github/actions",
+            "      - uses: ./evil-action\n",
+            "      - {uses: ./evil-action}\n",
+        ),
+        (
+            "permitted local action",
+            "      - uses: ./.github/actions/setup\n",
+            "      - {uses: ./.github/actions/setup}\n",
+        ),
+        (
+            "repository run script",
+            "      - run: ./evil.sh\n",
+            "      - {run: ./evil.sh}\n",
+        ),
+        (
+            "approved automation script",
+            "      - run: ./scripts/safe.sh\n",
+            "      - {run: ./scripts/safe.sh}\n",
+        ),
+        (
+            "build dispatcher",
+            "      - run: make arm64\n",
+            "      - {run: make arm64}\n",
+        ),
+    ):
+        if reference_result(block_step) != reference_result(flow_step):
+            failures.append(
+                f"flow-spelled {spelling_label} did not match its block spelling"
+            )
+    if not reference_result("      - {uses: ./evil-action}\n")[2]:
+        failures.append("flow-spelled local action outside .github/actions was accepted")
+    if reference_result("      - {uses: ./.github/actions/setup}\n")[2]:
+        failures.append("flow-spelled permitted local action was rejected")
+    if "evil.sh" not in reference_result("      - {run: ./evil.sh}\n")[0]:
+        failures.append("flow-spelled run script was not followed")
+
+    # `defaults: {run: {shell: python}}` selects the same interpreter the block
+    # spelling selects, so a non-shell body cannot hide behind it.
+    def defaults_workflow(defaults: str, body: str) -> str:
+        return (
+            "name: Defaults\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  build:\n"
+            "    runs-on: ubuntu-latest\n"
+            + defaults
+            + "    steps:\n"
+            "      - run: |\n"
+            f"{body}"
+        )
+
+    python_cross_body = (
+        "          import subprocess\n"
+        "          subprocess.run(['cr' + 'oss', 'build', '--target', "
+        f"'{TARGET}'])\n"
+    )
+    block_defaults = (
+        "    defaults:\n"
+        "      run:\n"
+        "        shell: python\n"
+    )
+    for defaults_label, defaults_body in (
+        ("nested flow defaults", "    defaults: {run: {shell: python}}\n"),
+        ("partial flow defaults", "    defaults:\n      run: {shell: python}\n"),
+        ("quoted flow defaults", "    defaults: {run: {shell: 'python'}}\n"),
+    ):
+        block_surfaces, _ = flow_normalized_workflow_surfaces(
+            defaults_workflow(defaults_body, python_cross_body),
+            "self-test defaults workflow",
+        )
+        if not block_surfaces:
+            failures.append(
+                f"{defaults_label} hid a Python Cross invocation"
+            )
+    if not generic_workflow_cross_surfaces(
+        defaults_workflow(block_defaults, python_cross_body),
+        "self-test defaults workflow",
+    )[0]:
+        failures.append("block defaults no longer select the Python interpreter")
+    benign_python_body = "          print('hello')\n"
+    for benign_defaults in (
+        "    defaults: {run: {shell: python}}\n",
+        block_defaults,
+    ):
+        contents = defaults_workflow(benign_defaults, benign_python_body)
+        if generic_workflow_cross_surfaces(contents, "self-test defaults workflow")[0]:
+            failures.append("a benign Python run body was rejected")
+        if flow_normalized_workflow_surfaces(
+            contents,
+            "self-test defaults workflow",
+        )[0]:
+            failures.append("a benign flow-spelled Python run body was rejected")
+
+    # `rustup run <toolchain> <command>` execs the command operand.
+    shell_automation_escapes(
+        "rustup run Cross execution",
+        f"rustup run stable cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "rustup run repository Cross executable",
+        f"rustup run stable ./cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "rustup run with installing toolchain",
+        f"rustup run --install nightly cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "rustup run wrapped Cross execution",
+        f"nice rustup run stable cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "rustup run dispatched through a shell",
+        f"rustup run stable sh -c 'cross {arm_target}'",
+    )
+    if validate_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        {"scripts/safe.sh": "#!/bin/sh\nrustup component add clippy\n"},
+        "self-test automation directory",
+    ):
+        failures.append("a benign rustup subcommand was rejected")
+    if validate_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        {"scripts/safe.sh": "#!/bin/sh\nrustup run stable cargo build\n"},
+        "self-test automation directory",
+    ):
+        failures.append("a benign rustup run operand was rejected")
+
+    # Every job that publishes by wildcard freezes its whole step list, not
+    # just the download or the `needs` graph that feeds it.
+    for contract_source, contract_job in (
+        ("CI workflow", "latest-release"),
+        ("CI workflow", "docker-manifest"),
+        ("release workflow", "create-release"),
+        ("release workflow", "docker-manifest"),
+        ("release workflow", "docker-ebpf-manifest"),
+    ):
+        contract = PUBLISH_CONTROL_CONTRACTS[contract_source][contract_job]
+        if "steps" not in contract:
+            failures.append(
+                f"{contract_source} job {contract_job!r} does not freeze its "
+                "publishing steps"
+            )
+            continue
+        steps = contract["steps"]
+        if not steps.startswith("    steps:\n") or not steps.endswith("\n"):
+            failures.append(
+                f"{contract_source} job {contract_job!r} step contract is not a "
+                "whole extracted steps block"
+            )
+    for wildcard_source, wildcard_job, wildcard_token in (
+        ("CI workflow", "latest-release", "release-assets/*"),
+        ("release workflow", "create-release", "files: release-assets/*"),
+        ("release workflow", "docker-manifest", "docker buildx imagetools create"),
+        (
+            "release workflow",
+            "docker-ebpf-manifest",
+            "docker buildx imagetools create",
+        ),
+    ):
+        if wildcard_token not in (
+            PUBLISH_CONTROL_CONTRACTS[wildcard_source][wildcard_job]["steps"]
+        ):
+            failures.append(
+                f"{wildcard_source} job {wildcard_job!r} step contract no longer "
+                f"covers {wildcard_token!r}"
+            )
+
+    # The normalization layer itself: a malformed flow collection fails closed
+    # rather than being read as an absent one, and a block-scalar body is shell
+    # text whose braces are arguments rather than YAML structure.
+    _, _, malformed_failures = flow_normalized_workflow(
+        "steps:\n  - {uses: ./evil-action\n",
+        "self-test malformed workflow",
+    )
+    if not malformed_failures:
+        failures.append("a malformed YAML flow collection was not reported")
+    scalar_normalized, _, _ = flow_normalized_workflow(
+        "steps:\n  - run: |\n      echo '- {uses: ./evil-action}'\n",
+        "self-test scalar workflow",
+    )
+    if scalar_normalized is not None:
+        failures.append("a block-scalar body was normalized as YAML flow structure")
+    if flow_normalized_workflow(
+        "steps:\n  - uses: ./.github/actions/setup\n",
+        "self-test block workflow",
+    )[0] is not None:
+        failures.append("a document without flow constructs was normalized anyway")
+    anchored_normalized, _, _ = flow_normalized_workflow(
+        "steps:\n  - {<<: *defaults, uses: ./evil-action}\n",
+        "self-test anchored workflow",
+    )
+    if anchored_normalized is None or "<<: *defaults" not in anchored_normalized:
+        failures.append("a flow merge key was dropped by normalization")
+    expression_normalized, _, _ = flow_normalized_workflow(
+        "steps:\n  - {uses: ${{ env.action }}, with: {name: a}}\n",
+        "self-test expression workflow",
+    )
+    if expression_normalized is None or (
+        "uses: ${{ env.action }}" not in expression_normalized
+    ):
+        failures.append("a flow expression value was cut short by normalization")
 
     return failures
 

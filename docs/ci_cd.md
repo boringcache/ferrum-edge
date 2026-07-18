@@ -654,6 +654,47 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   rejected while `binary-${{ matrix.target }}` and unrelated artifact names stay
   editable. This is checked against both the pinned contract and the proposed
   tree, so an added job is caught even though it changes no frozen field.
+  Ownership does not depend on how the uploading step is written: every
+  `actions/upload-artifact` reference is checked whatever its ref (tag, branch,
+  SHA, or none), and a repo-local composite action may not produce a digest
+  artifact at all, because the job that calls it — and therefore whether it is
+  the frozen owner — is not knowable from the action file.
+- Every job that publishes by **wildcard** freezes its whole `steps:` list, not
+  only the download that feeds it. `latest-release` and `create-release` publish
+  whatever is left in `release-assets/` (`files: release-assets/*` and
+  `gh release create ... release-assets/*`), and the manifest jobs publish
+  whatever digests the download produced. Freezing only the download list or the
+  `needs` graph therefore left every other step of those jobs — including one
+  whose stated purpose is release notes — free to add a wildcard download, copy
+  an extra file into `release-assets`, or hard-code an additional digest into a
+  published tag. The frozen step lists are `latest-release` and `docker-manifest`
+  in CI and `create-release`, `docker-manifest`, and `docker-ebpf-manifest` in
+  the release workflow. Changing one is a trusted-base change on `main`, exactly
+  like the protected ARM64 build job; the published outputs themselves are
+  unchanged.
+- Flow-spelled YAML is normalized before scanning. `- {uses: ./evil-action}`,
+  `- {run: ./evil.sh}`, `with: {name: docker-digest-evil}`, and
+  `defaults: {run: {shell: python}}` are the same documents to the runner as
+  their block spellings, but every line-oriented scan — local-action roots,
+  repository-script following, artifact-name ownership, and workflow shell
+  selection — independently loses sight of them. Rather than teach each scan a
+  second syntax, one shared layer renders the flow spellings into the block lines
+  they stand for and the existing scans are repeated over that rendering, with
+  reported line numbers mapped back to the physical source line. The raw pass is
+  unchanged, so the normalized pass can only add findings: no anchor, alias,
+  merge-key, expression, literal-value-set, shell, local-action, artifact
+  ownership, generated-command, or frozen-contract protection is replaced by it.
+  Block-scalar bodies are left alone — `- {a: b}` inside a `run: |` script is a
+  shell argument, not a step — and a malformed flow collection is reported rather
+  than read as an absent one.
+- `rustup run <toolchain> <command>` executes its command operand like `nice` or
+  `timeout`, with a mandatory toolchain operand in between, so executable
+  dispatch follows it: `rustup run stable ./cross build --target ...` is read as
+  the `./cross` invocation it is. Subcommands that only manage toolchains and
+  components (`component`, `toolchain`, `target`, `update`, and the rest) execute
+  nothing the caller named and are not followed, so ordinary
+  `rustup component add clippy` stays editable and no trust is extended to
+  repository executables outside the approved automation roots.
 - `latest-release` and `create-release` download the five build artifacts by
   exact name instead of by a `binary-*`/`release-binaries-*` wildcard, so an
   unrelated job cannot contribute a colliding upload to a published release.
