@@ -4854,9 +4854,11 @@ paths:
 
         Ferrum also validates that the complete pre-delete compensation snapshot
         is owned and shaped so it can be restored atomically. A cascade plugin
-        owned by another API spec, a global plugin carrying the deleted proxy ID,
-        a proxy-group plugin carrying `proxy_id`, or an embedded proxy association
-        naming a missing plugin config returns 422 without deleting anything.
+        owned by another API spec, an explicitly associated global plugin, a
+        proxy-scoped association targeting another proxy, a global plugin carrying
+        the deleted proxy ID, a proxy-group plugin carrying `proxy_id`, or an
+        embedded proxy association naming a missing plugin config returns a
+        structured 422 validation failure without deleting anything.
 
         If namespace admission is lost after deletion commits, SQL backends and
         replica-set MongoDB compensate in one transaction: the upstream, proxy,
@@ -4896,7 +4898,8 @@ paths:
             with no supported TCP/TCP+TLS target, or the pre-delete compensation
             snapshot contains foreign ownership, an unrestorable plugin scope/proxy
             association, or an embedded proxy association naming a missing plugin
-            config. No resources are deleted.
+            config. The response identifies the offending restore-snapshot
+            resource and validation details. No resources are deleted.
           content:
             application/json:
               schema:
@@ -19105,8 +19108,9 @@ components:
         or database cross-checks (e.g., duplicate `listen_path`, invalid plugin
         config). For DELETE, removing the spec-owned and cascaded resources
         would leave an invalid transaction-log schema graph or TCP-throttle
-        plugin composition. An authoritative in-transaction rejection may omit
-        `spec_version` and the failure `id`.
+        plugin composition, or the compensation snapshot contains an
+        unrestorable resource. An authoritative in-transaction rejection may
+        omit `spec_version` and the failure `id`.
       properties:
         error:
           type: string
@@ -19122,8 +19126,8 @@ components:
             properties:
               resource_type:
                 type: string
-                enum: [proxy, upstream, plugin, plugin_composition, plugin_graph]
-                description: Kind of resource or aggregate plugin composition that failed
+                enum: [proxy, upstream, plugin, plugin_composition, plugin_graph, restore_snapshot]
+                description: Kind of resource, aggregate plugin composition, or pre-delete restore snapshot that failed
               id:
                 type: string
                 description: ID of the resource (from the extension object)

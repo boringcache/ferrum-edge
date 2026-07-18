@@ -29,7 +29,8 @@ use crate::admin::{AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, SortOrder,
     is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
-    tcp_connection_throttle_attachment_conflict, validate_api_spec_restore_inputs,
+    tcp_connection_throttle_attachment_conflict, validate_api_spec_proxy_plugin_association,
+    validate_api_spec_restore_inputs,
 };
 use crate::config::types::{ApiSpec, PluginAssociation, PluginScope, Upstream};
 use crate::util::body_limit::is_length_limit_error;
@@ -133,6 +134,21 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
         ApiSpecError::NotFound
     } else {
         ApiSpecError::Internal(msg.to_string())
+    }
+}
+
+fn restore_snapshot_validation_failure(
+    spec: &ApiSpec,
+    resource_id: String,
+    error: String,
+) -> ApiSpecError {
+    ApiSpecError::ValidationFailures {
+        spec_version: spec.spec_version.clone(),
+        failures: vec![ValidationFailure {
+            resource_type: "restore_snapshot",
+            id: resource_id,
+            errors: vec![error],
+        }],
     }
 }
 
@@ -3363,13 +3379,16 @@ pub async fn handle_delete_api_spec(
         match db.get_plugin_config(namespace, plugin_id).await {
             Ok(Some(plugin)) if plugin.api_spec_id.is_none() => additional_plugins.push(plugin),
             Ok(Some(plugin)) => {
-                return Ok(error_response(ApiSpecError::Unprocessable(format!(
+                let error = format!(
                     "API spec '{}' cannot delete proxy '{}': plugin '{}' is owned by API spec '{}'",
                     existing.id,
                     existing.proxy_id,
                     plugin.id,
                     plugin.api_spec_id.as_deref().unwrap_or("<unknown>")
-                ))));
+                );
+                return Ok(error_response(restore_snapshot_validation_failure(
+                    &existing, plugin.id, error,
+                )));
             }
             Ok(None) => {
                 return Ok(error_response(ApiSpecError::Internal(format!(
@@ -3386,15 +3405,28 @@ pub async fn handle_delete_api_spec(
             continue;
         }
         match db.get_plugin_config(namespace, plugin_id).await {
-            Ok(Some(plugin)) if plugin.api_spec_id.is_none() => {}
+            Ok(Some(plugin)) if plugin.api_spec_id.is_none() => {
+                if let Err(error) =
+                    validate_api_spec_proxy_plugin_association(&plugin, &existing.proxy_id)
+                {
+                    return Ok(error_response(restore_snapshot_validation_failure(
+                        &existing,
+                        plugin.id,
+                        error.to_string(),
+                    )));
+                }
+            }
             Ok(Some(plugin)) => {
-                return Ok(error_response(ApiSpecError::Unprocessable(format!(
+                let error = format!(
                     "API spec '{}' cannot delete proxy '{}': associated plugin '{}' is owned by API spec '{}'",
                     existing.id,
                     existing.proxy_id,
                     plugin.id,
                     plugin.api_spec_id.as_deref().unwrap_or("<unknown>")
-                ))));
+                );
+                return Ok(error_response(restore_snapshot_validation_failure(
+                    &existing, plugin.id, error,
+                )));
             }
             Ok(None) => {
                 return Ok(error_response(ApiSpecError::ValidationFailures {

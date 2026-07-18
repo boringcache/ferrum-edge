@@ -1156,11 +1156,19 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        restored_proxy_id: &str,
     ) -> Result<(), anyhow::Error> {
         let candidate = self
             .load_namespace_admission_policy_candidate_tx(tx, namespace)
             .await?;
-        Self::reject_invalid_gateway_plugin_references("restore_api_spec_bundle", &candidate)?;
+        let recovered_graph = crate::config::db_backend::api_spec_recovered_proxy_graph(
+            candidate.clone(),
+            restored_proxy_id,
+        )?;
+        Self::reject_invalid_gateway_plugin_references(
+            "restore_api_spec_bundle",
+            &recovered_graph,
+        )?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
             .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
@@ -6672,8 +6680,12 @@ impl DatabaseStore {
         // 4. INSERT api_specs row.
         self.insert_api_spec_tx(&mut tx, spec).await?;
         if compensation_restore {
-            self.validate_api_spec_restore_candidate_tx(&mut tx, &spec.namespace)
-                .await?;
+            self.validate_api_spec_restore_candidate_tx(
+                &mut tx,
+                &spec.namespace,
+                &bundle.proxy.id,
+            )
+            .await?;
         } else {
             // Preserve the normal submission contract: ordinary API-spec
             // writes run the same guarded admission checks as the other

@@ -698,6 +698,103 @@ async fn restore_bundle_preserves_unattached_proxy_config_during_late_delete_com
 }
 
 #[tokio::test]
+async fn restore_bundle_ignores_unrelated_malformed_plugin_association() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let plugin_target_proxy_id = uid("restore-repair-target");
+    let wrong_association_proxy_id = uid("restore-repair-wrong-association");
+    let malformed_plugin_id = uid("restore-repair-plugin");
+
+    store
+        .create_proxy(&make_proxy(&plugin_target_proxy_id, ns))
+        .await
+        .expect("seed plugin target proxy failed");
+    store
+        .create_proxy(&make_proxy(&wrong_association_proxy_id, ns))
+        .await
+        .expect("seed wrongly associated proxy failed");
+    store
+        .create_plugin_config(&make_plugin(
+            &malformed_plugin_id,
+            &plugin_target_proxy_id,
+            ns,
+            None,
+        ))
+        .await
+        .expect("seed proxy-scoped plugin failed");
+    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
+        .bind(&wrong_association_proxy_id)
+        .bind(&malformed_plugin_id)
+        .execute(&store.pool())
+        .await
+        .expect("seed out-of-band malformed association failed");
+
+    let restored_proxy_id = uid("restore-repair-recovered-proxy");
+    let spec_id = uid("restore-repair-spec");
+    let mut restored_proxy = make_proxy(&restored_proxy_id, ns);
+    restored_proxy.api_spec_id = Some(spec_id.clone());
+    let bundle = ExtractedBundle {
+        proxy: restored_proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &restored_proxy_id,
+        ns,
+        b"valid recovery beside malformed plugin state",
+    );
+
+    store
+        .restore_api_spec_bundle(&bundle, &spec, &[])
+        .await
+        .expect("unrelated repairable association must not block compensation");
+
+    assert!(
+        store
+            .get_proxy(ns, &restored_proxy_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_some());
+    let malformed_association_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?",
+    )
+    .bind(&wrong_association_proxy_id)
+    .bind(&malformed_plugin_id)
+    .fetch_one(&store.pool())
+    .await
+    .expect("count malformed association failed");
+    assert_eq!(
+        malformed_association_count, 1,
+        "compensation must not mask or rewrite unrelated repairable state"
+    );
+}
+
+#[test]
+fn mongo_restore_validation_uses_the_recovered_proxy_graph_projection() {
+    let source = include_str!("../../src/config/mongo_store.rs");
+    let validation_start = source
+        .find("async fn validate_api_spec_restore_candidate_in_session")
+        .expect("Mongo restore validation helper");
+    let validation_end = source[validation_start..]
+        .find("// -----------------------------------------------------------------------")
+        .map(|offset| validation_start + offset)
+        .expect("end of Mongo restore validation helper");
+    let validation = &source[validation_start..validation_end];
+
+    assert!(validation.contains("api_spec_recovered_proxy_graph"));
+    assert!(validation.contains("restored_proxy_id"));
+    assert!(validation.contains("recovered_graph.validate_plugin_references()"));
+    assert!(
+        validation.contains("validate_tcp_connection_throttle_attachments(&candidate)"),
+        "namespace-wide guarded composition validation must remain in force"
+    );
+}
+
+#[tokio::test]
 async fn restore_bundle_rolls_back_resources_associations_spec_and_changes_on_late_failure() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;

@@ -4074,6 +4074,7 @@ mod inner {
         connection: &MongoConnectionBundle,
         session: &mut ClientSession,
         namespace: &str,
+        restored_proxy_id: &str,
     ) -> Result<(), anyhow::Error> {
         let proxies = store
             .load_full_proxies_opt_session(namespace, Some((connection, &mut *session)), true)
@@ -4093,7 +4094,11 @@ mod inner {
             ..Default::default()
         };
         candidate.normalize_fields();
-        if let Err(errors) = candidate.validate_plugin_references() {
+        let recovered_graph = crate::config::db_backend::api_spec_recovered_proxy_graph(
+            candidate.clone(),
+            restored_proxy_id,
+        )?;
+        if let Err(errors) = recovered_graph.validate_plugin_references() {
             anyhow::bail!(
                 "restore_api_spec_bundle produced invalid proxy/plugin associations: {}",
                 errors.join("; ")
@@ -9261,6 +9266,7 @@ mod inner {
                             guard_params,
                             upsert_changes,
                             spec.namespace.clone(),
+                            bundle.proxy.id.clone(),
                         ),
                         |s,
                          (
@@ -9270,6 +9276,7 @@ mod inner {
                             guard_params,
                             upsert_changes,
                             namespace,
+                            restored_proxy_id,
                         )| {
                             Box::pin(async move {
                                 if let Some((_, doc)) = &prepared_docs.upstream {
@@ -9309,6 +9316,7 @@ mod inner {
                                     connection.as_ref(),
                                     &mut *s,
                                     namespace.as_str(),
+                                    restored_proxy_id.as_str(),
                                 )
                                 .await
                                 .map_err(|error| {

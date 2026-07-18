@@ -779,19 +779,24 @@ Deletes the spec and cascades:
   plugin-config deletion reports the equivalent precondition failure as 400.
 - Before deletion, the complete compensation snapshot is checked for ownership
   and restorable plugin shape. Foreign API-spec ownership, a global plugin tied
-  to the deleted proxy, a proxy-group plugin carrying `proxy_id`, or an embedded
-  proxy association naming a missing config returns 422 without deleting
-  anything, leaving the malformed graph available for operator repair.
+  to or explicitly associated with the deleted proxy, a proxy-scoped association
+  targeting another proxy, a proxy-group plugin carrying `proxy_id`, or an
+  embedded proxy association naming a missing config returns the structured 422
+  validation-failure response without deleting anything, leaving the malformed
+  graph available for operator repair.
 - If namespace admission is lost after the delete commits, SQL backends and
   replica-set MongoDB restore the upstream, proxy, all spec-owned and hand-owned
   plugins removed by the cascade, associations, spec row, and config-change
   records in one transaction. Valid proxy-scoped configs without a reverse
   proxy association are restored in that same transaction and remain
-  unattached. Route uniqueness and referenced-upstream existence are rechecked
-  inside the restore transaction after any intervening writer; a conflict
-  rolls the complete restore back. Standalone MongoDB cannot provide that
-  boundary, so compensation fails before writing and leaves the route deleted
-  rather than publishing a partially protected proxy.
+  unattached. Reference validation is limited to this recovered proxy graph, so
+  unrelated malformed associations remain available for in-band repair. Route
+  uniqueness, namespace-wide guarded plugin composition, mTLS identity policy,
+  and referenced-upstream existence are still rechecked inside the restore
+  transaction after any intervening writer; a conflict rolls the complete
+  restore back. Standalone MongoDB cannot provide that boundary, so compensation
+  fails before writing and leaves the route deleted rather than publishing a
+  partially protected proxy.
 
 ### Cascade and ownership summary
 

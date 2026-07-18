@@ -12,6 +12,66 @@ use chrono::{DateTime, Utc};
 use percent_encoding::percent_decode_str;
 use std::collections::HashSet;
 
+/// Validate that a plugin row can be restored as an explicit association on
+/// `proxy_id`. Global plugins are inherited rather than associated, while a
+/// proxy-scoped plugin may only be attached to its own target proxy.
+pub(crate) fn validate_api_spec_proxy_plugin_association(
+    plugin: &PluginConfig,
+    proxy_id: &str,
+) -> Result<(), anyhow::Error> {
+    match plugin.scope {
+        PluginScope::Global => anyhow::bail!(
+            "API-spec restore associated plugin '{}' is global and cannot be associated explicitly with proxy '{}'",
+            plugin.id,
+            proxy_id
+        ),
+        PluginScope::Proxy if plugin.proxy_id.as_deref() != Some(proxy_id) => anyhow::bail!(
+            "API-spec restore associated plugin '{}' targets proxy '{}', not restored proxy '{}'",
+            plugin.id,
+            plugin.proxy_id.as_deref().unwrap_or("<none>"),
+            proxy_id
+        ),
+        PluginScope::ProxyGroup if plugin.proxy_id.is_some() => anyhow::bail!(
+            "API-spec restore associated proxy-group plugin '{}' unexpectedly carries proxy_id '{}'",
+            plugin.id,
+            plugin.proxy_id.as_deref().unwrap_or("<none>")
+        ),
+        PluginScope::Proxy | PluginScope::ProxyGroup => Ok(()),
+    }
+}
+
+/// Project a namespace transaction candidate down to the recovered proxy graph.
+///
+/// Restore must fail closed for the proxy it is publishing, including attached
+/// shared proxy-group rows, effective global rows, and unattached proxy-scoped
+/// rows that the cascade removed. Unrelated malformed associations remain
+/// available for in-band repair and must not make otherwise-valid compensation
+/// impossible.
+pub(crate) fn api_spec_recovered_proxy_graph(
+    mut candidate: GatewayConfig,
+    proxy_id: &str,
+) -> Result<GatewayConfig, anyhow::Error> {
+    let restored_proxy = candidate
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == proxy_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("API-spec restore proxy '{}' is missing", proxy_id))?;
+    let associated_plugin_ids: HashSet<&str> = restored_proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    candidate.plugin_configs.retain(|plugin| {
+        plugin.scope == PluginScope::Global
+            || associated_plugin_ids.contains(plugin.id.as_str())
+            || plugin.proxy_id.as_deref() == Some(proxy_id)
+    });
+    candidate.proxies.clear();
+    candidate.proxies.push(restored_proxy);
+    Ok(candidate)
+}
+
 /// Validate the immutable identity and ownership boundaries of an API-spec
 /// bundle before a backend starts an atomic restore.
 ///
@@ -135,26 +195,7 @@ pub(crate) fn validate_api_spec_restore_inputs(
                 plugin.id
             );
         }
-        match plugin.scope {
-            PluginScope::Global => anyhow::bail!(
-                "API-spec restore additional plugin '{}' is global and cannot be associated with proxy '{}'",
-                plugin.id,
-                bundle.proxy.id
-            ),
-            PluginScope::Proxy if plugin.proxy_id.as_deref() != Some(bundle.proxy.id.as_str()) => {
-                anyhow::bail!(
-                    "API-spec restore additional plugin '{}' targets a different proxy",
-                    plugin.id
-                );
-            }
-            PluginScope::ProxyGroup if plugin.proxy_id.is_some() => {
-                anyhow::bail!(
-                    "API-spec restore proxy-group plugin '{}' unexpectedly carries proxy_id",
-                    plugin.id
-                );
-            }
-            PluginScope::Proxy | PluginScope::ProxyGroup => {}
-        }
+        validate_api_spec_proxy_plugin_association(plugin, &bundle.proxy.id)?;
         if !inserted_plugin_ids.insert(plugin.id.as_str()) {
             anyhow::bail!(
                 "API-spec restore contains overlapping plugin id '{}'",

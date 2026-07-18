@@ -1995,6 +1995,107 @@ async fn api_spec_delete_rejects_cascade_plugins_that_atomic_restore_cannot_recr
     }
 }
 
+#[tokio::test]
+async fn api_spec_delete_rejects_unrestorable_hand_owned_associations_before_persistence() {
+    for (case, expected_error) in [
+        ("global", "is global and cannot be associated"),
+        ("other_proxy", "not restored proxy"),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir).await;
+        let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+        let client = AdminClient::new(base);
+        let proxy_id = uid("unrestorable-association-proxy");
+        let spec = minimal_json_spec(&proxy_id);
+
+        let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+        assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+        let spec_id = post_body["id"]
+            .as_str()
+            .expect("created API spec returns id")
+            .to_string();
+        let plugin_id = uid("unrestorable-association-plugin");
+        let plugin = manual_proxy_plugin(&plugin_id, &proxy_id, "stdout_logging", json!({}));
+        attach_manual_proxy_plugin(&store, &proxy_id, &plugin).await;
+
+        match case {
+            "global" => {
+                sqlx::query(
+                    "UPDATE plugin_configs SET scope = 'global', proxy_id = NULL \
+                     WHERE namespace = ? AND id = ?",
+                )
+                .bind("ferrum")
+                .bind(&plugin_id)
+                .execute(&store.pool())
+                .await
+                .expect("inject associated global plugin");
+            }
+            "other_proxy" => {
+                let other_proxy_id = uid("unrestorable-association-other-proxy");
+                store
+                    .create_proxy(&make_proxy_for_db(
+                        &other_proxy_id,
+                        "ferrum",
+                        &format!("/{other_proxy_id}"),
+                    ))
+                    .await
+                    .expect("create the plugin's foreign target proxy");
+                sqlx::query(
+                    "UPDATE plugin_configs SET proxy_id = ? WHERE namespace = ? AND id = ?",
+                )
+                .bind(&other_proxy_id)
+                .bind("ferrum")
+                .bind(&plugin_id)
+                .execute(&store.pool())
+                .await
+                .expect("retarget associated plugin to another proxy");
+            }
+            _ => unreachable!("fixed test case"),
+        }
+
+        let (delete_status, delete_body) =
+            client.delete_json(&format!("/api-specs/{spec_id}")).await;
+        assert_eq!(
+            delete_status,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "unrestorable {case} association must fail before delete: {delete_body}"
+        );
+        assert_eq!(delete_body["error"], "Spec validation failed");
+        assert_eq!(
+            delete_body["failures"][0]["resource_type"],
+            "restore_snapshot"
+        );
+        assert_eq!(delete_body["failures"][0]["id"], plugin_id);
+        let error = delete_body["failures"][0]["errors"][0]
+            .as_str()
+            .expect("structured restore-snapshot error");
+        assert!(
+            error.contains(expected_error),
+            "unexpected failure: {delete_body}"
+        );
+        assert!(
+            error.contains(&proxy_id),
+            "proxy evidence missing: {delete_body}"
+        );
+        assert!(
+            store
+                .get_api_spec("ferrum", &spec_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "pre-delete rejection must preserve the API spec"
+        );
+        assert!(
+            store
+                .get_proxy("ferrum", &proxy_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "pre-delete rejection must preserve the proxy"
+        );
+    }
+}
+
 #[test]
 fn api_spec_delete_maps_missing_embedded_plugin_association_to_422() {
     let source = include_str!("../../src/admin/api_specs/handlers.rs");
@@ -2045,12 +2146,25 @@ async fn api_spec_delete_rejects_foreign_owned_cascade_plugin_without_retagging(
         .await
         .expect("inject foreign API-spec ownership");
 
-    let delete_status = client.delete(&format!("/api-specs/{spec_id}")).await;
+    let (delete_status, delete_body) =
+        client.delete_json(&format!("/api-specs/{spec_id}")).await;
     assert_eq!(
         delete_status,
         reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-        "foreign-owned cascade plugin must block API-spec deletion"
+        "foreign-owned cascade plugin must block API-spec deletion: {delete_body}"
     );
+    assert_eq!(delete_body["error"], "Spec validation failed");
+    assert_eq!(
+        delete_body["failures"][0]["resource_type"],
+        "restore_snapshot"
+    );
+    assert_eq!(delete_body["failures"][0]["id"], plugin_id);
+    let ownership_error = delete_body["failures"][0]["errors"][0]
+        .as_str()
+        .expect("structured ownership failure");
+    assert!(ownership_error.contains(&spec_id));
+    assert!(ownership_error.contains(&foreign_spec_id));
+    assert!(ownership_error.contains(&plugin_id));
     assert!(
         store
             .get_api_spec("ferrum", &spec_id)
