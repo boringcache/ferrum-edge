@@ -1087,7 +1087,10 @@ async fn wait_for_health_target(
         if Instant::now() >= deadline {
             return Err(format!(
                 "gateway admin /health did not {} on port {} within {:?} (last observation: {})",
-                target.timeout_description(), admin_port, timeout, last_observation
+                target.timeout_description(),
+                admin_port,
+                timeout,
+                last_observation
             )
             .into());
         }
