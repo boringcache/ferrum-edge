@@ -226,34 +226,66 @@ pub fn apply_run_overrides(args: &RunArgs) {
         // SAFETY: single-threaded context, before tokio runtime.
         unsafe { std::env::set_var("FERRUM_LOG_LEVEL", level) };
     }
-
-    infer_file_mode();
 }
 
 /// Apply settings/spec overrides shared between `run` and `validate`.
 pub fn apply_validate_overrides(args: &ValidateArgs) {
     apply_common_overrides(args.settings.as_deref(), args.spec.as_deref());
-
-    infer_file_mode();
 }
 
-/// Infer file mode when a spec is available but no mode is configured.
+/// Infer file mode when a spec is available but no mode is configured anywhere.
 ///
-/// "Available" includes a spec path that is *configured* but not yet
-/// materialized: this runs before startup secret resolution, so a
-/// `FERRUM_FILE_CONFIG_PATH_FILE` (or `_VAULT`/`_AWS`/`_AZURE`/`_GCP`) has not
-/// been written to `FERRUM_FILE_CONFIG_PATH` yet. Without this, sourcing the
-/// spec path from a secret would silently change the inferred mode compared to
-/// setting it directly — the same ordering blind spot `externally_sourced`
-/// closes for smart discovery.
-fn infer_file_mode() {
+/// # Ordering: must run *after* startup secret resolution
+///
+/// This is the last rung of `CLI > env > conf file > smart defaults >
+/// hardcoded`, so it may only fire once every higher-precedence source has had
+/// its say. Two of them are not observable before
+/// `main::resolve_startup_secrets` has run:
+///
+/// * `FERRUM_MODE_FILE`/`_VAULT`/`_AWS`/`_AZURE`/`_GCP` — an explicit *env*
+///   source for the mode. Inferring before resolution both ignores it and,
+///   worse, writes a synthetic direct `FERRUM_MODE` that the resolver then sees
+///   as a second source for the same base key, failing the whole command with
+///   `Multiple secret sources configured for FERRUM_MODE`. A deployment that
+///   externalizes both the mode and the spec path could not start or validate.
+/// * `FERRUM_FILE_CONFIG_PATH_*` — the spec path that triggers the inference.
+///   After resolution it is materialized into `FERRUM_FILE_CONFIG_PATH`, so the
+///   plain env check below covers a secret-backed spec path with no special
+///   case, and the pre-resolution `externally_sourced` probe this used to need
+///   is gone.
+///
+/// The settings file is the third: `FERRUM_MODE` in `ferrum.conf` outranks a
+/// smart default, and materializing `FERRUM_MODE=file` as an env var would
+/// *invert* that — `EnvConfig` gives the environment precedence over the conf
+/// file, so `validate`/startup would silently check the wrong surface for an
+/// operator who configured `FERRUM_MODE = database`. Reading it is correct only
+/// at this point, because `FERRUM_CONF_PATH` is only final once a
+/// `FERRUM_CONF_PATH_FILE` source has been materialized; before that this would
+/// consult the wrong settings file.
+///
+/// The read goes through a fresh `ConfFile::load()`, not
+/// `config::conf_file::resolve_ferrum_var`. The latter memoizes into the
+/// process-wide `CONF_FILE_CACHE`, and this helper must not be the thing that
+/// pins that cache for the rest of the process — `EnvConfig::from_env()` loads
+/// the file itself and reports a malformed one properly. A load failure here is
+/// therefore *not* treated as "a mode is configured": inference proceeds and the
+/// real error surfaces from settings validation a moment later.
+pub fn infer_file_mode() {
+    use crate::config::conf_file::ConfFile;
+
+    // `-m/--mode` was already written to the environment by
+    // `apply_run_overrides`, so this one check covers CLI and env alike.
     if std::env::var("FERRUM_MODE").is_ok() {
         return;
     }
-    if std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok()
-        || externally_sourced("FERRUM_FILE_CONFIG_PATH")
-    {
-        // SAFETY: single-threaded context.
+    let conf_mode = ConfFile::load()
+        .ok()
+        .and_then(|conf| conf.get("FERRUM_MODE").map(str::to_string));
+    if conf_mode.is_some_and(|mode| !mode.trim().is_empty()) {
+        return;
+    }
+    if std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok() {
+        // SAFETY: single-threaded context, before the multi-threaded runtime.
         unsafe { std::env::set_var("FERRUM_MODE", "file") };
     }
 }
@@ -318,6 +350,36 @@ pub fn execute_reload(args: &ReloadArgs) -> Result<(), String> {
     }
 }
 
+/// Render a `validate` report field whose value is derived from `env_key`.
+///
+/// The report goes to stdout with `println!`, which bypasses both redaction
+/// boundaries that cover everything else: it is not a tracing record, so
+/// `logging::non_blocking::RecordWriter::submit` never sees it, and a
+/// *successful* validation returns no error for `redact_external_secret_values`
+/// to filter. Every value-bearing line is therefore filtered at its own call
+/// site.
+///
+/// Filtering is **key-tied first**, not textual, because the report re-renders
+/// values rather than echoing them. `Mode: {:?}` prints the `OperatingMode`
+/// variant, so a `FERRUM_MODE_FILE` holding `database` reaches stdout as
+/// `Database` — a form `secrets::derive_candidates` deliberately does not
+/// produce (it derives upper- and lowercase, not `Display`/`Debug` casing of
+/// every enum in the crate). Widening candidate derivation to chase that would
+/// be exactly the open-ended normalization the redaction design rejects.
+/// Withholding by key instead is exact: the variable is known by name to have
+/// been externally resolved, so *no* rendering of its value can escape.
+///
+/// `redact_external_secret_values` still runs as the second pass, covering a
+/// field that interpolates some *other* externally resolved variable's value
+/// verbatim (the spec path is one such: it is the value of
+/// `FERRUM_FILE_CONFIG_PATH`, but a future field could embed one).
+fn report_field(env_key: &str, rendered: &str) -> String {
+    if crate::secrets::is_external_secret_key(env_key) {
+        return crate::secrets::EXTERNAL_SECRET_PLACEHOLDER.to_string();
+    }
+    crate::secrets::redact_external_secret_values(rendered)
+}
+
 /// Validate configuration without starting the gateway.
 pub fn execute_validate() -> Result<(), String> {
     use crate::config::{EnvConfig, OperatingMode, file_loader};
@@ -325,7 +387,10 @@ pub fn execute_validate() -> Result<(), String> {
     let env_config =
         EnvConfig::from_env().map_err(|e| format!("Settings validation failed: {}", e))?;
     println!("Settings (ferrum.conf): OK");
-    println!("  Mode: {:?}", env_config.mode);
+    println!(
+        "  Mode: {}",
+        report_field("FERRUM_MODE", &format!("{:?}", env_config.mode))
+    );
 
     if env_config.mode == OperatingMode::File {
         let config_path = env_config
@@ -352,8 +417,11 @@ pub fn execute_validate() -> Result<(), String> {
         // emission-boundary redaction. Filter it the same way.
         println!(
             "Spec ({}): OK",
-            crate::secrets::redact_external_secret_values(config_path)
+            report_field("FERRUM_FILE_CONFIG_PATH", config_path)
         );
+        // The counts below are cardinalities of the *loaded spec document*, not
+        // renderings of any environment value, so there is nothing key-tied to
+        // withhold and nothing an external source could have supplied.
         println!("  Proxies: {}", config.proxies.len());
         println!("  Consumers: {}", config.consumers.len());
         println!("  Upstreams: {}", config.upstreams.len());

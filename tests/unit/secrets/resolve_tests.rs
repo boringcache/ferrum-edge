@@ -1,15 +1,19 @@
 //! Tests for the secret resolution system (env + file backends).
 //!
 //! These tests mutate process-global environment variables, so they MUST run
-//! serially. We use the same ENV_LOCK pattern as env_config_tests.
+//! serially against every other env-touching test in the `unit_tests` binary —
+//! not merely against each other. They therefore acquire the single
+//! process-wide [`crate::unit::env_lock::ENV_LOCK`], the same mutex the config,
+//! CLI, identity, and redaction suites take. A file-private mutex would leave
+//! `set_var` here racing a `getenv` there, which is exactly what Rust 2024's
+//! unsafe-env contract forbids.
 
 use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_secret};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::Mutex;
 use tempfile::NamedTempFile;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+use crate::unit::env_lock::ENV_LOCK;
 
 /// Helper to set env vars, run an async closure, then clean them up.
 fn with_env_vars_async<F, Fut>(vars: &[(&str, &str)], f: F)
@@ -17,7 +21,9 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for (k, v) in vars {
         // SAFETY: We hold a mutex preventing concurrent access.
         unsafe {
@@ -535,7 +541,9 @@ fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
         return;
     }
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // SAFETY: ENV_LOCK is held for the whole test, including the worker thread.
     unsafe {
         std::env::set_var("FERRUM_TEST_SECRET_BLOCKED_FILE", &fifo);

@@ -617,6 +617,12 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 return 1;
             }
         };
+        // Lowest-precedence mode selection, deliberately after resolution: a
+        // `FERRUM_MODE_*` source is now materialized and wins, a secret-backed
+        // spec path is now visible as `FERRUM_FILE_CONFIG_PATH`, and the
+        // settings file named by a resolved `FERRUM_CONF_PATH` is the one
+        // consulted for a configured mode. See `cli::infer_file_mode`.
+        cli::infer_file_mode();
         let _logging_guards = match init_logging() {
             Ok(guards) => guards,
             Err(error) => {
@@ -654,6 +660,13 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             return 1;
         }
     };
+
+    // Same lowest-precedence mode selection as the `validate` branch above, and
+    // for the same reasons. Scoped to `run` because that is the only serving
+    // entry point whose CLI overrides were applied in `main()`.
+    if matches!(&cli.command, Some(cli::Command::Run(_))) {
+        cli::infer_file_mode();
+    }
 
     let _logging_guards = match init_logging() {
         Ok(guards) => guards,

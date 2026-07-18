@@ -1,8 +1,7 @@
 use ferrum_edge::secrets::file::{read_secret, resolve_ref};
 use std::io::Write;
-use std::sync::Mutex;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+use crate::unit::env_lock::ENV_LOCK;
 
 #[test]
 fn read_secret_reads_file_content() {
@@ -70,7 +69,9 @@ fn resolve_ref_returns_none_when_not_set() {
 
 #[test]
 fn resolve_ref_returns_path_when_set() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let key = "FERRUM_TEST_SECRET_FILE_REF_12345";
     let file_key = format!("{}_FILE", key);

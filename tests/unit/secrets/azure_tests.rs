@@ -1,16 +1,17 @@
 //! Tests for Azure Key Vault secret resolution.
 
 use ferrum_edge::secrets::resolve_secret;
-use std::sync::Mutex;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+use crate::unit::env_lock::ENV_LOCK;
 
 fn with_env_vars_async<F, Fut>(vars: &[(&str, &str)], f: F)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for (k, v) in vars {
         unsafe {
             std::env::set_var(k, v);

@@ -1143,6 +1143,184 @@ async fn functional_cli_validate_prefers_secret_spec_path_over_discovered_resour
     );
 }
 
+/// An externally sourced `FERRUM_MODE` is an explicit env source and must beat
+/// the file-mode smart default, even with a spec path configured.
+///
+/// Inferring before startup secret resolution got this wrong twice over: the
+/// suffixed source was invisible, *and* the synthetic `FERRUM_MODE=file` the
+/// inference wrote became a second source for the same base key, so the
+/// resolver failed the whole command with a multiple-sources error. A
+/// deployment that externalizes both its mode and its spec path could not
+/// validate or start at all.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_external_mode_source_beats_file_inference() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // A spec path is configured directly, which is what used to trigger the
+    // premature inference.
+    let spec_path = temp_dir.path().join("resources.yaml");
+    std::fs::write(
+        &spec_path,
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+
+    let mode_pointer = temp_dir.path().join("mode-source");
+    std::fs::write(&mode_pointer, "database").unwrap();
+
+    let mut cmd = hermetic_validate_command(&temp_dir, &[]);
+    cmd.env("FERRUM_MODE_FILE", mode_pointer.to_str().unwrap())
+        .env("FERRUM_FILE_CONFIG_PATH", spec_path.to_str().unwrap())
+        .env("FERRUM_DB_TYPE", "sqlite")
+        .env("FERRUM_DB_URL", "sqlite::memory:");
+
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("Multiple secret sources"),
+        "mode inference must not synthesize a competing FERRUM_MODE source: stderr={stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "externalizing both the mode and the spec path must validate: \
+         stdout={stdout}, stderr={stderr}"
+    );
+    // The Mode field itself is withheld (it *is* the externally resolved
+    // value), so the selected mode is proven by what the report does next:
+    // file mode validates the spec surface and prints `Spec (...)`, database
+    // mode does not.
+    assert!(
+        !stdout.contains("Spec ("),
+        "the smart default must not override an externally sourced database mode: {stdout}"
+    );
+}
+
+/// The resolved value of an externally sourced `FERRUM_MODE` must not come back
+/// out on stdout.
+///
+/// `validate`'s report is a plain `println!`: it is not a tracing record, so the
+/// `RecordWriter` emission boundary never sees it, and a *successful* run
+/// returns no error for the final redactor to filter. The mode is also
+/// re-rendered rather than echoed — `Mode: {:?}` turns a resolved `database`
+/// into `Database`, which textual candidate derivation deliberately does not
+/// produce — so the field is withheld by key instead.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_does_not_echo_externally_sourced_mode() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let mode_pointer = temp_dir.path().join("mode-source");
+    std::fs::write(&mode_pointer, "database").unwrap();
+
+    let mut cmd = hermetic_validate_command(&temp_dir, &[]);
+    cmd.env("FERRUM_MODE_FILE", mode_pointer.to_str().unwrap())
+        .env("FERRUM_DB_TYPE", "sqlite")
+        .env("FERRUM_DB_URL", "sqlite::memory:");
+
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "database-mode validate should succeed: stdout={stdout}, stderr={stderr}"
+    );
+    // Non-vacuous: the report definitely printed a Mode line.
+    assert!(
+        stdout.contains("  Mode: "),
+        "the validate report must still print a Mode field: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Mode: Database"),
+        "the externally resolved mode value must not be echoed back: {stdout}"
+    );
+    assert!(
+        stdout.contains("Mode: <redacted: value from external secret source>"),
+        "the Mode field must be withheld by key: {stdout}"
+    );
+    assert!(
+        stdout.contains("Validation passed."),
+        "withholding the value must not cost the validation result: {stdout}"
+    );
+}
+
+/// A mode configured in `ferrum.conf` outranks the file-mode smart default.
+///
+/// Materializing the inference as `FERRUM_MODE=file` inverts the documented
+/// `CLI > env > conf file > smart defaults` order, because `EnvConfig` gives the
+/// environment precedence over the settings file. The result is silent: the
+/// operator asked to validate a database deployment and got a file-mode check.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_conf_mode_beats_external_spec_inference() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let spec_path = temp_dir.path().join("resolved-resources.yaml");
+    std::fs::write(
+        &spec_path,
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+    let spec_pointer = temp_dir.path().join("spec-path-source");
+    std::fs::write(&spec_pointer, spec_path.to_str().unwrap()).unwrap();
+
+    let conf_path = temp_dir.path().join("configured-mode.conf");
+    std::fs::write(
+        &conf_path,
+        "FERRUM_MODE = database\nFERRUM_DB_TYPE = sqlite\nFERRUM_DB_URL = sqlite::memory:\n",
+    )
+    .unwrap();
+
+    // `--settings` outranks the hermetic helper's own `FERRUM_CONF_PATH`.
+    let mut cmd =
+        hermetic_validate_command(&temp_dir, &["--settings", conf_path.to_str().unwrap()]);
+    cmd.env(
+        "FERRUM_FILE_CONFIG_PATH_FILE",
+        spec_pointer.to_str().unwrap(),
+    );
+
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "database-mode validate should succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("Mode: Database"),
+        "the configured conf-file mode must win over the smart default: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Mode: File"),
+        "the smart default must not override the settings file: {stdout}"
+    );
+    // Database mode never reaches the spec check, so a file-mode misfire would
+    // also have shown up as a `Spec (...)` line.
+    assert!(
+        !stdout.contains("Spec ("),
+        "database mode must not validate a spec surface: {stdout}"
+    );
+}
+
 // ── run ─────────────────────────────────────────────────────────────────────
 
 #[ignore]
