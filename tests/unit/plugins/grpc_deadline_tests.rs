@@ -1304,7 +1304,9 @@ async fn deadline_replacement_preserves_workload_metrics_traceparent_on_exact_ba
         transform_buffered_response_body_with_deadline_for_test,
     };
 
-    let workload_metrics = create_plugin("workload_metrics", &json!({})).unwrap().unwrap();
+    let workload_metrics = create_plugin("workload_metrics", &json!({}))
+        .unwrap()
+        .unwrap();
     let after_proxy_plugins = vec![Arc::clone(&workload_metrics)];
     let transform_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledResponseTransformer)];
 
