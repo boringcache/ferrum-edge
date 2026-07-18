@@ -3500,8 +3500,7 @@ pub async fn handle_delete_api_spec(
         &[],
         &additional_plugins,
         true,
-    )
-    {
+    ) {
         return Ok(error_response(ApiSpecError::ValidationFailures {
             spec_version: existing.spec_version.clone(),
             failures: vec![ValidationFailure {
