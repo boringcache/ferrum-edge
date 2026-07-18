@@ -7250,11 +7250,8 @@ impl ProxyState {
         staged_config: Arc<GatewayConfig>,
         delta: &crate::config_delta::ConfigDelta,
     ) -> Result<StagedIncrementalRequestEpoch, String> {
-        let proxy_ids_to_rebuild = plugin_rebuild_targets_for_incremental_stage(
-            &current.config,
-            new_config,
-            delta,
-        );
+        let proxy_ids_to_rebuild =
+            plugin_rebuild_targets_for_incremental_stage(&current.config, new_config, delta);
         let proxy_plugin_rebuild_count = proxy_ids_to_rebuild.len();
         let rebuild_globals = delta.global_plugin_configs_changed;
         // A route-indexed proxy delta OR a change to the route table's mesh

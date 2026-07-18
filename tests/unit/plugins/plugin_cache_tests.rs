@@ -2991,13 +2991,7 @@ fn fault_delta_priority_change_is_targeted_and_unchanged_config_is_noop() {
 #[test]
 fn fault_reconciliation_scope_move_advances_the_actual_generation() {
     let generation = Utc::now() - chrono::Duration::seconds(10);
-    let mut fault = make_plugin_config(
-        "fault",
-        "fault_injection",
-        PluginScope::Global,
-        None,
-        true,
-    );
+    let mut fault = make_plugin_config("fault", "fault_injection", PluginScope::Global, None, true);
     fault.created_at = generation;
     fault.updated_at = generation;
     let accepted = make_config(vec![], vec![fault]);
@@ -3044,13 +3038,7 @@ fn fault_reconciliation_priority_change_advances_the_actual_generation() {
 #[test]
 fn fault_reconciliation_comparison_is_schema_complete_and_normalizes_only_timestamps() {
     let generation = Utc::now() - chrono::Duration::seconds(10);
-    let mut fault = make_plugin_config(
-        "fault",
-        "fault_injection",
-        PluginScope::Global,
-        None,
-        true,
-    );
+    let mut fault = make_plugin_config("fault", "fault_injection", PluginScope::Global, None, true);
     fault.created_at = generation;
     fault.updated_at = generation;
     let accepted = make_config(vec![], vec![fault]);

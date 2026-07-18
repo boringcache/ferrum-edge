@@ -175,9 +175,7 @@ pub mod _test_support {
         candidate: &crate::config::types::GatewayConfig,
     ) -> HashSet<String> {
         let delta = crate::config_delta::ConfigDelta::compute(current, candidate);
-        crate::proxy::plugin_rebuild_targets_for_incremental_stage(
-            current, candidate, &delta,
-        )
+        crate::proxy::plugin_rebuild_targets_for_incremental_stage(current, candidate, &delta)
     }
 
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
