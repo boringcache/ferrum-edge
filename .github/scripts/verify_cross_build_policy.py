@@ -1354,6 +1354,20 @@ def generic_action_cross_surfaces(
     return (f"file:{digest}",)
 
 
+def contains_literal_executable_cross(contents: str) -> bool:
+    """Recognize a literal Cross command or environment input in executable text."""
+
+    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    return any(
+        has_cross_command_context(variant) or CROSS_ENVIRONMENT.search(variant)
+        for line in logical_contents.splitlines()
+        for variant in scan_variants(
+            line,
+            include_opaque_shell_executable=False,
+        )
+    )
+
+
 def automation_file_cross_surfaces(name: str, contents: str) -> tuple[str, ...]:
     """Protect Cross tokens plus opaque Python process-dispatch files."""
 
@@ -1868,9 +1882,10 @@ def validate_automation_collection(
     reachable, errors = reachable_automation_references(sources, automation, source)
     for name in sorted(reachable):
         contents = automation.get(name)
-        if contents is not None and generic_action_cross_surfaces(
-            contents,
-            include_opaque_shell_executable=False,
+        if (
+            contents is not None
+            and name.endswith((".sh", ".bash"))
+            and contains_literal_executable_cross(contents)
         ):
             errors.append(
                 f"{source}/{name} contains an unprotected Cross executable or "
