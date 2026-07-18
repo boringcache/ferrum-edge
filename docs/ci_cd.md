@@ -368,8 +368,10 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   `release.yml` are isolated from the shared native matrix. Their exact job
   blocks and inherited top-level `env` mappings are hashed by the trusted
   verifier, and merge-base comparison rejects any PR-authored mutation while
-  allowing unrelated workflow jobs to evolve. These jobs use only pinned
-  external setup actions before revalidation.
+  allowing unrelated workflow jobs to evolve. Any new or changed Cross
+  executable/configuration token outside those isolated jobs is also rejected,
+  including quoted executable spellings and Cross environment aliases. These
+  jobs use only pinned external setup actions before revalidation.
 - The Cross process starts through `env -i` with an explicit minimal host
   environment and fixed compiler variables. This removes `CROSS_CONFIG`, every
   `CROSS_BUILD_*`/`CROSS_TARGET_*` alias, image/Dockerfile/pre-build/runner
@@ -379,7 +381,9 @@ boundary therefore uses a complete allowlist rather than a field denylist:
 
 The trusted `pull_request_target` job checks out only the base SHA with
 read-only contents permission. It fetches the PR head without checking it out,
-extracts `Cross.toml`, `Cargo.toml`, `ci.yml`, and `release.yml` as hostile data,
+requires the fetched object to equal the immutable head SHA from the triggering
+event, then extracts `Cross.toml`, `Cargo.toml`, `ci.yml`, and `release.yml` as
+hostile data,
 and runs only the base branch's verifier. The verifier and trusted workflow are
 compared with `HEAD...FETCH_HEAD`, preserving merge-base behavior for stale
 branches while rejecting a PR-authored modification, mode change, rename, or

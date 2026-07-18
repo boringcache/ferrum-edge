@@ -30,8 +30,14 @@ jobs:
       - name: Enforce trusted ARM64 cross-build policy
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+
+          if [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::invalid triggering PR head SHA" >&2
+            exit 1
+          fi
 
           proposed_cross="$RUNNER_TEMP/proposed-Cross.toml"
           proposed_cargo="$RUNNER_TEMP/proposed-Cargo.toml"
@@ -40,6 +46,11 @@ jobs:
           merge_base_ci="$RUNNER_TEMP/merge-base-ci.yml"
           merge_base_release="$RUNNER_TEMP/merge-base-release.yml"
           git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+          fetched_head="$(git rev-parse FETCH_HEAD)"
+          if [ "$fetched_head" != "$PR_HEAD_SHA" ]; then
+            echo "::error::fetched PR head ${fetched_head} does not match triggering head ${PR_HEAD_SHA}" >&2
+            exit 1
+          fi
 
           # These files define and invoke the trusted policy. Once this
           # bootstrap workflow is on main, changes to either require an

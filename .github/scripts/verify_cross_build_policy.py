@@ -70,6 +70,12 @@ ATTACK_PAYLOADS = {
     "command substitution": "$(touch /tmp/cross-policy-marker)",
 }
 
+STANDALONE_CROSS = re.compile(r"(?<![A-Za-z0-9_-])cross(?![A-Za-z0-9_-])")
+CROSS_ENVIRONMENT = re.compile(
+    r"(?<![A-Za-z0-9_])(?:CROSS_[A-Z0-9_]*|DOCKER_OPTS|QEMU_STRACE|"
+    r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
+)
+
 
 def exact_keys(value: Any, expected: set[str], location: str) -> list[str]:
     if not isinstance(value, dict):
@@ -316,6 +322,112 @@ def extract_top_level_block(
     return block, []
 
 
+def scan_variants(line: str) -> tuple[str, ...]:
+    """Expose ordinary YAML/shell quoting variants to the lexical boundary."""
+
+    variants = [line]
+    collapsed = re.sub(r"[\\'\"]", "", line)
+    if collapsed != line:
+        variants.append(collapsed)
+
+    for match in re.finditer(r'"(?:[^"\\]|\\.)*"', line):
+        try:
+            decoded = json.loads(match.group())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decoded, str):
+            variants.append(decoded)
+
+    return tuple(dict.fromkeys(variants))
+
+
+def unprotected_cross_surfaces(
+    contents: str,
+    source: str,
+    job_name: str,
+    *,
+    required_job: bool,
+) -> tuple[tuple[str, ...], list[str]]:
+    """Return Cross executable/config tokens outside the isolated trusted job."""
+
+    block, failures = extract_job_block(
+        contents,
+        source,
+        job_name,
+        required=required_job,
+    )
+    if failures:
+        return (), failures
+
+    outside = contents
+    if block is not None:
+        block_start = contents.find(block)
+        if block_start < 0:
+            return (), [f"{source} protected job {job_name!r} cannot be isolated"]
+        outside = contents[:block_start] + contents[block_start + len(block) :]
+
+    lines = outside.splitlines(keepends=True)
+    jobs_index = next(
+        index
+        for index, line in enumerate(lines)
+        if decode_simple_yaml_key(line.rstrip("\r\n")) == (0, "jobs")
+    )
+    jobs_end = next(
+        (
+            index
+            for index in range(jobs_index + 1, len(lines))
+            if (decoded := decode_simple_yaml_key(lines[index].rstrip("\r\n")))
+            is not None
+            and decoded[0] == 0
+        ),
+        len(lines),
+    )
+    job_starts = [
+        (index, decoded[1])
+        for index in range(jobs_index + 1, jobs_end)
+        if (decoded := decode_simple_yaml_key(lines[index].rstrip("\r\n")))
+        is not None
+        and decoded[0] == 2
+    ]
+    job_names = [name for _, name in job_starts]
+    if len(job_names) != len(set(job_names)):
+        return (), [f"{source} must not contain duplicate job keys"]
+
+    line_jobs: list[str | None] = [None] * len(lines)
+    job_digests: dict[str, str] = {}
+    for position, (start, name) in enumerate(job_starts):
+        end = job_starts[position + 1][0] if position + 1 < len(job_starts) else jobs_end
+        for index in range(start, end):
+            line_jobs[index] = name
+        block_contents = "".join(lines[start:end]).rstrip() + "\n"
+        job_digests[name] = hashlib.sha256(block_contents.encode("utf-8")).hexdigest()
+
+    top_level_surfaces: list[str] = []
+    sensitive_jobs: set[str] = set()
+    for index, line in enumerate(lines):
+        line_surfaces: set[str] = set()
+        for variant in scan_variants(line):
+            normalized = re.sub(r"\s+", " ", variant).strip()
+            if STANDALONE_CROSS.search(variant):
+                line_surfaces.add(f"executable:{normalized}")
+            if CROSS_ENVIRONMENT.search(variant):
+                line_surfaces.add(f"environment:{normalized}")
+        if not line_surfaces:
+            continue
+        job_name_for_line = line_jobs[index]
+        if job_name_for_line is None:
+            top_level_surfaces.extend(sorted(line_surfaces))
+        else:
+            sensitive_jobs.add(job_name_for_line)
+
+    job_surfaces = [
+        f"job:{name}:{job_digests[name]}"
+        for _, name in job_starts
+        if name in sensitive_jobs
+    ]
+    return tuple([*top_level_surfaces, *job_surfaces]), []
+
+
 def validate_workflow_contract(
     contents: str,
     source: str,
@@ -346,6 +458,19 @@ def validate_workflow_contract(
                 f"environment contract (expected SHA-256 {expected_env_sha256}, "
                 f"got {actual_env})"
             )
+
+    surfaces, surface_failures = unprotected_cross_surfaces(
+        contents,
+        source,
+        job_name,
+        required_job=True,
+    )
+    errors.extend(surface_failures)
+    if surfaces:
+        errors.append(
+            f"{source} contains Cross executable or configuration input outside "
+            f"protected job {job_name!r}"
+        )
     return errors
 
 
@@ -389,6 +514,27 @@ def compare_pr_workflow_job(
             errors.append(
                 f"{source} top-level env cannot be changed by a pull request because "
                 "it is inherited by the protected ARM64 invocation"
+            )
+
+    baseline_surfaces, baseline_surface_failures = unprotected_cross_surfaces(
+        merge_base_contents,
+        f"merge-base {source}",
+        job_name,
+        required_job=False,
+    )
+    proposed_surfaces, proposed_surface_failures = unprotected_cross_surfaces(
+        proposed_contents,
+        f"proposed {source}",
+        job_name,
+        required_job=False,
+    )
+    errors.extend(baseline_surface_failures)
+    errors.extend(proposed_surface_failures)
+    if not baseline_surface_failures and not proposed_surface_failures:
+        if baseline_surfaces != proposed_surfaces:
+            errors.append(
+                f"{source} cannot add or change Cross executable/configuration "
+                "surfaces outside the protected ARM64 job"
             )
     return errors
 
@@ -702,6 +848,28 @@ pre_build = []
             "  FIXED_INPUT: approved\n",
             "  FIXED_INPUT: approved\n  LD_PRELOAD: ./attacker.so\n",
         ),
+        "unprotected Cross job": workflow
+        + "  unprotected-cross-on-pr:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n",
+        "unprotected absolute Cross executable": workflow.replace(
+            "echo safe",
+            "/home/runner/.cargo/bin/cross build --target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected Cross install": workflow.replace(
+            "echo safe", "cargo install cross"
+        ),
+        "unprotected quoted Cross executable": workflow.replace(
+            "echo safe", '"\\u0063ross build --target aarch64-unknown-linux-gnu"'
+        ),
+        "unprotected split-quoted Cross executable": workflow.replace(
+            "echo safe", 'cr"oss build --target aarch64-unknown-linux-gnu'
+        ),
+        "unprotected flow environment alias": workflow.replace(
+            "  unrelated:\n",
+            "  unrelated:\n    env: { CROSS_CONFIG: attacker.toml }\n",
+        ),
     }
     for name, contents in workflow_bypasses.items():
         if not validate_workflow_contract(
@@ -725,6 +893,25 @@ pre_build = []
         "protected-arm",
     ):
         failures.append("stale branch unrelated workflow edit was rejected")
+    stale_cross_workflow = (
+        "name: stale\nenv:\n  FIXED_INPUT: approved\njobs:\n"
+        "  legacy-cross:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: cross build --target aarch64-unknown-linux-gnu\n"
+        "  unrelated:\n"
+        "    runs-on: ubuntu-22.04\n"
+    )
+    proposed_stale_cross = stale_cross_workflow.replace(
+        "ubuntu-22.04", "ubuntu-24.04"
+    )
+    if compare_pr_workflow_job(
+        stale_cross_workflow,
+        proposed_stale_cross,
+        "stale workflow",
+        "protected-arm",
+    ):
+        failures.append("stale branch unchanged legacy Cross surface was rejected")
     if compare_pr_workflow_job(
         workflow,
         benign_workflow,
@@ -748,6 +935,17 @@ pre_build = []
         "protected-arm",
     ):
         failures.append("merge-base comparison allowed a protected top-level env edit")
+    changed_unprotected_cross = benign_workflow.replace(
+        "echo unrelated-edit",
+        "cross build --target aarch64-unknown-linux-gnu",
+    )
+    if not compare_pr_workflow_job(
+        workflow,
+        changed_unprotected_cross,
+        "current workflow",
+        "protected-arm",
+    ):
+        failures.append("merge-base comparison allowed an unprotected Cross invocation")
     if not compare_pr_workflow_job(
         merge_base_without_job,
         workflow,
