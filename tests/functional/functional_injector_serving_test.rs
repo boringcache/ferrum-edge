@@ -13,14 +13,22 @@
 //!     cert source is ACME-issued;
 //!   - a nonzero `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` closes a connection
 //!     that trickles request headers, and `0` is the documented opt-out.
+//!
+//! Two things keep the assertions non-vacuous. The plaintext cases explicitly
+//! remove any inherited `FERRUM_INJECTOR_TLS_*` pair (a parent environment
+//! exporting one makes the injector serve TLS regardless of
+//! `FERRUM_INJECTOR_ALLOW_PLAINTEXT`, which would turn the raw-TCP slow-header
+//! tests into TLS parse failures), and the readiness probe identifies the child
+//! it reached rather than accepting whatever holds the port.
 
 use std::io::Cursor;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -30,6 +38,13 @@ use crate::scaffolding::ports::reserve_port;
 /// Spawn attempts before giving up. Matches the shared harness budget; each
 /// attempt takes a fresh port and a fresh temp dir.
 const MAX_SPAWN_ATTEMPTS: u32 = 5;
+
+/// Readiness probes per spawn attempt, one per 100ms — a 10s startup budget.
+const MAX_READINESS_PROBES: u32 = 100;
+
+/// Per-probe I/O budget. Bounds the readiness loop deterministically instead of
+/// letting a wedged listener stall the attempt.
+const PROBE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn gateway_binary_path() -> String {
     std::env::var("CARGO_BIN_EXE_ferrum-edge")
@@ -43,6 +58,11 @@ struct InjectorGateway {
     port: u16,
     /// Retained so the on-disk TLS material outlives the child.
     tmp: tempfile::TempDir,
+    /// Unique to this spawn attempt. The injector stamps it into the SPIFFE ID
+    /// it patches into the pod, so an admission response carrying it could only
+    /// have come from this child — that is what makes the readiness probe a
+    /// real identity check rather than "something is listening".
+    trust_domain: String,
 }
 
 impl Drop for InjectorGateway {
@@ -75,6 +95,10 @@ async fn try_start_injector(
         .map_err(|e| format!("reserve injector port: {e}"))?
         .drop_and_take_port();
 
+    // Unique per spawning process and per port, so a listener that answers with
+    // this trust domain is this child and not another test's injector.
+    let trust_domain = format!("injector-probe-{}-{port}.test", std::process::id());
+
     let mut command = Command::new(gateway_binary_path());
     command
         .env("FERRUM_MODE", "injector")
@@ -83,10 +107,16 @@ async fn try_start_injector(
             "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS",
             header_read_timeout_seconds,
         )
+        .env("FERRUM_INJECTOR_TRUST_DOMAIN", &trust_domain)
         .env("FERRUM_LOG_LEVEL", "warn")
         // Keep the ACME store lookups the TLS-ALPN resolver performs inside
         // the temp dir instead of the ambient default store path.
         .env("FERRUM_TLS_MANAGED_STORE_PATH", tmp.path())
+        // Pin the two other bounds the serving contract depends on. An ambient
+        // `FERRUM_MAX_CONNECTIONS=0` or a tiny handshake timeout would change
+        // which limit closes a connection and make these assertions vacuous.
+        .env("FERRUM_MAX_CONNECTIONS", "64")
+        .env("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS", "10")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
@@ -101,42 +131,166 @@ async fn try_start_injector(
         std::fs::write(&ca_path, &ca.cert_pem).map_err(|e| format!("write ca: {e}"))?;
         command
             .env("FERRUM_INJECTOR_TLS_CERT_PATH", &cert_path)
-            .env("FERRUM_INJECTOR_TLS_KEY_PATH", &key_path);
+            .env("FERRUM_INJECTOR_TLS_KEY_PATH", &key_path)
+            // Ambient plaintext opt-in must not weaken the TLS cases.
+            .env("FERRUM_INJECTOR_ALLOW_PLAINTEXT", "false");
     } else {
-        command.env("FERRUM_INJECTOR_ALLOW_PLAINTEXT", "true");
+        // `FERRUM_INJECTOR_ALLOW_PLAINTEXT=true` does NOT force plaintext: a
+        // parent environment exporting the injector cert/key pair still
+        // satisfies `validate_injector_tls_serving`, and `build_tls_acceptor`
+        // would serve TLS. The raw-TCP slow-header assertions would then close
+        // during TLS parsing rather than at the header read timeout — vacuously
+        // passing. Drop the inherited pair explicitly.
+        command
+            .env_remove("FERRUM_INJECTOR_TLS_CERT_PATH")
+            .env_remove("FERRUM_INJECTOR_TLS_KEY_PATH")
+            .env("FERRUM_INJECTOR_ALLOW_PLAINTEXT", "true");
     }
 
     let child = command
         .spawn()
         .map_err(|e| format!("spawn injector: {e}"))?;
-    let mut gateway = InjectorGateway { child, port, tmp };
+    let mut gateway = InjectorGateway {
+        child,
+        port,
+        tmp,
+        trust_domain,
+    };
 
-    for _ in 0..100 {
-        let exited = gateway.child.try_wait().map_err(|e| format!("poll: {e}"))?;
-        if let Some(status) = exited {
+    let mut last_probe_error = "no probe attempted".to_string();
+    for _ in 0..MAX_READINESS_PROBES {
+        if let Some(status) = child_exit_status(&mut gateway)? {
             return Err(format!("injector exited during startup: {status}"));
         }
-        let probe = TcpStream::connect(("127.0.0.1", gateway.port)).await;
-        if probe.is_ok() {
-            return Ok(gateway);
+        match probe_injector_identity(&gateway, tls).await {
+            Ok(()) => {
+                // The probe proves the listener is an injector stamping this
+                // attempt's unique trust domain. Re-check the child before
+                // returning anyway: had it died between the poll above and the
+                // probe, a bare TCP success could have come from whatever took
+                // the port next, and this helper exists to retry that race
+                // rather than hand the assertions a foreign listener.
+                if let Some(status) = child_exit_status(&mut gateway)? {
+                    return Err(format!("injector exited during readiness probe: {status}"));
+                }
+                return Ok(gateway);
+            }
+            Err(error) => last_probe_error = error,
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(format!(
-        "injector never accepted a connection on port {port}"
+        "injector never served an admission response on port {port}: {last_probe_error}"
     ))
+}
+
+fn child_exit_status(
+    gateway: &mut InjectorGateway,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    gateway
+        .child
+        .try_wait()
+        .map_err(|e| format!("poll injector child: {e}"))
+}
+
+/// Readiness probe: drive one real `POST /mutate` and require the response to
+/// carry this attempt's unique trust domain.
+///
+/// A bare TCP connect only proves *something* is listening. Under parallel test
+/// load another process can take the reserved port between
+/// `drop_and_take_port()` and the child's bind, so the probe has to identify the
+/// peer. On TLS the handshake alone already does (the leaf chains to a CA
+/// generated in this attempt's temp dir); the admission response is checked on
+/// both paths so plaintext gets the same guarantee.
+async fn probe_injector_identity(gateway: &InjectorGateway, tls: bool) -> Result<(), String> {
+    let stream = timeout(
+        PROBE_IO_TIMEOUT,
+        TcpStream::connect(("127.0.0.1", gateway.port)),
+    )
+    .await
+    .map_err(|_| "probe connect timed out".to_string())?
+    .map_err(|e| format!("probe connect: {e}"))?;
+
+    let response = if tls {
+        install_crypto_provider();
+        let mut client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(probe_root_store(gateway)?)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())
+            .map_err(|e| format!("probe server name: {e}"))?;
+        let tls_stream = timeout(PROBE_IO_TIMEOUT, connector.connect(server_name, stream))
+            .await
+            .map_err(|_| "probe TLS handshake timed out".to_string())?
+            .map_err(|e| format!("probe TLS handshake: {e}"))?;
+        probe_admission_exchange(tls_stream).await?
+    } else {
+        probe_admission_exchange(stream).await?
+    };
+
+    if !response.starts_with("HTTP/1.1 200 OK") {
+        return Err(format!("probe response was {response:?}"));
+    }
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .ok_or_else(|| "probe response had no body".to_string())?;
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| format!("probe body was not JSON: {e}"))?;
+    let patch = value
+        .pointer("/response/patch")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "probe response carried no patch".to_string())?;
+    let patch = base64::engine::general_purpose::STANDARD
+        .decode(patch)
+        .map_err(|e| format!("probe patch was not base64: {e}"))?;
+    let patch = String::from_utf8_lossy(&patch);
+    if !patch.contains(&gateway.trust_domain) {
+        return Err(format!(
+            "port {} answered without this attempt's `{}` trust domain, so the \
+             listener is not this injector",
+            gateway.port, gateway.trust_domain
+        ));
+    }
+    Ok(())
+}
+
+async fn probe_admission_exchange<S>(stream: S) -> Result<String, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    timeout(
+        PROBE_IO_TIMEOUT,
+        writer.write_all(mutate_request(&admission_review("readiness-probe")).as_bytes()),
+    )
+    .await
+    .map_err(|_| "probe write timed out".to_string())?
+    .map_err(|e| format!("probe write: {e}"))?;
+    let mut response = Vec::new();
+    timeout(PROBE_IO_TIMEOUT, reader.read_to_end(&mut response))
+        .await
+        .map_err(|_| "probe read timed out".to_string())?
+        .map_err(|e| format!("probe read: {e}"))?;
+    Ok(String::from_utf8_lossy(&response).to_string())
+}
+
+fn probe_root_store(gateway: &InjectorGateway) -> Result<rustls::RootCertStore, String> {
+    let ca_pem = std::fs::read(gateway.tmp.path().join("ca.crt"))
+        .map_err(|e| format!("read test CA pem: {e}"))?;
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut Cursor::new(ca_pem)) {
+        root_store
+            .add(cert.map_err(|e| format!("parse CA cert: {e}"))?)
+            .map_err(|e| format!("add CA: {e}"))?;
+    }
+    Ok(root_store)
 }
 
 /// The CA PEM the running TLS injector serves under, as a rustls trust anchor.
 fn root_store_for(gateway: &InjectorGateway) -> rustls::RootCertStore {
-    let ca_pem = std::fs::read(gateway.tmp.path().join("ca.crt")).expect("read test CA pem");
-    let mut root_store = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut Cursor::new(ca_pem)) {
-        root_store
-            .add(cert.expect("parse CA cert"))
-            .expect("add CA");
-    }
-    root_store
+    probe_root_store(gateway).expect("build test CA root store")
 }
 
 fn install_crypto_provider() {
