@@ -273,6 +273,16 @@ const MINIMAL_WITHHELD_LOG_RECORD: &str = "{}";
 ///
 /// Returns the bare template before redaction is armed, where there is nothing
 /// to collide with.
+//
+// Library/external-test accessor: the only consumer is
+// `tests/unit/secrets/redaction_tests.rs`, which asserts the process-specific,
+// already-redacted template. Production has no use for it — `redact_log_record`
+// already holds the `&RedactionPlan` snapshot it is acting on and reaches
+// `plan.withheld_record` through `withheld_record(plan, ..)`, so calling this
+// there would add a second global-plan lookup and let the emitted line come
+// from a different snapshot than the record being withheld. The binary target
+// therefore compiles it unused; scoped to this accessor only.
+#[allow(dead_code)]
 pub fn withheld_log_record() -> &'static str {
     match redaction_plan() {
         Some(plan) => plan.withheld_record.as_str(),
