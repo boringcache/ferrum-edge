@@ -2770,20 +2770,28 @@ where
                     }
                 }
 
-                for plugin in plugins {
-                    if let Some(transformed) = plugin
-                        .transform_response_body_with_context(
-                            &mut *ctx,
-                            &response_body,
-                            content_type_of(&response_headers),
-                            &response_headers,
-                        )
-                        .await
-                    {
-                        response_headers
-                            .insert("content-length".to_string(), transformed.len().to_string());
-                        response_body = transformed;
-                        plugin.on_response_body_transformed(ctx, &mut response_headers);
+                if crate::plugins::response_body_rewrite_allowed(response_status) {
+                    for plugin in plugins {
+                        if let Some(transformed) = plugin
+                            .transform_response_body_with_context(
+                                &mut *ctx,
+                                &response_body,
+                                content_type_of(&response_headers),
+                                &response_headers,
+                            )
+                            .await
+                        {
+                            response_headers.insert(
+                                "content-length".to_string(),
+                                transformed.len().to_string(),
+                            );
+                            response_body = transformed;
+                            crate::plugins::finalize_response_body_transformation(
+                                plugin.as_ref(),
+                                ctx,
+                                &mut response_headers,
+                            );
+                        }
                     }
                     ctx.record_deadline_response_header_plugin(plugin.as_ref(), &response_headers);
                 }
@@ -4535,36 +4543,42 @@ where
             // while the wire trailers stay separate for the split H3 wire shape.
             // content-length updates land on the view and flow into the wire
             // headers after reconciliation below.
-            for plugin in plugins.iter() {
-                let transformed = match crate::plugins::await_grpc_deadline(
-                    ctx.grpc_deadline_at(),
-                    plugin.transform_response_body_with_context(
-                        &mut *ctx,
-                        &response_body,
-                        content_type_of(&plugin_response_headers),
-                        &plugin_response_headers,
-                    ),
-                )
-                .await
-                {
-                    Ok(transformed) => transformed,
-                    Err(()) => {
-                        replace_buffered_grpc_response_with_deadline(
+            if crate::plugins::response_body_rewrite_allowed(response_status) {
+                for plugin in plugins.iter() {
+                    let transformed = match crate::plugins::await_grpc_deadline(
+                        ctx.grpc_deadline_at(),
+                        plugin.transform_response_body_with_context(
+                            &mut *ctx,
+                            &response_body,
+                            content_type_of(&plugin_response_headers),
+                            &plugin_response_headers,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(transformed) => transformed,
+                        Err(()) => {
+                            replace_buffered_grpc_response_with_deadline(
+                                ctx,
+                                &mut response_status,
+                                &mut plugin_response_headers,
+                                &mut response_body,
+                                &mut response_trailers,
+                                initial_response_header_policy_plugins,
+                            );
+                            break;
+                        }
+                    };
+                    if let Some(transformed) = transformed {
+                        plugin_response_headers
+                            .insert("content-length".to_string(), transformed.len().to_string());
+                        response_body = transformed;
+                        crate::plugins::finalize_response_body_transformation(
+                            plugin.as_ref(),
                             ctx,
-                            &mut response_status,
                             &mut plugin_response_headers,
-                            &mut response_body,
-                            &mut response_trailers,
-                            initial_response_header_policy_plugins,
                         );
-                        break;
                     }
-                };
-                if let Some(transformed) = transformed {
-                    plugin_response_headers
-                        .insert("content-length".to_string(), transformed.len().to_string());
-                    response_body = transformed;
-                    plugin.on_response_body_transformed(ctx, &mut plugin_response_headers);
                 }
                 ctx.record_deadline_response_header_plugin(
                     plugin.as_ref(),

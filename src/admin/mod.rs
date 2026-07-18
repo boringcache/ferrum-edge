@@ -6270,7 +6270,7 @@ async fn handle_restore(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
                         "error": format!(
-                            "Restore aborted: HMAC request-transform composition could not be validated: {}. Existing config was NOT deleted.",
+                            "Restore aborted: plugin security composition could not be validated: {}. Existing config was NOT deleted.",
                             error
                         )
                     }),

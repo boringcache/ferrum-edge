@@ -767,6 +767,18 @@ impl PluginHttpClient {
             error_class: classify_reqwest_error(&error),
             request_reached_wire: false,
         })?;
+        if let Some(reason) = self.denied_literal_ip_reason(&request) {
+            tracing::warn!(
+                plugin = label,
+                url = %redacted_url,
+                reason,
+                "Plugin egress policy denied literal-IP endpoint; not dialing"
+            );
+            return Err(PluginHttpFailure {
+                error_class: crate::retry::ErrorClass::DispatchPolicyRejected,
+                request_reached_wire: false,
+            });
+        }
         self.execute_request(request, label, Some(accumulator), Some(redacted_url))
             .await
             .map_err(|error| {
@@ -804,14 +816,7 @@ impl PluginHttpClient {
         // Enforce the backend egress policy here — the single runtime chokepoint
         // for every plugin that dials through the shared client. A denied
         // destination is surfaced to the plugin as a 502 (not dialed).
-        let literal_ip = match request.url().host() {
-            Some(url::Host::Ipv4(addr)) => Some(std::net::IpAddr::V4(addr)),
-            Some(url::Host::Ipv6(addr)) => Some(std::net::IpAddr::V6(addr)),
-            _ => None,
-        };
-        if let Some(ip) = literal_ip
-            && let Some(reason) = self.backend_allow_ips.deny_reason(&ip)
-        {
+        if let Some(reason) = self.denied_literal_ip_reason(&request) {
             tracing::warn!(
                 plugin = label,
                 url = %log_url,
@@ -878,6 +883,15 @@ impl PluginHttpClient {
 
             return self.finish_request(result, label, &log_url, total_start);
         }
+    }
+
+    fn denied_literal_ip_reason(&self, request: &reqwest::Request) -> Option<&'static str> {
+        let literal_ip = match request.url().host() {
+            Some(url::Host::Ipv4(addr)) => Some(std::net::IpAddr::V4(addr)),
+            Some(url::Host::Ipv6(addr)) => Some(std::net::IpAddr::V6(addr)),
+            _ => None,
+        };
+        literal_ip.and_then(|ip| self.backend_allow_ips.deny_reason(&ip))
     }
 
     fn finish_request(

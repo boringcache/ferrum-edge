@@ -514,6 +514,40 @@ async fn test_force_sse_content_type_on_json_response() {
 }
 
 #[tokio::test]
+async fn test_preserved_non_sse_response_is_not_relabelled_without_body_wrap() {
+    let plugin = make_plugin(json!({
+        "force_sse_content_type": true,
+        "wrap_non_sse_responses": true
+    }));
+
+    for status in [206, 226] {
+        let mut ctx = make_sse_ctx();
+        let mut headers = json_response_headers();
+        assert!(!plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            status,
+            &headers
+        ));
+        assert!(
+            plugin.should_release_response_body_before_content_type_rewrite(&ctx, status, &headers)
+        );
+        plugin.after_proxy(&mut ctx, status, &mut headers).await;
+
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some("42")
+        );
+        assert!(!headers.contains_key("cache-control"));
+        assert!(!headers.contains_key("connection"));
+    }
+}
+
+#[tokio::test]
 async fn test_force_does_not_overwrite_existing_sse() {
     let plugin = make_plugin(json!({"force_sse_content_type": true}));
     let mut ctx = make_sse_ctx();

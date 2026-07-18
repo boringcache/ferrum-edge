@@ -114,7 +114,7 @@ use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -250,6 +250,77 @@ pub fn apply_initial_response_header_policies(
     for plugin in policy_plugins {
         plugin.apply_initial_response_header_policy(response_headers);
     }
+}
+
+/// Representation metadata that becomes invalid whenever a buffered response
+/// transform replaces the client-visible bytes.
+const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
+    "accept-ranges",
+    "content-range",
+    "content-md5",
+    "digest",
+    "content-digest",
+    "repr-digest",
+    "etag",
+    "last-modified",
+    "delta-base",
+    "im",
+    "variant-key",
+    "signature",
+    "signature-input",
+    "content-signature",
+    "content-signature-input",
+    "content-checksum",
+];
+
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+fn is_transform_invalidated_response_header(name: &str) -> bool {
+    TRANSFORM_INVALIDATED_RESPONSE_HEADERS
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
+        || starts_with_ascii_case_insensitive(name, "x-amz-checksum-")
+        || starts_with_ascii_case_insensitive(name, "x-checksum-")
+        || name.eq_ignore_ascii_case("x-goog-hash")
+        || name.eq_ignore_ascii_case("x-ms-content-crc64")
+}
+
+/// Whether buffered response bytes may be rewritten while preserving the
+/// response status semantics.
+///
+/// A `206 Partial Content` body is only the selected range, not a complete
+/// representation. A `226 IM Used` body is a delta whose interpretation
+/// depends on `IM` and `Delta-Base`. Rewriting either body while removing its
+/// representation metadata would leave the unchanged status incoherent. Keep
+/// both response forms untouched. Inspection hooks still run; enforcing
+/// plugins whose findings require a rewrite must reject instead of reporting a
+/// redaction that cannot be applied. All protocol paths and the
+/// provider/protocol normalization phase consult this shared gate.
+pub(crate) fn response_body_rewrite_allowed(response_status: u16) -> bool {
+    !matches!(response_status, 206 | 226)
+}
+
+/// Finalize one successful buffered response-body transformation.
+///
+/// Every protocol path calls this immediately after replacing the bytes and
+/// recomputing `Content-Length`. The lifecycle owns invalidation of upstream
+/// validators, range metadata, integrity digests, and content-bound signatures
+/// so an individual transformer cannot accidentally leave stale metadata. The
+/// plugin-specific hook runs afterward and may attach metadata it recomputed
+/// for the new representation. Returning `None` from the transform skips this
+/// function, preserving untouched response semantics.
+pub(crate) fn finalize_response_body_transformation(
+    plugin: &dyn Plugin,
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+) {
+    response_headers.retain(|name, _| !is_transform_invalidated_response_header(name));
+    plugin.on_response_body_transformed(ctx, response_headers);
 }
 
 /// Ordered outcome of deterministic initial-response policy for a buffered
@@ -1213,12 +1284,6 @@ pub struct RequestContext {
     /// Prefix that supplied the selected trusted cost. This remains private so
     /// public metadata cannot influence deterministic multi-instance pricing.
     ai_usage_export_cost_prefix: Option<Arc<str>>,
-    /// Per-request ownership state for each live request-deduplication plugin
-    /// instance. Multiple instances may coexist on one proxy; keeping their
-    /// correlation state in a private instance-keyed map prevents one hook
-    /// from consuming another instance's key or local/Redis owner token.
-    pub(crate) request_deduplication_state:
-        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
     /// Aggregate CORS policy state staged across every attached CORS instance
     /// and consumed by the cache-inserted CORS finalizer. Kept outside public
     /// metadata so policy details never enter transaction logs.
@@ -1272,6 +1337,15 @@ pub struct RequestContext {
     /// instances may coexist on one proxy and must never consume each other's
     /// dedup state.
     pub(crate) ai_tool_governor_response_hashes: HashMap<u64, String>,
+    /// `ai_response_guard` instances that inspected an already-finalized
+    /// deduplication replay and found content requiring a current-policy
+    /// redaction transform. Kept outside public metadata so response data or a
+    /// custom plugin cannot opt a replay into or out of mandatory rewriting.
+    pub(crate) ai_response_guard_replay_redactions: HashSet<u64>,
+    /// `ai_tool_governor` equivalent of
+    /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
+    /// governor from consuming another instance's transform requirement.
+    pub(crate) ai_tool_governor_replay_redactions: HashSet<u64>,
     /// Per-instance governed-call identity multisets (identity hash -> count),
     /// the one-for-one skip ledgers final re-checks consume. Kept off
     /// `metadata` for the same reason as the response hashes.
@@ -1289,6 +1363,44 @@ pub struct RequestContext {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
+    /// Per-`request_deduplication`-instance completion state acquired during
+    /// `before_proxy`. Keeping this out of public metadata prevents internal
+    /// cache keys and lock tokens from entering transaction logs. The map is
+    /// bounded by the configured deduplication instances on the matched proxy.
+    pub(crate) request_deduplication_states:
+        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
+    /// Whether `request_deduplication` supplied an already-finalized committed
+    /// representation for this request. The shared synthetic rejection path
+    /// must not run ordinary presentation transforms over it again. Inspection
+    /// and final-body validation still run over the replayed client
+    /// representation, and a current redaction decision can require its own
+    /// transform or fail closed.
+    /// Kept private so request metadata cannot suppress response inspection.
+    pub(crate) deduplication_replay_response_finalized: bool,
+    /// Deduplication instances whose in-flight ownership can be released after
+    /// a serverless rejection proven to occur before external invocation. Each
+    /// committed hook consumes only its own entry, preserving exactly-once
+    /// cleanup without weakening uncertain-side-effect retention.
+    pub(crate) serverless_pre_invocation_rejection_owners: HashSet<u64>,
+    /// Deduplication instances that own protection for a terminal serverless
+    /// invocation. Each committed/stream-terminal hook consumes or observes
+    /// only its own entry, so one instance cannot publish into another cache or
+    /// release another instance's in-flight marker. This set is bounded by the
+    /// completion-state map above.
+    pub(crate) serverless_external_side_effect_owners: HashSet<u64>,
+    /// Whether a successful terminate-mode serverless invocation produced the
+    /// current synthetic response. Unlike ordinary plugin rejections, every
+    /// final 2xx-5xx function response is application-owned content and must run
+    /// through the buffered response-body lifecycle when configured. Kept out
+    /// of public metadata so a custom plugin cannot opt an unrelated rejection
+    /// into that contract.
+    pub(crate) serverless_terminate_response: bool,
+    /// Deduplication instance currently publishing an owned terminal response
+    /// from the observe-only committed hook. This transient private marker lets
+    /// the ordinary publication path retain in-flight protection when no replay
+    /// can be stored. Committed hooks run sequentially, so at most one instance
+    /// occupies the slot.
+    pub(crate) serverless_owned_dedup_publication: Option<u64>,
     /// Per-`ai_prompt_compressor`-instance source digest, transformed bytes, and
     /// stats staged by `before_proxy`. Kept out of public metadata so a staged
     /// prompt copy and prompt-derived digest cannot enter transaction logs.
@@ -1632,7 +1744,6 @@ impl RequestContext {
             ai_usage_export: None,
             ai_usage_export_token_prefix: None,
             ai_usage_export_cost_prefix: None,
-            request_deduplication_state: HashMap::new(),
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
@@ -1644,10 +1755,18 @@ impl RequestContext {
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
             ai_tool_governor_response_hashes: HashMap::new(),
+            ai_response_guard_replay_redactions: HashSet::new(),
+            ai_tool_governor_replay_redactions: HashSet::new(),
             ai_tool_governor_call_hashes: HashMap::new(),
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
+            request_deduplication_states: HashMap::new(),
+            deduplication_replay_response_finalized: false,
+            serverless_pre_invocation_rejection_owners: HashSet::new(),
+            serverless_external_side_effect_owners: HashSet::new(),
+            serverless_terminate_response: false,
+            serverless_owned_dedup_publication: None,
             ai_prompt_compressor_staged: HashMap::new(),
             ai_prompt_compressor_classification_path: None,
             ai_prompt_compressor_wire_stats_started: false,
@@ -2123,10 +2242,6 @@ impl RequestContext {
             ai_usage_export: self.ai_usage_export.clone(),
             ai_usage_export_token_prefix: self.ai_usage_export_token_prefix.clone(),
             ai_usage_export_cost_prefix: self.ai_usage_export_cost_prefix.clone(),
-            // Deduplication has no final request-body hook, and the caller only
-            // copies selected hook results back. Keep ownership solely on the
-            // live context instead of cloning request keys and tokens here.
-            request_deduplication_state: HashMap::new(),
             // Final request-body hooks cannot observe or mutate the real CORS
             // aggregate. CORS has no body hook, and only metadata is copied
             // back from this compatibility context.
@@ -2144,10 +2259,22 @@ impl RequestContext {
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
+            ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
+            ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
+            request_deduplication_states: self.request_deduplication_states.clone(),
+            deduplication_replay_response_finalized: self.deduplication_replay_response_finalized,
+            serverless_pre_invocation_rejection_owners: self
+                .serverless_pre_invocation_rejection_owners
+                .clone(),
+            serverless_external_side_effect_owners: self
+                .serverless_external_side_effect_owners
+                .clone(),
+            serverless_terminate_response: self.serverless_terminate_response,
+            serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
             // Transfer rather than clone the potentially body-sized compressor
             // stage. The final wire hook consumes it from this compatibility
             // context, while the live context no longer retains a second copy.
@@ -3210,7 +3337,13 @@ pub async fn normalize_response_body_for_inspection(
     response_body: &mut Vec<u8>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
+    // Seed provenance before the rewrite gate: a status that forbids body
+    // rewrites can still be replaced by the request's gRPC deadline, and an
+    // unseeded provenance strips every header from that replacement.
     ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
+    if !response_body_rewrite_allowed(response_status) {
+        return false;
+    }
     let content_type = response_headers.get("content-type").cloned();
     let mut normalized = false;
     for plugin in plugins {
@@ -4547,13 +4680,35 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin sends the buffered request body to an
+    /// external service during `before_proxy`, before request-body transforms
+    /// and final-body policy hooks run. Cache validation rejects a same-protocol
+    /// transformer in that chain so policy cannot govern different bytes than
+    /// the backend receives.
+    fn egresses_request_body_before_finalization(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin can execute an external side effect and
+    /// then terminate the request from `before_proxy`.
+    ///
+    /// A configured `request_deduplication` instance must have a strictly lower
+    /// effective priority so it acquires replay/in-flight ownership before the
+    /// side effect can run. This capability does not require deduplication to be
+    /// configured; it only makes an attached deduplication chain fail closed on
+    /// an unsafe ordering.
+    fn requires_prior_request_deduplication(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs the raw request body to be available
     /// during `before_proxy`.
     ///
     /// This is narrower than `requires_request_body_buffering()`: body
     /// transformers can buffer later, after `before_proxy` rejects have had a
-    /// chance to short-circuit. Override this only for plugins that read
-    /// `ctx.metadata["request_body"]` inside `before_proxy`.
+    /// chance to short-circuit. Override this only for plugins that inspect
+    /// `ctx.metadata["request_body"]` or `ctx.request_body_bytes` inside
+    /// `before_proxy`.
     fn requires_request_body_before_before_proxy(&self) -> bool {
         false
     }
@@ -5221,13 +5376,27 @@ pub trait Plugin: Send + Sync {
             .await
     }
 
-    /// Called immediately after this plugin returns a transformed response
-    /// body, before the next body transform runs.
+    /// Whether this plugin's response inspection just determined that its
+    /// transform is required to make an already-finalized deduplication replay
+    /// safe under current policy.
     ///
-    /// Use this for response headers that are valid only for the original body
-    /// representation, such as upstream validators or integrity digests. The
-    /// hook is not called when the transform returns `None`, so unchanged
-    /// responses retain their original headers.
+    /// Ordinary presentation transforms do not run twice over replayed bytes.
+    /// A plugin returning true here is therefore making a fail-closed security
+    /// claim: its transform must return replacement bytes before delivery. As
+    /// with every response-body hook, the plugin must also advertise response
+    /// buffering through `requires_response_body_buffering()`.
+    fn requires_replay_response_body_transform(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Called immediately after this plugin returns a transformed response
+    /// body, after the core removes stale representation metadata and before
+    /// the next body transform runs.
+    ///
+    /// Use this to attach validators, integrity digests, or other headers the
+    /// plugin recomputed for its replacement bytes. The hook is not called when
+    /// the transform returns `None`, so unchanged responses retain their
+    /// original headers.
     fn on_response_body_transformed(
         &self,
         _ctx: &mut RequestContext,

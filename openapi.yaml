@@ -15649,6 +15649,7 @@ components:
 
     ServerlessFunctionConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: serverless_function — Invokes AWS Lambda, Azure Functions, or
         Google Cloud Functions as middleware in the proxy pipeline. In
@@ -15657,7 +15658,78 @@ components:
         response is returned directly to the client (HTTP only — gRPC
         rejection normalization would drop the body, so terminate mode on
         gRPC requests is rejected with 500). Cloud credential fields fall
-        back to well-known environment variables.
+        back to well-known environment variables. Terminate mode forwards
+        applicable end-to-end response headers, preserving repeated Set-Cookie
+        and list-valued Link while requiring Location, Content-Location, and
+        Refresh to remain singleton,
+        while stripping hop-by-hop, Connection-listed, transport-managed,
+        provider-control, and credential-bearing fields. URL-valued Location,
+        Content-Location, Refresh (url= and bare URI forms after semicolon,
+        comma, or ASCII-whitespace delay separators), and every Link target are removed
+        when a relative, absolute, encoded, or nested target exposes the
+        configured signed function path/query. Duplicate singleton URL-valued
+        fields fail closed instead of being comma-folded; repeated Link lines
+        are revalidated as the exact combined list returned downstream.
+        Complete signed paths match at
+        slash-delimited segment boundaries even with added prefix or descendant
+        segments, not inside arbitrary substrings. The complete slash-trimmed
+        signed path is also protected when copied exactly into either side of a
+        decoded query pair; longer scalar lookalikes remain observable. Both
+        non-empty components of every configured query pair are protected
+        credential scalars: a key
+        remains protected whether it is key-only (`?SIGNED_TOKEN=`) or paired
+        with a value (`?SIGNED_TOKEN=1`), and a non-empty value is protected
+        independently. Exact ASCII-case-insensitive URI scheme copies are also
+        governed. Leading and trailing slashes remain part of each scalar;
+        a slash-only scalar remains protected and makes ambiguous URL-path
+        surfaces fail closed. Each scalar remains protected if copied into
+        either side of another query pair or into decoded paths at URI-component
+        boundaries (including path-parameter/query delimiters), and decoded fragments are checked
+        directly at URI-component boundaries even when they are scalar rather
+        than URI-shaped. Query comparison
+        percent-decodes generic URI components but preserves literal `+` characters
+        instead of applying form-data space conversion. Inspection checks
+        explicit numeric authority ports before normalization can erase default
+        ports, and is bounded to 16 KiB per field, 32 Link targets, 32 embedded
+        path URI references, eight percent-decoding transforms, and two nested
+        URI-reference hops. URI userinfo, residual
+        encoding, malformed target syntax, malformed percent triplets,
+        percent-decoded non-UTF-8 bytes, budget overflow, or another structural
+        URI reference at the nesting boundary fails closed even for root
+        function destinations, while unrelated URL targets, non-URL
+        Refresh directives, quoted Link parameters, and scalar labels without
+        signed components remain observable.
+        Later body rewrites invalidate ranges, validators, integrity metadata,
+        and content-bound signatures while unmodified responses retain them;
+        206 Partial Content and 226 IM Used responses skip rewriting to preserve
+        range and delta semantics; transform-dependent header hooks also decline
+        them rather than relabelling untouched bytes. Inspection still runs,
+        and enforcing
+        redaction-dependent plugins reject governed content when those bytes
+        cannot be safely rewritten.
+        Proven pre-invocation payload-validation, unsupported-gRPC, DNS-policy,
+        and literal-IP-policy rejections release every acquired deduplication
+        owner after commit. Real remote 502 responses remain application
+        responses; uncertain post-invocation failures retain their protection.
+        Deduplicated terminal replays preserve the final status/body but use
+        sanitized headers: session/authentication fields, Retry-After,
+        trace/correlation fields, and rate-limit counters are not replayed. The
+        stored body is already finalized and bypasses ordinary presentation
+        transforms on replay while remaining subject to response inspection and
+        final-body validation. A current-policy redaction decision runs only its
+        required transform and fails closed with 502 if rewriting cannot
+        complete.
+        If request_deduplication is attached, every same-protocol instance must
+        have a strictly lower effective priority than terminate mode; candidate
+        admission rejects equal or reversed ordering before persistence. This
+        candidate check derives static serverless capabilities without resolving
+        CP-local cloud credentials; runtime construction still validates the
+        node-local credentials and environment fail closed.
+        HEAD/204/205/304 bodies are empty. Automatic redirects are disabled;
+        pre_proxy accepts only 2xx as approval, while terminate may
+        intentionally return only final 2xx-5xx statuses (200-599).
+        Informational and out-of-range three-digit function statuses follow the
+        configured error path.
       required:
         - provider
       properties:
@@ -15675,8 +15747,8 @@ components:
         function_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#\\s]+"
-          description: "HTTP(S) trigger URL. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied."
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^@/?#\\s]+(?:[/?][^#\\s]*)?$"
+          description: "HTTP(S) trigger URL without URL userinfo or a fragment. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied. Path/query credentials are structurally redacted from diagnostics and non-admin/audit projections."
         aws_region:
           type: string
           description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars."
@@ -15698,10 +15770,11 @@ components:
         aws_endpoint_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#\\s]+"
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^@/?#\\s]+/?$"
           description: >-
             Optional HTTP(S) Lambda endpoint override for LocalStack or a
-            VPC-internal endpoint. Falls back to `AWS_LAMBDA_ENDPOINT_URL`.
+            VPC-internal endpoint. Must be an origin without userinfo, path,
+            query, or fragment. Falls back to `AWS_LAMBDA_ENDPOINT_URL`.
         azure_function_key:
           type: string
           description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var."
@@ -15711,7 +15784,7 @@ components:
         forward_body:
           type: boolean
           default: false
-          description: "Include request body in function payload (forces request-body buffering for JSON POST requests)."
+          description: "Include one authoritative lossless request-body representation in the function payload for every HTTP method. Ferrum never parses JSON into a structured value: exact UTF-8 bytes are carried as a string with body_encoding=utf8, arbitrary bytes are base64 with body_encoding=base64, and the active hook Content-Type is carried separately as body_content_type. The plugin buffers before invocation and fails closed if bytes are unavailable or the active request headers use a non-identity Content-Encoding. Candidate admission and runtime cache construction reject combination with a request-body transformer on the same protocol chain."
         forward_headers:
           type: array
           items:
@@ -15720,7 +15793,7 @@ components:
         forward_query_params:
           type: boolean
           default: false
-          description: "Include query parameters in function payload."
+          description: "Include decoded query parameters in the function payload after omitting credentials that an earlier auth plugin marked for backend stripping. Duplicate decoded names, invalid percent-encoded UTF-8, raw '+' ambiguity, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
         timeout_ms:
           type: integer
           format: uint64
@@ -15741,10 +15814,10 @@ components:
         error_status_code:
           type: integer
           format: uint16
-          minimum: 100
+          minimum: 400
           maximum: 599
           default: 502
-          description: "HTTP status when rejecting on error. Must be in range 100-599."
+          description: "Final HTTP error status when rejecting an invocation or pre_proxy non-2xx response. Must be in range 400-599."
       allOf:
         - if:
             required: [provider]
@@ -18545,7 +18618,7 @@ components:
 
     RequestDeduplicationConfig:
       type: object
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed ai_federation provider call publishes a small non-replayable 409 tombstone so an identical idempotency-key retry cannot repeat the billable external operation or double-apply response transforms; this provenance contract does not yet cover other externally executed synthetic plugins. Completed response retention is bounded by per-entry and exact local total byte limits; ordinary size-skipped responses return normally and are not retained. If a federation tombstone cannot fit, in-flight ownership remains until inflight_ttl_seconds rather than failing open immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and are not backward-compatible with pre-fingerprint values. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
       properties:
         header_name:
           type: string
@@ -18568,7 +18641,7 @@ components:
           type: integer
           minimum: 1
           default: 10000
-          description: Maximum number of tracked local deduplication entries. Active in-flight entries count but are not evicted while live.
+          description: Maximum number of tracked local deduplication entries. Active in-flight entries and fail-closed terminal tombstones count but are not evicted while live, so security state may temporarily exceed the cap.
         max_entry_size_bytes:
           type: integer
           minimum: 1
