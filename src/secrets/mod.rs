@@ -182,12 +182,14 @@ pub fn redact_external_secret_values(message: &str) -> String {
 ///   itself a resolved secret; its occurrences in *values* are still redacted.
 /// * string **values** are matched after unescaping, so JSON escaping cannot
 ///   smuggle a value past the scan and the reserializer re-escapes correctly.
-///   (The escaped form stays a derived candidate for [`redact_external_secret_values`],
-///   which does filter raw text.)
-/// * numeric and boolean **values** are matched against their rendered form —
-///   an externally resolved port or flag is a scalar in the record, not a
-///   string — and a match replaces the whole scalar with the placeholder
-///   string.
+///   (The escaped form stays a candidate in its own right — for
+///   [`redact_external_secret_values`], which does filter raw text, and for the
+///   pre-parse screen, which sees the record already escaped.)
+/// * numeric, boolean, and null **values** are matched against their rendered
+///   form — an externally resolved port or flag is a scalar in the record, not
+///   a string — and a match replaces the whole scalar with the placeholder
+///   string. All three unquoted scalar forms are treated alike; leaving any of
+///   them out would emit that value's own representation.
 /// * field **order** is preserved (see [`LogJson`]), so a redacted record
 ///   differs from an unredacted one only in the values that were redacted.
 ///
@@ -474,7 +476,9 @@ struct RedactionPlan {
 impl RedactionPlan {
     /// Minimum length for a *derived* candidate.
     ///
-    /// The value exactly as materialized has no minimum — it is the secret. A
+    /// The value exactly as materialized has no minimum — it is the secret, and
+    /// neither does its JSON-escaped body, which is the same secret in the only
+    /// other form a record can carry it in (see [`Self::build`]). A
     /// derived fragment shorter than this (a one-letter namespace entry, say)
     /// carries no meaningful secret content while matching constantly, which
     /// would shred every diagnostic the operator needs to read. Same threshold,
@@ -489,6 +493,20 @@ impl RedactionPlan {
                 continue;
             }
             candidates.push(value.clone());
+            // The JSON-escaped body of the value *as materialized* is another
+            // exact representation of the same secret, not a transformed
+            // fragment, so it carries no minimum either. Without this, an exact
+            // value whose escaped body is shorter than the derived minimum —
+            // a one-character control such as tab (`\t`), carriage return
+            // (`\r`), backspace (`\b`), or form feed (`\f`) — is present in a
+            // serialized record only in its escaped form, which the filter
+            // below drops. `contains_candidate` would then find nothing, the
+            // record would never be parsed, and the secret would be emitted.
+            // Unlike `"` or `\n`, those bytes need not produce an incidental
+            // structural match to rescue the screen.
+            if let Some(escaped) = json_escaped_body(&value) {
+                candidates.push(escaped);
+            }
             candidates.extend(
                 derive_candidates(&value)
                     .into_iter()
@@ -585,7 +603,11 @@ impl RedactionPlan {
             // different number or invalid JSON.
             LogJson::Bool(flag) => self.contains_candidate(if *flag { "true" } else { "false" }),
             LogJson::Number(number) => self.contains_candidate(&number.to_string()),
-            LogJson::Null => false,
+            // `null` is a rendered scalar exactly like `true` and `918273645`:
+            // a resolved value of `null` that a validator echoes into a field
+            // serialized as a JSON null is present in the record verbatim, so
+            // leaving it alone would emit the secret's own representation.
+            LogJson::Null => self.contains_candidate("null"),
         };
         if scalar_matches {
             *value = LogJson::String(EXTERNAL_SECRET_PLACEHOLDER.to_string());

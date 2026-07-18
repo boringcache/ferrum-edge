@@ -57,7 +57,32 @@ const FIELD_NAME_VALUE: &str = "level";
 const NUMBER_KEY: &str = "FERRUM_REDACTION_FIXTURE_NUMBER";
 const NUMBER_VALUE: &str = "918273645";
 
-const FIXTURES: [(&str, &str); 8] = [
+/// A one-character control secret. Unlike `"` or `\n` it has no incidental
+/// structural twin in a record, and its serialized body (`\t`) is two bytes —
+/// shorter than the *derived* candidate minimum. If only derived forms carried
+/// the escaped representation, the pre-parse screen would find neither the raw
+/// tab (absent from the escaped record) nor `\t` (filtered out), the record
+/// would never be parsed, and the secret would be emitted verbatim.
+const TAB_KEY: &str = "FERRUM_REDACTION_FIXTURE_TAB";
+const TAB_VALUE: &str = "\t";
+
+/// Same class, second escape: backspace serializes as `\b`.
+const BACKSPACE_KEY: &str = "FERRUM_REDACTION_FIXTURE_BACKSPACE";
+const BACKSPACE_VALUE: &str = "\u{8}";
+
+/// A secret whose exact value renders as the unquoted JSON scalar `null`, the
+/// third rendered scalar form alongside numbers and booleans.
+///
+/// Safe to arm process-wide: the only other sink user in this binary
+/// (`logging_tests`) serializes `TransactionSummary`, whose hand-written
+/// `Serialize` skips `None` fields rather than emitting nulls. An exact `true`
+/// or `false` fixture is deliberately *not* armed for the same reason the
+/// number fixture avoids a plausible port — it would rewrite the boolean
+/// assertions in that file.
+const NULL_KEY: &str = "FERRUM_REDACTION_FIXTURE_NULL";
+const NULL_VALUE: &str = "null";
+
+const FIXTURES: [(&str, &str); 11] = [
     (PLAIN_KEY, PLAIN_VALUE),
     (LIST_KEY, LIST_VALUE),
     (CASE_KEY, CASE_VALUE),
@@ -66,6 +91,9 @@ const FIXTURES: [(&str, &str); 8] = [
     (DELIMITER_KEY, DELIMITER_VALUE),
     (FIELD_NAME_KEY, FIELD_NAME_VALUE),
     (NUMBER_KEY, NUMBER_VALUE),
+    (TAB_KEY, TAB_VALUE),
+    (BACKSPACE_KEY, BACKSPACE_VALUE),
+    (NULL_KEY, NULL_VALUE),
 ];
 
 static RECORDED: Once = Once::new();
@@ -484,4 +512,91 @@ fn a_non_json_record_without_a_resolved_value_is_untouched() {
     });
 
     assert_eq!(line, "plain operator output\n");
+}
+
+/// A one-character control secret is present in the serialized record *only* in
+/// its escaped form. The escaped body of an exact value therefore has to reach
+/// the pre-parse screen unfiltered: with a minimum applied to it, `\t` is
+/// dropped, the raw tab never appears in the escaped record, nothing triggers
+/// parsing, and the record is emitted carrying the secret.
+#[test]
+fn one_character_escaped_control_secret_is_redacted() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &serde_json::json!({
+                "level": "WARN",
+                "message": format!("before{TAB_VALUE}after"),
+            }),
+        );
+    });
+
+    let record = parse_record(&line);
+    assert_eq!(record["level"], "WARN", "unrelated values must survive");
+    assert!(
+        !line.contains("\\t"),
+        "the escaped form of the resolved value must not survive: {line}"
+    );
+    let message = record["message"].as_str().expect("message stays a string");
+    assert!(
+        !message.contains(TAB_VALUE),
+        "the resolved control character must not survive: {message:?}"
+    );
+    assert!(message.contains(EXTERNAL_SECRET_PLACEHOLDER));
+}
+
+/// Same class, a second escape, so the fix is not a one-character special case
+/// for tab.
+#[test]
+fn a_second_escaped_control_secret_is_redacted() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &serde_json::json!({
+                "level": "INFO",
+                "message": format!("before{BACKSPACE_VALUE}after"),
+            }),
+        );
+    });
+
+    let record = parse_record(&line);
+    assert!(
+        !line.contains("\\b"),
+        "the escaped form of the resolved value must not survive: {line}"
+    );
+    let message = record["message"].as_str().expect("message stays a string");
+    assert!(
+        !message.contains(BACKSPACE_VALUE),
+        "the resolved control character must not survive: {message:?}"
+    );
+    assert!(message.contains(EXTERNAL_SECRET_PLACEHOLDER));
+}
+
+/// `null` is the third unquoted scalar form, and a resolved value of `null`
+/// reaches the record as that literal. Skipping it would emit the secret's own
+/// representation while numbers and booleans in the same record are replaced.
+#[test]
+fn a_null_scalar_value_is_redacted() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &serde_json::json!({
+                "level": "INFO",
+                "resolved": serde_json::Value::Null,
+                "tls": true,
+            }),
+        );
+    });
+
+    let record = parse_record(&line);
+    assert_eq!(
+        record["resolved"],
+        serde_json::Value::String(EXTERNAL_SECRET_PLACEHOLDER.to_string()),
+        "the resolved null scalar must be replaced whole: {line}"
+    );
+    assert_eq!(
+        record["tls"],
+        serde_json::Value::Bool(true),
+        "unrelated scalars must survive"
+    );
 }
