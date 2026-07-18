@@ -1,9 +1,9 @@
 //! Tests for the ferrum.conf configuration file parser and integration
 //! with EnvConfig.
 
+use crate::unit::env_lock::ENV_LOCK;
 use ferrum_edge::config::conf_file::ConfFile;
 use ferrum_edge::config::{DbTlsMode, EnvConfig};
-use crate::unit::env_lock::ENV_LOCK;
 
 /// Helper to set env vars, run a closure, then clean them up.
 fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
