@@ -522,14 +522,20 @@ async fn rejection_mid_hook_deadline_preserves_completed_decorator() {
     let mut ctx = create_grpc_context_with_timeout(None);
     set_grpc_deadline_budget_for_test(&mut ctx, Some(10));
 
-    let (status, body, headers) = finalize_plugin_rejection_for_test(
-        &plugins,
-        &mut ctx,
-        503,
-        b"discarded rejection".to_vec(),
-        HashMap::new(),
-    )
-    .await;
+    let rejection = PluginResult::RejectBinary {
+        status_code: 503,
+        body: bytes::Bytes::from_static(b"discarded rejection"),
+        headers: HashMap::new(),
+    };
+    let (status, body, headers) =
+        match finalize_plugin_rejection_for_test(&plugins, &mut ctx, rejection).await {
+            PluginResult::RejectBinary {
+                status_code,
+                body,
+                headers,
+            } => (status_code, body, headers),
+            other => panic!("expected finalized rejection, got {other:?}"),
+        };
 
     assert_eq!(status, 200);
     assert!(body.is_empty());
@@ -1390,14 +1396,20 @@ async fn owned_hook_clone_adopt_chain_preserves_all_recorded_decorators() {
     let mut ctx = create_grpc_context_with_timeout(None);
     set_grpc_deadline_budget_for_test(&mut ctx, Some(10));
 
-    let (status, body, headers) = finalize_plugin_rejection_for_test(
-        &plugins,
-        &mut ctx,
-        503,
-        b"discarded rejection".to_vec(),
-        HashMap::new(),
-    )
-    .await;
+    let rejection = PluginResult::RejectBinary {
+        status_code: 503,
+        body: bytes::Bytes::from_static(b"discarded rejection"),
+        headers: HashMap::new(),
+    };
+    let (status, body, headers) =
+        match finalize_plugin_rejection_for_test(&plugins, &mut ctx, rejection).await {
+            PluginResult::RejectBinary {
+                status_code,
+                body,
+                headers,
+            } => (status_code, body, headers),
+            other => panic!("expected finalized rejection, got {other:?}"),
+        };
 
     assert_eq!(status, 200);
     assert!(body.is_empty());
