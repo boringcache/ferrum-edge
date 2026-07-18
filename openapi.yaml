@@ -1379,7 +1379,8 @@ paths:
         Returns a JWT-authenticated JSON snapshot for "how is this host doing
         right now?": process CPU and memory, file descriptors, ephemeral-port
         pressure, HTTP status rates, error classes, DNS cache outcomes, pool
-        churn, TCP resets, log-event counters, and the inline overload state.
+        churn, TCP resets, log-event counters, bounded stdout/stderr sink
+        health/loss/last-failure diagnostics, and the inline overload state.
 
         The response is cached briefly (default 1000 ms, configurable with
         `FERRUM_METRICS_RUNTIME_CACHE_MS`) because system metrics are sampled in
@@ -8959,7 +8960,7 @@ components:
         Tiered: unauthenticated callers receive only `status` and `ready`. The
         remaining detailed fields (`timestamp`, `mode`, `database`,
         `admin_writes_enabled`, `cached_config`, `database_polling`,
-        `config_rejected`, `mesh`, `listener_failures`) are
+        `config_rejected`, `mesh`, `listener_failures`, `logging`) are
         present only when the caller is authenticated (admin JWT, metrics bearer
         token, or allowlisted CIDR).
       required: [status, ready]
@@ -9105,6 +9106,8 @@ components:
           $ref: "#/components/schemas/MeshHealthResponse"
         listener_failures:
           $ref: "#/components/schemas/ServingListenerFailureSnapshot"
+        logging:
+          $ref: "#/components/schemas/LoggingSinkSnapshot"
 
     ServingListenerFailureSnapshot:
       type: object
@@ -9526,7 +9529,7 @@ components:
 
     RuntimeLogsSnapshot:
       type: object
-      description: Ferrum project tracing event counters after applying the output log-level filter.
+      description: Ferrum project tracing event counters and bounded process-sink health/loss telemetry.
       properties:
         by_level:
           type: object
@@ -9540,6 +9543,89 @@ components:
             additionalProperties:
               type: integer
               format: uint64
+        sinks:
+          $ref: "#/components/schemas/LoggingSinkSnapshot"
+
+    LoggingSinkSnapshot:
+      type: object
+      description: >-
+        Authenticated stdout/stderr diagnostics. Stdout combines runtime
+        stdout events and stdout_logging access records because both use the
+        same bounded queue; stderr is independent.
+      required: [stdout, stderr]
+      properties:
+        stdout:
+          oneOf:
+            - $ref: "#/components/schemas/LoggingSinkState"
+            - type: "null"
+        stderr:
+          oneOf:
+            - $ref: "#/components/schemas/LoggingSinkState"
+            - type: "null"
+
+    LoggingSinkState:
+      type: object
+      required:
+        - sink
+        - healthy
+        - accepting
+        - queue_capacity_records
+        - queue_capacity_bytes
+        - max_record_bytes
+        - queued_records
+        - reserved_bytes
+        - queued_bytes
+        - accepted_records_total
+        - saturation_dropped_records_total
+        - oversized_dropped_records_total
+        - closed_dropped_records_total
+        - writer_failures_total
+        - flush_failures_total
+        - shutdown_timeouts_total
+        - shutdown_incomplete_records_total
+        - last_failure
+      properties:
+        sink: { type: string, enum: [stdout, stderr] }
+        healthy: { type: boolean }
+        accepting: { type: boolean }
+        queue_capacity_records:
+          type: integer
+          description: Hard admitted-record limit; the byte budget may limit admission first.
+        queue_capacity_bytes:
+          type: integer
+          description: Aggregate per-sink serialized-payload reservation limit for admitted records.
+        max_record_bytes:
+          type: integer
+          description: Per-record serialization limit and provisional pre-serialization reservation.
+        queued_records:
+          type: integer
+          description: Records admitted but not yet completed by the writer.
+        reserved_bytes:
+          type: integer
+          description: >-
+            Current byte reservations. A producer initially reserves
+            max_record_bytes; after serialization an exact-sized payload is
+            queued and this shrinks to the record length until write completion.
+        queued_bytes:
+          type: integer
+          description: Actual serialized bytes admitted but not yet completed by the writer.
+        accepted_records_total: { type: integer, format: uint64 }
+        saturation_dropped_records_total: { type: integer, format: uint64 }
+        oversized_dropped_records_total: { type: integer, format: uint64 }
+        closed_dropped_records_total: { type: integer, format: uint64 }
+        writer_failures_total: { type: integer, format: uint64 }
+        flush_failures_total: { type: integer, format: uint64 }
+        shutdown_timeouts_total: { type: integer, format: uint64 }
+        shutdown_incomplete_records_total: { type: integer, format: uint64 }
+        last_failure:
+          oneOf:
+            - type: object
+              required: [operation, error_kind, occurred_at]
+              properties:
+                operation: { type: string, enum: [write, flush, shutdown] }
+                error_kind: { type: string }
+                occurred_at: { type: string, format: date-time }
+            - type: "null"
 
     DatabaseDeltaPollingDegraded:
       type: object
@@ -10184,7 +10270,11 @@ components:
         cannot be introduced via `static_fields` or `derived_fields`
         (rejected at construction). This object, each `derived_fields`
         entry, and `metadata` are strict fixed shapes: unknown keys are
-        rejected with a nested path. See docs/log_schema.md.
+        rejected with a nested path.
+        HTTP summaries include the normalized terminal `grpc_status` field
+        (separate from `response_status_code`) when the request is gRPC. It
+        can be renamed, omitted, or ordered like every other native field.
+        See docs/log_schema.md.
       additionalProperties: false
       properties:
         summary_type:
@@ -10279,11 +10369,13 @@ components:
     # accepts one of these depending on the `plugin_name` value.
 
     StdoutLoggingConfig:
-      type: object
-      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to stdout through the non-blocking writer, so logging never blocks request-processing threads. Independent of FERRUM_LOG_LEVEL: enabling the plugin is the on/off switch. The optional filter (when present) runs before schema application. Mesh mode injects this plugin to honor a Telemetry CRD's accessLogging configuration."
+      type: [object, "null"]
+      additionalProperties: false
+      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to the bounded non-blocking stdout writer. Independent of FERRUM_LOG_LEVEL. Accepted keys are filter, schema, and schema_ref; null or an empty object uses defaults. The optional filter runs before schema application."
       properties:
         filter:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           description: >-
             Optional predicate that suppresses log entries before they are
             serialized. All present fields must match for an entry to be
@@ -10306,7 +10398,13 @@ components:
             errors_only:
               type: boolean
               default: false
-              description: Skip summaries with no error_class (and no connection_error for streams).
+              description: >-
+                HTTP-family summaries require an authoritative terminal
+                failure: dispatch/error_class, body failure, incomplete body,
+                client disconnect, gateway rejection, or nonzero final
+                grpc_status. Stream summaries require error_class or
+                connection_error. Status and latency predicates remain
+                independent and must also match.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:

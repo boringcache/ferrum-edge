@@ -112,6 +112,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use percent_encoding::percent_decode_str;
+use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
@@ -3037,12 +3038,6 @@ pub struct MirrorResponseMeta {
     pub mirror_error: Option<String>,
 }
 
-/// Serde skip predicate: true when the value is zero. Used to keep logs tidy
-/// when new u64 counters are unset for a given transaction.
-fn is_zero_u64(v: &u64) -> bool {
-    *v == 0
-}
-
 /// Which direction of a bidirectional stream experienced a failure first.
 ///
 /// Used by TCP/UDP/WebSocket disconnect logging so operators can tell whether
@@ -3099,14 +3094,13 @@ pub enum DisconnectCause {
 ///     ..TransactionSummary::default()
 /// }
 /// ```
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default)]
 pub struct TransactionSummary {
     /// Namespace of the matched proxy.
     pub namespace: String,
     pub timestamp_received: String,
     pub client_ip: String,
     pub consumer_username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<&'static str>,
     pub http_method: String,
     pub request_path: String,
@@ -3115,11 +3109,9 @@ pub struct TransactionSummary {
     /// JSON key as `StreamTransactionSummary.proxy_id` so log consumers see
     /// a single `proxy_id` field across HTTP, gRPC, WebSocket, TCP, UDP, and
     /// DTLS transactions.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_id: Option<String>,
     /// Human-friendly proxy name; same JSON key as
     /// `StreamTransactionSummary.proxy_name`.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_name: Option<String>,
     /// Backend the request was forwarded to. For HTTP this is the full URL
     /// (`scheme://host:port/path`); `None` when the request was rejected
@@ -3128,7 +3120,6 @@ pub struct TransactionSummary {
     /// uses `host:port` form, since stream proxies have no path).
     pub backend_target: Option<String>,
     /// The DNS-resolved IP address of the backend that was connected to.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_resolved_ip: Option<String>,
     pub response_status_code: u16,
     pub latency_total_ms: f64,
@@ -3165,7 +3156,6 @@ pub struct TransactionSummary {
     /// True when the response body was streamed (not buffered).
     /// When true, `latency_backend_total_ms` is populated at deferred-log
     /// fire time from the real body-completion timestamp (see that field).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub response_streamed: bool,
     /// True when the client disconnected before receiving the full response.
     ///
@@ -3179,12 +3169,10 @@ pub struct TransactionSummary {
     ///   the handler function has already constructed and emitted the
     ///   summary. Consumers should treat `false` on a buffered response
     ///   as "not known to have disconnected," not as a positive assertion.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub client_disconnected: bool,
     /// Human-friendly classification of the error when the gateway itself
     /// failed to communicate with the backend. `None` for successful requests
     /// and normal HTTP error responses from the backend.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<crate::retry::ErrorClass>,
     /// Classification of an error that occurred while streaming the response
     /// body to the client (e.g., client RST after headers were sent). `None`
@@ -3193,12 +3181,10 @@ pub struct TransactionSummary {
     /// Distinct from `error_class`, which covers errors reaching the backend.
     /// Populated by the deferred-logging path when the response body wrapper
     /// returns an error frame or is dropped before completion.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub body_error_class: Option<crate::retry::ErrorClass>,
     /// True when the response body finished streaming all frames successfully.
     /// False when streaming was interrupted (client disconnect, backend RST,
     /// body size limit exceeded) or when no streaming occurred.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub body_completed: bool,
     /// Bytes of the request body relayed from the client to the backend
     /// (gateway-perspective: bytes it sent onward on the client's behalf).
@@ -3214,9 +3200,8 @@ pub struct TransactionSummary {
     ///   an `Arc<AtomicU64>` between the forwarded body and the summary
     ///   builder so the final byte count is visible once hyper has consumed
     ///   the body.
-    /// * **Empty / GET / HEAD / size-zero requests**: zero (skipped during
-    ///   serialization via `skip_serializing_if = "is_zero_u64"`).
-    #[serde(skip_serializing_if = "is_zero_u64")]
+    /// * **Empty / GET / HEAD / size-zero requests**: zero (omitted by the
+    ///   transaction summary serializer).
     pub bytes_sent: u64,
     /// Bytes of the response body relayed from the backend to the client
     /// (gateway-perspective: bytes it received and forwarded back). Unified
@@ -3231,12 +3216,10 @@ pub struct TransactionSummary {
     /// * **Streaming responses**: populated at deferred-log fire time from
     ///   the body counter. On a client disconnect mid-stream this reflects
     ///   bytes actually flushed before the disconnect.
-    #[serde(skip_serializing_if = "is_zero_u64")]
     pub bytes_received: u64,
     /// True when this summary represents a mirror (shadow) request, not the
     /// actual client-facing proxy traffic. Logged as a separate entry with the
     /// same schema so existing log queries and dashboards work without changes.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub mirror: bool,
     /// Plugin-injected metadata. Sensitive keys (authorization, cookie,
     /// credential/session tokens, secrets — see
@@ -3244,20 +3227,131 @@ pub struct TransactionSummary {
     /// plus operator extras from `FERRUM_LOG_REDACT_METADATA_KEYS`) are
     /// replaced with `[REDACTED]` at serialize time. The in-memory value is
     /// untouched so other plugin phases can still read the original.
-    #[serde(
-        serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
-    )]
     pub metadata: HashMap<String, String>,
     /// Built-in AI usage provenance for Prometheus. This is intentionally not
     /// serialized into transaction logs; the operator-visible usage metadata
     /// remains in `metadata` while trust stays typed and private to the request
     /// pipeline.
     #[doc(hidden)]
-    #[serde(skip)]
     pub ai_usage_export: Option<AiUsageExport>,
 }
 
+impl Serialize for TransactionSummary {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use crate::plugins::utils::metadata_redaction::RedactedMetadata;
+
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("namespace", &self.namespace)?;
+        map.serialize_entry("timestamp_received", &self.timestamp_received)?;
+        map.serialize_entry("client_ip", &self.client_ip)?;
+        map.serialize_entry("consumer_username", &self.consumer_username)?;
+        if let Some(auth_method) = self.auth_method {
+            map.serialize_entry("auth_method", auth_method)?;
+        }
+        map.serialize_entry("http_method", &self.http_method)?;
+        map.serialize_entry("request_path", &self.request_path)?;
+        if let Some(proxy_id) = &self.proxy_id {
+            map.serialize_entry("proxy_id", proxy_id)?;
+        }
+        if let Some(proxy_name) = &self.proxy_name {
+            map.serialize_entry("proxy_name", proxy_name)?;
+        }
+        map.serialize_entry("backend_target", &self.backend_target)?;
+        if let Some(backend_resolved_ip) = &self.backend_resolved_ip {
+            map.serialize_entry("backend_resolved_ip", backend_resolved_ip)?;
+        }
+        map.serialize_entry("response_status_code", &self.response_status_code)?;
+        if let Some(grpc_status) = self.grpc_status() {
+            map.serialize_entry("grpc_status", &grpc_status)?;
+        }
+        map.serialize_entry("latency_total_ms", &self.latency_total_ms)?;
+        map.serialize_entry(
+            "latency_gateway_processing_ms",
+            &self.latency_gateway_processing_ms,
+        )?;
+        map.serialize_entry("latency_backend_ttfb_ms", &self.latency_backend_ttfb_ms)?;
+        map.serialize_entry("latency_backend_total_ms", &self.latency_backend_total_ms)?;
+        map.serialize_entry(
+            "latency_plugin_execution_ms",
+            &self.latency_plugin_execution_ms,
+        )?;
+        map.serialize_entry(
+            "latency_plugin_external_io_ms",
+            &self.latency_plugin_external_io_ms,
+        )?;
+        map.serialize_entry(
+            "latency_gateway_overhead_ms",
+            &self.latency_gateway_overhead_ms,
+        )?;
+        map.serialize_entry("request_user_agent", &self.request_user_agent)?;
+        if self.response_streamed {
+            map.serialize_entry("response_streamed", &true)?;
+        }
+        if self.client_disconnected {
+            map.serialize_entry("client_disconnected", &true)?;
+        }
+        if let Some(error_class) = self.error_class {
+            map.serialize_entry("error_class", &error_class)?;
+        }
+        if let Some(body_error_class) = self.body_error_class {
+            map.serialize_entry("body_error_class", &body_error_class)?;
+        }
+        if self.body_completed {
+            map.serialize_entry("body_completed", &true)?;
+        }
+        if self.bytes_sent != 0 {
+            map.serialize_entry("bytes_sent", &self.bytes_sent)?;
+        }
+        if self.bytes_received != 0 {
+            map.serialize_entry("bytes_received", &self.bytes_received)?;
+        }
+        if self.mirror {
+            map.serialize_entry("mirror", &true)?;
+        }
+        map.serialize_entry("metadata", &RedactedMetadata(&self.metadata))?;
+        map.end()
+    }
+}
+
 impl TransactionSummary {
+    /// Authoritative final gRPC application status, kept separate from the
+    /// HTTP transport status. Missing or malformed terminal status on a known
+    /// gRPC transaction remains a failure: missing is UNKNOWN (2), while
+    /// malformed input uses the existing `u32::MAX` invalid-status sentinel.
+    /// Translated gRPC-Web requests are stamped as `request_protocol="grpc"`
+    /// by the H1/H2 and H3 dispatchers; no runtime path currently produces
+    /// `request_protocol="grpc-web"` (mesh uses `mesh.request_protocol`).
+    pub fn grpc_status(&self) -> Option<u32> {
+        match self.metadata.get("grpc_status") {
+            Some(status) => Some(crate::proxy::grpc_proxy::parse_grpc_status_value(status)),
+            None if self
+                .metadata
+                .get("request_protocol")
+                .is_some_and(|protocol| protocol == "grpc") =>
+            {
+                Some(crate::proxy::grpc_proxy::grpc_status::UNKNOWN)
+            }
+            None => None,
+        }
+    }
+
+    /// One authoritative terminal-failure predicate for transaction loggers.
+    ///
+    /// HTTP status filters remain independent: an upstream HTTP 5xx without a
+    /// gateway/terminal failure is not implicitly an `errors_only` match.
+    pub fn is_terminal_failure(&self) -> bool {
+        self.error_class.is_some()
+            || self.body_error_class.is_some()
+            || self.client_disconnected
+            || (self.response_streamed && !self.body_completed)
+            || self.metadata.contains_key("rejection_phase")
+            || self.metadata.contains_key("mirror_error")
+            || self.grpc_status().is_some_and(|status| status != 0)
+    }
+
     /// Build a mirror transaction summary from this summary and a mirror result.
     ///
     /// Clones the original request context fields (client_ip, method, path, proxy,
@@ -3282,6 +3376,22 @@ impl TransactionSummary {
         mirror.error_class = None;
         mirror.body_error_class = None;
         mirror.body_completed = false;
+        // The cloned metadata describes the primary response. Clear every
+        // response-only key that participates in terminal classification or
+        // mirror serialization before applying the mirror task's own outcome.
+        // In particular, retaining request_protocol="grpc" without a mirror
+        // grpc-status would synthesize UNKNOWN, while retaining grpc_status
+        // would report and filter on the primary backend's status.
+        for key in [
+            "request_protocol",
+            "grpc_status",
+            "grpc_message",
+            "rejection_phase",
+            "mirror_error",
+            "response_size_bytes",
+        ] {
+            mirror.metadata.remove(key);
+        }
         // Mirror traffic is fire-and-forget from the client's perspective — body
         // byte counters from the primary transaction are not meaningful on the
         // mirror summary. Mirror response size goes into metadata instead.

@@ -434,6 +434,63 @@ fn test_disabled_unknown_plugin_name_remains_invalid() {
 }
 
 #[test]
+fn test_admin_stdout_logging_validation_rejects_unknown_paths() {
+    let now = chrono::Utc::now();
+    for (config, path) in [
+        (
+            json!({"filters": {"errors_only": true}}),
+            "stdout_logging.filters",
+        ),
+        (
+            json!({"filter": {"error_only": true}}),
+            "stdout_logging.filter.error_only",
+        ),
+    ] {
+        let plugin_config = ferrum_edge::config::types::PluginConfig {
+            id: format!("invalid-{path}"),
+            plugin_name: "stdout_logging".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            config,
+            scope: ferrum_edge::config::types::PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let error =
+            ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config)
+                .expect_err("admin validation must reject unknown keys");
+        assert!(error.contains(path), "expected {path} in {error}");
+    }
+}
+
+#[test]
+fn test_admin_stdout_logging_validation_preserves_null_defaults() {
+    for (index, config) in [serde_json::Value::Null, json!({"filter": null})]
+        .into_iter()
+        .enumerate()
+    {
+        let plugin_config = ferrum_edge::config::types::PluginConfig {
+            id: format!("stdout-null-default-{index}"),
+            plugin_name: "stdout_logging".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            config,
+            scope: ferrum_edge::config::types::PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config)
+            .expect("admin validation must preserve null defaults");
+    }
+}
+
+#[test]
 fn test_admin_transaction_log_schema_rejects_unknown_closed_object_keys() {
     let now = chrono::Utc::now();
     for (id, config, expected_path) in [

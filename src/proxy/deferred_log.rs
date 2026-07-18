@@ -405,6 +405,8 @@ mod tests {
             summary.metadata.get("grpc_status").map(String::as_str),
             Some("14")
         );
+        assert_eq!(summary.grpc_status(), Some(14));
+        assert!(summary.is_terminal_failure());
         assert_eq!(summary.response_status_code, 200);
     }
 
@@ -430,6 +432,8 @@ mod tests {
             summary.metadata.get("grpc_status").map(String::as_str),
             Some("2")
         );
+        assert_eq!(summary.grpc_status(), Some(2));
+        assert!(summary.is_terminal_failure());
     }
 
     #[tokio::test]
