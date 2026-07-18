@@ -347,7 +347,7 @@ impl BufferedDeadlineResponseHeaderProvenance {
                 !self
                     .backend_set_cookie_lines
                     .iter()
-                    .any(|backend| backend == line)
+                    .any(|backend| backend.as_str() == *line)
             })
             .collect::<Vec<_>>();
         (!gateway_lines.is_empty()).then(|| gateway_lines.join("\n"))
