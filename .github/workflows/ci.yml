@@ -78,6 +78,7 @@ jobs:
         run: |
           set -euo pipefail
           planner=.github/scripts/pr_ci_plan.py
+          planner_dir=.github/scripts
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base_ref="origin/${BASE_REF}"
             if ! git cat-file -e "${base_ref}:${planner}" 2>/dev/null; then
@@ -93,8 +94,9 @@ jobs:
               "${base_ref}:.github/scripts/live_suite_path_filter.py" \
               > "$trusted_live_filter"
             planner="$trusted_planner"
+            planner_dir="$trusted_dir"
           fi
-          python3 -I "$planner" --self-test
+          python3 -I -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); sys.argv[0] = sys.argv.pop(1); runpy.run_path(sys.argv[0], run_name="__main__")' "$planner_dir" "$planner" --self-test
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
@@ -110,6 +112,7 @@ jobs:
 
           changed_files="$RUNNER_TEMP/pr-ci-changed-files.txt"
           planner=".github/scripts/pr_ci_plan.py"
+          planner_dir=".github/scripts"
           : > "$changed_files"
 
           if [ "$EVENT_NAME" = "pull_request" ]; then
@@ -132,10 +135,11 @@ jobs:
                 git show "${base_ref}:.github/scripts/live_suite_path_filter.py" > "$trusted_live_filter"
               fi
               planner="$trusted_planner"
+              planner_dir="$trusted_dir"
             fi
           fi
 
-          plan="$(python3 -I "$planner" \
+          plan="$(python3 -I -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); sys.argv[0] = sys.argv.pop(1); runpy.run_path(sys.argv[0], run_name="__main__")' "$planner_dir" "$planner" \
             --event-name "$EVENT_NAME" \
             --changed-files "$changed_files")"
           mode="$(printf '%s\n' "$plan" | sed -n 's/^mode=//p')"

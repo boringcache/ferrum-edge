@@ -17,6 +17,13 @@ from typing import Any
 
 TARGET = "aarch64-unknown-linux-gnu"
 EXPECTED_IMAGE = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
+ISOLATED_PLANNER_LAUNCHER = (
+    "python3 -I -c 'import runpy, sys; "
+    "sys.path.insert(0, sys.argv.pop(1)); "
+    "sys.argv[0] = sys.argv.pop(1); "
+    'runpy.run_path(sys.argv[0], run_name="__main__")\' '
+    '"$planner_dir" "$planner"'
+)
 EXPECTED_PRE_BUILD_COMMANDS = (
     "dpkg --add-architecture 'arm64'",
     "apt-get update && apt-get install --assume-yes perl make "
@@ -3584,10 +3591,42 @@ def validate_ci_planner_isolation(contents: str, source: str) -> list[str]:
         )
         return errors
     for invocation in invocations:
-        if re.search(r"\bpython3\s+-I\s+\"\$planner\"", invocation) is None:
+        if ISOLATED_PLANNER_LAUNCHER not in invocation:
             errors.append(
-                f"{source} trusted planner invocations must use python3 -I"
+                f"{source} trusted planner invocations must use the isolated "
+                "trusted-directory launcher"
             )
+    planner_dir_assignments = [
+        line.strip()
+        for line in block.splitlines()
+        if re.match(r"^\s*planner_dir\s*=", line)
+    ]
+    expected_planner_dirs = [
+        "planner_dir=.github/scripts",
+        'planner_dir=".github/scripts"',
+        'planner_dir="$trusted_dir"',
+        'planner_dir="$trusted_dir"',
+    ]
+    if sorted(planner_dir_assignments) != sorted(expected_planner_dirs):
+        errors.append(
+            f"{source} ci-plan planner directories must resolve only to the "
+            "repository bootstrap or extracted trusted directory"
+        )
+    trusted_dir_assignments = [
+        line.strip()
+        for line in block.splitlines()
+        if re.match(r"^\s*trusted_dir\s*=", line)
+    ]
+    if sorted(trusted_dir_assignments) != sorted(
+        [
+            'trusted_dir="$RUNNER_TEMP/pr-ci-plan"',
+            'trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"',
+        ]
+    ):
+        errors.append(
+            f"{source} ci-plan must stage trusted planner modules only under "
+            "RUNNER_TEMP"
+        )
     if not any("--self-test" in invocation for invocation in invocations):
         errors.append(f"{source} ci-plan is missing the isolated planner self-test")
     if not any("--event-name" in invocation for invocation in invocations):
@@ -5519,9 +5558,16 @@ pre_build = []
         "  ci-plan:\n"
         "    runs-on: ubuntu-latest\n"
         "    steps:\n"
-        "      - run: python3 -I \"$planner\" --self-test\n"
         "      - run: |\n"
-        "          plan=\"$(python3 -I \"$planner\" \\\n"
+        "          planner_dir=.github/scripts\n"
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"\n'
+        '          planner_dir="$trusted_dir"\n'
+        f"          {ISOLATED_PLANNER_LAUNCHER} --self-test\n"
+        "      - run: |\n"
+        '          planner_dir=".github/scripts"\n'
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan"\n'
+        '          planner_dir="$trusted_dir"\n'
+        f"          plan=\"$({ISOLATED_PLANNER_LAUNCHER} \\\n"
         "            --event-name pull_request)\"\n"
     )
     if validate_ci_planner_isolation(
@@ -5530,8 +5576,8 @@ pre_build = []
     ):
         failures.append("isolated trusted planner fixture was rejected")
     poisoned_planner_workflow = isolated_planner_workflow.replace(
-        'python3 -I "$planner" --self-test',
-        'python3 "$planner" --self-test',
+        "python3 -I -c",
+        "python3 -c",
         1,
     )
     if not validate_ci_planner_isolation(
