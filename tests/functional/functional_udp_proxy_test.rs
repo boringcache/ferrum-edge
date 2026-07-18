@@ -63,6 +63,25 @@ async fn start_udp_fixed_response_server(
     handle
 }
 
+/// Start a UDP backend that acknowledges a zero-length request with one byte,
+/// then echoes nonempty requests. This exercises the bounded zero-length
+/// amplification exception without weakening ordinary payload accounting.
+async fn start_udp_zero_ack_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async move {
+        let socket = UdpSocket::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap_or_else(|_| panic!("Failed to bind UDP zero-ack server on port {}", port));
+
+        let mut buf = vec![0u8; 65535];
+        while let Ok((len, src)) = socket.recv_from(&mut buf).await {
+            let response: &[u8] = if len == 0 { b"x" } else { &buf[..len] };
+            let _ = socket.send_to(response, src).await;
+        }
+    });
+    sleep(Duration::from_millis(200)).await;
+    handle
+}
+
 /// Start a UDP backend that sends periodic responses after the first datagram
 /// from each client. Used to verify backend-side activity keeps DTLS frontend
 /// sessions alive even when the client is idle.
@@ -254,16 +273,17 @@ plugin_configs: []
     echo_server.abort();
 }
 
-/// Regression: a zero-length UDP datagram is valid payload, not EOF. The proxy
-/// must relay it in both directions and keep the session usable afterwards.
+/// Regression: a zero-length UDP datagram is valid payload, not EOF. With the
+/// amplification guard enabled, it receives exactly the one-byte allowance and
+/// the session remains usable for an ordinary follow-up request.
 #[ignore]
 #[tokio::test]
-async fn test_udp_proxy_zero_length_datagram_forwarding() {
+async fn test_udp_proxy_zero_length_request_has_bounded_reply_budget() {
     let backend_port = 19830u16;
     let proxy_port = 19831u16;
     let gateway_http_port = 18220u16;
 
-    let echo_server = start_udp_echo_server(backend_port).await;
+    let backend = start_udp_zero_ack_echo_server(backend_port).await;
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -279,6 +299,7 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     udp_idle_timeout_seconds: 30
+    udp_max_response_amplification_factor: 1.0
 
 consumers: []
 plugin_configs: []
@@ -301,11 +322,15 @@ plugin_configs: []
         .await
         .expect("Failed to send empty datagram");
     let mut buf = vec![0u8; 1024];
-    let empty_len = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+    let zero_ack_len = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
         .await
-        .expect("empty datagram echo timed out")
+        .expect("zero-length request acknowledgment timed out")
         .expect("empty datagram recv error");
-    assert_eq!(empty_len, 0, "empty datagram echo should have length 0");
+    assert_eq!(
+        &buf[..zero_ack_len],
+        b"x",
+        "zero-length request should receive the bounded one-byte acknowledgment"
+    );
 
     let followup = b"after-empty";
     client
@@ -319,7 +344,7 @@ plugin_configs: []
     assert_eq!(&buf[..followup_len], followup);
 
     shutdown_gateway(&mut gateway);
-    echo_server.abort();
+    backend.abort();
 }
 
 /// Regression: datagrams sent while background session setup is still running

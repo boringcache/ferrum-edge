@@ -283,14 +283,12 @@ async fn test_all_plugins_available() {
 #[tokio::test]
 async fn test_plugin_creation_all_plugins() {
     for plugin_name in available_plugins() {
-        // geo_restriction requires a valid .mmdb file on disk — skip in this test.
-        // Its config validation is tested separately in geo_restriction_tests.rs.
-        if plugin_name == "geo_restriction" {
-            continue;
-        }
-
         // Some plugins now require specific config fields
         let config = match plugin_name {
+            "geo_restriction" => json!({
+                "db_path": "/nonexistent/GeoIP2-Country.mmdb",
+                "allow_countries": ["US"]
+            }),
             "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
             "tcp_logging" => json!({"host": "localhost", "port": 5140}),
             "ws_logging" => json!({"endpoint_url": "ws://localhost:9300/logs"}),

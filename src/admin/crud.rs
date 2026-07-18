@@ -20,7 +20,8 @@ use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
     PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_admission_unavailable,
     is_mtls_dns_identity_conflict, mark_mtls_dns_admission_unavailable,
-    tcp_connection_throttle_attachment_conflict,
+    tcp_connection_throttle_attachment_conflict, validate_api_spec_proxy_plugin_association,
+    validate_api_spec_restore_inputs,
 };
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
@@ -71,8 +72,25 @@ pub(crate) enum InterveningWriteRecovery {
 
 pub(crate) struct ApiSpecDeleteSnapshot {
     spec: crate::config::types::ApiSpec,
-    upstreams: Vec<Upstream>,
+    upstream: Option<Upstream>,
     plugins: Vec<PluginConfig>,
+    additional_upstreams: Vec<Upstream>,
+    additional_plugins: Vec<PluginConfig>,
+}
+
+#[derive(Debug)]
+struct ApiSpecRestoreSnapshotValidation(String);
+
+impl std::fmt::Display for ApiSpecRestoreSnapshotValidation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ApiSpecRestoreSnapshotValidation {}
+
+fn api_spec_restore_snapshot_validation(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ApiSpecRestoreSnapshotValidation(message.into()))
 }
 
 #[derive(Clone, Copy)]
@@ -711,6 +729,7 @@ async fn recover_late_resource_write<R: AdminResource>(
                         recovery
                             .delete_snapshots
                             .and_then(|snapshots| snapshots.api_spec),
+                        http_client,
                     )
                     .await?;
                 }
@@ -1172,6 +1191,104 @@ pub(crate) async fn validate_plugin_graph_proxy_deletion_candidate(
 
     let http_client = super::plugin_validation_http_client(state);
     validate_candidate_plugin_graph(&candidate, &http_client)
+}
+
+/// A direct proxy delete can cascade resources that the runtime snapshot
+/// deliberately exposes without API-spec ownership metadata. Re-read every
+/// resource that compensation would classify as hand-owned before persistence,
+/// while namespace admission is still held, so a foreign spec's resource can
+/// never be restored with its ownership stripped.
+async fn validate_direct_api_spec_proxy_delete_restore_ownership(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &Proxy,
+) -> Result<(), AfterValidateError> {
+    let spec = db
+        .get_api_spec_by_proxy(namespace, &proxy.id)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let Some(spec) = spec else {
+        if let Some(owner) = proxy.api_spec_id.as_deref() {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' is stamped to API spec '{}' but its owning API-spec metadata is missing",
+                proxy.id, owner
+            )]));
+        }
+        return Ok(());
+    };
+    if let Some(owner) = proxy.api_spec_id.as_deref()
+        && owner != spec.id
+    {
+        return Err(AfterValidateError::BadRequest(vec![format!(
+            "proxy '{}' is stamped to API spec '{}' but its owning metadata identifies API spec '{}'",
+            proxy.id, owner, spec.id
+        )]));
+    }
+    let snapshot = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let associated_ids = proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect::<HashSet<_>>();
+    let other_associated_ids = snapshot
+        .proxies
+        .iter()
+        .filter(|candidate| candidate.id != proxy.id)
+        .flat_map(|candidate| candidate.plugins.iter())
+        .map(|association| association.plugin_config_id.as_str())
+        .collect::<HashSet<_>>();
+
+    for snapshot_plugin in snapshot.plugin_configs.iter().filter(|plugin| {
+        plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+            || (plugin.scope == PluginScope::ProxyGroup
+                && associated_ids.contains(plugin.id.as_str())
+                && !other_associated_ids.contains(plugin.id.as_str()))
+    }) {
+        let Some(plugin) = db
+            .get_plugin_config(namespace, &snapshot_plugin.id)
+            .await
+            .map_err(AfterValidateError::Db)?
+        else {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' cascade plugin '{}' disappeared before API-spec restore ownership validation",
+                proxy.id, snapshot_plugin.id
+            )]));
+        };
+        if let Some(owner) = plugin.api_spec_id.as_deref()
+            && owner != spec.id
+        {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' cascade plugin '{}' is owned by API spec '{}', not owning API spec '{}'",
+                proxy.id, plugin.id, owner, spec.id
+            )]));
+        }
+    }
+
+    if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+        let Some(upstream) = db
+            .get_upstream(namespace, upstream_id)
+            .await
+            .map_err(AfterValidateError::Db)?
+        else {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' upstream '{}' disappeared before API-spec restore ownership validation",
+                proxy.id, upstream_id
+            )]));
+        };
+        if let Some(owner) = upstream.api_spec_id.as_deref()
+            && owner != spec.id
+        {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' upstream '{}' is owned by API spec '{}', not owning API spec '{}'",
+                proxy.id, upstream.id, owner, spec.id
+            )]));
+        }
+    }
+
+    Ok(())
 }
 
 /// Validate the post-mutation named log-schema graph for one namespace.
@@ -1665,6 +1782,7 @@ pub(crate) trait AdminResource:
         previous: &Self,
         _previous_snapshot: Option<&GatewayConfig>,
         _previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+        _http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<()> {
         Self::db_create(db, previous).await
     }
@@ -1682,6 +1800,7 @@ pub(crate) trait AdminResource:
         _db: &dyn DatabaseBackend,
         _namespace: &str,
         _previous: &Self,
+        _previous_snapshot: Option<&GatewayConfig>,
     ) -> DbResult<Option<ApiSpecDeleteSnapshot>> {
         Ok(None)
     }
@@ -1908,7 +2027,14 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     } else {
         None
     };
-    let previous_api_spec = match R::late_delete_api_spec_snapshot(db, namespace, &existing).await {
+    let previous_api_spec = match R::late_delete_api_spec_snapshot(
+        db,
+        namespace,
+        &existing,
+        previous_snapshot.as_ref(),
+    )
+    .await
+    {
         Ok(snapshot) => snapshot,
         Err(error) => return Ok(R::map_precheck_db_error(&error)),
     };
@@ -3235,6 +3361,7 @@ impl AdminResource for PluginConfig {
         previous: &Self,
         previous_snapshot: Option<&GatewayConfig>,
         _previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+        _http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<()> {
         let snapshot = previous_snapshot.ok_or_else(|| {
             anyhow::anyhow!("late plugin delete recovery is missing the namespace snapshot")
@@ -3756,7 +3883,25 @@ impl AdminResource for Proxy {
         previous: &Self,
         previous_snapshot: Option<&GatewayConfig>,
         previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+        http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<()> {
+        if let Some(api_spec_snapshot) = previous_api_spec {
+            let bundle = crate::admin::api_specs::ExtractedBundle {
+                proxy: previous.clone(),
+                upstream: api_spec_snapshot.upstream.clone(),
+                plugins: api_spec_snapshot.plugins.clone(),
+            };
+            db.restore_api_spec_bundle(
+                &bundle,
+                &api_spec_snapshot.spec,
+                &api_spec_snapshot.additional_upstreams,
+                &api_spec_snapshot.additional_plugins,
+                &http_client,
+            )
+            .await?;
+            return Ok(());
+        }
+
         let snapshot = previous_snapshot.ok_or_else(|| {
             anyhow::anyhow!("late proxy delete recovery is missing the namespace snapshot")
         })?;
@@ -3772,7 +3917,7 @@ impl AdminResource for Proxy {
             .flat_map(|proxy| proxy.plugins.iter())
             .map(|association| association.plugin_config_id.as_str())
             .collect();
-        let mut affected_plugins = snapshot
+        let affected_plugins = snapshot
             .plugin_configs
             .iter()
             .filter(|plugin| {
@@ -3783,81 +3928,20 @@ impl AdminResource for Proxy {
             })
             .cloned()
             .collect::<Vec<_>>();
-        if let Some(api_spec_snapshot) = previous_api_spec {
-            for plugin in &api_spec_snapshot.plugins {
-                if !affected_plugins
-                    .iter()
-                    .any(|affected| affected.id == plugin.id)
-                {
-                    affected_plugins.push(plugin.clone());
-                }
-            }
-        }
-
-        let mut affected_upstreams = snapshot
+        let affected_upstreams = snapshot
             .upstreams
             .iter()
             .filter(|upstream| previous.upstream_id.as_deref() == Some(upstream.id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        if let Some(api_spec_snapshot) = previous_api_spec {
-            for upstream in &api_spec_snapshot.upstreams {
-                if !affected_upstreams
-                    .iter()
-                    .any(|affected| affected.id == upstream.id)
-                {
-                    affected_upstreams.push(upstream.clone());
-                }
+        for upstream in &affected_upstreams {
+            if db.get_upstream(namespace, &upstream.id).await?.is_none() {
+                db.create_upstream(upstream).await?;
             }
         }
-
-        if let Some(api_spec_snapshot) = previous_api_spec {
-            let spec = &api_spec_snapshot.spec;
-            let spec_plugins = api_spec_snapshot.plugins.clone();
-            let spec_plugin_ids = spec_plugins
-                .iter()
-                .map(|plugin| plugin.id.as_str())
-                .collect::<HashSet<_>>();
-            let bundle_upstream = affected_upstreams
-                .iter()
-                .find(|upstream| {
-                    upstream.api_spec_id.as_deref() == Some(spec.id.as_str())
-                        && previous.upstream_id.as_deref() == Some(upstream.id.as_str())
-                })
-                .or_else(|| {
-                    affected_upstreams
-                        .iter()
-                        .find(|upstream| upstream.api_spec_id.as_deref() == Some(spec.id.as_str()))
-                })
-                .cloned();
-            for upstream in &affected_upstreams {
-                if bundle_upstream.as_ref().map(|item| item.id.as_str())
-                    != Some(upstream.id.as_str())
-                    && db.get_upstream(namespace, &upstream.id).await?.is_none()
-                {
-                    db.create_upstream(upstream).await?;
-                }
-            }
-            let mut base_proxy = previous.clone();
-            base_proxy.plugins.retain(|association| {
-                spec_plugin_ids.contains(association.plugin_config_id.as_str())
-            });
-            let bundle = crate::admin::api_specs::ExtractedBundle {
-                proxy: base_proxy,
-                upstream: bundle_upstream,
-                plugins: spec_plugins,
-            };
-            db.submit_api_spec_bundle(&bundle, spec).await?;
-        } else {
-            for upstream in &affected_upstreams {
-                if db.get_upstream(namespace, &upstream.id).await?.is_none() {
-                    db.create_upstream(upstream).await?;
-                }
-            }
-            let mut proxy_without_associations = previous.clone();
-            proxy_without_associations.plugins.clear();
-            db.create_proxy(&proxy_without_associations).await?;
-        }
+        let mut proxy_without_associations = previous.clone();
+        proxy_without_associations.plugins.clear();
+        db.create_proxy(&proxy_without_associations).await?;
         for plugin in affected_plugins {
             if db.get_plugin_config(namespace, &plugin.id).await?.is_none() {
                 db.create_plugin_config(&plugin).await?;
@@ -3873,6 +3957,7 @@ impl AdminResource for Proxy {
         db: &dyn DatabaseBackend,
         namespace: &str,
         previous: &Self,
+        previous_snapshot: Option<&GatewayConfig>,
     ) -> DbResult<Option<ApiSpecDeleteSnapshot>> {
         let Some(spec) = db.get_api_spec_by_proxy(namespace, &previous.id).await? else {
             return Ok(None);
@@ -3881,10 +3966,139 @@ impl AdminResource for Proxy {
         let plugins = db
             .list_spec_owned_plugin_configs(namespace, &spec.id)
             .await?;
+        let upstream = match upstreams.as_slice() {
+            [] => None,
+            [upstream] => Some(upstream.clone()),
+            _ => {
+                return Err(api_spec_restore_snapshot_validation(format!(
+                    "API spec '{}' owns multiple upstreams, which direct proxy delete recovery cannot reproduce safely",
+                    spec.id
+                )));
+            }
+        };
+        let mut additional_upstreams = Vec::new();
+        if let Some(current_upstream_id) = previous.upstream_id.as_deref()
+            && upstream.as_ref().map(|item| item.id.as_str()) != Some(current_upstream_id)
+        {
+            match db.get_upstream(namespace, current_upstream_id).await? {
+                Some(current) if current.api_spec_id.is_none() => {
+                    additional_upstreams.push(current);
+                }
+                Some(current) => {
+                    return Err(api_spec_restore_snapshot_validation(format!(
+                        "API spec '{}' cannot snapshot proxy '{}' current upstream '{}': it is owned by API spec '{}'",
+                        spec.id,
+                        previous.id,
+                        current.id,
+                        current.api_spec_id.as_deref().unwrap_or("<unknown>")
+                    )));
+                }
+                None => {
+                    return Err(api_spec_restore_snapshot_validation(format!(
+                        "API spec '{}' proxy '{}' references missing upstream '{}'",
+                        spec.id, previous.id, current_upstream_id
+                    )));
+                }
+            }
+        }
+
+        let snapshot = previous_snapshot.ok_or_else(|| {
+            anyhow::anyhow!("direct API-spec proxy delete is missing the namespace snapshot")
+        })?;
+        let owned_plugin_ids: HashSet<&str> =
+            plugins.iter().map(|plugin| plugin.id.as_str()).collect();
+        let associated_ids: HashSet<&str> = previous
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.as_str())
+            .collect();
+        let other_associated_ids: HashSet<&str> = snapshot
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id != previous.id)
+            .flat_map(|proxy| proxy.plugins.iter())
+            .map(|association| association.plugin_config_id.as_str())
+            .collect();
+        let additional_plugin_ids = snapshot
+            .plugin_configs
+            .iter()
+            .filter(|plugin| !owned_plugin_ids.contains(plugin.id.as_str()))
+            .filter(|plugin| {
+                plugin.proxy_id.as_deref() == Some(previous.id.as_str())
+                    || (plugin.scope == PluginScope::ProxyGroup
+                        && associated_ids.contains(plugin.id.as_str())
+                        && !other_associated_ids.contains(plugin.id.as_str()))
+            })
+            .map(|plugin| plugin.id.clone())
+            .collect::<Vec<_>>();
+        let mut additional_plugins = Vec::with_capacity(additional_plugin_ids.len());
+        for plugin_id in &additional_plugin_ids {
+            let plugin = db
+                .get_plugin_config(namespace, plugin_id)
+                .await?
+                .ok_or_else(|| {
+                    api_spec_restore_snapshot_validation(format!(
+                        "API spec '{}' direct proxy delete snapshot lost plugin '{}' before persistence",
+                        spec.id, plugin_id
+                    ))
+                })?;
+            if let Some(owner) = plugin.api_spec_id.as_deref() {
+                return Err(api_spec_restore_snapshot_validation(format!(
+                    "API spec '{}' cannot delete proxy '{}': cascade plugin '{}' is owned by API spec '{}'",
+                    spec.id, previous.id, plugin.id, owner
+                )));
+            }
+            validate_api_spec_proxy_plugin_association(&plugin, &previous.id)
+                .map_err(|error| api_spec_restore_snapshot_validation(error.to_string()))?;
+            additional_plugins.push(plugin);
+        }
+
+        let additional_plugin_id_set: HashSet<&str> =
+            additional_plugin_ids.iter().map(String::as_str).collect();
+        for association in &previous.plugins {
+            let plugin_id = association.plugin_config_id.as_str();
+            if owned_plugin_ids.contains(plugin_id) || additional_plugin_id_set.contains(plugin_id)
+            {
+                continue;
+            }
+            let plugin = db
+                .get_plugin_config(namespace, plugin_id)
+                .await?
+                .ok_or_else(|| {
+                    api_spec_restore_snapshot_validation(format!(
+                        "API spec '{}' proxy association references missing plugin '{}'",
+                        spec.id, plugin_id
+                    ))
+                })?;
+            if let Some(owner) = plugin.api_spec_id.as_deref() {
+                return Err(api_spec_restore_snapshot_validation(format!(
+                    "API spec '{}' cannot delete proxy '{}': associated plugin '{}' is owned by API spec '{}'",
+                    spec.id, previous.id, plugin.id, owner
+                )));
+            }
+            validate_api_spec_proxy_plugin_association(&plugin, &previous.id)
+                .map_err(|error| api_spec_restore_snapshot_validation(error.to_string()))?;
+        }
+
+        let bundle = crate::admin::api_specs::ExtractedBundle {
+            proxy: previous.clone(),
+            upstream: upstream.clone(),
+            plugins: plugins.clone(),
+        };
+        validate_api_spec_restore_inputs(
+            &bundle,
+            &spec,
+            &additional_upstreams,
+            &additional_plugins,
+            true,
+        )
+        .map_err(|error| api_spec_restore_snapshot_validation(error.to_string()))?;
         Ok(Some(ApiSpecDeleteSnapshot {
             spec,
-            upstreams,
+            upstream,
             plugins,
+            additional_upstreams,
+            additional_plugins,
         }))
     }
 
@@ -3942,6 +4156,19 @@ impl AdminResource for Proxy {
         }
 
         Ok(None)
+    }
+
+    fn map_precheck_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+        if let Some(validation) = error.downcast_ref::<ApiSpecRestoreSnapshotValidation>() {
+            return super::json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": validation.to_string()}),
+            );
+        }
+        super::json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &super::db_error_response(error),
+        )
     }
 
     fn map_persist_db_error(
@@ -4167,6 +4394,7 @@ impl AdminResource for Proxy {
         existing: &Self,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
+        validate_direct_api_spec_proxy_delete_restore_ownership(db, namespace, existing).await?;
         validate_plugin_graph_proxy_deletion_candidate(db, state, namespace, &existing.id).await
     }
 
