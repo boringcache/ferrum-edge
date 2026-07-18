@@ -109,7 +109,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("late plugin delete compensation could not restore proxy"));
     assert!(crud_source.contains("late_delete_api_spec_snapshot("));
     assert!(crud_source.contains("db.get_api_spec_by_proxy(namespace, &previous.id)"));
-    assert!(crud_source.contains("db.submit_api_spec_bundle(&bundle, spec)"));
+    assert!(crud_source.contains("db.restore_api_spec_bundle(&bundle, spec, &additional_plugins)"));
     assert!(crud_source.contains("affected_upstreams"));
     assert!(crud_source.contains("task.abort();"));
     assert!(crud_source.contains("tokio::time::timeout("));
@@ -249,6 +249,28 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         .expect("DELETE prospective graph validation");
     assert!(delete_lock < delete_validation);
     assert!(delete_validation < delete_persist);
+}
+
+#[test]
+fn direct_api_spec_proxy_delete_uses_atomic_restore_contract() {
+    let source = include_str!("../../../src/admin/crud.rs");
+    let proxy_impl = source
+        .find("impl AdminResource for Proxy")
+        .expect("Proxy admin implementation must exist");
+    let compensation = source[proxy_impl..]
+        .find("async fn compensate_late_delete(")
+        .map(|offset| proxy_impl + offset)
+        .expect("Proxy DELETE must define late compensation");
+    let snapshot = source[compensation..]
+        .find("async fn late_delete_api_spec_snapshot(")
+        .map(|offset| compensation + offset)
+        .expect("Proxy compensation must have a bounded source region");
+    let recovery = &source[compensation..snapshot];
+
+    assert!(recovery.contains("proxy: previous.clone()"));
+    assert!(recovery.contains("!spec_plugin_ids.contains(plugin.id.as_str())"));
+    assert!(recovery.contains("db.restore_api_spec_bundle(&bundle, spec, &additional_plugins)"));
+    assert!(!recovery.contains("db.submit_api_spec_bundle("));
 }
 
 #[test]

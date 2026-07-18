@@ -3538,6 +3538,14 @@ paths:
     delete:
       operationId: deleteProxy
       summary: Delete a proxy
+      description: |
+        Deletes the proxy and its proxy-owned cascade resources. If the proxy is
+        owned by an API spec, the spec row and spec-owned resources are also
+        deleted. When namespace admission is lost after that deletion commits,
+        SQL backends and replica-set MongoDB use the API-spec compensation
+        transaction to restore the stamped spec resources, hand-owned cascade
+        plugins, associations, and config-change records together. Standalone
+        MongoDB fails closed before multi-document compensation writes.
       tags: [Proxies]
       responses:
         "204":

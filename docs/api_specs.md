@@ -249,6 +249,8 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 
 **MongoDB with a replica set**: late `DELETE` compensation uses one multi-document transaction with the same all-or-nothing graph and config-change boundary as SQL.
 
+The same dedicated restore boundary is used when `DELETE /proxies/{id}` directly removes a proxy owned by an API spec and late compensation is required. The stamped spec-owned resources and hand-owned plugins removed by the proxy cascade are restored through the compensation contract, not replayed as a normal client submission.
+
 Because compensation follows a lost namespace-admission lease, another writer may have changed the namespace before recovery reacquires admission. SQL and replica-set MongoDB therefore reapply proxy route-uniqueness and upstream-reference admission inside the restore transaction. An intervening overlapping route or a deleted hand-owned upstream rejects and rolls back the complete restore instead of committing a conflicting or dangling proxy.
 
 **MongoDB without a replica set**: atomicity is limited to single-document operations. Normal multi-resource submissions retain their best-effort approach with compensating deletes on failure. In the event of an infrastructure fault mid-submission, orphaned resources are possible. Late `DELETE` compensation is stricter: it fails closed before writing anything because a partially restored proxy could publish without its security plugins. The already-committed delete therefore remains in place until an operator retries on a replica-set deployment or re-submits the spec. Use a MongoDB replica set for production deployments that require atomic multi-document writes or automatic late-delete recovery.

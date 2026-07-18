@@ -3825,26 +3825,29 @@ impl AdminResource for Proxy {
                     db.create_upstream(upstream).await?;
                 }
             }
-            let mut base_proxy = previous.clone();
-            base_proxy.plugins.retain(|association| {
-                spec_plugin_ids.contains(association.plugin_config_id.as_str())
-            });
+            let additional_plugins = affected_plugins
+                .iter()
+                .filter(|plugin| !spec_plugin_ids.contains(plugin.id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
             let bundle = crate::admin::api_specs::ExtractedBundle {
-                proxy: base_proxy,
+                proxy: previous.clone(),
                 upstream: bundle_upstream,
                 plugins: spec_plugins,
             };
-            db.submit_api_spec_bundle(&bundle, spec).await?;
-        } else {
-            for upstream in &affected_upstreams {
-                if db.get_upstream(namespace, &upstream.id).await?.is_none() {
-                    db.create_upstream(upstream).await?;
-                }
-            }
-            let mut proxy_without_associations = previous.clone();
-            proxy_without_associations.plugins.clear();
-            db.create_proxy(&proxy_without_associations).await?;
+            db.restore_api_spec_bundle(&bundle, spec, &additional_plugins)
+                .await?;
+            return Ok(());
         }
+
+        for upstream in &affected_upstreams {
+            if db.get_upstream(namespace, &upstream.id).await?.is_none() {
+                db.create_upstream(upstream).await?;
+            }
+        }
+        let mut proxy_without_associations = previous.clone();
+        proxy_without_associations.plugins.clear();
+        db.create_proxy(&proxy_without_associations).await?;
         for plugin in affected_plugins {
             if db.get_plugin_config(namespace, &plugin.id).await?.is_none() {
                 db.create_plugin_config(&plugin).await?;
