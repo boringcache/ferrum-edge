@@ -889,8 +889,9 @@ mod inner {
                     "MongoDB connected without a replica set (FERRUM_MONGO_REPLICA_SET is unset). \
                      Multi-document writes (proxy delete/update, api_spec submit/replace) will \
                      fall back to compensating rollback instead of transactions, leaving a small \
-                     window where partial failure may require operator reconciliation. Configure \
-                     FERRUM_MONGO_REPLICA_SET to enable transactions."
+                     window where partial failure may require operator reconciliation. Atomic \
+                     late API-spec delete compensation is unavailable and fails before writing. \
+                     Configure FERRUM_MONGO_REPLICA_SET to enable transactions."
                 );
             }
 
@@ -4015,6 +4016,7 @@ mod inner {
     #[derive(Clone)]
     struct PreparedApiSpecBundleDocs {
         upstream: Option<(String, Document)>,
+        additional_upstreams: Vec<(String, Document)>,
         plugins: Vec<(String, Document)>,
         proxy: (String, Document),
         spec: Document,
@@ -4047,10 +4049,100 @@ mod inner {
 
         Ok(PreparedApiSpecBundleDocs {
             upstream,
+            additional_upstreams: Vec::new(),
             plugins,
             proxy: (bundle.proxy.id.clone(), proxy_doc),
             spec: spec_doc,
         })
+    }
+
+    fn prepare_api_spec_restore_docs(
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &ApiSpec,
+        additional_upstreams: &[Upstream],
+        additional_plugins: &[PluginConfig],
+    ) -> Result<PreparedApiSpecBundleDocs, anyhow::Error> {
+        let mut prepared = prepare_api_spec_bundle_docs(bundle, spec)?;
+        prepared
+            .additional_upstreams
+            .reserve(additional_upstreams.len());
+        for upstream in additional_upstreams {
+            prepared
+                .additional_upstreams
+                .push((upstream.id.clone(), upstream_to_doc(upstream)?));
+        }
+        prepared.plugins.reserve(additional_plugins.len());
+        for plugin in additional_plugins {
+            prepared
+                .plugins
+                .push((plugin.id.clone(), plugin_config_to_doc(plugin)?));
+        }
+        Ok(prepared)
+    }
+
+    async fn validate_api_spec_restore_candidate_in_session(
+        store: &MongoStore,
+        connection: &MongoConnectionBundle,
+        session: &mut ClientSession,
+        namespace: &str,
+        restored_proxy_id: &str,
+        validation_http_client: &crate::plugins::PluginHttpClient,
+    ) -> Result<(), anyhow::Error> {
+        let proxies = store
+            .load_full_proxies_opt_session(namespace, Some((connection, &mut *session)), true)
+            .await?;
+        let plugin_configs = store
+            .load_full_plugin_configs_opt_session(
+                namespace,
+                Some((connection, &mut *session)),
+                true,
+            )
+            .await?;
+        let upstreams = store
+            .load_full_upstreams_opt_session(namespace, Some((connection, &mut *session)), true)
+            .await?;
+        let mut candidate = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            plugin_configs,
+            upstreams,
+            loaded_at: Utc::now(),
+            ..Default::default()
+        };
+        candidate.normalize_fields();
+        let recovered_graph = crate::config::db_backend::api_spec_recovered_proxy_graph(
+            candidate.clone(),
+            restored_proxy_id,
+        )?;
+        if let Err(errors) = recovered_graph.validate_plugin_references() {
+            anyhow::bail!(
+                "restore_api_spec_bundle produced invalid proxy/plugin associations: {}",
+                errors.join("; ")
+            );
+        }
+        if let Err(errors) = recovered_graph.validate_upstream_references() {
+            anyhow::bail!(
+                "restore_api_spec_bundle produced invalid proxy/upstream references: {}",
+                errors.join("; ")
+            );
+        }
+        crate::config::db_backend::validate_api_spec_recovered_plugin_graph(
+            &recovered_graph,
+            validation_http_client,
+        )
+        .await?;
+        crate::plugin_cache::validate_tcp_connection_throttle_attachments(&candidate).map_err(
+            |errors| anyhow::Error::new(TcpConnectionThrottleAttachmentConflict::new(errors)),
+        )?;
+        if !candidate.has_effective_mtls_dns_identity_policy() {
+            return Ok(());
+        }
+        candidate.consumers = store
+            .load_full_consumers_opt_session(namespace, Some((connection, &mut *session)), true)
+            .await?;
+        candidate
+            .validate_unique_mtls_dns_identities()
+            .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
     }
 
     // -----------------------------------------------------------------------
@@ -5326,8 +5418,13 @@ mod inner {
                                             .session(&mut *s)
                                             .await?;
                                     }
-                                    // Cascade-delete orphaned upstream.
-                                    if let Some(ref uid) = upstream_id_to_check {
+                                    // Generic proxy deletion owns ordinary
+                                    // orphan cleanup. A spec-owned proxy can
+                                    // drift to a hand-owned upstream, which
+                                    // must survive deletion of the spec graph.
+                                    if spec_owner.is_none()
+                                        && let Some(ref uid) = upstream_id_to_check
+                                    {
                                         let still_referenced = this
                                             .proxies()
                                             .count_documents(mongodb::bson::doc! {
@@ -5551,7 +5648,9 @@ mod inner {
                         ),
                     }
                 }
-                if let Some(ref uid) = upstream_id_to_check {
+                if spec_owner.is_none()
+                    && let Some(ref uid) = upstream_id_to_check
+                {
                     let still_referenced = self
                         .proxies()
                         .count_documents(doc! { "upstream_id": uid })
@@ -8885,6 +8984,13 @@ mod inner {
             bundle: &crate::admin::api_specs::ExtractedBundle,
             spec: &ApiSpec,
         ) -> Result<(), anyhow::Error> {
+            crate::config::db_backend::validate_api_spec_restore_inputs(
+                bundle,
+                spec,
+                &[],
+                &[],
+                false,
+            )?;
             // Pre-flight size check: BSON document limit is 16 MiB.
             // Measure the actual serialized BSON size rather than estimating
             // with a hardcoded overhead constant.
@@ -9115,6 +9221,225 @@ mod inner {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
 
+                Ok(())
+            })
+            .await?;
+            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Ok(())
+        }
+
+        async fn restore_api_spec_bundle(
+            &self,
+            bundle: &crate::admin::api_specs::ExtractedBundle,
+            spec: &ApiSpec,
+            additional_upstreams: &[Upstream],
+            additional_plugins: &[PluginConfig],
+            validation_http_client: &crate::plugins::PluginHttpClient,
+        ) -> Result<(), anyhow::Error> {
+            crate::config::db_backend::validate_api_spec_restore_inputs(
+                bundle,
+                spec,
+                additional_upstreams,
+                additional_plugins,
+                true,
+            )?;
+            if !self.replica_set_configured() {
+                anyhow::bail!(
+                    "atomic API-spec restore requires MongoDB replica-set transactions; configure FERRUM_MONGO_REPLICA_SET"
+                );
+            }
+
+            let spec_doc = api_spec_to_doc(spec)?;
+            let bson_bytes = mongodb::bson::to_vec(&spec_doc)?;
+            if bson_bytes.len() > 15 * 1024 * 1024 {
+                anyhow::bail!(
+                    "MongoDB document limit exceeded: serialized spec is {} bytes \
+                     (limit ~15 MiB); use a SQL backend for large specs",
+                    bson_bytes.len()
+                );
+            }
+
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases(std::iter::once(spec.namespace.as_str()))
+                .await?;
+            self.validate_plugin_graph_admission_candidate(&spec.namespace, |candidate| {
+                candidate.proxies.push(bundle.proxy.clone());
+                candidate
+                    .plugin_configs
+                    .extend(bundle.plugins.iter().cloned());
+                candidate
+                    .plugin_configs
+                    .extend(additional_plugins.iter().cloned());
+            })
+            .await?;
+
+            Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                let prepared_docs = prepare_api_spec_restore_docs(
+                    bundle,
+                    spec,
+                    additional_upstreams,
+                    additional_plugins,
+                )?;
+                let guard_params = ProxyWriteGuardParams::from_proxy(&bundle.proxy);
+                let mut upsert_changes: Vec<(String, &'static str, String)> = Vec::new();
+                if let Some(upstream) = &bundle.upstream {
+                    upsert_changes.push((
+                        upstream.namespace.clone(),
+                        "upstream",
+                        upstream.id.clone(),
+                    ));
+                }
+                upsert_changes.push((
+                    bundle.proxy.namespace.clone(),
+                    "proxy",
+                    bundle.proxy.id.clone(),
+                ));
+                for plugin in bundle.plugins.iter().chain(additional_plugins) {
+                    upsert_changes.push((
+                        plugin.namespace.clone(),
+                        "plugin_config",
+                        plugin.id.clone(),
+                    ));
+                }
+
+                session
+                    .start_transaction()
+                    .and_run(
+                        (
+                            self,
+                            connection,
+                            prepared_docs,
+                            guard_params,
+                            upsert_changes,
+                            spec.namespace.clone(),
+                            bundle.proxy.id.clone(),
+                            validation_http_client,
+                        ),
+                        |s,
+                         (
+                            this,
+                            connection,
+                            prepared_docs,
+                            guard_params,
+                            upsert_changes,
+                            namespace,
+                            restored_proxy_id,
+                            validation_http_client,
+                        )| {
+                            Box::pin(async move {
+                                if let Some((_, doc)) = &prepared_docs.upstream {
+                                    this.upstreams()
+                                        .insert_one(doc.clone())
+                                        .session(&mut *s)
+                                        .await?;
+                                }
+                                for (upstream_id, doc) in &prepared_docs.additional_upstreams {
+                                    let upstream_namespace = doc
+                                        .get_str("namespace")
+                                        .map_err(|error| {
+                                            mongodb::error::Error::custom(format!(
+                                                "additional restore upstream {} is missing namespace: {}",
+                                                upstream_id, error
+                                            ))
+                                        })?;
+                                    let existing = this
+                                        .upstreams()
+                                        .find_one(mongodb::bson::doc! {
+                                            "_id": upstream_id.as_str(),
+                                            "namespace": upstream_namespace,
+                                        })
+                                        .session(&mut *s)
+                                        .await?;
+                                    if let Some(existing) = existing {
+                                        let existing = doc_to_upstream(existing).map_err(|error| {
+                                            mongodb::error::Error::custom(error.to_string())
+                                        })?;
+                                        let expected = doc_to_upstream(doc.clone()).map_err(
+                                            |error| {
+                                                mongodb::error::Error::custom(error.to_string())
+                                            },
+                                        )?;
+                                        crate::config::db_backend::validate_api_spec_retained_upstream_identity(
+                                            &expected,
+                                            &existing,
+                                        )
+                                        .map_err(|error| {
+                                            mongodb::error::Error::custom(error.to_string())
+                                        })?;
+                                        continue;
+                                    }
+                                    this.upstreams()
+                                        .insert_one(doc.clone())
+                                        .session(&mut *s)
+                                        .await?;
+                                    upsert_changes.push((
+                                        upstream_namespace.to_string(),
+                                        "upstream",
+                                        upstream_id.clone(),
+                                    ));
+                                }
+                                // Compensation may follow an intervening
+                                // writer. Reapply the same in-session route
+                                // uniqueness and upstream-reference guards as
+                                // normal proxy creation before publishing the
+                                // restored proxy.
+                                this.ensure_proxy_admission_guards_in_session(
+                                    &mut *s,
+                                    guard_params,
+                                    None,
+                                )
+                                .await?;
+                                this.proxies()
+                                    .insert_one(prepared_docs.proxy.1.clone())
+                                    .session(&mut *s)
+                                    .await?;
+                                for (_, doc) in &prepared_docs.plugins {
+                                    this.plugin_configs()
+                                        .insert_one(doc.clone())
+                                        .session(&mut *s)
+                                        .await?;
+                                }
+                                this.api_specs()
+                                    .insert_one(prepared_docs.spec.clone())
+                                    .session(&mut *s)
+                                    .await?;
+
+                                validate_api_spec_restore_candidate_in_session(
+                                    this,
+                                    connection.as_ref(),
+                                    &mut *s,
+                                    namespace.as_str(),
+                                    restored_proxy_id.as_str(),
+                                    validation_http_client,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    mongodb::error::Error::custom(error.to_string())
+                                })?;
+
+                                for (namespace, resource_type, resource_id) in upsert_changes.iter()
+                                {
+                                    this.record_config_change_in_session(
+                                        &mut *s,
+                                        namespace.as_str(),
+                                        resource_type,
+                                        resource_id.as_str(),
+                                        "upsert",
+                                    )
+                                    .await?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("restore_api_spec_bundle transaction failed")?;
+
+                self.compact_config_changes_best_effort(&spec.namespace)
+                    .await;
                 Ok(())
             })
             .await?;

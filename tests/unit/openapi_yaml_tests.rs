@@ -3244,6 +3244,7 @@ fn plugin_graph_delete_rejections_have_openapi_parity() {
         .and_then(serde_json::Value::as_array)
         .expect("API-spec validation resource types");
     assert!(resource_types.contains(&json!("plugin_composition")));
+    assert!(resource_types.contains(&json!("upstream_graph")));
 }
 
 #[test]
