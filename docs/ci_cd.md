@@ -374,10 +374,11 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   as a collection, so a PR cannot move or add an invocation in a different
   workflow. Any new or changed Cross executable/configuration token outside
   the isolated jobs is rejected, including quoted or nested shell/GitHub-
-  interpolated executable spellings and Cross environment aliases; Bash
-  backslash-newline continuations are normalized before scanning. Unrelated
-  workflow additions and edits remain permitted. The isolated jobs use only
-  pinned external setup actions before revalidation.
+  interpolated executable spellings, literal GitHub `format()` expressions,
+  Bash brace expansions, and Cross environment aliases; Bash backslash-newline
+  continuations are normalized before scanning. Unrelated workflow additions
+  and edits remain permitted. The isolated jobs use only pinned external setup
+  actions before revalidation.
 - The Cross process starts through `env -i` with an explicit minimal host
   environment and fixed compiler variables. This removes `CROSS_CONFIG`, every
   `CROSS_BUILD_*`/`CROSS_TARGET_*` alias, image/Dockerfile/pre-build/runner
@@ -397,7 +398,9 @@ deletion. On pull requests, the ordinary `CI Plan` executes the base branch's
 trusted verifier when it exists and never imports or runs the proposed script.
 For this bootstrap PR, where the base has no verifier yet, it only syntax-
 compiles the proposed file as inert data; main pushes execute the newly trusted
-verifier and its hosted self-tests.
+verifier and its hosted self-tests. This policy step runs before every other
+repository Python entry point in the plan job, and the subsequent planner
+self-test is also extracted from the base branch on pull requests.
 
 #### 8. Latest Release and Docker Jobs
 

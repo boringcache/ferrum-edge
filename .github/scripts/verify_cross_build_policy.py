@@ -346,6 +346,9 @@ def interpolation_literal(raw: str) -> str:
         inner = raw[3:-2].strip()
         if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in "'\"":
             return inner[1:-1]
+        formatted = github_format_literal(inner)
+        if formatted is not None:
+            return formatted
         return ""
 
     if raw.startswith("${"):
@@ -359,6 +362,64 @@ def interpolation_literal(raw: str) -> str:
         inner = raw[1:-1]
     words = re.findall(r"[A-Za-z]+", inner)
     return next((word for word in reversed(words) if word in "cross"), "")
+
+
+def expression_string_arguments(value: str) -> tuple[str, ...] | None:
+    """Parse a comma-separated list containing only quoted expression strings."""
+
+    arguments: list[str] = []
+    cursor = 0
+    while cursor < len(value):
+        while cursor < len(value) and value[cursor].isspace():
+            cursor += 1
+        if cursor == len(value) or value[cursor] not in "'\"":
+            return None
+
+        quote = value[cursor]
+        cursor += 1
+        characters: list[str] = []
+        while cursor < len(value):
+            character = value[cursor]
+            if character == quote:
+                if quote == "'" and cursor + 1 < len(value) and value[cursor + 1] == "'":
+                    characters.append("'")
+                    cursor += 2
+                    continue
+                cursor += 1
+                break
+            if character == "\\" and quote == '"' and cursor + 1 < len(value):
+                characters.append(value[cursor + 1])
+                cursor += 2
+                continue
+            characters.append(character)
+            cursor += 1
+        else:
+            return None
+
+        arguments.append("".join(characters))
+        while cursor < len(value) and value[cursor].isspace():
+            cursor += 1
+        if cursor == len(value):
+            break
+        if value[cursor] != ",":
+            return None
+        cursor += 1
+    return tuple(arguments)
+
+
+def github_format_literal(inner: str) -> str | None:
+    """Evaluate GitHub format() only when every input is a static string."""
+
+    match = re.fullmatch(r"format\s*\((.*)\)", inner)
+    if match is None:
+        return None
+    arguments = expression_string_arguments(match.group(1))
+    if arguments is None or not arguments:
+        return None
+    try:
+        return arguments[0].format(*arguments[1:])
+    except (IndexError, KeyError, ValueError):
+        return None
 
 
 def command_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
@@ -415,6 +476,72 @@ def replace_command_substitutions(line: str, *, literal: bool) -> str:
     return "".join(parts)
 
 
+def brace_options(value: str) -> tuple[str, ...] | None:
+    """Return bounded Bash brace-expansion choices for one innermost group."""
+
+    if "," in value:
+        return tuple(value.split(","))
+
+    character_range = re.fullmatch(r"([A-Za-z])\.\.([A-Za-z])(?:\.\.(-?\d+))?", value)
+    if character_range is not None:
+        start = ord(character_range.group(1))
+        end = ord(character_range.group(2))
+        default_step = 1 if end >= start else -1
+        step = int(character_range.group(3) or default_step)
+        if step == 0 or (end - start) * step < 0:
+            return None
+        stop = end + (1 if step > 0 else -1)
+        choices = tuple(chr(point) for point in range(start, stop, step))
+        return choices if len(choices) <= 256 else None
+
+    integer_range = re.fullmatch(r"(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?", value)
+    if integer_range is not None:
+        start = int(integer_range.group(1))
+        end = int(integer_range.group(2))
+        default_step = 1 if end >= start else -1
+        step = int(integer_range.group(3) or default_step)
+        if step == 0 or (end - start) * step < 0:
+            return None
+        stop = end + (1 if step > 0 else -1)
+        choices = tuple(str(number) for number in range(start, stop, step))
+        return choices if len(choices) <= 256 else None
+    return None
+
+
+def brace_expansion_variants(value: str) -> tuple[str, ...]:
+    """Enumerate bounded Bash brace expansions and fail closed on explosion."""
+
+    variants = [value]
+    while True:
+        expanded: list[str] = []
+        changed = False
+        for variant in variants:
+            expandable = next(
+                (
+                    (match, options)
+                    for match in re.finditer(r"\{([^{}\n]*)\}", variant)
+                    if (options := brace_options(match.group(1))) is not None
+                ),
+                None,
+            )
+            if expandable is None:
+                expanded.append(variant)
+                continue
+            match, options = expandable
+            changed = True
+            for option in options:
+                expanded.append(
+                    variant[: match.start()] + option + variant[match.end() :]
+                )
+                if len(expanded) > 256:
+                    # A deliberately explosive shell expansion is an unknown
+                    # executable surface and therefore fails closed.
+                    return tuple([*dict.fromkeys(variants), "cross"])
+        variants = list(dict.fromkeys(expanded))
+        if not changed:
+            return tuple(variants)
+
+
 def scan_variants(line: str) -> tuple[str, ...]:
     """Expose ordinary YAML/shell quoting variants to the lexical boundary."""
 
@@ -443,7 +570,12 @@ def scan_variants(line: str) -> tuple[str, ...]:
         if isinstance(decoded, str):
             variants.append(decoded)
 
-    return tuple(dict.fromkeys(variants))
+    expanded_variants = [
+        expanded
+        for variant in variants
+        for expanded in brace_expansion_variants(variant)
+    ]
+    return tuple(dict.fromkeys(expanded_variants))
 
 
 def contains_cross_surface(contents: str) -> bool:
@@ -1143,6 +1275,15 @@ pre_build = []
         "unprotected GitHub interpolation": workflow.replace(
             "echo safe",
             "cr${{ 'o' }}ss build --target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected GitHub format expression": workflow.replace(
+            "echo safe",
+            "${{ format('cr{0}ss', 'o') }} build "
+            "--target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected Bash brace expansion": workflow.replace(
+            "echo safe",
+            "cr{o,}ss build --target aarch64-unknown-linux-gnu",
         ),
         "unprotected positional shell expansion": workflow.replace(
             "echo safe",

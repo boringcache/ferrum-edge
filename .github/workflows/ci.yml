@@ -41,9 +41,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate PR CI planner examples
-        run: python3 .github/scripts/pr_ci_plan.py --self-test
-
       - name: Validate ARM64 Cross policy without executing a PR verifier
         run: |
           set -euo pipefail
@@ -73,6 +70,25 @@ jobs:
             --ci-workflow .github/workflows/ci.yml \
             --release-workflow .github/workflows/release.yml \
             --workflows-dir .github/workflows
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+
+      - name: Validate trusted PR CI planner examples
+        run: |
+          set -euo pipefail
+          planner=.github/scripts/pr_ci_plan.py
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base_ref="origin/${BASE_REF}"
+            if ! git cat-file -e "${base_ref}:${planner}" 2>/dev/null; then
+              echo "::error::trusted base branch has no PR CI planner" >&2
+              exit 1
+            fi
+            trusted_planner="$RUNNER_TEMP/pr-ci-plan-self-test.py"
+            git show "${base_ref}:${planner}" > "$trusted_planner"
+            planner="$trusted_planner"
+          fi
+          python3 "$planner" --self-test
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
