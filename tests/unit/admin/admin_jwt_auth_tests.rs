@@ -694,7 +694,8 @@ fn test_jwt_max_ttl_representable_boundary() {
     // valid (if absurd) configuration and still enforces the cap.
     let over = JwtManager::new(config_with_max_ttl(i64::MAX as u64 + 1));
     assert!(
-        over.verify_token(&sign_claims(&claims_at(0, 1800))).is_err(),
+        over.verify_token(&sign_claims(&claims_at(0, 1800)))
+            .is_err(),
         "max_ttl above i64::MAX must be rejected as invalid configuration"
     );
 
