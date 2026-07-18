@@ -127,10 +127,7 @@ async fn request_context_debug_redacts_request_deduplication_state() {
             "local_inflight_owner_token",
             "dedup-debug-local-owner-sentinel-4a57",
         ),
-        (
-            "redis_lock_token",
-            "dedup-debug-redis-lock-sentinel-2d84",
-        ),
+        ("redis_lock_token", "dedup-debug-redis-lock-sentinel-2d84"),
     ];
     request_deduplication_set_request_state_for_test(
         &plugin,
