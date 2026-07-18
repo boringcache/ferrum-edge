@@ -3597,11 +3597,25 @@ impl EnvConfig {
         std::net::SocketAddr::new(ip, port)
     }
 
-    /// Whether the admin HTTPS listener should be started: TLS cert and key
-    /// are configured AND `FERRUM_ADMIN_HTTPS_PORT` is not the disable
-    /// sentinel (`0`). Every serving mode must gate listener creation, TLS
-    /// reload watchers, and startup signals on this predicate — with port 0
-    /// the process must never bind an ephemeral admin HTTPS socket.
+    /// Whether a **binary-owned** admin HTTPS listener should be started: TLS
+    /// cert and key are configured AND `FERRUM_ADMIN_HTTPS_PORT` is not the
+    /// disable sentinel (`0`). Every serving mode must gate creation of a
+    /// listener it binds itself, plus the matching TLS reload watchers and
+    /// startup signals, on this predicate — with port 0 the process must never
+    /// bind an ephemeral admin HTTPS socket.
+    ///
+    /// This predicate is deliberately EnvConfig-only, so it does not describe
+    /// listeners the process did not bind. Embedded file mode
+    /// (`file::serve` with `ServeOptions.admin_https`) keeps a caller-owned,
+    /// already-bound HTTPS socket even under port 0: a pre-bound listener wins
+    /// over the port setting, and suppressing it would close a socket the
+    /// embedder owns. The `ferrum-edge` binary never passes one, so for the
+    /// binary this predicate alone decides the listener.
+    ///
+    /// It is also config-level, and therefore says nothing about
+    /// `secrets::resolve_all_env_secrets()`, which runs before `EnvConfig` is
+    /// parsed: suffixed admin TLS inputs are resolved (and can fail startup)
+    /// regardless of this gate.
     pub fn admin_https_listener_enabled(&self) -> bool {
         self.admin_https_port != 0
             && self.admin_tls_cert_path.is_some()

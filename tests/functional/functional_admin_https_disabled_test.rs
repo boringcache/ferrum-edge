@@ -2,9 +2,11 @@
 //!
 //! The helper truth table (`EnvConfig::admin_https_listener_enabled`) is
 //! covered by unit tests. These tests prove the *mode-level side effect*: with
-//! the disable sentinel set, a serving mode must not load admin TLS material at
-//! all, so cert/key paths that do not exist cannot fail startup and no
-//! ephemeral admin HTTPS socket is bound.
+//! the disable sentinel set, a serving mode must not load the configured admin
+//! TLS material, so `_PATH` cert/key values that do not exist cannot fail
+//! startup and no ephemeral admin HTTPS socket is bound. The scope is
+//! mode-local: external-secret resolution runs before config parsing and is
+//! unaffected by the sentinel, so these tests use plain `_PATH` inputs only.
 //!
 //! CP mode is the probe: it is the cheapest mode to spawn as a real process
 //! (SQLite + loopback gRPC, no peer gateway) and, before the fix, it took the
