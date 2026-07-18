@@ -2390,13 +2390,31 @@ def yaml_command_fields(
             index += 1
             continue
 
+        indent_header = re.match(
+            r"^[|>](?:(?P<leading>[1-9])[+-]?|[+-](?P<trailing>[1-9])?)?",
+            value,
+        )
+        indent_digit = (
+            indent_header.group("leading") or indent_header.group("trailing")
+            if indent_header is not None
+            else None
+        )
+        explicit_indent = (
+            field_indent + int(indent_digit) if indent_digit is not None else None
+        )
         block: list[str] = []
         index += 1
         while index < len(lines):
             line = lines[index]
             if line.strip():
                 indentation = len(line) - len(line.lstrip(" "))
-                if indentation <= mapping_indent:
+                if (
+                    explicit_indent is not None
+                    and indentation < explicit_indent
+                ) or (
+                    explicit_indent is None
+                    and indentation <= mapping_indent
+                ):
                     break
                 block.append(line)
             else:
@@ -2405,7 +2423,10 @@ def yaml_command_fields(
         nonblank_indents = [
             len(line) - len(line.lstrip(" ")) for line in block if line.strip()
         ]
-        block_indent = min(nonblank_indents, default=mapping_indent + 2)
+        block_indent = explicit_indent or min(
+            nonblank_indents,
+            default=mapping_indent + 2,
+        )
         dedented = [line[block_indent:] if line.strip() else "" for line in block]
         literal = "\n".join(dedented)
         rendered = folded_block_text(dedented) if value.startswith(">") else literal
@@ -5492,29 +5513,32 @@ pre_build = []
         f"bash < <(printf 'cross {arm_target}')",
     )
 
-    benign_executor_shell = {
-        "scripts/safe.sh": (
-            "#!/bin/sh\n"
-            "eval 'echo safe'\n"
-            "env FOO='a b' cargo build --locked\n"
-            ">/tmp/safe.log echo safe\n"
-            "printf x | xargs -n 1 echo\n"
-            "find . -exec echo safe ';'\n"
-            "printf 'cargo build --locked' | bash\n"
-            "bash <<< 'cargo test --locked'\n"
-            "bash < <(printf 'cargo check --locked')\n"
-        )
+    benign_executor_lines = {
+        "literal eval": "eval 'echo safe'",
+        "quoted env assignment": "env FOO='a b' cargo build --locked",
+        "leading redirection": ">/tmp/safe.log echo safe",
+        "xargs command": "printf x | xargs -n 1 echo",
+        "find exec command": "find . -exec echo safe ';'",
+        "literal pipeline shell input": "printf 'cargo build --locked' | bash",
+        "literal here-string shell input": "bash <<< 'cargo test --locked'",
+        "literal process-substitution shell input": (
+            "bash < <(printf 'cargo check --locked')"
+        ),
     }
-    if compare_pr_automation_collection(
-        {"ci.yml": referenced_workflow},
-        {"ci.yml": referenced_workflow},
-        {"setup/action.yml": safe_action},
-        {"setup/action.yml": safe_action},
-        safe_automation,
-        benign_executor_shell,
-        "self-test automation directory",
-    ):
-        failures.append("benign shell executor controls were rejected")
+    for benign_label, benign_line in benign_executor_lines.items():
+        benign_errors = compare_pr_automation_collection(
+            {"ci.yml": referenced_workflow},
+            {"ci.yml": referenced_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            safe_automation,
+            {"scripts/safe.sh": f"#!/bin/sh\n{benign_line}\n"},
+            "self-test automation directory",
+        )
+        if benign_errors:
+            failures.append(
+                f"benign {benign_label} was rejected: {'; '.join(benign_errors)}"
+            )
 
     python_automation_escapes(
         "literal subprocess shell input",
