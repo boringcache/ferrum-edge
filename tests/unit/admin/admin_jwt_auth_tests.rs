@@ -610,6 +610,41 @@ fn claims_at(iat_offset: i64, exp_offset: i64) -> AdminClaims {
     }
 }
 
+/// Sign and verify `claims_at(iat_offset, exp_offset)`, retrying until the whole
+/// sign-then-verify cycle stays inside one wall-clock second.
+///
+/// `claims_at()` floors `Utc::now()` to seconds while `verify_token()` reads its
+/// own fresh timestamp. A whole-second tick landing between the two shifts every
+/// verifier-time bound by one second, so an assertion placed exactly one second
+/// outside a bound can legitimately flip. Requiring both samples to land in the
+/// same second pins claim time and verifier time together, which makes the
+/// exact boundary deterministic without widening the offsets under test.
+///
+/// Only exact-boundary assertions need this. Assertions whose outcome is
+/// claim-relative (`exp - iat`), or that a later verifier timestamp can only
+/// push further in the asserted direction, are already drift-safe.
+fn verify_within_one_second(
+    manager: &JwtManager,
+    iat_offset: i64,
+    exp_offset: i64,
+) -> Result<(), String> {
+    // A sign-and-verify cycle is sub-millisecond, so a tick-free sample is
+    // effectively immediate. The bound exists only so a pathological
+    // environment fails loudly instead of spinning forever.
+    for _ in 0..64 {
+        let before = Utc::now().timestamp();
+        let token = sign_claims(&claims_at(iat_offset, exp_offset));
+        let result = manager.verify_token(&token);
+        // Both `claims_at()`'s clock read and the verifier's fall between
+        // `before` and this sample, so an unchanged second forces all three
+        // to be equal.
+        if Utc::now().timestamp() == before {
+            return result.map(|_| ()).map_err(|err| err.to_string());
+        }
+    }
+    panic!("could not sign and verify a token within a single wall-clock second");
+}
+
 #[test]
 fn test_jwt_nominal_max_ttl_boundary_accepted() {
     // exp - iat == max_ttl exactly: the documented nominal maximum.
@@ -651,10 +686,12 @@ fn test_jwt_final_acceptance_window_is_one_skew_allowance() {
     );
 
     // One second more of future shift breaks the single skew allowance on
-    // both the `iat` and remaining-lifetime bounds.
-    let token = sign_claims(&claims_at(61, 61 + 3600));
+    // both the `iat` and remaining-lifetime bounds. This sits exactly one
+    // second outside those bounds, so claim time and verifier time must be
+    // pinned to the same second; the accepted case above needs no pinning
+    // because a later verifier timestamp only relaxes bounds (2) and (3).
     assert!(
-        manager.verify_token(&token).is_err(),
+        verify_within_one_second(&manager, 61, 61 + 3600).is_err(),
         "Shifting beyond one skew window must not extend real acceptance"
     );
 }
