@@ -998,7 +998,16 @@ pub struct EnvConfig {
     #[allow(dead_code)]
     pub admin_jwt_issuer: String,
     /// Maximum accepted TTL in seconds for externally minted Admin API JWT tokens.
-    /// Tokens with `exp - iat` above this value are rejected. Default: 3600.
+    ///
+    /// Enforced against verifier time, with the 60s clock-skew leeway counted
+    /// exactly once: the nominal lifetime (`exp - iat`) must be positive and
+    /// within this value, `iat` must not be later than `now + leeway`, the
+    /// remaining lifetime (`exp - now`) must be within this value plus that
+    /// leeway, and `exp` must still be in the future at verifier time (no
+    /// additional expiry grace). Effective maximum real validity is therefore
+    /// `max_ttl + 60s`. `0` is an intentional disable sentinel that skips the
+    /// lifetime cap entirely; a value above `i64::MAX` is rejected as invalid
+    /// rather than treated as unlimited. Default: 3600.
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
     #[allow(dead_code)]
     pub admin_jwt_max_ttl: u64,
@@ -4628,6 +4637,20 @@ impl EnvConfig {
         if let Some(ref path) = self.tls_ca_bundle_path {
             crate::config::types::validate_pem_cert_file("FERRUM_TLS_CA_BUNDLE_PATH", path)
                 .map_err(|e| e.to_string())?;
+        }
+
+        // The admin JWT lifetime cap is a security control: `0` is the only
+        // documented way to disable it, so a value that cannot be represented
+        // as a JWT `NumericDate` bound (i64 seconds) is a misconfiguration
+        // and must not silently degrade into an effectively unlimited cap.
+        // `JwtManager::verify_token()` fails closed on the same condition.
+        if i64::try_from(self.admin_jwt_max_ttl).is_err() {
+            return Err(format!(
+                "FERRUM_ADMIN_JWT_MAX_TTL ({}) exceeds the maximum supported value ({}); \
+                 use 0 to disable the lifetime cap",
+                self.admin_jwt_max_ttl,
+                i64::MAX
+            ));
         }
 
         if self.http3_initial_mtu < crate::http3::config::QUIC_INITIAL_MTU_MIN

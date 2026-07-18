@@ -498,6 +498,11 @@ impl Plugin for OtelTracing {
         true
     }
 
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        name.eq_ignore_ascii_case(TRACEPARENT_HEADER)
+            && ctx.metadata.contains_key(TRACEPARENT_HEADER)
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
         let trace_id = match summary.metadata.get("trace_id") {
             Some(id) => id,

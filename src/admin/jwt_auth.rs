@@ -193,12 +193,95 @@ impl JwtManager {
         // Decode and validate
         let token_data = decode::<AdminClaims>(token, &key, &validation)?;
 
-        // Enforce max TTL: reject tokens with excessive or non-positive lifetimes
+        // Enforce max TTL.
+        //
+        // # Contract
+        //
+        // `max_ttl_seconds == 0` is the intentional disable sentinel
+        // (documented for `FERRUM_ADMIN_JWT_MAX_TTL`) and is the ONLY way to
+        // turn the cap off; a value that cannot be represented as a JWT
+        // `NumericDate` (i64 seconds) is a misconfiguration and fails closed.
+        //
+        // When the cap is enabled, `leeway` (jsonwebtoken's
+        // `Validation::leeway`, default 60s — read from the struct so it can
+        // never drift from the leeway applied to `exp`/`nbf`) is the SINGLE
+        // accepted clock-skew allowance, and it is spent on the issuance
+        // side. All four conditions must hold:
+        //   1. `exp - iat` is positive and `<= max_ttl` (nominal lifetime);
+        //   2. `iat <= now + leeway` — not issued in the future beyond skew;
+        //   3. `exp - now <= max_ttl + leeway` — remaining lifetime at
+        //      verifier time, carrying the one skew window so an issuer whose
+        //      clock runs fast is not locked out of minting full-length
+        //      tokens;
+        //   4. `exp > now` — expiry re-evaluated against verifier time with
+        //      NO additional grace. jsonwebtoken keeps accepting a token
+        //      until `exp + leeway`; without this the same skew allowance
+        //      would be counted a second time and real acceptance could reach
+        //      `max_ttl + 2 * leeway`.
+        //
+        // Effective maximum real acceptance is therefore exactly
+        // `max_ttl + leeway`. All arithmetic is saturating, so hostile
+        // `i64::MIN`/`i64::MAX` claims are rejected by (1) rather than
+        // overflowing. Keep `docs/configuration.md`, `ferrum.conf`,
+        // `EnvConfig::admin_jwt_max_ttl`, `docs/admin_api.md`, and the
+        // `openapi.yaml` `bearerAuth` description in sync with this list.
         if self.config.max_ttl_seconds > 0 {
-            let ttl = token_data.claims.exp - token_data.claims.iat;
-            if ttl <= 0 || ttl > self.config.max_ttl_seconds as i64 {
+            let Ok(max_ttl) = i64::try_from(self.config.max_ttl_seconds) else {
+                // Unrepresentable positive value: invalid configuration, not
+                // a disable request. Reject rather than clamping to
+                // `i64::MAX`, which would silently turn a `u64::MAX` typo
+                // into an effectively unlimited bound. Only signature-valid
+                // tokens reach this point, so this warning is not
+                // attacker-floodable; `EnvConfig::validate()` and
+                // `create_jwt_manager_from_env()` reject the same value at
+                // startup. Operators disable the cap with `0`, never with a
+                // huge value.
+                tracing::warn!(
+                    configured_max_ttl = self.config.max_ttl_seconds,
+                    max_supported = i64::MAX,
+                    "FERRUM_ADMIN_JWT_MAX_TTL is not representable; rejecting all admin JWTs"
+                );
                 return Err(jsonwebtoken::errors::Error::from(
                     jsonwebtoken::errors::ErrorKind::InvalidToken,
+                ));
+            };
+            // `leeway` is a u64 seconds count with a 60s default; a value
+            // beyond i64 range saturates to the strictest representable
+            // bound rather than wrapping negative.
+            let leeway = i64::try_from(validation.leeway).unwrap_or(i64::MAX);
+            let now = i64::try_from(jsonwebtoken::get_current_timestamp()).unwrap_or(i64::MAX);
+
+            // (1) Nominal claim lifetime.
+            let ttl = token_data.claims.exp.saturating_sub(token_data.claims.iat);
+            if ttl <= 0 || ttl > max_ttl {
+                return Err(jsonwebtoken::errors::Error::from(
+                    jsonwebtoken::errors::ErrorKind::InvalidToken,
+                ));
+            }
+
+            // (2) Issued-at in the future beyond accepted clock skew.
+            if token_data.claims.iat > now.saturating_add(leeway) {
+                return Err(jsonwebtoken::errors::Error::from(
+                    jsonwebtoken::errors::ErrorKind::InvalidToken,
+                ));
+            }
+
+            // (3) Remaining lifetime exceeds the configured maximum even
+            // though `exp - iat` looked acceptable (future-shifted iat).
+            let remaining = token_data.claims.exp.saturating_sub(now);
+            if remaining > max_ttl.saturating_add(leeway) {
+                return Err(jsonwebtoken::errors::Error::from(
+                    jsonwebtoken::errors::ErrorKind::InvalidToken,
+                ));
+            }
+
+            // (4) Expiry at verifier time with no grace, so the skew
+            // allowance already granted by (2)/(3) is not counted twice.
+            // RFC 7519 §4.1.4: the token must not be accepted on or after
+            // `exp`.
+            if token_data.claims.exp <= now {
+                return Err(jsonwebtoken::errors::Error::from(
+                    jsonwebtoken::errors::ErrorKind::ExpiredSignature,
                 ));
             }
         }
@@ -291,9 +374,31 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
     // matching `aud` claim. Unset ⇒ audience is not validated.
     let audience = resolve_ferrum_var("FERRUM_ADMIN_JWT_AUDIENCE").filter(|s| !s.is_empty());
 
-    let max_ttl = resolve_ferrum_var("FERRUM_ADMIN_JWT_MAX_TTL")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3600);
+    // A present-but-invalid value is a misconfiguration of a security
+    // control, so it fails startup instead of silently falling back to the
+    // default or to an effectively unlimited cap. `0` remains the documented
+    // disable sentinel; values above `i64::MAX` are not representable as a
+    // JWT `NumericDate` bound and are rejected the same way
+    // `EnvConfig::validate()` rejects them.
+    let max_ttl = match resolve_ferrum_var("FERRUM_ADMIN_JWT_MAX_TTL").filter(|s| !s.is_empty()) {
+        Some(raw) => {
+            let parsed: u64 = raw.trim().parse().map_err(|_| {
+                JwtError::VerificationFailed(format!(
+                    "FERRUM_ADMIN_JWT_MAX_TTL must be a non-negative integer number of seconds \
+                     (got '{raw}'); use 0 to disable the lifetime cap"
+                ))
+            })?;
+            if i64::try_from(parsed).is_err() {
+                return Err(JwtError::VerificationFailed(format!(
+                    "FERRUM_ADMIN_JWT_MAX_TTL ({parsed}) exceeds the maximum supported value \
+                     ({}); use 0 to disable the lifetime cap",
+                    i64::MAX
+                )));
+            }
+            parsed
+        }
+        None => 3600,
+    };
 
     let config = JwtConfig {
         secret,

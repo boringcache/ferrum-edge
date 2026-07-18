@@ -4,7 +4,11 @@
 
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    admin_mtls_dns_admission_contention_response, admin_mtls_dns_admission_drop_should_release,
+    admin_batch_persistence_message_for_test, admin_consumer_persistence_response_for_test,
+    admin_database_error_body_for_test, admin_mtls_dns_admission_contention_response,
+    admin_mtls_dns_admission_drop_should_release, admin_proxy_route_conflict_message_for_test,
+    admin_recovery_persistence_message_for_test, admin_throttle_conflict_message_for_test,
+    admin_wrapped_mtls_conflict_message_for_test, admin_wrapped_mtls_conflict_response_for_test,
 };
 use ferrum_edge::admin::{
     AdminState,
@@ -13,10 +17,41 @@ use ferrum_edge::admin::{
 use http_body_util::BodyExt;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
+use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
+
+#[derive(Clone, Default)]
+struct SharedAdminLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl SharedAdminLogWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl Write for SharedAdminLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedAdminLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 #[test]
 fn mtls_dns_admission_lifecycle_only_retains_uncertain_mutations() {
@@ -43,6 +78,150 @@ async fn mtls_dns_admission_contention_is_retryable_and_redacted() {
         r#"{"error":"Namespace mutation is temporarily unavailable; retry later"}"#
     );
     assert!(!body.contains(raw_detail));
+}
+
+#[tokio::test]
+async fn persistence_failures_are_redacted_from_admin_responses_and_logs() {
+    let raw_backend_detail = "postgres://ferrum:s3cr3t-dsn-password@db.internal:5432/ferrum_prod: relation secret_schema.consumers violates constraint secret_constraint using index secret_index";
+    let raw_unique_detail = "E11000 duplicate key error collection: ferrum.consumers index: secret_index dup key: { credentials.keyauth.key: must-not-escape }";
+    let writer = SharedAdminLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(writer.clone())
+        .finish();
+
+    let (
+        batch_message,
+        recovery_message,
+        database_body,
+        generic_consumer_response,
+        unique_batch_message,
+        unique_consumer_response,
+    ) = tracing::subscriber::with_default(subscriber, || {
+        (
+            admin_batch_persistence_message_for_test(raw_backend_detail),
+            admin_recovery_persistence_message_for_test(raw_backend_detail),
+            admin_database_error_body_for_test(raw_backend_detail),
+            admin_consumer_persistence_response_for_test(raw_backend_detail),
+            admin_batch_persistence_message_for_test(raw_unique_detail),
+            admin_consumer_persistence_response_for_test(raw_unique_detail),
+        )
+    });
+
+    assert_eq!(batch_message, "Database unavailable — operation failed");
+    assert_eq!(
+        recovery_message,
+        "failed to clear existing config: Database unavailable — operation failed"
+    );
+    assert_eq!(
+        database_body,
+        json!({"error": "Database unavailable — operation failed"})
+    );
+    assert_eq!(
+        generic_consumer_response.status(),
+        hyper::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let generic_consumer_body = generic_consumer_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(
+        String::from_utf8(generic_consumer_body.to_vec()).unwrap(),
+        r#"{"error":"Database unavailable — operation failed"}"#
+    );
+
+    assert_eq!(
+        unique_batch_message,
+        "Resource identity conflicts with an existing resource in the namespace"
+    );
+    assert_eq!(
+        unique_consumer_response.status(),
+        hyper::StatusCode::CONFLICT
+    );
+    let unique_consumer_body = unique_consumer_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(
+        String::from_utf8(unique_consumer_body.to_vec()).unwrap(),
+        r#"{"error":"Consumer identity or credential conflicts with another Consumer in the namespace"}"#
+    );
+
+    let logs = writer.contents();
+    assert!(logs.contains("external_recovery_regression"));
+    assert!(logs.contains("database_response"));
+    assert!(logs.contains("consumer_persist"));
+    assert!(logs.contains("detail_withheld=true"));
+    let visible = format!(
+        "{batch_message}\n{recovery_message}\n{database_body}\n{unique_batch_message}\n{logs}"
+    );
+    for sentinel in [
+        "s3cr3t-dsn-password",
+        "db.internal:5432",
+        "ferrum_prod",
+        "secret_schema",
+        "secret_constraint",
+        "secret_index",
+        "credentials.keyauth.key",
+        "must-not-escape",
+    ] {
+        assert!(
+            !visible.contains(sentinel),
+            "admin response or log leaked persistence sentinel {sentinel:?}: {visible}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn typed_and_static_persistence_conflicts_survive_wrapping_without_context_leaks() {
+    let raw_backend_detail = "insert into secret_schema.consumers on postgres://ferrum:s3cr3t-dsn-password@db.internal:5432/ferrum_prod using secret_constraint";
+    let mtls_message = admin_wrapped_mtls_conflict_message_for_test(raw_backend_detail);
+    let mtls_response = admin_wrapped_mtls_conflict_response_for_test(raw_backend_detail);
+    let throttle_message = admin_throttle_conflict_message_for_test(raw_backend_detail);
+    let route_message = admin_proxy_route_conflict_message_for_test(raw_backend_detail);
+
+    assert_eq!(
+        mtls_message,
+        "mTLS DNS identity conflict: consumers edge-a and edge-b share mTLS DNS identity svc.internal"
+    );
+    assert_eq!(mtls_response.status(), hyper::StatusCode::CONFLICT);
+    let mtls_body = mtls_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(
+        String::from_utf8(mtls_body.to_vec()).unwrap(),
+        r#"{"error":"mTLS DNS identity conflict: consumers edge-a and edge-b share mTLS DNS identity svc.internal"}"#
+    );
+    assert_eq!(
+        throttle_message,
+        "PluginConfig 'throttle-a' cannot attach to UDP proxy 'edge-a'"
+    );
+    assert_eq!(
+        route_message,
+        ferrum_edge::config::db_backend::PROXY_ROUTE_CONFLICT_ERROR
+    );
+    for message in [mtls_message, throttle_message, route_message] {
+        for sentinel in [
+            "secret_schema",
+            "s3cr3t-dsn-password",
+            "db.internal:5432",
+            "ferrum_prod",
+            "secret_constraint",
+        ] {
+            assert!(
+                !message.contains(sentinel),
+                "typed/static conflict leaked wrapping context {sentinel:?}: {message}"
+            );
+        }
+    }
 }
 
 /// Test configuration for admin API
