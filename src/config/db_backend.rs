@@ -136,6 +136,17 @@ pub(crate) fn validate_api_spec_restore_inputs(
         }
     }
 
+    let mut association_ids = HashSet::with_capacity(bundle.proxy.plugins.len());
+    for association in &bundle.proxy.plugins {
+        if !association_ids.insert(association.plugin_config_id.as_str()) {
+            anyhow::bail!(
+                "API-spec restore proxy '{}' contains duplicate association to plugin '{}'",
+                bundle.proxy.id,
+                association.plugin_config_id
+            );
+        }
+    }
+
     let mut inserted_plugin_ids = HashSet::with_capacity(
         bundle
             .plugins
@@ -163,9 +174,12 @@ pub(crate) fn validate_api_spec_restore_inputs(
             ),
             Some(_) | None => {}
         }
-        if plugin.scope != PluginScope::Proxy
-            || plugin.proxy_id.as_deref() != Some(bundle.proxy.id.as_str())
-        {
+        let is_proxy_scoped_to_bundle = plugin.scope == PluginScope::Proxy
+            && plugin.proxy_id.as_deref() == Some(bundle.proxy.id.as_str());
+        let is_unassociated_compensation_global = compensation_restore
+            && plugin.scope == PluginScope::Global
+            && !association_ids.contains(plugin.id.as_str());
+        if !is_proxy_scoped_to_bundle && !is_unassociated_compensation_global {
             anyhow::bail!(
                 "API-spec restore plugin '{}' is not proxy-scoped to proxy '{}'",
                 plugin.id,
@@ -204,16 +218,6 @@ pub(crate) fn validate_api_spec_restore_inputs(
         }
     }
 
-    let mut association_ids = HashSet::with_capacity(bundle.proxy.plugins.len());
-    for association in &bundle.proxy.plugins {
-        if !association_ids.insert(association.plugin_config_id.as_str()) {
-            anyhow::bail!(
-                "API-spec restore proxy '{}' contains duplicate association to plugin '{}'",
-                bundle.proxy.id,
-                association.plugin_config_id
-            );
-        }
-    }
     Ok(())
 }
 

@@ -2085,12 +2085,15 @@ async fn api_spec_delete_rejects_unrestorable_hand_owned_associations_before_per
                 .is_some(),
             "pre-delete rejection must preserve the API spec"
         );
-        assert!(
-            store
-                .get_proxy("ferrum", &proxy_id)
+        let proxy_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proxies WHERE namespace = ? AND id = ?")
+                .bind("ferrum")
+                .bind(&proxy_id)
+                .fetch_one(&store.pool())
                 .await
-                .unwrap()
-                .is_some(),
+                .expect("inspect preserved invalid proxy row");
+        assert_eq!(
+            proxy_count, 1,
             "pre-delete rejection must preserve the proxy"
         );
     }
