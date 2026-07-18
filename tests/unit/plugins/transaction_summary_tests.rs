@@ -77,6 +77,40 @@ fn test_summary_json_contains_backend_fields() {
     assert!(json.contains(r#""backend_resolved_ip":"10.244.1.42""#));
 }
 
+#[test]
+fn test_summary_exposes_normalized_terminal_grpc_status() {
+    let mut summary = make_full_summary();
+    let http_value = serde_json::to_value(&summary).unwrap();
+    assert!(http_value.get("grpc_status").is_none());
+
+    summary
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    summary
+        .metadata
+        .insert("grpc_status".to_string(), "14".to_string());
+    let value = serde_json::to_value(&summary).unwrap();
+    assert_eq!(value["response_status_code"], 201);
+    assert_eq!(value["grpc_status"], 14);
+
+    summary
+        .metadata
+        .insert("grpc_status".to_string(), "malformed".to_string());
+    let value = serde_json::to_value(&summary).unwrap();
+    assert_eq!(
+        value["grpc_status"],
+        u32::MAX,
+        "malformed status retains the invalid-status sentinel"
+    );
+
+    summary.metadata.remove("grpc_status");
+    let value = serde_json::to_value(&summary).unwrap();
+    assert_eq!(
+        value["grpc_status"], 2,
+        "missing terminal status is UNKNOWN"
+    );
+}
+
 // ── Field value correctness ─────────────────────────────────────────────
 
 #[test]
@@ -563,10 +597,9 @@ fn test_grpc_body_exceeded_emits_real_backend_total() {
 // stashed credentials in `metadata` leaked them verbatim through every
 // logging sink. Redaction now lives in
 // `plugins::utils::metadata_redaction::serialize_redacted_metadata` and is
-// wired onto both `TransactionSummary.metadata` and
-// `StreamTransactionSummary.metadata` via `#[serde(serialize_with = ...)]`,
-// so every logger that calls `serde_json::to_string(summary)` gets the same
-// sanitized output without each call site having to remember to redact.
+// delegated to by both the manual `TransactionSummary` serializer and the
+// `StreamTransactionSummary.metadata` serde adapter, so every logger gets the
+// same sanitized output without each call site having to remember to redact.
 
 #[test]
 fn test_summary_redacts_authorization_metadata_value() {
