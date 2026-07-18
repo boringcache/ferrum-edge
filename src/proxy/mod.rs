@@ -224,6 +224,18 @@ const RETRY_RESPONSE_BUFFERING_METADATA_KEY: &str = "ferrum:retry_response_buffe
 /// buffered-only `transform_response_body` will never actually apply.
 pub(crate) const RANGE_RESPONSE_METADATA_KEY: &str = "ferrum:range_response";
 
+/// Marker recorded in `ctx.metadata` when the ORIGINAL backend response was a
+/// delta representation (`226 IM Used`, or carrying an `IM` field), captured
+/// before any `after_proxy` hook can mutate the response headers.
+///
+/// Kept separate from [`RANGE_RESPONSE_METADATA_KEY`] rather than folded into
+/// it: that marker feeds `compression`'s streaming/`Content-Encoding` decision,
+/// and widening it to delta responses would change compression behavior as a
+/// side effect. The shared representation gate reads both, so a `226` delta is
+/// recognized as a fragment even if an `after_proxy` hook removed `IM` or
+/// rewrote the status before the buffered body phase.
+pub(crate) const ORIGIN_DELTA_RESPONSE_METADATA_KEY: &str = "ferrum:origin_delta_response";
+
 /// Marker recorded in `ctx.metadata` when the ORIGINAL backend response carried
 /// `Cache-Control: no-transform`, captured before any `after_proxy` hook can
 /// mutate response headers. Compression reads this to preserve the backend's
@@ -395,9 +407,17 @@ pub(crate) fn stamp_original_response_metadata(
             encoding.clone(),
         );
     }
+    ctx.metadata.remove(RANGE_RESPONSE_METADATA_KEY);
     if response_status == 206 || response_headers.contains_key("content-range") {
         ctx.metadata
             .insert(RANGE_RESPONSE_METADATA_KEY.to_string(), "true".to_string());
+    }
+    ctx.metadata.remove(ORIGIN_DELTA_RESPONSE_METADATA_KEY);
+    if response_status == 226 || response_headers.contains_key("im") {
+        ctx.metadata.insert(
+            ORIGIN_DELTA_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
     }
     if headers_have_cache_control_directive(response_headers, "no-transform") {
         ctx.metadata.insert(
@@ -14468,9 +14488,32 @@ async fn apply_synthetic_response_body_hooks(
             rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
     }
 
+    // Same shared representation gate as every backend path. The bytes here were
+    // produced by the gateway (plugin short-circuit, mock, semantic-cache hit,
+    // serverless terminate, dedup replay), so there is no upstream snapshot and
+    // no hidden origin coding — the live headers are the only description of
+    // these bytes, and `GatewayGenerated` reads them directly.
+    let grpc_web_response_content_type =
+        crate::plugins::grpc_web::retained_response_content_type(ctx);
+    let admission = admit_buffered_response_body_transforms(
+        plugins,
+        ctx,
+        crate::plugins::response_representation::RepresentationOrigin::GatewayGenerated,
+        response_status,
+        response_headers,
+        response_body,
+        grpc_web_response_content_type,
+        &[],
+    );
+    // Read after the gate: a decoded body installs fresh representation headers.
     let content_type = response_headers.get("content-type").cloned();
     let ct_ref = content_type.as_deref();
-    if crate::plugins::response_body_rewrite_allowed(*response_status) {
+    if matches!(
+        admission,
+        BufferedTransformAdmission::Proceed {
+            rewrite_allowed: true
+        }
+    ) {
         let mut mandatory_replay_transform_failed = None;
         for plugin in plugins.iter() {
             let mandatory_replay_transform = ctx.deduplication_replay_response_finalized
@@ -15319,9 +15362,186 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     StatusCode::OK
 }
 
+/// Client-visible message when a configured response body policy could not be
+/// applied to the representation the backend produced.
+///
+/// Deliberately describes only that inspection failed. The rejection reason is
+/// recorded in transaction metadata for operators; it is not echoed to the
+/// client, so a caller cannot probe which codings or documents evade inspection.
+const REPRESENTATION_UNINSPECTABLE_MESSAGE: &str = "response representation could not be inspected";
+
+/// Transaction-metadata key carrying the low-cardinality reason a protected
+/// buffered response was rejected by the shared representation gate.
+pub(crate) const REPRESENTATION_REJECTED_METADATA_KEY: &str = "ferrum:representation_rejected";
+
+/// Whether the buffered body transform phase may run, after the shared
+/// representation gate has had its say.
+pub(crate) enum BufferedTransformAdmission {
+    /// Run the transform phase. `rewrite_allowed` carries the pre-existing
+    /// status gate, which still applies to responses no configured body policy
+    /// claims: an unprotected `206`/`226` body is a fragment, and a
+    /// presentation transform (compression, gRPC-Web framing) must not rewrite
+    /// it into something the unchanged status no longer describes.
+    Proceed { rewrite_allowed: bool },
+    /// The response was replaced with a fail-closed representation error and the
+    /// transform phase must be skipped.
+    Rejected,
+}
+
+/// Replace a buffered response whose protected representation could not be
+/// inspected, in the flavor the client is speaking.
+///
+/// gRPC and gRPC-Web get a trailers-only `INTERNAL` error (a plugin rejection on
+/// `application/grpc` must never be a bare HTTP status); everything else gets a
+/// `502` JSON body through the same rebuild path plugin rejections use.
+fn replace_buffered_response_with_representation_error(
+    ctx: &mut RequestContext,
+    grpc_web_response_content_type: Option<&str>,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+    rejection: crate::plugins::response_representation::RepresentationRejection,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) {
+    warn!(
+        reason = rejection.reason(),
+        "Buffered response rejected: configured response body policy could not be enforced"
+    );
+    ctx.metadata.insert(
+        REPRESENTATION_REJECTED_METADATA_KEY.to_string(),
+        rejection.reason().to_string(),
+    );
+
+    let native_grpc = response_headers
+        .get("content-type")
+        .is_some_and(|value| backend_dispatch::is_native_grpc_content_type(value.as_bytes()));
+
+    if let Some(content_type) = grpc_web_response_content_type {
+        // Same header discipline as every other buffered terminal response:
+        // drop entity/representation headers, keep CORS/Vary decorators.
+        retain_deadline_response_decorators(response_headers);
+        let mut response = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            grpc_proxy::grpc_status::INTERNAL,
+            REPRESENTATION_UNINSPECTABLE_MESSAGE,
+        );
+        response.headers.extend(response_headers.drain());
+        finalize_grpc_web_error_response_headers(
+            &mut response,
+            initial_response_header_policy_plugins,
+            None,
+        );
+        *response_headers = response.headers;
+        *response_body = response.body;
+        *response_status = StatusCode::OK.as_u16();
+        insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            grpc_proxy::grpc_status::INTERNAL,
+            REPRESENTATION_UNINSPECTABLE_MESSAGE,
+        );
+    } else if native_grpc {
+        grpc_proxy::finalize_grpc_error_response_headers(
+            response_headers,
+            grpc_proxy::grpc_status::INTERNAL,
+            REPRESENTATION_UNINSPECTABLE_MESSAGE,
+            initial_response_header_policy_plugins,
+        );
+        response_body.clear();
+        *response_status = StatusCode::OK.as_u16();
+        insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            grpc_proxy::grpc_status::INTERNAL,
+            REPRESENTATION_UNINSPECTABLE_MESSAGE,
+        );
+    } else {
+        *response_body = rebuild_plugin_rejection_response_headers(
+            response_status,
+            response_headers,
+            RejectedResponseParts {
+                status_code: 502,
+                body: format!(r#"{{"error":"{REPRESENTATION_UNINSPECTABLE_MESSAGE}"}}"#)
+                    .into_bytes(),
+                headers: HashMap::new(),
+            },
+        );
+    }
+}
+
+/// Apply the shared representation gate to one buffered response, immediately
+/// before its body transform phase.
+///
+/// This is the single decision point every buffered publication path funnels
+/// through — H1/H2, buffered gRPC, native H3, both H3 cross-protocol bridges,
+/// and the synthetic/replay short-circuit — so the same bytes under the same
+/// configuration cannot be treated differently by frontend protocol. On
+/// `Enforce` with decoded bytes it installs the identity-coded body first, so
+/// every transform in the phase sees exactly the representation the gate proved
+/// inspectable.
+pub(crate) fn admit_buffered_response_body_transforms(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    origin: crate::plugins::response_representation::RepresentationOrigin,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+    grpc_web_response_content_type: Option<&str>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> BufferedTransformAdmission {
+    use crate::plugins::response_representation::{
+        ResponseBodyPolicyPosture, evaluate_response_body_policy_posture,
+        install_decoded_response_body,
+    };
+
+    match evaluate_response_body_policy_posture(
+        plugins,
+        ctx,
+        origin,
+        *response_status,
+        response_headers,
+        response_body,
+    ) {
+        ResponseBodyPolicyPosture::Unprotected => BufferedTransformAdmission::Proceed {
+            rewrite_allowed: crate::plugins::response_body_rewrite_allowed(*response_status),
+        },
+        ResponseBodyPolicyPosture::Enforce { decoded } => {
+            if let Some(decoded) = decoded {
+                install_decoded_response_body(ctx, response_headers, response_body, decoded);
+            }
+            // A claimed response is never a fragment here: the gate rejects
+            // partial and delta representations rather than admitting them, so
+            // there is no status to relabel and no truncated resource to cache.
+            BufferedTransformAdmission::Proceed {
+                rewrite_allowed: true,
+            }
+        }
+        ResponseBodyPolicyPosture::Reject(rejection) => {
+            replace_buffered_response_with_representation_error(
+                ctx,
+                grpc_web_response_content_type,
+                response_status,
+                response_headers,
+                response_body,
+                rejection,
+                initial_response_header_policy_plugins,
+            );
+            BufferedTransformAdmission::Rejected
+        }
+    }
+}
+
 /// Run buffered response transforms under the request's absolute gRPC
 /// deadline. A transform that exhausts the deadline selects the same
 /// flavor-aware terminal response as every other buffered response phase.
+///
+/// The shared representation gate runs first
+/// ([`admit_buffered_response_body_transforms`]). Every caller of this helper is
+/// publishing a real backend response, so the pre-`after_proxy` snapshot is
+/// authoritative for its encoding and range/delta state.
+///
+/// Returns `(response_replaced, body_transformed)`. `response_replaced` is true
+/// when this phase substituted a terminal response — a deadline replacement or a
+/// representation rejection — so callers drop backend trailers and treat the
+/// gateway-authored terminal metadata as authoritative in both cases.
 pub(crate) async fn transform_buffered_response_body_with_deadline(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -15331,6 +15551,23 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     grpc_web_response_content_type: Option<&str>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> (bool, bool) {
+    let rewrite_allowed = match admit_buffered_response_body_transforms(
+        plugins,
+        ctx,
+        crate::plugins::response_representation::RepresentationOrigin::Backend,
+        response_status,
+        response_headers,
+        response_body,
+        grpc_web_response_content_type,
+        initial_response_header_policy_plugins,
+    ) {
+        BufferedTransformAdmission::Proceed { rewrite_allowed } => rewrite_allowed,
+        BufferedTransformAdmission::Rejected => return (true, false),
+    };
+    if !rewrite_allowed {
+        return (false, false);
+    }
+    // Read after the gate: a decoded body installs fresh representation headers.
     let content_type = response_headers.get("content-type").cloned();
     let content_type = content_type.as_deref();
     let mut body_transformed = false;
@@ -15367,9 +15604,6 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                 ctx,
                 response_headers,
             );
-            if matches!(*response_status, 206 | 226) {
-                *response_status = 200;
-            }
             body_transformed = true;
         }
     }
@@ -23071,9 +23305,11 @@ async fn handle_proxy_request_inner(
     // Provider/protocol normalizers run before response-body guardrails. This is
     // a distinct lifecycle phase from ordinary presentation transforms, which
     // intentionally remain after on_response_body.
+    // The fragment gate lives inside `normalize_response_body_for_inspection`
+    // itself, so every protocol path reaches it identically; duplicating it here
+    // would let one path drift from the others.
     if !after_proxy_rejected
         && !plugins.is_empty()
-        && crate::plugins::response_body_rewrite_allowed(response_status)
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();

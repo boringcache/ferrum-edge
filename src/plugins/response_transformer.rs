@@ -521,6 +521,29 @@ impl Plugin for ResponseTransformer {
             && !super::utils::sse::is_sse_request(ctx)
     }
 
+    fn enforces_response_body_policy(
+        &self,
+        ctx: &RequestContext,
+        response_content_type: Option<&str>,
+    ) -> bool {
+        // Claim exactly the responses `transform_response_body` would actually
+        // rewrite, so the shared representation gate fails closed on those and
+        // leaves every other response alone. The three declines below are the
+        // plugin's own documented no-ops, not inspection failures:
+        //   * no configured `body_rules` — there is no body policy at all;
+        //   * the RTDS kill-switch disabled this scope, mirroring the early
+        //     `return None` in `transform_response_body`;
+        //   * SSE, which `should_buffer_response_body` keeps out of the buffered
+        //     path entirely, so no transform ever runs over it.
+        // A non-JSON `Content-Type` is likewise a documented decline (the
+        // configured rules address JSON fields), so those responses are not
+        // claimed and are forwarded as before.
+        !self.body_rules.is_empty()
+            && self.rules_enabled()
+            && !super::utils::sse::is_sse_request(ctx)
+            && response_content_type.is_none_or(body_transform::is_json_content_type)
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,

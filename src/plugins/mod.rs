@@ -84,6 +84,7 @@ pub mod request_termination;
 pub mod request_transformer;
 pub mod response_caching;
 pub mod response_mock;
+pub(crate) mod response_representation;
 pub mod response_size_limiting;
 pub mod response_transformer;
 pub mod security_headers;
@@ -297,10 +298,26 @@ fn is_transform_invalidated_response_header(name: &str) -> bool {
 /// representation. A `226 IM Used` body is a delta whose interpretation
 /// depends on `IM` and `Delta-Base`. Rewriting either body while removing its
 /// representation metadata would leave the unchanged status incoherent. Keep
-/// both response forms untouched. Inspection hooks still run; enforcing
-/// plugins whose findings require a rewrite must reject instead of reporting a
-/// redaction that cannot be applied. All protocol paths and the
-/// provider/protocol normalization phase consult this shared gate.
+/// both response forms untouched.
+///
+/// # Layering
+///
+/// This is the *presentation* rule, and it is the second half of one decision,
+/// not a competing one. The shared representation gate
+/// ([`response_representation`]) runs first on every buffered path and answers
+/// the security question — whether a configured body policy claims these bytes:
+///
+/// * A claimed fragment never reaches this predicate. The gate rejects it
+///   ([`response_representation::RepresentationRejection::PartialRepresentation`]),
+///   because the gateway cannot reconstruct the complete resource and must not
+///   present a rewritten slice as one.
+/// * An unclaimed fragment reaches this predicate, which keeps it untouched so
+///   presentation transforms (compression, gRPC-Web framing) cannot rewrite a
+///   body the unchanged status no longer describes.
+///
+/// So a `206` is never both silently forwarded past a configured redaction and
+/// never relabeled as a complete `200`. Plugins additionally consult this
+/// predicate for their own behavior on fragments; that use is unchanged.
 pub(crate) fn response_body_rewrite_allowed(response_status: u16) -> bool {
     !matches!(response_status, 206 | 226)
 }
@@ -4967,6 +4984,34 @@ pub trait Plugin: Send + Sync {
     ) -> Option<Vec<u8>> {
         self.transform_response_body(body, content_type, response_headers)
             .await
+    }
+
+    /// Whether this plugin has a configured body policy that claims authority
+    /// over this response's bytes.
+    ///
+    /// Returning `true` is a security claim, not a capability advertisement: it
+    /// asserts that the operator configured this plugin to rewrite or redact
+    /// bodies like this one, so the gateway must not serve the response unless
+    /// the policy was genuinely applied. The shared representation gate
+    /// (`response_representation`) uses this to decide whether an encoded,
+    /// partial, or non-parseable representation is an ordinary pass-through or a
+    /// fail-closed rejection — see
+    /// [`crate::plugins::response_representation::evaluate_response_body_policy_posture`].
+    ///
+    /// Return `false` whenever the configured policy would decline this response
+    /// anyway (no rules configured, a runtime kill-switch disabled the scope, or
+    /// the media type is outside the policy's document model). Claiming a
+    /// response the policy would not have touched converts benign traffic into
+    /// errors; failing to claim one it would have touched reopens the bypass.
+    ///
+    /// `response_content_type` is the live `Content-Type`, matching what
+    /// [`Plugin::transform_response_body_with_context`] will receive.
+    fn enforces_response_body_policy(
+        &self,
+        _ctx: &RequestContext,
+        _response_content_type: Option<&str>,
+    ) -> bool {
+        false
     }
 
     /// Whether this plugin's response inspection just determined that its

@@ -2769,7 +2769,28 @@ where
                     }
                 }
 
-                if crate::plugins::response_body_rewrite_allowed(response_status) {
+                // Shared representation gate — identical to H1/H2 and native H3.
+                // An H3 client bridged to an H1/H2 backend must not receive a
+                // protected representation this gateway could not inspect just
+                // because the frontend protocol differs.
+                let grpc_web_response_content_type =
+                    crate::plugins::grpc_web::retained_response_content_type(ctx);
+                let admission = crate::proxy::admit_buffered_response_body_transforms(
+                    plugins,
+                    ctx,
+                    crate::plugins::response_representation::RepresentationOrigin::Backend,
+                    &mut response_status,
+                    &mut response_headers,
+                    &mut response_body,
+                    grpc_web_response_content_type,
+                    &[],
+                );
+                if matches!(
+                    admission,
+                    crate::proxy::BufferedTransformAdmission::Proceed {
+                        rewrite_allowed: true
+                    }
+                ) {
                     for plugin in plugins {
                         if let Some(transformed) = plugin
                             .transform_response_body_with_context(
@@ -4368,6 +4389,17 @@ where
             .then(|| {
                 crate::proxy::grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&resp.headers)
             });
+            // Capture original response invariants before `after_proxy` rewrites
+            // the header view below, exactly as `dispatch_plain` and the native
+            // H3 path do. `resp.headers` is the untouched backend initial header
+            // map, so the shared representation gate can prove this response's
+            // original content coding and range/delta state instead of reading a
+            // header map a hook may already have rewritten.
+            crate::http3::server::stamp_h3_original_response_metadata(
+                ctx,
+                resp.status,
+                &resp.headers,
+            );
             ctx.begin_buffered_initial_response_header_policy(
                 initial_response_header_policy_names,
                 &resp.headers,
@@ -4540,7 +4572,36 @@ where
             // while the wire trailers stay separate for the split H3 wire shape.
             // content-length updates land on the view and flow into the wire
             // headers after reconciliation below.
-            if crate::plugins::response_body_rewrite_allowed(response_status) {
+            //
+            // The shared representation gate runs first, on the same merged view
+            // the transforms see. A rejection here replaces the response, so the
+            // backend trailers no longer describe the bytes being sent and are
+            // dropped — the same rule the deadline replacement below follows.
+            let grpc_web_response_content_type =
+                crate::plugins::grpc_web::retained_response_content_type(ctx);
+            let admission = crate::proxy::admit_buffered_response_body_transforms(
+                plugins,
+                ctx,
+                crate::plugins::response_representation::RepresentationOrigin::Backend,
+                &mut response_status,
+                &mut plugin_response_headers,
+                &mut response_body,
+                grpc_web_response_content_type,
+                initial_response_header_policy_plugins,
+            );
+            if matches!(
+                admission,
+                crate::proxy::BufferedTransformAdmission::Rejected
+            ) {
+                response_trailers.clear();
+                buffered_initial_response_header_policy_state = None;
+            }
+            if matches!(
+                admission,
+                crate::proxy::BufferedTransformAdmission::Proceed {
+                    rewrite_allowed: true
+                }
+            ) {
                 for plugin in plugins.iter() {
                     let transformed = match crate::plugins::await_grpc_deadline(
                         ctx.grpc_deadline_at(),
