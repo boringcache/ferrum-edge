@@ -163,13 +163,19 @@ jobs:
               mkdir -p "$(dirname "$output")"
               git show "${commit}:${path}" > "$output"
             done < <(
-              # The trailing root manifests are build dispatchers: a workflow
-              # step running `make`/`npm run` executes their recipes, so they
-              # are compared exactly like the approved script roots.
+              # The trailing manifests are build dispatchers: a workflow step
+              # running `make`/`npm run` executes their recipes. Include every
+              # nested package.json because npm workspace selection bypasses
+              # the root manifest.
               git ls-tree -rz --name-only "$commit" -- \
                 .github/scripts comparison scripts tests/k8s tests/performance \
                 Makefile makefile GNUmakefile package.json \
                 justfile Justfile .justfile Taskfile.yml Taskfile.yaml
+              git ls-tree -rz --name-only "$commit" | while IFS= read -r -d '' path; do
+                if [[ "$path" == */package.json ]]; then
+                  printf '%s\0' "$path"
+                fi
+              done
             )
           }
 

@@ -94,7 +94,7 @@ jobs:
               > "$trusted_live_filter"
             planner="$trusted_planner"
           fi
-          python3 "$planner" --self-test
+          python3 -I "$planner" --self-test
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
@@ -135,7 +135,7 @@ jobs:
             fi
           fi
 
-          plan="$(python3 "$planner" \
+          plan="$(python3 -I "$planner" \
             --event-name "$EVENT_NAME" \
             --changed-files "$changed_files")"
           mode="$(printf '%s\n' "$plan" | sed -n 's/^mode=//p')"
