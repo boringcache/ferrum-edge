@@ -298,6 +298,47 @@ async fn functional_cli_validate_with_settings() {
 
 // ── validate: external secret suffixes ──────────────────────────────────────
 
+/// The only non-Ferrum variables carried into a hermetic validate subprocess.
+///
+/// Everything else is dropped by `env_clear()`, so the child cannot inherit any
+/// `FERRUM_*` variable — including provider suffixes — from the invoking shell
+/// or CI runner. None of these can influence secret resolution or settings
+/// parsing.
+const HERMETIC_ENV_PASSTHROUGH: &[&str] = &[
+    // Process/loader basics.
+    "PATH",
+    "HOME",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    // Temp-dir resolution.
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    // Windows loader / profile resolution.
+    "SystemRoot",
+    "USERPROFILE",
+    // Keep child counters attributable when the suite runs under
+    // `cargo llvm-cov`; the value carries `%p` so processes cannot collide.
+    "LLVM_PROFILE_FILE",
+    // Diagnostics only; cannot influence secret resolution.
+    "RUST_BACKTRACE",
+];
+
+/// Replace `cmd`'s environment with a closed-world hermetic one for a
+/// database-mode `validate`.
+///
+/// The environment is built by `env_clear()` plus an allow-list rather than by
+/// removing a list of known keys: validate resolves the *entire* `FERRUM_*`
+/// environment before settings are parsed, so any inherited
+/// `FERRUM_*_{FILE,VAULT,AWS,AZURE,GCP}` — `FERRUM_DB_URL_FILE`, for instance —
+/// could fail the command on an unrelated fetch, conflict, or
+/// unsupported-suffix error before a test's assertions are ever reached. A
+/// deny-list would need extending for every new variable; clearing cannot
+/// drift. Any variable set on `cmd` before this call is therefore also dropped,
+/// which is what lets a test stage stand-ins for inherited variables and prove
+/// they do not survive.
+///
 /// Database-mode validate requires *both* `FERRUM_DB_TYPE` and `FERRUM_DB_URL`
 /// (`EnvConfig::validate`), so both are supplied explicitly; sqlite in-memory
 /// keeps the check hermetic and reachable without a live database.
@@ -310,29 +351,28 @@ async fn functional_cli_validate_with_settings() {
 /// candidate on machines that have one. The variable is therefore pinned to an
 /// empty settings file inside the temp dir, which suppresses discovery
 /// entirely.
-///
-/// An inherited `FERRUM_ADMIN_JWT_SECRET`, or any inherited suffixed source for
-/// it, would turn the `_FILE` cases into source conflicts, so the base key and
-/// every provider suffix are cleared explicitly; callers that want one set it
-/// back afterwards.
-fn validate_database_mode_command(temp_dir: &TempDir) -> Command {
+fn apply_hermetic_validate_env(cmd: &mut Command, temp_dir: &TempDir) {
     let conf_path = temp_dir.path().join("hermetic-ferrum.conf");
     std::fs::write(&conf_path, "").unwrap();
 
-    let mut cmd = Command::new(binary_abs_path());
-    cmd.args(["validate"])
-        .env("FERRUM_MODE", "database")
+    cmd.env_clear();
+    for key in HERMETIC_ENV_PASSTHROUGH {
+        if let Ok(value) = std::env::var(key) {
+            cmd.env(key, value);
+        }
+    }
+
+    cmd.env("FERRUM_MODE", "database")
         .env("FERRUM_DB_TYPE", "sqlite")
         .env("FERRUM_DB_URL", "sqlite::memory:")
         .env("FERRUM_CONF_PATH", &conf_path)
-        .env_remove("FERRUM_ADMIN_JWT_SECRET")
-        .env_remove("FERRUM_ADMIN_JWT_SECRET_FILE")
-        .env_remove("FERRUM_ADMIN_JWT_SECRET_VAULT")
-        .env_remove("FERRUM_ADMIN_JWT_SECRET_AWS")
-        .env_remove("FERRUM_ADMIN_JWT_SECRET_AZURE")
-        .env_remove("FERRUM_ADMIN_JWT_SECRET_GCP")
-        .env_remove("FERRUM_FILE_CONFIG_PATH")
         .current_dir(temp_dir.path());
+}
+
+fn validate_database_mode_command(temp_dir: &TempDir) -> Command {
+    let mut cmd = Command::new(binary_abs_path());
+    cmd.args(["validate"]);
+    apply_hermetic_validate_env(&mut cmd, temp_dir);
     cmd
 }
 
@@ -373,6 +413,59 @@ async fn functional_cli_validate_resolves_file_secret_suffix() {
             && !stderr.contains("validate-file-secret-with-well-over-32-bytes"),
         "secret values must never be logged: stdout={stdout}, stderr={stderr}"
     );
+}
+
+/// Proves the hermetic helper's closed-world isolation, not just that it is
+/// written that way.
+///
+/// The three variables staged before `apply_hermetic_validate_env()` sit
+/// exactly where an inherited variable from the invoking shell or CI runner
+/// would sit, and each one alone is fatal if it survives: `FERRUM_DB_URL_FILE`
+/// points at a missing file (read failure), `FERRUM_ADMIN_JWT_SECRET_VAULT` is
+/// an unsupported-suffix error in a default build and an unreachable fetch in a
+/// `cloud-secrets` build, and the bare `FERRUM_ADMIN_JWT_SECRET` alongside the
+/// `_FILE` source is a provider conflict. Reaching "Validation passed." is
+/// therefore only possible if all three were cleared.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_isolates_inherited_secret_environment() {
+    let temp_dir = TempDir::new().unwrap();
+    let secret_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&secret_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+
+    let mut cmd = Command::new(binary_abs_path());
+    cmd.args(["validate"])
+        .env(
+            "FERRUM_DB_URL_FILE",
+            temp_dir.path().join("inherited-missing-db-url"),
+        )
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET_VAULT",
+            "secret/data/ferrum/edge#jwt",
+        )
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "inherited-direct-secret-value-well-over-32-bytes",
+        );
+    apply_hermetic_validate_env(&mut cmd, &temp_dir);
+
+    let output = cmd
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET_FILE",
+            secret_path.to_str().unwrap(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "hermetic env must drop inherited FERRUM_* secret sources: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(stdout.contains("Validation passed."));
 }
 
 #[ignore]
