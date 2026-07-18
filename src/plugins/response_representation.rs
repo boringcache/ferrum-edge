@@ -289,15 +289,19 @@ fn decode_one_coding(
 /// `Content-Encoding` lists codings in the order they were applied, so they are
 /// undone in reverse. `identity` tokens are skipped; an empty or whitespace-only
 /// token is malformed rather than absent, and is rejected — a present-but-empty
-/// coding cannot be proven to describe identity-coded bytes.
-fn decode_response_body(encoding: &str, body: &[u8]) -> Result<Vec<u8>, RepresentationRejection> {
+/// coding cannot be proven to describe identity-coded bytes. `None` means the
+/// field reduced to identity-only tokens and no client-visible bytes changed.
+fn decode_response_body(
+    encoding: &str,
+    body: &[u8],
+) -> Result<Option<Vec<u8>>, RepresentationRejection> {
     let codings: Vec<&str> = encoding
         .split(',')
         .map(str::trim)
         .filter(|token| !token.eq_ignore_ascii_case("identity"))
         .collect();
     if codings.is_empty() {
-        return Ok(body.to_vec());
+        return Ok(None);
     }
     if codings.len() > MAX_STACKED_RESPONSE_CODINGS {
         return Err(RepresentationRejection::DecodedBodyTooLarge);
@@ -311,7 +315,7 @@ fn decode_response_body(encoding: &str, body: &[u8]) -> Result<Vec<u8>, Represen
         let lowered = coding.to_ascii_lowercase();
         current = decode_one_coding(&lowered, &current, MAX_DECODED_RESPONSE_INSPECTION_BYTES)?;
     }
-    Ok(current)
+    Ok(Some(current))
 }
 
 /// Whether the decoded bytes are a complete parseable document that a
@@ -374,7 +378,7 @@ pub(crate) fn evaluate_response_body_policy_posture(
     let decoded = match origin_content_encoding(ctx, origin, response_headers) {
         None => None,
         Some(encoding) => match decode_response_body(encoding, response_body) {
-            Ok(decoded) => Some(decoded),
+            Ok(decoded) => decoded,
             Err(rejection) => return ResponseBodyPolicyPosture::Reject(rejection),
         },
     };

@@ -14583,7 +14583,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
         response_headers,
         response_body,
         grpc_web_response_content_type,
-        &[],
+        InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
         false,
     )
     .await;
@@ -15354,6 +15354,20 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     finalized_reject_headers: Option<&HashMap<String, String>>,
 ) {
+    finalize_grpc_web_error_response_headers_with_policy_source(
+        response,
+        InitialResponseHeaderPolicySource::Prefiltered(
+            initial_response_header_policy_plugins,
+        ),
+        finalized_reject_headers,
+    );
+}
+
+fn finalize_grpc_web_error_response_headers_with_policy_source(
+    response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
+    finalized_reject_headers: Option<&HashMap<String, String>>,
+) {
     let content_type = response.headers.get("content-type").cloned();
     let grpc_web = response.headers.get("x-grpc-web").cloned();
 
@@ -15376,10 +15390,7 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
         // terminal gRPC fields are removed from the initial header block.
         crate::plugins::grpc_web::rebuild_error_body_from_headers(response);
     } else {
-        crate::plugins::apply_initial_response_header_policies(
-            initial_response_header_policy_plugins,
-            &mut response.headers,
-        );
+        initial_response_header_policy_source.apply(&mut response.headers);
     }
 
     let expose_headers = merge_grpc_web_expose_headers(
@@ -15507,6 +15518,40 @@ pub(crate) enum BufferedTransformAdmission {
     Rejected,
 }
 
+/// Where a representation-error path obtains deterministic initial-response
+/// header policy.
+///
+/// Backend publication paths already carry the plugin cache's prefiltered list.
+/// The synthetic short-circuit body phase instead owns the live,
+/// protocol-filtered plugin chain; it filters that chain only after the gate has
+/// selected a terminal representation error, avoiding allocation and leaving
+/// the successful request path untouched.
+#[derive(Clone, Copy)]
+pub(crate) enum InitialResponseHeaderPolicySource<'a> {
+    Prefiltered(&'a [Arc<dyn Plugin>]),
+    ProtocolPlugins(&'a [Arc<dyn Plugin>]),
+}
+
+impl InitialResponseHeaderPolicySource<'_> {
+    fn apply(self, response_headers: &mut HashMap<String, String>) {
+        match self {
+            Self::Prefiltered(policy_plugins) => {
+                crate::plugins::apply_initial_response_header_policies(
+                    policy_plugins,
+                    response_headers,
+                );
+            }
+            Self::ProtocolPlugins(plugins) => {
+                for plugin in plugins {
+                    if plugin.is_initial_response_header_policy() {
+                        plugin.apply_initial_response_header_policy(response_headers);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Provenance of the buffered bytes entering the body transform phase.
 ///
 /// One shared answer so no publication path can drift: the bytes are the
@@ -15556,7 +15601,7 @@ async fn replace_buffered_response_with_representation_error(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Vec<u8>,
     rejection: crate::plugins::response_representation::RepresentationRejection,
-    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
     apply_reject_after_proxy_hooks: bool,
 ) {
     warn!(
@@ -15594,9 +15639,9 @@ async fn replace_buffered_response_with_representation_error(
             REPRESENTATION_UNINSPECTABLE_MESSAGE,
         );
         response.headers.extend(response_headers.drain());
-        finalize_grpc_web_error_response_headers(
+        finalize_grpc_web_error_response_headers_with_policy_source(
             &mut response,
-            initial_response_header_policy_plugins,
+            initial_response_header_policy_source,
             None,
         );
         *response_headers = response.headers;
@@ -15616,11 +15661,12 @@ async fn replace_buffered_response_with_representation_error(
         // metadata would survive onto a gateway-authored error describing bytes
         // that were rejected precisely because they could not be inspected.
         ctx.retain_deadline_response_gateway_headers(response_headers);
+        initial_response_header_policy_source.apply(response_headers);
         grpc_proxy::finalize_grpc_error_response_headers(
             response_headers,
             grpc_proxy::grpc_status::INTERNAL,
             REPRESENTATION_UNINSPECTABLE_MESSAGE,
-            initial_response_header_policy_plugins,
+            &[],
         );
         response_body.clear();
         *response_status = StatusCode::OK.as_u16();
@@ -15678,7 +15724,7 @@ pub(crate) async fn admit_buffered_response_body_transforms(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Vec<u8>,
     grpc_web_response_content_type: Option<&str>,
-    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
     apply_reject_after_proxy_hooks: bool,
 ) -> BufferedTransformAdmission {
     use crate::plugins::response_representation::{
@@ -15720,7 +15766,7 @@ pub(crate) async fn admit_buffered_response_body_transforms(
                 response_headers,
                 response_body,
                 rejection,
-                initial_response_header_policy_plugins,
+                initial_response_header_policy_source,
                 apply_reject_after_proxy_hooks,
             )
             .await;
@@ -15784,7 +15830,9 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         response_headers,
         response_body,
         grpc_web_response_content_type,
-        initial_response_header_policy_plugins,
+        InitialResponseHeaderPolicySource::Prefiltered(
+            initial_response_header_policy_plugins,
+        ),
         true,
     )
     .await

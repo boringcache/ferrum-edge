@@ -2795,7 +2795,9 @@ where
                     &mut response_headers,
                     &mut response_body,
                     grpc_web_response_content_type,
-                    &[],
+                    crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                        initial_response_header_policy_plugins,
+                    ),
                     true,
                 )
                 .await;
@@ -4640,7 +4642,9 @@ where
                 &mut plugin_response_headers,
                 &mut response_body,
                 grpc_web_response_content_type,
-                initial_response_header_policy_plugins,
+                crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                    initial_response_header_policy_plugins,
+                ),
                 true,
             )
             .await;

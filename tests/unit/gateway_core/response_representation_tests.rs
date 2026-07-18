@@ -22,9 +22,11 @@ use ferrum_edge::_test_support::{
     apply_synthetic_response_body_hooks_for_test,
     discard_grpc_application_trailers_after_body_rewrite_for_test,
     finalize_selected_buffered_grpc_terminal_response_for_test,
-    representation_rejection_reason_for_test, run_after_proxy_hooks_for_test,
-    set_grpc_deadline_budget_for_test, set_request_http_flavor_for_test,
+    representation_rejection_reason_for_test, retain_grpc_web_client_content_type_for_test,
+    run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
+    set_original_response_content_encoding_for_test, set_request_http_flavor_for_test,
     stamp_original_response_metadata_for_test,
+    transform_buffered_response_body_with_deadline_and_policy_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::HttpFlavor;
@@ -957,6 +959,55 @@ async fn decoded_body_invalidates_validators_even_when_no_rule_matches() {
     );
 }
 
+/// Defensive regression: if an identity-only coding marker reaches the decoder,
+/// it is still not a byte rewrite. Reporting one would retire validators and
+/// trailers even though the representation did not change.
+#[tokio::test]
+async fn identity_only_codings_are_not_reported_as_representation_rewrites() {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    let mut status = 200;
+    let mut headers = json_headers();
+    headers.insert(
+        "content-encoding".to_string(),
+        "identity, identity".to_string(),
+    );
+    headers.insert("etag".to_string(), "\"identity-v1\"".to_string());
+    let original_body = br#"{"keep":1}"#.to_vec();
+    let mut body = original_body.clone();
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    set_original_response_content_encoding_for_test(&mut ctx, "identity, identity");
+
+    let (replaced, representation_rewritten) =
+        transform_buffered_response_body_with_deadline_full_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+            false,
+        )
+        .await;
+
+    assert!(!replaced);
+    assert!(
+        !representation_rewritten,
+        "identity-only tokens must not report a client-visible byte rewrite"
+    );
+    assert_eq!(body, original_body);
+    assert_eq!(
+        headers.get("etag").map(String::as_str),
+        Some("\"identity-v1\""),
+        "validators remain valid when no bytes changed"
+    );
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("identity, identity"),
+        "an identity-only field must not be stripped as though decoding occurred"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Backend fragment evidence is status-semantic, not header-presence.
 // ---------------------------------------------------------------------------
@@ -1087,6 +1138,101 @@ impl Plugin for ClaimEverythingPolicy {
     ) -> bool {
         true
     }
+}
+
+/// Deterministic initial-response policy standing in for `security_headers`.
+struct InitialHeaderPolicy;
+
+impl Plugin for InitialHeaderPolicy {
+    fn name(&self) -> &str {
+        "test_initial_header_policy"
+    }
+
+    fn is_initial_response_header_policy(&self) -> bool {
+        true
+    }
+
+    fn apply_initial_response_header_policy(
+        &self,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        response_headers.insert(
+            "x-initial-policy".to_string(),
+            "gateway-enforced".to_string(),
+        );
+    }
+}
+
+/// H3 cross-protocol buffered publication carries the prefiltered initial-policy
+/// list into the shared gate. A gRPC-Web representation rejection must therefore
+/// keep operator policy on the synthesized trailers-only error.
+#[tokio::test]
+async fn grpc_web_representation_rejection_applies_prefiltered_initial_policy() {
+    let plugins = redacting_plugins();
+    let initial_policy_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(InitialHeaderPolicy)];
+    let mut ctx = make_ctx();
+    let mut status = 200;
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "zstd".to_string());
+    let mut body = br#"{"secret":"hunter2"}"#.to_vec();
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    let replaced = transform_buffered_response_body_with_deadline_and_policy_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        Some("application/grpc-web+proto"),
+        &initial_policy_plugins,
+    )
+    .await;
+
+    assert!(replaced);
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-initial-policy").map(String::as_str),
+        Some("gateway-enforced")
+    );
+}
+
+/// The synthetic/replay publication phase owns the live protocol plugin chain
+/// rather than the cache's separate policy slice. It must still select and apply
+/// opted-in initial policy when the gate synthesizes a gRPC-Web error.
+#[tokio::test]
+async fn synthetic_grpc_web_representation_rejection_applies_initial_policy() {
+    let mut plugins = redacting_plugins();
+    plugins.push(Arc::new(InitialHeaderPolicy));
+    let mut ctx = make_ctx();
+    retain_grpc_web_client_content_type_for_test(&mut ctx, "application/grpc-web+proto");
+    let mut status = 200;
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "zstd".to_string());
+    let mut body = br#"{"secret":"hunter2"}"#.to_vec();
+
+    apply_synthetic_response_body_hooks_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc-web+proto")
+    );
+    assert_eq!(
+        headers.get("x-initial-policy").map(String::as_str),
+        Some("gateway-enforced")
+    );
+    assert_eq!(
+        representation_rejection_reason_for_test(&ctx),
+        Some("unsupported_content_coding")
+    );
+    assert_secret_not_forwarded(&body);
 }
 
 /// A representation rejection is a gateway-authored terminal response, so it must
