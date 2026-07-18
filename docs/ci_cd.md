@@ -361,18 +361,20 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   approved pre-build commands, and the exact fixed-value passthrough entries.
   Global build settings, extra targets/keys, Dockerfiles, runners, build modes,
   volumes, and unfixed passthroughs are rejected.
-- `Cargo.toml` must not contain `package.metadata.cross` in table, dotted-key,
-  quoted-key, or inline-table form. Unrelated package metadata, dependency, and
-  version edits remain permitted.
+- `Cargo.toml` must not contain `package.metadata.cross` or
+  `workspace.metadata.cross` in table, dotted-key, quoted-key, or inline-table
+  form. Unrelated package/workspace metadata, dependency, and version edits
+  remain permitted.
 - `build-arm64-cross` in `ci.yml` and `build-release-arm64-cross` in
   `release.yml` are isolated from the shared native matrix. Their exact job
-  blocks and inherited top-level `env` mappings are hashed by the trusted
-  verifier, and merge-base comparison rejects any PR-authored mutation while
-  allowing unrelated workflow jobs to evolve. Any new or changed Cross
-  executable/configuration token outside those isolated jobs is also rejected,
-  including quoted or shell/GitHub-interpolated executable spellings and Cross
-  environment aliases. These jobs use only pinned external setup actions before
-  revalidation.
+  blocks, inherited top-level `env` mappings, and workflow trigger blocks are
+  hashed by the trusted verifier, and merge-base comparison rejects any
+  PR-authored mutation while allowing unrelated workflow jobs to evolve. Any
+  new or changed Cross executable/configuration token outside those isolated
+  jobs is also rejected, including quoted or shell/GitHub-interpolated
+  executable spellings and Cross environment aliases; Bash backslash-newline
+  continuations are normalized before scanning. These jobs use only pinned
+  external setup actions before revalidation.
 - The Cross process starts through `env -i` with an explicit minimal host
   environment and fixed compiler variables. This removes `CROSS_CONFIG`, every
   `CROSS_BUILD_*`/`CROSS_TARGET_*` alias, image/Dockerfile/pre-build/runner

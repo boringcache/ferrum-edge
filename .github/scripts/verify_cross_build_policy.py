@@ -43,8 +43,9 @@ EXPECTED_PASSTHROUGH = (
     "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar",
 )
 
-# These hashes cover the isolated jobs that prepare and invoke Cross plus the
-# top-level env mappings inherited by those jobs. The trusted
+# These hashes cover the isolated jobs that prepare and invoke Cross, the
+# top-level env mappings inherited by those jobs, and the workflow triggers
+# that schedule them. The trusted
 # pull_request_target guard compares those blocks at the PR merge base too, so
 # unrelated workflow edits and later base-only changes remain allowed while any
 # PR-authored mutation of an invocation input fails closed.
@@ -54,12 +55,14 @@ WORKFLOW_CONTRACTS = (
         "build-arm64-cross",
         "8ea20fea0ba8358c7e164bf3e2cdd67532b2a617fffe685d2dc5dace7c19a23d",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
+        "d775752cb399db3b0660e26e0d9bdb32d7d72cf4ed47694066ccbf629e87e80f",
     ),
     (
         "release workflow",
         "build-release-arm64-cross",
         "8cb2fed36e8e569eb51d3e3e285ec41b1cd1b6841a79392d6e9cb293df9297e7",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
+        "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
 )
 
@@ -161,21 +164,29 @@ def validate_cargo_configuration(parsed: Any) -> list[str]:
     if not isinstance(parsed, dict):
         return ["Cargo.toml root must be a table"]
 
-    package = parsed.get("package")
-    if not isinstance(package, dict):
+    if not isinstance(parsed.get("package"), dict):
         return ["Cargo.toml package must be a table"]
 
-    metadata = package.get("metadata")
-    if metadata is None:
-        return []
-    if not isinstance(metadata, dict):
-        return ["Cargo.toml package.metadata must be a table"]
-    if "cross" in metadata:
-        return [
-            "Cargo.toml package.metadata.cross is forbidden; all Cross configuration "
-            "must be present in the fully allowlisted Cross.toml"
-        ]
-    return []
+    errors: list[str] = []
+    for owner in ("package", "workspace"):
+        owner_table = parsed.get(owner)
+        if owner_table is None:
+            continue
+        if not isinstance(owner_table, dict):
+            errors.append(f"Cargo.toml {owner} must be a table")
+            continue
+        metadata = owner_table.get("metadata")
+        if metadata is None:
+            continue
+        if not isinstance(metadata, dict):
+            errors.append(f"Cargo.toml {owner}.metadata must be a table")
+            continue
+        if "cross" in metadata:
+            errors.append(
+                f"Cargo.toml {owner}.metadata.cross is forbidden; all Cross "
+                "configuration must be present in the fully allowlisted Cross.toml"
+            )
+    return errors
 
 
 def parse_toml(contents: str, source: str) -> tuple[Any, list[str]]:
@@ -431,6 +442,7 @@ def unprotected_cross_surfaces(
 
     line_jobs: list[str | None] = [None] * len(lines)
     job_digests: dict[str, str] = {}
+    sensitive_jobs: set[str] = set()
     for position, (start, name) in enumerate(job_starts):
         end = job_starts[position + 1][0] if position + 1 < len(job_starts) else jobs_end
         for index in range(start, end):
@@ -438,8 +450,16 @@ def unprotected_cross_surfaces(
         block_contents = "".join(lines[start:end]).rstrip() + "\n"
         job_digests[name] = hashlib.sha256(block_contents.encode("utf-8")).hexdigest()
 
+        logical_contents = re.sub(r"\\\r?\n[ \t]*", "", block_contents)
+        for logical_line in logical_contents.splitlines():
+            for variant in scan_variants(logical_line):
+                if STANDALONE_CROSS.search(variant) or CROSS_ENVIRONMENT.search(variant):
+                    sensitive_jobs.add(name)
+                    break
+            if name in sensitive_jobs:
+                break
+
     top_level_surfaces: list[str] = []
-    sensitive_jobs: set[str] = set()
     for index, line in enumerate(lines):
         line_surfaces: set[str] = set()
         for variant in scan_variants(line):
@@ -470,6 +490,7 @@ def validate_workflow_contract(
     job_name: str,
     expected_sha256: str,
     expected_env_sha256: str,
+    expected_trigger_sha256: str,
 ) -> list[str]:
     block, failures = extract_job_block(contents, source, job_name, required=True)
     if failures:
@@ -493,6 +514,18 @@ def validate_workflow_contract(
                 f"{source} top-level env differs from the trusted ARM64 host "
                 f"environment contract (expected SHA-256 {expected_env_sha256}, "
                 f"got {actual_env})"
+            )
+
+    trigger_block, trigger_failures = extract_top_level_block(contents, source, "on")
+    errors.extend(trigger_failures)
+    if not trigger_failures:
+        assert trigger_block is not None
+        actual_trigger = hashlib.sha256(trigger_block.encode("utf-8")).hexdigest()
+        if actual_trigger != expected_trigger_sha256:
+            errors.append(
+                f"{source} trigger differs from the trusted ARM64 scheduling "
+                f"contract (expected SHA-256 {expected_trigger_sha256}, "
+                f"got {actual_trigger})"
             )
 
     surfaces, surface_failures = unprotected_cross_surfaces(
@@ -550,6 +583,21 @@ def compare_pr_workflow_job(
             errors.append(
                 f"{source} top-level env cannot be changed by a pull request because "
                 "it is inherited by the protected ARM64 invocation"
+            )
+
+    baseline_trigger, baseline_trigger_failures = extract_top_level_block(
+        merge_base_contents, f"merge-base {source}", "on", required=False
+    )
+    proposed_trigger, proposed_trigger_failures = extract_top_level_block(
+        proposed_contents, f"proposed {source}", "on", required=False
+    )
+    errors.extend(baseline_trigger_failures)
+    errors.extend(proposed_trigger_failures)
+    if not baseline_trigger_failures and not proposed_trigger_failures:
+        if baseline_trigger != proposed_trigger:
+            errors.append(
+                f"{source} workflow trigger cannot be changed by a pull request "
+                "because it schedules the protected ARM64 invocation"
             )
 
     baseline_surfaces, baseline_surface_failures = unprotected_cross_surfaces(
@@ -745,6 +793,7 @@ pre_build = []
     benign_cargo, cargo_failures = parse_toml(
         "[package]\nname='example'\nversion='1.0.1'\n"
         "[package.metadata.release]\ntag-prefix='v'\n"
+        "[workspace.metadata.release]\nshared=true\n"
         "[dependencies]\nserde='1'\n",
         "self-test benign Cargo.toml",
     )
@@ -766,6 +815,14 @@ pre_build = []
             "[package]\nname='x'\n[package.metadata.\"cross\"]\n"
             "build-std=true\n"
         ),
+        "workspace cross metadata table": (
+            "[package]\nname='x'\n[workspace.metadata.cross.build]\n"
+            "dockerfile='Dockerfile'\n"
+        ),
+        "workspace cross metadata inline table": (
+            "[package]\nname='x'\n[workspace]\n"
+            "metadata={cross={build={pre-build=['id']}}}\n"
+        ),
     }
     for name, contents in cargo_bypasses.items():
         parsed, parse_failures = parse_toml(contents, f"self-test {name}")
@@ -779,6 +836,10 @@ pre_build = []
         ),
         "duplicate Cargo metadata key": (
             "[package]\nname='x'\nmetadata={cross={}}\nmetadata={}\n"
+        ),
+        "duplicate workspace Cross table": (
+            "[package]\nname='x'\n[workspace.metadata.cross]\n"
+            "[workspace.metadata.cross]\n"
         ),
     }
     for name, contents in malformed_cargo.items():
@@ -798,8 +859,11 @@ pre_build = []
     protected_hash = hashlib.sha256(protected_block.encode()).hexdigest()
     protected_env = "env:\n  FIXED_INPUT: approved\n"
     protected_env_hash = hashlib.sha256(protected_env.encode()).hexdigest()
+    protected_trigger = "on:\n  push:\n    branches: [main]\n"
+    protected_trigger_hash = hashlib.sha256(protected_trigger.encode()).hexdigest()
     workflow = (
         "name: fixture\n\n"
+        f"{protected_trigger}\n"
         f"{protected_env}\n"
         "jobs:\n"
         f"{protected_block}"
@@ -814,6 +878,7 @@ pre_build = []
         "protected-arm",
         protected_hash,
         protected_env_hash,
+        protected_trigger_hash,
     ):
         failures.append("valid protected workflow job was rejected")
 
@@ -824,6 +889,7 @@ pre_build = []
         "protected-arm",
         protected_hash,
         protected_env_hash,
+        protected_trigger_hash,
     ):
         failures.append("unrelated workflow job edit was rejected")
 
@@ -884,6 +950,16 @@ pre_build = []
             "  FIXED_INPUT: approved\n",
             "  FIXED_INPUT: approved\n  LD_PRELOAD: ./attacker.so\n",
         ),
+        "changed workflow trigger": workflow.replace(
+            "branches: [main]", "branches: [attacker]"
+        ),
+        "quoted workflow trigger": workflow.replace("on:\n", "'on':\n", 1),
+        "flow-style workflow trigger": workflow.replace(
+            protected_trigger,
+            "on: { push: { branches: [main] } }\n",
+        ),
+        "duplicate workflow trigger": workflow
+        + "on:\n  push:\n    branches: [attacker]\n",
         "unprotected Cross job": workflow
         + "  unprotected-cross-on-pr:\n"
         "    runs-on: ubuntu-latest\n"
@@ -922,6 +998,10 @@ pre_build = []
             "echo safe",
             "cr$1oss build --target aarch64-unknown-linux-gnu",
         ),
+        "unprotected continued Cross executable": workflow.replace(
+            "echo safe",
+            "|\n          cr\\\n          oss build --target aarch64-unknown-linux-gnu",
+        ),
         "unprotected flow environment alias": workflow.replace(
             "  unrelated:\n",
             "  unrelated:\n    env: { CROSS_CONFIG: attacker.toml }\n",
@@ -934,6 +1014,7 @@ pre_build = []
             "protected-arm",
             protected_hash,
             protected_env_hash,
+            protected_trigger_hash,
         ):
             failures.append(f"{name} was not rejected")
 
@@ -991,6 +1072,14 @@ pre_build = []
         "protected-arm",
     ):
         failures.append("merge-base comparison allowed a protected top-level env edit")
+    changed_trigger = workflow.replace("branches: [main]", "branches: [attacker]")
+    if not compare_pr_workflow_job(
+        workflow,
+        changed_trigger,
+        "current workflow",
+        "protected-arm",
+    ):
+        failures.append("merge-base comparison allowed a protected workflow trigger edit")
     changed_unprotected_cross = benign_workflow.replace(
         "echo unrelated-edit",
         "cross build --target aarch64-unknown-linux-gnu",
@@ -1064,6 +1153,7 @@ def main() -> int:
         job_name,
         expected_hash,
         expected_env_hash,
+        expected_trigger_hash,
     ) in workflow_inputs:
         contents, workflow_failures = load_workflow(workflow_path, label)
         failures.extend(workflow_failures)
@@ -1076,6 +1166,7 @@ def main() -> int:
                     job_name,
                     expected_hash,
                     expected_env_hash,
+                    expected_trigger_hash,
                 )
             )
 
@@ -1106,7 +1197,7 @@ def main() -> int:
         )
         for baseline_path, proposed_path, contract in comparisons:
             assert baseline_path is not None and proposed_path is not None
-            label, job_name, _, _ = contract
+            label, job_name, _, _, _ = contract
             baseline, baseline_failures = load_workflow(baseline_path, label)
             proposed, proposed_failures = load_workflow(proposed_path, label)
             failures.extend(baseline_failures)
