@@ -20,7 +20,7 @@ use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
     PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_admission_unavailable,
-    is_mtls_dns_identity_conflict, mark_mtls_dns_admission_unavailable,
+    is_mtls_dns_identity_conflict, mark_mtls_dns_admission_unavailable, mtls_dns_identity_conflict,
     tcp_connection_throttle_attachment_conflict, validate_api_spec_proxy_plugin_association,
     validate_api_spec_restore_inputs,
 };
@@ -2144,10 +2144,11 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
 pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
     if is_mtls_dns_admission_unavailable(error) {
         MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
-    } else if is_mtls_dns_identity_conflict(error) {
-        // Internally constructed validation message; the mTLS DNS identities
-        // it names are not secrets.
-        error.to_string()
+    } else if let Some(conflict) = mtls_dns_identity_conflict(error) {
+        // Render the typed conflict, not the chain's outermost message: the
+        // identities it names are internally constructed and not secrets, but
+        // any driver context wrapped above it would be.
+        conflict.to_string()
     } else if super::is_unique_constraint_violation(&error.to_string()) {
         "Consumer identity or credential conflicts with another Consumer in the namespace"
             .to_string()

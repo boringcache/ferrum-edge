@@ -39,7 +39,7 @@ use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
     NamespaceResourceCounts, PROXY_ROUTE_CONFLICT_ERROR, SnapshotDataIntegrityError,
     classify_atomic_clear_verification, is_mtls_dns_admission_unavailable,
-    is_mtls_dns_identity_conflict, tcp_connection_throttle_attachment_conflict,
+    mtls_dns_identity_conflict, tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
@@ -3545,8 +3545,10 @@ fn payload_persist_error_message(error: &anyhow::Error) -> String {
     if is_mtls_dns_admission_unavailable(error) {
         return MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string();
     }
-    if is_mtls_dns_identity_conflict(error) {
-        return error.to_string();
+    if let Some(conflict) = mtls_dns_identity_conflict(error) {
+        // Render the typed conflict, not the chain's outermost message, so
+        // driver context wrapped above it can never reach the wire.
+        return conflict.to_string();
     }
     if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
         return conflict.errors().join("; ");
@@ -7405,6 +7407,36 @@ mod tests {
             payload_persist_error_message(&route),
             PROXY_ROUTE_CONFLICT_ERROR
         );
+    }
+
+    #[test]
+    fn persist_error_messages_render_typed_conflict_not_wrapping_driver_context() {
+        // Classification matches the conflict anywhere in the anyhow chain, so
+        // rendering must come from the typed conflict — never from an outer
+        // context a persistence layer may attach.
+        use crate::config::db_backend::MtlsDnsIdentityConflict;
+
+        let conflict = MtlsDnsIdentityConflict::new(vec![
+            "consumers edge-a and edge-b share mTLS DNS identity svc.internal".to_string(),
+        ]);
+        let detail = "insert into gateway.consumers failed on ferrum_prod@db.internal:5432";
+        let wrapped = anyhow::Error::new(conflict).context(detail);
+
+        for message in [
+            payload_persist_error_message(&wrapped),
+            crud::consumer_persist_error_message(&wrapped),
+        ] {
+            assert!(
+                message.starts_with("mTLS DNS identity conflict:"),
+                "expected the typed conflict message, got {message:?}"
+            );
+            for sentinel in ["gateway.consumers", "ferrum_prod", "db.internal:5432"] {
+                assert!(
+                    !message.contains(sentinel),
+                    "response leaked wrapping driver context {sentinel:?}: {message:?}"
+                );
+            }
+        }
     }
 
     #[test]
