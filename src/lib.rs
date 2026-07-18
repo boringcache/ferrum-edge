@@ -190,7 +190,7 @@ pub mod _test_support {
         }
     }
 
-    pub async fn finalize_plugin_rejection_for_test(
+    pub async fn finalize_plugin_rejection_parts_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
         status_code: u16,

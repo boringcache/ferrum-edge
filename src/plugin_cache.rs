@@ -2327,7 +2327,8 @@ pub(crate) fn validate_plugin_security_composition_candidate(
         if let Err(error) = validate_plugin_security_composition(plugins) {
             errors.push(format!("global plugins namespace={namespace:?}: {error}"));
         }
-        if let Err(error) = validate_correlation_id_composition(plugins, http_client.real_ip_header())
+        if let Err(error) =
+            validate_correlation_id_composition(plugins, http_client.real_ip_header())
         {
             errors.push(format!("global plugins namespace={namespace:?}: {error}"));
         }
@@ -3434,9 +3435,10 @@ impl PluginCache {
             if let Err(e) = validate_plugin_security_composition(&global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
-            if let Err(e) =
-                validate_correlation_id_composition(&global_plugins, self.http_client.real_ip_header())
-            {
+            if let Err(e) = validate_correlation_id_composition(
+                &global_plugins,
+                self.http_client.real_ip_header(),
+            ) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
             Arc::new(global_plugins)
@@ -4267,7 +4269,8 @@ impl PluginCache {
             if let Err(e) = validate_plugin_security_composition(&merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) = validate_correlation_id_composition(&merged, http_client.real_ip_header())
+            if let Err(e) =
+                validate_correlation_id_composition(&merged, http_client.real_ip_header())
             {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
@@ -4300,7 +4303,8 @@ impl PluginCache {
         if let Err(e) = validate_plugin_security_composition(&global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
-        if let Err(e) = validate_correlation_id_composition(&global_plugins, http_client.real_ip_header())
+        if let Err(e) =
+            validate_correlation_id_composition(&global_plugins, http_client.real_ip_header())
         {
             plugin_errors.push(format!("global plugins: {e}"));
         }

@@ -4567,10 +4567,8 @@ where
                         }
                     };
                     if let Some(transformed) = transformed {
-                        plugin_response_headers.insert(
-                            "content-length".to_string(),
-                            transformed.len().to_string(),
-                        );
+                        plugin_response_headers
+                            .insert("content-length".to_string(), transformed.len().to_string());
                         response_body = transformed;
                         crate::plugins::finalize_response_body_transformation(
                             plugin.as_ref(),
