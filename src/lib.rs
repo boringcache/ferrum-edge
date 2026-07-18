@@ -1169,6 +1169,67 @@ pub mod _test_support {
         crate::admin::crud::consumer_persist_error_response(&error)
     }
 
+    pub fn admin_consumer_persistence_response_for_test(
+        raw_backend_detail: &str,
+    ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+        let error = anyhow::anyhow!(raw_backend_detail.to_string());
+        crate::admin::crud::consumer_persist_error_response(&error)
+    }
+
+    pub fn admin_batch_persistence_message_for_test(raw_backend_detail: &str) -> String {
+        let error = anyhow::anyhow!(raw_backend_detail.to_string());
+        crate::admin::payload_persist_error_message(&error)
+    }
+
+    pub fn admin_recovery_persistence_message_for_test(raw_backend_detail: &str) -> String {
+        let error = anyhow::anyhow!(raw_backend_detail.to_string());
+        crate::admin::redacted_recovery_error_message(
+            "external_recovery_regression",
+            "failed to clear existing config",
+            &error,
+        )
+    }
+
+    pub fn admin_database_error_body_for_test(raw_backend_detail: &str) -> serde_json::Value {
+        crate::admin::db_error_response(&raw_backend_detail)
+    }
+
+    pub fn admin_wrapped_mtls_conflict_message_for_test(raw_backend_detail: &str) -> String {
+        let conflict = crate::config::db_backend::MtlsDnsIdentityConflict::new(vec![
+            "consumers edge-a and edge-b share mTLS DNS identity svc.internal".to_string(),
+        ]);
+        let error = anyhow::Error::new(conflict).context(raw_backend_detail.to_string());
+        crate::admin::payload_persist_error_message(&error)
+    }
+
+    pub fn admin_wrapped_mtls_conflict_response_for_test(
+        raw_backend_detail: &str,
+    ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+        let conflict = crate::config::db_backend::MtlsDnsIdentityConflict::new(vec![
+            "consumers edge-a and edge-b share mTLS DNS identity svc.internal".to_string(),
+        ]);
+        let error = anyhow::Error::new(conflict).context(raw_backend_detail.to_string());
+        crate::admin::crud::consumer_persist_error_response(&error)
+    }
+
+    pub fn admin_throttle_conflict_message_for_test(raw_backend_detail: &str) -> String {
+        let conflict =
+            crate::config::db_backend::TcpConnectionThrottleAttachmentConflict::new(vec![
+                "PluginConfig 'throttle-a' cannot attach to UDP proxy 'edge-a'".to_string(),
+            ]);
+        let error = anyhow::Error::new(conflict).context(raw_backend_detail.to_string());
+        crate::admin::payload_persist_error_message(&error)
+    }
+
+    pub fn admin_proxy_route_conflict_message_for_test(raw_backend_detail: &str) -> String {
+        let error = anyhow::anyhow!(
+            "{}: {}",
+            crate::config::db_backend::PROXY_ROUTE_CONFLICT_ERROR,
+            raw_backend_detail
+        );
+        crate::admin::payload_persist_error_message(&error)
+    }
+
     pub fn mysql_mtls_dns_admission_lock_insert_sql() -> &'static str {
         crate::config::db_loader::MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL
     }
@@ -1234,6 +1295,9 @@ pub mod _test_support {
         body: &[u8],
         headers: &HashMap<String, String>,
     ) -> bool {
+        // No provenance seeding here: the production delegate seeds it, so this
+        // shim stays a pure pass-through and tests observe the real behavior of
+        // direct H3 reject callers rather than a test-only head start.
         crate::http3::server::run_h3_reject_response_committed_hooks(
             plugins,
             ctx,
@@ -1302,6 +1366,29 @@ pub mod _test_support {
         }
     }
 
+    /// The production buffered-H3 sticky-affinity injector: writes the cookie
+    /// and, on injection, records `set-cookie` as gRPC-deadline gateway-owned.
+    /// This is the exact function the buffered H3 call sites invoke, so a test
+    /// through it covers the inject-then-record ordering itself rather than
+    /// re-implementing it.
+    pub fn h3_inject_sticky_cookie_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        epoch: &crate::request_epoch::RequestEpoch,
+        proxy: &crate::config::types::Proxy,
+        upstream_target: Option<&crate::config::types::UpstreamTarget>,
+        sticky_cookie_needed: bool,
+        response_headers: &mut HashMap<String, String>,
+    ) -> bool {
+        crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
+            ctx,
+            epoch,
+            proxy,
+            upstream_target,
+            sticky_cookie_needed,
+            response_headers,
+        )
+    }
+
     pub fn h3_buffered_grpc_deadline_replacement_for_test(
         grpc_web_response_content_type: Option<&str>,
     ) -> NormalizedRejectResponse {
@@ -1310,10 +1397,17 @@ pub mod _test_support {
             "POST".to_string(),
             "/test.Service/Call".to_string(),
         );
+        ctx.set_grpc_deadline_budget(Some(1_000));
         let mut headers = HashMap::from([
             ("content-type".to_string(), "application/json".to_string()),
-            ("x-correlation-id".to_string(), "request-123".to_string()),
+            ("tracestate".to_string(), "backend=spoof".to_string()),
+            ("x-backend-secret".to_string(), "secret".to_string()),
+            ("set-cookie".to_string(), "session=secret".to_string()),
+            ("vary".to_string(), "Accept-Encoding, Origin".to_string()),
         ]);
+        ctx.begin_buffered_deadline_response_header_provenance(&headers);
+        headers.insert("x-correlation-id".to_string(), "request-123".to_string());
+        ctx.record_deadline_response_header_mutations(&headers);
         let mut body = b"backend response".to_vec();
         let http_status = crate::http3::server::replace_buffered_h3_response_with_grpc_deadline(
             &mut ctx,
@@ -1336,7 +1430,8 @@ pub mod _test_support {
 
     pub fn buffered_grpc_deadline_replacement_for_test(
         grpc_web_response_content_type: Option<&str>,
-        mut headers: HashMap<String, String>,
+        mut backend_headers: HashMap<String, String>,
+        gateway_headers: HashMap<String, String>,
         mut body: Vec<u8>,
     ) -> NormalizedRejectResponse {
         let mut ctx = crate::plugins::RequestContext::new(
@@ -1344,16 +1439,20 @@ pub mod _test_support {
             "POST".to_string(),
             "/test.Service/Call".to_string(),
         );
+        ctx.set_grpc_deadline_budget(Some(1_000));
+        ctx.begin_buffered_deadline_response_header_provenance(&backend_headers);
+        backend_headers.extend(gateway_headers);
+        ctx.record_deadline_response_header_mutations(&backend_headers);
         let http_status = crate::proxy::replace_buffered_grpc_response_with_deadline(
             &mut ctx,
             grpc_web_response_content_type,
-            &mut headers,
+            &mut backend_headers,
             &mut body,
             &[],
         );
         NormalizedRejectResponse {
             http_status,
-            headers,
+            headers: backend_headers,
             body,
             grpc_status: ctx
                 .metadata
@@ -1381,6 +1480,60 @@ pub mod _test_support {
         .await
     }
 
+    pub async fn run_after_proxy_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
+            .await
+            .is_some()
+    }
+
+    /// Like [`run_after_proxy_hooks_for_test`] but surfaces the terminal
+    /// rejection parts (status, body, headers) when an `after_proxy` hook
+    /// rejects or exhausts the RPC deadline, so tests can assert which gateway
+    /// decorations survive onto the synthesized DEADLINE_EXCEEDED response.
+    pub async fn run_after_proxy_hooks_reject_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
+        crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
+            .await
+            .map(|reject| (reject.status_code, reject.body, reject.headers))
+    }
+
+    /// Declare response-header keys a trusted hook wrote as a WHOLE-VALUE
+    /// REPLACEMENT (a `response_transformer` `update`/`rename` destination, or
+    /// an `add` into a slot a `remove` cleared), mirroring the declaration
+    /// `response_transformer` makes. Lets tests exercise the
+    /// owned-replacement-then-deadline path without a full proxy request.
+    ///
+    /// This is NOT the sticky-affinity cookie path — that is an APPEND and uses
+    /// [`record_deadline_response_header_mutations_for_test`].
+    pub fn record_deadline_owned_response_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        owned_header_names: &[&str],
+        response_headers: &HashMap<String, String>,
+    ) {
+        ctx.record_deadline_owned_response_headers(owned_header_names, response_headers);
+    }
+
+    /// Record a gateway-authored response-header APPEND into deadline
+    /// provenance without claiming ownership, mirroring what proxy core does
+    /// after injecting the sticky-session affinity `Set-Cookie` outside any
+    /// plugin mutation. Lets tests exercise the sticky-cookie-then-deadline
+    /// path without a full proxy request.
+    pub fn record_deadline_response_header_mutations_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) {
+        ctx.record_deadline_response_header_mutations(response_headers);
+    }
+
     pub async fn transform_buffered_response_body_with_deadline_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -1389,7 +1542,7 @@ pub mod _test_support {
         response_body: &mut Vec<u8>,
         grpc_web_response_content_type: Option<&str>,
     ) -> bool {
-        crate::proxy::transform_buffered_response_body_with_deadline(
+        transform_buffered_response_body_with_deadline_and_policy_for_test(
             plugins,
             ctx,
             response_status,
@@ -1397,6 +1550,27 @@ pub mod _test_support {
             response_body,
             grpc_web_response_content_type,
             &[],
+        )
+        .await
+    }
+
+    pub async fn transform_buffered_response_body_with_deadline_and_policy_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut Vec<u8>,
+        grpc_web_response_content_type: Option<&str>,
+        initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    ) -> bool {
+        crate::proxy::transform_buffered_response_body_with_deadline(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            grpc_web_response_content_type,
+            initial_response_header_policy_plugins,
         )
         .await
         .0

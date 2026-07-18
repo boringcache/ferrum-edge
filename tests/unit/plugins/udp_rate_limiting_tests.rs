@@ -18,8 +18,10 @@ fn make_plugin(
 }
 
 fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext<'static> {
+    let client_ip: std::net::IpAddr = client_ip.parse().expect("test client IP parses");
+    let client_addr = std::net::SocketAddr::new(client_ip, 5353);
     UdpDatagramContext {
-        client_ip: Arc::from(client_ip),
+        client_ip: ferrum_edge::proxy::udp_proxy::udp_session_client_ip(client_addr),
         proxy_id: Arc::from("proxy-1"),
         proxy_name: Some(Arc::from("test-proxy")),
         listen_port: 5353,
@@ -71,6 +73,25 @@ fn requires_udp_datagram_hooks() {
 fn tracked_keys_count_starts_at_zero() {
     let plugin = make_plugin(json!({"datagrams_per_second": 100}));
     assert_eq!(plugin.tracked_keys_count(), Some(0));
+}
+
+#[test]
+fn udp_session_admission_canonicalizes_mapped_client_identity() {
+    let mapped: std::net::SocketAddr = "[::ffff:192.0.2.10]:5353".parse().unwrap();
+    assert_eq!(
+        ferrum_edge::proxy::udp_proxy::udp_session_client_ip(mapped).as_ref(),
+        "192.0.2.10"
+    );
+}
+
+#[test]
+fn zero_length_udp_request_retains_bounded_response_budget() {
+    use ferrum_edge::proxy::udp_proxy::udp_amplification_response_budget;
+
+    assert_eq!(udp_amplification_response_budget(0, 1.0), 1);
+    assert_eq!(udp_amplification_response_budget(0, 0.25), 1);
+    assert_eq!(udp_amplification_response_budget(1, 1.0), 1);
+    assert_eq!(udp_amplification_response_budget(4, 1.0), 4);
 }
 
 #[test]
@@ -294,6 +315,24 @@ async fn tracked_keys_count_reflects_active_clients() {
     let ctx1_again = make_ctx("10.0.0.1", 100);
     plugin.on_udp_datagram(&ctx1_again).await;
     assert_eq!(plugin.tracked_keys_count(), Some(2));
+}
+
+#[tokio::test]
+async fn mapped_ipv4_shares_native_client_budget() {
+    let plugin = make_plugin(json!({"datagrams_per_second": 1}));
+
+    let native = make_ctx("192.0.2.10", 100);
+    assert_eq!(
+        plugin.on_udp_datagram(&native).await,
+        UdpDatagramVerdict::Forward
+    );
+
+    let mapped = make_ctx("::ffff:192.0.2.10", 100);
+    assert_eq!(
+        plugin.on_udp_datagram(&mapped).await,
+        UdpDatagramVerdict::Drop
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
 }
 
 // ── Combined Limits ───────────────────────────────────────────────────

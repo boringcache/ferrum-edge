@@ -4593,6 +4593,21 @@ fn spawn_backend_svid_rotation_task(
 }
 
 impl ProxyState {
+    /// Apply a full snapshot on Tokio's blocking pool. DP snapshots cannot
+    /// carry a CP-side node-local MMDB handoff, so their plugin-cache build may
+    /// synchronously hash, verify, and scan the configured database.
+    pub async fn update_config_off_thread(&self, new_config: GatewayConfig) -> ConfigApplyOutcome {
+        let proxy_state = self.clone();
+        match tokio::task::spawn_blocking(move || proxy_state.update_config(new_config)).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let message = format!("configuration update worker failed: {error}");
+                error!("Config reload rejected: {}", message);
+                ConfigApplyOutcome::rejected_one(message)
+            }
+        }
+    }
+
     /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
     ///
     /// If the gateway already has a file-loaded SVID, rebuild the SVID bundle
@@ -7298,6 +7313,7 @@ impl ProxyState {
         new_config: &GatewayConfig,
         staged_config: Arc<GatewayConfig>,
         delta: &crate::config_delta::ConfigDelta,
+        country_mmdb_load_mode: crate::plugin_cache::CountryMmdbLoadMode,
     ) -> Result<StagedIncrementalRequestEpoch, String> {
         let proxy_ids_to_rebuild =
             plugin_rebuild_targets_for_incremental_stage(&current.config, new_config, delta);
@@ -7318,6 +7334,7 @@ impl ProxyState {
             &proxy_ids_to_rebuild,
             &delta.removed_proxy_ids,
             rebuild_globals,
+            country_mmdb_load_mode,
         )?;
         let consumer_inner = if consumer_changed {
             ConsumerIndex::build_inner(&new_config.consumers)
@@ -7601,22 +7618,30 @@ impl ProxyState {
             |current| {
                 let delta = ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
-                    // No proxy / upstream / consumer / plugin delta. The mesh
-                    // block (`config.mesh`) is NOT diffed by `ConfigDelta`
-                    // (it carries no `id`/`updated_at`), and mesh endpoints
-                    // (`mesh.workloads`/`mesh.services`) are resolved at REQUEST
-                    // time from the live request-epoch's `config.mesh` (e.g. the
-                    // inbound HBONE relay destination guard, and the mesh
-                    // service discoverer) — NOT from any materialized
-                    // `Upstream.targets`. So a mesh-only change (a federation
-                    // bundle refresh, or a cross-cluster remote-cluster
-                    // scale-up/down merged in by
-                    // `merge_remote_endpoints_into_mesh`) leaves the delta empty
-                    // yet genuinely changes routable state. Republish the epoch
-                    // with the fresh config so the request path observes the new
-                    // `config.mesh`; the plugin/consumer/LB caches are unaffected
-                    // by a mesh-only change and reused as-is, and the route table
-                    // is reused UNLESS the mesh route inputs changed (see below).
+                    // ConfigDelta does not represent node-local plugin-file
+                    // contents or the mesh block. Claim an accepted MMDB
+                    // validation handoff before deciding this generation is a
+                    // no-op: a same-path file replacement must atomically
+                    // publish fresh geo readers even though every serialized
+                    // config field and timestamp is unchanged.
+                    let country_mmdb_plugin_cache =
+                        self.plugin_cache.build_country_mmdb_reload_inner(
+                            &current.plugin_cache,
+                            &new_config,
+                            matches!(
+                                self.env_config.mode,
+                                crate::config::env_config::OperatingMode::DataPlane
+                            ),
+                        )?;
+                    let mesh_changed = current.config.mesh != new_config.mesh;
+                    if !mesh_changed && country_mmdb_plugin_cache.is_none() {
+                        return Ok(None);
+                    }
+
+                    // Mesh endpoints (`mesh.workloads`/`mesh.services`) are
+                    // resolved at REQUEST time from the request epoch's live
+                    // `config.mesh`, not materialized `Upstream.targets`. A
+                    // mesh-only change therefore also needs an epoch publish.
                     //
                     // Without this, the `Ok(None)` no-delta path below updates
                     // only `ProxyState.config` (the ArcSwap the request path
@@ -7624,39 +7649,45 @@ impl ProxyState {
                     // stale — so a remote scale-up / trust-bundle overlay never
                     // reaches the live proxy until an unrelated proxy/upstream
                     // delta forces a republish (codex F7.2 round-5, finding 3).
-                    if current.config.mesh == new_config.mesh {
-                        return Ok(None);
-                    }
-                    // The mesh block changed. The pre-computed plugin/consumer/LB
-                    // caches are unaffected by a mesh-only change and are reused,
-                    // but the route table snapshot materializes mesh-derived maps
+                    // When the mesh block changed, the route table snapshot
+                    // must also refresh because it materializes mesh-derived maps
                     // (raw-TCP inbound port map from the `#[serde(skip)]`
                     // `mesh.local_inbound_tcp_routes`, VIP egress tables, sibling
-                    // port groups), and the route table is a pure function of
-                    // `config.mesh`, so a mesh change rebuilds it here. Without this,
+                    // port groups). Without this,
                     // a mesh slice update that retargets/adds/removes a local
                     // stream-family port would leave the inbound accept loop relaying
                     // to a stale loopback backend (or falling through to Hyper for a
-                    // newly added port). `mesh_route_table_inputs_changed` is the same
-                    // whole-mesh signal the incremental path ORs into `route_changed`;
-                    // having already established the mesh differs, the rebuild is
-                    // unconditional here.
-                    route_changed.set(true);
+                    // newly added port). An MMDB-only publish reuses that table.
+                    route_changed.set(mesh_changed);
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
-                        route_table: RouterCache::build_route_table_snapshot(&new_config),
-                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        route_table: if mesh_changed {
+                            RouterCache::build_route_table_snapshot(&new_config)
+                        } else {
+                            Arc::clone(&current.route_table)
+                        },
+                        plugin_cache: country_mmdb_plugin_cache
+                            .unwrap_or_else(|| Arc::clone(&current.plugin_cache)),
                         consumer_index: Arc::clone(&current.consumer_index),
                         load_balancer: Arc::clone(&current.load_balancer),
-                        route_changed: true,
+                        route_changed: mesh_changed,
                         lb_changed: false,
                     }));
                 }
+                let country_mmdb_load_mode = if matches!(
+                    self.env_config.mode,
+                    crate::config::env_config::OperatingMode::DataPlane
+                ) {
+                    crate::plugin_cache::CountryMmdbLoadMode::NodeLocalRefresh
+                } else {
+                    crate::plugin_cache::CountryMmdbLoadMode::Standard
+                };
                 let staged = self.stage_incremental_request_epoch(
                     current,
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
+                    country_mmdb_load_mode,
                 )?;
                 route_changed.set(staged.request_epoch.route_changed);
                 proxy_plugin_rebuild_count.set(staged.proxy_plugin_rebuild_count);
@@ -7686,16 +7717,13 @@ impl ProxyState {
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
-        // Mesh-only republish (no proxy/upstream/consumer/plugin delta — only
-        // `config.mesh` changed): the pre-computed caches were reused unchanged,
-        // so there is nothing to prune, warm, reconcile, or restart. The fresh
-        // epoch (and the mirrored `ProxyState.config`) already carry the new
-        // `config.mesh` for the request path. `mirror_request_epoch_wrappers`
-        // published the new config above. Return without running the
-        // delta-keyed maintenance below (it would all be a no-op anyway, and
-        // `applied_delta` is `None` here).
+        // Out-of-band republish (mesh-only and/or accepted MMDB-only reload):
+        // there is no resource delta to drive pruning, DNS warmup, listener
+        // reconciliation, or health-check restarts. The request epoch already
+        // carries the new mesh config and/or geo plugin snapshot, and
+        // `mirror_request_epoch_wrappers` published its wrapper views above.
         let Some(delta) = applied_delta else {
-            debug!("Config update: mesh-only change republished (caches reused)");
+            debug!("Config update: out-of-band mesh/MMDB generation republished");
             return ConfigApplyOutcome::Applied;
         };
         let proxy_plugin_rebuild_count = proxy_plugin_rebuild_count.get();
@@ -8062,6 +8090,35 @@ impl ProxyState {
             return ConfigApplyOutcome::rejected(errors);
         }
 
+        // Incremental database and CP/DP deltas stage plugin caches directly
+        // on this async call path. Expand the prospective rebuild scope using
+        // the same adaptive-concurrency route-definition logic as cache
+        // staging, preload every MMDB that exact scope reconstructs on the
+        // blocking pool, then require the cache stage to claim the handoff
+        // without synchronous file work.
+        let prospective_delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+        let prospective_proxy_rebuilds =
+            prospective_delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
+        if self.plugin_cache.country_mmdb_preload_required(
+            &new_config,
+            &prospective_proxy_rebuilds,
+            prospective_delta.global_plugin_configs_changed,
+        ) {
+            new_config = match crate::config::validation_pipeline::validate_plugin_file_dependencies_off_thread(
+                new_config,
+                crate::config::validation_pipeline::ValidationAction::Warn,
+            )
+            .await
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    let message = format!("incremental plugin file validation failed: {error}");
+                    error!("Incremental config rejected: {}", message);
+                    return ConfigApplyOutcome::rejected_one(message);
+                }
+            };
+        }
+
         let mut applied_delta = None;
         // See `update_config` rustdoc nearby for why this is a `Cell` and not
         // a plain `let mut bool`.
@@ -8071,13 +8128,34 @@ impl ProxyState {
             |current| {
                 let delta = crate::config_delta::ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
-                    return Ok(None);
+                    // A concurrent writer can make the prospective delta above
+                    // disappear after its off-thread MMDB generation was
+                    // accepted. Claim and publish that handoff rather than
+                    // leaving it unowned or retaining stale geo readers.
+                    let Some(plugin_cache) = self.plugin_cache.build_country_mmdb_reload_inner(
+                        &current.plugin_cache,
+                        &new_config,
+                        false,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(StagedRequestEpoch {
+                        config: Arc::clone(&staged_config),
+                        route_table: Arc::clone(&current.route_table),
+                        plugin_cache,
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: false,
+                        lb_changed: false,
+                    }));
                 }
                 let staged = self.stage_incremental_request_epoch(
                     current,
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
+                    crate::plugin_cache::CountryMmdbLoadMode::PreloadedOnly,
                 )?;
                 route_changed.set(staged.request_epoch.route_changed);
                 applied_delta = Some(delta);
@@ -8097,7 +8175,10 @@ impl ProxyState {
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
-        let delta = applied_delta.expect("delta captured when publish_result is Some");
+        let Some(delta) = applied_delta else {
+            debug!("Incremental config: accepted MMDB-only generation republished");
+            return ConfigApplyOutcome::Applied;
+        };
 
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -8737,11 +8818,14 @@ async fn handle_websocket_request_authenticated(
             custom_id.to_string(),
         );
     }
+    if let Some(country) = ctx.backend_geo_country() {
+        push_forwardable_header_override(&mut client_headers, "x-geo-country", country.to_string());
+    }
 
     // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`.
     // The WebSocket handshake gets the same sanitized `proxy_headers` as the
     // HTTP/gRPC dispatch paths. Keep applying the vector helper here because
-    // this function may append identity headers before backend dial.
+    // this function may append gateway assertions before backend dial.
     hbone_proxy::strip_egress_baggage_in_vec(
         &mut client_headers,
         &state.mesh_egress_strip_baggage_keys,
@@ -9890,6 +9974,7 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             | "sec-websocket-extensions"
             | "x-consumer-username"
             | "x-consumer-custom-id"
+            | "x-geo-country"
     )
 }
 
@@ -9902,16 +9987,17 @@ fn push_forwardable_header_override(
     headers.push((name.to_string(), value));
 }
 
-fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, String>) {
+fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, String>) {
     headers.retain(|name, _| {
         !name.eq_ignore_ascii_case("x-consumer-username")
             && !name.eq_ignore_ascii_case("x-consumer-custom-id")
+            && !name.eq_ignore_ascii_case("x-geo-country")
     });
 }
 
-/// Remove plugin-controlled consumer identity headers and restore only the
-/// gateway-authenticated values for backend dispatch.
-pub(crate) fn refresh_backend_consumer_identity_headers(
+/// Remove plugin-controlled gateway assertion headers and restore only the
+/// authenticated principal and private GeoIP lookup result for dispatch.
+pub(crate) fn refresh_backend_gateway_assertion_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
@@ -9919,33 +10005,39 @@ pub(crate) fn refresh_backend_consumer_identity_headers(
     let principal_custom_id = principal_username
         .as_ref()
         .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
-    let source_has_reserved_identity = principal_username.is_none()
+    let geo_country = ctx.backend_geo_country().map(str::to_string);
+    let source_has_reserved_assertion = principal_username.is_none()
+        && geo_country.is_none()
         && headers.keys().any(|name| {
             name.eq_ignore_ascii_case("x-consumer-username")
                 || name.eq_ignore_ascii_case("x-consumer-custom-id")
+                || name.eq_ignore_ascii_case("x-geo-country")
         });
-    if principal_username.is_none() && !source_has_reserved_identity {
+    if principal_username.is_none() && geo_country.is_none() && !source_has_reserved_assertion {
         return;
     }
 
-    sanitize_reserved_consumer_identity_headers(headers);
+    sanitize_reserved_gateway_assertion_headers(headers);
     if let Some(username) = principal_username {
         headers.insert("x-consumer-username".to_string(), username);
         if let Some(custom_id) = principal_custom_id {
             headers.insert("x-consumer-custom-id".to_string(), custom_id);
         }
     }
+    if let Some(country) = geo_country {
+        headers.insert("x-geo-country".to_string(), country);
+    }
 }
 
-fn refresh_effective_backend_consumer_identity_headers(
+fn refresh_effective_backend_gateway_assertion_headers(
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
 ) {
     if let Some(headers) = owned_proxy_headers.as_mut() {
-        refresh_backend_consumer_identity_headers(ctx, headers);
+        refresh_backend_gateway_assertion_headers(ctx, headers);
     } else {
         let mut headers = std::mem::take(&mut ctx.headers);
-        refresh_backend_consumer_identity_headers(ctx, &mut headers);
+        refresh_backend_gateway_assertion_headers(ctx, &mut headers);
         ctx.headers = headers;
     }
 }
@@ -13822,70 +13914,8 @@ pub(crate) async fn log_rejected_request_with_path(
     crate::plugins::log_with_mirror_before_buffered_response(plugins, summary, ctx).await;
 }
 
-/// Keep already-applied response decorators while removing fields that describe
-/// the response representation, transport framing, cache state, or terminal
-/// gRPC outcome being replaced. `Vary: Origin` is retained explicitly because
-/// it is part of the CORS decorator contract rather than backend content
-/// negotiation for the discarded representation.
-fn retain_deadline_response_decorators(response_headers: &mut HashMap<String, String>) {
-    let preserve_origin_vary = response_headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("vary"))
-        .is_some_and(|(_, value)| {
-            value
-                .split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("origin"))
-        });
-    response_headers.retain(|name, _| {
-        ![
-            "accept-ranges",
-            "age",
-            "cache-control",
-            "cdn-cache-control",
-            "connection",
-            "content-encoding",
-            "content-digest",
-            "content-language",
-            "content-length",
-            "content-location",
-            "content-md5",
-            "content-range",
-            "content-type",
-            "digest",
-            "etag",
-            "expires",
-            "grpc-accept-encoding",
-            "grpc-encoding",
-            "grpc-message",
-            "grpc-previous-rpc-attempts",
-            "grpc-retry-pushback-ms",
-            "grpc-status",
-            "grpc-status-details-bin",
-            "keep-alive",
-            "last-modified",
-            "pragma",
-            "proxy-authenticate",
-            "proxy-connection",
-            "proxy-status",
-            "repr-digest",
-            "retry-after",
-            "surrogate-control",
-            "te",
-            "trailer",
-            "transfer-encoding",
-            "upgrade",
-            "vary",
-            "warning",
-        ]
-        .iter()
-        .any(|managed| name.eq_ignore_ascii_case(managed))
-    });
-    if preserve_origin_vary {
-        response_headers.insert("vary".to_string(), "Origin".to_string());
-    }
-}
-
 fn replace_rejection_with_gateway_deadline(
+    ctx: &mut RequestContext,
     status_code: &mut u16,
     response_body: Option<&mut Vec<u8>>,
     response_headers: &mut HashMap<String, String>,
@@ -13894,16 +13924,14 @@ fn replace_rejection_with_gateway_deadline(
     if let Some(body) = response_body {
         body.clear();
     }
-    retain_deadline_response_decorators(response_headers);
-    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
-    response_headers.insert(
-        "grpc-status".to_string(),
-        GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER.to_string(),
+    ctx.retain_deadline_response_gateway_headers(response_headers);
+    grpc_proxy::finalize_grpc_error_response_headers(
+        response_headers,
+        grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+        GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+        &[],
     );
-    response_headers.insert(
-        "grpc-message".to_string(),
-        GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
-    );
+    ctx.sync_deadline_response_terminal_headers(response_headers);
 }
 
 const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -14007,6 +14035,7 @@ fn spawn_detached_rejection_cleanup(
             } = pending_hook.await;
             ctx.mark_gateway_deadline_response_selected();
             replace_rejection_with_gateway_deadline(
+                &mut ctx,
                 &mut status_code,
                 response_body.as_mut(),
                 &mut response_headers,
@@ -14044,6 +14073,7 @@ async fn run_after_proxy_hooks_on_rejection(
     mut response_body: Option<&mut Vec<u8>>,
     response_headers: &mut HashMap<String, String>,
 ) {
+    ctx.begin_rejection_deadline_response_header_provenance(response_headers);
     let previous_replaceable_marker = if response_body.is_some() {
         ctx.metadata.insert(
             REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY.to_string(),
@@ -14065,6 +14095,7 @@ async fn run_after_proxy_hooks_on_rejection(
     if initial_terminal_gateway_deadline {
         ctx.mark_gateway_deadline_response_selected();
         replace_rejection_with_gateway_deadline(
+            ctx,
             status_code,
             response_body.as_deref_mut(),
             response_headers,
@@ -14081,6 +14112,7 @@ async fn run_after_proxy_hooks_on_rejection(
         if terminal_gateway_deadline {
             ctx.mark_gateway_deadline_response_selected();
             replace_rejection_with_gateway_deadline(
+                ctx,
                 status_code,
                 response_body.as_deref_mut(),
                 response_headers,
@@ -14146,6 +14178,7 @@ async fn run_after_proxy_hooks_on_rejection(
                 () = &mut deadline_sleep => {
                     ctx.mark_gateway_deadline_response_selected();
                     replace_rejection_with_gateway_deadline(
+                        ctx,
                         status_code,
                         response_body.as_deref_mut(),
                         response_headers,
@@ -14182,6 +14215,9 @@ async fn run_after_proxy_hooks_on_rejection(
         };
         if terminal_gateway_deadline {
             ctx.mark_gateway_deadline_response_selected();
+        }
+        if matches!(&result, PluginResult::Continue) || !plugin.may_replace_rejection_response() {
+            ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
         }
         match result {
             PluginResult::Continue => {}
@@ -14245,6 +14281,7 @@ async fn run_after_proxy_hooks_on_rejection(
                             })
                             .or_insert_with(|| "Origin".to_string());
                     }
+                    ctx.record_deadline_response_header_mutations(response_headers);
                     if plugin.warn_on_rejection_response_replacement() {
                         warn!(
                             rejecting_plugin = plugin.name(),
@@ -14288,7 +14325,7 @@ async fn run_after_proxy_hooks_on_rejection(
             .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
     {
         ctx.mark_gateway_deadline_response_selected();
-        replace_rejection_with_gateway_deadline(status_code, response_body, response_headers);
+        replace_rejection_with_gateway_deadline(ctx, status_code, response_body, response_headers);
     }
 
     restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
@@ -14702,7 +14739,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             };
             if !terminal_gateway_deadline {
                 ctx.mark_gateway_deadline_response_selected();
-                replace_rejection_with_gateway_deadline(status, Some(body), headers);
+                replace_rejection_with_gateway_deadline(ctx, status, Some(body), headers);
             }
             spawn_detached_response_committed_hooks(
                 pending_hook,
@@ -14728,6 +14765,10 @@ pub(crate) async fn run_after_proxy_hooks(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
 ) -> Option<AfterProxyReject> {
+    // Establish backend provenance before the first trusted response hook can
+    // mutate the map. A later deadline replacement retains only mutations from
+    // hooks that completed, never backend fields selected by header name.
+    ctx.begin_buffered_deadline_response_header_provenance(response_headers);
     // Capture the genuine backend status BEFORE any after_proxy hook can reject
     // and replace the response. If a hook at a lower priority rejects a 2xx
     // backend response (e.g. `response_size_limiting` at 3490 rejecting an
@@ -14800,6 +14841,7 @@ pub(crate) async fn run_after_proxy_hooks(
                     plugin.as_ref(),
                     response_headers,
                 );
+                ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let RejectedResponseParts {
@@ -15194,6 +15236,20 @@ fn merge_grpc_web_expose_headers(
 /// headers before sending. The generated representation fields are also
 /// authoritative: neither a security policy nor reject headers may replace
 /// them or supply a stale content length.
+///
+/// The base gRPC-Web expose list is one of those authoritative generated
+/// fields, so it is seeded from the canonical constant rather than read back
+/// out of `response.headers`. Callers populate this map by EXTENDING the
+/// generated error with other header sources — retained deadline-provenance
+/// gateway output, or a finalized reject chain — and `extend` overwrites on key
+/// collision. Reading the field back therefore did not observe the generated
+/// base list at all once any of those sources carried its own
+/// `access-control-expose-headers`: a partial value (a CORS policy's configured
+/// list, or a provenance-partitioned suffix) replaced it wholesale, and the
+/// browser-facing DEADLINE_EXCEEDED response could omit `grpc-status` /
+/// `grpc-message` — the terminal metadata gRPC-Web carries in the body trailer
+/// frame and JavaScript cannot read without them being exposed. Everything else
+/// present still merges in on top; the merge dedups case-insensitively.
 pub(crate) fn finalize_grpc_web_error_response_headers(
     response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
@@ -15201,10 +15257,6 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
 ) {
     let content_type = response.headers.get("content-type").cloned();
     let grpc_web = response.headers.get("x-grpc-web").cloned();
-    let expose_headers = response
-        .headers
-        .get("access-control-expose-headers")
-        .cloned();
 
     if let Some(finalized_headers) = finalized_reject_headers {
         response.headers.extend(
@@ -15231,8 +15283,10 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
         );
     }
 
-    let expose_headers =
-        merge_grpc_web_expose_headers(expose_headers.as_deref(), &response.headers);
+    let expose_headers = merge_grpc_web_expose_headers(
+        Some(crate::plugins::grpc_web::BASE_EXPOSE_HEADERS_VALUE),
+        &response.headers,
+    );
 
     response.headers.retain(|name, _| {
         ![
@@ -15287,7 +15341,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
     ctx.mark_gateway_deadline_response_selected();
-    retain_deadline_response_decorators(response_headers);
+    ctx.retain_deadline_response_gateway_headers(response_headers);
     if let Some(content_type) = grpc_web_response_content_type {
         let mut response = crate::plugins::grpc_web::error_response_for_content_type(
             content_type,
@@ -15311,6 +15365,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
         );
         response_body.clear();
     }
+    ctx.sync_deadline_response_terminal_headers(response_headers);
     insert_grpc_error_metadata(
         &mut ctx.metadata,
         grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -15331,6 +15386,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     grpc_web_response_content_type: Option<&str>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> (bool, bool) {
+    ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
     let content_type = response_headers.get("content-type").cloned();
     let content_type = content_type.as_deref();
     let mut body_transformed = false;
@@ -15373,6 +15429,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                 );
                 body_transformed = true;
             }
+            ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
         }
     }
     (false, body_transformed)
@@ -18492,18 +18549,21 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
-    // Strip plugin-controlled identity headers and inject only the gateway's
-    // authenticated values. The common no-header/no-principal path avoids
-    // materializing an owned header map.
-    let source_has_reserved_identity = owned_proxy_headers.as_ref().is_some_and(|headers| {
-        headers.keys().any(|name| {
-            name.eq_ignore_ascii_case("x-consumer-username")
-                || name.eq_ignore_ascii_case("x-consumer-custom-id")
-        })
+    // Strip plugin-controlled gateway assertions and inject only the
+    // authenticated principal and private GeoIP result. The common
+    // no-assertion path avoids materializing an owned header map.
+    let effective_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    let source_has_reserved_assertion = effective_headers.keys().any(|name| {
+        name.eq_ignore_ascii_case("x-consumer-username")
+            || name.eq_ignore_ascii_case("x-consumer-custom-id")
+            || name.eq_ignore_ascii_case("x-geo-country")
     });
-    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
+    if ctx.backend_consumer_username().is_some()
+        || ctx.backend_geo_country().is_some()
+        || source_has_reserved_assertion
+    {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        refresh_backend_consumer_identity_headers(&ctx, headers);
+        refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
     // Egress baggage strip — operator-configured key prefixes are removed
     // from the outbound `baggage` header. Default empty list is a no-op.
@@ -18656,9 +18716,9 @@ async fn handle_proxy_request_inner(
         ctx.path = backend_ctx_path;
         if matches!(deferred_result, PluginResult::Continue) {
             // A deferred routing function can return arbitrary headers.
-            // Restore gateway-owned identity and reapply the egress baggage
+            // Restore gateway-owned assertions and reapply the egress baggage
             // policy before those headers can reach any backend transport.
-            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            refresh_effective_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
                 &ctx.headers,
@@ -18706,7 +18766,7 @@ async fn handle_proxy_request_inner(
             ctx.path = backend_ctx_path;
         }
         if matches!(deferred_result, PluginResult::Continue) {
-            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            refresh_effective_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
                 &ctx.headers,
@@ -21384,6 +21444,7 @@ async fn handle_proxy_request_inner(
                         response_status,
                         &mut plugin_response_headers,
                         &mut response_body,
+                        initial_response_header_policy_plugins.as_ref(),
                     )
                     .await;
                     for plugin in plugins.iter() {
@@ -21679,6 +21740,24 @@ async fn handle_proxy_request_inner(
                                 v.push_str(&cookie_val);
                             })
                             .or_insert(cookie_val);
+                        // Record the gateway-authored affinity cookie in deadline
+                        // provenance: it is injected here (not by a plugin
+                        // mutation), so a later response-committed hook that
+                        // exhausts the RPC deadline would otherwise rebuild the
+                        // DEADLINE_EXCEEDED response without it and the client
+                        // would not stay pinned. Line-granular recording keeps
+                        // any co-present backend cookie out of gateway output.
+                        //
+                        // This is an APPEND, so it deliberately does not declare
+                        // ownership: ownership means whole-value replacement and
+                        // retires the backend cookie baseline, which here would
+                        // credit a co-present backend cookie as gateway output.
+                        // The injection always changes the field (`or_insert`
+                        // into an absent slot, or `and_modify` adding a line), so
+                        // mutation tracking sees it unconditionally, and the
+                        // occurrence partition credits the affinity line even
+                        // when it is byte-identical to a backend cookie.
+                        ctx.record_deadline_response_header_mutations(&response_headers);
                     }
                 }
 
@@ -23085,6 +23164,7 @@ async fn handle_proxy_request_inner(
             response_status,
             &mut response_headers,
             data,
+            initial_response_header_policy_plugins.as_ref(),
         )
         .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -23233,6 +23313,13 @@ async fn handle_proxy_request_inner(
                     v.push_str(&cookie_val);
                 })
                 .or_insert(cookie_val);
+            // Record the gateway-authored affinity cookie in deadline provenance
+            // before the committed-hook phase can exhaust the RPC deadline and
+            // rebuild the response from gateway-owned output only. Line-granular
+            // recording keeps any co-present backend cookie out of gateway output.
+            // An APPEND, so it records mutations rather than declaring ownership
+            // (which means whole-value replacement) — see the sibling site above.
+            ctx.record_deadline_response_header_mutations(&response_headers);
         }
     }
 
@@ -35647,7 +35734,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_identity_headers_override_client_supplied_values() {
+    fn websocket_gateway_assertions_override_mutable_values() {
         let mut headers = vec![
             ("x-consumer-username".to_string(), "spoofed".to_string()),
             (
@@ -35658,6 +35745,7 @@ mod tests {
                 "x-consumer-custom-id".to_string(),
                 "spoofed-custom".to_string(),
             ),
+            ("X-Geo-Country".to_string(), "ATTACKER".to_string()),
             ("x-request-id".to_string(), "req-1".to_string()),
         ];
 
@@ -35671,6 +35759,7 @@ mod tests {
             "x-consumer-custom-id",
             "trusted-custom".to_string(),
         );
+        push_forwardable_header_override(&mut headers, "x-geo-country", "SE".to_string());
 
         let usernames: Vec<&str> = headers
             .iter()
@@ -35686,9 +35775,17 @@ mod tests {
                     .then_some(value.as_str())
             })
             .collect();
+        let countries: Vec<&str> = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("x-geo-country")
+                    .then_some(value.as_str())
+            })
+            .collect();
 
         assert_eq!(usernames, vec!["trusted-user"]);
         assert_eq!(custom_ids, vec!["trusted-custom"]);
+        assert_eq!(countries, vec!["SE"]);
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
         }));

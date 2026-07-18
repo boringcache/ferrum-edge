@@ -221,8 +221,10 @@ fn trim_header_ows(value: &[u8]) -> &[u8] {
 /// When trusted proxies are configured and the request contains an
 /// `X-Forwarded-For` header, walks the XFF chain right-to-left, skipping
 /// trusted proxy IPs, and returns the first untrusted IP.
+/// IPv4-mapped IPv6 results are canonicalized to native IPv4 before the value
+/// enters request accounting or plugin execution.
 ///
-/// When no trusted proxies are configured, returns the socket IP unchanged.
+/// When no trusted proxies are configured, returns the canonical socket IP.
 ///
 /// The `socket_addr` variant accepts a pre-parsed `IpAddr` to avoid redundant
 /// parsing on the hot path when the caller already has a parsed IP.
@@ -232,22 +234,23 @@ pub fn resolve_client_ip(
     xff_header: Option<&str>,
     trusted_proxies: &TrustedProxies,
 ) -> String {
-    // Fast path: no trusted proxies configured — always use socket IP
-    if trusted_proxies.is_empty() {
-        return socket_ip.to_string();
-    }
-
     // Parse the socket IP once; if unparseable, return it as-is
     let socket_addr: IpAddr = match socket_ip.parse() {
         Ok(ip) => ip,
         Err(_) => return socket_ip.to_string(),
     };
 
+    // Fast path: no trusted proxies configured — always use socket IP.
+    if trusted_proxies.is_empty() {
+        return socket_addr.to_canonical().to_string();
+    }
+
     resolve_client_ip_parsed(socket_ip, &socket_addr, xff_header, trusted_proxies)
 }
 
 /// Like `resolve_client_ip` but accepts a pre-parsed `IpAddr` so callers on
-/// the hot path avoid parsing the socket IP string twice.
+/// the hot path avoid parsing the socket IP string twice. The returned text is
+/// canonicalized before it becomes the request client identity.
 pub fn resolve_client_ip_parsed(
     socket_ip: &str,
     socket_addr: &IpAddr,
@@ -257,7 +260,7 @@ pub fn resolve_client_ip_parsed(
     // No XFF header — use socket IP
     let xff = match xff_header {
         Some(h) if !h.trim().is_empty() => h,
-        _ => return socket_ip.to_string(),
+        _ => return socket_addr.to_canonical().to_string(),
     };
 
     // If the direct connection is NOT from a trusted proxy, the XFF header
@@ -267,7 +270,7 @@ pub fn resolve_client_ip_parsed(
             socket_ip = socket_ip,
             "Direct connection not from trusted proxy; ignoring X-Forwarded-For"
         );
-        return socket_ip.to_string();
+        return socket_addr.to_canonical().to_string();
     }
 
     // Walk XFF entries right-to-left without collecting into a Vec.
@@ -281,7 +284,7 @@ pub fn resolve_client_ip_parsed(
             Ok(ip) => {
                 if !trusted_proxies.contains(&ip) {
                     // First untrusted IP = real client
-                    return ip.to_string();
+                    return ip.to_canonical().to_string();
                 }
                 // This is a trusted proxy, keep walking left
             }
@@ -301,7 +304,7 @@ pub fn resolve_client_ip_parsed(
     }
 
     // All XFF entries were trusted proxies — fall back to socket IP
-    socket_ip.to_string()
+    socket_addr.to_canonical().to_string()
 }
 
 /// Resolve a configured single-hop real-IP header from a trusted direct proxy.
@@ -335,7 +338,7 @@ pub fn resolve_real_ip_header(
     }
 
     match parse_single_real_ip_value(value) {
-        Ok(ip) => Some(ip.to_string()),
+        Ok(ip) => Some(ip.to_canonical().to_string()),
         Err(_) => {
             debug!(
                 value = value,
