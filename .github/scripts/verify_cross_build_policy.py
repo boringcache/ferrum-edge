@@ -196,23 +196,36 @@ LOCAL_ACTION_CANDIDATE = re.compile(
 )
 LOCAL_COMMAND_REFERENCE = re.compile(
     r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;|\|)\s*|\$\(\s*|"
+    r"(?:<|>)\(\s*|"
     r"\b(?:if|elif|while|until|then|do|else)\s+)"
+    r"(?:!\s*)?"
     r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
     r"(?:\(\s*)?"
+    r"(?:(?:command|exec|nohup|sudo)(?:\s+--?[^\s]+)*\s+)*"
     r"(?:env(?:\s+(?:--?[^\s]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+))*\s+)?"
-    r"(?:(?:bash|sh|python|python3|ruby|node|source|\.)"
+    r"(?:(?:bash|sh|python|python3|ruby|node)"
+    r"(?:\s+--?[^\s]+)*\s*(?:[0-9]+)?<(?![<&])\s*"
+    r"(?P<redirected>(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|"
+    r"\{[A-Za-z_][A-Za-z0-9_]*\})/)?"
+    r"(?:[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+|"
+    r"[A-Za-z0-9._-]+\.(?:sh|py|rb)))|"
+    r"(?:bash|sh|python|python3|ruby|node|source|\.)"
     r"(?:\s+--?[^\s]+)*\s+"
     r"(?P<interpreted>(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|"
     r"\{[A-Za-z_][A-Za-z0-9_]*\})/)?"
-    r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+)|"
+    r"(?:[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+|"
+    r"[A-Za-z0-9._-]+\.(?:sh|py|rb)))|"
     r"(?P<direct>\./[A-Za-z0-9._/-]+)|"
     r"(?P<bare>[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+\.(?:sh|py|rb)))"
 )
 YAML_RUN_FIELD = re.compile(
-    r"^(?P<indent> *)(?:-\s*)?(?:run|'run'|\"run\")\s*:\s*(?P<value>.*)$"
+    r"^(?P<indent> *)(?:-\s*)?"
+    r"(?P<key>run|'run'|\"run\"|shell|'shell'|\"shell\")"
+    r"\s*:\s*(?P<value>.*)$"
 )
-YAML_DYNAMIC_RUN_FIELD = re.compile(
-    r"^\s*(?:-\s*)?(?:run|'run'|\"run\")\s*:\s*[*!&]"
+YAML_DYNAMIC_COMMAND_FIELD = re.compile(
+    r"^\s*(?:-\s*)?"
+    r"(?:run|'run'|\"run\"|shell|'shell'|\"shell\")\s*:\s*[*!&]"
 )
 YAML_DYNAMIC_USES_FIELD = re.compile(
     r"^\s*(?:-\s*)?(?:uses|'uses'|\"uses\")\s*:\s*[*!&]"
@@ -220,6 +233,23 @@ YAML_DYNAMIC_USES_FIELD = re.compile(
 HEREDOC_START = re.compile(
     r"<<-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)"
     r"(?P=quote)"
+)
+BLOCK_SCALAR_HEADER = re.compile(
+    r"^[|>](?:(?:[1-9][+-]?)|(?:[+-][1-9]?))?(?:\s+#.*)?$"
+)
+HEREDOC_EXECUTABLE = re.compile(
+    r"(?:^\s*|(?:&&|\|\||;|\|)\s*|\$\(\s*|"
+    r"\b(?:if|elif|while|until|then|do|else)\s+)"
+    r"(?:!\s*)?"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+    r"(?:(?:command|exec|nohup|sudo)(?:\s+--?[^\s]+)*\s+)*"
+    r"(?:env(?:\s+(?:--?[^\s]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+))*\s+)?"
+    r"(?P<interpreter>bash|sh|python|python3)\b"
+)
+CD_COMMAND = re.compile(
+    r"(?:^\s*|(?:&&|\|\||;|\|)\s*|\b(?:then|do|else)\s+)"
+    r"cd(?:\s+--)?\s+"
+    r"(?P<quote>['\"]?)(?P<path>[^\s;&|]+)(?P=quote)"
 )
 
 
@@ -1304,6 +1334,27 @@ def generic_action_cross_surfaces(
     return (f"file:{digest}",)
 
 
+def automation_file_cross_surfaces(name: str, contents: str) -> tuple[str, ...]:
+    """Protect Cross tokens plus opaque Python process-dispatch files."""
+
+    surfaces = list(
+        generic_action_cross_surfaces(
+            contents,
+            include_opaque_shell_executable=True,
+        )
+    )
+    if name.endswith(".py"):
+        _, process_failures = python_command_scripts(
+            contents,
+            name,
+            reject_dynamic_commands=True,
+        )
+        if process_failures:
+            digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+            surfaces.append(f"opaque-python-process:{digest}")
+    return tuple(surfaces)
+
+
 def validate_action_collection(actions: dict[str, str], source: str) -> list[str]:
     """Reject Cross executable/configuration inputs in repo-local actions."""
 
@@ -1326,13 +1377,13 @@ def compare_pr_action_collection(
 
     errors: list[str] = []
     for name in sorted(set(merge_base_actions) | set(proposed_actions)):
-        baseline_surfaces = generic_action_cross_surfaces(
+        baseline_surfaces = automation_file_cross_surfaces(
+            name,
             merge_base_actions.get(name, ""),
-            include_opaque_shell_executable=True,
         )
-        proposed_surfaces = generic_action_cross_surfaces(
+        proposed_surfaces = automation_file_cross_surfaces(
+            name,
             proposed_actions.get(name, ""),
-            include_opaque_shell_executable=True,
         )
         if baseline_surfaces != proposed_surfaces:
             errors.append(
@@ -1360,6 +1411,17 @@ def normalize_repository_path(raw: str) -> str | None:
     return candidate.as_posix()
 
 
+def repository_command_line(line: str) -> str:
+    """Reduce only the trusted workspace expression to its repository-relative form."""
+
+    return re.sub(
+        r"\$\{\{\s*github\.workspace\s*\}\}/?",
+        "",
+        line,
+        flags=re.IGNORECASE,
+    )
+
+
 def shell_command_lines(contents: str) -> tuple[str, ...]:
     """Return shell command lines while excluding literal here-document data."""
 
@@ -1380,8 +1442,8 @@ def shell_command_lines(contents: str) -> tuple[str, ...]:
     return tuple(commands)
 
 
-def workflow_run_scripts(contents: str) -> tuple[str, ...]:
-    """Extract literal run scalars without treating embedded program data as YAML."""
+def workflow_command_scripts(contents: str) -> tuple[str, ...]:
+    """Extract literal run and shell scalars from workflows and actions."""
 
     lines = contents.splitlines()
     scripts: list[str] = []
@@ -1392,7 +1454,7 @@ def workflow_run_scripts(contents: str) -> tuple[str, ...]:
             index += 1
             continue
         value = match.group("value").strip()
-        if value not in {"|", "|-", "|+", ">", ">-", ">+"}:
+        if BLOCK_SCALAR_HEADER.fullmatch(value) is None:
             if len(value) >= 2 and value[0] == value[-1] == "'":
                 value = value[1:-1].replace("''", "'")
             elif len(value) >= 2 and value[0] == value[-1] == '"':
@@ -1431,7 +1493,42 @@ def workflow_run_scripts(contents: str) -> tuple[str, ...]:
     return tuple(scripts)
 
 
-def python_command_scripts(contents: str, source: str) -> tuple[list[str], list[str]]:
+def executable_heredocs(contents: str) -> tuple[tuple[str, str], ...]:
+    """Return heredoc programs consumed by a literal shell or Python command."""
+
+    programs: list[tuple[str, str]] = []
+    delimiter: str | None = None
+    interpreter: str | None = None
+    body: list[str] = []
+    for line in contents.splitlines():
+        if delimiter is not None:
+            if line.strip() == delimiter:
+                if interpreter is not None:
+                    programs.append((interpreter, "\n".join(body) + "\n"))
+                delimiter = None
+                interpreter = None
+                body = []
+            else:
+                body.append(line)
+            continue
+
+        heredoc = HEREDOC_START.search(line)
+        if heredoc is None:
+            continue
+        delimiter = heredoc.group("delimiter")
+        interpreters = [
+            match.group("interpreter") for match in HEREDOC_EXECUTABLE.finditer(line)
+        ]
+        interpreter = interpreters[-1] if interpreters else None
+    return tuple(programs)
+
+
+def python_command_scripts(
+    contents: str,
+    source: str,
+    *,
+    reject_dynamic_commands: bool = False,
+) -> tuple[list[str], list[str]]:
     """Extract literal commands passed to standard Python process APIs."""
 
     try:
@@ -1440,6 +1537,7 @@ def python_command_scripts(contents: str, source: str) -> tuple[list[str], list[
         return [], [f"{source} cannot be parsed as Python: {error}"]
 
     commands: list[str] = []
+    errors: list[str] = []
     process_calls = {
         "os.execl",
         "os.execle",
@@ -1497,9 +1595,43 @@ def python_command_scripts(contents: str, source: str) -> tuple[list[str], list[
             resolved_name = f"{resolved_name}.{name_parts[1]}"
         if resolved_name not in process_calls:
             continue
-        if not node.args:
+        if any(isinstance(argument, ast.Starred) for argument in node.args) or any(
+            keyword.arg is None for keyword in node.keywords
+        ):
+            errors.append(
+                f"{source} process calls must not expand positional or keyword "
+                "arguments"
+            )
             continue
-        command = node.args[0]
+        positional_index = 1 if resolved_name.startswith("os.spawn") else 0
+        command: ast.expr | None = (
+            node.args[positional_index]
+            if len(node.args) > positional_index
+            else None
+        )
+        command_from_keyword = False
+        if command is None:
+            if resolved_name.startswith("subprocess."):
+                keyword_names = {"args"}
+            elif resolved_name == "os.system":
+                keyword_names = {"command"}
+            elif resolved_name == "os.popen":
+                keyword_names = {"cmd"}
+            else:
+                keyword_names = {"file", "path"}
+            command = next(
+                (
+                    keyword.value
+                    for keyword in node.keywords
+                    if keyword.arg in keyword_names
+                ),
+                None,
+            )
+            command_from_keyword = command is not None
+        if command is None:
+            if reject_dynamic_commands:
+                errors.append(f"{source} has an opaque process command")
+            continue
         if isinstance(command, ast.Constant) and isinstance(command.value, str):
             commands.append(command.value)
         elif isinstance(command, (ast.List, ast.Tuple)) and all(
@@ -1507,7 +1639,14 @@ def python_command_scripts(contents: str, source: str) -> tuple[list[str], list[
             for element in command.elts
         ):
             commands.append(" ".join(element.value for element in command.elts))
-    return commands, []
+        elif command_from_keyword:
+            errors.append(
+                f"{source} keyword process commands must be literal strings or "
+                "string arrays"
+            )
+        elif reject_dynamic_commands:
+            errors.append(f"{source} has an opaque process command")
+    return commands, errors
 
 
 def automation_command_scripts(
@@ -1517,7 +1656,7 @@ def automation_command_scripts(
     workflow_source: bool,
 ) -> tuple[list[str], list[str]]:
     if workflow_source:
-        return list(workflow_run_scripts(contents)), []
+        return list(workflow_command_scripts(contents)), []
     if source.endswith(".py"):
         return python_command_scripts(contents, source)
     if (
@@ -1541,9 +1680,28 @@ def local_automation_references(
     errors: list[str] = []
     if workflow_source:
         for line_number, line in enumerate(contents.splitlines(), start=1):
-            if YAML_DYNAMIC_RUN_FIELD.search(line):
+            command_field = YAML_RUN_FIELD.match(line)
+            if command_field is not None:
+                command_value = command_field.group("value").strip()
+                command_key = command_field.group("key").strip("'\"")
+                if command_value.startswith(("|", ">")) and (
+                    BLOCK_SCALAR_HEADER.fullmatch(command_value) is None
+                ):
+                    errors.append(
+                        f"{source}:{line_number} has a malformed YAML block-scalar "
+                        "header"
+                    )
+                if command_key == "shell" and (
+                    github_expression_spans(command_value)
+                    or SHELL_INTERPOLATION.search(command_value)
+                    or "`" in command_value
+                ):
+                    errors.append(
+                        f"{source}:{line_number} shell templates must be literal"
+                    )
+            if YAML_DYNAMIC_COMMAND_FIELD.search(line):
                 errors.append(
-                    f"{source}:{line_number} run commands must not use YAML "
+                    f"{source}:{line_number} run and shell commands must not use YAML "
                     "tags, anchors, or aliases"
                 )
             if YAML_DYNAMIC_USES_FIELD.search(line):
@@ -1575,13 +1733,34 @@ def local_automation_references(
     )
     errors.extend(command_failures)
     for command_script in command_scripts:
-        for line_number, line in enumerate(
-            shell_command_lines(command_script),
-            start=1,
-        ):
-            for match in LOCAL_COMMAND_REFERENCE.finditer(line):
+        pending_programs: list[tuple[str, str]] = [("shell", command_script)]
+        command_lines: list[str] = []
+        while pending_programs:
+            language, program = pending_programs.pop()
+            if language in {"python", "python3"}:
+                python_commands, python_failures = python_command_scripts(
+                    program,
+                    f"{source} executable heredoc",
+                )
+                errors.extend(python_failures)
+                pending_programs.extend(
+                    ("shell", command) for command in python_commands
+                )
+                continue
+            command_lines.extend(shell_command_lines(program))
+            pending_programs.extend(executable_heredocs(program))
+
+        working_directory: str | None = ""
+        for line_number, line in enumerate(command_lines, start=1):
+            normalized_line = repository_command_line(line)
+            for directory_match in CD_COMMAND.finditer(normalized_line):
+                directory = normalize_repository_path(directory_match.group("path"))
+                working_directory = directory
+
+            for match in LOCAL_COMMAND_REFERENCE.finditer(normalized_line):
                 raw_command_path = (
-                    match.group("interpreted")
+                    match.group("redirected")
+                    or match.group("interpreted")
                     or match.group("direct")
                     or match.group("bare")
                 )
@@ -1593,6 +1772,12 @@ def local_automation_references(
                         f"{source}:{line_number} has a non-canonical repository command"
                     )
                     continue
+                if command_path in GENERATED_COMMAND_PATHS:
+                    continue
+                if "/" not in command_path and working_directory:
+                    command_path = (
+                        PurePosixPath(working_directory) / command_path
+                    ).as_posix()
                 if command_path in GENERATED_COMMAND_PATHS:
                     continue
                 if command_path.startswith(GENERATED_SCRIPT_PREFIXES):
@@ -1699,13 +1884,13 @@ def compare_pr_automation_collection(
     # covers scripts selected through an existing trusted variable or sourced
     # transitively without freezing files whose Cross surface remains empty.
     for name in sorted(set(merge_base_automation) | set(proposed_automation)):
-        baseline_surfaces = generic_action_cross_surfaces(
+        baseline_surfaces = automation_file_cross_surfaces(
+            name,
             merge_base_automation.get(name, ""),
-            include_opaque_shell_executable=True,
         )
-        proposed_surfaces = generic_action_cross_surfaces(
+        proposed_surfaces = automation_file_cross_surfaces(
+            name,
             proposed_automation.get(name, ""),
-            include_opaque_shell_executable=True,
         )
         if baseline_surfaces != proposed_surfaces:
             errors.append(
@@ -2683,6 +2868,83 @@ pre_build = []
     ):
         failures.append("YAML-aliased automation command was not rejected")
 
+    custom_shell_workflow = referenced_workflow.replace(
+        "      - run: bash scripts/safe.sh\n",
+        "      - run: echo safe\n"
+        "        shell: ./ci/run-cross.sh {0}\n",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": custom_shell_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("custom repository shell template was not rejected")
+
+    dynamic_shell_workflow = referenced_workflow.replace(
+        "      - run: bash scripts/safe.sh\n",
+        "      - run: echo safe\n"
+        "        shell: ${{ matrix.shell }}\n",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": dynamic_shell_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("dynamic shell template was not rejected")
+
+    indented_block_workflow = referenced_workflow.replace(
+        "run: bash scripts/safe.sh",
+        "run: |2-\n        bash ci/arm64.sh",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": indented_block_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("explicit-indent block scalar escaped automation scanning")
+
+    malformed_block_workflow = referenced_workflow.replace(
+        "run: bash scripts/safe.sh",
+        "run: |22\n        echo safe",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": malformed_block_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("malformed block-scalar header was not rejected")
+
+    redirected_script_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "bash 0< ci/arm64.sh",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": redirected_script_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("interpreter input redirection escaped automation scanning")
+
+    executable_heredoc_workflow = referenced_workflow.replace(
+        "run: bash scripts/safe.sh",
+        "run: |\n"
+        "          bash <<'SHELL'\n"
+        "          ci/arm64.sh\n"
+        "          SHELL",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": executable_heredoc_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("executable shell heredoc escaped automation scanning")
+
     external_action_workflow = referenced_workflow.replace(
         "./.github/actions/setup",
         "./ci/cross-action",
@@ -2743,7 +3005,7 @@ pre_build = []
     external_python_automation = {
         "scripts/safe.py": (
             "from subprocess import run as execute\n"
-            "execute(['python3', 'ci/arm64.py'], check=True)\n"
+            "execute(args=['python3', 'ci/arm64.py'], check=True)\n"
         )
     }
     if not validate_automation_collection(
@@ -2753,6 +3015,46 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("Python process API escaped the scanned automation roots")
+
+    expanded_python_automation = {
+        "scripts/safe.py": (
+            "import subprocess\n"
+            "options = {'args': ['python3', 'ci/arm64.py']}\n"
+            "subprocess.run(**options)\n"
+        )
+    }
+    if not validate_automation_collection(
+        {"ci.yml": python_workflow},
+        {"setup/action.yml": safe_action},
+        expanded_python_automation,
+        "self-test automation directory",
+    ):
+        failures.append("expanded Python process arguments were not rejected")
+
+    opaque_python_baseline = {
+        "scripts/safe.py": (
+            "import subprocess\n"
+            "command = ['echo', 'safe']\n"
+            "subprocess.run(command, check=True)\n"
+        )
+    }
+    opaque_python_proposed = {
+        "scripts/safe.py": (
+            "import subprocess\n"
+            "command = ['bash', 'ci/arm64.sh']\n"
+            "subprocess.run(command, check=True)\n"
+        )
+    }
+    if not compare_pr_automation_collection(
+        {"ci.yml": python_workflow},
+        {"ci.yml": python_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        opaque_python_baseline,
+        opaque_python_proposed,
+        "self-test automation directory",
+    ):
+        failures.append("opaque Python process dispatch was not protected")
 
     benign_automation_edit = {"scripts/safe.sh": "#!/bin/sh\necho still-safe\n"}
     if compare_pr_automation_collection(

@@ -386,7 +386,9 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   script without freezing benign script edits. Any new or changed Cross
   executable/configuration token outside the isolated jobs is rejected,
   including `env`-wrapped and Cargo-subcommand forms, quoted or nested
-  shell/GitHub-interpolated executable spellings, literal or command-position
+  shell/GitHub-interpolated executable spellings, custom step/default `shell`
+  templates, YAML block-scalar variants, interpreter input redirection, Python
+  process-API positional/keyword forms, literal or command-position
   dynamic GitHub expressions before any Cargo-compatible subcommand or
   toolchain selector, shell-variable executable indirection, partial or whole
   opaque command substitutions, Bash brace expansions and ANSI-C escapes, and
