@@ -1659,8 +1659,7 @@ async fn validate_bundle(
 
         if proxy.api_spec_id.is_some() {
             proxy_errors.push(
-                "api_spec_id is server-managed and must be omitted from x-ferrum-proxy"
-                    .to_string(),
+                "api_spec_id is server-managed and must be omitted from x-ferrum-proxy".to_string(),
             );
         }
 

@@ -925,13 +925,13 @@ async fn api_spec_post_and_put_reject_client_supplied_ownership_tags() {
         assert!(
             post_failures.iter().any(|failure| {
                 failure["resource_type"] == resource_type
-                    && failure["errors"]
-                        .as_array()
-                        .is_some_and(|errors| errors.iter().any(|error| {
+                    && failure["errors"].as_array().is_some_and(|errors| {
+                        errors.iter().any(|error| {
                             error
                                 .as_str()
                                 .is_some_and(|message| message.contains("server-managed"))
-                        }))
+                        })
+                    })
             }),
             "missing {resource_type} ownership-tag rejection: {post_body}"
         );

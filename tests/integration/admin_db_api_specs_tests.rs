@@ -1256,7 +1256,11 @@ async fn restore_bundle_rejects_intervening_hand_owned_mesh_retry_change() {
             .await
             .unwrap()
             .is_some_and(|current| {
-                current.targets[0].tags.get("mesh.hbone").map(String::as_str) == Some("true")
+                current.targets[0]
+                    .tags
+                    .get("mesh.hbone")
+                    .map(String::as_str)
+                    == Some("true")
             }),
         "rejected compensation must preserve the intervening mesh upstream"
     );
