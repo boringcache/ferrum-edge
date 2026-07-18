@@ -468,8 +468,9 @@ where
 /// environment is mutated, and must be called before non-blocking logging or
 /// any multi-threaded runtime exists. Shared by `run` and `validate` so both
 /// commands see identical configuration and identical resolution/conflict
-/// failures; secret values are never logged. The returned metadata lets the
-/// caller log which sources were loaded (never the values).
+/// failures; secret values are never logged. The returned metadata lets each
+/// caller report which base variables and providers were loaded after tracing
+/// is initialized (never source references or values).
 fn resolve_startup_secrets() -> Result<secrets::ResolvedEnvSecrets, String> {
     let resolved = {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -495,6 +496,19 @@ fn resolve_startup_secrets() -> Result<secrets::ResolvedEnvSecrets, String> {
     Ok(resolved)
 }
 
+/// Report non-secret startup resolution metadata after tracing is initialized.
+fn log_resolved_secret_sources(resolved: &secrets::ResolvedEnvSecrets) {
+    for (base_key, backend_name) in &resolved.loaded_sources {
+        info!("Loaded {} from {}", base_key, backend_name);
+    }
+    if !resolved.vars.is_empty() {
+        info!(
+            "Resolved {} env var(s) from external secret sources",
+            resolved.vars.len()
+        );
+    }
+}
+
 /// Runs startup secret resolution, logging init, env-config parsing, and the
 /// gateway runtime. Returns the process exit code.
 ///
@@ -511,10 +525,13 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // semantics as `run` so validation sees the identical configuration
     // picture (and the same provider-conflict/fetch failures).
     if matches!(&cli.command, Some(cli::Command::Validate(_))) {
-        if let Err(error) = resolve_startup_secrets() {
-            emit_bootstrap_error("secret resolution failed", &[("error", error)]);
-            return 1;
-        }
+        let resolved = match resolve_startup_secrets() {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                emit_bootstrap_error("secret resolution failed", &[("error", error)]);
+                return 1;
+            }
+        };
         let _logging_guards = match init_logging() {
             Ok(guards) => guards,
             Err(error) => {
@@ -522,6 +539,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 return 1;
             }
         };
+        log_resolved_secret_sources(&resolved);
         match cli::execute_validate() {
             Ok(()) => return 0,
             Err(e) => {
@@ -589,15 +607,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         env!("CARGO_PKG_VERSION"),
         env!("TARGET")
     );
-    for (base_key, backend_name) in &resolved.loaded_sources {
-        info!("Loaded {} from {}", base_key, backend_name);
-    }
-    if !resolved.vars.is_empty() {
-        info!(
-            "Resolved {} env var(s) from external secret sources",
-            resolved.vars.len()
-        );
-    }
+    log_resolved_secret_sources(&resolved);
 
     // Load environment config (now includes any resolved secrets)
     let env_config = match EnvConfig::from_env() {

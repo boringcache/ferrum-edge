@@ -261,6 +261,26 @@ fn test_resolve_all_env_secrets_rejects_unsupported_cloud_suffixes() {
 }
 
 #[test]
+fn test_resolve_all_env_secrets_ignores_empty_cloud_suffixes() {
+    with_env_vars_async(
+        &[
+            ("FERRUM_TEST_SECRET_EMPTY_VAULT", ""),
+            ("FERRUM_TEST_SECRET_EMPTY_AWS", ""),
+            ("FERRUM_TEST_SECRET_EMPTY_AZURE", ""),
+            ("FERRUM_TEST_SECRET_EMPTY_GCP", ""),
+        ],
+        || async {
+            let resolved = resolve_all_env_secrets()
+                .await
+                .expect("empty cloud suffixes must be treated as unset");
+            assert!(resolved.vars.is_empty());
+            assert!(resolved.source_keys_to_remove.is_empty());
+            assert!(resolved.loaded_sources.is_empty());
+        },
+    );
+}
+
+#[test]
 fn test_resolve_secret_rejects_unsupported_cloud_suffixes() {
     with_env_vars_async(
         &[(

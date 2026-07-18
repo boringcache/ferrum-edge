@@ -320,6 +320,12 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
         if !raw_key.starts_with(FERRUM_PREFIX) {
             continue;
         }
+        // Empty suffixed variables are unset-equivalent for every backend.
+        // Check this before feature gating so behavior does not change based
+        // on whether a cloud provider was compiled into the binary.
+        if value.is_empty() {
+            continue;
+        }
         if let Some((suffix, backend_name)) = unsupported_cloud_suffix(&raw_key) {
             return Err(format!(
                 "Unsupported secret suffix {} on {}: {} support is not enabled in this build.",
@@ -327,7 +333,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             ));
         }
         if let Some((backend, base_key)) = match_suffix(&raw_key) {
-            if base_key.is_empty() || value.is_empty() {
+            if base_key.is_empty() {
                 continue;
             }
             to_resolve.entry(base_key.to_string()).or_default().push((

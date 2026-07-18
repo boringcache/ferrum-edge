@@ -350,10 +350,18 @@ const HERMETIC_ENV_PASSTHROUGH: &[&str] = &[
 /// an unset value still falls through to the `/etc/ferrum/ferrum.conf`
 /// candidate on machines that have one. The variable is therefore pinned to an
 /// empty settings file inside the temp dir, which suppresses discovery
-/// entirely.
+/// entirely. `FERRUM_FILE_CONFIG_PATH` is likewise pinned to a valid empty spec
+/// in the temp dir so host-level spec discovery stays disabled even if the test
+/// mode changes later.
 fn apply_hermetic_validate_env(cmd: &mut Command, temp_dir: &TempDir) {
     let conf_path = temp_dir.path().join("hermetic-ferrum.conf");
     std::fs::write(&conf_path, "").unwrap();
+    let spec_path = temp_dir.path().join("hermetic-resources.yaml");
+    std::fs::write(
+        &spec_path,
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
 
     cmd.env_clear();
     for key in HERMETIC_ENV_PASSTHROUGH {
@@ -366,6 +374,7 @@ fn apply_hermetic_validate_env(cmd: &mut Command, temp_dir: &TempDir) {
         .env("FERRUM_DB_TYPE", "sqlite")
         .env("FERRUM_DB_URL", "sqlite::memory:")
         .env("FERRUM_CONF_PATH", &conf_path)
+        .env("FERRUM_FILE_CONFIG_PATH", &spec_path)
         .current_dir(temp_dir.path());
 }
 
@@ -406,6 +415,10 @@ async fn functional_cli_validate_resolves_file_secret_suffix() {
     // "Validation passed." is if the `_FILE` source was actually materialized
     // into the base variable.
     assert!(stdout.contains("Validation passed."));
+    assert!(
+        stdout.contains("Loaded FERRUM_ADMIN_JWT_SECRET from file"),
+        "validate must report the non-secret base variable and provider after logging initializes: {stdout}"
+    );
     // The resolved value must never be echoed on either stream.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
