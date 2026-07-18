@@ -135,7 +135,7 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 ## File Dependencies And Custom Plugins
 
 - Backend TLS file validation belongs to `validate_all_fields_with_ip_policy()`: file mode fatal, DB/CP admin warn, DP rejects update and keeps old config.
-- Plugin file dependencies, such as MaxMind `.mmdb`, belong to `validate_plugin_file_dependencies()`: file fatal, DB warn, CP admin and DP skip.
+- Plugin file dependencies, such as MaxMind `.mmdb`, belong to `validate_plugin_file_dependencies()`: file fatal; DB warns for absent/unreadable files; CP admin validates structure but skips node-local files; DP validates and refreshes its node-local files off the runtime worker for full snapshots and affected incremental rebuilds. On DB/DP runtime nodes, absent/unreadable files use the configured request-time fallback, while readable invalid files reject the new plugin generation.
 - Plugin constructors with file deps should tolerate missing files, log a warning, store `None`, and apply configured request-time fallback policy.
 - Frontend TLS cert failure is always fatal.
 - Custom plugins live under `custom_plugins/` and may export `plugin_migrations() -> Vec<CustomPluginMigration>`.

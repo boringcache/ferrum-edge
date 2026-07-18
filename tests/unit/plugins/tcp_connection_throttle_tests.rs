@@ -2,6 +2,7 @@ use ferrum_edge::config::types::{BackendScheme, Consumer};
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, create_plugin,
 };
+use ferrum_edge::proxy::proxy_protocol::{ProxyProtocolResult, apply_proxy_result};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -111,6 +112,29 @@ async fn test_tcp_connection_throttle_rejects_second_connection_for_same_ip() {
     let mut ctx2 = make_ctx("tcp-proxy", "10.0.0.1", None);
     assert!(matches!(
         plugin.on_stream_connect(&mut ctx2).await,
+        PluginResult::Reject {
+            status_code: 429,
+            ..
+        }
+    ));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_uses_canonical_ingress_identity() {
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
+
+    let mut native = make_ctx("tcp-proxy", "192.0.2.10", None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut native).await,
+        PluginResult::Continue
+    ));
+
+    let mapped_peer = "[::ffff:192.0.2.10]:4321".parse().unwrap();
+    let (mapped_ip, _) = apply_proxy_result(ProxyProtocolResult::NoAddress, &mapped_peer);
+    let mut mapped = make_ctx("tcp-proxy", &mapped_ip, None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut mapped).await,
         PluginResult::Reject {
             status_code: 429,
             ..

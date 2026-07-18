@@ -1298,7 +1298,7 @@ async fn run_tcp_accept_loop(
 
                     let connected_at = Instant::now();
                     let connected_wall_at = chrono::Utc::now();
-                    let direct_client_ip = remote_addr.ip().to_string();
+                    let direct_client_ip = remote_addr.ip().to_canonical().to_string();
 
                     // Inbound PROXY protocol (v1 text / v2 binary) — opt-in per proxy.
                     // When `stream_proxy_protocol: true` is set on the Proxy config, every
@@ -1385,7 +1385,7 @@ async fn run_tcp_accept_loop(
                     // (after TLS handshake for TLS proxies, so client cert is available).
                     let mut stream_ctx = StreamConnectionContext::new(
                         client_ip.clone(),
-                        // `direct_client_ip` is always the raw socket peer. When PROXY
+                        // `direct_client_ip` is the canonicalized socket peer. When PROXY
                         // protocol is active `client_ip` may differ (forwarded source IP).
                         direct_client_ip.clone(),
                         proxy_id.to_string(),

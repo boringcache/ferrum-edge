@@ -29,7 +29,8 @@ use crate::admin::{AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, SortOrder,
     is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
-    tcp_connection_throttle_attachment_conflict,
+    tcp_connection_throttle_attachment_conflict, validate_api_spec_proxy_plugin_association,
+    validate_api_spec_restore_inputs,
 };
 use crate::config::types::{ApiSpec, PluginAssociation, PluginScope, Upstream};
 use crate::util::body_limit::is_length_limit_error;
@@ -94,10 +95,12 @@ enum ApiSpecLateWriteRecovery {
 
 fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
     if is_mtls_dns_admission_unavailable(&e) {
-        return ApiSpecError::AdmissionUnavailable(e.to_string());
+        return ApiSpecError::AdmissionUnavailable(
+            "namespace config admission unavailable".to_string(),
+        );
     }
     if is_mtls_dns_identity_conflict(&e) {
-        return ApiSpecError::Conflict(e.to_string());
+        return ApiSpecError::Conflict("mTLS DNS identity conflict".to_string());
     }
     if let Some(conflict) = tcp_connection_throttle_attachment_conflict(&e) {
         return ApiSpecError::PluginComposition(conflict.errors().to_vec());
@@ -110,8 +113,13 @@ fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
         return ApiSpecError::NotFound;
     }
 
-    let msg = e.to_string();
-    classify_db_error_str(&msg)
+    for cause in e.chain() {
+        let classified = classify_db_error_str(&cause.to_string());
+        if !matches!(classified, ApiSpecError::Internal(_)) {
+            return classified;
+        }
+    }
+    ApiSpecError::Internal("database operation failed".to_string())
 }
 
 fn classify_db_error_str(msg: &str) -> ApiSpecError {
@@ -121,18 +129,33 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
         || lower.contains("duplicate key")
         || lower.contains("duplicate entry")
     {
-        ApiSpecError::Conflict(msg.to_string())
+        ApiSpecError::Conflict("resource conflict".to_string())
     } else if msg.contains("MongoDB document limit") {
         ApiSpecError::MongoDocTooLarge
     } else if lower.contains("foreign key constraint")
         || lower.contains("foreign key")
         || lower.contains("references a")
     {
-        ApiSpecError::Unprocessable(msg.to_string())
+        ApiSpecError::Unprocessable("referential integrity violation".to_string())
     } else if is_row_missing_error_message(&lower) {
         ApiSpecError::NotFound
     } else {
-        ApiSpecError::Internal(msg.to_string())
+        ApiSpecError::Internal("database operation failed".to_string())
+    }
+}
+
+fn restore_snapshot_validation_failure(
+    spec: &ApiSpec,
+    resource_id: String,
+    error: String,
+) -> ApiSpecError {
+    ApiSpecError::ValidationFailures {
+        spec_version: spec.spec_version.clone(),
+        failures: vec![ValidationFailure {
+            resource_type: "restore_snapshot",
+            id: resource_id,
+            errors: vec![error],
+        }],
     }
 }
 
@@ -152,31 +175,30 @@ where
         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(result)) => {
             result.map_err(classify_db_error)
         }
-        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
-            tracing::warn!(
-                %error,
-                "API-spec persistence completed after namespace config admission was lost"
-            );
+        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_namespace_admission_lost");
             match result {
                 Ok(result) => {
                     let lost_generation = guard.generation();
                     drop(guard);
-                    let recovery_guard = crate::admin::crud::lock_namespace_config_admission(
-                        db, namespace,
-                    )
-                    .await
-                    .map_err(|recovery_error| {
-                        tracing::error!(
-                            %recovery_error,
-                            "Failed to reacquire API-spec namespace admission after a late write"
-                        );
-                        ApiSpecError::AdmissionUnavailable(recovery_error.to_string())
-                    })?;
+                    let recovery_guard =
+                        crate::admin::crud::lock_namespace_config_admission(db, namespace)
+                            .await
+                            .map_err(|_recovery_error| {
+                                crate::admin::error_persistence_failure_redacted(
+                                    "api_spec_namespace_admission_reacquire_after_late_write",
+                                );
+                                ApiSpecError::AdmissionUnavailable(
+                                    "namespace config admission unavailable".to_string(),
+                                )
+                            })?;
                     if recovery_guard.immediately_succeeds_generation(lost_generation) {
                         return Ok(result);
                     }
                     if !compensate_after_intervening_write {
-                        return Err(ApiSpecError::AdmissionUnavailable(error.to_string()));
+                        return Err(ApiSpecError::AdmissionUnavailable(
+                            "namespace config admission unavailable".to_string(),
+                        ));
                     }
                     match recovery_guard
                         .run_to_completion_while_held(compensation)
@@ -190,38 +212,39 @@ where
                         ))) => {}
                         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
                             result: Ok(_),
-                            error: recovery_error,
+                            error: _,
                         }) => {
-                            tracing::error!(
-                                %recovery_error,
-                                "API-spec late-write compensation lost namespace admission"
+                            crate::admin::error_persistence_failure_redacted(
+                                "api_spec_late_write_compensation_admission_lost",
                             );
                         }
                         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Err(
-                            recovery_error,
+                            _,
                         )))
                         | Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
-                            result: Err(recovery_error),
+                            result: Err(_),
                             ..
                         })
-                        | Err(recovery_error) => {
-                            tracing::error!(
-                                %recovery_error,
-                                "API-spec late-write compensation failed"
+                        | Err(_) => {
+                            crate::admin::error_persistence_failure_redacted(
+                                "api_spec_late_write_compensation",
                             );
                         }
                     }
-                    Err(ApiSpecError::AdmissionUnavailable(error.to_string()))
+                    Err(ApiSpecError::AdmissionUnavailable(
+                        "namespace config admission unavailable".to_string(),
+                    ))
                 }
                 Err(error) => Err(classify_db_error(error)),
             }
         }
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "API-spec persistence could not start with namespace config admission held"
+        Err(_error) => {
+            crate::admin::warn_persistence_failure_redacted(
+                "api_spec_namespace_admission_before_persist",
             );
-            Err(ApiSpecError::AdmissionUnavailable(error.to_string()))
+            Err(ApiSpecError::AdmissionUnavailable(
+                "namespace config admission unavailable".to_string(),
+            ))
         }
     }
 }
@@ -423,6 +446,7 @@ async fn compensate_late_api_spec_delete(
     db: Arc<dyn DatabaseBackend>,
     previous_bundle: ExtractedBundle,
     previous_spec: ApiSpec,
+    additional_upstreams: Vec<Upstream>,
     additional_plugins: Vec<crate::config::types::PluginConfig>,
     state: &AdminState,
 ) -> Result<ApiSpecLateWriteRecovery, anyhow::Error> {
@@ -480,28 +504,15 @@ async fn compensate_late_api_spec_delete(
             anyhow::bail!("late API-spec delete compensation validation returned an HTTP response")
         }
     }
-    let additional_plugin_ids = additional_plugins
-        .iter()
-        .map(|plugin| plugin.id.clone())
-        .collect::<HashSet<_>>();
-    let mut base_bundle = previous_bundle.clone();
-    base_bundle.proxy.plugins.retain(|association| {
-        !additional_plugin_ids.contains(association.plugin_config_id.as_str())
-    });
-    db.submit_api_spec_bundle(&base_bundle, &previous_spec)
-        .await?;
-    for plugin in additional_plugins {
-        if db
-            .get_plugin_config(&previous_spec.namespace, &plugin.id)
-            .await?
-            .is_none()
-        {
-            db.create_plugin_config(&plugin).await?;
-        }
-    }
-    if !additional_plugin_ids.is_empty() && !db.update_proxy(&previous_bundle.proxy).await? {
-        anyhow::bail!("late API-spec delete compensation could not restore proxy associations");
-    }
+    let validation_http_client = crate::admin::plugin_validation_http_client(state);
+    db.restore_api_spec_bundle(
+        &previous_bundle,
+        &previous_spec,
+        &additional_upstreams,
+        &additional_plugins,
+        &validation_http_client,
+    )
+    .await?;
     Ok(ApiSpecLateWriteRecovery::NotRetained)
 }
 
@@ -560,8 +571,8 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::NOT_FOUND,
             &json!({"error": "API spec not found"}),
         ),
-        ApiSpecError::Conflict(detail) => {
-            tracing::warn!("api-spec conflict (raw DB error): {}", detail);
+        ApiSpecError::Conflict(_detail) => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_conflict");
             json_resp(
                 StatusCode::CONFLICT,
                 &json!({
@@ -573,8 +584,8 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::PAYLOAD_TOO_LARGE,
             &json!({"error": "Spec document exceeds MongoDB document size limit"}),
         ),
-        ApiSpecError::Unprocessable(detail) => {
-            tracing::warn!("api-spec unprocessable (raw DB error): {}", detail);
+        ApiSpecError::Unprocessable(_detail) => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_unprocessable");
             json_resp(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &json!({
@@ -596,15 +607,12 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "No database configured"}),
         ),
-        ApiSpecError::AdmissionUnavailable(detail) => {
-            tracing::warn!(
-                "api-spec namespace admission temporarily unavailable: {}",
-                detail
-            );
+        ApiSpecError::AdmissionUnavailable(_detail) => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_admission_unavailable");
             crate::admin::mtls_dns_admission_unavailable_response()
         }
-        ApiSpecError::Internal(msg) => {
-            tracing::error!("api-specs internal error: {}", msg);
+        ApiSpecError::Internal(_msg) => {
+            crate::admin::error_persistence_failure_redacted("api_spec_internal");
             json_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": "Internal server error"}),
@@ -1628,6 +1636,12 @@ async fn validate_bundle(
         // fields too (the rejection is scoped to operator paths; the mesh
         // slice-apply path does not run it).
         let mut upstream_errors = Vec::new();
+        if upstream.api_spec_id.is_some() {
+            upstream_errors.push(
+                "api_spec_id is server-managed and must be omitted from x-ferrum-upstream"
+                    .to_string(),
+            );
+        }
         if let Err(e) = upstream.validate_fields() {
             upstream_errors.extend(e);
         }
@@ -1654,6 +1668,12 @@ async fn validate_bundle(
         let proxy = &bundle.proxy;
 
         let mut proxy_errors: Vec<String> = Vec::new();
+
+        if proxy.api_spec_id.is_some() {
+            proxy_errors.push(
+                "api_spec_id is server-managed and must be omitted from x-ferrum-proxy".to_string(),
+            );
+        }
 
         // validate_fields covers scheme, port, listen_path regex, etc.
         if let Err(e) = proxy.validate_fields() {
@@ -1700,6 +1720,13 @@ async fn validate_bundle(
     let known_plugins = crate::plugins::available_plugins();
     for plugin in &bundle.plugins {
         let mut plugin_errors: Vec<String> = Vec::new();
+
+        if plugin.api_spec_id.is_some() {
+            plugin_errors.push(
+                "api_spec_id is server-managed and must be omitted from x-ferrum-plugins"
+                    .to_string(),
+            );
+        }
 
         // Generic PluginConfig field constraints (Fix 3): priority_override
         // range, config JSON size, nesting depth.  Direct admin runs
@@ -2805,10 +2832,12 @@ pub async fn handle_post_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+            Err(_error) => {
+                crate::admin::warn_persistence_failure_redacted(
+                    "api_spec_namespace_admission_acquire",
+                );
                 return Ok(error_response(ApiSpecError::AdmissionUnavailable(
-                    error.to_string(),
+                    "namespace config admission unavailable".to_string(),
                 )));
             }
         };
@@ -2967,10 +2996,12 @@ pub async fn handle_put_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+            Err(_error) => {
+                crate::admin::warn_persistence_failure_redacted(
+                    "api_spec_namespace_admission_acquire",
+                );
                 return Ok(error_response(ApiSpecError::AdmissionUnavailable(
-                    error.to_string(),
+                    "namespace config admission unavailable".to_string(),
                 )));
             }
         };
@@ -3313,10 +3344,12 @@ pub async fn handle_delete_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+            Err(_error) => {
+                crate::admin::warn_persistence_failure_redacted(
+                    "api_spec_namespace_admission_acquire",
+                );
                 return Ok(error_response(ApiSpecError::AdmissionUnavailable(
-                    error.to_string(),
+                    "namespace config admission unavailable".to_string(),
                 )));
             }
         };
@@ -3339,6 +3372,41 @@ pub async fn handle_delete_api_spec(
     let existing_upstream = match load_single_spec_owned_upstream(db, namespace, id).await {
         Ok(upstream) => upstream,
         Err(error) => return Ok(error_response(error)),
+    };
+    let additional_upstreams = match existing_proxy.upstream_id.as_deref().filter(|upstream_id| {
+        existing_upstream
+            .as_ref()
+            .map(|upstream| upstream.id.as_str())
+            != Some(*upstream_id)
+    }) {
+        Some(upstream_id) => match db.get_upstream(namespace, upstream_id).await {
+            Ok(Some(upstream)) if upstream.api_spec_id.is_none() => vec![upstream],
+            Ok(Some(upstream)) => {
+                let error = format!(
+                    "API spec '{}' cannot snapshot current upstream '{}': it is owned by API spec '{}'",
+                    existing.id,
+                    upstream.id,
+                    upstream.api_spec_id.as_deref().unwrap_or("<unknown>")
+                );
+                return Ok(error_response(restore_snapshot_validation_failure(
+                    &existing,
+                    upstream.id,
+                    error,
+                )));
+            }
+            Ok(None) => {
+                return Ok(error_response(ApiSpecError::ValidationFailures {
+                    spec_version: existing.spec_version.clone(),
+                    failures: vec![ValidationFailure {
+                        resource_type: "upstream_graph",
+                        id: existing.proxy_id.clone(),
+                        errors: vec![format!("proxy references missing upstream '{upstream_id}'")],
+                    }],
+                }));
+            }
+            Err(error) => return Ok(error_response(classify_db_error(error))),
+        },
+        None => Vec::new(),
     };
     let existing_plugins = match db.list_spec_owned_plugin_configs(namespace, id).await {
         Ok(plugins) => plugins,
@@ -3364,7 +3432,34 @@ pub async fn handle_delete_api_spec(
         .flat_map(|proxy| proxy.plugins.iter())
         .map(|association| association.plugin_config_id.as_str())
         .collect();
-    let additional_plugins = deletion_snapshot
+    for plugin in deletion_snapshot.plugin_configs.iter().filter(|plugin| {
+        owned_plugin_ids.contains(plugin.id.as_str())
+            || plugin.proxy_id.as_deref() == Some(existing.proxy_id.as_str())
+    }) {
+        let Some(other_proxy) = deletion_snapshot
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id != existing.proxy_id)
+            .find(|proxy| {
+                proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == plugin.id)
+            })
+        else {
+            continue;
+        };
+        let error = format!(
+            "API spec '{}' cannot delete proxy '{}': cascade plugin '{}' is also associated with proxy '{}', whose association is not part of the restore snapshot",
+            existing.id, existing.proxy_id, plugin.id, other_proxy.id
+        );
+        return Ok(error_response(restore_snapshot_validation_failure(
+            &existing,
+            plugin.id.clone(),
+            error,
+        )));
+    }
+    let additional_plugin_ids = deletion_snapshot
         .plugin_configs
         .iter()
         .filter(|plugin| !owned_plugin_ids.contains(plugin.id.as_str()))
@@ -3374,13 +3469,100 @@ pub async fn handle_delete_api_spec(
                     && proxy_plugin_ids.contains(plugin.id.as_str())
                     && !other_proxy_plugin_ids.contains(plugin.id.as_str()))
         })
-        .cloned()
+        .map(|plugin| plugin.id.clone())
         .collect::<Vec<_>>();
+    let additional_plugin_id_set: HashSet<&str> =
+        additional_plugin_ids.iter().map(String::as_str).collect();
+    let mut additional_plugins = Vec::with_capacity(additional_plugin_ids.len());
+    for plugin_id in &additional_plugin_ids {
+        match db.get_plugin_config(namespace, plugin_id).await {
+            Ok(Some(plugin)) if plugin.api_spec_id.is_none() => additional_plugins.push(plugin),
+            Ok(Some(plugin)) => {
+                let error = format!(
+                    "API spec '{}' cannot delete proxy '{}': plugin '{}' is owned by API spec '{}'",
+                    existing.id,
+                    existing.proxy_id,
+                    plugin.id,
+                    plugin.api_spec_id.as_deref().unwrap_or("<unknown>")
+                );
+                return Ok(error_response(restore_snapshot_validation_failure(
+                    &existing, plugin.id, error,
+                )));
+            }
+            Ok(None) => {
+                return Ok(error_response(ApiSpecError::Internal(format!(
+                    "API spec '{}' delete snapshot lost plugin '{}' before persistence",
+                    existing.id, plugin_id
+                ))));
+            }
+            Err(error) => return Ok(error_response(classify_db_error(error))),
+        }
+    }
+    for association in &existing_proxy.plugins {
+        let plugin_id = association.plugin_config_id.as_str();
+        if owned_plugin_ids.contains(plugin_id) || additional_plugin_id_set.contains(plugin_id) {
+            continue;
+        }
+        match db.get_plugin_config(namespace, plugin_id).await {
+            Ok(Some(plugin)) if plugin.api_spec_id.is_none() => {
+                if let Err(error) =
+                    validate_api_spec_proxy_plugin_association(&plugin, &existing.proxy_id)
+                {
+                    return Ok(error_response(restore_snapshot_validation_failure(
+                        &existing,
+                        plugin.id,
+                        error.to_string(),
+                    )));
+                }
+            }
+            Ok(Some(plugin)) => {
+                let error = format!(
+                    "API spec '{}' cannot delete proxy '{}': associated plugin '{}' is owned by API spec '{}'",
+                    existing.id,
+                    existing.proxy_id,
+                    plugin.id,
+                    plugin.api_spec_id.as_deref().unwrap_or("<unknown>")
+                );
+                return Ok(error_response(restore_snapshot_validation_failure(
+                    &existing, plugin.id, error,
+                )));
+            }
+            Ok(None) => {
+                return Ok(error_response(ApiSpecError::ValidationFailures {
+                    spec_version: existing.spec_version.clone(),
+                    failures: vec![ValidationFailure {
+                        resource_type: "plugin_graph",
+                        id: existing.proxy_id.clone(),
+                        errors: vec![format!(
+                            "proxy association references missing plugin '{plugin_id}'"
+                        )],
+                    }],
+                }));
+            }
+            Err(error) => return Ok(error_response(classify_db_error(error))),
+        }
+    }
     let previous_bundle = ExtractedBundle {
         proxy: existing_proxy,
         upstream: existing_upstream,
         plugins: existing_plugins,
     };
+    if let Err(error) = validate_api_spec_restore_inputs(
+        &previous_bundle,
+        &existing,
+        &additional_upstreams,
+        &additional_plugins,
+        true,
+    ) {
+        return Ok(error_response(ApiSpecError::ValidationFailures {
+            spec_version: existing.spec_version.clone(),
+            failures: vec![ValidationFailure {
+                resource_type: "restore_snapshot",
+                id: existing.proxy_id.clone(),
+                errors: vec![error.to_string()],
+            }],
+        }));
+    }
 
     match crate::admin::crud::validate_plugin_graph_proxy_deletion_candidate(
         db.as_ref(),
@@ -3463,6 +3645,7 @@ pub async fn handle_delete_api_spec(
                 compensation_db,
                 previous_bundle,
                 compensation_spec,
+                additional_upstreams,
                 additional_plugins,
                 &settlement_state,
             ),

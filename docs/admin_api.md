@@ -24,7 +24,7 @@ Most endpoints require a valid HS256 JWT in the `Authorization: Bearer <token>` 
 
 The whole admin listener can additionally be restricted at the TCP layer with `FERRUM_ADMIN_ALLOWED_CIDRS`.
 
-Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`), `exp - iat` must not exceed `FERRUM_ADMIN_JWT_MAX_TTL` (default `3600` seconds), and `nbf`/`exp` are validated. When `FERRUM_ADMIN_JWT_AUDIENCE` is set, tokens must also carry a matching `aud` claim. When unset (default), tokens without an `aud` claim are accepted, but tokens that carry `aud` are rejected per RFC 7519 §4.1.3 (no acceptable audience is configured) — if your token minter stamps `aud`, set `FERRUM_ADMIN_JWT_AUDIENCE` to that value.
+Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`), and `nbf`/`exp` are validated. The `FERRUM_ADMIN_JWT_MAX_TTL` cap (default `3600` seconds) is enforced against verifier time, not just the claims, and counts the accepted clock-skew leeway (60 seconds) exactly once: `exp - iat` must be positive and within the maximum, `iat` must not be later than verifier time plus the leeway, `exp - now` must stay within the maximum plus that same leeway, and `exp` must still be in the future at verifier time (the cap path applies no expiry grace, so the skew allowance is not counted a second time at expiration). Effective maximum real validity is therefore `FERRUM_ADMIN_JWT_MAX_TTL + 60s`, and shifting `iat` and `exp` together into the future cannot extend a token's real lifetime beyond that bound. Setting `FERRUM_ADMIN_JWT_MAX_TTL=0` intentionally disables the lifetime cap; a configured value above `9223372036854775807` is rejected at startup as invalid rather than treated as unlimited. When `FERRUM_ADMIN_JWT_AUDIENCE` is set, tokens must also carry a matching `aud` claim. When unset (default), tokens without an `aud` claim are accepted, but tokens that carry `aud` are rejected per RFC 7519 §4.1.3 (no acceptable audience is configured) — if your token minter stamps `aud`, set `FERRUM_ADMIN_JWT_AUDIENCE` to that value.
 
 ### Per-namespace tenancy (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`)
 
@@ -716,7 +716,7 @@ Ferrum Edge can ingest an OpenAPI 2.0 (Swagger), 3.0.x, 3.1.x, or 3.2.x specific
 
 ### `POST /api-specs`
 
-Submit an OpenAPI or Swagger document. The spec must include a `x-ferrum-proxy` extension at the root. Optional `x-ferrum-upstream` and `x-ferrum-plugins` extensions create additional resources. All created resources are tagged with the spec's `api_spec_id`.
+Submit an OpenAPI or Swagger document. The spec must include a `x-ferrum-proxy` extension at the root. Optional `x-ferrum-upstream` and `x-ferrum-plugins` extensions create additional resources. All created resources are tagged with the spec's `api_spec_id` by the server. Clients must omit `api_spec_id` from all three extensions; copied ownership tags return 422 on POST and PUT.
 
 ```bash
 curl -X POST https://gateway/api-specs \
@@ -776,9 +776,36 @@ Deletes the spec and cascades:
 - Spec-owned **proxy** is deleted → FK cascade removes its plugins (including any added manually after import).
 - Spec-owned **upstream** is deleted if present. Upstreams without `api_spec_id` survive.
 - Calling `DELETE /proxies/{id}` directly also removes the spec row via the `ON DELETE CASCADE` FK constraint.
+- Before a direct delete of an API-spec-owned proxy, Ferrum re-reads the
+  current upstream and every cascade plugin with ownership metadata intact.
+  Hand-owned rows remain hand-owned; foreign API-spec ownership, missing rows,
+  or an ownership/scope shape that atomic recovery cannot reproduce returns 400
+  without deleting the proxy.
 - If the cascade would leave an invalid aggregate plugin graph, the API returns
   422 with validation failures and no resources are deleted. Direct proxy or
   plugin-config deletion reports the equivalent precondition failure as 400.
+- Before deletion, the complete compensation snapshot is checked for ownership
+  and restorable plugin shape. Foreign API-spec ownership, a global plugin tied
+  to or explicitly associated with the deleted proxy, a proxy-scoped association
+  targeting another proxy, a proxy-group plugin carrying `proxy_id`, or an
+  embedded proxy association naming a missing config returns the structured 422
+  validation-failure response without deleting anything, leaving the malformed
+  graph available for operator repair.
+- If namespace admission is lost after the delete commits, SQL backends and
+  replica-set MongoDB restore the upstream, proxy, all spec-owned and hand-owned
+  plugins removed by the cascade, associations, spec row, and config-change
+  records in one transaction. Valid proxy-scoped configs without a reverse
+  proxy association are restored in that same transaction and remain
+  unattached. Reference validation is limited to this recovered proxy graph, so
+  unrelated malformed associations remain available for in-band repair. Route
+  uniqueness, namespace-wide guarded plugin composition, mTLS identity policy,
+  and referenced-upstream existence are still rechecked inside the restore
+  transaction after any intervening writer; a conflict rolls the complete
+  restore back. Recovery validation uses the same configured backend egress
+  policy and real-IP header as normal admin plugin validation. Standalone
+  MongoDB cannot provide that boundary, so compensation fails before writing
+  and leaves the route deleted rather than publishing a partially protected
+  proxy.
 
 ### Cascade and ownership summary
 

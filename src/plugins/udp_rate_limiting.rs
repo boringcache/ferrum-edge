@@ -150,7 +150,7 @@ impl Plugin for UdpRateLimiting {
             .limiter
             .check_with_redis_key(
                 Arc::clone(&key),
-                || Self::redis_ip_key(&ctx.client_ip),
+                || Self::redis_ip_key(key.as_ref()),
                 &UdpRateLimitOp {
                     datagram_size: ctx.datagram_size as u64,
                 },

@@ -3538,12 +3538,32 @@ paths:
     delete:
       operationId: deleteProxy
       summary: Delete a proxy
+      description: |
+        Deletes the proxy and its proxy-owned cascade resources. If the proxy is
+        owned by an API spec, the spec row and spec-owned resources are also
+        deleted. When namespace admission is lost after that deletion commits,
+        SQL backends and replica-set MongoDB use the API-spec compensation
+        transaction to restore the stamped spec resources, an orphaned
+        hand-owned upstream, hand-owned cascade plugins, associations, and
+        config-change records together. Before persistence, the namespace
+        snapshot is used only to discover affected IDs; the current upstream
+        and cascade plugins are re-read with ownership metadata intact.
+        Hand-owned rows remain hand-owned, the API-spec snapshot supplies
+        stamped bundle rows, and foreign ownership or an unrestorable ownership
+        shape returns 400 without deleting the proxy. A shared hand-owned
+        upstream that remained live is reused rather than inserted again only
+        when its stable creation identity and ownership match the pre-delete
+        snapshot; a same-ID replacement rejects recovery. The recovered proxy
+        graph's current upstream, plugin-composition, and named-schema
+        dependencies are revalidated before commit with the configured backend
+        egress policy and real-IP header. Standalone MongoDB fails closed before
+        multi-document compensation writes.
       tags: [Proxies]
       responses:
         "204":
           description: Proxy deleted
         "400":
-          description: Deletion would leave an invalid plugin-composition graph, such as a global TCP connection throttle with no supported TCP/TCP+TLS target
+          description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely
           content:
             application/json:
               schema:
@@ -4468,6 +4488,9 @@ paths:
         separately. Plugin `config` values must not contain credential or
         consumer fields (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`,
         `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`).
+        `api_spec_id` is server-managed and must be omitted from
+        `x-ferrum-proxy`, `x-ferrum-upstream`, and `x-ferrum-plugins`; copied
+        ownership tags return a 422 validation response on both POST and PUT.
 
         **Content-Type detection**: `application/json` → JSON parser;
         `application/yaml` / `application/x-yaml` / `text/yaml` / `text/x-yaml` → YAML parser;
@@ -4853,8 +4876,26 @@ paths:
         left with a dangling `schema_ref`, or when the cascade would leave a
         global TCP connection throttle without a supported TCP/TCP+TLS target.
 
+        Ferrum also validates that the complete pre-delete compensation snapshot
+        is owned and shaped so it can be restored atomically. A cascade plugin
+        owned by another API spec, an explicitly associated global plugin, a
+        proxy-scoped association targeting another proxy, a global plugin carrying
+        the deleted proxy ID, a proxy-group plugin carrying `proxy_id`, or an
+        embedded proxy association naming a missing plugin config returns a
+        structured 422 validation failure without deleting anything.
+
+        If namespace admission is lost after deletion commits, SQL backends and
+        replica-set MongoDB compensate in one transaction: the spec-owned and
+        current hand-owned upstream snapshots, proxy, spec-owned and hand-owned
+        cascade plugins, associations, API-spec row, and config-change records
+        are all restored or all remain deleted. The
+        recovered proxy's current upstream, plugin-composition, and named-schema
+        dependencies are revalidated before commit. A standalone MongoDB
+        deployment fails closed before compensation writes because it cannot
+        provide that multi-document atomic boundary.
+
         Returns 204 on success, 404 if the spec does not exist, or 422 when the
-        prospective deletion fails plugin-graph validation.
+        prospective deletion fails plugin-graph or restore-snapshot validation.
 
         This mutation requires the `admin` role.
       tags: [API Specs]
@@ -4881,7 +4922,11 @@ paths:
             Deleting the spec and its cascaded resources would leave an invalid
             aggregate plugin-composition graph in the namespace, such as a dangling
             transaction-log `schema_ref` or a global TCP connection throttle
-            with no supported TCP/TCP+TLS target. No resources are deleted.
+            with no supported TCP/TCP+TLS target, or the pre-delete compensation
+            snapshot contains foreign ownership, an unrestorable plugin scope/proxy
+            association, or an embedded proxy association naming a missing plugin
+            config. The response identifies the offending restore-snapshot
+            resource and validation details. No resources are deleted.
           content:
             application/json:
               schema:
@@ -4993,13 +5038,23 @@ components:
         |----------|---------|-------------|
         | `FERRUM_ADMIN_JWT_SECRET` | *(required)* | Signing key (minimum 32 characters) |
         | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
-        | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds) |
+        | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds); `0` disables the cap |
 
         Tokens must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a
-        string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER`; `exp -
-        iat` must not exceed `FERRUM_ADMIN_JWT_MAX_TTL`; `nbf` and `exp` are
-        validated. Required `role` claim values are `viewer`, `operator`, and
-        `admin`. Tokens without a valid `role` claim are rejected.
+        string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER`; `nbf`
+        and `exp` are validated. `FERRUM_ADMIN_JWT_MAX_TTL` is enforced against
+        verifier time, not just the claims, counting the accepted clock-skew
+        leeway (60 seconds) exactly once: `exp - iat` must be positive and
+        within the maximum, `iat` must not be later than verifier time plus the
+        leeway, `exp - now` must stay within the maximum plus that same leeway,
+        and `exp` must still be in the future at verifier time (no expiry
+        grace on the cap path). Effective maximum real validity is
+        `FERRUM_ADMIN_JWT_MAX_TTL + 60s`, so future-shifted timestamps cannot
+        extend a token's real lifetime. A configured value above
+        `9223372036854775807` is rejected at startup as invalid rather than
+        treated as unlimited. Required `role` claim values are `viewer`,
+        `operator`, and `admin`. Tokens without a valid `role` claim are
+        rejected.
 
     metricsBearerAuth:
       type: http
@@ -6347,10 +6402,12 @@ components:
           description: |
             Maximum allowed response amplification factor for UDP proxies.
             When set, backend→client datagrams are dropped if their size exceeds
-            `last_request_size * factor`. Protects against UDP amplification
-            attacks (e.g., spoofed-source reflection). When omitted (default),
-            no per-datagram amplification cap is applied. Only applicable for
-            `udp` / `dtls` proxies.
+            `payload_size * factor`. A zero-length request receives an explicit
+            one-byte reply allowance so it cannot black-hole the session;
+            nonempty requests retain the exact configured payload ratio. This
+            protects against UDP amplification attacks (e.g., spoofed-source
+            reflection). When omitted (default), no per-datagram amplification
+            cap is applied. Only applicable for `udp` / `dtls` proxies.
         allowed_methods:
           oneOf:
             - type: array
@@ -18707,26 +18764,57 @@ components:
 
     GeoRestrictionConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: geo_restriction — country-level access control backed by a
-        MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is mmap'd at
-        construction time for zero-copy lookups; the file dependency is
-        validated per-mode (fatal in file mode, warn in db mode, skipped on
-        the data plane so a missing file degrades to `on_lookup_failure`
-        instead of rejecting the whole config). `allow_countries` and
-        `deny_countries` are mutually exclusive; at least one must be
-        non-empty. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
+        MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is fully verified
+        and loaded into bounded owned immutable memory at construction. Files
+        larger than 512 MiB, aggregate verified MMDB content above 512 MiB per
+        validation generation/cache build, and records containing unsupported
+        country codes are rejected before publication. File dependency
+        validation is fatal in file mode and warns for absent/unreadable files
+        in database mode. CP performs structure-only validation without opening
+        node-local files; DP validates and refreshes its node-local files for
+        full snapshots and affected incremental rebuilds. On runtime nodes that
+        construct the plugin, a missing file uses
+        `on_lookup_failure`, while a readable corrupt, incompatible, or
+        wrong-product database is rejected.
+        Exactly one of `allow_countries` and `deny_countries` must be non-empty.
+        Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
       required: [db_path]
+      oneOf:
+        - title: Allow-list mode
+          required: [allow_countries]
+          properties:
+            allow_countries:
+              minItems: 1
+            deny_countries:
+              maxItems: 0
+        - title: Deny-list mode
+          required: [deny_countries]
+          properties:
+            allow_countries:
+              maxItems: 0
+            deny_countries:
+              minItems: 1
       properties:
         db_path:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: >-
-            Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database.
-            Required.
+            Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database no
+            larger than 512 MiB. Across one validation generation/cache build,
+            the verified sizes of all distinct content snapshots must also total
+            no more than 512 MiB; equivalent path spellings with identical
+            verified content are charged once. A changed candidate overlaps the live snapshot;
+            when their combined size exceeds 512 MiB, hot replacement is
+            rejected and the installed database must be loaded by restarting
+            the gateway. Required.
         allow_countries:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/GeoRestrictionCountryCode"
           default: []
           description: >-
             ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
@@ -18735,7 +18823,7 @@ components:
         deny_countries:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/GeoRestrictionCountryCode"
           default: []
           description: >-
             ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
@@ -18747,7 +18835,12 @@ components:
           description: >-
             When true, inject the resolved country code into the proxied
             request as the `x-geo-country` header (uppercase ISO 3166-1
-            alpha-2). HTTP-family proxies only — ignored on TCP/UDP streams.
+            alpha-2). Central header materialization strips any client-supplied
+            value even when no geo plugin is attached. The header remains
+            absent on fail-open lookup paths unless an earlier geo instance
+            already emitted an authoritative value; later non-injecting
+            instances preserve that value. HTTP-family proxies only — ignored
+            on TCP/UDP streams.
         on_lookup_failure:
           type: string
           enum: [allow, deny]
@@ -18761,6 +18854,17 @@ components:
             disables the geo gate. Set this explicitly to `deny` for fail-closed
             behaviour. When the default is used, a one-time warning is logged at
             startup, and the first request-time fail-open is logged at warn.
+
+    GeoRestrictionCountryCode:
+      type: string
+      minLength: 2
+      maxLength: 2
+      pattern: '^(?:[Aa][DdEeFfGgIiLlMmOoQqRrSsTtUuWwXxZz]|[Bb][AaBbDdEeFfGgHhIiJjLlMmNnOoQqRrSsTtVvWwYyZz]|[Cc][AaCcDdFfGgHhIiKkLlMmNnOoRrUuVvWwXxYyZz]|[Dd][EeJjKkMmOoZz]|[Ee][CcEeGgHhRrSsTt]|[Ff][IiJjKkMmOoRr]|[Gg][AaBbDdEeFfGgHhIiLlMmNnPpQqRrSsTtUuWwYy]|[Hh][KkMmNnRrTtUu]|[Ii][DdEeLlMmNnOoQqRrSsTt]|[Jj][EeMmOoPp]|[Kk][EeGgHhIiMmNnPpRrWwYyZz]|[Ll][AaBbCcIiKkRrSsTtUuVvYy]|[Mm][AaCcDdEeFfGgHhKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz]|[Nn][AaCcEeFfGgIiLlOoPpRrUuZz]|[Oo][Mm]|[Pp][AaEeFfGgHhKkLlMmNnRrSsTtWwYy]|[Qq][Aa]|[Rr][EeOoSsUuWw]|[Ss][AaBbCcDdEeGgHhIiJjKkLlMmNnOoRrSsTtVvXxYyZz]|[Tt][CcDdFfGgHhJjKkLlMmNnOoRrTtVvWwZz]|[Uu][AaGgMmSsYyZz]|[Vv][AaCcEeGgIiNnUu]|[Ww][FfSs]|[Xx][Kk]|[Yy][EeTt]|[Zz][AaMmWw])$'
+      description: >-
+        A currently assigned ISO 3166-1 alpha-2 country code, or XK (the
+        user-assigned Kosovo code emitted by MaxMind). Matching is
+        case-insensitive and runtime storage is normalized to uppercase. Other
+        reserved, user-assigned, deleted, and alias codes are rejected.
 
     RateSpec:
       type: object
@@ -19264,8 +19368,9 @@ components:
         or database cross-checks (e.g., duplicate `listen_path`, invalid plugin
         config). For DELETE, removing the spec-owned and cascaded resources
         would leave an invalid transaction-log schema graph or TCP-throttle
-        plugin composition. An authoritative in-transaction rejection may omit
-        `spec_version` and the failure `id`.
+        plugin composition, or the compensation snapshot contains an
+        unrestorable resource. An authoritative in-transaction rejection may
+        omit `spec_version` and the failure `id`.
       properties:
         error:
           type: string
@@ -19281,8 +19386,8 @@ components:
             properties:
               resource_type:
                 type: string
-                enum: [proxy, upstream, plugin, plugin_composition, plugin_graph]
-                description: Kind of resource or aggregate plugin composition that failed
+                enum: [proxy, upstream, upstream_graph, plugin, plugin_composition, plugin_graph, restore_snapshot]
+                description: Kind of resource, upstream/plugin graph, or pre-delete restore snapshot that failed
               id:
                 type: string
                 description: ID of the resource (from the extension object)
