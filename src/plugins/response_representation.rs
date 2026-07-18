@@ -256,20 +256,23 @@ fn is_partial_representation(
         //   shape a fragment whose status was rewritten would take, so it is
         //   still treated as a fragment. Over-detecting here only rejects, and
         //   rejecting is the safe direction.
-        // * A **non-2xx** could not. Per RFC 9110 §15.5, a `4xx`/`5xx` body
-        //   represents the error condition; it is not a slice of the target
-        //   resource, and no range unit is delivered under it. That holds for
-        //   `416` specifically: its `Content-Range` describes the selected
-        //   representation rather than this response's body, which is still a
-        //   complete error document. On any other non-`2xx` status the header is
-        //   stale provider metadata with no defined meaning. Either way it is
-        //   not evidence that *these bytes* are a fragment — and it is the exact
-        //   thing the permitted rewrite's
-        //   `finalize_response_body_transformation` invalidation exists to
-        //   strip. Treating it as fragment evidence would fail closed on
-        //   ordinary provider `416`/`429`/`503` replies while protecting
-        //   nothing: those bodies are complete, fully inspectable documents, and
-        //   the configured policy is applied to them rather than bypassed.
+        // * A **non-2xx** could not, anywhere in the category. A `1xx` carries
+        //   no content at all (RFC 9110 §15.2). A `3xx` body describes the
+        //   redirection and a `4xx`/`5xx` body describes the error condition
+        //   (RFC 9110 §15.4, §15.5, §15.6) — status-specific content, not a
+        //   successfully delivered range or delta of the selected
+        //   representation, and no range unit is delivered under any of them.
+        //   That holds for `416` specifically: its `Content-Range` reports the
+        //   selected representation's length rather than describing this
+        //   response's content, which is still a complete status document. On
+        //   any other non-`2xx` status the header is stale provider metadata
+        //   with no defined meaning. Either way it is not evidence that *these
+        //   bytes* are a fragment — and it is the exact thing the permitted
+        //   rewrite's `finalize_response_body_transformation` invalidation
+        //   exists to strip. Treating it as fragment evidence would fail closed
+        //   on ordinary provider `416`/`429`/`503` replies while protecting
+        //   nothing: those bodies are complete, fully inspectable documents,
+        //   and the configured policy is applied to them rather than bypassed.
         RepresentationOrigin::GatewayGenerated => {
             (200..300).contains(&response_status)
                 && (response_headers.contains_key("content-range")
