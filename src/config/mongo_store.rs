@@ -9316,7 +9316,7 @@ mod inner {
                             connection,
                             prepared_docs,
                             guard_params,
-                            upsert_changes,
+                            mut upsert_changes,
                             namespace,
                             restored_proxy_id,
                             validation_http_client,
