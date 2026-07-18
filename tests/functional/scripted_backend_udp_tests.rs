@@ -235,7 +235,7 @@ impl GatewayFixture {
     }
 
     /// Send `SIGTERM` and wait for the gateway to exit cleanly. The
-    /// `tracing_appender::non_blocking` `WorkerGuard` is dropped during
+    /// bounded process-log worker guard is dropped during
     /// the gateway's normal shutdown path, which flushes any
     /// outstanding log lines through Rust's stdout/stderr writers
     /// (block-buffered when piped to a file). Tests that grep the
