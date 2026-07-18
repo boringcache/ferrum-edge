@@ -6680,12 +6680,8 @@ impl DatabaseStore {
         // 4. INSERT api_specs row.
         self.insert_api_spec_tx(&mut tx, spec).await?;
         if compensation_restore {
-            self.validate_api_spec_restore_candidate_tx(
-                &mut tx,
-                &spec.namespace,
-                &bundle.proxy.id,
-            )
-            .await?;
+            self.validate_api_spec_restore_candidate_tx(&mut tx, &spec.namespace, &bundle.proxy.id)
+                .await?;
         } else {
             // Preserve the normal submission contract: ordinary API-spec
             // writes run the same guarded admission checks as the other

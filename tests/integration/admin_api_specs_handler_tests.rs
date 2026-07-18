@@ -2146,8 +2146,7 @@ async fn api_spec_delete_rejects_foreign_owned_cascade_plugin_without_retagging(
         .await
         .expect("inject foreign API-spec ownership");
 
-    let (delete_status, delete_body) =
-        client.delete_json(&format!("/api-specs/{spec_id}")).await;
+    let (delete_status, delete_body) = client.delete_json(&format!("/api-specs/{spec_id}")).await;
     assert_eq!(
         delete_status,
         reqwest::StatusCode::UNPROCESSABLE_ENTITY,
