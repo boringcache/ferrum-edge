@@ -15334,45 +15334,43 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     let content_type = response_headers.get("content-type").cloned();
     let content_type = content_type.as_deref();
     let mut body_transformed = false;
-    // Range/delta representations (206/226) are only a selected slice, so they
-    // are not rewritten into a truthful full representation here.
-    if crate::plugins::response_body_rewrite_allowed(*response_status) {
-        for plugin in plugins {
-            let transformed = match crate::plugins::await_grpc_deadline(
-                ctx.grpc_deadline_at(),
-                plugin.transform_response_body_with_context(
+    for plugin in plugins {
+        let transformed = match crate::plugins::await_grpc_deadline(
+            ctx.grpc_deadline_at(),
+            plugin.transform_response_body_with_context(
+                ctx,
+                response_body,
+                content_type,
+                response_headers,
+            ),
+        )
+        .await
+        {
+            Ok(transformed) => transformed,
+            Err(()) => {
+                *response_status = replace_buffered_grpc_response_with_deadline(
                     ctx,
+                    grpc_web_response_content_type,
+                    response_headers,
                     response_body,
-                    content_type,
-                    response_headers,
-                ),
-            )
-            .await
-            {
-                Ok(transformed) => transformed,
-                Err(()) => {
-                    *response_status = replace_buffered_grpc_response_with_deadline(
-                        ctx,
-                        grpc_web_response_content_type,
-                        response_headers,
-                        response_body,
-                        initial_response_header_policy_plugins,
-                    )
-                    .as_u16();
-                    return (true, body_transformed);
-                }
-            };
-            if let Some(transformed) = transformed {
-                response_headers
-                    .insert("content-length".to_string(), transformed.len().to_string());
-                *response_body = transformed;
-                crate::plugins::finalize_response_body_transformation(
-                    plugin.as_ref(),
-                    ctx,
-                    response_headers,
-                );
-                body_transformed = true;
+                    initial_response_header_policy_plugins,
+                )
+                .as_u16();
+                return (true, body_transformed);
             }
+        };
+        if let Some(transformed) = transformed {
+            response_headers.insert("content-length".to_string(), transformed.len().to_string());
+            *response_body = transformed;
+            crate::plugins::finalize_response_body_transformation(
+                plugin.as_ref(),
+                ctx,
+                response_headers,
+            );
+            if matches!(*response_status, 206 | 226) {
+                *response_status = 200;
+            }
+            body_transformed = true;
         }
     }
     (false, body_transformed)
@@ -23143,7 +23141,6 @@ async fn handle_proxy_request_inner(
     // JSON fields in the response body before it is sent to the client.
     if !after_proxy_rejected
         && !plugins.is_empty()
-        && crate::plugins::response_body_rewrite_allowed(response_status)
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();

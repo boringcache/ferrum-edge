@@ -6408,10 +6408,7 @@ async fn handle_h3_request(
         }
 
         // transform_response_body hooks — only for buffered responses.
-        if !after_proxy_rejected
-            && !plugins.is_empty()
-            && crate::plugins::response_body_rewrite_allowed(response_status)
-        {
+        if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
             let (deadline_replaced, body_transformed) =
                 crate::proxy::transform_buffered_response_body_with_deadline(
