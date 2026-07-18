@@ -469,7 +469,15 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   normalization, in block or flow mappings), or whose input values carry the
   protected ARM64 target, the pinned Cross image, or the `cross` executable is a
   build-execution surface; a dynamic `uses:` reference fails closed. Benign
-  pinned actions with unrelated inputs stay editable.
+  pinned actions with unrelated inputs stay editable. One narrow exception
+  exists so release downloads can be isolated to exact artifact names, which
+  necessarily name the protected target: for `actions/upload-artifact` and
+  `actions/download-artifact` **pinned to a full commit SHA**, the target
+  string in an artifact `name`/`path`/`pattern` input is not a surface, because
+  those two actions only move files between jobs and cannot start a build. The
+  Cross image, a `cross` executable token, every Cross-enabling input key, any
+  other input key, an unpinned reference, and any other action are all still
+  surfaces; self-test fixtures assert each of those boundaries.
   Heredoc parsing is quote-aware and rejects unterminated bodies. Repository
   working-directory state changes only after each `cd` execution point and is
   rejected when conditional or loop control flow makes it ambiguous. Dockerfile

@@ -480,6 +480,16 @@ CROSS_CAPABLE_ACTION_INPUTS = frozenset(
         "usecrossbuild",
     }
 )
+# Isolating a release download to an exact artifact name requires naming the
+# protected target in that artifact name. `actions/upload-artifact` and
+# `actions/download-artifact` only move files between jobs and cannot start a
+# build, so — and only when pinned to a full commit SHA — the target string in
+# an artifact `name`/`path`/`pattern` is not a build-execution surface. The
+# Cross image, a `cross` executable token, and every Cross-enabling input key
+# remain surfaces for these actions like any other.
+ARTIFACT_TRANSFER_ACTION = re.compile(
+    r"^actions/(?:up|down)load-artifact@[0-9a-f]{40}$"
+)
 REMOTE_ACTION_FIELD = re.compile(
     r"^(?P<lead> *)(?P<dash>-\s+)?(?:uses|'uses'|\"uses\")\s*:\s*(?P<value>.*)$"
 )
@@ -3034,6 +3044,7 @@ def remote_action_surface_lines(
         reason: str | None = None
         if "cross" in re.split(r"[^A-Za-z0-9]+", value.lower()):
             reason = "reference"
+        artifact_transfer = bool(ARTIFACT_TRANSFER_ACTION.match(value))
 
         key_column = len(match.group("lead")) + len(match.group("dash") or "")
         for offset in range(index + 1, len(lines)):
@@ -3064,6 +3075,18 @@ def remote_action_surface_lines(
             )
             if cross_input is not None:
                 reason = f"input:{cross_input}"
+                continue
+            if artifact_transfer and re.match(
+                r"(?:- )?(?:name|path|pattern)\s*:", stripped
+            ):
+                # An artifact name or path is not an execution argument. These
+                # two SHA-pinned first-party actions only move files between
+                # jobs, so naming the protected target in an artifact name
+                # cannot start a build. Everything else about them, including a
+                # `cross` executable token and every Cross-enabling input key,
+                # is still a surface.
+                if EXPECTED_IMAGE in text or STANDALONE_CROSS.search(text):
+                    reason = "input-value"
                 continue
             if TARGET in text or EXPECTED_IMAGE in text or (
                 STANDALONE_CROSS.search(text)
@@ -7848,6 +7871,44 @@ pre_build = []
         "from asyncio import create_subprocess_exec as run\n"
         f"run('cross', {arm_arguments})\n",
     )
+
+    # The artifact-transfer carve-out must stay exactly as narrow as it claims.
+    artifact_action = "actions/download-artifact@" + ("a" * 40)
+    artifact_workflow = (
+        "name: Artifacts\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  publish:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: USES\n"
+        "        with:\n"
+        "          KEY: VALUE\n"
+    )
+
+    def artifact_surface(uses: str, key: str, value: str) -> dict[int, str]:
+        surfaces, _ = remote_action_surface_lines(
+            artifact_workflow.replace("USES", uses)
+            .replace("KEY", key)
+            .replace("VALUE", value),
+            "self-test artifact workflow",
+        )
+        return surfaces
+
+    if artifact_surface(artifact_action, "name", f"binary-{TARGET}"):
+        failures.append("exact ARM64 artifact name was rejected")
+    if artifact_surface(artifact_action, "path", f"downloaded/binary-{TARGET}"):
+        failures.append("exact ARM64 artifact path was rejected")
+    for carve_label, carve_uses, carve_key, carve_value in (
+        ("unpinned artifact action", "actions/download-artifact@v8", "name", f"binary-{TARGET}"),
+        ("non-artifact action", "some/other-action@" + ("b" * 40), "name", f"binary-{TARGET}"),
+        ("artifact action Cross token", artifact_action, "name", "cross"),
+        ("artifact action Cross image", artifact_action, "name", EXPECTED_IMAGE),
+        ("artifact action non-artifact key", artifact_action, "args", TARGET),
+        ("artifact action Cross input key", artifact_action, "use-cross", "true"),
+    ):
+        if not artifact_surface(carve_uses, carve_key, carve_value):
+            failures.append(f"{carve_label} was not protected")
 
     # A `shell: pwsh` body is PowerShell, not POSIX shell.
     powershell_workflow = (
