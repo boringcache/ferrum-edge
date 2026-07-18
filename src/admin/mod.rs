@@ -3654,7 +3654,10 @@ async fn rollback_failed_batch_create(
                         errors.push(format!(
                             "proxy '{}': {}",
                             proxy.id,
-                            redacted_persistence_error_message("batch_rollback_delete_proxy", &error)
+                            redacted_persistence_error_message(
+                                "batch_rollback_delete_proxy",
+                                &error
+                            )
                         ));
                     }
                 }
@@ -3869,11 +3872,10 @@ fn transaction_log_graph_validation_error_message(error: crud::AfterValidateErro
     match error {
         crud::AfterValidateError::BadRequest(errors)
         | crud::AfterValidateError::Conflict(errors) => errors.join("; "),
-        crud::AfterValidateError::Db(error) => redacted_persistence_error_message(
-            "batch_recovery_transaction_log_graph",
-            &error,
-        )
-        .to_string(),
+        crud::AfterValidateError::Db(error) => {
+            redacted_persistence_error_message("batch_recovery_transaction_log_graph", &error)
+                .to_string()
+        }
         crud::AfterValidateError::Response(_) => {
             "transaction-log schema validation returned an HTTP response".to_string()
         }
@@ -6348,9 +6350,7 @@ async fn handle_restore(
                 validation_errors.extend(errors);
             }
             Err(crud::AfterValidateError::Db(_error)) => {
-                warn_persistence_failure_redacted(
-                    "restore_plugin_security_composition_check",
-                );
+                warn_persistence_failure_redacted("restore_plugin_security_composition_check");
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
@@ -6427,9 +6427,7 @@ async fn handle_restore(
         Ok(snapshot) => snapshot,
         Err(error) => {
             if let Err(_release_error) = restore_guard.release().await {
-                error_persistence_failure_redacted(
-                    "restore_guard_release_after_snapshot_failure",
-                );
+                error_persistence_failure_redacted("restore_guard_release_after_snapshot_failure");
             }
             let data_integrity = error
                 .downcast_ref::<SnapshotDataIntegrityError>()
@@ -6581,10 +6579,7 @@ async fn handle_restore(
                     .await
                 {
                     Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
-                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
-                        result,
-                        error: _,
-                    }) => {
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => {
                         error_persistence_failure_redacted(
                             "restore_namespace_admission_lost_after_clear_recovery",
                         );
@@ -6797,10 +6792,7 @@ async fn handle_restore(
             return Ok(
                 match rollback_guard.run_to_completion_while_held(rollback).await {
                     Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
-                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
-                        result,
-                        error: _,
-                    }) => {
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => {
                         error_persistence_failure_redacted(
                             "restore_namespace_admission_lost_after_import_rollback",
                         );
@@ -6858,10 +6850,7 @@ async fn handle_restore(
                 .await
             {
                 Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
-                Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
-                    result,
-                    error: _,
-                }) => {
+                Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => {
                     error_persistence_failure_redacted(
                         "restore_namespace_admission_lost_after_failed_import_rollback",
                     );

@@ -8,8 +8,7 @@ use ferrum_edge::_test_support::{
     admin_database_error_body_for_test, admin_mtls_dns_admission_contention_response,
     admin_mtls_dns_admission_drop_should_release, admin_proxy_route_conflict_message_for_test,
     admin_recovery_persistence_message_for_test, admin_throttle_conflict_message_for_test,
-    admin_wrapped_mtls_conflict_message_for_test,
-    admin_wrapped_mtls_conflict_response_for_test,
+    admin_wrapped_mtls_conflict_message_for_test, admin_wrapped_mtls_conflict_response_for_test,
 };
 use ferrum_edge::admin::{
     AdminState,
@@ -83,10 +82,8 @@ async fn mtls_dns_admission_contention_is_retryable_and_redacted() {
 
 #[tokio::test]
 async fn persistence_failures_are_redacted_from_admin_responses_and_logs() {
-    let raw_backend_detail =
-        "postgres://ferrum:s3cr3t-dsn-password@db.internal:5432/ferrum_prod: relation secret_schema.consumers violates constraint secret_constraint using index secret_index";
-    let raw_unique_detail =
-        "E11000 duplicate key error collection: ferrum.consumers index: secret_index dup key: { credentials.keyauth.key: must-not-escape }";
+    let raw_backend_detail = "postgres://ferrum:s3cr3t-dsn-password@db.internal:5432/ferrum_prod: relation secret_schema.consumers violates constraint secret_constraint using index secret_index";
+    let raw_unique_detail = "E11000 duplicate key error collection: ferrum.consumers index: secret_index dup key: { credentials.keyauth.key: must-not-escape }";
     let writer = SharedAdminLogWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .without_time()
@@ -182,8 +179,7 @@ async fn persistence_failures_are_redacted_from_admin_responses_and_logs() {
 
 #[tokio::test]
 async fn typed_and_static_persistence_conflicts_survive_wrapping_without_context_leaks() {
-    let raw_backend_detail =
-        "insert into secret_schema.consumers on postgres://ferrum:s3cr3t-dsn-password@db.internal:5432/ferrum_prod using secret_constraint";
+    let raw_backend_detail = "insert into secret_schema.consumers on postgres://ferrum:s3cr3t-dsn-password@db.internal:5432/ferrum_prod using secret_constraint";
     let mtls_message = admin_wrapped_mtls_conflict_message_for_test(raw_backend_detail);
     let mtls_response = admin_wrapped_mtls_conflict_response_for_test(raw_backend_detail);
     let throttle_message = admin_throttle_conflict_message_for_test(raw_backend_detail);

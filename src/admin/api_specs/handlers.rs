@@ -176,25 +176,22 @@ where
             result.map_err(classify_db_error)
         }
         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => {
-            crate::admin::warn_persistence_failure_redacted(
-                "api_spec_namespace_admission_lost",
-            );
+            crate::admin::warn_persistence_failure_redacted("api_spec_namespace_admission_lost");
             match result {
                 Ok(result) => {
                     let lost_generation = guard.generation();
                     drop(guard);
-                    let recovery_guard = crate::admin::crud::lock_namespace_config_admission(
-                        db, namespace,
-                    )
-                    .await
-                    .map_err(|_recovery_error| {
-                        crate::admin::error_persistence_failure_redacted(
-                            "api_spec_namespace_admission_reacquire_after_late_write",
-                        );
-                        ApiSpecError::AdmissionUnavailable(
-                            "namespace config admission unavailable".to_string(),
-                        )
-                    })?;
+                    let recovery_guard =
+                        crate::admin::crud::lock_namespace_config_admission(db, namespace)
+                            .await
+                            .map_err(|_recovery_error| {
+                                crate::admin::error_persistence_failure_redacted(
+                                    "api_spec_namespace_admission_reacquire_after_late_write",
+                                );
+                                ApiSpecError::AdmissionUnavailable(
+                                    "namespace config admission unavailable".to_string(),
+                                )
+                            })?;
                     if recovery_guard.immediately_succeeds_generation(lost_generation) {
                         return Ok(result);
                     }
@@ -221,7 +218,9 @@ where
                                 "api_spec_late_write_compensation_admission_lost",
                             );
                         }
-                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Err(_)))
+                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Err(
+                            _,
+                        )))
                         | Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
                             result: Err(_),
                             ..
