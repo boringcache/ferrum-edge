@@ -58,8 +58,8 @@ adding, removing, or materially changing a workflow.
 ```
 Pull Request
     ├─► Trusted Cross Build Policy (`pull_request_target`, base code only)
-            └─► Validate proposed Cross.toml, Cargo metadata, and every
-                workflow invocation surface as hostile data
+            └─► Validate proposed Cross.toml, Cargo metadata, workflows, and
+                repo-local action invocation surfaces as hostile data
     ├─► CI plan
             ├─► Docs/license/agent-only: lightweight Tests aggregate
             └─► Full CI
@@ -370,16 +370,20 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   blocks, inherited top-level `env` mappings, and workflow trigger blocks are
   hashed by the trusted verifier, and merge-base comparison rejects any
   PR-authored mutation while allowing unrelated workflow jobs to evolve. Every
-  `.yml` and `.yaml` file directly under `.github/workflows` is also compared
-  as a collection, so a PR cannot move or add an invocation in a different
-  workflow. Any new or changed Cross executable/configuration token outside
-  the isolated jobs is rejected, including quoted or nested shell/GitHub-
-  interpolated executable spellings, literal or command-position dynamic
-  GitHub expressions, partial or whole opaque command substitutions, Bash
-  brace expansions and ANSI-C escapes, and Cross environment aliases; Bash
-  backslash-newline continuations are normalized before scanning. Unrelated
-  workflow additions and edits remain permitted. The isolated jobs use only
-  pinned external setup actions before revalidation.
+  `.yml` and `.yaml` file directly under `.github/workflows`, plus every regular
+  file recursively under `.github/actions`, is also compared as a collection,
+  so a PR cannot move or add an invocation in a different workflow or a
+  repo-local action. Any new or changed Cross executable/configuration token
+  outside the isolated jobs is rejected, including quoted or nested
+  shell/GitHub-interpolated executable spellings, literal or command-position
+  dynamic GitHub expressions before any Cargo-compatible subcommand or
+  toolchain selector, shell-variable executable indirection, partial or whole
+  opaque command substitutions, Bash brace expansions and ANSI-C escapes, and
+  Cross environment aliases; Bash backslash-newline continuations are
+  normalized before scanning. Cross-sensitive jobs and local-action files are
+  represented by full digests, while unrelated workflow and action additions
+  or edits remain permitted. The isolated jobs use only pinned external setup
+  actions before revalidation.
 - The `needs` fields that connect ARM64 artifacts to `latest-release`, CI and
   release Docker publishing, and `create-release` are separately protected;
   the CI publishers' success conditions are protected too. Only those direct
@@ -396,8 +400,8 @@ The trusted `pull_request_target` job checks out only the base SHA with
 read-only contents permission. It fetches the PR head without checking it out,
 requires the fetched object to equal the immutable head SHA from the triggering
 event, then extracts `Cross.toml`, `Cargo.toml`, and the complete proposed and
-merge-base workflow directories as hostile data, and runs only the base
-branch's verifier. The verifier and trusted workflow are
+merge-base workflow and repo-local action directories as hostile data, and
+runs only the base branch's verifier. The verifier and trusted workflow are
 compared with `HEAD...FETCH_HEAD`, preserving merge-base behavior for stale
 branches while rejecting a PR-authored modification, mode change, rename, or
 deletion. On pull requests, the ordinary `CI Plan` executes the base branch's

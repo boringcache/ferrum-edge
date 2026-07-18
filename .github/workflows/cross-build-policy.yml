@@ -47,6 +47,8 @@ jobs:
           merge_base_release="$RUNNER_TEMP/merge-base-release.yml"
           proposed_workflows="$RUNNER_TEMP/proposed-workflows"
           merge_base_workflows="$RUNNER_TEMP/merge-base-workflows"
+          proposed_actions="$RUNNER_TEMP/proposed-actions"
+          merge_base_actions="$RUNNER_TEMP/merge-base-actions"
           git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
           fetched_head="$(git rev-parse FETCH_HEAD)"
           if [ "$fetched_head" != "$PR_HEAD_SHA" ]; then
@@ -104,6 +106,31 @@ jobs:
           extract_workflows FETCH_HEAD "$proposed_workflows"
           extract_workflows "$merge_base" "$merge_base_workflows"
 
+          extract_actions() {
+            local commit="$1"
+            local destination="$2"
+            local path relative entry output
+            mkdir -p "$destination"
+            while IFS= read -r -d '' path; do
+              relative="${path#.github/actions/}"
+              if [[ ! "$relative" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
+                echo "::error file=${path}::unsupported local-action path" >&2
+                return 1
+              fi
+              entry="$(git ls-tree "$commit" -- "$path")"
+              if [[ "$entry" != "100644 blob "* && "$entry" != "100755 blob "* ]]; then
+                echo "::error file=${path}::local-action input must be a regular blob" >&2
+                return 1
+              fi
+              output="${destination}/${relative}"
+              mkdir -p "$(dirname "$output")"
+              git show "${commit}:${path}" > "$output"
+            done < <(git ls-tree -rz --name-only "$commit" -- .github/actions)
+          }
+
+          extract_actions FETCH_HEAD "$proposed_actions"
+          extract_actions "$merge_base" "$merge_base_actions"
+
           python3 -I .github/scripts/verify_cross_build_policy.py \
             --self-test \
             --config "$proposed_cross" \
@@ -115,4 +142,6 @@ jobs:
             --merge-base-release-workflow "$merge_base_release" \
             --proposed-release-workflow "$proposed_release" \
             --merge-base-workflows-dir "$merge_base_workflows" \
-            --proposed-workflows-dir "$proposed_workflows"
+            --proposed-workflows-dir "$proposed_workflows" \
+            --merge-base-actions-dir "$merge_base_actions" \
+            --proposed-actions-dir "$proposed_actions"

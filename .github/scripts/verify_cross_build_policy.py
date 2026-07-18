@@ -118,8 +118,9 @@ CROSS_ENVIRONMENT = re.compile(
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
 )
 CROSS_COMMAND_CONTEXT = re.compile(
-    r"(?:^|(?:run|shell):\s*|(?:&&|\|\||;|\|)\s*)cross\s+"
-    r"(?:build|check|test|run)\b|cargo\s+install(?:\s+--[^\s]+)*\s+cross\b"
+    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;|\||\()\s*|"
+    r"\b(?:if|elif|while|until|then|do|else|time|command|exec|sudo|nohup)\s+)"
+    r"cross(?=\s+\S)|cargo\s+install(?:\s+--[^\s]+)*\s+cross\b"
 )
 SHELL_INTERPOLATION = re.compile(
     r"\$\{[^{}\n]*\}|`[^`\n]*`|"
@@ -675,6 +676,15 @@ def replace_command_substitutions(line: str, *, literal: bool) -> str:
     return "".join(parts)
 
 
+def has_cross_command_context(candidate: str) -> bool:
+    """Recognize Cross in an executable slot, including ordinary shell quotes."""
+
+    return any(
+        CROSS_COMMAND_CONTEXT.search(variant)
+        for variant in (candidate, re.sub(r"[\\'\"]", "", candidate))
+    )
+
+
 def opaque_command_completion_variants(line: str) -> tuple[str, ...]:
     """Expose opaque substitutions that can complete a literal Cross token."""
 
@@ -692,11 +702,11 @@ def opaque_command_completion_variants(line: str) -> tuple[str, ...]:
         for fragment in fragments:
             if f"{prefix}{fragment}{suffix}" == "cross":
                 candidate = line[:start] + fragment + line[end:]
-                if CROSS_COMMAND_CONTEXT.search(candidate):
+                if has_cross_command_context(candidate):
                     variants.append(candidate)
         if not prefix and not suffix:
             candidate = line[:start] + "cross" + line[end:]
-            if CROSS_COMMAND_CONTEXT.search(candidate):
+            if has_cross_command_context(candidate):
                 variants.append(candidate)
     return tuple(variants)
 
@@ -730,11 +740,38 @@ def opaque_github_expression_variants(line: str) -> tuple[str, ...]:
         for fragment in fragments:
             if f"{prefix}{fragment}{suffix}" == "cross":
                 candidate = line[:start] + fragment + line[end:]
-                if CROSS_COMMAND_CONTEXT.search(candidate):
+                if has_cross_command_context(candidate):
                     variants.append(candidate)
         if not prefix and not suffix:
             candidate = line[:start] + "cross" + line[end:]
-            if CROSS_COMMAND_CONTEXT.search(candidate):
+            if has_cross_command_context(candidate):
+                variants.append(candidate)
+    return tuple(variants)
+
+
+def opaque_shell_interpolation_variants(line: str) -> tuple[str, ...]:
+    """Expose a shell interpolation that can occupy a Cross executable word."""
+
+    variants: list[str] = []
+    fragments = {
+        "cross"[start:end]
+        for start in range(len("cross"))
+        for end in range(start + 1, len("cross") + 1)
+    }
+    for match in SHELL_INTERPOLATION.finditer(line):
+        start, end = match.span()
+        prefix_match = re.search(r"[A-Za-z]+$", line[:start])
+        suffix_match = re.match(r"[A-Za-z]+", line[end:])
+        prefix = prefix_match.group() if prefix_match is not None else ""
+        suffix = suffix_match.group() if suffix_match is not None else ""
+        for fragment in fragments:
+            if f"{prefix}{fragment}{suffix}" == "cross":
+                candidate = line[:start] + fragment + line[end:]
+                if has_cross_command_context(candidate):
+                    variants.append(candidate)
+        if not prefix and not suffix:
+            candidate = line[:start] + "cross" + line[end:]
+            if has_cross_command_context(candidate):
                 variants.append(candidate)
     return tuple(variants)
 
@@ -862,12 +899,18 @@ def brace_expansion_variants(value: str) -> tuple[str, ...]:
             return tuple(variants)
 
 
-def scan_variants(line: str) -> tuple[str, ...]:
+def scan_variants(
+    line: str,
+    *,
+    include_opaque_shell_executable: bool = False,
+) -> tuple[str, ...]:
     """Expose ordinary YAML/shell quoting variants to the lexical boundary."""
 
     variants = [line]
     variants.extend(opaque_command_completion_variants(line))
     variants.extend(opaque_github_expression_variants(line))
+    if include_opaque_shell_executable:
+        variants.extend(opaque_shell_interpolation_variants(line))
     variants.extend(ansi_c_quoted_variants(line))
     collapsed = re.sub(r"[\\'\"]", "", line)
     if collapsed != line:
@@ -906,14 +949,21 @@ def scan_variants(line: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(expanded_variants))
 
 
-def contains_cross_surface(contents: str) -> bool:
+def contains_cross_surface(
+    contents: str,
+    *,
+    include_opaque_shell_executable: bool = False,
+) -> bool:
     """Return whether lexical normalization exposes a Cross-controlled input."""
 
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
     return any(
         STANDALONE_CROSS.search(variant) or CROSS_ENVIRONMENT.search(variant)
         for line in logical_contents.splitlines()
-        for variant in scan_variants(line)
+        for variant in scan_variants(
+            line,
+            include_opaque_shell_executable=include_opaque_shell_executable,
+        )
     )
 
 
@@ -923,6 +973,7 @@ def unprotected_cross_surfaces(
     job_name: str,
     *,
     required_job: bool,
+    include_opaque_shell_executable: bool = False,
 ) -> tuple[tuple[str, ...], list[str]]:
     """Return Cross executable/config tokens outside the isolated trusted job."""
 
@@ -981,7 +1032,10 @@ def unprotected_cross_surfaces(
 
         logical_contents = re.sub(r"\\\r?\n[ \t]*", "", block_contents)
         for logical_line in logical_contents.splitlines():
-            for variant in scan_variants(logical_line):
+            for variant in scan_variants(
+                logical_line,
+                include_opaque_shell_executable=include_opaque_shell_executable,
+            ):
                 if STANDALONE_CROSS.search(variant) or CROSS_ENVIRONMENT.search(variant):
                     sensitive_jobs.add(name)
                     break
@@ -991,7 +1045,10 @@ def unprotected_cross_surfaces(
     top_level_surfaces: list[str] = []
     for index, line in enumerate(lines):
         line_surfaces: set[str] = set()
-        for variant in scan_variants(line):
+        for variant in scan_variants(
+            line,
+            include_opaque_shell_executable=include_opaque_shell_executable,
+        ):
             normalized = re.sub(r"\s+", " ", variant).strip()
             if STANDALONE_CROSS.search(variant):
                 line_surfaces.add(f"executable:{normalized}")
@@ -1016,19 +1073,25 @@ def unprotected_cross_surfaces(
 def generic_workflow_cross_surfaces(
     contents: str,
     source: str,
+    *,
+    include_opaque_shell_executable: bool = False,
 ) -> tuple[tuple[str, ...], list[str]]:
     """Scan a workflow that must not contain any Cross-controlled surface."""
 
     # Avoid imposing a YAML layout contract on unrelated workflows. As soon as
     # a Cross token is exposed, however, parse the job layout conservatively so
     # malformed, duplicate, and alias-shaped jobs fail closed.
-    if not contains_cross_surface(contents):
+    if not contains_cross_surface(
+        contents,
+        include_opaque_shell_executable=include_opaque_shell_executable,
+    ):
         return (), []
     return unprotected_cross_surfaces(
         contents,
         source,
         "__no_unprotected_cross_job__",
         required_job=False,
+        include_opaque_shell_executable=include_opaque_shell_executable,
     )
 
 
@@ -1073,10 +1136,12 @@ def compare_pr_workflow_collection(
         baseline_surfaces, baseline_failures = generic_workflow_cross_surfaces(
             baseline_contents,
             f"merge-base {source}/{name}",
+            include_opaque_shell_executable=True,
         )
         proposed_surfaces, proposed_failures = generic_workflow_cross_surfaces(
             proposed_contents,
             f"proposed {source}/{name}",
+            include_opaque_shell_executable=True,
         )
         errors.extend(baseline_failures)
         errors.extend(proposed_failures)
@@ -1086,6 +1151,60 @@ def compare_pr_workflow_collection(
                     f"{source}/{name} cannot add or change Cross executable/"
                     "configuration surfaces"
                 )
+    return errors
+
+
+def generic_action_cross_surfaces(
+    contents: str,
+    *,
+    include_opaque_shell_executable: bool = False,
+) -> tuple[str, ...]:
+    """Represent every Cross-sensitive local-action file by its full digest."""
+
+    if not contains_cross_surface(
+        contents,
+        include_opaque_shell_executable=include_opaque_shell_executable,
+    ):
+        return ()
+    digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+    return (f"file:{digest}",)
+
+
+def validate_action_collection(actions: dict[str, str], source: str) -> list[str]:
+    """Reject Cross executable/configuration inputs in repo-local actions."""
+
+    errors: list[str] = []
+    for name, contents in sorted(actions.items()):
+        if generic_action_cross_surfaces(contents):
+            errors.append(
+                f"{source}/{name} contains an unprotected Cross executable or "
+                "configuration input"
+            )
+    return errors
+
+
+def compare_pr_action_collection(
+    merge_base_actions: dict[str, str],
+    proposed_actions: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Permit benign local-action edits while freezing Cross-sensitive files."""
+
+    errors: list[str] = []
+    for name in sorted(set(merge_base_actions) | set(proposed_actions)):
+        baseline_surfaces = generic_action_cross_surfaces(
+            merge_base_actions.get(name, ""),
+            include_opaque_shell_executable=True,
+        )
+        proposed_surfaces = generic_action_cross_surfaces(
+            proposed_actions.get(name, ""),
+            include_opaque_shell_executable=True,
+        )
+        if baseline_surfaces != proposed_surfaces:
+            errors.append(
+                f"{source}/{name} cannot add or change Cross executable/"
+                "configuration surfaces"
+            )
     return errors
 
 
@@ -1211,12 +1330,14 @@ def compare_pr_workflow_job(
         f"merge-base {source}",
         job_name,
         required_job=False,
+        include_opaque_shell_executable=True,
     )
     proposed_surfaces, proposed_surface_failures = unprotected_cross_surfaces(
         proposed_contents,
         f"proposed {source}",
         job_name,
         required_job=False,
+        include_opaque_shell_executable=True,
     )
     errors.extend(baseline_surface_failures)
     errors.extend(proposed_surface_failures)
@@ -1633,6 +1754,16 @@ pre_build = []
             "${{ github.event.pull_request.title }} build "
             "--target aarch64-unknown-linux-gnu",
         ),
+        "unprotected dynamic GitHub rustc expression": workflow.replace(
+            "echo safe",
+            "${{ github.event.pull_request.title }} rustc "
+            "--target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected dynamic GitHub toolchain expression": workflow.replace(
+            "echo safe",
+            "${{ github.event.pull_request.title }} +nightly build "
+            "--target aarch64-unknown-linux-gnu",
+        ),
         "unprotected Bash brace expansion": workflow.replace(
             "echo safe",
             "cr{o,}ss build --target aarch64-unknown-linux-gnu",
@@ -1738,6 +1869,20 @@ pre_build = []
         "protected-arm",
     ):
         failures.append("merge-base comparison allowed an unprotected Cross invocation")
+    changed_shell_variable_cross = benign_workflow.replace(
+        "echo unrelated-edit",
+        "|\n          cmd=$(printf '\\143\\162\\157\\163\\163')\n"
+        '          "$cmd" build --target aarch64-unknown-linux-gnu',
+    )
+    if not compare_pr_workflow_job(
+        workflow,
+        changed_shell_variable_cross,
+        "current workflow",
+        "protected-arm",
+    ):
+        failures.append(
+            "merge-base comparison allowed a shell-variable Cross executable"
+        )
     if not compare_pr_workflow_job(
         merge_base_without_job,
         workflow,
@@ -1793,6 +1938,78 @@ pre_build = []
         "self-test workflow directory",
     ):
         failures.append("malformed Cross workflow was not rejected")
+
+    safe_action = (
+        "name: Safe local action\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - shell: bash\n"
+        "      run: echo safe\n"
+    )
+    benign_action_edit = safe_action.replace("echo safe", "echo still-safe")
+    if validate_action_collection(
+        {"setup/action.yml": safe_action},
+        "self-test local-action directory",
+    ):
+        failures.append("safe local action was rejected")
+    if compare_pr_action_collection(
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": benign_action_edit},
+        "self-test local-action directory",
+    ):
+        failures.append("benign local-action edit was rejected")
+
+    cross_action = safe_action.replace(
+        "echo safe",
+        "cross build --target aarch64-unknown-linux-gnu",
+    )
+    if not validate_action_collection(
+        {"setup/action.yml": cross_action},
+        "self-test local-action directory",
+    ):
+        failures.append("local-action Cross invocation was not rejected")
+    if not compare_pr_action_collection(
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": cross_action},
+        "self-test local-action directory",
+    ):
+        failures.append("merge-base comparison allowed local-action Cross invocation")
+
+    cross_action_environment = safe_action.replace(
+        "echo safe",
+        "echo CROSS_CONFIG=attacker.toml >> $GITHUB_ENV",
+    )
+    if not compare_pr_action_collection(
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": cross_action_environment},
+        "self-test local-action directory",
+    ):
+        failures.append("merge-base comparison allowed local-action Cross environment")
+
+    dynamic_action = safe_action.replace(
+        "echo safe",
+        "${{ github.event.pull_request.title }} rustc "
+        "--target aarch64-unknown-linux-gnu",
+    )
+    if not compare_pr_action_collection(
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": dynamic_action},
+        "self-test local-action directory",
+    ):
+        failures.append("merge-base comparison allowed dynamic local-action Cross")
+
+    variable_action = safe_action.replace(
+        "echo safe",
+        "|\n        cmd=$(printf '\\143\\162\\157\\163\\163')\n"
+        '        "$cmd" build --target aarch64-unknown-linux-gnu',
+    )
+    if not compare_pr_action_collection(
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": variable_action},
+        "self-test local-action directory",
+    ):
+        failures.append("merge-base comparison allowed variable local-action Cross")
 
     ci_publish_contract = PUBLISH_CONTROL_CONTRACTS["CI workflow"]
     publish_workflow = (
@@ -1894,6 +2111,42 @@ def load_workflow_directory(
     return workflows, errors
 
 
+def load_action_directory(
+    path: Path,
+    label: str,
+) -> tuple[dict[str, str], list[str]]:
+    """Load every repo-local action file without following filesystem aliases."""
+
+    if path.is_symlink() or not path.is_dir():
+        return {}, [f"{label} must be a non-symlink directory"]
+
+    actions: dict[str, str] = {}
+    errors: list[str] = []
+    directories = [path]
+    while directories:
+        directory = directories.pop()
+        try:
+            entries = sorted(directory.iterdir(), key=lambda entry: entry.name)
+        except OSError as error:
+            errors.append(f"cannot list {label}: {error}")
+            continue
+        for entry in entries:
+            relative = entry.relative_to(path).as_posix()
+            if entry.is_symlink():
+                errors.append(f"{label}/{relative} must not be a symlink")
+            elif entry.is_dir():
+                directories.append(entry)
+            elif entry.is_file():
+                contents, failures = load_workflow(entry, f"{label}/{relative}")
+                errors.extend(failures)
+                if not failures:
+                    assert contents is not None
+                    actions[relative] = contents
+            else:
+                errors.append(f"{label}/{relative} must be a regular file or directory")
+    return actions, errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path("Cross.toml"))
@@ -1915,8 +2168,15 @@ def main() -> int:
         type=Path,
         default=Path(".github/workflows"),
     )
+    parser.add_argument(
+        "--actions-dir",
+        type=Path,
+        default=Path(".github/actions"),
+    )
     parser.add_argument("--merge-base-workflows-dir", type=Path)
     parser.add_argument("--proposed-workflows-dir", type=Path)
+    parser.add_argument("--merge-base-actions-dir", type=Path)
+    parser.add_argument("--proposed-actions-dir", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -1967,6 +2227,14 @@ def main() -> int:
     if not workflow_directory_failures:
         failures.extend(validate_workflow_collection(workflows, "workflow directory"))
 
+    actions, action_directory_failures = load_action_directory(
+        args.actions_dir,
+        "local-action directory",
+    )
+    failures.extend(action_directory_failures)
+    if not action_directory_failures:
+        failures.extend(validate_action_collection(actions, "local-action directory"))
+
     pr_paths = (
         args.merge_base_ci_workflow,
         args.proposed_ci_workflow,
@@ -1974,6 +2242,8 @@ def main() -> int:
         args.proposed_release_workflow,
         args.merge_base_workflows_dir,
         args.proposed_workflows_dir,
+        args.merge_base_actions_dir,
+        args.proposed_actions_dir,
     )
     if any(path is not None for path in pr_paths) and not all(
         path is not None for path in pr_paths
@@ -2028,6 +2298,27 @@ def main() -> int:
                 )
             )
 
+        assert args.merge_base_actions_dir is not None
+        assert args.proposed_actions_dir is not None
+        merge_base_actions, merge_base_action_failures = load_action_directory(
+            args.merge_base_actions_dir,
+            "merge-base local-action directory",
+        )
+        proposed_actions, proposed_action_failures = load_action_directory(
+            args.proposed_actions_dir,
+            "proposed local-action directory",
+        )
+        failures.extend(merge_base_action_failures)
+        failures.extend(proposed_action_failures)
+        if not merge_base_action_failures and not proposed_action_failures:
+            failures.extend(
+                compare_pr_action_collection(
+                    merge_base_actions,
+                    proposed_actions,
+                    "local-action directory",
+                )
+            )
+
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     if failures:
@@ -2035,7 +2326,7 @@ def main() -> int:
 
     print(
         "ARM64 Cross 0.2.5 configuration, Cargo metadata, and isolated "
-        "workflow invocations match the complete trusted policy."
+        "workflow/local-action invocations match the complete trusted policy."
     )
     return 0
 
