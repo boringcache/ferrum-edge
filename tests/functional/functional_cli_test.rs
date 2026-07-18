@@ -678,6 +678,96 @@ async fn functional_cli_validate_redacts_resolved_value_in_settings_error() {
     );
 }
 
+/// Redaction must read the original diagnostic only, never the text it just
+/// substituted.
+///
+/// Every value staged here is a substring of `EXTERNAL_SECRET_PLACEHOLDER`
+/// (`<redacted: value from external secret source>`), so a redactor that
+/// loops `replace()` over the running message
+/// feeds each pass the placeholders emitted by the previous one. Each short
+/// value then multiplies the diagnostic by that character's density in the
+/// placeholder, and ten externally resolved values are enough to turn one
+/// startup error into megabytes — a validation-time memory/CPU exhaustion
+/// reachable by config alone. `a` is staged under two keys to cover duplicate
+/// values, and `f` collides with the sentinel's first character so the run also
+/// pins longest-match-first.
+///
+/// The load-bearing assertion is the *intact* placeholder: substitution output
+/// is only ever appended, so it survives passes that would otherwise replace its
+/// own `a`/`e`/`s`. A re-scanning redactor shreds its own placeholders and
+/// cannot satisfy it. The length bound then covers the amplification directly.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_bounds_redaction_of_short_secret_values() {
+    // Invalid only because of the trailing `!`. `validate_namespace()`
+    // interpolates the offending value into a hand-written message, which is the
+    // class of diagnostic this backstop exists for — unlike a typed `EnvConfig`
+    // parse failure, which already withholds the value by key at
+    // `invalid_env_value`.
+    const SENTINEL: &str = "ferrum-redaction-sentinel-must-not-be-printed!";
+    const PROBE_VALUES: &[&str] = &[
+        "external", "source", "value", "a", "a", "e", "f", "o", "r", "s",
+    ];
+    // ~30x headroom over the bounded output (the diagnostic is a few hundred
+    // characters and each can expand to one placeholder at most), and well
+    // under the amplified megabytes.
+    const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+    let temp_dir = TempDir::new().unwrap();
+    let namespace_path = temp_dir.path().join("namespace");
+    std::fs::write(&namespace_path, SENTINEL).unwrap();
+
+    let mut cmd = validate_database_mode_command(&temp_dir);
+    cmd.env("FERRUM_NAMESPACE_FILE", namespace_path.to_str().unwrap())
+        // The default 64 KiB per-record cap would truncate an amplified
+        // diagnostic into looking bounded. Raised to the maximum so the
+        // assertion observes the string redaction actually built.
+        .env("FERRUM_LOG_MAX_RECORD_BYTES", "1048576");
+
+    for (index, value) in PROBE_VALUES.iter().enumerate() {
+        let probe_path = temp_dir.path().join(format!("probe-{index}"));
+        std::fs::write(&probe_path, value).unwrap();
+        // Unrecognized `FERRUM_*` names are inert for settings parsing but are
+        // still discovered by secret resolution, so each adds a resolved value
+        // without perturbing the diagnostic under test.
+        cmd.env(
+            format!("FERRUM_REDACTION_PROBE_{index}_FILE"),
+            probe_path.to_str().unwrap(),
+        );
+    }
+
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "an invalid resolved namespace must fail validation: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(ferrum_edge::secrets::EXTERNAL_SECRET_PLACEHOLDER),
+        "an intact placeholder must survive redaction, proving substituted text \
+         is not itself re-scanned: {stderr}"
+    );
+    assert!(
+        !stderr.contains(SENTINEL) && !stdout.contains(SENTINEL),
+        "externally resolved secret values must never be printed: \
+         stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.len() <= MAX_OUTPUT_BYTES && stdout.len() <= MAX_OUTPUT_BYTES,
+        "redaction output must stay bounded in the original diagnostic, got \
+         stdout={} bytes, stderr={} bytes",
+        stdout.len(),
+        stderr.len()
+    );
+}
+
 /// `loaded_sources` is derived from `HashMap` iteration over the environment,
 /// so without an explicit sort two runs on identical input can print the report
 /// lines in different orders.

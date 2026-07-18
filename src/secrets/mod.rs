@@ -93,6 +93,15 @@ pub fn is_external_secret_key(key: &str) -> bool {
 /// still a secret, and mangling an unrelated substring of a diagnostic is
 /// strictly preferable to printing the secret. Longest values are replaced
 /// first so one secret that contains another cannot leave a fragment behind.
+///
+/// Matching runs against the *original* diagnostic only. Substituted
+/// placeholders are never re-examined, so a resolved value that happens to be a
+/// substring of [`EXTERNAL_SECRET_PLACEHOLDER`] (`value`, `external`, `a`)
+/// cannot make one replacement's output the next replacement's input. A
+/// repeated-substitution loop over the running message compounds instead:
+/// n such values multiply the diagnostic by roughly the placeholder's density
+/// of each, which turns a handful of externally resolved short secrets into a
+/// validation-time memory/CPU exhaustion. See [`redact_values`] for the bound.
 pub fn redact_external_secret_values(message: &str) -> String {
     let Some(keys) = EXTERNAL_SECRET_KEYS.get() else {
         return message.to_string();
@@ -103,15 +112,55 @@ pub fn redact_external_secret_values(message: &str) -> String {
         .filter_map(|key| std::env::var(key).ok())
         .filter(|value| !value.is_empty())
         .collect();
+    // Distinct values only: two keys holding the same secret describe one span,
+    // and a duplicate would otherwise be scanned (and charged for) twice.
+    values.sort_unstable();
+    values.dedup();
+    // Longest first, so the find below yields the longest match at a position.
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
 
-    let mut message = message.to_string();
-    for value in values {
-        if message.contains(&value) {
-            message = message.replace(&value, EXTERNAL_SECRET_PLACEHOLDER);
+    redact_values(message, &values)
+}
+
+/// Single left-to-right pass over `message`, substituting the longest matching
+/// value at each position.
+///
+/// `values` must be non-empty strings ordered longest-first. The cursor only
+/// ever advances — past a matched value, or by one character — so every byte of
+/// the original is examined once and no generated placeholder text re-enters
+/// matching. Output is therefore bounded by
+/// `message.chars().count() * EXTERNAL_SECRET_PLACEHOLDER.len()` regardless of
+/// how many values are configured or how short they are, and the work is
+/// `O(message.len() * values.len() * longest_value.len())`.
+fn redact_values(message: &str, values: &[String]) -> String {
+    if values.is_empty() {
+        return message.to_string();
+    }
+
+    let mut out = String::with_capacity(message.len());
+    // Start of the not-yet-copied literal run, and the scan position.
+    let mut copied = 0usize;
+    let mut cursor = 0usize;
+
+    while cursor < message.len() {
+        let rest = &message[cursor..];
+        if let Some(matched) = values.iter().find(|value| rest.starts_with(value.as_str())) {
+            out.push_str(&message[copied..cursor]);
+            out.push_str(EXTERNAL_SECRET_PLACEHOLDER);
+            cursor += matched.len();
+            copied = cursor;
+            continue;
+        }
+        // Advance a whole character, so `cursor` only ever sits on a character
+        // boundary and the slicing above cannot panic on multi-byte input.
+        match rest.chars().next() {
+            Some(next) => cursor += next.len_utf8(),
+            None => break,
         }
     }
-    message
+
+    out.push_str(&message[copied..]);
+    out
 }
 
 // Azure Key Vault credential injection + reference parsing are exposed so the
