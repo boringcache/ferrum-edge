@@ -3660,6 +3660,19 @@ impl ConfigApplyOutcome {
     }
 }
 
+struct StagedIncrementalRequestEpoch {
+    request_epoch: StagedRequestEpoch,
+    proxy_plugin_rebuild_count: usize,
+}
+
+pub(crate) fn plugin_rebuild_targets_for_incremental_stage(
+    current_config: &GatewayConfig,
+    candidate_config: &GatewayConfig,
+    delta: &crate::config_delta::ConfigDelta,
+) -> HashSet<String> {
+    delta.proxy_ids_needing_plugin_rebuild(current_config, candidate_config)
+}
+
 /// Shared state for the proxy engine.
 #[derive(Clone)]
 pub struct ProxyState {
@@ -7237,8 +7250,10 @@ impl ProxyState {
         new_config: &GatewayConfig,
         staged_config: Arc<GatewayConfig>,
         delta: &crate::config_delta::ConfigDelta,
-    ) -> Result<StagedRequestEpoch, String> {
-        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
+    ) -> Result<StagedIncrementalRequestEpoch, String> {
+        let proxy_ids_to_rebuild =
+            plugin_rebuild_targets_for_incremental_stage(&current.config, new_config, delta);
+        let proxy_plugin_rebuild_count = proxy_ids_to_rebuild.len();
         let rebuild_globals = delta.global_plugin_configs_changed;
         // A route-indexed proxy delta OR a change to the route table's mesh
         // inputs (e.g. `mesh.local_inbound_tcp_routes`, invisible to `ConfigDelta`)
@@ -7278,14 +7293,17 @@ impl ProxyState {
             Arc::clone(&current.route_table)
         };
 
-        Ok(StagedRequestEpoch {
-            config: staged_config,
-            route_table,
-            plugin_cache: plugin_inner,
-            consumer_index: consumer_inner,
-            load_balancer,
-            route_changed,
-            lb_changed,
+        Ok(StagedIncrementalRequestEpoch {
+            request_epoch: StagedRequestEpoch {
+                config: staged_config,
+                route_table,
+                plugin_cache: plugin_inner,
+                consumer_index: consumer_inner,
+                load_balancer,
+                route_changed,
+                lb_changed,
+            },
+            proxy_plugin_rebuild_count,
         })
     }
 
@@ -7524,13 +7542,12 @@ impl ProxyState {
         }
 
         let mut applied_delta = None;
-        // `Cell` so both `update_config` closures can share access — closure 1
-        // writes via `set()` (requires only `&Cell`), closure 2 reads via
-        // `get()`. A plain `let mut route_changed = false` would force closure
-        // 1 to capture `&mut bool` and closure 2 `&bool` simultaneously, which
-        // the borrow checker rejects even though both closures are `FnOnce`
-        // and never run concurrently.
+        // `Cell` lets the staging closure carry accepted-snapshot facts into
+        // the publish mirror and post-publish maintenance. Plain mutable locals
+        // would force incompatible mutable/immutable captures across the two
+        // `FnOnce` closures even though they never run concurrently.
         let route_changed = std::cell::Cell::new(false);
+        let proxy_plugin_rebuild_count = std::cell::Cell::new(0usize);
         let staged_config = Arc::new(new_config.clone());
         let publish_result = self.request_epoch.update_config(
             |current| {
@@ -7593,9 +7610,10 @@ impl ProxyState {
                     Arc::clone(&staged_config),
                     &delta,
                 )?;
-                route_changed.set(staged.route_changed);
+                route_changed.set(staged.request_epoch.route_changed);
+                proxy_plugin_rebuild_count.set(staged.proxy_plugin_rebuild_count);
                 applied_delta = Some(delta);
-                Ok(Some(staged))
+                Ok(Some(staged.request_epoch))
             },
             |published| {
                 self.mirror_request_epoch_wrappers(published, route_changed.get(), false);
@@ -7632,7 +7650,7 @@ impl ProxyState {
             debug!("Config update: mesh-only change republished (caches reused)");
             return ConfigApplyOutcome::Applied;
         };
-        let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
+        let proxy_plugin_rebuild_count = proxy_plugin_rebuild_count.get();
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -7767,11 +7785,12 @@ impl ProxyState {
             + delta.added_plugin_configs.len()
             + delta.removed_plugin_config_ids.len()
             + delta.modified_plugin_configs.len()
+            + delta.plugin_association_changed_proxy_ids.len()
             + delta.added_upstreams.len()
             + delta.removed_upstream_ids.len()
             + delta.modified_upstreams.len();
         info!(
-            "Config updated incrementally: {} changes (proxies: +{} -{} ~{}, consumers: +{} -{} ~{}, plugins: +{} -{} ~{}, upstreams: +{} -{} ~{}, {} proxy plugin lists rebuilt)",
+            "Config updated incrementally: {} changes (proxies: +{} -{} ~{}, consumers: +{} -{} ~{}, plugins: +{} -{} ~{}, plugin associations: ~{}, upstreams: +{} -{} ~{}, {} proxy plugin lists rebuilt)",
             total_changes,
             delta.added_proxies.len(),
             delta.removed_proxy_ids.len(),
@@ -7782,6 +7801,7 @@ impl ProxyState {
             delta.added_plugin_configs.len(),
             delta.removed_plugin_config_ids.len(),
             delta.modified_plugin_configs.len(),
+            delta.plugin_association_changed_proxy_ids.len(),
             delta.added_upstreams.len(),
             delta.removed_upstream_ids.len(),
             delta.modified_upstreams.len(),
@@ -8011,9 +8031,9 @@ impl ProxyState {
                     Arc::clone(&staged_config),
                     &delta,
                 )?;
-                route_changed.set(staged.route_changed);
+                route_changed.set(staged.request_epoch.route_changed);
                 applied_delta = Some(delta);
-                Ok(Some(staged))
+                Ok(Some(staged.request_epoch))
             },
             |published| {
                 self.mirror_request_epoch_wrappers(published, route_changed.get(), false);

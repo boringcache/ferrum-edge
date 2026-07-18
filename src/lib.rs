@@ -160,6 +160,24 @@ pub mod _test_support {
         crate::plugin_cache::validate_plugin_composition_candidate(config, &http_client)
     }
 
+    /// Exercise the mesh RTDS generation reconciliation boundary without
+    /// widening its runtime API beyond the crate.
+    pub fn reconcile_fault_plugin_generations_for_test(
+        candidate: &mut crate::config::types::GatewayConfig,
+        previous: &crate::config::types::GatewayConfig,
+    ) {
+        crate::modes::mesh::reconcile_fault_plugin_generations(candidate, previous);
+    }
+
+    /// Return the exact proxy targets used by incremental plugin-cache staging.
+    pub fn incremental_plugin_rebuild_targets_for_test(
+        current: &crate::config::types::GatewayConfig,
+        candidate: &crate::config::types::GatewayConfig,
+    ) -> HashSet<String> {
+        let delta = crate::config_delta::ConfigDelta::compute(current, candidate);
+        crate::proxy::plugin_rebuild_targets_for_incremental_stage(current, candidate, &delta)
+    }
+
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
     pub fn grpc_deadline_duration_millis_ceil_saturating_for_test(
         duration: std::time::Duration,
