@@ -26,8 +26,8 @@ pub fn resolve_ref(key: &str) -> Option<String> {
 /// attach the path to its `io::Error`, so the reason is safe to forward
 /// verbatim.
 pub fn read_secret(path: &str, key: &str) -> Result<String, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {}_FILE: {}", key, e))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}_FILE: {}", key, e))?;
 
     let trimmed = content.trim_end().to_string();
     if trimmed.is_empty() {

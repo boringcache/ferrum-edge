@@ -87,10 +87,12 @@ async fn fetch_with_client(
             .map_err(|e| format!("Failed to read {} from Vault: {}", key, e))?;
 
     match json_key {
-        Some(jk) => secret
-            .get(jk)
-            .cloned()
-            .ok_or_else(|| format!("Vault secret for {} does not contain the requested key", key)),
+        Some(jk) => secret.get(jk).cloned().ok_or_else(|| {
+            format!(
+                "Vault secret for {} does not contain the requested key",
+                key
+            )
+        }),
         None => {
             // Without an explicit #json_key, require exactly one key to avoid
             // non-deterministic results from HashMap iteration order.
