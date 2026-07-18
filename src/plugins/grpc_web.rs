@@ -63,7 +63,12 @@ const HEADER_GRPC_WEB_MODE: &str = "x-grpc-web-mode";
 const APPLICATION_GRPC_WEB: &str = "application/grpc-web";
 const APPLICATION_GRPC_WEB_TEXT: &str = "application/grpc-web-text";
 const BASE_EXPOSE_HEADERS: [&str; 3] = ["grpc-status", "grpc-message", "grpc-status-details-bin"];
-const BASE_EXPOSE_HEADERS_VALUE: &str = "grpc-status, grpc-message, grpc-status-details-bin";
+/// The gRPC-Web expose list every generated error representation must carry, so
+/// a browser can read the terminal metadata out of the body trailer frame.
+/// Authoritative in `finalize_grpc_web_error_response_headers`, which seeds the
+/// merge from this constant rather than from whatever ended up in the header map.
+pub(crate) const BASE_EXPOSE_HEADERS_VALUE: &str =
+    "grpc-status, grpc-message, grpc-status-details-bin";
 
 /// gRPC frame flag: data frame.
 pub(crate) const GRPC_FRAME_DATA: u8 = 0x00;

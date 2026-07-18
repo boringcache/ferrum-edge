@@ -1706,6 +1706,84 @@ async fn deadline_replacement_keeps_configured_grpc_web_expose_headers_on_exact_
     }
 }
 
+/// The base gRPC-Web expose list is an authoritative generated-representation
+/// field. A gateway hook that retains its own `access-control-expose-headers`
+/// (a CORS policy's configured list, or a provenance-partitioned suffix) is
+/// merged ON TOP of the base list, never in place of it — otherwise the
+/// browser-facing DEADLINE_EXCEEDED response omits `grpc-status`/`grpc-message`
+/// and JavaScript cannot read the terminal metadata out of the trailer frame.
+#[tokio::test]
+async fn deadline_replacement_keeps_base_grpc_web_expose_list_under_partial_gateway_value() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
+        transform_buffered_response_body_with_deadline_for_test,
+    };
+
+    for content_type in [
+        "application/grpc-web+proto",
+        "application/grpc-web-text+proto",
+    ] {
+        // A trusted decorator writes a PARTIAL expose list and the deadline
+        // fires before any grpc_web `after_proxy` can restore the full one.
+        let decorator: Vec<Arc<dyn Plugin>> = vec![Arc::new(TrustedResponseHeaderDecorator {
+            headers: HashMap::from([(
+                "access-control-expose-headers".to_string(),
+                "x-only-custom".to_string(),
+            )]),
+        })];
+        let transform_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledResponseTransformer)];
+
+        let mut ctx = create_grpc_context_with_timeout(None);
+        set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+        let mut headers = HashMap::from([(
+            "content-type".to_string(),
+            "application/grpc".to_string(),
+        )]);
+        assert!(
+            !run_after_proxy_hooks_for_test(&decorator, &mut ctx, 200, &mut headers).await,
+            "the decorator must not reject the response"
+        );
+
+        set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+        let mut status = 200;
+        let mut body = b"discarded backend response".to_vec();
+        assert!(
+            transform_buffered_response_body_with_deadline_for_test(
+                &transform_plugins,
+                &mut ctx,
+                &mut status,
+                &mut headers,
+                &mut body,
+                Some(content_type),
+            )
+            .await
+        );
+
+        let exposed = headers
+            .get("access-control-expose-headers")
+            .map(String::as_str)
+            .unwrap_or_default();
+        let tokens = exposed
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        for required in ["grpc-status", "grpc-message", "grpc-status-details-bin"] {
+            assert!(
+                tokens
+                    .iter()
+                    .any(|token| token.eq_ignore_ascii_case(required)),
+                "the base gRPC-Web expose list must survive a partial gateway \
+                 value for {content_type}: {exposed:?}"
+            );
+        }
+        assert!(
+            tokens.iter().any(|token| *token == "x-only-custom"),
+            "the gateway's own expose value must still merge in: {exposed:?}"
+        );
+    }
+}
+
 /// Finding 3 (regression lock): a chain of completing decorators run through the
 /// owned-hook clone/adopt path under an active deadline; every adopted context
 /// must retain the previously recorded gateway output before a later hook

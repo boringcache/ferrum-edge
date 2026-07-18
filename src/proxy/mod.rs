@@ -15144,6 +15144,20 @@ fn merge_grpc_web_expose_headers(
 /// headers before sending. The generated representation fields are also
 /// authoritative: neither a security policy nor reject headers may replace
 /// them or supply a stale content length.
+///
+/// The base gRPC-Web expose list is one of those authoritative generated
+/// fields, so it is seeded from the canonical constant rather than read back
+/// out of `response.headers`. Callers populate this map by EXTENDING the
+/// generated error with other header sources — retained deadline-provenance
+/// gateway output, or a finalized reject chain — and `extend` overwrites on key
+/// collision. Reading the field back therefore did not observe the generated
+/// base list at all once any of those sources carried its own
+/// `access-control-expose-headers`: a partial value (a CORS policy's configured
+/// list, or a provenance-partitioned suffix) replaced it wholesale, and the
+/// browser-facing DEADLINE_EXCEEDED response could omit `grpc-status` /
+/// `grpc-message` — the terminal metadata gRPC-Web carries in the body trailer
+/// frame and JavaScript cannot read without them being exposed. Everything else
+/// present still merges in on top; the merge dedups case-insensitively.
 pub(crate) fn finalize_grpc_web_error_response_headers(
     response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
@@ -15151,10 +15165,6 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
 ) {
     let content_type = response.headers.get("content-type").cloned();
     let grpc_web = response.headers.get("x-grpc-web").cloned();
-    let expose_headers = response
-        .headers
-        .get("access-control-expose-headers")
-        .cloned();
 
     if let Some(finalized_headers) = finalized_reject_headers {
         response.headers.extend(
@@ -15181,8 +15191,10 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
         );
     }
 
-    let expose_headers =
-        merge_grpc_web_expose_headers(expose_headers.as_deref(), &response.headers);
+    let expose_headers = merge_grpc_web_expose_headers(
+        Some(crate::plugins::grpc_web::BASE_EXPOSE_HEADERS_VALUE),
+        &response.headers,
+    );
 
     response.headers.retain(|name, _| {
         ![
