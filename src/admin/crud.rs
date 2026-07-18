@@ -3835,13 +3835,8 @@ impl AdminResource for Proxy {
                 upstream: bundle_upstream,
                 plugins: spec_plugins,
             };
-            db.restore_api_spec_bundle(
-                &bundle,
-                spec,
-                &additional_upstreams,
-                &additional_plugins,
-            )
-            .await?;
+            db.restore_api_spec_bundle(&bundle, spec, &additional_upstreams, &additional_plugins)
+                .await?;
             return Ok(());
         }
 

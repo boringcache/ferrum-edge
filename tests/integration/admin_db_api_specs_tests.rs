@@ -846,12 +846,7 @@ async fn restore_bundle_rolls_back_resources_associations_spec_and_changes_on_la
     let additional = make_plugin(additional_plugin_id, proxy_id, ns, None);
 
     let error = store
-        .restore_api_spec_bundle(
-            &bundle,
-            &spec,
-            &[additional_upstream],
-            &[additional],
-        )
+        .restore_api_spec_bundle(&bundle, &spec, &[additional_upstream], &[additional])
         .await
         .expect_err("fault-injected restore must fail");
     assert!(
@@ -1013,8 +1008,20 @@ async fn restore_bundle_rejects_invalid_additional_upstream_ownership_before_wri
         );
         assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
         assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
-        assert!(store.get_upstream(ns, &upstream_id).await.unwrap().is_none());
-        assert!(store.get_upstream(ns, &additional_id).await.unwrap().is_none());
+        assert!(
+            store
+                .get_upstream(ns, &upstream_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_upstream(ns, &additional_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
 
