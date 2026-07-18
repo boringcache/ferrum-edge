@@ -2434,6 +2434,23 @@ impl RequestContext {
             });
     }
 
+    /// Capture pristine backend headers for any later gateway-authored
+    /// replacement, even when the request has no RPC deadline.
+    ///
+    /// Representation-policy rejection is the non-deadline caller: it must
+    /// shed backend representation metadata while retaining only mutations
+    /// made by completed trusted response hooks. This is deliberately separate
+    /// from [`Self::begin_buffered_deadline_response_header_provenance`] so the
+    /// ordinary deadline allocation gate remains unchanged.
+    pub(crate) fn begin_buffered_replacement_response_header_provenance(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        self.buffered_deadline_response_header_provenance = Some(Arc::new(
+            BufferedDeadlineResponseHeaderProvenance::backend_response(response_headers),
+        ));
+    }
+
     pub(crate) fn ensure_buffered_deadline_response_header_provenance(
         &mut self,
         response_headers: &HashMap<String, String>,
@@ -2523,11 +2540,12 @@ impl RequestContext {
         }
     }
 
-    /// Whether backend/gateway deadline-response provenance is being tracked for
-    /// this request. Trusted response hooks whose owned-name set must be
+    /// Whether backend/gateway terminal-replacement provenance is being tracked
+    /// for this request. Trusted response hooks whose owned-name set must be
     /// COMPUTED (e.g. `response_transformer` accumulating fired `update` /
     /// `rename` / `add` keys) consult this first so that work is skipped
-    /// entirely on the common path with no absolute RPC deadline. Hooks that
+    /// entirely on the common path with neither an absolute RPC deadline nor a
+    /// configured body policy that may reject. Hooks that
     /// own a fixed name can call
     /// [`Self::record_deadline_owned_response_headers`] with a borrowed static
     /// slice unconditionally — it allocates nothing and returns immediately
@@ -2591,8 +2609,9 @@ impl RequestContext {
     /// [`BufferedDeadlineResponseHeaderProvenance::retire_backend_authored_elements`].
     ///
     /// `name` must already be canonical (lowercase). Like the sibling recorders
-    /// this returns immediately when no deadline provenance is being tracked,
-    /// and it borrows the authored elements rather than cloning them.
+    /// this returns immediately when no terminal-replacement provenance is
+    /// being tracked, and it borrows the authored elements rather than cloning
+    /// them.
     pub(crate) fn record_deadline_authored_response_header_elements(
         &mut self,
         name: &str,
@@ -5886,6 +5905,19 @@ pub trait Plugin: Send + Sync {
         _response_content_type: Option<&str>,
     ) -> bool {
         false
+    }
+
+    /// Whether this plugin may make [`Plugin::enforces_response_body_policy`]
+    /// return `true` for the current request.
+    ///
+    /// The response lifecycle consults this before `after_proxy`, when the
+    /// final live `Content-Type` is not yet known, to decide whether it must
+    /// retain gateway-header provenance for a possible representation
+    /// rejection. The default probes the untyped response shape; plugins whose
+    /// policy claims only specific present media types must override this
+    /// capability predicate.
+    fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        self.enforces_response_body_policy(ctx, None)
     }
 
     /// Whether this plugin's response inspection just determined that its

@@ -242,6 +242,16 @@ boundary.
 
 Either way, `grpc-status` reaches the H3 client intact.
 
+When the representation gate decodes a buffered response from `gzip`/`br` to
+identity, that decode counts as a body rewrite even if no configured rule later
+changes the document. Native H3 drops trailers for the discarded encoded
+representation. On the buffered gRPC bridge, application trailers and their
+merged header-view copies are retired while reserved gRPC completion metadata
+stays terminal. If the gate instead synthesizes an `INTERNAL` rejection, that
+new status/message is snapshotted as authoritative before split finalization;
+the stale backend terminal status cannot return and the synthesized status is
+not duplicated between initial and terminal metadata.
+
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
 
 The H3 listener accepts WebSocket Extended CONNECT requests per

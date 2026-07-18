@@ -1583,6 +1583,47 @@ impl GrpcTerminalMetadataSnapshot {
     }
 }
 
+/// Select gateway-authored terminal metadata after a buffered response is
+/// replaced and retire every stale backend trailer in one transition.
+///
+/// Callers pass the replacement header view after it has been normalized into
+/// the client's gRPC flavor. Capturing before split finalization is essential:
+/// non-empty backend responses otherwise have no pristine Trailers-Only
+/// snapshot, and finalization correctly strips an unsourced `grpc-status` from
+/// initial HEADERS.
+pub fn select_buffered_grpc_terminal_response(
+    response_headers: &HashMap<String, String>,
+    response_trailers: &mut HashMap<String, String>,
+    authoritative_terminal_metadata: &mut Option<GrpcTerminalMetadataSnapshot>,
+) {
+    *authoritative_terminal_metadata =
+        Some(GrpcTerminalMetadataSnapshot::from_headers(response_headers));
+    response_trailers.clear();
+}
+
+/// Discard application trailers after buffered response bytes are rewritten,
+/// while retaining the reserved gRPC terminal status on its wire channel.
+///
+/// Buffered hooks see a merged header/trailer compatibility map. Removing only
+/// the wire trailer map would accidentally promote trailer-only application
+/// metadata into initial HEADERS, so this also removes those compatibility
+/// copies. A key that the backend supplied in both channels remains as its real
+/// initial header; only its trailing copy is retired. `grpc-status`,
+/// `grpc-message`, and status details survive because they describe RPC
+/// completion, not the discarded byte representation.
+pub fn discard_grpc_application_trailers_after_body_rewrite(
+    response_headers: &mut HashMap<String, String>,
+    response_trailers: &mut HashMap<String, String>,
+    header_shadowed_trailer_keys: &HashSet<String>,
+) {
+    response_headers.retain(|name, _| {
+        is_reserved_grpc_terminal_metadata(name)
+            || !response_trailers.contains_key(name)
+            || header_shadowed_trailer_keys.contains(name)
+    });
+    response_trailers.retain(|name, _| is_reserved_grpc_terminal_metadata(name));
+}
+
 /// Build the merged header+trailer view buffered gRPC response-hook plugins run
 /// on, plus the set of trailer keys the backend ALSO sent as real initial
 /// headers ("header-shadowed" keys).

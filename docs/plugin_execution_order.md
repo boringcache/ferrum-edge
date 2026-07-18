@@ -219,6 +219,20 @@ What is inspectable:
 
 A rejection is served in the client's flavor: a trailers-only gRPC `INTERNAL` error for `application/grpc` and gRPC-Web, and a `502` JSON body otherwise. All three shapes follow the same header discipline as every other buffered terminal response: the map is rebuilt from provenance-known gateway output, so no header describing the rejected representation (`Set-Cookie`, validators, cache directives) survives onto the gateway-authored error, and the opt-in `applies_after_proxy_on_reject` decorators still run so CORS, correlation, and security headers are preserved exactly as they are for an ordinary body reject. The client-visible message states only that inspection failed; the specific reason (`unsupported_content_coding`, `malformed_content_coding`, `decoded_body_too_large`, `partial_representation`, `unparseable_document`, `unproven_origin_state`) is recorded in transaction metadata for operators and is not echoed to the caller.
 
+That gateway-header provenance is captured before response hooks whenever a
+configured body policy may reject, even when the request has no RPC deadline.
+This keeps ordinary gRPC and gRPC-Web rejection decorators without widening the
+trusted set to backend fields that happen to use the same header names.
+
+Successful content decoding is itself a client-visible representation rewrite,
+including when no later body rule matches. Native H3 therefore drops backend
+trailers after a decode just as it does after an ordinary body transform.
+Buffered gRPC retires application trailers and their merged compatibility
+copies while preserving only reserved RPC completion metadata (`grpc-status`,
+`grpc-message`, and status details) on the terminal channel. Unclaimed or
+identity-coded responses that no body rule changes retain their original
+trailers.
+
 For gateway-generated rejection responses, a small set of header-only `after_proxy` plugins opt in to still run. This preserves headers such as `Access-Control-Allow-Origin`, `traceparent`, and request IDs on rejected responses without treating them as backend responses.
 
 An RPC deadline discovered while buffering an upload is finalized through this same rejection path even when it occurs before authentication, authorization, `before_proxy`, or backend dispatch. Immediately-ready non-replacing decorators and committed observers run against the canonical status-4 result before it is emitted, gRPC-Web translation happens only after those synchronous headers are finalized, and the rejection is logged before the frontend returns. If a rejection or committed hook is still pending when the deadline wins, that exact invocation and the remaining eligible hooks continue once, in priority order, on owned response/context state under a bounded detached cleanup task. Their late mutations cannot race or delay the client-visible response. Response-replacing hooks cannot overwrite an already-selected terminal deadline.

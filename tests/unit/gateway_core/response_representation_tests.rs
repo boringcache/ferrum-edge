@@ -19,8 +19,11 @@ use std::io::Write;
 use std::sync::Arc;
 
 use ferrum_edge::_test_support::{
-    apply_synthetic_response_body_hooks_for_test, representation_rejection_reason_for_test,
-    stamp_original_response_metadata_for_test,
+    apply_synthetic_response_body_hooks_for_test,
+    discard_grpc_application_trailers_after_body_rewrite_for_test,
+    finalize_selected_buffered_grpc_terminal_response_for_test,
+    representation_rejection_reason_for_test, run_after_proxy_hooks_for_test,
+    set_grpc_deadline_budget_for_test, stamp_original_response_metadata_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::plugins::{
@@ -920,8 +923,8 @@ async fn decoded_body_invalidates_validators_even_when_no_rule_matches() {
 
     assert!(!replaced, "a decodable, unmatched document must be served");
     assert!(
-        !transformed,
-        "no rule matched, so this is the transform no-op path under test"
+        transformed,
+        "the decode itself must be reported as a client-visible representation rewrite"
     );
     assert_eq!(status, 200);
     assert_eq!(reason, None);
@@ -1198,6 +1201,153 @@ async fn native_grpc_representation_rejection_strips_backend_headers() {
             "backend `{leaked}` survived onto a gateway-authored gRPC error"
         );
     }
+}
+
+/// The rejection retain step must use provenance captured before response
+/// decorators, even when there is no RPC deadline. Otherwise the fail-closed
+/// fallback clears both backend metadata and the gateway's CORS/correlation/
+/// security output. Exercise native gRPC and gRPC-Web with and without an
+/// active deadline so the representation-only provenance path cannot diverge
+/// from the established deadline path.
+#[tokio::test]
+async fn grpc_representation_rejection_preserves_decorators_with_or_without_deadline() {
+    for deadline_active in [false, true] {
+        for grpc_web_content_type in [None, Some("application/grpc-web+proto")] {
+            let plugins: Vec<Arc<dyn Plugin>> = vec![
+                Arc::new(ClaimEverythingPolicy),
+                Arc::new(RejectDecorator),
+            ];
+            let mut ctx = make_ctx();
+            if deadline_active {
+                set_grpc_deadline_budget_for_test(&mut ctx, Some(10_000));
+            }
+            let mut status = 200;
+            let mut headers = HashMap::from([
+                (
+                    "content-type".to_string(),
+                    "application/grpc+proto".to_string(),
+                ),
+                ("content-encoding".to_string(), "zstd".to_string()),
+                ("etag".to_string(), "\"backend-v1\"".to_string()),
+                ("set-cookie".to_string(), "backend=secret".to_string()),
+            ]);
+            let mut body = b"backend-response".to_vec();
+            stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+            assert!(
+                !run_after_proxy_hooks_for_test(&plugins, &mut ctx, status, &mut headers).await,
+                "decorators must not reject the response"
+            );
+            let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+                &plugins,
+                &mut ctx,
+                &mut status,
+                &mut headers,
+                &mut body,
+                grpc_web_content_type,
+                false,
+            )
+            .await;
+
+            assert!(replaced);
+            assert_eq!(status, 200);
+            assert_eq!(
+                headers
+                    .get("access-control-allow-origin")
+                    .map(String::as_str),
+                Some("https://app.example"),
+                "gateway decorator was lost (deadline={deadline_active}, grpc_web={})",
+                grpc_web_content_type.is_some()
+            );
+            for leaked in ["etag", "set-cookie", "content-encoding"] {
+                assert!(
+                    !headers.contains_key(leaked),
+                    "backend `{leaked}` survived (deadline={deadline_active}, grpc_web={})",
+                    grpc_web_content_type.is_some()
+                );
+            }
+        }
+    }
+}
+
+/// A body rewrite retires application trailers that may describe the original
+/// bytes, but it must retain reserved gRPC completion metadata on the trailer
+/// channel. A trailer key shadowed by a genuine initial header keeps only that
+/// initial-header value.
+#[test]
+fn grpc_body_rewrite_discards_application_trailers_but_preserves_terminal_status() {
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("grpc-status".to_string(), "0".to_string()),
+        ("content-digest".to_string(), "sha-256=:old:".to_string()),
+        ("x-app-trailer".to_string(), "old".to_string()),
+        ("x-shadowed".to_string(), "initial".to_string()),
+    ]);
+    let mut trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("content-digest".to_string(), "sha-256=:old:".to_string()),
+        ("x-app-trailer".to_string(), "old".to_string()),
+        ("x-shadowed".to_string(), "trailing".to_string()),
+    ]);
+
+    discard_grpc_application_trailers_after_body_rewrite_for_test(
+        &mut headers,
+        &mut trailers,
+        &["x-shadowed"],
+    );
+
+    assert_eq!(
+        trailers,
+        HashMap::from([("grpc-status".to_string(), "0".to_string())])
+    );
+    assert_eq!(
+        headers.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        headers.get("x-shadowed").map(String::as_str),
+        Some("initial")
+    );
+    assert!(!headers.contains_key("content-digest"));
+    assert!(!headers.contains_key("x-app-trailer"));
+}
+
+/// A representation rejection can replace a non-empty backend response. Its
+/// new INTERNAL status must become the authoritative Trailers-Only metadata;
+/// split finalization must neither strip it nor restore the stale backend OK.
+#[test]
+fn h3_bridge_replacement_preserves_synthesized_terminal_status() {
+    let replacement_headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("grpc-status".to_string(), "13".to_string()),
+        (
+            "grpc-message".to_string(),
+            "response representation could not be inspected".to_string(),
+        ),
+    ]);
+    let stale_backend_trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("x-backend-trailer".to_string(), "stale".to_string()),
+    ]);
+
+    let (headers, trailers) = finalize_selected_buffered_grpc_terminal_response_for_test(
+        replacement_headers,
+        stale_backend_trailers,
+    );
+
+    assert!(
+        trailers.is_empty(),
+        "Trailers-Only status must not be duplicated"
+    );
+    assert_eq!(
+        headers.get("grpc-status").map(String::as_str),
+        Some("13")
+    );
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("response representation could not be inspected")
+    );
+    assert!(!headers.contains_key("x-backend-trailer"));
 }
 
 // ---------------------------------------------------------------------------

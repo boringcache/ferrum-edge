@@ -2802,7 +2802,8 @@ where
                 if matches!(
                     admission,
                     crate::proxy::BufferedTransformAdmission::Proceed {
-                        rewrite_allowed: true
+                        rewrite_allowed: true,
+                        ..
                     }
                 ) {
                     for plugin in plugins {
@@ -4404,7 +4405,7 @@ where
                     &resp.headers,
                     &resp.trailers,
                 );
-            let pristine_trailers_only_terminal_metadata = (resp.body.is_empty()
+            let mut authoritative_trailers_only_terminal_metadata = (resp.body.is_empty()
                 && resp.trailers.is_empty())
             .then(|| {
                 crate::proxy::grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&resp.headers)
@@ -4542,7 +4543,19 @@ where
             )
             .await
             {
-                response_trailers.clear();
+                if ctx.gateway_deadline_response_selected() {
+                    crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                        &plugin_response_headers,
+                        &mut response_trailers,
+                        &mut authoritative_trailers_only_terminal_metadata,
+                    );
+                } else {
+                    crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+                        &mut plugin_response_headers,
+                        &mut response_trailers,
+                        &header_shadowed_trailer_keys,
+                    );
+                }
             }
             // Set once an `on_response_body` hook replaces the backend response
             // with a gateway-authored rejection; from that point the buffered
@@ -4584,6 +4597,11 @@ where
                             &mut response_trailers,
                         )
                         .await;
+                        crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                            &plugin_response_headers,
+                            &mut response_trailers,
+                            &mut authoritative_trailers_only_terminal_metadata,
+                        );
                         buffered_initial_response_header_policy_state = None;
                         response_body_rejected = true;
                         break;
@@ -4621,13 +4639,25 @@ where
                 admission,
                 crate::proxy::BufferedTransformAdmission::Rejected
             ) {
-                response_trailers.clear();
+                crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                    &plugin_response_headers,
+                    &mut response_trailers,
+                    &mut authoritative_trailers_only_terminal_metadata,
+                );
                 buffered_initial_response_header_policy_state = None;
             }
+            let mut representation_rewritten = matches!(
+                admission,
+                crate::proxy::BufferedTransformAdmission::Proceed {
+                    representation_rewritten: true,
+                    ..
+                }
+            );
             if matches!(
                 admission,
                 crate::proxy::BufferedTransformAdmission::Proceed {
-                    rewrite_allowed: true
+                    rewrite_allowed: true,
+                    ..
                 }
             ) {
                 for plugin in plugins.iter() {
@@ -4652,6 +4682,11 @@ where
                                 &mut response_trailers,
                                 initial_response_header_policy_plugins,
                             );
+                            crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                                &plugin_response_headers,
+                                &mut response_trailers,
+                                &mut authoritative_trailers_only_terminal_metadata,
+                            );
                             break;
                         }
                     };
@@ -4664,12 +4699,20 @@ where
                             ctx,
                             &mut plugin_response_headers,
                         );
+                        representation_rewritten = true;
                     }
                     ctx.record_deadline_response_header_plugin(
                         plugin.as_ref(),
                         &plugin_response_headers,
                     );
                 }
+            }
+            if representation_rewritten {
+                crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+                    &mut plugin_response_headers,
+                    &mut response_trailers,
+                    &header_shadowed_trailer_keys,
+                );
             }
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
                 Arc::make_mut(policy_state)
@@ -4711,6 +4754,11 @@ where
                             &mut response_trailers,
                         )
                         .await;
+                        crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                            &plugin_response_headers,
+                            &mut response_trailers,
+                            &mut authoritative_trailers_only_terminal_metadata,
+                        );
                         buffered_initial_response_header_policy_state = None;
                         break;
                     }
@@ -4749,7 +4797,7 @@ where
             let mut response_headers = plugin_response_headers;
             let authoritative_terminal_metadata =
                 if response_body.is_empty() && response_trailers.is_empty() {
-                    pristine_trailers_only_terminal_metadata.as_ref()
+                    authoritative_trailers_only_terminal_metadata.as_ref()
                 } else {
                     None
                 };

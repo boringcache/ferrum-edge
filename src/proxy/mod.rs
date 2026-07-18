@@ -14593,7 +14593,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     if matches!(
         admission,
         BufferedTransformAdmission::Proceed {
-            rewrite_allowed: true
+            rewrite_allowed: true,
+            ..
         }
     ) {
         let mut mandatory_replay_transform_failed = None;
@@ -14854,9 +14855,19 @@ pub(crate) async fn run_after_proxy_hooks(
     response_headers: &mut HashMap<String, String>,
 ) -> Option<AfterProxyReject> {
     // Establish backend provenance before the first trusted response hook can
-    // mutate the map. A later deadline replacement retains only mutations from
-    // hooks that completed, never backend fields selected by header name.
-    ctx.begin_buffered_deadline_response_header_provenance(response_headers);
+    // mutate the map. A later deadline or representation-error replacement
+    // retains only mutations from hooks that completed, never backend fields
+    // selected by header name. Body-policy provenance is also required without
+    // an RPC deadline: the eventual rejection must preserve gateway decorators
+    // while shedding the rejected backend representation.
+    if plugins
+        .iter()
+        .any(|plugin| plugin.may_enforce_response_body_policy(ctx))
+    {
+        ctx.begin_buffered_replacement_response_header_provenance(response_headers);
+    } else {
+        ctx.begin_buffered_deadline_response_header_provenance(response_headers);
+    }
     // Capture the genuine backend status BEFORE any after_proxy hook can reject
     // and replace the response. If a hook at a lower priority rejects a 2xx
     // backend response (e.g. `response_size_limiting` at 3490 rejecting an
@@ -15483,7 +15494,14 @@ pub(crate) enum BufferedTransformAdmission {
     /// claims: an unprotected `206`/`226` body is a fragment, and a
     /// presentation transform (compression, gRPC-Web framing) must not rewrite
     /// it into something the unchanged status no longer describes.
-    Proceed { rewrite_allowed: bool },
+    Proceed {
+        rewrite_allowed: bool,
+        /// The gate itself replaced encoded bytes with identity bytes. This is
+        /// a client-visible representation rewrite even when no later body rule
+        /// returns replacement bytes, so trailer disposition must treat it the
+        /// same as an ordinary transform.
+        representation_rewritten: bool,
+    },
     /// The response was replaced with a fail-closed representation error and the
     /// transform phase must be skipped.
     Rejected,
@@ -15555,12 +15573,11 @@ async fn replace_buffered_response_with_representation_error(
         .is_some_and(|value| backend_dispatch::is_native_grpc_content_type(value.as_bytes()));
 
     // Both gRPC branches below rebuild from provenance-known gateway output.
-    // Establish that provenance for the paths that never took it (the H3
-    // cross-protocol bridges): with no state recorded,
-    // `retain_deadline_response_gateway_headers` clears the map wholesale, which
-    // is the fail-closed direction but drops gateway decorators too. Seeding it
-    // here is idempotent — `transform_buffered_response_body_with_deadline`
-    // already called it with the same map before the gate ran.
+    // The backend lifecycle seeded replacement provenance before response
+    // hooks whenever a body policy could reject; this idempotent ensure also
+    // covers deadline-only and direct helper paths. With no state recorded,
+    // `retain_deadline_response_gateway_headers` still clears the map wholesale
+    // rather than trusting backend fields by name.
     if grpc_web_response_content_type.is_some() || native_grpc {
         ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
     }
@@ -15678,8 +15695,10 @@ pub(crate) async fn admit_buffered_response_body_transforms(
     ) {
         ResponseBodyPolicyPosture::Unprotected => BufferedTransformAdmission::Proceed {
             rewrite_allowed: crate::plugins::response_body_rewrite_allowed(*response_status),
+            representation_rewritten: false,
         },
         ResponseBodyPolicyPosture::Enforce { decoded } => {
+            let representation_rewritten = decoded.is_some();
             if let Some(decoded) = decoded {
                 install_decoded_response_body(ctx, response_headers, response_body, decoded);
             }
@@ -15688,6 +15707,7 @@ pub(crate) async fn admit_buffered_response_body_transforms(
             // there is no status to relabel and no truncated resource to cache.
             BufferedTransformAdmission::Proceed {
                 rewrite_allowed: true,
+                representation_rewritten,
             }
         }
         ResponseBodyPolicyPosture::Reject(rejection) => {
@@ -15729,10 +15749,13 @@ pub(crate) async fn admit_buffered_response_body_transforms(
 /// [`RepresentationOrigin::Backend`]: crate::plugins::response_representation::RepresentationOrigin::Backend
 /// [`RepresentationOrigin::GatewayGenerated`]: crate::plugins::response_representation::RepresentationOrigin::GatewayGenerated
 ///
-/// Returns `(response_replaced, body_transformed)`. `response_replaced` is true
-/// when this phase substituted a terminal response — a deadline replacement or a
-/// representation rejection — so callers drop backend trailers and treat the
-/// gateway-authored terminal metadata as authoritative in both cases.
+/// Returns `(response_replaced, representation_rewritten)`.
+/// `response_replaced` is true when this phase substituted a terminal response
+/// — a deadline replacement or a representation rejection — so callers drop
+/// backend trailers and treat the gateway-authored terminal metadata as
+/// authoritative in both cases. `representation_rewritten` includes both a
+/// plugin body transform and a gate-owned content decode, because either makes
+/// trailers describing the original bytes stale.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn transform_buffered_response_body_with_deadline(
     plugins: &[Arc<dyn Plugin>],
@@ -15752,29 +15775,33 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     // `Content-Encoding` after a decode cannot be resurrected by a later rebuild,
     // which replays gateway output only.
     ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
-    let rewrite_allowed = match admit_buffered_response_body_transforms(
-        plugins,
-        ctx,
-        origin,
-        response_status,
-        response_headers,
-        response_body,
-        grpc_web_response_content_type,
-        initial_response_header_policy_plugins,
-        true,
-    )
-    .await
-    {
-        BufferedTransformAdmission::Proceed { rewrite_allowed } => rewrite_allowed,
-        BufferedTransformAdmission::Rejected => return (true, false),
-    };
+    let (rewrite_allowed, representation_rewritten) =
+        match admit_buffered_response_body_transforms(
+            plugins,
+            ctx,
+            origin,
+            response_status,
+            response_headers,
+            response_body,
+            grpc_web_response_content_type,
+            initial_response_header_policy_plugins,
+            true,
+        )
+        .await
+        {
+            BufferedTransformAdmission::Proceed {
+                rewrite_allowed,
+                representation_rewritten,
+            } => (rewrite_allowed, representation_rewritten),
+            BufferedTransformAdmission::Rejected => return (true, false),
+        };
     if !rewrite_allowed {
         return (false, false);
     }
     // Read after the gate: a decoded body installs fresh representation headers.
     let content_type = response_headers.get("content-type").cloned();
     let content_type = content_type.as_deref();
-    let mut body_transformed = false;
+    let mut body_transformed = representation_rewritten;
     for plugin in plugins {
         let transformed = match crate::plugins::await_grpc_deadline(
             ctx.grpc_deadline_at(),
@@ -21906,25 +21933,31 @@ async fn handle_proxy_request_inner(
                         plugin_response_headers
                             .insert("content-type".to_string(), grpc_web_ct.to_string());
                     }
-                    if transform_buffered_response_body_with_deadline(
-                        &plugins,
-                        &mut ctx,
-                        buffered_response_representation_origin(response_body_rejected),
-                        &mut response_status,
-                        &mut plugin_response_headers,
-                        &mut response_body,
-                        grpc_web_response_content_type,
-                        initial_response_header_policy_plugins.as_ref(),
-                    )
-                    .await
-                    .0
-                    {
-                        authoritative_trailers_only_terminal_metadata =
-                            Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
-                                &plugin_response_headers,
-                            ));
-                        response_trailers.clear();
+                    let (response_replaced, representation_rewritten) =
+                        transform_buffered_response_body_with_deadline(
+                            &plugins,
+                            &mut ctx,
+                            buffered_response_representation_origin(response_body_rejected),
+                            &mut response_status,
+                            &mut plugin_response_headers,
+                            &mut response_body,
+                            grpc_web_response_content_type,
+                            initial_response_header_policy_plugins.as_ref(),
+                        )
+                        .await;
+                    if response_replaced {
+                        grpc_proxy::select_buffered_grpc_terminal_response(
+                            &plugin_response_headers,
+                            &mut response_trailers,
+                            &mut authoritative_trailers_only_terminal_metadata,
+                        );
                         buffered_initial_response_header_policy_state = None;
+                    } else if representation_rewritten {
+                        grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+                            &mut plugin_response_headers,
+                            &mut response_trailers,
+                            &header_shadowed_trailer_keys,
+                        );
                     }
                     if let Some(policy_state) =
                         buffered_initial_response_header_policy_state.as_mut()

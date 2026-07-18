@@ -1481,9 +1481,10 @@ pub mod _test_support {
     }
 
     /// Like [`transform_buffered_response_body_with_deadline_for_test`] but
-    /// returns the full `(response_replaced, body_transformed)` pair, so a test
-    /// can distinguish "the gate rejected and replaced the response" from "the
-    /// transforms ran and rewrote the body" from "nothing happened".
+    /// returns the full `(response_replaced, representation_rewritten)` pair,
+    /// so a test can distinguish "the gate rejected and replaced the response"
+    /// from "the gate decoded or a transform rewrote the body" from "nothing
+    /// happened".
     ///
     /// `response_body_rejected` is the production flag every buffered path
     /// maintains: `false` while the bytes are still the backend's, `true` once an
@@ -1560,6 +1561,49 @@ pub mod _test_support {
         ctx.metadata
             .get(crate::proxy::REPRESENTATION_REJECTED_METADATA_KEY)
             .map(String::as_str)
+    }
+
+    /// Exercise the buffered gRPC trailer-disposition boundary used after a
+    /// client-visible body rewrite.
+    pub fn discard_grpc_application_trailers_after_body_rewrite_for_test(
+        response_headers: &mut HashMap<String, String>,
+        response_trailers: &mut HashMap<String, String>,
+        header_shadowed_trailer_keys: &[&str],
+    ) {
+        let header_shadowed_trailer_keys: std::collections::HashSet<String> =
+            header_shadowed_trailer_keys
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect();
+        crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+            response_headers,
+            response_trailers,
+            &header_shadowed_trailer_keys,
+        );
+    }
+
+    /// Model the H3 bridge transition from a non-empty backend response to a
+    /// synthesized Trailers-Only gateway response, including split-response
+    /// finalization.
+    pub fn finalize_selected_buffered_grpc_terminal_response_for_test(
+        mut response_headers: HashMap<String, String>,
+        mut stale_backend_trailers: HashMap<String, String>,
+    ) -> (HashMap<String, String>, HashMap<String, String>) {
+        let mut authoritative_terminal_metadata = None;
+        crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+            &response_headers,
+            &mut stale_backend_trailers,
+            &mut authoritative_terminal_metadata,
+        );
+        crate::proxy::grpc_proxy::finalize_buffered_grpc_split_response(
+            &mut response_headers,
+            &mut stale_backend_trailers,
+            &std::collections::HashSet::new(),
+            None,
+            authoritative_terminal_metadata.as_ref(),
+            None,
+        );
+        (response_headers, stale_backend_trailers)
     }
 
     pub async fn run_after_proxy_hooks_for_test(

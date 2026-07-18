@@ -616,8 +616,8 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return PluginResult::Continue;
         }
-        // Collect fired whole-value writes only when a deadline rebuild could
-        // consult them, keeping the common path allocation-free.
+        // Collect fired whole-value writes only when a terminal replacement
+        // rebuild could consult them, keeping the common path allocation-free.
         let track_owned = ctx.has_buffered_deadline_response_header_provenance();
         let mut fired_write_keys: Vec<String> = Vec::new();
         self.apply_static_header_rules(

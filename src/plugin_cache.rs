@@ -781,6 +781,9 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .enforces_response_body_policy(ctx, response_content_type)
     }
+    fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        self.inner.may_enforce_response_body_policy(ctx)
+    }
     fn on_response_body_transformed(
         &self,
         ctx: &mut RequestContext,
