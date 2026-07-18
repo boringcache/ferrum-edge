@@ -1169,7 +1169,8 @@ async fn deadline_replacement_keeps_exact_value_response_transformer_writes() {
             ("x-route-exact".to_string(), "route-value".to_string()),
         ]);
         assert!(
-            !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+            !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers)
+                .await,
             "response transformer must not reject the buffered response"
         );
 
