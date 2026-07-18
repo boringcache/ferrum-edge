@@ -404,6 +404,23 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   read as a word separator, so `cross${IFS}build` and
   `cargo${IFS}+stable${IFS}cross build` resolve exactly like literal
   whitespace at the executable, toolchain-selector, and subcommand boundaries.
+  A shell can also move Cross out of the command word entirely and still run it
+  by dispatching an argument vector that holds it, so a function whose body
+  executes its arguments (`run() { "$@"; }`, `go() { exec "$@"; }`, `only() {
+  "$1"; }`) makes every call site's argument list a command line, and a command
+  line loaded into the positional parameters (`set -- cross build --target
+  ...`) is read as one wherever it appears. Which names dispatch their argument
+  vector is resolved from the whole program rather than from the line being
+  scanned, so a definition and its call site may sit on different lines. A
+  function that merely *forwards* its arguments to a named command
+  (`f() { curl "$@"; }`) does not dispatch them and stays editable.
+  A dynamic expression that occupies a whole command word is replaced by a
+  whole command, not just by an executable name, so `run: ${{
+  steps.plan.outputs.cmd }}`, a composite action's `run: ${{ inputs.cmd }}`,
+  `run: $CMD`, and `run: $(plan)` all fail closed even though no literal
+  `build --target` text is left on the line; an expression that is an argument
+  to a named command, or that is only data, does not occupy a command word and
+  stays editable.
   Binding Cross to another executable name is itself a Cross surface: linking,
   copying, moving, or installing the Cross binary under a new name, and writing
   a wrapper script whose body runs Cross, are all detected, and every later
@@ -486,10 +503,18 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   target token is searched for. A double-quoted scalar continued with
   a trailing backslash is folded the way the runner folds it, so a target split
   across two source lines is still detected. A YAML merge key
-  (`with: {<<: *cross_inputs}`) supplies inputs the step never spells and a
-  YAML alias, anchor, or tag on a `uses:` value (`uses: *cargo_action`)
-  resolves outside the step, so both fail closed rather than being read as the
-  literal text they appear to be. Input values are resolved rather
+  (`with: {<<: *cross_inputs}`) supplies inputs the step never spells, and a
+  YAML alias, anchor, or tag resolves outside the step in a `uses:` reference
+  (`uses: *cargo_action`) and in any value position alike (`with:
+  *cargo_inputs`, `args: *arm_target`), so all of them fail closed rather than
+  being read as the literal text they appear to be — the runner expands an
+  aliased input map into the action's inputs before it runs, so a step that
+  spells neither `use-cross: true` nor the protected target can still deliver
+  both. A step written entirely as a YAML flow mapping
+  (`- {uses: actions-rs/cargo@<sha>, with: {use-cross: true}}`) is the same step
+  to the runner, including when the entry spans several source lines, so those
+  sequence entries are entered and held to the identical reference and input
+  rules instead of being skipped for not starting a line with a key. Input values are resolved rather
   than compared as literal text: an expression such as
   `args: build --target ${{ matrix.target }}` is expanded against the enclosing
   job's `matrix`, `env`, and `inputs` **declarations** — a step's `with:` keys
@@ -585,6 +610,26 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   input — can touch the prepared per-arch binaries. Editing a Docker publishing
   job requires updating `PUBLISH_CONTROL_CONTRACTS` in the same commit; the
   remaining publishing jobs stay editable.
+- The manifest jobs that assemble the published tags select their inputs by
+  **wildcard**, not by name: `docker-manifest` and `docker-ebpf-manifest`
+  download `docker-digest-*`/`docker-ebpf-digest-*` into `/tmp/digests` and
+  hand every file in that directory to `docker buildx imagetools create`.
+  Freezing the per-platform producers alone therefore left the published
+  `latest` and release tags reachable, because artifacts are scoped to the
+  **workflow run** rather than to `needs`: a pull request could add an unrelated
+  push-only job that uploads one more matching digest and have it collected with
+  no edge in the job graph at all. Each manifest job's `needs`, its gating
+  condition, its `Download digests` step, and the `imagetools create` commands
+  are frozen, `docker-ebpf`'s `needs`, `strategy`, and `Upload digest` step are
+  frozen alongside the other producers, and — because freezing the job graph
+  cannot stop an *added* job — the digest artifact **name space itself is
+  owned**: only `docker` may produce a `docker-digest-*` name and only
+  `docker-ebpf` may produce a `docker-ebpf-digest-*` one. A name assembled by an
+  expression is ruled out only when its literal prefix already disagrees with
+  the wildcard, so `docker-digest-${{ github.actor }}` from any other job is
+  rejected while `binary-${{ matrix.target }}` and unrelated artifact names stay
+  editable. This is checked against both the pinned contract and the proposed
+  tree, so an added job is caught even though it changes no frozen field.
 - `latest-release` and `create-release` download the five build artifacts by
   exact name instead of by a `binary-*`/`release-binaries-*` wildcard, so an
   unrelated job cannot contribute a colliding upload to a published release.

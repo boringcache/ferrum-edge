@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import hashlib
 import itertools
 import json
@@ -187,6 +188,51 @@ DOCKER_PUBLISH_STEPS_TAIL = (
     "          path: /tmp/digests/*\n"
     "          if-no-files-found: error\n"
 )
+# Freezing the per-platform `docker` job still leaves the manifest jobs that
+# assemble the published `latest` and release tags editable, and those jobs
+# select their inputs with a wildcard rather than by name: they download
+# `docker-digest-*`/`docker-ebpf-digest-*` into `/tmp/digests` and hand every
+# file in that directory to `docker buildx imagetools create`. Artifacts are
+# scoped to the workflow run and not to `needs`, so a pull request that adds any
+# job uploading one more matching artifact puts an attacker-controlled image
+# digest into a published manifest without creating a Cross surface anywhere.
+# The wildcard, the `needs` edges, the gating condition, and the create commands
+# are therefore frozen together with the producing jobs, and the artifact name
+# space itself is owned so no other job can produce a name the wildcard matches.
+DOCKER_MANIFEST_DOWNLOAD_STEP = (
+    "      - name: Download digests\n"
+    "        uses: actions/download-artifact"
+    "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+    "        with:\n"
+    "          path: /tmp/digests\n"
+    "          pattern: docker-digest-*\n"
+    "          merge-multiple: true\n"
+)
+DOCKER_EBPF_MANIFEST_DOWNLOAD_STEP = DOCKER_MANIFEST_DOWNLOAD_STEP.replace(
+    "pattern: docker-digest-*",
+    "pattern: docker-ebpf-digest-*",
+)
+DOCKER_EBPF_UPLOAD_DIGEST_STEP = (
+    "      - name: Upload digest\n"
+    "        uses: actions/upload-artifact"
+    "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+    "        with:\n"
+    "          name: docker-ebpf-digest-${{ matrix.arch_dir }}\n"
+    "          path: /tmp/digests/*\n"
+    "          if-no-files-found: error\n"
+)
+# Each wildcard belongs to exactly the jobs allowed to produce a name it
+# matches. Any other upload whose artifact name could match — including one
+# whose name is assembled by an expression whose literal prefix does not rule
+# the wildcard out — is rejected.
+DIGEST_ARTIFACT_OWNERS = {
+    "CI workflow": {"docker-digest-": ("docker",)},
+    "release workflow": {
+        "docker-digest-": ("docker",),
+        "docker-ebpf-digest-": ("docker-ebpf",),
+    },
+}
+UPLOAD_ARTIFACT_ACTION = re.compile(r"^actions/upload-artifact@[0-9a-f]{40}\b")
 # The Docker jobs never name the protected ARM64 artifact literally. They
 # select it through matrix values that the download step and the context step
 # interpolate, so freezing the job's `needs`/`if` alone would still let a pull
@@ -206,6 +252,28 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
             ),
             "Prepare Docker context": DOCKER_CONTEXT_STEP,
         },
+        "docker-manifest": {
+            "Download digests": DOCKER_MANIFEST_DOWNLOAD_STEP,
+            "Create and push multi-arch manifest (Docker Hub)": (
+                "      - name: Create and push multi-arch manifest (Docker Hub)\n"
+                "        working-directory: /tmp/digests\n"
+                "        run: |\n"
+                "          docker buildx imagetools create \\\n"
+                "            -t ferrumedge/ferrum-edge:latest \\\n"
+                "            -t ferrumedge/ferrum-edge:main-${{ github.sha }} \\\n"
+                "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n"
+            ),
+            "Create and push multi-arch manifest (GHCR)": (
+                "      - name: Create and push multi-arch manifest (GHCR)\n"
+                "        working-directory: /tmp/digests\n"
+                "        run: |\n"
+                "          docker buildx imagetools create \\\n"
+                "            -t ghcr.io/${{ github.repository }}:latest \\\n"
+                "            -t ghcr.io/${{ github.repository }}:main-"
+                "${{ github.sha }} \\\n"
+                "            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)\n"
+            ),
+        },
     },
     "release workflow": {
         "docker": {
@@ -218,6 +286,15 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
                 "          path: downloaded-artifacts\n"
             ),
             "Prepare Docker context": DOCKER_CONTEXT_STEP,
+        },
+        "docker-manifest": {
+            "Download digests": DOCKER_MANIFEST_DOWNLOAD_STEP,
+        },
+        "docker-ebpf": {
+            "Upload digest": DOCKER_EBPF_UPLOAD_DIGEST_STEP,
+        },
+        "docker-ebpf-manifest": {
+            "Download digests": DOCKER_EBPF_MANIFEST_DOWNLOAD_STEP,
         },
     },
 }
@@ -252,6 +329,13 @@ PUBLISH_CONTROL_CONTRACTS = {
                 + DOCKER_PUBLISH_STEPS_TAIL
             ),
         },
+        "docker-manifest": {
+            "needs": "    needs: docker\n",
+            "if": (
+                "    if: always() && needs.docker.result == 'success' && "
+                "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
+            ),
+        },
     },
     "release workflow": {
         "create-release": {
@@ -272,6 +356,30 @@ PUBLISH_CONTROL_CONTRACTS = {
                 + DOCKER_PUBLISH_STEPS_MIDDLE
                 + DOCKER_CONTEXT_STEP
                 + DOCKER_PUBLISH_STEPS_TAIL
+            ),
+        },
+        "docker-manifest": {
+            "needs": "    needs: docker\n",
+        },
+        "docker-ebpf": {
+            "needs": "    needs: validate-release-sha\n",
+            "strategy": (
+                "    strategy:\n"
+                "      fail-fast: false\n"
+                "      matrix:\n"
+                "        include:\n"
+                "          - os: ubuntu-latest\n"
+                "            platform: linux/amd64\n"
+                "            arch_dir: amd64\n"
+                "          - os: ubuntu-24.04-arm\n"
+                "            platform: linux/arm64\n"
+                "            arch_dir: arm64\n"
+            ),
+        },
+        "docker-ebpf-manifest": {
+            "needs": (
+                "    needs: [build-release-binaries, docker-manifest, "
+                "docker-ebpf]\n"
             ),
         },
     },
@@ -613,6 +721,30 @@ SHELL_PARAMETER_REFERENCE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 SHELL_ASSIGNMENT_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=.*", re.DOTALL)
 WHOLE_SHELL_PARAMETER = re.compile(r"\s*\$[A-Za-z_][A-Za-z0-9_]*\s*")
 _shell_assigned_names: frozenset[str] = frozenset()
+# A command word that is an argument reference runs whatever the surrounding
+# argument vector holds, so `run() { "$@"; }` makes `run cross build ...` a
+# Cross invocation and `set -- cross build ...; "$@"` is one with no function at
+# all. Only an argument reference in a *command* position counts: an ordinary
+# forwarding wrapper such as `f() { curl "$@"; }` passes its arguments to
+# `curl` and never dispatches them itself. Quoting is already removed by the
+# tokenizer, so `"$@"` and `$@` reach this set the same way.
+ARGV_REFERENCE_WORDS = frozenset(
+    {"$@", "$*", "${@}", "${*}", "$1", "${1}", '"$@"', '"$*"'}
+)
+# The tokens that end one command and begin the next. A standalone `{` or `}` is
+# a grouping keyword rather than part of a command word, so a call written after
+# a one-line function body starts a statement of its own instead of trailing the
+# closing brace.
+STATEMENT_SEPARATOR_TOKENS = frozenset({";", ";;", "&&", "||", "&", "{", "}"})
+# The names a program binds to argument-vector dispatch, tracked for the
+# duration of one program scan like the assigned names above. A function may be
+# called above the line that defines it, so the whole program is analyzed before
+# any statement is dispatched.
+_shell_argv_dispatchers: frozenset[str] = frozenset()
+# A dynamic expression that occupies a whole command word expands to the whole
+# command, not just to an executable name, so the substitution that tests it has
+# to carry its own arguments.
+WHOLE_CROSS_COMMAND = f"cross build --target {TARGET}"
 # A remote `uses:` step runs code this repository does not own, so any remote
 # action able to reach Cross is an unreviewable build-execution surface.
 # `actions-rs/cargo` with `use-cross: true` documents that it runs the `cross`
@@ -680,6 +812,29 @@ YAML_INDIRECT_SCALAR = re.compile(r"^[*&!]")
 # `<<:` merges another mapping's keys into this one. The merged inputs reach
 # the action even though no line in the step spells them.
 YAML_MERGE_KEY = re.compile(r"(?:^|[\s{,])<<\s*:")
+# A mapping *value* may also be an alias, an anchor, or a tag. The runner
+# resolves `with: *cargo_inputs` into the anchored mapping before the action
+# runs, so the inputs that actually reach it are declared somewhere else in the
+# document and the step text is not literal evidence of anything. This is the
+# value-position counterpart to `YAML_INDIRECT_SCALAR`, which only guards the
+# `uses:` reference itself.
+YAML_INDIRECT_VALUE = re.compile(
+    rf"(?:^|[\s{{\[,])(?:{YAML_SCALAR})\s*:\s*[*&!][^\s,}}\]]*"
+)
+# A step may be written as a flow mapping instead of a block mapping. `- {uses:
+# ..., with: {use-cross: true}}` is the same step to the runner, so the scanner
+# has to enter the sequence entry rather than only reading `key:` at the start
+# of a line.
+YAML_FLOW_SEQUENCE_ENTRY = re.compile(r"^(?P<lead> *)-\s*(?P<flow>\{.*)$")
+# One `key: value` pair inside a flow mapping, stopping at the separators that
+# end a flow scalar so a nested mapping does not swallow the rest of the entry.
+# A `${{ ... }}` expression carries its own braces and is consumed whole, so
+# `uses: ${{ env.action }}` is read as one dynamic value rather than being cut
+# short at the expression's opening brace and mistaken for a literal.
+FLOW_MAPPING_VALUE = re.compile(
+    rf"(?:^|[{{\[,\s])(?P<key>{YAML_SCALAR})\s*:\s*"
+    r"(?P<value>(?:\$\{\{[^{}]*\}\}|[^,{}\[\]])*)"
+)
 YAML_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 YAML_DOUBLE_QUOTED_ESCAPES = {
     "0": "\0",
@@ -1163,6 +1318,134 @@ def extract_job_step_block(
     return "".join(lines[start:end]).rstrip() + "\n", []
 
 
+def workflow_job_ranges(lines: list[str]) -> tuple[tuple[str, int, int], ...]:
+    """Return each top-level job with the half-open line range it occupies."""
+
+    jobs_start: int | None = None
+    for index, line in enumerate(lines):
+        if decode_simple_yaml_key(line) == (0, "jobs"):
+            jobs_start = index + 1
+            break
+    if jobs_start is None:
+        return ()
+    starts: list[tuple[str, int]] = []
+    for index in range(jobs_start, len(lines)):
+        decoded = decode_simple_yaml_key(lines[index])
+        if decoded is None:
+            continue
+        indent, name = decoded
+        if indent == 0:
+            break
+        if indent == 2:
+            starts.append((name, index))
+    return tuple(
+        (
+            name,
+            start,
+            starts[position + 1][1] if position + 1 < len(starts) else len(lines),
+        )
+        for position, (name, start) in enumerate(starts)
+    )
+
+
+def artifact_name_can_match(name: str, prefix: str) -> bool:
+    """Return whether an artifact name can match a `<prefix>*` download pattern.
+
+    Only the literal text before the first expansion is known at review time, so
+    a name is ruled out only when that literal prefix already disagrees with the
+    wildcard. `docker-digest-${{ matrix.arch_dir }}` matches, `binary-${{
+    matrix.binary_target }}` cannot, and a name that begins with an expression
+    has no literal prefix at all and so is not ruled out by anything.
+    """
+
+    literal = name.split("${{", 1)[0]
+    literal = re.split(r"\$[A-Za-z_{(]", literal, maxsplit=1)[0]
+    return literal.startswith(prefix) or prefix.startswith(literal)
+
+
+def uploaded_artifact_names(
+    lines: list[str],
+    start: int,
+    end: int,
+    key_column: int,
+) -> tuple[str, ...]:
+    """Return the `name:` inputs an upload step declares, or the action default.
+
+    The step's own display `name:` sits at the reference's own column, so only
+    the deeper input mapping is read. `actions/upload-artifact` defaults to the
+    literal name `artifact` when the input is omitted, and that default is what
+    the wildcard would have to match.
+    """
+
+    values: list[str] = []
+    for offset in range(start, end):
+        match = YAML_MAPPING_FIELD.match(lines[offset])
+        if match is None:
+            continue
+        indent = len(match.group("lead")) + len(match.group("dash") or "")
+        if indent <= key_column:
+            continue
+        if decode_yaml_scalar(match.group("key")) != "name":
+            continue
+        values.append(
+            decode_yaml_scalar(
+                re.sub(r"\s+#.*$", "", match.group("value")).strip()
+            )
+        )
+    return tuple(values) if values else ("artifact",)
+
+
+def digest_artifact_ownership_errors(contents: str, source: str) -> list[str]:
+    """Reject any job outside the frozen producers that can feed a manifest.
+
+    The manifest jobs collect their inputs by wildcard, and artifacts are scoped
+    to the workflow run rather than to `needs`, so an extra matching upload from
+    anywhere in the run reaches `docker buildx imagetools create` whether or not
+    the job graph connects it. Ownership of the name space is what makes the
+    frozen download pattern meaningful.
+    """
+
+    owners = DIGEST_ARTIFACT_OWNERS.get(source, {})
+    if not owners:
+        return []
+    errors: list[str] = []
+    lines = contents.splitlines()
+    for job_name, job_start, job_end in workflow_job_ranges(lines):
+        for index in range(job_start, job_end):
+            match = YAML_MAPPING_FIELD.match(lines[index])
+            if match is None:
+                continue
+            if decode_yaml_scalar(match.group("key")) != "uses":
+                continue
+            reference = decode_yaml_scalar(
+                re.sub(r"\s+#.*$", "", match.group("value")).strip()
+            )
+            if not UPLOAD_ARTIFACT_ACTION.match(reference):
+                continue
+            key_column = len(match.group("lead")) + len(match.group("dash") or "")
+            start, end = step_block_bounds(
+                lines,
+                index,
+                key_column,
+                has_dash=bool(match.group("dash")),
+            )
+            names = uploaded_artifact_names(lines, start, end, key_column)
+            for prefix, allowed in owners.items():
+                if job_name in allowed:
+                    continue
+                for name in names:
+                    if not artifact_name_can_match(name, prefix):
+                        continue
+                    errors.append(
+                        f"{source}:{index + 1} job {job_name!r} uploads artifact "
+                        f"{name!r}, which the frozen {prefix}* digest manifest "
+                        "pattern can match; only "
+                        f"{', '.join(repr(job) for job in allowed)} may produce "
+                        "a digest artifact the published manifests consume"
+                    )
+    return errors
+
+
 def validate_publish_control_contract(contents: str, source: str) -> list[str]:
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
     errors: list[str] = []
@@ -1196,6 +1479,7 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
                     f"{source} job {job_name!r} step {step_name!r} differs from "
                     "the trusted ARM64 publication artifact-selection contract"
                 )
+    errors.extend(digest_artifact_ownership_errors(contents, source))
     return errors
 
 
@@ -1254,6 +1538,11 @@ def compare_pr_publish_control_contract(
                         f"{source} job {job_name!r} ARM64 artifact-selection step "
                         f"{step_name!r} cannot be changed by a pull request"
                     )
+    # A pull request can add a whole new job rather than edit a frozen one, and
+    # a new job needs no `needs` edge to upload an artifact the manifest
+    # wildcard collects, so the proposed tree is checked for ownership directly
+    # instead of only being compared field by field against the merge base.
+    errors.extend(digest_artifact_ownership_errors(proposed_contents, source))
     return errors
 
 
@@ -2561,6 +2850,92 @@ def inline_interpreter_has_cross(
     return False
 
 
+def segments_dispatch_argv(body: tuple[str, ...]) -> bool:
+    """Return whether any statement puts an argument reference in command position."""
+
+    for segment in shell_statement_segments(body):
+        position, executes = executable_index(segment)
+        if not executes or position >= len(segment):
+            continue
+        if segment[position] in ARGV_REFERENCE_WORDS:
+            return True
+    return False
+
+
+def shell_argv_dispatch_analysis(tokens: tuple[str, ...]) -> frozenset[str]:
+    """Find the functions that execute their argument vector.
+
+    A shell can move Cross out of the command word and still run it. `run() {
+    "$@"; }; run cross build --target ...` dispatches the arguments the caller
+    supplied, which leaves `cross` looking like inert argument text to a scanner
+    that only reads command words.
+
+    Only a body that dispatches an argument reference itself is a dispatcher, so
+    a wrapper that forwards its arguments to a named command — `f() { curl "$@";
+    }` — is correctly left alone.
+    """
+
+    dispatchers: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        name: str | None = None
+        body_start = 0
+        if (
+            index + 3 < len(tokens)
+            and tokens[index] not in {"{", "}", "(", ")"}
+            and tokens[index + 1] == "("
+            and tokens[index + 2] == ")"
+            and tokens[index + 3] == "{"
+        ):
+            name, body_start = tokens[index], index + 4
+        elif (
+            tokens[index] == "function"
+            and index + 2 < len(tokens)
+            and tokens[index + 2] == "{"
+        ):
+            name, body_start = tokens[index + 1], index + 3
+        if name is None:
+            index += 1
+            continue
+        depth = 1
+        cursor = body_start
+        while cursor < len(tokens):
+            if tokens[cursor] == "{":
+                depth += 1
+            elif tokens[cursor] == "}":
+                depth -= 1
+                if not depth:
+                    break
+            cursor += 1
+        if segments_dispatch_argv(tokens[body_start:cursor]):
+            dispatchers.add(tool_name(name))
+        index = cursor + 1
+    return frozenset(dispatchers)
+
+
+@contextlib.contextmanager
+def shell_argv_dispatch_scope(contents: str):
+    """Make a program's argv-dispatching function names visible to a line scan.
+
+    Which names dispatch their argument vector is a property of the whole
+    program: the definition and the call site are on different lines, and the
+    scanners below read one logical line at a time. The names are therefore
+    resolved once from the whole text and left in place for the duration of the
+    scan, so `run() { "$@"; }` on one line still explains `run cross build
+    --target ...` on the next.
+    """
+
+    global _shell_argv_dispatchers
+    outer = _shell_argv_dispatchers
+    tokens = shell_tokens(contents)
+    if tokens is not None:
+        _shell_argv_dispatchers = outer | shell_argv_dispatch_analysis(tokens)
+    try:
+        yield
+    finally:
+        _shell_argv_dispatchers = outer
+
+
 def token_command_has_cross(
     tokens: tuple[str, ...],
     *,
@@ -2664,6 +3039,25 @@ def token_command_has_cross(
             programs,
             include_opaque_shell_executable=include_opaque_shell_executable,
         )
+    if command in _shell_argv_dispatchers:
+        # This name belongs to a function whose body executes `"$@"`, so the
+        # words it is called with are the command line it runs.
+        return token_command_has_cross(
+            tokens[index + 1 :],
+            include_opaque_shell_executable=include_opaque_shell_executable,
+            depth=depth + 1,
+        )
+    if command == "set" and tokens[index + 1 : index + 2] == ("--",):
+        # `set -- cross build --target ...` installs a command line into the
+        # positional parameters for a later `"$@"` to dispatch. The dispatch is
+        # frequently a plain newline away from the assignment rather than a
+        # statement separator, so the operand list is read as a command line
+        # wherever it appears rather than only when a bare dispatch is proven.
+        return token_command_has_cross(
+            tokens[index + 2 :],
+            include_opaque_shell_executable=include_opaque_shell_executable,
+            depth=depth + 1,
+        )
     return False
 
 
@@ -2698,13 +3092,18 @@ def shell_program_has_cross(
         tokens = tokens[1:]
 
     global _shell_assigned_names
+    global _shell_argv_dispatchers
     outer_assigned_names = _shell_assigned_names
+    outer_dispatchers = _shell_argv_dispatchers
     _shell_assigned_names = outer_assigned_names | frozenset(
         match.group(1)
         for match in (
             SHELL_ASSIGNMENT_TOKEN.fullmatch(token) for token in tokens
         )
         if match is not None
+    )
+    _shell_argv_dispatchers = outer_dispatchers | shell_argv_dispatch_analysis(
+        tokens
     )
     try:
         return shell_statements_have_cross(
@@ -2715,6 +3114,7 @@ def shell_program_has_cross(
         )
     finally:
         _shell_assigned_names = outer_assigned_names
+        _shell_argv_dispatchers = outer_dispatchers
 
 
 def stdin_language_has_cross(
@@ -2755,7 +3155,12 @@ def shell_statements_have_cross(
             depth_count += 1
         elif token == ")" and depth_count:
             depth_count -= 1
-        if token in {";", ";;", "&&", "||", "&"} and depth_count == 0:
+        # A standalone `{` or `}` is a grouping keyword, not part of a command
+        # word, so it ends the statement before it and begins a new one after
+        # it. Without this, the call that follows a one-line function body —
+        # `f() { "$@"; }` then `f cross build ...` — would be read as a
+        # continuation of `}` and never reach a command-word check.
+        if token in STATEMENT_SEPARATOR_TOKENS and depth_count == 0:
             if current:
                 statements.append(tuple(current))
             current = []
@@ -2894,6 +3299,17 @@ def opaque_executable_variants(
             candidate = line[:start] + "cross" + line[end:]
             if has_cross_command_context(candidate):
                 variants.append(candidate)
+            # An opaque word that stands alone is replaced by its whole value,
+            # not by an executable name with the surrounding literal arguments
+            # kept. `run: ${{ steps.plan.outputs.cmd }}` executes whatever the
+            # producing step wrote, so the substitution has to supply the
+            # subcommand and target itself; testing only the bare word would
+            # leave nothing for the argument check to find. The same applies to
+            # `run: $CMD`, to `run: $(plan)`, and to a composite action's
+            # `run: ${{ inputs.cmd }}`.
+            whole_command = line[:start] + WHOLE_CROSS_COMMAND + line[end:]
+            if has_cross_command_context(whole_command):
+                variants.append(whole_command)
     return tuple(variants)
 
 
@@ -3181,7 +3597,7 @@ def shell_statement_segments(tokens: tuple[str, ...]) -> tuple[tuple[str, ...], 
             depth += 1
         elif token == ")" and depth:
             depth -= 1
-        if token in {";", ";;", "&&", "||", "&"} and depth == 0:
+        if token in STATEMENT_SEPARATOR_TOKENS and depth == 0:
             if current:
                 statements.append(tuple(current))
             current = []
@@ -3347,18 +3763,19 @@ def contains_cross_surface(
         OPAQUE_ARM_CROSS_EXECUTION.search(logical_contents)
     ):
         return True
-    return any(
-        has_cross_command_context(
-            variant,
-            include_opaque_shell_executable=include_opaque_shell_executable,
+    with shell_argv_dispatch_scope(logical_contents):
+        return any(
+            has_cross_command_context(
+                variant,
+                include_opaque_shell_executable=include_opaque_shell_executable,
+            )
+            or CROSS_ENVIRONMENT.search(variant)
+            for line in logical_scan_lines(logical_contents)
+            for variant in scan_variants(
+                line,
+                include_opaque_shell_executable=include_opaque_shell_executable,
+            )
         )
-        or CROSS_ENVIRONMENT.search(variant)
-        for line in logical_scan_lines(logical_contents)
-        for variant in scan_variants(
-            line,
-            include_opaque_shell_executable=include_opaque_shell_executable,
-        )
-    )
 
 
 def step_block_bounds(
@@ -3692,6 +4109,50 @@ def expression_reaches_target(
     )
 
 
+def flow_mapping_step_regions(lines: list[str]) -> tuple[tuple[int, str], ...]:
+    """Return every sequence entry written as a YAML flow mapping.
+
+    `- {uses: actions-rs/cargo@<sha>, with: {use-cross: true}}` is exactly the
+    step the block spelling describes, but none of its keys begin a line, so a
+    scanner that only reads `key:` at the start of a line never enters it. The
+    entry is collected from the sequence dash until its braces balance, which
+    may be several source lines later, and is returned as one logical line keyed
+    by the line the entry opens on.
+    """
+
+    regions: list[tuple[int, str]] = []
+    index = 0
+    while index < len(lines):
+        match = YAML_FLOW_SEQUENCE_ENTRY.match(lines[index])
+        if match is None:
+            index += 1
+            continue
+        collected: list[str] = []
+        depth = 0
+        quote: str | None = None
+        end = index
+        for offset in range(index, len(lines)):
+            text = match.group("flow") if offset == index else lines[offset]
+            collected.append(text.strip())
+            for character in text:
+                if quote is not None:
+                    if character == quote:
+                        quote = None
+                    continue
+                if character in "'\"":
+                    quote = character
+                elif character == "{":
+                    depth += 1
+                elif character == "}":
+                    depth -= 1
+            end = offset
+            if depth <= 0:
+                break
+        regions.append((index, " ".join(collected)))
+        index = end + 1
+    return tuple(regions)
+
+
 def remote_action_surface_lines(
     contents: str,
     source: str = "",
@@ -3709,8 +4170,11 @@ def remote_action_surface_lines(
     The whole step mapping is scanned, in any key order, with quoted keys,
     flow mappings, folded double-quoted scalars, YAML escape sequences, and
     matrix-derived target expressions all read the way the Actions runner reads
-    them. YAML aliases and merge keys resolve outside the step, so they are not
-    literal evidence of anything and fail closed.
+    them. A step written entirely as a flow mapping is a step too, so those
+    sequence entries are entered rather than skipped for not starting a line
+    with a key. YAML aliases, anchors, tags, and merge keys resolve outside the
+    step, in a reference or in a value position alike, so they are not literal
+    evidence of anything and fail closed.
 
     A local `./` action is scanned as a file of its own, but the workflow's
     `with:` values are part of its executable surface too — a composite action
@@ -3781,6 +4245,17 @@ def remote_action_surface_lines(
                 if reason is None:
                     reason = "input-merge"
                 continue
+            if YAML_INDIRECT_VALUE.search(text):
+                # `with: *cargo_inputs` is the same escape without a merge key:
+                # the runner expands the anchored mapping into the action's
+                # inputs before it runs, so `use-cross: true` and an ARM64
+                # `args:` value can reach the action while this step spells
+                # neither. An alias, an anchor, and a tag in a value position
+                # are all resolved outside the step, so none of them is literal
+                # evidence and all of them fail closed.
+                if reason is None:
+                    reason = "input-indirect"
+                continue
             # Every key on the line is considered, so a flow mapping such as
             # `with: {use-cross: true}` is read like a block mapping.
             keys = step_input_keys(text)
@@ -3836,6 +4311,73 @@ def remote_action_surface_lines(
                 if expression_reaches_target(text, definitions):
                     reason = "input-expression"
                     break
+        if reason is not None:
+            kind = "local-action" if local_action else "remote-action"
+            surfaces[index] = f"{kind}:{value}:{reason}"
+
+    for index, flow_text in flow_mapping_step_regions(lines):
+        if index in surfaces:
+            continue
+        pairs = [
+            (decode_yaml_scalar(match.group("key")), match.group("value").strip())
+            for match in FLOW_MAPPING_VALUE.finditer(flow_text)
+        ]
+        raw_value = next(
+            (value for key, value in pairs if key.lower() == "uses"),
+            None,
+        )
+        if raw_value is None:
+            # Without a `uses:` key this entry is not an action step. A `run:`
+            # step written in flow form still carries its command text on this
+            # line, where the shell scanner reads it like any other command.
+            continue
+        indirect_reference = bool(YAML_INDIRECT_SCALAR.match(raw_value))
+        value = decode_yaml_scalar(raw_value)
+        local_action = value.startswith("./") and not indirect_reference
+        if not value or (
+            not local_action
+            and (indirect_reference or "${{" in value or dynamic_shell_word(value))
+        ):
+            surfaces[index] = f"remote-action-dynamic:{index + 1}"
+            errors.append(
+                f"{source}:{index + 1} remote action references must be literal"
+                if source
+                else f"line {index + 1} remote action references must be literal"
+            )
+            continue
+
+        reason: str | None = None
+        if not local_action and "cross" in re.split(r"[^A-Za-z0-9]+", value.lower()):
+            reason = "reference"
+        elif YAML_MERGE_KEY.search(flow_text) or YAML_INDIRECT_VALUE.search(flow_text):
+            reason = "input-merge"
+        else:
+            # Every key in the entry is an input key, at any nesting depth, so
+            # `with: {use-cross: true}` and `with: {args: --target ...}` are read
+            # here exactly as the block spelling is read above.
+            cross_input = next(
+                (
+                    key
+                    for key, _ in pairs
+                    if re.sub(r"[^a-z0-9]", "", key.lower())
+                    in CROSS_CAPABLE_ACTION_INPUTS
+                ),
+                None,
+            )
+            if cross_input is not None:
+                reason = f"input:{cross_input}"
+        if reason is None:
+            definitions = workflow_scope_definitions(lines, index)
+            for variant in (flow_text, decoded_yaml_text(flow_text)):
+                if (
+                    TARGET in variant
+                    or EXPECTED_IMAGE in variant
+                    or STANDALONE_CROSS.search(variant)
+                ):
+                    reason = "input-value"
+                    break
+            if reason is None and expression_reaches_target(flow_text, definitions):
+                reason = "input-expression"
         if reason is not None:
             kind = "local-action" if local_action else "remote-action"
             surfaces[index] = f"{kind}:{value}:{reason}"
@@ -3915,19 +4457,22 @@ def unprotected_cross_surfaces(
         ):
             sensitive_jobs.add(name)
             continue
-        for logical_line in logical_scan_lines(logical_contents):
-            for variant in scan_variants(
-                logical_line,
-                include_opaque_shell_executable=include_opaque_shell_executable,
-            ):
-                if has_cross_command_context(
-                    variant,
+        with shell_argv_dispatch_scope(logical_contents):
+            for logical_line in logical_scan_lines(logical_contents):
+                for variant in scan_variants(
+                    logical_line,
                     include_opaque_shell_executable=include_opaque_shell_executable,
-                ) or CROSS_ENVIRONMENT.search(variant):
-                    sensitive_jobs.add(name)
+                ):
+                    if has_cross_command_context(
+                        variant,
+                        include_opaque_shell_executable=(
+                            include_opaque_shell_executable
+                        ),
+                    ) or CROSS_ENVIRONMENT.search(variant):
+                        sensitive_jobs.add(name)
+                        break
+                if name in sensitive_jobs:
                     break
-            if name in sensitive_jobs:
-                break
 
     # A remote action is opaque code, so a Cross-capable one is attributed to
     # the job that runs it exactly like a literal Cross command would be.
@@ -4109,26 +4654,27 @@ def generic_action_cross_surfaces(
         remote_surfaces, remote_errors = remote_action_surface_lines(contents, name)
     else:
         remote_surfaces, remote_errors = {}, []
-    sensitive = (
-        runtime_sensitive
-        or bool(runtime_errors)
-        or bool(remote_surfaces)
-        or bool(remote_errors)
-        or OPAQUE_INLINE_SHELL.search(logical_contents) is not None
-        or WRAPPED_LITERAL_CROSS.search(logical_contents) is not None
-        or any(
-            has_cross_command_context(
-                variant,
-                include_opaque_shell_executable=include_opaque_shell_executable,
-            )
-            or CROSS_ENVIRONMENT.search(variant)
-            for line in logical_scan_lines(logical_contents)
-            for variant in scan_variants(
-                line,
-                include_opaque_shell_executable=include_opaque_shell_executable,
+    with shell_argv_dispatch_scope(logical_contents):
+        sensitive = (
+            runtime_sensitive
+            or bool(runtime_errors)
+            or bool(remote_surfaces)
+            or bool(remote_errors)
+            or OPAQUE_INLINE_SHELL.search(logical_contents) is not None
+            or WRAPPED_LITERAL_CROSS.search(logical_contents) is not None
+            or any(
+                has_cross_command_context(
+                    variant,
+                    include_opaque_shell_executable=include_opaque_shell_executable,
+                )
+                or CROSS_ENVIRONMENT.search(variant)
+                for line in logical_scan_lines(logical_contents)
+                for variant in scan_variants(
+                    line,
+                    include_opaque_shell_executable=include_opaque_shell_executable,
+                )
             )
         )
-    )
     if not sensitive:
         return ()
     digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
@@ -8272,6 +8818,89 @@ pre_build = []
         "spaced one-line function body",
         f"f() {{ cross {arm_target}; }}\nf",
     )
+    # A shell can move Cross out of the command word and still execute it by
+    # dispatching an argument vector that holds it.
+    shell_automation_escapes(
+        "function that dispatches its argument vector",
+        f'run() {{ "$@"; }}\nrun cross {arm_target}',
+    )
+    shell_automation_escapes(
+        "argument-vector dispatch through exec",
+        f'go() {{ exec "$@"; }}\ngo cross {arm_target}',
+    )
+    shell_automation_escapes(
+        "first positional parameter dispatch",
+        f'only() {{ "$1"; }}\nonly cross {arm_target}',
+    )
+    shell_automation_escapes(
+        "command line loaded into the positional parameters",
+        f'set -- cross {arm_target}\n"$@"',
+    )
+    shell_automation_escapes(
+        "argument-vector dispatch defined with the function keyword",
+        f'function run {{ "$@"; }}\nrun cross {arm_target}',
+    )
+    # Following an argv dispatcher must not turn every wrapper into a surface: a
+    # function that forwards its arguments to a named command never dispatches
+    # them, and a real dispatcher called with an ordinary command line is still
+    # an ordinary command line.
+    benign_argv_scripts = {
+        "argument reference in an argument position": (
+            'w() { echo "$@"; }\nw hello'
+        ),
+        "argv dispatcher called with an unrelated command": (
+            'r() { "$@"; }\nr echo hello'
+        ),
+    }
+    for label, body in benign_argv_scripts.items():
+        if validate_automation_collection(
+            {"ci.yml": referenced_workflow},
+            {"setup/action.yml": safe_action},
+            {"scripts/safe.sh": f"#!/bin/sh\n{body}\n"},
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} was rejected")
+
+    # A dynamic expression that occupies a whole command word is replaced by a
+    # whole command, so nothing of `build --target ...` is left on the line for
+    # an argument check to find.
+    expression_command_workflow = (
+        "name: Expression\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: BODY\n"
+    )
+    whole_command_bodies = {
+        "whole-command step output expression": "${{ steps.plan.outputs.cmd }}",
+        "whole-command composite action input": "${{ inputs.cmd }}",
+        "whole-command shell parameter": "$CMD",
+        "whole-command substitution": "$(cat plan.txt)",
+    }
+    for label, body in whole_command_bodies.items():
+        surfaces, errors = generic_workflow_cross_surfaces(
+            expression_command_workflow.replace("BODY", body),
+            "self-test expression workflow",
+            include_opaque_shell_executable=True,
+        )
+        if not surfaces and not errors:
+            failures.append(f"{label} was not protected")
+
+    # An expression that is an argument to a named command, or that is only
+    # data, does not occupy a command word and stays editable.
+    benign_expression_bodies = {
+        "expression argument to a named command": "echo ${{ github.sha }}",
+        "expression in a data assignment": "VALUE=${{ github.sha }}",
+    }
+    for label, body in benign_expression_bodies.items():
+        surfaces, errors = generic_workflow_cross_surfaces(
+            expression_command_workflow.replace("BODY", body),
+            "self-test expression workflow",
+        )
+        if surfaces or errors:
+            failures.append(f"{label} was rejected")
     shell_automation_escapes(
         "env with a separate option operand",
         f"env -u FOO cross {arm_target}",
@@ -8977,6 +9606,76 @@ pre_build = []
     ):
         failures.append("a preceding step's contents leaked into the next step")
 
+    # An alias, an anchor, or a tag in a value position is resolved outside the
+    # step, so `with: *cargo_inputs` can carry `use-cross: true` and an ARM64
+    # `args:` value into the action while the step itself spells neither.
+    indirect_input_steps = {
+        "aliased input map": (
+            f"      - uses: {remote_action}\n        with: *cargo_inputs\n"
+        ),
+        "aliased single input": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          args: *arm_target\n"
+        ),
+        "anchored input map": (
+            f"      - uses: {other_action}\n"
+            "        with: &reused\n"
+            "          context: .\n"
+        ),
+        "tagged input value": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          args: !!str build\n"
+        ),
+        "flow-mapping aliased input map": (
+            f"      - {{uses: {other_action}, with: *cargo_inputs}}\n"
+        ),
+    }
+    for label, body in indirect_input_steps.items():
+        if not step_surface(body):
+            failures.append(f"{label} was not protected")
+
+    # A step written entirely as a flow mapping is the same step the runner
+    # runs, so its reference and every one of its inputs are read here too.
+    flow_mapping_steps = {
+        "flow-mapping Cross-capable input": (
+            f"      - {{uses: {other_action}, "
+            "with: {use-cross: true, args: build}}\n"
+        ),
+        "flow-mapping ARM64 target argument": (
+            f"      - {{uses: {other_action}, "
+            "with: {args: --target " + TARGET + "}}\n"
+        ),
+        "flow-mapping Cross-capable reference": (
+            "      - {uses: cross-rs/cross-action@" + ("e" * 40) + "}\n"
+        ),
+        "flow-mapping dynamic reference": "      - {uses: ${{ env.action }}}\n",
+        "flow-mapping merge key": (
+            f"      - {{uses: {other_action}, with: {{<<: *cross_inputs}}}}\n"
+        ),
+        "flow-mapping step split across lines": (
+            f"      - {{uses: {other_action},\n"
+            "          with: {use-cross: true}}\n"
+        ),
+    }
+    for label, body in flow_mapping_steps.items():
+        if not step_surface(body):
+            failures.append(f"{label} was not protected")
+
+    # An ordinary flow-mapping step stays editable.
+    benign_flow_steps = {
+        "flow-mapping checkout": (
+            "      - {uses: actions/checkout@" + ("f" * 40) + "}\n"
+        ),
+        "flow-mapping benign inputs": (
+            f"      - {{uses: {other_action}, with: {{context: ., push: true}}}}\n"
+        ),
+    }
+    for label, body in benign_flow_steps.items():
+        if step_surface(body):
+            failures.append(f"{label} was rejected")
+
     # A `shell: pwsh` body is PowerShell, not POSIX shell.
     powershell_workflow = (
         "name: PowerShell\n"
@@ -9529,6 +10228,9 @@ pre_build = []
 
     ci_publish_contract = PUBLISH_CONTROL_CONTRACTS["CI workflow"]
     ci_publish_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["CI workflow"]["docker"]
+    ci_manifest_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["CI workflow"][
+        "docker-manifest"
+    ]
     publish_workflow = (
         "name: Publish fixture\n"
         "on: [push]\n"
@@ -9545,6 +10247,17 @@ pre_build = []
         + "    runs-on: ubuntu-latest\n"
         + ci_publish_contract["docker"]["strategy"]
         + ci_publish_contract["docker"]["steps"]
+        + "\n"
+        + "  docker-manifest:\n"
+        + ci_publish_contract["docker-manifest"]["needs"]
+        + ci_publish_contract["docker-manifest"]["if"]
+        + "    runs-on: ubuntu-latest\n"
+        + "    steps:\n"
+        + ci_manifest_steps["Download digests"]
+        + "\n"
+        + ci_manifest_steps["Create and push multi-arch manifest (Docker Hub)"]
+        + "\n"
+        + ci_manifest_steps["Create and push multi-arch manifest (GHCR)"]
     )
     if validate_publish_control_contract(publish_workflow, "CI workflow"):
         failures.append("valid ARM64 publication dependency controls were rejected")
@@ -9587,6 +10300,92 @@ pre_build = []
             "CI workflow",
         ):
             failures.append(f"{label} was allowed by the merge-base comparison")
+
+    # The manifest job assembles the published `latest` tag from a wildcard, so
+    # its dependency edges, its download pattern, and the commands that consume
+    # `/tmp/digests` are part of the publication contract too.
+    manifest_edits = {
+        "manifest needs widened to an added job": (
+            ci_publish_contract["docker-manifest"]["needs"],
+            "    needs: [docker, extra-digests]\n",
+        ),
+        "manifest download pattern widened": (
+            "          pattern: docker-digest-*\n",
+            "          pattern: docker-*\n",
+        ),
+        "manifest gate opened to pull requests": (
+            ci_publish_contract["docker-manifest"]["if"],
+            "    if: always()\n",
+        ),
+        "manifest tag repointed": (
+            "            -t ferrumedge/ferrum-edge:latest \\\n",
+            "            -t ferrumedge/ferrum-edge:latest -t evil/image:latest \\\n",
+        ),
+    }
+    for label, (original, replacement) in manifest_edits.items():
+        tampered = publish_workflow.replace(original, replacement, 1)
+        if tampered == publish_workflow:
+            failures.append(f"{label} fixture did not change the workflow")
+            continue
+        if not validate_publish_control_contract(tampered, "CI workflow"):
+            failures.append(f"{label} was not rejected")
+        if not compare_pr_publish_control_contract(
+            publish_workflow,
+            tampered,
+            "CI workflow",
+        ):
+            failures.append(f"{label} was allowed by the merge-base comparison")
+
+    # Artifacts are scoped to the workflow run rather than to `needs`, so an
+    # added job can put one more digest in front of the manifest wildcard
+    # without touching any frozen field. The name space is owned for that
+    # reason, not just the job graph frozen.
+    digest_namespace_workflow = publish_workflow + (
+        "\n"
+        "  extra-digests:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/upload-artifact@" + ("0" * 40) + "\n"
+        "        with:\n"
+        "          name: docker-digest-evil\n"
+        "          path: /tmp/digests/*\n"
+    )
+    if not validate_publish_control_contract(
+        digest_namespace_workflow,
+        "CI workflow",
+    ):
+        failures.append("an added digest artifact producer was not rejected")
+    if not compare_pr_publish_control_contract(
+        publish_workflow,
+        digest_namespace_workflow,
+        "CI workflow",
+    ):
+        failures.append(
+            "an added digest artifact producer was allowed by the comparison"
+        )
+
+    # A name assembled by an expression is ruled out only when its literal
+    # prefix already disagrees with the wildcard.
+    dynamic_digest_workflow = digest_namespace_workflow.replace(
+        "          name: docker-digest-evil\n",
+        "          name: docker-digest-${{ github.actor }}\n",
+        1,
+    )
+    if not validate_publish_control_contract(dynamic_digest_workflow, "CI workflow"):
+        failures.append("a dynamically named digest artifact was not rejected")
+
+    # An unrelated artifact from an unrelated job stays editable.
+    for label, artifact_name in (
+        ("unrelated artifact upload", "coverage-report"),
+        ("unrelated dynamic artifact upload", "binary-${{ matrix.target }}"),
+    ):
+        unrelated_workflow = digest_namespace_workflow.replace(
+            "          name: docker-digest-evil\n",
+            f"          name: {artifact_name}\n",
+            1,
+        )
+        if validate_publish_control_contract(unrelated_workflow, "CI workflow"):
+            failures.append(f"{label} was rejected")
 
     # Freezing the artifact-selection steps alone leaves the rest of the job
     # able to rewrite the context they prepared. Every one of these keeps the
