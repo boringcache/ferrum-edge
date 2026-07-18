@@ -163,8 +163,13 @@ jobs:
               mkdir -p "$(dirname "$output")"
               git show "${commit}:${path}" > "$output"
             done < <(
+              # The trailing root manifests are build dispatchers: a workflow
+              # step running `make`/`npm run` executes their recipes, so they
+              # are compared exactly like the approved script roots.
               git ls-tree -rz --name-only "$commit" -- \
-                .github/scripts comparison scripts tests/k8s tests/performance
+                .github/scripts comparison scripts tests/k8s tests/performance \
+                Makefile makefile GNUmakefile package.json \
+                justfile Justfile .justfile Taskfile.yml Taskfile.yaml
             )
           }
 

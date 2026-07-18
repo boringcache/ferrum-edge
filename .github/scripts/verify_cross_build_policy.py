@@ -138,16 +138,37 @@ CROSS_ENVIRONMENT = re.compile(
     r"(?<![A-Za-z0-9_])(?:CROSS_[A-Z0-9_]*|DOCKER_OPTS|QEMU_STRACE|"
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
 )
+# An executable word may be spelled with a leading directory path
+# (`/usr/bin/cargo cross`, `~/.cargo/bin/cross`, `./tools/cross`). Absorbing the
+# path prefix at every command-word position keeps the whole scanner
+# path-agnostic instead of recognizing only bare tool names.
+TOOL_PATH_PREFIX = r"(?:[~.]{0,2}(?:/[A-Za-z0-9_.$@{}+-]+)*/)?"
+# `sh -c '<script>'` starts a nested shell whose first word is an executable.
+# The trailing quote is optional because a flattened Python argv
+# (`subprocess.run(['sh', '-c', 'cross build ...'])`) loses its quoting before
+# it reaches this scanner. `-lc` and `-l -c` are the same end-of-flags form.
+SHELL_C_CONTEXT = (
+    rf"(?<![A-Za-z0-9_-]){TOOL_PATH_PREFIX}(?:bash|sh|dash|ksh|zsh|ash)"
+    r"(?:\s+-[A-Za-z]+)*\s+-[A-Za-z]*c[A-Za-z]*\s+['\"]?"
+)
+# `case $x in *) cross build ...;; esac` puts the executable straight after a
+# pattern terminator. Anchoring on the preceding `in`/`;;` keeps ordinary
+# parenthesized prose such as `see (note) cross builds` out of the slot.
+CASE_ARM_CONTEXT = r"(?:\bin|;;)\s+\(?\s*[^\s;&|()]+(?:\s*\|\s*[^\s;&|()]+)*\)\s+"
 # A command word can start a new statement after an operator, at the start of a
 # line, or immediately inside a function body/group. `{` matters because a
 # one-line function such as `f(){ cross build ...; }` places the executable
 # directly after the brace with no other separator. Bash requires blank space
 # after that brace, and requiring it here keeps ordinary `{"cross": ...}` data
-# out of the executable slot. `(` is deliberately not a context: a real
-# subshell is already covered by the optional `\(` that follows each context,
-# whereas a bare `(` also appears literally inside quoted prose.
+# out of the executable slot. A bare `(` is deliberately still not a context: a
+# real subshell is already covered by the optional `\(` that follows each
+# context, whereas a bare `(` also appears literally inside quoted prose.
+# `$(`, a backtick, and `<(`/`>(` are unambiguous executable slots, so an
+# assignment such as `out=$(cross build ...)` is one.
 COMMAND_START_CONTEXT = (
     r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|"
+    r"\$\(\s*|`\s*|[<>]\(\s*|"
+    rf"{CASE_ARM_CONTEXT}|{SHELL_C_CONTEXT}|"
     r"\b(?:if|elif|while|until|then|do|else)\s+)"
     r"(?:!\s*)?"
 )
@@ -156,16 +177,21 @@ COMMAND_START_CONTEXT = (
 # cross`). Enumerate the operand-taking forms before the self-contained ones so
 # the operand is consumed with its flag instead of being mistaken for the
 # executable.
+# A bare `--` ends option parsing, so `env -- cross` and `sudo -- cross` place
+# the executable in the very next word. Enumerating it first stops the scanner
+# from halting on the marker instead of consuming it.
 ENV_OPTION = (
-    r"(?:-[uCS]\s+[^\s]+|"
+    r"(?:--(?=\s)|"
+    r"-[uCS]\s+[^\s]+|"
     r"--(?:unset|chdir|split-string|block-signal|default-signal|ignore-signal)"
     r"(?:=[^\s]+|\s+[^\s]+)|"
     r"--?[^\s]+|"
     r"[A-Za-z_][A-Za-z0-9_]*=[^\s]+)"
 )
-ENV_PREFIX = rf"(?:env(?:\s+{ENV_OPTION})*\s+)"
+ENV_PREFIX = rf"(?:{TOOL_PATH_PREFIX}env(?:\s+{ENV_OPTION})*\s+)"
 WRAPPER_OPTION = (
-    r"(?:-[nupgEC]\s+[^\s]+|"
+    r"(?:--(?=\s)|"
+    r"-[nupgEC]\s+[^\s]+|"
     r"--(?:user|group|chdir|niceness|priority|signal|kill-after)"
     r"(?:=[^\s]+|\s+[^\s]+)|"
     r"--?[A-Za-z0-9][A-Za-z0-9-]*(?:=[^\s]+)?|"
@@ -174,21 +200,27 @@ WRAPPER_OPTION = (
 # `command -v`/`-V` only looks a name up and prints it; it does not execute the
 # operand, so it must not open an executable slot.
 WRAPPER_PREFIX = (
-    r"(?:(?!command\s+-[vV]\b)"
+    rf"(?:{TOOL_PATH_PREFIX}(?!command\s+-[vV]\b)"
     r"(?:command|exec|nohup|sudo|time|timeout|stdbuf|nice|ionice|setsid)"
     rf"(?:\s+{WRAPPER_OPTION})*\s+)*"
+)
+# Every Cross spelling shares one command-start prefix, including the
+# `cargo install cross` form. Anchoring that form keeps benign prose such as
+# `echo "run cargo install cross locally"` or a comment out of the executable
+# slot instead of freezing unrelated edits to the file that mentions it.
+CROSS_EXECUTABLE = (
+    rf"(?:{ENV_PREFIX}?(?:{TOOL_PATH_PREFIX}cargo(?:\s+\+[^\s]+)?\s+)?"
+    rf"{TOOL_PATH_PREFIX}(?<![A-Za-z0-9_-])cross(?![A-Za-z0-9_-])(?=\s+\S)|"
+    rf"{ENV_PREFIX}?{TOOL_PATH_PREFIX}cargo(?:\s+\+[^\s]+)?\s+install"
+    r"(?:\s+--[^\s=]+(?:=[^\s]+|\s+(?!cross\b)[^\s]+)?)*"
+    r"\s+cross(?![A-Za-z0-9_-]))"
 )
 CROSS_COMMAND_CONTEXT = re.compile(
     COMMAND_START_CONTEXT
     + WRAPPER_PREFIX
     + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    r"(?:\(\s*)?(?:"
-    r"cross|"
-    + ENV_PREFIX
-    + r"(?:cargo(?:\s+\+[^\s]+)?\s+)?cross|"
-    r"cargo(?:\s+\+[^\s]+)?\s+cross"
-    r")(?=\s+\S)|cargo\s+install"
-    r"(?:\s+--[^\s=]+(?:=[^\s]+|\s+(?!cross\b)[^\s]+)?)*\s+cross\b"
+    r"(?:\(\s*)?"
+    + CROSS_EXECUTABLE
 )
 WRAPPED_LITERAL_CROSS = re.compile(
     r"(?:\b(?:bash|sh)\s+-c\s+['\"][^'\"]*\bcross\s+|"
@@ -322,6 +354,54 @@ NON_PYTHON_PROCESS_DISPATCH = re.compile(
     r"\b(?:Bun\.spawn|Deno\.Command)\s*\(|"
     r"\b(?:Process\.spawn|IO\.popen|Open3\.[A-Za-z_]+|system|exec)\s*\(|"
     r"\b(?:os\.execute|io\.popen)\s*\()"
+)
+# A Bash helper that enables `expand_aliases` and binds a short name to Cross
+# runs Cross through a word that never appears as a literal executable. Both
+# the alias body and every command-start use of the alias name are command text.
+SHELL_ALIAS_DEFINITION = re.compile(
+    r"(?:^[ \t]*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|\b(?:then|do|else)\s+)"
+    r"alias\s+(?:-p\s+)*(?P<name>[A-Za-z_][A-Za-z0-9_-]*)="
+    r"(?P<value>'[^'\n]*'|\"[^\"\n]*\"|[^\s;&|]*)",
+    # Definitions are scanned over whole files, so the line-start context must
+    # match every line rather than only the first.
+    re.MULTILINE,
+)
+MAXIMUM_TRACKED_ALIASES = 64
+# A repo-controlled dispatcher runs recipes from a manifest the workflow never
+# names, so `run: make arm64` can reach Cross with no Cross token in the
+# workflow. Each dispatcher is mapped to the manifests it can execute; the
+# manifest is then followed and frozen exactly like a referenced script.
+DISPATCHER_MANIFESTS = {
+    "make": ("Makefile", "makefile", "GNUmakefile"),
+    "gmake": ("Makefile", "makefile", "GNUmakefile"),
+    "npm": ("package.json",),
+    "pnpm": ("package.json",),
+    "yarn": ("package.json",),
+    "just": ("justfile", "Justfile", ".justfile"),
+    "task": ("Taskfile.yml", "Taskfile.yaml"),
+}
+DISPATCHER_MANIFEST_NAMES = frozenset(
+    name for names in DISPATCHER_MANIFESTS.values() for name in names
+)
+BUILD_DISPATCHER = re.compile(
+    COMMAND_START_CONTEXT
+    + WRAPPER_PREFIX
+    + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+    + ENV_PREFIX
+    + r"?"
+    + TOOL_PATH_PREFIX
+    + r"(?P<dispatcher>" + "|".join(sorted(DISPATCHER_MANIFESTS)) + r")"
+    r"(?![A-Za-z0-9_-])(?P<arguments>[^\n;&|]*)"
+)
+# `make -C build`, `just --justfile tools/justfile`, and `npm --prefix web run`
+# relocate the manifest the dispatcher reads.
+DISPATCHER_DIRECTORY = re.compile(
+    r"(?:^|\s)(?:-C|--directory|--prefix|--cwd|--dir)(?:=|\s+)"
+    r"(?P<quote>['\"]?)(?P<path>[^\s'\";&|]+)(?P=quote)"
+)
+DISPATCHER_MANIFEST_OPTION = re.compile(
+    r"(?:^|\s)(?:-f|--file|--makefile|--justfile|--taskfile)(?:=|\s+)"
+    r"(?P<quote>['\"]?)(?P<path>[^\s'\";&|]+)(?P=quote)"
 )
 CD_COMMAND = re.compile(
     r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|\b(?:then|do|else)\s+)"
@@ -1189,6 +1269,48 @@ def scan_variants(
     return tuple(dict.fromkeys(expanded_variants))
 
 
+def shell_alias_variants(contents: str) -> tuple[str, ...]:
+    """Expose the command text a Bash alias expands to at a command start."""
+
+    aliases: dict[str, str] = {}
+    for match in SHELL_ALIAS_DEFINITION.finditer(contents):
+        value = match.group("value")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if value:
+            aliases[match.group("name")] = value
+        if len(aliases) >= MAXIMUM_TRACKED_ALIASES:
+            # A deliberately huge alias table is an unknown executable surface,
+            # so stop expanding and fail closed instead of skipping the rest.
+            return (f"cross build --target {TARGET}",)
+    if not aliases:
+        return ()
+
+    # An alias body is a command line in its own right, which covers
+    # `alias c='cross build ...'` even with no use site in the same file.
+    variants: list[str] = list(aliases.values())
+    for name, value in aliases.items():
+        expansion = re.compile(
+            COMMAND_START_CONTEXT + re.escape(name) + r"(?![A-Za-z0-9_-])"
+        )
+        for line in contents.splitlines():
+            # The match ends with the alias name, so replacing that suffix keeps
+            # the command-start context that preceded it intact.
+            expanded = expansion.sub(
+                lambda use, alias=name, body=value: use.group()[: -len(alias)] + body,
+                line,
+            )
+            if expanded != line:
+                variants.append(expanded)
+    return tuple(dict.fromkeys(variants))
+
+
+def logical_scan_lines(contents: str) -> tuple[str, ...]:
+    """Return every command line to scan, including Bash alias expansions."""
+
+    return (*contents.splitlines(), *shell_alias_variants(contents))
+
+
 def contains_cross_surface(
     contents: str,
     *,
@@ -1203,7 +1325,7 @@ def contains_cross_surface(
         return True
     return any(
         STANDALONE_CROSS.search(variant) or CROSS_ENVIRONMENT.search(variant)
-        for line in logical_contents.splitlines()
+        for line in logical_scan_lines(logical_contents)
         for variant in scan_variants(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
@@ -1280,7 +1402,7 @@ def unprotected_cross_surfaces(
         ):
             sensitive_jobs.add(name)
             continue
-        for logical_line in logical_contents.splitlines():
+        for logical_line in logical_scan_lines(logical_contents):
             for variant in scan_variants(
                 logical_line,
                 include_opaque_shell_executable=include_opaque_shell_executable,
@@ -1437,7 +1559,7 @@ def generic_action_cross_surfaces(
         or WRAPPED_LITERAL_CROSS.search(logical_contents) is not None
         or any(
         has_cross_command_context(variant) or CROSS_ENVIRONMENT.search(variant)
-        for line in logical_contents.splitlines()
+        for line in logical_scan_lines(logical_contents)
         for variant in scan_variants(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
@@ -1456,11 +1578,44 @@ def contains_literal_executable_cross(contents: str) -> bool:
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
     return any(
         has_cross_command_context(variant) or CROSS_ENVIRONMENT.search(variant)
-        for line in logical_contents.splitlines()
+        for line in logical_scan_lines(logical_contents)
         for variant in scan_variants(
             line,
             include_opaque_shell_executable=False,
         )
+    )
+
+
+def is_dispatcher_manifest(name: str) -> bool:
+    return PurePosixPath(name).name in DISPATCHER_MANIFEST_NAMES
+
+
+def dispatcher_manifest_scripts(name: str, contents: str) -> tuple[str, ...]:
+    """Return the shell text a repo build-dispatcher manifest can execute."""
+
+    if PurePosixPath(name).name == "package.json":
+        try:
+            parsed = json.loads(contents)
+        except json.JSONDecodeError:
+            # An unparsable manifest is an unknown surface, so scan it whole.
+            return (contents,)
+        scripts = parsed.get("scripts") if isinstance(parsed, dict) else None
+        if not isinstance(scripts, dict):
+            return ()
+        return tuple(value for value in scripts.values() if isinstance(value, str))
+    # Make/just/task recipe lines are shell, but carry `@`, `-`, and `+` prefixes
+    # that would otherwise sit between the command start and the executable.
+    return (re.sub(r"(?m)^(\s+)[-@+]+", r"\1", contents),)
+
+
+def dispatcher_manifest_cross_surface(name: str, contents: str) -> bool:
+    """Return whether a dispatcher manifest recipe can execute Cross."""
+
+    return any(
+        contains_literal_executable_cross(script)
+        or WRAPPED_LITERAL_CROSS.search(script)
+        or OPAQUE_ARM_CROSS_EXECUTION.search(re.sub(r"\\\r?\n[ \t]*", "", script))
+        for script in dispatcher_manifest_scripts(name, contents)
     )
 
 
@@ -1473,6 +1628,12 @@ def automation_file_cross_surfaces(name: str, contents: str) -> tuple[str, ...]:
             include_opaque_shell_executable=True,
         )
     )
+    if is_dispatcher_manifest(name) and dispatcher_manifest_cross_surface(
+        name,
+        contents,
+    ):
+        digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+        surfaces.append(f"dispatcher-manifest-cross:{digest}")
     if name.endswith(".py"):
         process_commands, process_failures = python_command_scripts(
             contents,
@@ -1817,6 +1978,36 @@ def python_command_scripts(
             return f"{parent}.{node.attr}" if parent is not None else None
         return None
 
+    def resolve_import_alias(raw: str | None) -> str | None:
+        if raw is None:
+            return None
+        parts = raw.split(".", 1)
+        head = imported_names.get(parts[0], parts[0])
+        return f"{head}.{parts[1]}" if len(parts) == 2 else head
+
+    # `run = subprocess.run` and `sp = subprocess` reach exactly the same
+    # process API as a direct call, so a local alias must resolve to what it
+    # names instead of being skipped as an unknown local variable. Chained
+    # aliases settle in a bounded number of passes.
+    for _ in range(8):
+        rebound = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            aliased = resolve_import_alias(static_name(node.value))
+            if aliased is None or aliased == target.id:
+                continue
+            if aliased not in process_calls and aliased not in {"os", "subprocess"}:
+                continue
+            if imported_names.get(target.id) != aliased:
+                imported_names[target.id] = aliased
+                rebound = True
+        if not rebound:
+            break
+
     def call_name(node: ast.expr) -> str | None:
         """Resolve a callee, including literal dynamic import/attribute lookup."""
 
@@ -1968,6 +2159,10 @@ def automation_command_scripts(
 ) -> tuple[list[str], list[str]]:
     if workflow_source:
         return list(workflow_command_scripts(contents)), []
+    if is_dispatcher_manifest(source):
+        # Recipes are shell, so a manifest can chain into scripts and further
+        # dispatchers exactly like any other reached automation file.
+        return list(dispatcher_manifest_scripts(source, contents)), []
     if source.endswith(".py"):
         return python_command_scripts(contents, source)
     if (
@@ -1984,10 +2179,15 @@ def local_automation_references(
     source: str,
     *,
     workflow_source: bool,
-) -> tuple[set[str], list[str]]:
-    """Collect canonical repo scripts and reject unscanned local actions/commands."""
+) -> tuple[set[str], set[str], list[str]]:
+    """Collect canonical repo scripts and reject unscanned local actions/commands.
+
+    Returns the literal script references, the build-dispatcher manifest
+    candidate groups (`"Makefile|makefile|GNUmakefile"`), and any failures.
+    """
 
     references: set[str] = set()
+    dispatcher_groups: set[str] = set()
     errors: list[str] = []
     if workflow_source:
         for line_number, line in enumerate(contents.splitlines(), start=1):
@@ -2100,7 +2300,39 @@ def local_automation_references(
                         f"{source}:{line_number} repository command {command_path!r} "
                         "is outside the scanned automation roots"
                     )
-    return references, errors
+
+            for match in BUILD_DISPATCHER.finditer(normalized_line):
+                arguments = match.group("arguments")
+                base = working_directory or ""
+                directory = DISPATCHER_DIRECTORY.search(arguments)
+                if directory is not None:
+                    relocated = normalize_repository_path(directory.group("path"))
+                    if relocated is None:
+                        errors.append(
+                            f"{source}:{line_number} build dispatcher directory "
+                            f"{directory.group('path')!r} is not a repository path"
+                        )
+                        continue
+                    base = relocated
+
+                explicit = DISPATCHER_MANIFEST_OPTION.search(arguments)
+                if explicit is not None:
+                    manifest = normalize_repository_path(explicit.group("path"))
+                    if manifest is None:
+                        errors.append(
+                            f"{source}:{line_number} build dispatcher manifest "
+                            f"{explicit.group('path')!r} is not a repository path"
+                        )
+                        continue
+                    names: tuple[str, ...] = (manifest,)
+                else:
+                    names = DISPATCHER_MANIFESTS[match.group("dispatcher")]
+                candidates = tuple(
+                    (PurePosixPath(base) / name).as_posix() if base else name
+                    for name in names
+                )
+                dispatcher_groups.add("|".join(candidates))
+    return references, dispatcher_groups, errors
 
 
 def reachable_automation_references(
@@ -2113,14 +2345,31 @@ def reachable_automation_references(
     reachable: set[str] = set()
     errors: list[str] = []
     pending: list[str] = []
+
+    def follow_dispatchers(groups: set[str], origin: str) -> None:
+        """Resolve each dispatcher to whichever of its manifests exists."""
+
+        for group in sorted(groups):
+            candidates = group.split("|")
+            present = [name for name in candidates if name in automation]
+            if present:
+                pending.extend(present)
+                continue
+            errors.append(
+                f"{origin} runs a repository build dispatcher whose manifest "
+                f"({candidates[0]!r}) is missing from the scanned automation "
+                "roots"
+            )
+
     for name, contents in sorted(sources.items()):
-        references, failures = local_automation_references(
+        references, dispatchers, failures = local_automation_references(
             contents,
             f"{label}/{name}",
             workflow_source=True,
         )
         errors.extend(failures)
         pending.extend(sorted(references))
+        follow_dispatchers(dispatchers, f"{label}/{name}")
 
     while pending:
         name = pending.pop()
@@ -2131,13 +2380,14 @@ def reachable_automation_references(
         if contents is None:
             errors.append(f"{label} references missing automation file {name!r}")
             continue
-        references, failures = local_automation_references(
+        references, dispatchers, failures = local_automation_references(
             contents,
             f"{label}/{name}",
             workflow_source=False,
         )
         errors.extend(failures)
         pending.extend(sorted(references - reachable))
+        follow_dispatchers(dispatchers, f"{label}/{name}")
     return reachable, errors
 
 
@@ -2170,6 +2420,15 @@ def validate_automation_collection(
             errors.append(
                 f"{source}/{name} contains an unprotected Cross executable or "
                 "generated inline shell surface"
+            )
+        elif (
+            contents is not None
+            and is_dispatcher_manifest(name)
+            and dispatcher_manifest_cross_surface(name, contents)
+        ):
+            errors.append(
+                f"{source}/{name} contains an unprotected Cross executable in a "
+                "build-dispatcher recipe"
             )
         elif contents is not None and name.endswith(".py"):
             process_commands, process_failures = python_command_scripts(
@@ -3627,13 +3886,65 @@ pre_build = []
         "name = 'run'\n"
         f"getattr(subprocess, name)(['cross', {arm_arguments}])\n",
     )
+    python_automation_escapes(
+        "shell-wrapper subprocess",
+        "import subprocess\n"
+        "subprocess.run(['sh', '-c', 'cross build --target "
+        f"{TARGET}'])\n",
+    )
+    python_automation_escapes(
+        "login-shell-wrapper subprocess",
+        "import subprocess\n"
+        "subprocess.run(['bash', '-lc', 'cross build --target "
+        f"{TARGET}'])\n",
+    )
+    python_automation_escapes(
+        "absolute Cross executable path",
+        "import subprocess\n"
+        f"subprocess.run(['/home/runner/.cargo/bin/cross', {arm_arguments}])\n",
+    )
+    python_automation_escapes(
+        "absolute Cargo path before Cross",
+        "import subprocess\n"
+        f"subprocess.run(['/usr/bin/cargo', 'cross', {arm_arguments}])\n",
+    )
+    python_automation_escapes(
+        "aliased process function",
+        "import subprocess\n"
+        "run = subprocess.run\n"
+        f"run(['cross', {arm_arguments}])\n",
+    )
+    python_automation_escapes(
+        "aliased process module",
+        "import subprocess\n"
+        "sp = subprocess\n"
+        f"sp.run(['cross', {arm_arguments}])\n",
+    )
+    python_automation_escapes(
+        "chained process alias",
+        "import subprocess\n"
+        "run = subprocess.run\n"
+        "launch = run\n"
+        f"launch(['cross', {arm_arguments}])\n",
+    )
+    python_automation_escapes(
+        "aliased shell-wrapper subprocess",
+        "import subprocess\n"
+        "run = subprocess.run\n"
+        f"run(['sh', '-c', 'cross build --target {TARGET}'])\n",
+    )
 
     benign_python = {
         "scripts/safe.py": (
             "import subprocess\n"
             "# cross-compilation notes live at cross.example.invalid\n"
+            "# the handbook says to run cargo install cross locally\n"
             "subprocess.run(['cargo', 'build', '--locked'])\n"
             "subprocess.run(['cargo', 'test'], executable='/usr/bin/cargo')\n"
+            "subprocess.run(['sh', '-c', 'cargo build --locked'])\n"
+            "subprocess.run(['/usr/bin/cargo', 'build', '--locked'])\n"
+            "runner = subprocess.run\n"
+            "runner(['cargo', 'test', '--locked'])\n"
         )
     }
     if compare_pr_automation_collection(
@@ -3716,14 +4027,90 @@ pre_build = []
         "background separator before Cross",
         f"echo start & cross {arm_target}",
     )
+    shell_automation_escapes(
+        "command substitution assignment",
+        f"out=$(cross {arm_target})\necho \"$out\"",
+    )
+    shell_automation_escapes(
+        "backtick substitution assignment",
+        f"out=`cross {arm_target}`\necho \"$out\"",
+    )
+    shell_automation_escapes(
+        "process substitution operand",
+        f"diff <(cross {arm_target}) /dev/null",
+    )
+    shell_automation_escapes(
+        "single-line case arm",
+        f"case $t in *) cross {arm_target} ;; esac",
+    )
+    shell_automation_escapes(
+        "alternate case arm after a terminator",
+        f"case $t in x) echo x ;; *) cross {arm_target} ;; esac",
+    )
+    shell_automation_escapes(
+        "nested shell wrapper",
+        f"sh -c \"cross {arm_target}\"",
+    )
+    shell_automation_escapes(
+        "login shell wrapper",
+        f"bash -lc \"cross {arm_target}\"",
+    )
+    shell_automation_escapes(
+        "absolute Cross path",
+        f"/home/runner/.cargo/bin/cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "absolute Cargo path before Cross",
+        f"/usr/bin/cargo cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "home-relative Cross path",
+        f"~/.cargo/bin/cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "absolute Cargo path installing Cross",
+        "/usr/bin/cargo install --version 0.2.5 cross",
+    )
+    shell_automation_escapes(
+        "sudo end-of-options before Cross",
+        f"sudo -- cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "command end-of-options before Cross",
+        f"command -- cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "env end-of-options before Cross",
+        f"env -- cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "expanded alias bound to Cross",
+        f"shopt -s expand_aliases\nalias c=cross\nc {arm_target}",
+    )
+    shell_automation_escapes(
+        "quoted alias body invoking Cross",
+        f"shopt -s expand_aliases\nalias c='cross {arm_target}'\nc",
+    )
+    shell_automation_escapes(
+        "alias chained after a separator",
+        "shopt -s expand_aliases; "
+        + f"alias c=cross\nc {arm_target}",
+    )
 
     benign_shell = {
         "scripts/safe.sh": (
             "#!/bin/sh\n"
             "# builds are cross-checked against cross.example.invalid\n"
+            "# see the handbook for cargo install cross guidance\n"
             "f() { echo safe; }\n"
             "env -u FOO cargo build --locked\n"
             "sudo -u builder cargo test\n"
+            "sudo -- cargo build --locked\n"
+            "/usr/bin/cargo build --locked\n"
+            "sh -c 'cargo test --locked'\n"
+            "case $t in *) echo safe ;; esac\n"
+            'echo "run cargo install cross locally"\n'
+            "out=$(cargo metadata --format-version 1)\n"
             "x=cr\ny=ate\n"
             "echo \"${x}${y}\"\n"
         )
@@ -3738,6 +4125,75 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("benign shell automation edit was rejected")
+
+    def dispatcher_escapes(
+        label: str,
+        workflow_command: str,
+        baseline: dict[str, str],
+        proposed: dict[str, str],
+    ) -> None:
+        """A dispatcher manifest is followed, scanned, and frozen like a script."""
+
+        dispatcher_workflow = referenced_workflow.replace(
+            "bash scripts/safe.sh",
+            workflow_command,
+        )
+        if validate_automation_collection(
+            {"ci.yml": dispatcher_workflow},
+            {"setup/action.yml": safe_action},
+            baseline,
+            "self-test automation directory",
+        ):
+            failures.append(f"benign {label} manifest was rejected")
+        if not validate_automation_collection(
+            {"ci.yml": dispatcher_workflow},
+            {"setup/action.yml": safe_action},
+            proposed,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} Cross recipe was not rejected")
+        if not compare_pr_automation_collection(
+            {"ci.yml": dispatcher_workflow},
+            {"ci.yml": dispatcher_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            baseline,
+            proposed,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} Cross recipe edit was not rejected")
+        if not validate_automation_collection(
+            {"ci.yml": dispatcher_workflow},
+            {"setup/action.yml": safe_action},
+            {},
+            "self-test automation directory",
+        ):
+            failures.append(f"missing {label} manifest was not rejected")
+
+    dispatcher_escapes(
+        "make dispatcher",
+        "make arm64",
+        {"Makefile": "arm64:\n\tcargo build --locked\n"},
+        {"Makefile": f"arm64:\n\t@cross {arm_target}\n"},
+    )
+    dispatcher_escapes(
+        "relocated make dispatcher",
+        "make -C tests/performance arm64",
+        {"tests/performance/Makefile": "arm64:\n\tcargo build --locked\n"},
+        {"tests/performance/Makefile": f"arm64:\n\tcross {arm_target}\n"},
+    )
+    dispatcher_escapes(
+        "npm script dispatcher",
+        "npm run arm64",
+        {"package.json": json.dumps({"scripts": {"arm64": "cargo build --locked"}})},
+        {"package.json": json.dumps({"scripts": {"arm64": f"cross {arm_target}"}})},
+    )
+    dispatcher_escapes(
+        "just dispatcher",
+        "just arm64",
+        {"justfile": "arm64:\n    cargo build --locked\n"},
+        {"justfile": f"arm64:\n    cross {arm_target}\n"},
+    )
 
     folded_action = (
         "name: Folded\n"
@@ -3957,6 +4413,22 @@ def load_automation_directory(
         errors.extend(failures)
         for name, contents in loaded.items():
             automation[f"{root_name}{name}"] = contents
+
+    # Build-dispatcher manifests live at the repository root rather than in an
+    # approved script root, but a workflow step reaches their recipes through
+    # `make`/`npm run`, so they are scanned and frozen alongside the scripts.
+    for manifest_name in sorted(DISPATCHER_MANIFEST_NAMES):
+        manifest = path / manifest_name
+        if manifest.is_symlink():
+            errors.append(f"{label}/{manifest_name} must not be a symlink")
+            continue
+        if not manifest.is_file():
+            continue
+        contents, failures = load_workflow(manifest, f"{label}/{manifest_name}")
+        errors.extend(failures)
+        if not failures:
+            assert contents is not None
+            automation[manifest_name] = contents
     return automation, errors
 
 

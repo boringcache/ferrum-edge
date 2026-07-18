@@ -393,7 +393,22 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   toolchain selector, shell-variable executable indirection, partial or whole
   opaque command substitutions, Bash brace expansions and ANSI-C escapes, and
   Cross environment aliases; Bash backslash-newline continuations are
-  normalized before scanning. Cross-sensitive jobs, local-action files, and
+  normalized before scanning. Executable slots are recognized wherever the
+  shell creates one, so nested `sh -c`/`bash -lc` scripts, `$(...)`, backtick
+  and `<(...)`/`>(...)` substitutions, single-line `case` arms, wrapper
+  end-of-options markers (`sudo -- cross`), absolute or home-relative tool
+  paths (`/usr/bin/cargo cross`, `~/.cargo/bin/cross`), and Bash aliases bound
+  to Cross under `expand_aliases` all resolve to the Cross command word. Python
+  helpers are analyzed through local process-API aliases (`run =
+  subprocess.run`) and shell-wrapper argv (`subprocess.run(['sh', '-c', ...])`).
+  Repo-controlled build dispatchers are followed rather than trusted: a step
+  running `make`, `npm`/`pnpm`/`yarn`, `just`, or `task` resolves to the
+  matching root or `-C`-relocated `Makefile`, `package.json` `scripts`,
+  `justfile`, or `Taskfile`, which is then scanned and frozen like any
+  referenced script, and a dispatcher whose manifest is not in the scanned set
+  fails closed. Detection stays anchored to command positions, so prose or a
+  comment mentioning `cargo install cross` does not freeze unrelated edits.
+  Cross-sensitive jobs, local-action files, and
   reachable scripts are represented by full digests, while unrelated workflow,
   action, and script additions or edits remain permitted. The isolated jobs use
   only pinned external setup actions before revalidation.
@@ -414,8 +429,8 @@ read-only contents permission. It fetches the PR head without checking it out,
 requires the fetched object to equal the immutable head SHA from the triggering
 event, then extracts `Cross.toml`, `Cargo.toml`, `.cargo/config.toml`, the
 complete proposed and merge-base workflow and repo-local action directories,
-and the approved automation roots as hostile data, and runs only the base
-branch's verifier. A proposed legacy `.cargo/config` is surfaced and rejected.
+and the approved automation roots plus the root build-dispatcher manifests as
+hostile data, and runs only the base branch's verifier. A proposed legacy `.cargo/config` is surfaced and rejected.
 The verifier and trusted workflow are
 compared with `HEAD...FETCH_HEAD`, preserving merge-base behavior for stale
 branches while rejecting a PR-authored modification, mode change, rename, or
