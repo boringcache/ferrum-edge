@@ -45,14 +45,14 @@ jobs:
           proposed_cargo_legacy="$RUNNER_TEMP/proposed-cargo-config"
           proposed_ci="$RUNNER_TEMP/proposed-ci.yml"
           proposed_release="$RUNNER_TEMP/proposed-release.yml"
-          merge_base_ci="$RUNNER_TEMP/merge-base-ci.yml"
-          merge_base_release="$RUNNER_TEMP/merge-base-release.yml"
+          merge_base_ci="$RUNNER_TEMP/current-base-ci.yml"
+          merge_base_release="$RUNNER_TEMP/current-base-release.yml"
           proposed_workflows="$RUNNER_TEMP/proposed-workflows"
-          merge_base_workflows="$RUNNER_TEMP/merge-base-workflows"
+          merge_base_workflows="$RUNNER_TEMP/current-base-workflows"
           proposed_actions="$RUNNER_TEMP/proposed-actions"
-          merge_base_actions="$RUNNER_TEMP/merge-base-actions"
+          merge_base_actions="$RUNNER_TEMP/current-base-actions"
           proposed_automation="$RUNNER_TEMP/proposed-automation"
-          merge_base_automation="$RUNNER_TEMP/merge-base-automation"
+          merge_base_automation="$RUNNER_TEMP/current-base-automation"
           git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
           fetched_head="$(git rev-parse FETCH_HEAD)"
           if [ "$fetched_head" != "$PR_HEAD_SHA" ]; then
@@ -76,7 +76,6 @@ jobs:
             fi
           done
 
-          merge_base="$(git merge-base HEAD FETCH_HEAD)"
           git show "FETCH_HEAD:Cross.toml" > "$proposed_cross"
           git show "FETCH_HEAD:Cargo.toml" > "$proposed_cargo"
           cargo_tool_entry="$(git ls-tree FETCH_HEAD -- .cargo/config.toml)"
@@ -90,21 +89,29 @@ jobs:
           fi
           git show "FETCH_HEAD:.github/workflows/ci.yml" > "$proposed_ci"
           git show "FETCH_HEAD:.github/workflows/release.yml" > "$proposed_release"
-          git show "${merge_base}:.github/workflows/ci.yml" > "$merge_base_ci"
-          git show "${merge_base}:.github/workflows/release.yml" > "$merge_base_release"
+          # Compare executable/configuration surfaces to the current trusted
+          # base tip. A stale head therefore cannot restore a Cross surface
+          # removed from current main.
+          git show "HEAD:.github/workflows/ci.yml" > "$merge_base_ci"
+          git show "HEAD:.github/workflows/release.yml" > "$merge_base_release"
 
           extract_workflows() {
             local commit="$1"
             local destination="$2"
-            local path relative entry
+            local path relative entry listing
             mkdir -p "$destination"
+            listing="${destination}.ls-tree"
+            if ! git ls-tree -rz --name-only "$commit" -- .github/workflows > "$listing"; then
+              echo "::error::.github/workflows tree enumeration failed" >&2
+              return 1
+            fi
             while IFS= read -r -d '' path; do
               relative="${path#.github/workflows/}"
               if [[ "$relative" == */* ]]; then
                 continue
               fi
-              if [[ ! "$relative" =~ ^[A-Za-z0-9._-]+\.(yml|yaml)$ ]]; then
-                echo "::error file=${path}::unsupported workflow filename" >&2
+              if [[ ! "$relative" =~ ^[A-Za-z0-9._+@~\ -]+\.(yml|yaml)$ ]]; then
+                echo "::error file=${path}::unsupported workflow filename; use letters, digits, '.', '_', '+', '@', '~', spaces, or '-'" >&2
                 return 1
               fi
               entry="$(git ls-tree "$commit" -- "$path")"
@@ -113,21 +120,30 @@ jobs:
                 return 1
               fi
               git show "${commit}:${path}" > "${destination}/${relative}"
-            done < <(git ls-tree -rz --name-only "$commit" -- .github/workflows)
+            done < "$listing"
           }
 
           extract_workflows FETCH_HEAD "$proposed_workflows"
-          extract_workflows "$merge_base" "$merge_base_workflows"
+          extract_workflows HEAD "$merge_base_workflows"
 
           extract_actions() {
             local commit="$1"
             local destination="$2"
-            local path relative entry output
+            local path relative entry output listing
             mkdir -p "$destination"
+            listing="${destination}.ls-tree"
+            if ! git ls-tree -rz --name-only "$commit" -- .github/actions > "$listing"; then
+              echo "::error::.github/actions tree enumeration failed" >&2
+              return 1
+            fi
             while IFS= read -r -d '' path; do
               relative="${path#.github/actions/}"
-              if [[ ! "$relative" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
-                echo "::error file=${path}::unsupported local-action path" >&2
+              if [[ "/$relative/" == *"/../"* ]]; then
+                echo "::error file=${path}::local-action paths must not contain '..'" >&2
+                return 1
+              fi
+              if [[ ! "$relative" =~ ^[A-Za-z0-9._+@~\ -]+(/[A-Za-z0-9._+@~\ -]+)*$ ]]; then
+                echo "::error file=${path}::unsupported local-action path; use letters, digits, '.', '_', '+', '@', '~', spaces, or '-'" >&2
                 return 1
               fi
               entry="$(git ls-tree "$commit" -- "$path")"
@@ -138,20 +154,42 @@ jobs:
               output="${destination}/${relative}"
               mkdir -p "$(dirname "$output")"
               git show "${commit}:${path}" > "$output"
-            done < <(git ls-tree -rz --name-only "$commit" -- .github/actions)
+            done < "$listing"
           }
 
           extract_actions FETCH_HEAD "$proposed_actions"
-          extract_actions "$merge_base" "$merge_base_actions"
+          extract_actions HEAD "$merge_base_actions"
 
           extract_automation() {
             local commit="$1"
             local destination="$2"
-            local path entry output
+            local path entry output listing workspace_listing
             mkdir -p "$destination"
+            listing="${destination}.ls-tree"
+            workspace_listing="${destination}.workspace-ls-tree"
+            if ! git ls-tree -rz --name-only "$commit" -- \
+              .github/scripts comparison scripts tests/k8s tests/performance \
+              Makefile makefile GNUmakefile package.json \
+              justfile Justfile .justfile Taskfile.yml Taskfile.yaml > "$listing"; then
+              echo "::error::automation tree enumeration failed" >&2
+              return 1
+            fi
+            if ! git ls-tree -rz --name-only "$commit" > "$workspace_listing"; then
+              echo "::error::workspace manifest enumeration failed" >&2
+              return 1
+            fi
             while IFS= read -r -d '' path; do
-              if [[ ! "$path" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
-                echo "::error file=${path}::unsupported automation path" >&2
+              if [[ "$path" == */package.json ]]; then
+                printf '%s\0' "$path" >> "$listing"
+              fi
+            done < "$workspace_listing"
+            while IFS= read -r -d '' path; do
+              if [[ "/$path/" == *"/../"* ]]; then
+                echo "::error file=${path}::automation paths must not contain '..'" >&2
+                return 1
+              fi
+              if [[ ! "$path" =~ ^[A-Za-z0-9._+@~\ -]+(/[A-Za-z0-9._+@~\ -]+)*$ ]]; then
+                echo "::error file=${path}::unsupported automation path; use letters, digits, '.', '_', '+', '@', '~', spaces, or '-'" >&2
                 return 1
               fi
               entry="$(git ls-tree "$commit" -- "$path")"
@@ -162,25 +200,11 @@ jobs:
               output="${destination}/${path}"
               mkdir -p "$(dirname "$output")"
               git show "${commit}:${path}" > "$output"
-            done < <(
-              # The trailing manifests are build dispatchers: a workflow step
-              # running `make`/`npm run` executes their recipes. Include every
-              # nested package.json because npm workspace selection bypasses
-              # the root manifest.
-              git ls-tree -rz --name-only "$commit" -- \
-                .github/scripts comparison scripts tests/k8s tests/performance \
-                Makefile makefile GNUmakefile package.json \
-                justfile Justfile .justfile Taskfile.yml Taskfile.yaml
-              git ls-tree -rz --name-only "$commit" | while IFS= read -r -d '' path; do
-                if [[ "$path" == */package.json ]]; then
-                  printf '%s\0' "$path"
-                fi
-              done
-            )
+            done < "$listing"
           }
 
           extract_automation FETCH_HEAD "$proposed_automation"
-          extract_automation "$merge_base" "$merge_base_automation"
+          extract_automation HEAD "$merge_base_automation"
 
           python3 -I .github/scripts/verify_cross_build_policy.py \
             --self-test \

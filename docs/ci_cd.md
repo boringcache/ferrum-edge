@@ -374,8 +374,9 @@ boundary therefore uses a complete allowlist rather than a field denylist:
 - `build-arm64-cross` in `ci.yml` and `build-release-arm64-cross` in
   `release.yml` are isolated from the shared native matrix. Their exact job
   blocks, inherited top-level `env` mappings, and workflow trigger blocks are
-  hashed by the trusted verifier, and merge-base comparison rejects any
-  PR-authored mutation while allowing unrelated workflow jobs to evolve. Every
+  hashed by the trusted verifier, and comparison with the current trusted base
+  tip rejects any PR-authored mutation while allowing unrelated workflow jobs
+  to evolve. Every
   `.yml` and `.yaml` file directly under `.github/workflows`, plus every regular
   file recursively under `.github/actions`, is also compared as a collection.
   The complete `.github/scripts`, `comparison`, `scripts`, `tests/k8s`, and
@@ -401,6 +402,20 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   to Cross under `expand_aliases` all resolve to the Cross command word. Python
   helpers are analyzed through local process-API aliases (`run =
   subprocess.run`) and shell-wrapper argv (`subprocess.run(['sh', '-c', ...])`).
+  Workflow `run` bodies are dispatched through their effective step, job, or
+  workflow-level shell; Python shells and executable Python heredocs therefore
+  receive the same AST analysis, while dynamic or unsupported shells fail
+  closed. Shell, Python, Perl, PHP, R, JavaScript/TypeScript, PowerShell, awk,
+  and BusyBox script launchers are recognized when resolving repository paths.
+  Heredoc parsing is quote-aware and rejects unterminated bodies. Repository
+  working-directory state changes only after each `cd` execution point and is
+  rejected when conditional or loop control flow makes it ambiguous. Dockerfile
+  instruction parsing is enabled only for Dockerfile-named inputs containing a
+  real `FROM` instruction, so ordinary Python beginning with `from` remains
+  Python. Baseline and proposed automation diagnostics are aggregated before
+  surface comparison, ensuring a malformed baseline cannot suppress proposed
+  findings. Generated-artifact exemptions are limited to literal repository
+  paths; variable-prefixed pseudo-paths are not allowlisted.
   Repo-controlled build dispatchers are followed rather than trusted: a step
   running `make`, `npm`/`pnpm`/`yarn`, `just`, or `task` resolves to the
   matching root or `-C`-relocated `Makefile`, `package.json` `scripts`,
@@ -428,13 +443,19 @@ The trusted `pull_request_target` job checks out only the base SHA with
 read-only contents permission. It fetches the PR head without checking it out,
 requires the fetched object to equal the immutable head SHA from the triggering
 event, then extracts `Cross.toml`, `Cargo.toml`, `.cargo/config.toml`, the
-complete proposed and merge-base workflow and repo-local action directories,
+complete proposed and current-base workflow and repo-local action directories,
 and the approved automation roots plus the root build-dispatcher manifests as
-hostile data, and runs only the base branch's verifier. A proposed legacy `.cargo/config` is surfaced and rejected.
-The verifier and trusted workflow are
-compared with `HEAD...FETCH_HEAD`, preserving merge-base behavior for stale
-branches while rejecting a PR-authored modification, mode change, rename, or
-deletion. On pull requests, the ordinary `CI Plan` executes the base branch's
+hostile data, and runs only the base branch's verifier. Each NUL-delimited
+`git ls-tree` result is materialized and its status checked before consumption;
+regular blobs may use letters, digits, `.`, `_`, `+`, `@`, `~`, spaces, and
+`-`, while dot-dot components, symlinks, gitlinks, and NULs fail closed. A
+proposed legacy `.cargo/config` is surfaced and rejected. Proposed executable
+and configuration surfaces are compared with current base `HEAD`, preventing a
+stale branch from restoring a surface removed from main. The verifier and
+trusted workflow themselves are compared with `HEAD...FETCH_HEAD`, preserving
+merge-base behavior only for the question of whether the PR authored a
+protected-file modification, mode change, rename, or deletion. On pull
+requests, the ordinary `CI Plan` executes the base branch's
 trusted verifier when it exists and never imports or runs the proposed script.
 For this one bootstrap PR, where no base verifier or base-loaded trusted
 workflow can exist yet, CI syntax-compiles and executes the reviewed proposed
@@ -443,7 +464,10 @@ verifier invocation uses Python isolated mode so the script directory,
 `PYTHONPATH`, and user site cannot redirect its standard-library imports. This
 policy step runs before every other repository Python entry point in the plan
 job, and the subsequent planner self-test and its imported live-suite path
-filter are also extracted from the base branch on pull requests.
+filter are also extracted from the base branch on pull requests. The planner
+example consumes the exact `origin/${BASE_REF}` fetched by the immediately
+preceding policy step, so those adjacent steps have an intentional ordering
+dependency.
 
 #### 8. Latest Release and Docker Jobs
 

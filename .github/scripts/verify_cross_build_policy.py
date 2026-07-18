@@ -75,9 +75,10 @@ EXPECTED_CARGO_TARGETS = {
 # These hashes cover the isolated jobs that prepare and invoke Cross, the
 # top-level env mappings inherited by those jobs, and the workflow triggers
 # that schedule them. The trusted
-# pull_request_target guard compares those blocks at the PR merge base too, so
-# unrelated workflow edits and later base-only changes remain allowed while any
-# PR-authored mutation of an invocation input fails closed.
+# pull_request_target guard compares those blocks with the current trusted base
+# tip, so a stale branch cannot restore a removed Cross surface while unrelated
+# workflow edits remain allowed. The guard separately uses HEAD...FETCH_HEAD
+# only to decide whether the PR itself modified the protected policy files.
 WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
@@ -146,7 +147,9 @@ CROSS_ENVIRONMENT = re.compile(
     r"(?<![A-Za-z0-9_])(?:CROSS_[A-Z0-9_]*|DOCKER_OPTS|QEMU_STRACE|"
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
 )
-SHELL_INTERPRETER_NAMES = frozenset({"ash", "bash", "dash", "ksh", "sh", "zsh"})
+SHELL_INTERPRETER_NAMES = frozenset(
+    {"ash", "bash", "busybox", "dash", "ksh", "pwsh", "powershell", "sh", "zsh"}
+)
 PYTHON_INTERPRETER = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|pypy\d*)$")
 # An executable word may be spelled with a leading directory path
 # (`/usr/bin/cargo cross`, `~/.cargo/bin/cross`, `./tools/cross`). Absorbing the
@@ -240,7 +243,7 @@ SHELL_INTERPOLATION = re.compile(
     r"\$\{[^{}\n]*\}|`[^`\n]*`|"
     r"\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]"
 )
-WORKFLOW_FILENAME = re.compile(r"^[A-Za-z0-9._-]+\.(?:yml|yaml)$")
+WORKFLOW_FILENAME = re.compile(r"^[A-Za-z0-9._+@~ -]+\.(?:yml|yaml)$")
 PROTECTED_WORKFLOW_FILENAMES = frozenset({"ci.yml", "release.yml"})
 APPROVED_AUTOMATION_ROOTS = (
     ".github/scripts/",
@@ -260,8 +263,6 @@ GENERATED_COMMAND_PATHS = frozenset(
     }
 )
 GENERATED_SCRIPT_PREFIXES = (
-    "RUNNER_TEMP/",
-    "trusted_dir/",
     "target/",
     "results/",
     "coverage-report/",
@@ -275,7 +276,7 @@ IGNORED_AUTOMATION_SUFFIXES = frozenset(
 IGNORED_AUTOMATION_DIRECTORIES = frozenset({"__pycache__"})
 LOCAL_ACTION_REFERENCE = re.compile(
     r"^\s*(?:-\s*)?(?:uses|'uses'|\"uses\")\s*:\s*"
-    r"(?P<quote>['\"]?)(?P<path>\./[A-Za-z0-9._/-]+)"
+    r"(?P<quote>['\"]?)(?P<path>\./[A-Za-z0-9._+@~ /-]+)"
     r"(?P=quote)\s*(?:#.*)?$"
 )
 LOCAL_ACTION_CANDIDATE = re.compile(
@@ -291,20 +292,29 @@ LOCAL_COMMAND_REFERENCE = re.compile(
     + WRAPPER_PREFIX
     + ENV_PREFIX
     + r"?"
-    r"(?:(?:bash|sh|python|python3|ruby|node)"
+    r"(?:(?:bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|pypy[0-9]*|ruby|node|"
+    r"perl|php|Rscript|deno|bun|pwsh|powershell|busybox\s+sh|awk\s+-f)"
     r"(?:\s+--?[^\s]+)*\s*(?:[0-9]+)?<(?![<&])\s*"
     r"(?P<redirected>(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|"
     r"\{[A-Za-z_][A-Za-z0-9_]*\})/)?"
-    r"(?:[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+|"
-    r"[A-Za-z0-9._-]+\.(?:sh|py|rb)))|"
-    r"(?:bash|sh|python|python3|ruby|node|source|\.)"
+    r"(?:'[A-Za-z0-9._+@~ /-]+'|\"[A-Za-z0-9._+@~ /-]+\"|"
+    r"[A-Za-z0-9._+@~-]+(?:/[A-Za-z0-9._+@~-]+)+|"
+    r"[A-Za-z0-9._+@~-]+\.(?:sh|bash|py|rb|pl|awk|php|R|js|mjs|cjs|ts|ps1)))|"
+    r"(?:bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|pypy[0-9]*|ruby|node|"
+    r"perl|php|Rscript|deno|bun|pwsh|powershell|busybox\s+sh|awk\s+-f|source|\.)"
     r"(?:\s+--?[^\s]+)*\s+"
     r"(?P<interpreted>(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|"
     r"\{[A-Za-z_][A-Za-z0-9_]*\})/)?"
-    r"(?:[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+|"
-    r"[A-Za-z0-9._-]+\.(?:sh|py|rb)))|"
-    r"(?P<direct>\./[A-Za-z0-9._/-]+)|"
-    r"(?P<bare>[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+\.(?:sh|py|rb)))"
+    r"(?:'[A-Za-z0-9._+@~ /-]+'|\"[A-Za-z0-9._+@~ /-]+\"|"
+    r"[A-Za-z0-9._+@~-]+(?:/[A-Za-z0-9._+@~-]+)+|"
+    r"[A-Za-z0-9._+@~-]+\.(?:sh|bash|py|rb|pl|awk|php|R|js|mjs|cjs|ts|ps1)))|"
+    r"(?P<direct>(?:'\./[A-Za-z0-9._+@~ /-]+'|"
+    r"\"\./[A-Za-z0-9._+@~ /-]+\"|\./[A-Za-z0-9._+@~/-]+))|"
+    r"(?P<bare>(?:'[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|py|rb|pl|awk|php|R|"
+    r"js|mjs|cjs|ts|ps1)'|\"[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|py|rb|pl|"
+    r"awk|php|R|js|mjs|cjs|ts|ps1)\"|[A-Za-z0-9._+@~-]+"
+    r"(?:/[A-Za-z0-9._+@~-]+)+\.(?:sh|bash|py|rb|pl|awk|php|R|js|mjs|"
+    r"cjs|ts|ps1))))"
 )
 YAML_RUN_FIELD = re.compile(
     r"^(?P<indent> *)(?:-\s*)?"
@@ -333,7 +343,8 @@ HEREDOC_EXECUTABLE = re.compile(
     + WRAPPER_PREFIX
     + ENV_PREFIX
     + r"?"
-    r"(?P<interpreter>bash|sh|python|python3)\b"
+    r"(?P<interpreter>bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|"
+    r"pypy[0-9]*|pwsh|powershell)\b"
 )
 OPAQUE_INLINE_SHELL = re.compile(
     r"(?:\b(?:bash|sh)\s+-c\s+[^\n]*\$\(|"
@@ -407,11 +418,11 @@ BUILD_DISPATCHER = re.compile(
 # relocate the manifest the dispatcher reads.
 DISPATCHER_DIRECTORY = re.compile(
     r"(?:^|\s)(?:-C|--directory|--prefix|--cwd|--dir)(?:=|\s+)"
-    r"(?P<quote>['\"]?)(?P<path>[^\s'\";&|]+)(?P=quote)"
+    r"(?P<path>'[^'\n;&|]+'|\"[^\"\n;&|]+\"|[^\s'\";&|]+)"
 )
 DISPATCHER_WORKSPACE = re.compile(
     r"(?:^|\s)(?:-w|--workspace)(?:=|\s+)"
-    r"(?P<quote>['\"]?)(?P<path>[^\s'\";&|]+)(?P=quote)"
+    r"(?P<path>'[^'\n;&|]+'|\"[^\"\n;&|]+\"|[^\s'\";&|]+)"
 )
 DISPATCHER_WORKSPACE_OPTION = re.compile(
     r"(?:^|\s)(?:-w|--workspace)(?==|\s|$)|(?:^|\s)-w[^\s=]+"
@@ -419,12 +430,12 @@ DISPATCHER_WORKSPACE_OPTION = re.compile(
 DISPATCHER_ALL_WORKSPACES = re.compile(r"(?:^|\s)--workspaces(?:\s|$)")
 DISPATCHER_MANIFEST_OPTION = re.compile(
     r"(?:^|\s)(?:-f|--file|--makefile|--justfile|--taskfile)(?:=|\s+)"
-    r"(?P<quote>['\"]?)(?P<path>[^\s'\";&|]+)(?P=quote)"
+    r"(?P<path>'[^'\n;&|]+'|\"[^\"\n;&|]+\"|[^\s'\";&|]+)"
 )
 CD_COMMAND = re.compile(
     r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|\b(?:then|do|else)\s+)"
     r"cd(?:\s+--)?\s+"
-    r"(?P<quote>['\"]?)(?P<path>[^\s;&|]+)(?P=quote)"
+    r"(?P<path>'[^'\n;&|]+'|\"[^\"\n;&|]+\"|[^\s'\";&|]+)"
 )
 
 
@@ -2113,21 +2124,32 @@ def generic_workflow_cross_surfaces(
 ) -> tuple[tuple[str, ...], list[str]]:
     """Scan a workflow that must not contain any Cross-controlled surface."""
 
+    programs, interpreter_errors = workflow_run_programs(contents, source)
+    runtime_sensitive, runtime_errors = runtime_program_cross_surface(
+        programs,
+        source,
+        include_opaque_shell_executable=include_opaque_shell_executable,
+    )
+    errors = [*interpreter_errors, *runtime_errors]
+
     # Avoid imposing a YAML layout contract on unrelated workflows. As soon as
     # a Cross token is exposed, however, parse the job layout conservatively so
     # malformed, duplicate, and alias-shaped jobs fail closed.
-    if not contains_cross_surface(
+    if not runtime_sensitive and not contains_cross_surface(
         yaml_command_augmented(contents),
         include_opaque_shell_executable=include_opaque_shell_executable,
     ):
-        return (), []
-    return unprotected_cross_surfaces(
+        return (), errors
+    surfaces, surface_errors = unprotected_cross_surfaces(
         contents,
         source,
         "__no_unprotected_cross_job__",
         required_job=False,
         include_opaque_shell_executable=include_opaque_shell_executable,
     )
+    if runtime_sensitive and not surfaces:
+        surfaces = (f"runtime:{hashlib.sha256(contents.encode()).hexdigest()}",)
+    return surfaces, [*errors, *surface_errors]
 
 
 def validate_workflow_collection(
@@ -2356,6 +2378,8 @@ def compare_pr_action_collection(
 
 
 def normalize_repository_path(raw: str) -> str | None:
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+        raw = raw[1:-1]
     variable_prefix = re.match(
         r"^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})/",
         raw,
@@ -2373,6 +2397,20 @@ def normalize_repository_path(raw: str) -> str | None:
     return candidate.as_posix()
 
 
+def repository_path_has_dot_dot(raw: str) -> bool:
+    """Return whether a possibly quoted repository path contains `..`."""
+
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+        raw = raw[1:-1]
+    variable_prefix = re.match(
+        r"^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})/",
+        raw,
+    )
+    if variable_prefix is not None:
+        raw = raw[variable_prefix.end() :]
+    return ".." in PurePosixPath(raw).parts
+
+
 def repository_command_line(line: str) -> str:
     """Reduce only the trusted workspace expression to its repository-relative form."""
 
@@ -2384,24 +2422,90 @@ def repository_command_line(line: str) -> str:
     )
 
 
-def shell_command_lines(contents: str) -> tuple[str, ...]:
-    """Return shell command lines while excluding literal here-document data."""
+def quote_aware_heredoc_starts(line: str) -> tuple[tuple[int, str], ...]:
+    """Find real shell heredoc openers without matching quoted prose."""
+
+    starts: list[tuple[int, str]] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        if not line.startswith("<<", index) or line.startswith("<<<", index):
+            index += 1
+            continue
+
+        cursor = index + 2
+        if cursor < len(line) and line[cursor] == "-":
+            cursor += 1
+        while cursor < len(line) and line[cursor] in " \t":
+            cursor += 1
+        delimiter_quote = (
+            line[cursor]
+            if cursor < len(line) and line[cursor] in {"'", '"'}
+            else None
+        )
+        if delimiter_quote is not None:
+            cursor += 1
+        delimiter = re.match(r"[A-Za-z_][A-Za-z0-9_]*", line[cursor:])
+        if delimiter is None:
+            index += 2
+            continue
+        value = delimiter.group(0)
+        cursor += len(value)
+        if delimiter_quote is not None:
+            if cursor >= len(line) or line[cursor] != delimiter_quote:
+                index += 2
+                continue
+            cursor += 1
+        starts.append((index, value))
+        index = cursor
+    return tuple(starts)
+
+
+def shell_command_lines(
+    contents: str,
+    source: str,
+) -> tuple[tuple[str, ...], list[str]]:
+    """Return commands outside heredoc bodies and reject unterminated input."""
 
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
     commands: list[str] = []
-    heredoc_delimiter: str | None = None
+    heredoc_delimiters: list[str] = []
     for line in logical_contents.splitlines():
-        if heredoc_delimiter is not None:
-            if line.strip() == heredoc_delimiter:
-                heredoc_delimiter = None
+        if heredoc_delimiters:
+            if line.strip() == heredoc_delimiters[0]:
+                heredoc_delimiters.pop(0)
             continue
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         commands.append(line)
-        heredoc = HEREDOC_START.search(line)
-        if heredoc is not None:
-            heredoc_delimiter = heredoc.group("delimiter")
-    return tuple(commands)
+        heredoc_delimiters.extend(
+            delimiter for _, delimiter in quote_aware_heredoc_starts(line)
+        )
+    errors = (
+        [f"{source} has an unterminated heredoc {heredoc_delimiters[0]!r}"]
+        if heredoc_delimiters
+        else []
+    )
+    return tuple(commands), errors
 
 
 def folded_block_text(lines: list[str]) -> str:
@@ -2531,6 +2635,115 @@ def workflow_command_scripts(
     return tuple(folded_scripts if folded_only else scripts)
 
 
+def workflow_run_programs(
+    contents: str,
+    source: str,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Resolve each workflow run body through its effective interpreter."""
+
+    lines = contents.splitlines()
+    fields = yaml_command_fields(contents)
+
+    def step_start(line_number: int, field_indent: int) -> tuple[int, int] | None:
+        for candidate in range(line_number, -1, -1):
+            match = re.match(r"^(?P<indent> *)-\s+", lines[candidate])
+            if match is None:
+                continue
+            indent = len(match.group("indent"))
+            if indent <= field_indent:
+                if any(
+                    intervening.strip()
+                    and len(intervening) - len(intervening.lstrip(" ")) <= indent
+                    for intervening in lines[candidate + 1 : line_number]
+                ):
+                    return None
+                return candidate, indent
+        return None
+
+    grouped: dict[tuple[int, int], list[tuple[str, str, int]]] = {}
+    for line_number, field_indent, _, key, _, rendered in fields:
+        step = step_start(line_number, field_indent)
+        if step is not None:
+            grouped.setdefault(step, []).append((key, rendered, line_number))
+
+    default_shells: list[tuple[int, int, int, str]] = []
+    for index, line in enumerate(lines):
+        defaults = re.match(r"^(?P<indent> *)defaults\s*:\s*(?:#.*)?$", line)
+        if defaults is None:
+            continue
+        defaults_indent = len(defaults.group("indent"))
+        end = len(lines)
+        for candidate in range(index + 1, len(lines)):
+            if not lines[candidate].strip():
+                continue
+            indentation = len(lines[candidate]) - len(lines[candidate].lstrip(" "))
+            if indentation < defaults_indent:
+                end = candidate
+                break
+        run_mapping = next(
+            (
+                candidate
+                for candidate in range(index + 1, end)
+                if re.match(
+                    rf"^ {{{defaults_indent + 2}}}run\s*:\s*(?:#.*)?$",
+                    lines[candidate],
+                )
+            ),
+            None,
+        )
+        if run_mapping is None:
+            continue
+        shell_match: re.Match[str] | None = None
+        for candidate in range(run_mapping + 1, end):
+            shell_match = re.match(
+                rf"^ {{{defaults_indent + 4}}}shell\s*:\s*(?P<value>.+?)\s*$",
+                lines[candidate],
+            )
+            if shell_match is not None:
+                break
+        if shell_match is not None:
+            value = shell_match.group("value").split(" #", maxsplit=1)[0].strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            default_shells.append((index, end, defaults_indent, value))
+
+    programs: list[tuple[str, str]] = []
+    errors: list[str] = []
+    for step, step_fields in sorted(grouped.items()):
+        run_values = [
+            (value, line_number)
+            for key, value, line_number in step_fields
+            if key == "run" and value
+        ]
+        if not run_values:
+            continue
+        shell_values = [value for key, value, _ in step_fields if key == "shell"]
+        if len(run_values) != 1 or len(shell_values) > 1:
+            errors.append(
+                f"{source}:{step[0] + 1} workflow steps require one literal run "
+                "and at most one shell scalar"
+            )
+            continue
+        run_value, run_line = run_values[0]
+        if shell_values:
+            shell_value = shell_values[0]
+        else:
+            matching_defaults = [
+                (indent, value)
+                for start, end, indent, value in default_shells
+                if start < run_line < end
+            ]
+            shell_value = max(matching_defaults, default=(0, "bash"))[1]
+        language = interpreter_kind(shell_tokens(shell_value))
+        if language is None:
+            errors.append(
+                f"{source}:{step[0] + 1} uses an unsupported or dynamic workflow shell"
+            )
+            continue
+        programs.append((language, run_value))
+    return programs, errors
+
+
 def interpreter_kind(words: tuple[str, ...] | None) -> str | None:
     """Classify a literal interpreter command as shell, Python, or unknown."""
 
@@ -2561,6 +2774,12 @@ def interpreter_kind(words: tuple[str, ...] | None) -> str | None:
     if index >= len(words) or dynamic_shell_word(words[index]):
         return None
     executable = tool_name(words[index])
+    if executable == "busybox":
+        return (
+            "shell"
+            if index + 1 < len(words) and tool_name(words[index + 1]) == "sh"
+            else None
+        )
     if executable in SHELL_INTERPRETER_NAMES:
         return "shell"
     if PYTHON_INTERPRETER.fullmatch(executable):
@@ -2718,8 +2937,11 @@ def dockerfile_programs(
     return programs, errors
 
 
-def executable_heredocs(contents: str) -> tuple[tuple[str, str], ...]:
-    """Return heredoc programs consumed by a literal shell or Python command."""
+def executable_heredocs(
+    contents: str,
+    source: str,
+) -> tuple[tuple[tuple[str, str], ...], list[str]]:
+    """Return executable heredocs and reject an unterminated program."""
 
     programs: list[tuple[str, str]] = []
     delimiter: str | None = None
@@ -2737,15 +2959,27 @@ def executable_heredocs(contents: str) -> tuple[tuple[str, str], ...]:
                 body.append(line)
             continue
 
-        heredoc = HEREDOC_START.search(line)
-        if heredoc is None:
+        heredocs = quote_aware_heredoc_starts(line)
+        if not heredocs:
             continue
-        delimiter = heredoc.group("delimiter")
+        _, delimiter = heredocs[0]
         interpreters = [
-            match.group("interpreter") for match in HEREDOC_EXECUTABLE.finditer(line)
+            match.group("interpreter")
+            for match in HEREDOC_EXECUTABLE.finditer(line[: heredocs[0][0]])
         ]
-        interpreter = interpreters[-1] if interpreters else None
-    return tuple(programs)
+        if interpreters:
+            executable = tool_name(interpreters[-1])
+            interpreter = (
+                "python"
+                if PYTHON_INTERPRETER.fullmatch(executable)
+                else "shell"
+            )
+    errors = (
+        [f"{source} has an unterminated executable heredoc {delimiter!r}"]
+        if delimiter is not None
+        else []
+    )
+    return tuple(programs), errors
 
 
 DYNAMIC_DISPATCH_NAMES = frozenset(
@@ -3116,6 +3350,19 @@ def runtime_program_cross_surface(
                 include_opaque_shell_executable=include_opaque_shell_executable,
             ) or OPAQUE_ARM_CROSS_EXECUTION.search(program):
                 sensitive = True
+            heredoc_programs, heredoc_failures = executable_heredocs(
+                program,
+                source,
+            )
+            errors.extend(heredoc_failures)
+            if heredoc_programs:
+                nested_sensitive, nested_failures = runtime_program_cross_surface(
+                    list(heredoc_programs),
+                    f"{source} executable heredoc",
+                    include_opaque_shell_executable=include_opaque_shell_executable,
+                )
+                sensitive = sensitive or nested_sensitive
+                errors.extend(nested_failures)
             continue
         if language == "python":
             commands, failures = python_command_scripts(
@@ -3161,11 +3408,9 @@ def action_file_runtime_surface(
                 errors.append(
                     f"{name} Docker actions require one literal repository Dockerfile"
                 )
-    elif (
-        basename == "dockerfile"
-        or basename.startswith("dockerfile.")
-        or re.search(r"(?im)^\s*(?:ARG|FROM)\s+", contents)
-    ):
+    elif basename == "dockerfile" or basename.startswith("dockerfile."):
+        if re.search(r"(?im)^\s*FROM\s+", contents) is None:
+            return False, [f"{name} Dockerfile input has no FROM instruction"]
         programs, errors = dockerfile_programs(contents, name)
     else:
         return False, []
@@ -3182,18 +3427,22 @@ def automation_command_scripts(
     source: str,
     *,
     workflow_source: bool,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[tuple[str, str]], list[str]]:
     if workflow_source:
-        return list(workflow_command_scripts(contents)), []
+        return workflow_run_programs(contents, source)
     if is_dispatcher_manifest(source):
         # Recipes are shell, so a manifest can chain into scripts and further
         # dispatchers exactly like any other reached automation file.
-        return list(dispatcher_manifest_scripts(source, contents)), []
+        return [
+            ("shell", script)
+            for script in dispatcher_manifest_scripts(source, contents)
+        ], []
     language = automation_language(source, contents)
     if language == "python":
-        return python_command_scripts(contents, source)
+        commands, errors = python_command_scripts(contents, source)
+        return [("shell", command) for command in commands], errors
     if language == "shell":
-        return [contents], []
+        return [("shell", contents)], []
     if language == "unknown" or contents.startswith("#!"):
         return [], [f"{source} has an unsupported executable shebang"]
     return [], [f"{source} is executable automation with no scannable interpreter"]
@@ -3253,6 +3502,12 @@ def local_automation_references(
                     f"{source}:{line_number} has a non-canonical local action reference"
                 )
             else:
+                if repository_path_has_dot_dot(match.group("path")):
+                    errors.append(
+                        f"{source}:{line_number} local action paths must not "
+                        "contain '..'"
+                    )
+                    continue
                 action_path = normalize_repository_path(match.group("path"))
                 if action_path is None or not action_path.startswith(
                     ".github/actions/"
@@ -3262,18 +3517,18 @@ def local_automation_references(
                         ".github/actions"
                     )
 
-    command_scripts, command_failures = automation_command_scripts(
+    command_programs, command_failures = automation_command_scripts(
         contents,
         source,
         workflow_source=workflow_source,
     )
     errors.extend(command_failures)
-    for command_script in command_scripts:
-        pending_programs: list[tuple[str, str]] = [("shell", command_script)]
+    for initial_program in command_programs:
+        pending_programs: list[tuple[str, str]] = [initial_program]
         command_lines: list[str] = []
         while pending_programs:
             language, program = pending_programs.pop()
-            if language in {"python", "python3"}:
+            if language == "python":
                 python_commands, python_failures = python_command_scripts(
                     program,
                     f"{source} executable heredoc",
@@ -3283,15 +3538,56 @@ def local_automation_references(
                     ("shell", command) for command in python_commands
                 )
                 continue
-            command_lines.extend(shell_command_lines(program))
-            pending_programs.extend(executable_heredocs(program))
+            shell_lines, shell_failures = shell_command_lines(program, source)
+            errors.extend(shell_failures)
+            command_lines.extend(shell_lines)
+            heredoc_programs, heredoc_failures = executable_heredocs(program, source)
+            errors.extend(heredoc_failures)
+            pending_programs.extend(heredoc_programs)
 
         working_directory: str | None = ""
+        control_depth = 0
         for line_number, line in enumerate(command_lines, start=1):
             normalized_line = repository_command_line(line)
-            for directory_match in CD_COMMAND.finditer(normalized_line):
-                directory = normalize_repository_path(directory_match.group("path"))
-                working_directory = directory
+            directory_matches = list(CD_COMMAND.finditer(normalized_line))
+
+            def directory_after(
+                initial: str | None,
+                matches: list[re.Match[str]],
+            ) -> str | None:
+                current = initial
+                for directory_match in matches:
+                    matched = directory_match.group(0)
+                    path_offset = (
+                        directory_match.start("path") - directory_match.start()
+                    )
+                    before_cd = matched[:path_offset].rsplit("cd", maxsplit=1)[0]
+                    after_path = normalized_line[directory_match.end("path") :]
+                    conditional = bool(
+                        control_depth
+                        or re.search(
+                            r"(?:&&|\|\||\||\b(?:if|elif|while|until|for|case|"
+                            r"then|do|else)\b)",
+                            before_cd,
+                        )
+                        or re.match(r"\s*(?:&&|\|\||\|)", after_path)
+                    )
+                    directory_path = directory_match.group("path")
+                    if (
+                        current is None
+                        or conditional
+                        or dynamic_shell_word(directory_path)
+                    ):
+                        current = None
+                        continue
+                    current = normalize_repository_path(directory_path)
+                return current
+
+            def directory_before(position: int) -> str | None:
+                return directory_after(
+                    working_directory,
+                    [match for match in directory_matches if match.start() < position],
+                )
 
             for match in LOCAL_COMMAND_REFERENCE.finditer(normalized_line):
                 raw_command_path = (
@@ -3302,6 +3598,12 @@ def local_automation_references(
                 )
                 if raw_command_path.endswith("/"):
                     continue
+                if repository_path_has_dot_dot(raw_command_path):
+                    errors.append(
+                        f"{source}:{line_number} repository command paths must not "
+                        "contain '..'"
+                    )
+                    continue
                 command_path = normalize_repository_path(raw_command_path)
                 if command_path is None:
                     errors.append(
@@ -3310,9 +3612,16 @@ def local_automation_references(
                     continue
                 if command_path in GENERATED_COMMAND_PATHS:
                     continue
-                if "/" not in command_path and working_directory:
+                effective_directory = directory_before(match.start())
+                if "/" not in command_path and effective_directory is None:
+                    errors.append(
+                        f"{source}:{line_number} repository command has ambiguous "
+                        "working-directory state"
+                    )
+                    continue
+                if "/" not in command_path and effective_directory:
                     command_path = (
-                        PurePosixPath(working_directory) / command_path
+                        PurePosixPath(effective_directory) / command_path
                     ).as_posix()
                 if command_path in GENERATED_COMMAND_PATHS:
                     continue
@@ -3329,9 +3638,22 @@ def local_automation_references(
             for match in BUILD_DISPATCHER.finditer(normalized_line):
                 arguments = match.group("arguments")
                 dispatcher = match.group("dispatcher")
-                base = working_directory or ""
+                effective_directory = directory_before(match.start())
+                if effective_directory is None:
+                    errors.append(
+                        f"{source}:{line_number} build dispatcher has ambiguous "
+                        "working-directory state"
+                    )
+                    continue
+                base = effective_directory
                 directory = DISPATCHER_DIRECTORY.search(arguments)
                 if directory is not None:
+                    if repository_path_has_dot_dot(directory.group("path")):
+                        errors.append(
+                            f"{source}:{line_number} build dispatcher directory "
+                            "must not contain '..'"
+                        )
+                        continue
                     relocated = normalize_repository_path(directory.group("path"))
                     if relocated is None:
                         errors.append(
@@ -3368,6 +3690,12 @@ def local_automation_references(
                         )
                         continue
                     workspace_path = workspace.group("path")
+                    if repository_path_has_dot_dot(workspace_path):
+                        errors.append(
+                            f"{source}:{line_number} build dispatcher workspace "
+                            "must not contain '..'"
+                        )
+                        continue
                     relocated = normalize_repository_path(workspace_path)
                     if (
                         relocated is None
@@ -3383,6 +3711,12 @@ def local_automation_references(
 
                 explicit = DISPATCHER_MANIFEST_OPTION.search(arguments)
                 if explicit is not None:
+                    if repository_path_has_dot_dot(explicit.group("path")):
+                        errors.append(
+                            f"{source}:{line_number} build dispatcher manifest "
+                            "must not contain '..'"
+                        )
+                        continue
                     manifest = normalize_repository_path(explicit.group("path"))
                     if manifest is None:
                         errors.append(
@@ -3398,6 +3732,14 @@ def local_automation_references(
                     for name in names
                 )
                 dispatcher_groups.add("|".join(candidates))
+            working_directory = directory_after(working_directory, directory_matches)
+            opened_controls = len(
+                re.findall(r"\b(?:if|while|until|for|case)\b", normalized_line)
+            )
+            closed_controls = len(
+                re.findall(r"\b(?:fi|done|esac)\b", normalized_line)
+            )
+            control_depth = max(0, control_depth + opened_controls - closed_controls)
     return references, dispatcher_groups, errors
 
 
@@ -3547,8 +3889,6 @@ def compare_pr_automation_collection(
         f"proposed {source}",
     )
     errors = [*baseline_errors, *proposed_errors]
-    if errors:
-        return errors
 
     # Compare every file in the narrowly approved automation roots. This also
     # covers scripts selected through an existing trusted variable or sourced
@@ -3631,6 +3971,43 @@ def validate_ci_planner_isolation(contents: str, source: str) -> list[str]:
         errors.append(f"{source} ci-plan is missing the isolated planner self-test")
     if not any("--event-name" in invocation for invocation in invocations):
         errors.append(f"{source} ci-plan is missing the isolated planning invocation")
+    return errors
+
+
+def validate_trusted_policy_extraction(contents: str, source: str) -> list[str]:
+    """Keep hostile-tree extraction fail-closed and based on current main."""
+
+    errors: list[str] = []
+    required_current_base_inputs = (
+        'git show "HEAD:.github/workflows/ci.yml"',
+        'git show "HEAD:.github/workflows/release.yml"',
+        'extract_workflows HEAD "$merge_base_workflows"',
+        'extract_actions HEAD "$merge_base_actions"',
+        'extract_automation HEAD "$merge_base_automation"',
+    )
+    for required in required_current_base_inputs:
+        if required not in contents:
+            errors.append(
+                f"{source} must compare proposed Cross surfaces with current base "
+                f"HEAD ({required!r} is missing)"
+            )
+    if "git merge-base" in contents:
+        errors.append(f"{source} must not use a stale merge-base Cross baseline")
+
+    checked_enumerations = re.findall(
+        r"if ! git ls-tree -rz --name-only \"\$commit\"[^;]*> \"\$[a-z_]+\"; then",
+        contents,
+        re.DOTALL,
+    )
+    if len(checked_enumerations) != 4:
+        errors.append(
+            f"{source} must status-check all four hostile git tree enumerations "
+            "before consuming materialized listings"
+        )
+    if re.search(r"<\s*<\(\s*git\s+ls-tree\b", contents):
+        errors.append(
+            f"{source} must not consume git ls-tree through process substitution"
+        )
     return errors
 
 
@@ -4603,6 +4980,216 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("safe referenced automation was rejected")
+
+    interpreter_references = {
+        "dash": "dash ci/unsafe.sh",
+        "zsh": "zsh ci/unsafe.sh",
+        "ksh": "ksh ci/unsafe.sh",
+        "ash": "ash ci/unsafe.sh",
+        "Perl": "perl ci/unsafe.pl",
+        "awk file mode": "awk -f ci/unsafe.awk",
+        "PowerShell Core": "pwsh ci/unsafe.ps1",
+        "PHP": "php ci/unsafe.php",
+        "Rscript": "Rscript ci/unsafe.R",
+        "Deno": "deno ci/unsafe.ts",
+        "Bun": "bun ci/unsafe.ts",
+        "BusyBox shell": "busybox sh ci/unsafe.sh",
+    }
+    for interpreter_label, command in interpreter_references.items():
+        interpreter_workflow = referenced_workflow.replace(
+            "bash scripts/safe.sh",
+            command,
+        )
+        if not validate_automation_collection(
+            {"ci.yml": interpreter_workflow},
+            {"setup/action.yml": safe_action},
+            safe_automation,
+            "self-test automation directory",
+        ):
+            failures.append(
+                f"{interpreter_label} repository command escaped automation scanning"
+            )
+
+    future_filename_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "bash 'scripts/future +@~ name.sh'",
+    )
+    future_filename_automation = {
+        "scripts/future +@~ name.sh": "#!/bin/sh\necho safe\n"
+    }
+    if validate_automation_collection(
+        {"future +@~ workflow.yml": future_filename_workflow},
+        {"setup/action.yml": safe_action},
+        future_filename_automation,
+        "self-test automation directory",
+    ):
+        failures.append("benign supported filename characters were rejected")
+    if WORKFLOW_FILENAME.fullmatch("future +@~ workflow.yml") is None:
+        failures.append("supported workflow filename characters were not accepted")
+
+    dot_dot_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "bash scripts/../ci/unsafe.sh",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": dot_dot_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("dot-dot repository command path was not rejected")
+
+    reference_before_cd = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "bash scripts/safe.sh && cd scripts",
+    )
+    if validate_automation_collection(
+        {"ci.yml": reference_before_cd},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("a later same-line cd affected an earlier command")
+
+    conditional_cd_workflow = referenced_workflow.replace(
+        "run: bash scripts/safe.sh",
+        "run: |\n"
+        "          if test -d scripts; then\n"
+        "            cd scripts\n"
+        "          fi\n"
+        "          bash safe.sh",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": conditional_cd_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("conditional working-directory state was not rejected")
+
+    quoted_heredoc_prose = referenced_workflow.replace(
+        "run: bash scripts/safe.sh",
+        "run: |\n"
+        "          echo \"usage: program <<EOF\"\n"
+        "          bash scripts/safe.sh",
+    )
+    if validate_automation_collection(
+        {"ci.yml": quoted_heredoc_prose},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("quoted heredoc prose suppressed later command scanning")
+
+    unterminated_heredoc = referenced_workflow.replace(
+        "run: bash scripts/safe.sh",
+        "run: |\n          bash <<'SHELL'\n          echo incomplete",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": unterminated_heredoc},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("unterminated executable heredoc was not rejected")
+
+    python_shell_cross = referenced_workflow.replace(
+        "      - run: bash scripts/safe.sh\n",
+        "      - shell: python\n"
+        "        run: |\n"
+        "          import subprocess\n"
+        "          subprocess.run(['cross', 'build', '--target', "
+        "'aarch64-unknown-linux-gnu'])\n",
+    )
+    if not validate_workflow_collection(
+        {"python-shell.yml": python_shell_cross},
+        "self-test workflow directory",
+    ):
+        failures.append("workflow Python shell Cross process was not rejected")
+
+    default_python_shell_cross = (
+        "name: Default Python shell\n"
+        "defaults:\n"
+        "  run:\n"
+        "    shell: python3\n"
+        "jobs:\n"
+        "  unsafe:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          import subprocess\n"
+        "          subprocess.run(['cross', 'build', '--target', "
+        "'aarch64-unknown-linux-gnu'])\n"
+    )
+    if not validate_workflow_collection(
+        {"default-python-shell.yml": default_python_shell_cross},
+        "self-test workflow directory",
+    ):
+        failures.append("workflow default Python shell was not resolved")
+
+    python_heredoc_cross = referenced_workflow.replace(
+        "run: bash scripts/safe.sh",
+        "run: |\n"
+        "          python3 <<'PY'\n"
+        "          import subprocess\n"
+        "          subprocess.run(['cross', 'build', '--target', "
+        "'aarch64-unknown-linux-gnu'])\n"
+        "          PY",
+    )
+    if not validate_workflow_collection(
+        {"python-heredoc.yml": python_heredoc_cross},
+        "self-test workflow directory",
+    ):
+        failures.append("workflow Python heredoc Cross process was not rejected")
+
+    ordinary_python_source = (
+        "from subprocess import run\n"
+        "run(['echo', 'safe'])\n"
+    )
+    ordinary_sensitive, ordinary_errors = action_file_runtime_surface(
+        "scripts/ordinary.py",
+        ordinary_python_source,
+        include_opaque_shell_executable=True,
+    )
+    if ordinary_sensitive or ordinary_errors:
+        failures.append("ordinary Python beginning with from was treated as Dockerfile")
+    _, missing_from_errors = action_file_runtime_surface(
+        "actions/example/Dockerfile",
+        "RUN echo safe\n",
+        include_opaque_shell_executable=True,
+    )
+    if not missing_from_errors:
+        failures.append("Dockerfile without a FROM instruction was not rejected")
+
+    aggregate_comparison_errors = compare_pr_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        {},
+        {
+            "scripts/safe.sh": (
+                "#!/bin/sh\ncross build --target aarch64-unknown-linux-gnu\n"
+            )
+        },
+        "self-test aggregate automation directory",
+    )
+    if not any(
+        "references missing automation" in error
+        for error in aggregate_comparison_errors
+    ):
+        failures.append("baseline automation errors were not reported")
+    if not any(
+        "cannot add or change Cross" in error
+        for error in aggregate_comparison_errors
+    ):
+        failures.append("baseline errors suppressed proposed Cross comparison")
+
+    if any(
+        prefix in {"RUNNER_TEMP/", "trusted_dir/"}
+        for prefix in GENERATED_SCRIPT_PREFIXES
+    ):
+        failures.append("unreachable variable-prefixed generated paths remain allowed")
 
     quoted_run_workflow = referenced_workflow.replace(
         "run: bash scripts/safe.sh",
@@ -5846,6 +6433,49 @@ pre_build = []
     if not validate_publish_control_contract(duplicate_publish_needs, "CI workflow"):
         failures.append("duplicate publication needs field was not rejected")
 
+    trusted_extraction_fixture = (
+        'git show "HEAD:.github/workflows/ci.yml"\n'
+        'git show "HEAD:.github/workflows/release.yml"\n'
+        'extract_workflows HEAD "$merge_base_workflows"\n'
+        'extract_actions HEAD "$merge_base_actions"\n'
+        'extract_automation HEAD "$merge_base_automation"\n'
+        'if ! git ls-tree -rz --name-only "$commit" -- workflows > "$listing"; then\n'
+        "  return 1\n"
+        "fi\n"
+        'if ! git ls-tree -rz --name-only "$commit" -- actions > "$listing"; then\n'
+        "  return 1\n"
+        "fi\n"
+        'if ! git ls-tree -rz --name-only "$commit" -- scripts > "$listing"; then\n'
+        "  return 1\n"
+        "fi\n"
+        'if ! git ls-tree -rz --name-only "$commit" > "$workspace_listing"; then\n'
+        "  return 1\n"
+        "fi\n"
+    )
+    if validate_trusted_policy_extraction(
+        trusted_extraction_fixture,
+        "self-test trusted policy",
+    ):
+        failures.append("valid checked current-base extraction was rejected")
+    stale_extraction_fixture = trusted_extraction_fixture.replace(
+        'extract_workflows HEAD "$merge_base_workflows"',
+        'extract_workflows "$merge_base" "$merge_base_workflows"',
+    )
+    if not validate_trusted_policy_extraction(
+        stale_extraction_fixture,
+        "self-test trusted policy",
+    ):
+        failures.append("stale merge-base extraction was not rejected")
+    process_substitution_fixture = trusted_extraction_fixture.replace(
+        'if ! git ls-tree -rz --name-only "$commit" -- workflows > "$listing"; then',
+        'done < <(git ls-tree -rz --name-only "$commit" -- workflows)',
+    )
+    if not validate_trusted_policy_extraction(
+        process_substitution_fixture,
+        "self-test trusted policy",
+    ):
+        failures.append("unchecked process-substitution extraction was not rejected")
+
     return failures
 
 
@@ -6017,6 +6647,11 @@ def main() -> int:
         type=Path,
         default=Path(".github/workflows/release.yml"),
     )
+    parser.add_argument(
+        "--trusted-policy-workflow",
+        type=Path,
+        default=Path(".github/workflows/cross-build-policy.yml"),
+    )
     parser.add_argument("--merge-base-ci-workflow", type=Path)
     parser.add_argument("--proposed-ci-workflow", type=Path)
     parser.add_argument("--merge-base-release-workflow", type=Path)
@@ -6089,6 +6724,20 @@ def main() -> int:
                     expected_trigger_hash,
                 )
             )
+
+    trusted_policy, trusted_policy_failures = load_workflow(
+        args.trusted_policy_workflow,
+        "trusted Cross policy workflow",
+    )
+    failures.extend(trusted_policy_failures)
+    if not trusted_policy_failures:
+        assert trusted_policy is not None
+        failures.extend(
+            validate_trusted_policy_extraction(
+                trusted_policy,
+                "trusted Cross policy workflow",
+            )
+        )
 
     workflows, workflow_directory_failures = load_workflow_directory(
         args.workflows_dir,

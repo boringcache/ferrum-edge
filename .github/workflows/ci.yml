@@ -77,6 +77,9 @@ jobs:
       - name: Validate trusted PR CI planner examples
         run: |
           set -euo pipefail
+          # The preceding Cross-policy step fetches the exact base ref into
+          # origin/${BASE_REF}; keep these adjacent because this consumer uses
+          # that immutable fetched ref rather than PR-controlled planner code.
           planner=.github/scripts/pr_ci_plan.py
           planner_dir=.github/scripts
           if [ "$EVENT_NAME" = "pull_request" ]; then
