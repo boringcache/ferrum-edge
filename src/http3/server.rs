@@ -6316,9 +6316,11 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
-        // Sticky session cookie injection
+        // Sticky session cookie injection. The buffered variant also records the
+        // cookie as gateway-owned so a committed-hook deadline cannot strip it.
         if !after_proxy_rejected {
-            inject_sticky_cookie(
+            inject_sticky_cookie_with_deadline_provenance(
+                &mut ctx,
                 &epoch,
                 &proxy,
                 upstream_target.as_deref(),
@@ -7180,13 +7182,22 @@ fn build_h3_backend_headers(
 /// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
 /// Inject a sticky-session `Set-Cookie` header when the LB strategy is cookie-based
 /// and the cookie was not present in the original request.
+///
+/// Returns whether a cookie was actually injected. Buffered callers use this to
+/// record `set-cookie` as gateway-owned in gRPC-deadline provenance before
+/// `response_committed` hooks run — mirroring the H1/H2 gRPC and plain buffered
+/// paths. Without that record, a committed hook that exhausts the RPC deadline
+/// rebuilds the response from gateway-owned headers only, and the freshly
+/// injected affinity cookie is stripped, silently breaking stickiness for the
+/// client. Streaming callers may ignore the result: their headers are already on
+/// the wire before any deadline rebuild can run.
 pub(crate) fn inject_sticky_cookie(
     epoch: &crate::request_epoch::RequestEpoch,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
     sticky_cookie_needed: bool,
     response_headers: &mut HashMap<String, String>,
-) {
+) -> bool {
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
@@ -7212,8 +7223,47 @@ pub(crate) fn inject_sticky_cookie(
                     v.push_str(&cookie_val);
                 })
                 .or_insert(cookie_val);
+            return true;
         }
     }
+    false
+}
+
+/// Inject the sticky-affinity cookie on a BUFFERED H3 response and, when one was
+/// written, declare it gateway-owned in gRPC-deadline provenance.
+///
+/// Every buffered H3 path must use this instead of calling
+/// [`inject_sticky_cookie`] directly. A `response_committed` hook that exhausts
+/// the RPC deadline rebuilds the response from gateway-owned headers only, so an
+/// unrecorded affinity cookie is stripped and the client silently loses
+/// stickiness. Recording here — before any committed hook runs — mirrors the
+/// H1/H2 gRPC and plain buffered paths in `src/proxy/mod.rs`.
+///
+/// Streaming paths deliberately keep calling [`inject_sticky_cookie`]: their
+/// headers reach the wire before a deadline can rebuild anything.
+pub(crate) fn inject_sticky_cookie_with_deadline_provenance(
+    ctx: &mut RequestContext,
+    epoch: &crate::request_epoch::RequestEpoch,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    sticky_cookie_needed: bool,
+    response_headers: &mut HashMap<String, String>,
+) -> bool {
+    if !inject_sticky_cookie(
+        epoch,
+        proxy,
+        upstream_target,
+        sticky_cookie_needed,
+        response_headers,
+    ) {
+        return false;
+    }
+    // Gated so the owned-name allocation only happens on deadline-bound
+    // responses, matching the gating rationale used elsewhere in this path.
+    if ctx.has_buffered_deadline_response_header_provenance() {
+        ctx.record_deadline_owned_response_headers(&["set-cookie".to_string()], response_headers);
+    }
+    true
 }
 
 /// Whether an H3 dispatch failure counts as a connect-class (pre-wire) backend
@@ -10481,6 +10531,22 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
     {
         return false;
     }
+
+    // Seed gateway-rejection provenance for every H3 reject path that can reach
+    // a committed hook, not just the ones routed through
+    // `apply_reject_after_proxy_and_synthetic_body_hooks`. Direct gateway-error
+    // callers (notably the mesh dispatch-required 502 emitted straight after
+    // `finalize_h3_gateway_error_headers`) otherwise hand gateway-authored
+    // headers to a committed hook with no provenance at all; if that hook
+    // exhausts the RPC deadline, `replace_buffered_h3_response_with_grpc_deadline`
+    // below rebuilds from an empty gateway map and strips them. These headers are
+    // the rejection the gateway itself synthesized, so declaring them
+    // gateway-owned adds no backend surface. Seeding here (after the
+    // no-committed-hook early return, and on the same `headers` the deadline
+    // rebuild clones) covers the shared wrapper and the direct delegate callers
+    // in one place; on paths that already seeded, this folds through
+    // `adopt_gateway_rejection` rather than restarting provenance.
+    ctx.begin_rejection_deadline_response_header_provenance(headers);
 
     let (committed_status, committed_headers, committed_body) = if let Some(content_type) =
         grpc_web_response_content_type

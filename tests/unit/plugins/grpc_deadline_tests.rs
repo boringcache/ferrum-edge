@@ -2889,3 +2889,292 @@ async fn test_original_and_adjusted_metadata() {
         "10000"
     );
 }
+
+/// A committed-response observer that captures the exact header map it is
+/// invoked with. Used to inspect the response the deadline rebuild handed to the
+/// remaining (detached) committed hooks.
+struct HeaderCapturingCommittedHook {
+    captured: Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
+    completion: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Plugin for HeaderCapturingCommittedHook {
+    fn name(&self) -> &str {
+        "header_capturing_committed_hook"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        *self.captured.lock().expect("captured headers lock") = Some(response_headers.clone());
+        self.completion.notify_one();
+    }
+}
+
+/// Codex finding: `Set-Cookie` provenance is matched by OCCURRENCE, not by value
+/// membership. A trusted hook that authors a cookie line byte-identical to one
+/// the backend already sent (a deterministic affinity cookie, or a session
+/// refresh reproducing the upstream value) must still deliver exactly one copy
+/// across a gRPC deadline rebuild — the previous value-only filter dropped every
+/// matching occurrence including the gateway's, leaving the client with none.
+#[tokio::test]
+async fn deadline_replacement_keeps_gateway_set_cookie_identical_to_a_backend_line() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+
+    const SHARED: &str = "sid=deterministic; Path=/";
+
+    // The gateway hook appends a line that is byte-for-byte the backend's.
+    let decorators: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(SessionCookieAppendingDecorator { cookie: SHARED })];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("set-cookie".to_string(), SHARED.to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&decorators, &mut ctx, 200, &mut headers).await,
+        "the cookie-appending decorator must not reject the response"
+    );
+    let both_lines = format!("{SHARED}\n{SHARED}");
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(both_lines.as_str()),
+        "precondition: both the backend and the gateway line are present"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(SHARED),
+        "exactly one occurrence survives: the gateway-authored copy is kept and \
+         only the backend's own occurrence is dropped"
+    );
+}
+
+/// The companion invariant: occurrence accounting must not become a
+/// backend-cookie smuggling channel. When the backend sends the SAME line twice,
+/// both occurrences are still dropped — the gateway's own distinct line is the
+/// only thing that crosses the deadline rebuild.
+#[tokio::test]
+async fn deadline_replacement_strips_every_duplicate_backend_set_cookie_line() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+
+    const BACKEND: &str = "backend_sid=leak; Path=/";
+    const GATEWAY: &str = "gw_session=fresh; Path=/";
+
+    // A real gateway hook must mutate `set-cookie`, otherwise no provenance is
+    // recorded and the filter under test is never invoked at all.
+    let decorators: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(SessionCookieAppendingDecorator { cookie: GATEWAY })];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    // The backend itself sent the same cookie line twice.
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("set-cookie".to_string(), format!("{BACKEND}\n{BACKEND}")),
+    ]);
+    assert!(!run_after_proxy_hooks_for_test(&decorators, &mut ctx, 200, &mut headers).await);
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(GATEWAY),
+        "both identical backend occurrences must be dropped while the distinct \
+         gateway-authored line survives"
+    );
+}
+
+/// Codex finding: production `run_h3_reject_response_committed_hooks` must seed
+/// gateway-rejection provenance itself. Direct H3 gateway-error callers (the
+/// mesh dispatch-required error after `finalize_h3_gateway_error_headers`) never
+/// run `apply_reject_after_proxy_and_synthetic_body_hooks`, so without the
+/// production seed their gateway-authored headers are stripped by the deadline
+/// rebuild while the test shim preserved them.
+#[tokio::test]
+async fn h3_reject_committed_deadline_preserves_direct_gateway_error_headers() {
+    use ferrum_edge::_test_support::{
+        run_h3_reject_response_committed_hooks, set_grpc_deadline_budget_for_test,
+    };
+    use ferrum_edge::config::types::HttpFlavor;
+    use hyper::StatusCode;
+
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let completion = Arc::new(tokio::sync::Notify::new());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(StalledCommittedHook),
+        Arc::new(HeaderCapturingCommittedHook {
+            captured: Arc::clone(&captured),
+            completion: Arc::clone(&completion),
+        }),
+    ];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    // Deadline already exhausted: the stalled hook cannot finish before it.
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+
+    // The header shape a direct mesh dispatch-required 502 hands over: entirely
+    // gateway-authored, with no backend response behind it.
+    let headers = HashMap::from([
+        (
+            "gateway-error-reason".to_string(),
+            "dispatch_required".to_string(),
+        ),
+        ("content-type".to_string(), "application/grpc".to_string()),
+    ]);
+
+    assert!(
+        run_h3_reject_response_committed_hooks(
+            &plugins,
+            &mut ctx,
+            HttpFlavor::Grpc,
+            None,
+            StatusCode::BAD_GATEWAY,
+            b"dispatch required",
+            &headers,
+        )
+        .await,
+        "the stalled committed hook must exhaust the RPC deadline and replace the response"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), completion.notified())
+        .await
+        .expect("the detached committed hook must observe the rebuilt response");
+
+    let observed = captured
+        .lock()
+        .expect("captured headers lock")
+        .clone()
+        .expect("the detached committed hook must capture headers");
+    assert_eq!(
+        observed.get("grpc-status").map(String::as_str),
+        Some("4"),
+        "the rebuild is a DEADLINE_EXCEEDED response"
+    );
+    assert_eq!(
+        observed.get("gateway-error-reason").map(String::as_str),
+        Some("dispatch_required"),
+        "gateway-authored rejection headers must survive a deadline rebuild on the \
+         direct H3 reject path, not only through the test shim"
+    );
+}
+
+/// Codex finding: a `response_transformer` `rename` whose destination value is
+/// indistinguishable from a backend-supplied header must still be recorded as
+/// gateway-owned. Mutation tracking sees only the source removal, so without
+/// recording the destination the deadline rebuild drops a header the completed
+/// transformer authored.
+#[tokio::test]
+async fn deadline_replacement_preserves_response_transformer_rename_destination() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+
+    let rename_rule = json!({
+        "operation": "rename",
+        "target": "header",
+        "key": "x-source",
+        "new_key": "x-public",
+    });
+    let transformer = create_plugin("response_transformer", &json!({"rules": [rename_rule]}))
+        .unwrap()
+        .unwrap();
+    let after_proxy_plugins = vec![transformer];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    // The backend supplies BOTH the rename source and the destination, with the
+    // same value the rename will produce — so the post-rename map is
+    // byte-identical to what a backend spoof would look like.
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("x-source".to_string(), "v".to_string()),
+        ("x-public".to_string(), "v".to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "the response_transformer must not reject the response"
+    );
+    assert!(
+        !headers.contains_key("x-source"),
+        "precondition: the rename consumed the source header"
+    );
+    assert_eq!(headers.get("x-public").map(String::as_str), Some("v"));
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("x-public").map(String::as_str),
+        Some("v"),
+        "the fired rename destination is gateway-authored and must survive the rebuild"
+    );
+    assert!(
+        !headers.contains_key("x-source"),
+        "the renamed-away backend source header must not reappear"
+    );
+}

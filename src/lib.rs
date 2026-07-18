@@ -1234,7 +1234,9 @@ pub mod _test_support {
         body: &[u8],
         headers: &HashMap<String, String>,
     ) -> bool {
-        ctx.begin_rejection_deadline_response_header_provenance(headers);
+        // No provenance seeding here: the production delegate seeds it, so this
+        // shim stays a pure pass-through and tests observe the real behavior of
+        // direct H3 reject callers rather than a test-only head start.
         crate::http3::server::run_h3_reject_response_committed_hooks(
             plugins,
             ctx,
@@ -1301,6 +1303,29 @@ pub mod _test_support {
         ) -> Option<Option<crate::plugins::BackendAdmissionPermitSet>> {
             self.inner.take_if_acquired()
         }
+    }
+
+    /// The production buffered-H3 sticky-affinity injector: writes the cookie
+    /// and, on injection, records `set-cookie` as gRPC-deadline gateway-owned.
+    /// This is the exact function the buffered H3 call sites invoke, so a test
+    /// through it covers the inject-then-record ordering itself rather than
+    /// re-implementing it.
+    pub fn h3_inject_sticky_cookie_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        epoch: &crate::request_epoch::RequestEpoch,
+        proxy: &crate::config::types::Proxy,
+        upstream_target: Option<&crate::config::types::UpstreamTarget>,
+        sticky_cookie_needed: bool,
+        response_headers: &mut HashMap<String, String>,
+    ) -> bool {
+        crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
+            ctx,
+            epoch,
+            proxy,
+            upstream_target,
+            sticky_cookie_needed,
+            response_headers,
+        )
     }
 
     pub fn h3_buffered_grpc_deadline_replacement_for_test(

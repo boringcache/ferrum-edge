@@ -165,10 +165,19 @@ impl ResponseTransformer {
             })
     }
 
+    /// `fired_rename_keys`, when `Some`, collects the destination key of every
+    /// `rename` rule that actually fired. A rename can land a value on the
+    /// destination that is byte-identical to something a backend could have sent
+    /// (the backend may even have sent that exact destination header itself), so
+    /// mutation tracking — which sees only the source removal — would not record
+    /// the destination as gateway-authored. Callers that track gRPC-deadline
+    /// provenance pass a sink and declare these keys owned; everyone else passes
+    /// `None` and stays allocation-free.
     fn apply_static_header_rules(
         &self,
         response_headers: &mut HashMap<String, String>,
         emit_debug: bool,
+        mut fired_rename_keys: Option<&mut Vec<String>>,
     ) {
         for rule in &self.header_rules {
             match rule.operation {
@@ -207,6 +216,9 @@ impl ResponseTransformer {
                             );
                         }
                         response_headers.insert(new_key.clone(), value);
+                        if let Some(sink) = fired_rename_keys.as_mut() {
+                            sink.push(new_key.clone());
+                        }
                     }
                 }
             }
@@ -506,7 +518,7 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return;
         }
-        self.apply_static_header_rules(response_headers, false);
+        self.apply_static_header_rules(response_headers, false, None);
         if let Some(route_rules) = ctx.route_override_response_transform.take() {
             apply_route_header_transforms(route_rules.as_ref(), response_headers);
         }
@@ -543,7 +555,15 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return PluginResult::Continue;
         }
-        self.apply_static_header_rules(response_headers, true);
+        // Collect fired `rename` destinations only when a deadline rebuild could
+        // consult them, keeping the common path allocation-free.
+        let track_owned = ctx.has_buffered_deadline_response_header_provenance();
+        let mut fired_rename_keys: Vec<String> = Vec::new();
+        self.apply_static_header_rules(
+            response_headers,
+            true,
+            track_owned.then_some(&mut fired_rename_keys),
+        );
         // Per-rule overrides published by `mesh_route_dispatch` run AFTER
         // static rules so route-level writes win on conflict — see module
         // docstring. Take the Arc out so a later response_transformer
@@ -558,12 +578,16 @@ impl Plugin for ResponseTransformer {
         // the configured value, so a backend that pre-populated the identical
         // key/value must not be able to suppress the decoration on a synthesized
         // DEADLINE_EXCEEDED response — mutation tracking cannot see an
-        // exact-value write. `add`/`rename` header changes are already visible
-        // to mutation tracking, and the provenance state exists only for
-        // deadline-bound buffered responses (gated here to avoid per-request
-        // allocation otherwise).
-        if ctx.has_buffered_deadline_response_header_provenance() {
+        // exact-value write. The destination of a `rename` that actually fired is
+        // owned for the same reason: mutation tracking observes only the source
+        // removal, so a backend that also sent the destination key with the same
+        // value it is being renamed to would otherwise suppress the gateway's
+        // write. `add` header changes remain visible to mutation tracking, and the
+        // provenance state exists only for deadline-bound buffered responses
+        // (gated here to avoid per-request allocation otherwise).
+        if track_owned {
             let mut owned = self.static_update_keys.clone();
+            owned.append(&mut fired_rename_keys);
             if let Some(route_rules) = route_rules.as_ref() {
                 for rule in route_rules.iter() {
                     if rule.operation == RouteHeaderTransformOp::Update {

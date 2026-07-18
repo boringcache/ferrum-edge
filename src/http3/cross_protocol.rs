@@ -2636,7 +2636,13 @@ where
 
     // Sticky session cookie injection — only runs if the LB selected a
     // sticky target.
-    crate::http3::server::inject_sticky_cookie(
+    // `run_after_proxy_hooks` above already armed deadline provenance, so the
+    // buffered variant can claim the affinity cookie as gateway-owned. The
+    // buffered branch below hands this response to `response_committed` hooks
+    // under `grpc_web_deadline_at`; a deadline rebuild there keeps gateway-owned
+    // headers only, and an unrecorded cookie would be dropped.
+    crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
+        ctx,
         epoch,
         proxy,
         current_target.as_deref(),
@@ -4680,7 +4686,12 @@ where
             // the merged view ensures it lands in the wire HEADERS frame even when
             // the backend sent a trailer-only `set-cookie` (a non-shadowed trailer
             // key that the strip loop above just removed from the headers).
-            crate::http3::server::inject_sticky_cookie(
+            // The buffered variant also records the affinity cookie as
+            // gateway-owned before the `response_committed` hooks below can
+            // rebuild this response as a gRPC deadline error, which retains
+            // gateway-owned headers only.
+            crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
+                ctx,
                 epoch,
                 proxy,
                 current_target.as_deref(),
