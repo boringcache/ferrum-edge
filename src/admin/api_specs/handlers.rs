@@ -1624,6 +1624,12 @@ async fn validate_bundle(
         // fields too (the rejection is scoped to operator paths; the mesh
         // slice-apply path does not run it).
         let mut upstream_errors = Vec::new();
+        if upstream.api_spec_id.is_some() {
+            upstream_errors.push(
+                "api_spec_id is server-managed and must be omitted from x-ferrum-upstream"
+                    .to_string(),
+            );
+        }
         if let Err(e) = upstream.validate_fields() {
             upstream_errors.extend(e);
         }
@@ -1650,6 +1656,13 @@ async fn validate_bundle(
         let proxy = &bundle.proxy;
 
         let mut proxy_errors: Vec<String> = Vec::new();
+
+        if proxy.api_spec_id.is_some() {
+            proxy_errors.push(
+                "api_spec_id is server-managed and must be omitted from x-ferrum-proxy"
+                    .to_string(),
+            );
+        }
 
         // validate_fields covers scheme, port, listen_path regex, etc.
         if let Err(e) = proxy.validate_fields() {
@@ -1696,6 +1709,13 @@ async fn validate_bundle(
     let known_plugins = crate::plugins::available_plugins();
     for plugin in &bundle.plugins {
         let mut plugin_errors: Vec<String> = Vec::new();
+
+        if plugin.api_spec_id.is_some() {
+            plugin_errors.push(
+                "api_spec_id is server-managed and must be omitted from x-ferrum-plugins"
+                    .to_string(),
+            );
+        }
 
         // Generic PluginConfig field constraints (Fix 3): priority_override
         // range, config JSON size, nesting depth.  Direct admin runs

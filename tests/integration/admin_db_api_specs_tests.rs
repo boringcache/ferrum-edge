@@ -788,6 +788,8 @@ fn mongo_restore_validation_uses_the_recovered_proxy_graph_projection() {
     assert!(validation.contains("api_spec_recovered_proxy_graph"));
     assert!(validation.contains("restored_proxy_id"));
     assert!(validation.contains("recovered_graph.validate_plugin_references()"));
+    assert!(validation.contains("load_full_upstreams_opt_session"));
+    assert!(validation.contains("recovered_graph.validate_upstream_references()"));
     assert!(
         validation.contains("validate_tcp_connection_throttle_attachments(&candidate)"),
         "namespace-wide guarded composition validation must remain in force"
@@ -1132,6 +1134,132 @@ async fn restore_bundle_rejects_missing_hand_owned_upstream_reference() {
     );
     assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
     assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_intervening_hand_owned_upstream_subset_change() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-subset-proxy");
+    let upstream_id = uid("restore-subset-upstream");
+    let spec_id = uid("restore-subset-spec");
+
+    let mut upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "id": upstream_id,
+        "namespace": ns,
+        "targets": [{
+            "host": "target.internal",
+            "port": 443,
+            "tags": {"version": "blue"}
+        }],
+        "subsets": [{"name": "blue", "labels": {"version": "blue"}}]
+    }))
+    .expect("subset upstream deserialization failed");
+    store
+        .create_upstream(&upstream)
+        .await
+        .expect("seed hand-owned upstream failed");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.upstream_id = Some(upstream_id.clone());
+    proxy.upstream_subset = Some("blue".to_string());
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"restored subset snapshot");
+
+    upstream.subsets = None;
+    assert!(
+        store
+            .update_upstream(&upstream)
+            .await
+            .expect("intervening upstream update failed")
+    );
+
+    let error = store
+        .restore_api_spec_bundle(&bundle, &spec, &[])
+        .await
+        .expect_err("removed upstream subset must reject compensation");
+    assert!(
+        error.to_string().contains("upstream_subset 'blue'"),
+        "unexpected subset validation error: {error:#}"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_upstream(ns, &upstream_id)
+            .await
+            .unwrap()
+            .is_some_and(|current| current.subsets.is_none()),
+        "rejected compensation must preserve the intervening upstream"
+    );
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_intervening_hand_owned_mesh_retry_change() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-mesh-retry-proxy");
+    let upstream_id = uid("restore-mesh-retry-upstream");
+    let spec_id = uid("restore-mesh-retry-spec");
+
+    let mut upstream = make_upstream(&upstream_id, ns);
+    store
+        .create_upstream(&upstream)
+        .await
+        .expect("seed hand-owned upstream failed");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.upstream_id = Some(upstream_id.clone());
+    proxy.retry = Some(
+        serde_json::from_value(serde_json::json!({"max_retries": 1}))
+            .expect("retry deserialization failed"),
+    );
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"restored mesh retry snapshot");
+
+    upstream.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+    assert!(
+        store
+            .update_upstream(&upstream)
+            .await
+            .expect("intervening mesh upstream update failed")
+    );
+
+    let error = store
+        .restore_api_spec_bundle(&bundle, &spec, &[])
+        .await
+        .expect_err("new mesh transport/retry conflict must reject compensation");
+    let message = error.to_string();
+    assert!(
+        message.contains("enables retry") && message.contains("mesh.hbone"),
+        "unexpected mesh retry validation error: {error:#}"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_upstream(ns, &upstream_id)
+            .await
+            .unwrap()
+            .is_some_and(|current| {
+                current.targets[0].tags.get("mesh.hbone").map(String::as_str) == Some("true")
+            }),
+        "rejected compensation must preserve the intervening mesh upstream"
+    );
 }
 
 // ---------------------------------------------------------------------------

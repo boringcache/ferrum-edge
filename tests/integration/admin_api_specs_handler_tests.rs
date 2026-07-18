@@ -879,6 +879,102 @@ async fn post_with_invalid_proxy_field_returns_422() {
 }
 
 #[tokio::test]
+async fn api_spec_post_and_put_reject_client_supplied_ownership_tags() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+
+    let rejected_proxy_id = uid("ownership-tagged-post");
+    let rejected_upstream_id = uid("ownership-tagged-upstream");
+    let rejected_plugin_id = uid("ownership-tagged-plugin");
+    let copied_owner = uid("copied-api-spec-owner");
+    let tagged_spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Copied API", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": rejected_proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{rejected_proxy_id}"),
+            "api_spec_id": copied_owner
+        },
+        "x-ferrum-upstream": {
+            "id": rejected_upstream_id,
+            "targets": [{"host": "target.internal", "port": 443}],
+            "api_spec_id": copied_owner
+        },
+        "x-ferrum-plugins": [{
+            "id": rejected_plugin_id,
+            "plugin_name": "rate_limiting",
+            "config": {"limits": [{"scope": "default", "requests_per_minute": 100}]},
+            "api_spec_id": copied_owner
+        }]
+    });
+
+    let (post_status, post_body) = client.post_json("/api-specs", &tagged_spec).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "client-supplied ownership tags must be a validation error: {post_body}"
+    );
+    let post_failures = post_body["failures"]
+        .as_array()
+        .expect("422 response must include validation failures");
+    for resource_type in ["proxy", "upstream", "plugin"] {
+        assert!(
+            post_failures.iter().any(|failure| {
+                failure["resource_type"] == resource_type
+                    && failure["errors"]
+                        .as_array()
+                        .is_some_and(|errors| errors.iter().any(|error| {
+                            error
+                                .as_str()
+                                .is_some_and(|message| message.contains("server-managed"))
+                        }))
+            }),
+            "missing {resource_type} ownership-tag rejection: {post_body}"
+        );
+    }
+    assert!(
+        store
+            .get_proxy("ferrum", &rejected_proxy_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "rejected POST must not persist its proxy"
+    );
+
+    let existing_proxy_id = uid("ownership-tagged-put");
+    let (setup_status, setup_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&existing_proxy_id))
+        .await;
+    assert_eq!(setup_status, reqwest::StatusCode::CREATED, "{setup_body}");
+    let spec_id = setup_body["id"]
+        .as_str()
+        .expect("POST response must include spec id");
+    let mut tagged_put = minimal_json_spec(&existing_proxy_id);
+    tagged_put["x-ferrum-proxy"]["api_spec_id"] = json!(copied_owner);
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &tagged_put)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "PUT must reject copied ownership tags before persistence: {put_body}"
+    );
+    assert!(put_body.to_string().contains("server-managed"));
+    assert!(
+        store
+            .get_api_spec("ferrum", spec_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "rejected PUT must preserve the existing API spec"
+    );
+}
+
+#[tokio::test]
 async fn post_same_proxy_id_twice_returns_conflict_or_validation_error() {
     // When the same spec (same proxy_id + listen_path) is submitted twice,
     // the second attempt fails because the listen_path uniqueness check at

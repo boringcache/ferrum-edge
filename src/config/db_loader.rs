@@ -1158,14 +1158,22 @@ impl DatabaseStore {
         namespace: &str,
         restored_proxy_id: &str,
     ) -> Result<(), anyhow::Error> {
-        let candidate = self
+        let mut candidate = self
             .load_namespace_admission_policy_candidate_tx(tx, namespace)
             .await?;
+        candidate.upstreams = self
+            .load_upstreams_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .await?;
+        candidate.normalize_fields();
         let recovered_graph = crate::config::db_backend::api_spec_recovered_proxy_graph(
             candidate.clone(),
             restored_proxy_id,
         )?;
         Self::reject_invalid_gateway_plugin_references(
+            "restore_api_spec_bundle",
+            &recovered_graph,
+        )?;
+        Self::reject_invalid_gateway_upstream_references(
             "restore_api_spec_bundle",
             &recovered_graph,
         )?;
@@ -1934,6 +1942,25 @@ impl DatabaseStore {
             // same typed marker used by the rest of the runtime validation
             // contract so database-mode polling keeps admin writes available
             // for in-band repair (issue #2158).
+            return Err(ConfigValidationRejection {
+                backend: "Database",
+                errors,
+            }
+            .into_anyhow()
+            .context(context));
+        }
+        Ok(())
+    }
+
+    fn reject_invalid_gateway_upstream_references(
+        operation: &str,
+        config: &GatewayConfig,
+    ) -> Result<(), anyhow::Error> {
+        if let Err(errors) = config.validate_upstream_references() {
+            let context = format!(
+                "operation={operation} resource=upstreams: invalid proxy/upstream references: {}",
+                errors.join("; ")
+            );
             return Err(ConfigValidationRejection {
                 backend: "Database",
                 errors,

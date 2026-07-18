@@ -225,13 +225,13 @@ The following are rejected at parse time with a 400 error:
 
 ## Ownership semantics
 
-All resources created by a spec submission are tagged with `api_spec_id = <spec UUID>`. Resources created via direct admin endpoints have `api_spec_id = null`. These IDs govern replacement and deletion behaviour:
+All resources created by a spec submission are tagged with `api_spec_id = <spec UUID>`. The field is server-managed: clients must omit it from `x-ferrum-proxy`, `x-ferrum-upstream`, and `x-ferrum-plugins`, including when copying an exported resource into a POST or PUT document. A client-supplied ownership tag returns a 422 validation response consistently across database backends. Resources created via direct admin endpoints have `api_spec_id = null`. These IDs govern replacement and deletion behaviour:
 
 | Operation | What happens |
 |---|---|
 | `POST /api-specs` | Resources tagged with the new `api_spec_id`. New proxy, optional upstream, and plugins are inserted. |
 | `PUT /api-specs/{id}` | Idempotent if the bundle is unchanged (see "PUT semantics" below). When changed, all resources with `api_spec_id = {id}` are deleted and re-inserted from the new document. Resources on the same proxy with `api_spec_id = null` (manually added) are untouched. |
-| `DELETE /api-specs/{id}` | Spec-owned proxy is deleted → FK cascade removes all of its plugins (including manually-added ones). Spec-owned upstream is deleted explicitly. Non-spec upstreams survive. The spec row is deleted. If the cascade would leave an invalid aggregate plugin graph, or the pre-delete snapshot contains foreign ownership or a plugin shape that atomic compensation cannot restore, the operation returns 422 without deleting anything. If namespace admission is lost after the delete commits, compensation restores the complete prior graph atomically or leaves it deleted. |
+| `DELETE /api-specs/{id}` | Spec-owned proxy is deleted → FK cascade removes all of its plugins (including manually-added ones). Spec-owned upstream is deleted explicitly. Non-spec upstreams survive. The spec row is deleted. If the cascade would leave an invalid aggregate plugin graph, or the pre-delete snapshot contains foreign ownership or a plugin shape that atomic compensation cannot restore, the operation returns 422 without deleting anything. If namespace admission is lost after the delete commits, compensation revalidates the recovered proxy's current upstream existence, subset, and mesh-retry constraints and restores the complete prior graph atomically or leaves it deleted. |
 | `DELETE /proxies/{id}` | The database `ON DELETE CASCADE` on `api_specs.proxy_id → proxies(id)` removes the spec row automatically. The spec-owned upstream is NOT automatically cleaned up in this case. |
 
 ## Mode behaviour

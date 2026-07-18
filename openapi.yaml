@@ -4468,6 +4468,9 @@ paths:
         separately. Plugin `config` values must not contain credential or
         consumer fields (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`,
         `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`).
+        `api_spec_id` is server-managed and must be omitted from
+        `x-ferrum-proxy`, `x-ferrum-upstream`, and `x-ferrum-plugins`; copied
+        ownership tags return a 422 validation response on both POST and PUT.
 
         **Content-Type detection**: `application/json` → JSON parser;
         `application/yaml` / `application/x-yaml` / `text/yaml` / `text/x-yaml` → YAML parser;

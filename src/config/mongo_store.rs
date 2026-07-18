@@ -4086,10 +4086,18 @@ mod inner {
                 true,
             )
             .await?;
+        let upstreams = store
+            .load_full_upstreams_opt_session(
+                namespace,
+                Some((connection, &mut *session)),
+                true,
+            )
+            .await?;
         let mut candidate = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             proxies,
             plugin_configs,
+            upstreams,
             loaded_at: Utc::now(),
             ..Default::default()
         };
@@ -4101,6 +4109,12 @@ mod inner {
         if let Err(errors) = recovered_graph.validate_plugin_references() {
             anyhow::bail!(
                 "restore_api_spec_bundle produced invalid proxy/plugin associations: {}",
+                errors.join("; ")
+            );
+        }
+        if let Err(errors) = recovered_graph.validate_upstream_references() {
+            anyhow::bail!(
+                "restore_api_spec_bundle produced invalid proxy/upstream references: {}",
                 errors.join("; ")
             );
         }
@@ -8950,6 +8964,12 @@ mod inner {
             bundle: &crate::admin::api_specs::ExtractedBundle,
             spec: &ApiSpec,
         ) -> Result<(), anyhow::Error> {
+            crate::config::db_backend::validate_api_spec_restore_inputs(
+                bundle,
+                spec,
+                &[],
+                false,
+            )?;
             // Pre-flight size check: BSON document limit is 16 MiB.
             // Measure the actual serialized BSON size rather than estimating
             // with a hardcoded overhead constant.

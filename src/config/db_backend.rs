@@ -76,8 +76,8 @@ pub(crate) fn api_spec_recovered_proxy_graph(
 /// bundle before a backend starts an atomic restore.
 ///
 /// A restore deliberately uses plain inserts rather than upserts. These checks
-/// make that contract explicit: spec-owned resources may arrive either
-/// unstamped (normal submit) or stamped with this spec, while compensating
+/// make that contract explicit: normal submissions must be unstamped, while
+/// compensation resources must be stamped with this spec and compensating
 /// plugins must remain hand-owned. Existing rows are left for the backend's
 /// uniqueness constraints and transaction-candidate validation to reject.
 pub(crate) fn validate_api_spec_restore_inputs(
@@ -100,17 +100,21 @@ pub(crate) fn validate_api_spec_restore_inputs(
             spec.namespace
         );
     }
-    match bundle.proxy.api_spec_id.as_deref() {
-        Some(owner) if owner != spec.id => anyhow::bail!(
+    match (bundle.proxy.api_spec_id.as_deref(), compensation_restore) {
+        (Some(owner), true) if owner != spec.id => anyhow::bail!(
             "API-spec restore proxy '{}' is owned by a different API spec",
             bundle.proxy.id
         ),
-        None if compensation_restore => anyhow::bail!(
+        (None, true) => anyhow::bail!(
             "API-spec restore proxy '{}' is not owned by API spec '{}'",
             bundle.proxy.id,
             spec.id
         ),
-        Some(_) | None => {}
+        (Some(_), false) => anyhow::bail!(
+            "API-spec submission proxy '{}' carries server-managed API-spec ownership",
+            bundle.proxy.id
+        ),
+        (Some(_), true) | (None, false) => {}
     }
 
     if let Some(upstream) = &bundle.upstream {
@@ -122,17 +126,21 @@ pub(crate) fn validate_api_spec_restore_inputs(
                 spec.namespace
             );
         }
-        match upstream.api_spec_id.as_deref() {
-            Some(owner) if owner != spec.id => anyhow::bail!(
+        match (upstream.api_spec_id.as_deref(), compensation_restore) {
+            (Some(owner), true) if owner != spec.id => anyhow::bail!(
                 "API-spec restore upstream '{}' is owned by a different API spec",
                 upstream.id
             ),
-            None if compensation_restore => anyhow::bail!(
+            (None, true) => anyhow::bail!(
                 "API-spec restore upstream '{}' is not owned by API spec '{}'",
                 upstream.id,
                 spec.id
             ),
-            Some(_) | None => {}
+            (Some(_), false) => anyhow::bail!(
+                "API-spec submission upstream '{}' carries server-managed API-spec ownership",
+                upstream.id
+            ),
+            (Some(_), true) | (None, false) => {}
         }
     }
 
@@ -162,17 +170,21 @@ pub(crate) fn validate_api_spec_restore_inputs(
                 spec.namespace
             );
         }
-        match plugin.api_spec_id.as_deref() {
-            Some(owner) if owner != spec.id => anyhow::bail!(
+        match (plugin.api_spec_id.as_deref(), compensation_restore) {
+            (Some(owner), true) if owner != spec.id => anyhow::bail!(
                 "API-spec restore plugin '{}' is owned by a different API spec",
                 plugin.id
             ),
-            None if compensation_restore => anyhow::bail!(
+            (None, true) => anyhow::bail!(
                 "API-spec restore plugin '{}' is not owned by API spec '{}'",
                 plugin.id,
                 spec.id
             ),
-            Some(_) | None => {}
+            (Some(_), false) => anyhow::bail!(
+                "API-spec submission plugin '{}' carries server-managed API-spec ownership",
+                plugin.id
+            ),
+            (Some(_), true) | (None, false) => {}
         }
         if compensation_restore && plugin.scope == PluginScope::Global && plugin.proxy_id.is_some()
         {
