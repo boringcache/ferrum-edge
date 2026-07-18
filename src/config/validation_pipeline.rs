@@ -1,5 +1,5 @@
 use crate::config::BackendEgressPolicy;
-use crate::config::types::GatewayConfig;
+use crate::config::types::{CountryMmdbValidationGeneration, GatewayConfig};
 use tracing::{error, warn};
 
 pub(crate) enum ValidationAction<'a> {
@@ -72,6 +72,24 @@ pub(crate) struct ValidationPipeline<'a> {
     steps: Vec<ValidationStep<'a>>,
 }
 
+/// Run the potentially large MMDB read, verification, and full-record scan on
+/// Tokio's blocking pool. Async database and reload paths pass ownership of the
+/// candidate config through this helper so runtime workers never perform the
+/// synchronous node-local dependency work.
+pub(crate) async fn validate_plugin_file_dependencies_off_thread(
+    mut config: GatewayConfig,
+    action: ValidationAction<'static>,
+) -> Result<GatewayConfig, anyhow::Error> {
+    tokio::task::spawn_blocking(move || -> Result<GatewayConfig, anyhow::Error> {
+        ValidationPipeline::new(&mut config)
+            .validate_plugin_file_dependencies(action)
+            .run()?;
+        Ok(config)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("MaxMind database validation worker failed: {error}"))?
+}
+
 /// Collect the rejecting runtime-config validation contract shared by
 /// database full loads and CP incremental updates.
 ///
@@ -107,26 +125,36 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     }
     // Serving modes reject malformed fail-closed plugins while staging the
     // PluginCache. CP mode has no runtime PluginCache, so validate the
-    // security-critical ip_restriction shape here as well before a database
-    // snapshot or delta can be accepted and broadcast. This intentionally
-    // invokes the same side-effect-free constructor used by file/admin/DP
-    // admission rather than duplicating its allowed-key contract.
+    // security-critical ip_restriction and geo_restriction shapes here as well
+    // before a database snapshot or delta can be accepted and broadcast. This
+    // intentionally invokes the same side-effect-free validators used by
+    // file/admin/DP admission rather than duplicating their allowed-key
+    // contracts. Geo shape validation never opens its node-local MMDB.
     //
     // Do not generalize this from PluginFailurePolicy::FailClosed alone. That
     // policy describes data-plane cache publication, not a pure CP schema
     // contract: some registered constructors intentionally depend on node-local
-    // resources (for example geo_restriction's MMDB), while adaptive_concurrency
-    // requires gateway/cache state. Broader CP parity needs explicit shape-only
-    // validators and mode/resource contracts for each such plugin.
+    // resources, while adaptive_concurrency requires gateway/cache state.
+    // Broader CP parity needs explicit shape-only validators and mode/resource
+    // contracts for each such plugin.
     for plugin_config in &config.plugin_configs {
-        if plugin_config.enabled
-            && plugin_config.plugin_name == "ip_restriction"
-            && let Err(error) =
+        if !plugin_config.enabled {
+            continue;
+        }
+        let shape_error = match plugin_config.plugin_name.as_str() {
+            "ip_restriction" => {
                 crate::plugins::ip_restriction::IpRestriction::new(&plugin_config.config)
-        {
+                    .map(|_| ())
+            }
+            "geo_restriction" => crate::plugins::geo_restriction::GeoRestriction::validate_config(
+                &plugin_config.config,
+            ),
+            _ => continue,
+        };
+        if let Err(error) = shape_error {
             errors.push(format!(
-                "Plugin 'ip_restriction' (id={}): {error}",
-                plugin_config.id
+                "Plugin '{}' (id={}): {error}",
+                plugin_config.plugin_name, plugin_config.id
             ));
         }
     }
@@ -348,6 +376,7 @@ impl<'a> ValidationPipeline<'a> {
     pub(crate) fn run(self) -> Result<Vec<String>, anyhow::Error> {
         let ValidationPipeline { config, steps } = self;
         let mut collected_errors = Vec::new();
+        let mut country_mmdb_validation_generation = None;
 
         for step in steps {
             match step {
@@ -508,10 +537,25 @@ impl<'a> ValidationPipeline<'a> {
                     }
                 }
                 ValidationStep::PluginFileDependencies { action } => {
-                    let errors = config.validate_plugin_file_dependencies();
+                    let country_mmdb_paths = config.country_mmdb_file_dependency_paths();
+                    let generation = if country_mmdb_paths.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            CountryMmdbValidationGeneration::begin(country_mmdb_paths)
+                                .map_err(anyhow::Error::msg)?,
+                        )
+                    };
+                    let errors = match generation.as_ref() {
+                        Some(generation) => {
+                            config.validate_plugin_file_dependencies_for_generation(generation)
+                        }
+                        None => config.validate_plugin_file_dependencies(),
+                    };
                     if !errors.is_empty() {
                         handle_validation_errors(action, errors, &mut collected_errors)?;
                     }
+                    country_mmdb_validation_generation = generation;
                 }
                 ValidationStep::StreamProxies { action } => {
                     if let Err(errors) = config.validate_stream_proxies() {
@@ -519,6 +563,10 @@ impl<'a> ValidationPipeline<'a> {
                     }
                 }
             }
+        }
+
+        if let Some(generation) = country_mmdb_validation_generation {
+            generation.commit().map_err(anyhow::Error::msg)?;
         }
 
         Ok(collected_errors)
@@ -729,6 +777,35 @@ mod tests {
         };
 
         assert_single_rejecting_error(config, "unknown configuration field 'alow'");
+    }
+
+    #[test]
+    fn rejecting_runtime_contract_includes_invalid_geo_restriction_shape() {
+        let config = GatewayConfig {
+            plugin_configs: vec![PluginConfig {
+                id: "broadened-geo-policy".to_string(),
+                namespace: default_namespace(),
+                plugin_name: "geo_restriction".to_string(),
+                config: json!({
+                    "db_path": "/data/GeoLite2-Country.mmdb",
+                    "allow_countries": null,
+                    "on_lookup_failure": "deny"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(
+            config,
+            "'allow_countries' must be an array of ISO country codes",
+        );
     }
 
     #[test]

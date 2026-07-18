@@ -313,6 +313,19 @@ fn apply_result_no_address_uses_peer_for_both() {
     assert_eq!(direct_ip, "172.16.0.50");
 }
 
+#[test]
+fn apply_result_canonicalizes_mapped_ipv4_before_stream_plugins() {
+    let peer = "[::ffff:10.0.0.1]:1234".parse().unwrap();
+    let result = ProxyProtocolResult::Forwarded {
+        src: "[::ffff:192.0.2.10]:4321".parse().unwrap(),
+        dst: "[2001:db8::1]:443".parse().unwrap(),
+    };
+
+    let (client_ip, direct_ip) = apply_proxy_result(result, &peer);
+    assert_eq!(client_ip, "192.0.2.10");
+    assert_eq!(direct_ip, "10.0.0.1");
+}
+
 // ── Boundary size test ────────────────────────────────────────────────────────
 
 #[tokio::test]

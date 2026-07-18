@@ -279,6 +279,26 @@ pub fn load_config_from_file(
     Ok(config)
 }
 
+/// Load and validate an owned file-mode candidate without blocking an async
+/// runtime worker on filesystem parsing or MMDB verification.
+pub async fn load_config_from_file_off_thread(
+    path: String,
+    cert_expiry_warning_days: u64,
+    backend_allow_ips: crate::config::BackendEgressPolicy,
+    namespace: String,
+) -> Result<GatewayConfig, anyhow::Error> {
+    tokio::task::spawn_blocking(move || {
+        load_config_from_file(
+            &path,
+            cert_expiry_warning_days,
+            &backend_allow_ips,
+            &namespace,
+        )
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("Configuration file validation worker failed: {error}"))?
+}
+
 /// Reload config from file, returning the new config or an error.
 #[cfg(unix)]
 pub fn reload_config_from_file(
@@ -289,4 +309,24 @@ pub fn reload_config_from_file(
 ) -> Result<GatewayConfig, anyhow::Error> {
     info!("Reloading configuration from file: {}", path);
     load_config_from_file(path, cert_expiry_warning_days, backend_allow_ips, namespace)
+}
+
+/// Async-runtime wrapper for [`reload_config_from_file`].
+#[cfg(unix)]
+pub async fn reload_config_from_file_off_thread(
+    path: String,
+    cert_expiry_warning_days: u64,
+    backend_allow_ips: crate::config::BackendEgressPolicy,
+    namespace: String,
+) -> Result<GatewayConfig, anyhow::Error> {
+    tokio::task::spawn_blocking(move || {
+        reload_config_from_file(
+            &path,
+            cert_expiry_warning_days,
+            &backend_allow_ips,
+            &namespace,
+        )
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("Configuration file reload worker failed: {error}"))?
 }

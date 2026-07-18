@@ -1921,17 +1921,12 @@ fn persist_acme_account_credentials(order: &AcmeOrderRecord) {
         warn!("ACME account store is unavailable; renewal will rely on order credentials");
         return;
     };
-    if let Err(error) = store.upsert_account(
+    if let Err(_error) = store.upsert_account(
         account_id.to_string(),
         order.directory_url.clone(),
         credentials_json.to_string(),
     ) {
-        warn!(
-            account_id = account_id,
-            directory_url = %order.directory_url,
-            error = %error,
-            "failed to persist ACME account credentials"
-        );
+        super::warn_persistence_failure_redacted("acme_account_credentials_persist");
     }
 }
 
