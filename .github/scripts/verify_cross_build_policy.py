@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Enforce the exact privileged ARM64 cross-image pre-build policy."""
+"""Enforce the complete trusted ARM64 Cross 0.2.5 policy boundary."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -11,6 +14,7 @@ from typing import Any
 
 
 TARGET = "aarch64-unknown-linux-gnu"
+EXPECTED_IMAGE = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
 EXPECTED_PRE_BUILD_COMMANDS = (
     "dpkg --add-architecture 'arm64'",
     "apt-get update && apt-get install --assume-yes perl make "
@@ -27,6 +31,37 @@ EXPECTED_PRE_BUILD_COMMANDS = (
     "'deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-6.0 main'",
     "apt-get update && apt-get install --assume-yes clang-6.0 libclang-6.0-dev",
 )
+EXPECTED_PASSTHROUGH = (
+    "LIBCLANG_PATH=/usr/lib/llvm-6.0/lib",
+    "RUSTC_WRAPPER=",
+    "CARGO_BUILD_RUSTC_WRAPPER=",
+    "RUSTFLAGS=",
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc",
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
+    "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc",
+    "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++",
+    "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar",
+)
+
+# These hashes cover the isolated jobs that prepare and invoke Cross plus the
+# top-level env mappings inherited by those jobs. The trusted
+# pull_request_target guard compares those blocks at the PR merge base too, so
+# unrelated workflow edits and later base-only changes remain allowed while any
+# PR-authored mutation of an invocation input fails closed.
+WORKFLOW_CONTRACTS = (
+    (
+        "CI workflow",
+        "build-arm64-cross",
+        "8ea20fea0ba8358c7e164bf3e2cdd67532b2a617fffe685d2dc5dace7c19a23d",
+        "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
+    ),
+    (
+        "release workflow",
+        "build-release-arm64-cross",
+        "8cb2fed36e8e569eb51d3e3e285ec41b1cd1b6841a79392d6e9cb293df9297e7",
+        "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
+    ),
+)
 
 ATTACK_PAYLOADS = {
     "whitespace": "arm64 amd64",
@@ -34,6 +69,24 @@ ATTACK_PAYLOADS = {
     "shell metacharacter": "arm64; touch /tmp/cross-policy-marker",
     "command substitution": "$(touch /tmp/cross-policy-marker)",
 }
+
+
+def exact_keys(value: Any, expected: set[str], location: str) -> list[str]:
+    if not isinstance(value, dict):
+        return [f"{location} must be a table"]
+
+    actual = set(value)
+    if actual == expected:
+        return []
+
+    unexpected = sorted(actual - expected)
+    missing = sorted(expected - actual)
+    details: list[str] = []
+    if unexpected:
+        details.append(f"unexpected keys: {', '.join(unexpected)}")
+    if missing:
+        details.append(f"missing keys: {', '.join(missing)}")
+    return [f"{location} must have exactly the approved keys ({'; '.join(details)})"]
 
 
 def validate_pre_build(value: Any) -> list[str]:
@@ -44,7 +97,7 @@ def validate_pre_build(value: Any) -> list[str]:
     if any("CROSS_DEB_ARCH" in command for command in value):
         errors.append("CROSS_DEB_ARCH must not reach any ARM64 pre-build command")
 
-    # cross 0.2.5 joins every entry with newlines and evaluates the result in a
+    # Cross 0.2.5 joins every entry with newlines and evaluates the result in a
     # Dockerfile RUN command. The complete ordered list must therefore be
     # allowlisted; validating only a privileged prefix leaves later commands
     # executable without review.
@@ -57,25 +110,84 @@ def validate_pre_build(value: Any) -> list[str]:
     return errors
 
 
-def parse_pre_build(contents: str, source: str) -> tuple[Any, list[str]]:
+def validate_cross_configuration(parsed: Any) -> list[str]:
+    errors = exact_keys(parsed, {"target"}, "Cross.toml root")
+    if errors:
+        return errors
+
+    targets = parsed["target"]
+    errors.extend(exact_keys(targets, {TARGET}, "Cross.toml target table"))
+    if errors:
+        return errors
+
+    target = targets[TARGET]
+    errors.extend(
+        exact_keys(target, {"image", "pre-build", "env"}, f"target.{TARGET}")
+    )
+    if errors:
+        return errors
+
+    if target["image"] != EXPECTED_IMAGE:
+        errors.append(f"target.{TARGET}.image must be exactly {EXPECTED_IMAGE!r}")
+    errors.extend(validate_pre_build(target["pre-build"]))
+
+    target_env = target["env"]
+    errors.extend(exact_keys(target_env, {"passthrough"}, f"target.{TARGET}.env"))
+    if not errors:
+        passthrough = target_env["passthrough"]
+        if not isinstance(passthrough, list) or not all(
+            isinstance(item, str) for item in passthrough
+        ):
+            errors.append(f"target.{TARGET}.env.passthrough must be an array of strings")
+        elif tuple(passthrough) != EXPECTED_PASSTHROUGH:
+            errors.append(
+                f"target.{TARGET}.env.passthrough must exactly match the approved fixed values"
+            )
+
+    return errors
+
+
+def validate_cargo_configuration(parsed: Any) -> list[str]:
+    if not isinstance(parsed, dict):
+        return ["Cargo.toml root must be a table"]
+
+    package = parsed.get("package")
+    if not isinstance(package, dict):
+        return ["Cargo.toml package must be a table"]
+
+    metadata = package.get("metadata")
+    if metadata is None:
+        return []
+    if not isinstance(metadata, dict):
+        return ["Cargo.toml package.metadata must be a table"]
+    if "cross" in metadata:
+        return [
+            "Cargo.toml package.metadata.cross is forbidden; all Cross configuration "
+            "must be present in the fully allowlisted Cross.toml"
+        ]
+    return []
+
+
+def parse_toml(contents: str, source: str) -> tuple[Any, list[str]]:
     try:
-        parsed = tomllib.loads(contents)
+        return tomllib.loads(contents), []
     except tomllib.TOMLDecodeError as error:
         return None, [f"cannot parse {source}: {error}"]
 
-    try:
-        return parsed["target"][TARGET]["pre-build"], []
-    except (KeyError, TypeError):
-        return None, [f"{source} is missing target.{TARGET}.pre-build"]
 
-
-def load_pre_build(path: Path) -> tuple[Any, list[str]]:
+def load_text(path: Path) -> tuple[str | None, list[str]]:
     try:
-        contents = path.read_text(encoding="utf-8")
-    except OSError as error:
+        return path.read_text(encoding="utf-8"), []
+    except (OSError, UnicodeError) as error:
         return None, [f"cannot read {path}: {error}"]
 
-    return parse_pre_build(contents, str(path))
+
+def load_toml(path: Path) -> tuple[Any, list[str]]:
+    contents, failures = load_text(path)
+    if failures:
+        return None, failures
+    assert contents is not None
+    return parse_toml(contents, str(path))
 
 
 def unsafe_commands(payload: str) -> list[str]:
@@ -89,6 +201,196 @@ def unsafe_commands(payload: str) -> list[str]:
         '"/usr/${multiarch}/include/curl"',
     ]
     return commands
+
+
+def decode_simple_yaml_key(line: str) -> tuple[int, str] | None:
+    """Decode the simple mapping-key forms accepted in the guarded workflows."""
+
+    match = re.match(
+        r"^(?P<indent> *)(?P<key>[A-Za-z0-9_-]+|'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\")\s*:",
+        line,
+    )
+    if match is None:
+        return None
+
+    raw = match.group("key")
+    if raw.startswith("'"):
+        key = raw[1:-1].replace("''", "'")
+    elif raw.startswith('"'):
+        try:
+            key = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    else:
+        key = raw
+    return len(match.group("indent")), key
+
+
+def extract_job_block(
+    contents: str,
+    source: str,
+    job_name: str,
+    *,
+    required: bool,
+) -> tuple[str | None, list[str]]:
+    lines = contents.splitlines(keepends=True)
+    jobs_headers = [
+        index
+        for index, line in enumerate(lines)
+        if decode_simple_yaml_key(line.rstrip("\r\n")) == (0, "jobs")
+    ]
+    if len(jobs_headers) != 1:
+        return None, [f"{source} must contain exactly one top-level jobs mapping"]
+
+    jobs_index = jobs_headers[0]
+    if lines[jobs_index].rstrip("\r\n") != "jobs:":
+        return None, [f"{source} must use the canonical top-level jobs: mapping"]
+
+    jobs_end = len(lines)
+    for index in range(jobs_index + 1, len(lines)):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        decoded = decode_simple_yaml_key(line.rstrip("\r\n"))
+        if decoded is not None and decoded[0] == 0:
+            jobs_end = index
+            break
+
+    matches = [
+        index
+        for index in range(jobs_index + 1, jobs_end)
+        if decode_simple_yaml_key(lines[index].rstrip("\r\n")) == (2, job_name)
+    ]
+    if not matches:
+        if required:
+            return None, [f"{source} is missing protected job {job_name!r}"]
+        return None, []
+    if len(matches) != 1:
+        return None, [f"{source} must contain protected job {job_name!r} exactly once"]
+
+    start = matches[0]
+    end = jobs_end
+    for index in range(start + 1, jobs_end):
+        decoded = decode_simple_yaml_key(lines[index].rstrip("\r\n"))
+        if decoded is not None and decoded[0] == 2:
+            end = index
+            break
+
+    block = "".join(lines[start:end]).rstrip() + "\n"
+    return block, []
+
+
+def extract_top_level_block(
+    contents: str,
+    source: str,
+    key_name: str,
+    *,
+    required: bool = True,
+) -> tuple[str | None, list[str]]:
+    lines = contents.splitlines(keepends=True)
+    matches = [
+        index
+        for index, line in enumerate(lines)
+        if decode_simple_yaml_key(line.rstrip("\r\n")) == (0, key_name)
+    ]
+    if not matches and not required:
+        return None, []
+    if len(matches) != 1:
+        return None, [f"{source} must contain exactly one top-level {key_name} mapping"]
+
+    start = matches[0]
+    if lines[start].rstrip("\r\n") != f"{key_name}:":
+        return None, [f"{source} must use the canonical top-level {key_name}: mapping"]
+
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        decoded = decode_simple_yaml_key(line.rstrip("\r\n"))
+        if decoded is not None and decoded[0] == 0:
+            end = index
+            break
+
+    block = "".join(lines[start:end]).rstrip() + "\n"
+    return block, []
+
+
+def validate_workflow_contract(
+    contents: str,
+    source: str,
+    job_name: str,
+    expected_sha256: str,
+    expected_env_sha256: str,
+) -> list[str]:
+    block, failures = extract_job_block(contents, source, job_name, required=True)
+    if failures:
+        return failures
+    assert block is not None
+    actual = hashlib.sha256(block.encode("utf-8")).hexdigest()
+    errors: list[str] = []
+    if actual != expected_sha256:
+        errors.append(
+            f"{source} protected job {job_name!r} differs from the trusted "
+            f"ARM64 invocation contract (expected SHA-256 {expected_sha256}, got {actual})"
+        )
+
+    env_block, env_failures = extract_top_level_block(contents, source, "env")
+    errors.extend(env_failures)
+    if not env_failures:
+        assert env_block is not None
+        actual_env = hashlib.sha256(env_block.encode("utf-8")).hexdigest()
+        if actual_env != expected_env_sha256:
+            errors.append(
+                f"{source} top-level env differs from the trusted ARM64 host "
+                f"environment contract (expected SHA-256 {expected_env_sha256}, "
+                f"got {actual_env})"
+            )
+    return errors
+
+
+def compare_pr_workflow_job(
+    merge_base_contents: str,
+    proposed_contents: str,
+    source: str,
+    job_name: str,
+) -> list[str]:
+    baseline, failures = extract_job_block(
+        merge_base_contents,
+        f"merge-base {source}",
+        job_name,
+        required=False,
+    )
+    proposed, proposed_failures = extract_job_block(
+        proposed_contents,
+        f"proposed {source}",
+        job_name,
+        required=False,
+    )
+    failures.extend(proposed_failures)
+    if failures:
+        return failures
+    errors: list[str] = []
+    if baseline != proposed:
+        errors.append(
+            f"{source} protected job {job_name!r} cannot be changed by a pull request"
+        )
+
+    baseline_env, baseline_env_failures = extract_top_level_block(
+        merge_base_contents, f"merge-base {source}", "env", required=False
+    )
+    proposed_env, proposed_env_failures = extract_top_level_block(
+        proposed_contents, f"proposed {source}", "env", required=False
+    )
+    errors.extend(baseline_env_failures)
+    errors.extend(proposed_env_failures)
+    if not baseline_env_failures and not proposed_env_failures:
+        if baseline_env != proposed_env:
+            errors.append(
+                f"{source} top-level env cannot be changed by a pull request because "
+                "it is inherited by the protected ARM64 invocation"
+            )
+    return errors
 
 
 def self_test() -> list[str]:
@@ -147,44 +449,429 @@ def self_test() -> list[str]:
     if not validate_pre_build(legacy):
         failures.append("CROSS_DEB_ARCH interpolation was not rejected")
 
-    duplicate_definitions = {
-        "duplicate pre-build key": f"""
-[target.{TARGET}]
-pre-build = []
-pre-build = []
-""",
-        "duplicate target table": f"""
-[target.{TARGET}]
-pre-build = []
-[target.{TARGET}]
-""",
+    valid_cross: dict[str, Any] = {
+        "target": {
+            TARGET: {
+                "image": EXPECTED_IMAGE,
+                "pre-build": expected,
+                "env": {"passthrough": list(EXPECTED_PASSTHROUGH)},
+            }
+        }
     }
-    for name, contents in duplicate_definitions.items():
-        _, parse_failures = parse_pre_build(contents, f"self-test {name}")
+    if validate_cross_configuration(valid_cross):
+        failures.append("valid complete Cross.toml policy was rejected")
+
+    cross_bypasses = {
+        "global build configuration": {**valid_cross, "build": {"xargo": True}},
+        "global dockerfile": {**valid_cross, "build": {"dockerfile": "Dockerfile"}},
+        "global pre-build": {**valid_cross, "build": {"pre-build": ["id"]}},
+        "global environment": {
+            **valid_cross,
+            "build": {"env": {"passthrough": ["CROSS_CONFIG"]}},
+        },
+        "global default target": {
+            **valid_cross,
+            "build": {"default-target": TARGET},
+        },
+        "extra target": {
+            "target": {**valid_cross["target"], "x86_64-unknown-linux-gnu": {}}
+        },
+        "custom image": {
+            "target": {
+                TARGET: {**valid_cross["target"][TARGET], "image": "attacker/image"}
+            }
+        },
+        "target dockerfile": {
+            "target": {
+                TARGET: {**valid_cross["target"][TARGET], "dockerfile": "Dockerfile"}
+            }
+        },
+        "target runner": {
+            "target": {
+                TARGET: {**valid_cross["target"][TARGET], "runner": "evil-runner"}
+            }
+        },
+        "target build-std": {
+            "target": {
+                TARGET: {**valid_cross["target"][TARGET], "build-std": True}
+            }
+        },
+        "target xargo": {
+            "target": {TARGET: {**valid_cross["target"][TARGET], "xargo": True}}
+        },
+        "target volume": {
+            "target": {
+                TARGET: {
+                    **valid_cross["target"][TARGET],
+                    "env": {
+                        **valid_cross["target"][TARGET]["env"],
+                        "volumes": ["/tmp:/host"],
+                    },
+                }
+            }
+        },
+        "extra passthrough": {
+            "target": {
+                TARGET: {
+                    **valid_cross["target"][TARGET],
+                    "env": {
+                        "passthrough": [*EXPECTED_PASSTHROUGH, "CROSS_CONFIG"]
+                    },
+                }
+            }
+        },
+    }
+    for name, value in cross_bypasses.items():
+        if not validate_cross_configuration(value):
+            failures.append(f"{name} was not rejected")
+
+    valid_cross_toml = f'''
+["target"."{TARGET}"]
+image = "{EXPECTED_IMAGE}"
+pre-build = {json.dumps(expected)}
+
+["target"."{TARGET}"."env"]
+passthrough = {json.dumps(list(EXPECTED_PASSTHROUGH))}
+'''
+    parsed_valid, parse_failures = parse_toml(valid_cross_toml, "self-test quoted keys")
+    if parse_failures or validate_cross_configuration(parsed_valid):
+        failures.append("equivalent quoted Cross.toml keys were rejected")
+
+    invalid_cross_toml = {
+        "duplicate pre-build key": f'''
+[target.{TARGET}]
+pre-build = []
+pre-build = []
+''',
+        "duplicate target table": f'''
+[target.{TARGET}]
+pre-build = []
+[target.{TARGET}]
+''',
+        "underscore alias": f'''
+[target.{TARGET}]
+image = "{EXPECTED_IMAGE}"
+pre_build = []
+''',
+        "global dockerfile": "[build]\ndockerfile = 'Dockerfile'\n",
+    }
+    for name, contents in invalid_cross_toml.items():
+        parsed, parse_failures = parse_toml(contents, f"self-test {name}")
+        if not parse_failures and not validate_cross_configuration(parsed):
+            failures.append(f"{name} was not rejected")
+
+    benign_cargo, cargo_failures = parse_toml(
+        "[package]\nname='example'\nversion='1.0.1'\n"
+        "[package.metadata.release]\ntag-prefix='v'\n"
+        "[dependencies]\nserde='1'\n",
+        "self-test benign Cargo.toml",
+    )
+    if cargo_failures or validate_cargo_configuration(benign_cargo):
+        failures.append("benign Cargo.toml dependency/version edit was rejected")
+
+    cargo_bypasses = {
+        "cross metadata table": "[package]\nname='x'\n[package.metadata.cross.build]\nxargo=true\n",
+        "cross metadata inline table": (
+            "[package]\nname='x'\n"
+            f'metadata={{ cross={{ target={{ "{TARGET}"={{ '
+            'dockerfile="Dockerfile" }} }} }} }\n'
+        ),
+        "cross metadata dotted key": (
+            "package.name='x'\npackage.metadata.cross.target."
+            f"'{TARGET}'.image='attacker/image'\n"
+        ),
+        "cross metadata quoted key": (
+            "[package]\nname='x'\n[package.metadata.\"cross\"]\n"
+            "build-std=true\n"
+        ),
+    }
+    for name, contents in cargo_bypasses.items():
+        parsed, parse_failures = parse_toml(contents, f"self-test {name}")
+        if not parse_failures and not validate_cargo_configuration(parsed):
+            failures.append(f"{name} was not rejected")
+
+    malformed_cargo = {
+        "duplicate Cargo cross table": (
+            "[package]\nname='x'\n[package.metadata.cross]\n"
+            "[package.metadata.cross]\n"
+        ),
+        "duplicate Cargo metadata key": (
+            "[package]\nname='x'\nmetadata={cross={}}\nmetadata={}\n"
+        ),
+    }
+    for name, contents in malformed_cargo.items():
+        _, parse_failures = parse_toml(contents, f"self-test {name}")
         if not parse_failures:
             failures.append(f"{name} was not rejected")
 
+    protected_block = """  protected-arm:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Build with an empty environment
+        run: env -i /trusted/cross build --target aarch64-unknown-linux-gnu
+"""
+    protected_hash = hashlib.sha256(protected_block.encode()).hexdigest()
+    protected_env = "env:\n  FIXED_INPUT: approved\n"
+    protected_env_hash = hashlib.sha256(protected_env.encode()).hexdigest()
+    workflow = (
+        "name: fixture\n\n"
+        f"{protected_env}\n"
+        "jobs:\n"
+        f"{protected_block}"
+        "\n  unrelated:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo safe\n"
+    )
+    if validate_workflow_contract(
+        workflow,
+        "self-test workflow",
+        "protected-arm",
+        protected_hash,
+        protected_env_hash,
+    ):
+        failures.append("valid protected workflow job was rejected")
+
+    benign_workflow = workflow.replace("echo safe", "echo unrelated-edit")
+    if validate_workflow_contract(
+        benign_workflow,
+        "self-test benign workflow",
+        "protected-arm",
+        protected_hash,
+        protected_env_hash,
+    ):
+        failures.append("unrelated workflow job edit was rejected")
+
+    workflow_bypasses = {
+        "job environment override": workflow.replace(
+            "    steps:\n", "    env: { CROSS_CONFIG: attacker.toml }\n    steps:\n", 1
+        ),
+        "step environment override": workflow.replace(
+            "        run: env -i",
+            "        env:\n          CROSS_TARGET_AARCH64_UNKNOWN_LINUX_GNU_IMAGE: attacker\n"
+            "        run: env -i",
+        ),
+        "GITHUB_ENV override step": workflow.replace(
+            "      - name: Build with an empty environment",
+            "      - run: echo override >> $GITHUB_ENV\n"
+            "      - name: Build with an empty environment",
+        ),
+        "changed cross command": workflow.replace("env -i", "env"),
+        "quoted environment spelling": workflow.replace(
+            "    steps:\n", '    env: { "CROSS_CONFIG": attacker.toml }\n    steps:\n', 1
+        ),
+        "build alias environment override": workflow.replace(
+            "    steps:\n",
+            "    env: { CROSS_BUILD_PRE_BUILD: 'id' }\n    steps:\n",
+            1,
+        ),
+        "custom toolchain environment override": workflow.replace(
+            "    steps:\n",
+            "    env: { CROSS_CUSTOM_TOOLCHAIN: '1' }\n    steps:\n",
+            1,
+        ),
+        "legacy container option override": workflow.replace(
+            "    steps:\n", "    env: { DOCKER_OPTS: '--privileged' }\n    steps:\n", 1
+        ),
+        "Cargo target environment override": workflow.replace(
+            "    steps:\n",
+            f"    env: {{ CARGO_BUILD_TARGET: {TARGET} }}\n    steps:\n",
+            1,
+        ),
+        "job container": workflow.replace(
+            "    runs-on: ubuntu-latest\n",
+            "    runs-on: ubuntu-latest\n    container: attacker/image\n",
+            1,
+        ),
+        "merge alias": workflow.replace(
+            "  protected-arm:\n", "  protected-arm:\n    <<: *attacker\n"
+        ),
+        "renamed protected job": workflow.replace("protected-arm", "renamed-arm", 1),
+        "duplicate protected job": workflow
+        + "  protected-arm:\n    runs-on: ubuntu-latest\n",
+        "duplicate jobs mapping": workflow + "jobs:\n  attacker: {}\n",
+        "flow-style jobs mapping": "name: fixture\njobs: { protected-arm: {} }\n",
+        "global loader override": workflow.replace(
+            "  FIXED_INPUT: approved\n",
+            "  FIXED_INPUT: approved\n  BASH_ENV: ./attacker.sh\n",
+        ),
+        "global linker preload": workflow.replace(
+            "  FIXED_INPUT: approved\n",
+            "  FIXED_INPUT: approved\n  LD_PRELOAD: ./attacker.so\n",
+        ),
+    }
+    for name, contents in workflow_bypasses.items():
+        if not validate_workflow_contract(
+            contents,
+            f"self-test {name}",
+            "protected-arm",
+            protected_hash,
+            protected_env_hash,
+        ):
+            failures.append(f"{name} was not rejected")
+
+    merge_base_without_job = (
+        "name: stale\nenv:\n  FIXED_INPUT: approved\njobs:\n"
+        "  unrelated:\n    runs-on: ubuntu-latest\n"
+    )
+    proposed_without_job = merge_base_without_job.replace("ubuntu-latest", "ubuntu-24.04")
+    if compare_pr_workflow_job(
+        merge_base_without_job,
+        proposed_without_job,
+        "stale workflow",
+        "protected-arm",
+    ):
+        failures.append("stale branch unrelated workflow edit was rejected")
+    if compare_pr_workflow_job(
+        workflow,
+        benign_workflow,
+        "current workflow",
+        "protected-arm",
+    ):
+        failures.append("merge-base comparison rejected an unrelated job edit")
+    changed_protected = workflow.replace("env -i", "env", 1)
+    if not compare_pr_workflow_job(
+        workflow,
+        changed_protected,
+        "current workflow",
+        "protected-arm",
+    ):
+        failures.append("merge-base comparison allowed a protected job edit")
+    changed_global_env = workflow.replace("FIXED_INPUT: approved", "FIXED_INPUT: attacker")
+    if not compare_pr_workflow_job(
+        workflow,
+        changed_global_env,
+        "current workflow",
+        "protected-arm",
+    ):
+        failures.append("merge-base comparison allowed a protected top-level env edit")
+    if not compare_pr_workflow_job(
+        merge_base_without_job,
+        workflow,
+        "stale workflow",
+        "protected-arm",
+    ):
+        failures.append("merge-base comparison allowed a newly added protected job")
+
     return failures
+
+
+def load_workflow(path: Path, label: str) -> tuple[str | None, list[str]]:
+    contents, failures = load_text(path)
+    if failures:
+        return None, failures
+    assert contents is not None
+    if "\x00" in contents:
+        return None, [f"{label} contains a NUL byte"]
+    return contents, []
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path("Cross.toml"))
+    parser.add_argument("--cargo-config", type=Path, default=Path("Cargo.toml"))
+    parser.add_argument(
+        "--ci-workflow", type=Path, default=Path(".github/workflows/ci.yml")
+    )
+    parser.add_argument(
+        "--release-workflow",
+        type=Path,
+        default=Path(".github/workflows/release.yml"),
+    )
+    parser.add_argument("--merge-base-ci-workflow", type=Path)
+    parser.add_argument("--proposed-ci-workflow", type=Path)
+    parser.add_argument("--merge-base-release-workflow", type=Path)
+    parser.add_argument("--proposed-release-workflow", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
     failures = self_test() if args.self_test else []
-    pre_build, load_failures = load_pre_build(args.config)
-    failures.extend(load_failures)
-    if not load_failures:
-        failures.extend(validate_pre_build(pre_build))
+
+    cross_config, cross_failures = load_toml(args.config)
+    failures.extend(cross_failures)
+    if not cross_failures:
+        failures.extend(validate_cross_configuration(cross_config))
+
+    cargo_config, cargo_failures = load_toml(args.cargo_config)
+    failures.extend(cargo_failures)
+    if not cargo_failures:
+        failures.extend(validate_cargo_configuration(cargo_config))
+
+    workflow_inputs = (
+        (args.ci_workflow, *WORKFLOW_CONTRACTS[0]),
+        (args.release_workflow, *WORKFLOW_CONTRACTS[1]),
+    )
+    for (
+        workflow_path,
+        label,
+        job_name,
+        expected_hash,
+        expected_env_hash,
+    ) in workflow_inputs:
+        contents, workflow_failures = load_workflow(workflow_path, label)
+        failures.extend(workflow_failures)
+        if not workflow_failures:
+            assert contents is not None
+            failures.extend(
+                validate_workflow_contract(
+                    contents,
+                    label,
+                    job_name,
+                    expected_hash,
+                    expected_env_hash,
+                )
+            )
+
+    pr_paths = (
+        args.merge_base_ci_workflow,
+        args.proposed_ci_workflow,
+        args.merge_base_release_workflow,
+        args.proposed_release_workflow,
+    )
+    if any(path is not None for path in pr_paths) and not all(
+        path is not None for path in pr_paths
+    ):
+        failures.append(
+            "all merge-base/proposed workflow arguments must be supplied together"
+        )
+    elif all(path is not None for path in pr_paths):
+        comparisons = (
+            (
+                args.merge_base_ci_workflow,
+                args.proposed_ci_workflow,
+                WORKFLOW_CONTRACTS[0],
+            ),
+            (
+                args.merge_base_release_workflow,
+                args.proposed_release_workflow,
+                WORKFLOW_CONTRACTS[1],
+            ),
+        )
+        for baseline_path, proposed_path, contract in comparisons:
+            assert baseline_path is not None and proposed_path is not None
+            label, job_name, _, _ = contract
+            baseline, baseline_failures = load_workflow(baseline_path, label)
+            proposed, proposed_failures = load_workflow(proposed_path, label)
+            failures.extend(baseline_failures)
+            failures.extend(proposed_failures)
+            if not baseline_failures and not proposed_failures:
+                assert baseline is not None and proposed is not None
+                failures.extend(
+                    compare_pr_workflow_job(baseline, proposed, label, job_name)
+                )
 
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     if failures:
         return 1
 
-    print("ARM64 cross-build pre-build matches the exact approved command list.")
+    print(
+        "ARM64 Cross 0.2.5 configuration, Cargo metadata, and isolated "
+        "workflow invocations match the complete trusted policy."
+    )
     return 0
 
 

@@ -38,6 +38,7 @@ adding, removing, or materially changing a workflow.
 | `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs. |
+| `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface; `Trusted Cross Build Policy` must be directly required after the bootstrap workflow merges. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | Path-filtered PRs, manual | Live multicluster federation datapath validation. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
@@ -56,6 +57,9 @@ adding, removing, or materially changing a workflow.
 
 ```
 Pull Request
+    ├─► Trusted Cross Build Policy (`pull_request_target`, base code only)
+            └─► Validate proposed Cross.toml, Cargo metadata, and protected
+                ARM64 invocation-job changes as hostile data
     ├─► CI plan
             ├─► Docs/license/agent-only: lightweight Tests aggregate
             └─► Full CI
@@ -72,7 +76,7 @@ Pull Request
 
 Push to main
     ├─► Full required validation gate
-    └─► Five target release builds
+    └─► Four native release builds + isolated Linux ARM64 Cross build
             └─► Tests aggregate passes
                     ├─► Replace latest GitHub prerelease
                     └─► Push per-arch Docker images to Docker Hub and GHCR
@@ -85,8 +89,8 @@ Push to main
 Push tag v* (e.g., v0.2.0)
     └─► Validate tag matches the Cargo.toml package version
             └─► Validate tag target has successful CI and Coverage runs for the exact SHA
-            └─► Five target release builds (matrix: linux-x86_64 / linux-aarch64 /
-                macos-x86_64 / macos-aarch64 / windows-x86_64)
+            └─► Four-target native matrix (linux-x86_64 / macos-x86_64 /
+                macos-aarch64 / windows-x86_64) + isolated linux-aarch64 Cross job
                     └─► Push versioned Docker images to Docker Hub and GHCR
                             └─► Create Docker manifest tags
                                     └─► Create GitHub Release with binaries and checksums
@@ -127,14 +131,20 @@ and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
 
-Branch protection must require four independent PR checks: the unchanged `Tests`
-aggregate from `ci.yml`, plus `Merge Coverage` from `coverage.yml`, `Gateway API
-Conformance` from `gateway-api-conformance.yml`, and `Mesh E2E Sidecar Live`
-from `mesh-e2e-sidecar-live.yml`. Each dedicated workflow triggers on every
-pull request, performs its path filtering internally, and terminates in an
-`if: always()` job that passes a legitimate internal skip and fails on planning
-or validation failures. They are required directly rather than mirrored by
-runner-holding polling jobs in `ci.yml`.
+Branch protection must require five independent PR checks: the unchanged `Tests`
+aggregate from `ci.yml`, `Merge Coverage` from `coverage.yml`, `Gateway API
+Conformance` from `gateway-api-conformance.yml`, `Mesh E2E Sidecar Live` from
+`mesh-e2e-sidecar-live.yml`, and `Trusted Cross Build Policy` from
+`cross-build-policy.yml`. Each dedicated workflow triggers on every pull
+request and fails closed on planning or validation failures. They are required
+directly rather than mirrored by runner-holding polling jobs in `ci.yml`.
+
+`cross-build-policy.yml` is bootstrapped by the change that introduces it, so
+it cannot emit a `pull_request_target` check until it exists on the default
+branch. After that change merges and the first check is visible, a repository
+administrator must add `Trusted Cross Build Policy` to the required checks for
+`main`. Ordinary pull requests must not modify the trusted verifier or its
+workflow; such maintenance requires an explicit branch-protection bypass.
 
 CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation. If the cancellation left publishing incomplete, re-run the newest workflow attempt (the one for the latest `main` SHA) — re-running the older, canceled run would re-publish stale binaries and images as `latest`.
 
@@ -322,18 +332,59 @@ python3 tests/performance/ci_overhead_bench.py \
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
-Builds cross-platform verification binaries on full-mode PRs and optimized
-release binaries on pushes to `main` for Linux x86_64, Linux ARM64, macOS
-x86_64, macOS ARM64, and Windows x86_64. The job installs the same
-prerequisites as the Release pipeline matrix — `protoc` on every OS,
-`libcurl4-openssl-dev` on Linux, and NASM on Windows — and builds with
-`--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included.
-Linux ARM64 downloads the checksum-verified `cross` 0.2.5 release through the
-repository's pinned installer action instead of compiling the tool from source.
-The macOS x86_64 build targets `x86_64-apple-darwin` with the standard
-Apple/Rust toolchain (no `cross` needed) and runs on whichever host architecture
-GitHub maps `macos-latest` to today (currently ARM64); pin to a concrete runner
-image such as `macos-14` if the host architecture must be guaranteed.
+Full-mode PRs build the native Linux x86_64 verification binary. Pushes to
+`main` build optimized release binaries for Linux x86_64, Linux ARM64, macOS
+x86_64, macOS ARM64, and Windows x86_64. Native targets share the ordinary
+matrix; Linux ARM64 runs only after code reaches `main`, in the isolated
+`build-arm64-cross` job described below. The jobs install the same prerequisites
+as the Release pipeline — `protoc` on every OS, `libcurl4-openssl-dev` on Linux,
+and NASM on Windows — and build with `--features cloud-secrets` so
+Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build targets
+`x86_64-apple-darwin` with the standard Apple/Rust toolchain (no `cross` needed)
+and runs on whichever host architecture GitHub maps `macos-latest` to today
+(currently ARM64); pin to a concrete runner image such as `macos-14` if the
+host architecture must be guaranteed.
+
+##### Trusted ARM64 Cross boundary
+
+Cross 0.2.5 merges `[package.metadata.cross]` from `Cargo.toml` with the selected
+Cross config file, gives `Cross.toml` precedence over Cargo metadata, and then
+allows target/build environment variables to override those values. It also
+accepts executable or privileged behavior through global Dockerfile,
+pre-build, build-mode, and env settings; target-specific image, Dockerfile,
+pre-build, runner, build-mode, and env settings; plus container-engine,
+container-option, custom-toolchain, and alternate-config inputs. The ARM64
+boundary therefore uses a complete allowlist rather than a field denylist:
+
+- `Cross.toml` may contain only the `aarch64-unknown-linux-gnu` target, its exact
+  `ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5` image, the ordered seven
+  approved pre-build commands, and the exact fixed-value passthrough entries.
+  Global build settings, extra targets/keys, Dockerfiles, runners, build modes,
+  volumes, and unfixed passthroughs are rejected.
+- `Cargo.toml` must not contain `package.metadata.cross` in table, dotted-key,
+  quoted-key, or inline-table form. Unrelated package metadata, dependency, and
+  version edits remain permitted.
+- `build-arm64-cross` in `ci.yml` and `build-release-arm64-cross` in
+  `release.yml` are isolated from the shared native matrix. Their exact job
+  blocks and inherited top-level `env` mappings are hashed by the trusted
+  verifier, and merge-base comparison rejects any PR-authored mutation while
+  allowing unrelated workflow jobs to evolve. These jobs use only pinned
+  external setup actions before revalidation.
+- The Cross process starts through `env -i` with an explicit minimal host
+  environment and fixed compiler variables. This removes `CROSS_CONFIG`, every
+  `CROSS_BUILD_*`/`CROSS_TARGET_*` alias, image/Dockerfile/pre-build/runner
+  overrides, custom-toolchain and compatibility flags, Docker/Podman engine and
+  option overrides, remote mode, Cargo default-target overrides, and arbitrary
+  inherited `CARGO_*` passthrough values before Cross reads configuration.
+
+The trusted `pull_request_target` job checks out only the base SHA with
+read-only contents permission. It fetches the PR head without checking it out,
+extracts `Cross.toml`, `Cargo.toml`, `ci.yml`, and `release.yml` as hostile data,
+and runs only the base branch's verifier. The verifier and trusted workflow are
+compared with `HEAD...FETCH_HEAD`, preserving merge-base behavior for stale
+branches while rejecting a PR-authored modification, mode change, rename, or
+deletion. The ordinary `CI Plan` separately runs the proposed verifier's hosted
+self-tests so a broken maintenance proposal cannot reach `main` unnoticed.
 
 #### 8. Latest Release and Docker Jobs
 
@@ -384,7 +435,8 @@ before publishing binaries or registry tags if it still has no success.
 
 ### Release Build Job
 
-**Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest` (matrix)
+**Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest` (four-target native
+matrix plus the isolated Linux ARM64 job)
 
 Depends on `Validate release SHA`, then builds optimized release binaries for all target platforms:
 
@@ -404,7 +456,7 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 6. Upload artifact
 
 **Cross-Compilation**:
-- Linux ARM64 uses `cross` tool for seamless compilation; `cross` requires Docker or Podman on the build host.
+- Linux ARM64 uses checksum-verified `cross` 0.2.5 in the isolated protected invocation job; `cross` requires Docker on the build host.
 - Other targets use standard `cargo build`; macOS x86_64 builds on the `macos-latest` runner (currently ARM64) with the standard Apple/Rust target tooling — pin to a concrete runner image such as `macos-14` if the host architecture must be guaranteed.
 
 **Output**:
@@ -593,11 +645,13 @@ If automatic release fails:
 ```bash
 # Build binaries manually with the same release features as CI. Install protoc
 # for every host first. Linux hosts also need libcurl4-openssl-dev, Windows
-# MSVC builds need NASM in PATH, and Linux ARM64 uses cross (`cargo install cross`)
-# with Docker or Podman running.
+# MSVC builds need NASM in PATH. For Linux ARM64, install the pinned Cross 0.2.5
+# binary and copy the exact `env -i` invocation from build-release-arm64-cross;
+# do not substitute an unpinned `cargo install cross` or inherited environment.
 # On a Linux host:
 cargo build --features cloud-secrets --release --target x86_64-unknown-linux-gnu
-cross build --features cloud-secrets --release --target aarch64-unknown-linux-gnu
+# Then run the complete pinned ARM64 command from build-release-arm64-cross in
+# .github/workflows/release.yml (including its revalidation and `env -i` block).
 
 # On a macOS host:
 cargo build --features cloud-secrets --release --target x86_64-apple-darwin
@@ -797,7 +851,9 @@ gh secret set DOCKERHUB_TOKEN --body "your-token"
 
 ### Adding New Targets
 
-Edit both `.github/workflows/ci.yml` (`build-binaries`) and `.github/workflows/release.yml` (`build-release-binaries`):
+For a new native target, edit both `.github/workflows/ci.yml`
+(`build-binaries`) and `.github/workflows/release.yml`
+(`build-release-binaries`):
 
 ```yaml
 strategy:
@@ -811,8 +867,10 @@ strategy:
 ```
 
 Musl targets need their own toolchain setup. Add `musl-tools` before a native
-`cargo build`, or route the target through `cross build` and install `cross`
-in the workflow the same way the ARM64 Linux target does.
+`cargo build`. A Cross-backed target requires a separate isolated invocation
+job, a complete Cross configuration allowlist, fixed empty environment, and an
+updated trusted verifier contract; do not add an unguarded Cross invocation to
+the native matrix.
 
 ### Skipping Steps
 

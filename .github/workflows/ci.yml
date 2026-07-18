@@ -45,7 +45,13 @@ jobs:
         run: python3 .github/scripts/pr_ci_plan.py --self-test
 
       - name: Validate proposed ARM64 cross-build policy
-        run: python3 .github/scripts/verify_cross_build_policy.py --self-test --config Cross.toml
+        run: |
+          python3 .github/scripts/verify_cross_build_policy.py \
+            --self-test \
+            --config Cross.toml \
+            --cargo-config Cargo.toml \
+            --ci-workflow .github/workflows/ci.yml \
+            --release-workflow .github/workflows/release.yml
 
       - name: Check PR diff hygiene
         if: github.event_name == 'pull_request'
@@ -156,13 +162,6 @@ jobs:
                   "artifact_name": "ferrum-edge",
                   "asset_name": "ferrum-edge-linux-x86_64",
                   "cni_asset_name": "ferrum-cni-linux-x86_64",
-              },
-              {
-                  "os": "ubuntu-latest",
-                  "target": "aarch64-unknown-linux-gnu",
-                  "artifact_name": "ferrum-edge",
-                  "asset_name": "ferrum-edge-linux-aarch64",
-                  "cni_asset_name": "ferrum-cni-linux-aarch64",
               },
               {
                   "os": "macos-latest",
@@ -2534,6 +2533,7 @@ jobs:
       - two-cluster-mesh-live
       - performance-regression
       - build-binaries
+      - build-arm64-cross
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -2619,7 +2619,8 @@ jobs:
           add_row "Netns capture live" "${{ needs.netns-capture-live.result }}"
           add_row "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}"
           add_row "Performance regression" "${{ needs.performance-regression.result }}"
-          add_row "Cross-platform binaries" "${{ needs.build-binaries.result }}"
+          add_row "Native platform binaries" "${{ needs.build-binaries.result }}"
+          add_row "Protected Linux ARM64 Cross build" "${{ needs.build-arm64-cross.result }}"
 
           require_success "CI plan" "${{ needs.ci-plan.result }}"
           require_success "Unit and inline lib" "${{ needs.test-unit.result }}"
@@ -2643,13 +2644,22 @@ jobs:
           require_live_gate "Netns capture live" "${{ needs.netns-capture-live.result }}"
           require_live_gate "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}"
           require_success "Performance regression" "${{ needs.performance-regression.result }}"
-          require_success "Cross-platform binaries" "${{ needs.build-binaries.result }}"
+          require_success "Native platform binaries" "${{ needs.build-binaries.result }}"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if [ "${{ needs.build-arm64-cross.result }}" != "skipped" ]; then
+              echo "::error title=Unexpected ARM64 PR build::protected Cross invocation must run only after code reaches main"
+              failures=1
+            fi
+          else
+            require_success "Protected Linux ARM64 Cross build" "${{ needs.build-arm64-cross.result }}"
+          fi
 
           if [ "$failures" -ne 0 ]; then
             exit 1
           fi
         env:
           CI_MODE: ${{ needs.ci-plan.outputs.mode }}
+          EVENT_NAME: ${{ github.event_name }}
 
   lint:
     name: Lint
@@ -3293,9 +3303,10 @@ jobs:
 
   # ── Cross-platform builds ────────────────────────────────────────────────
   # PRs run the native Linux x86_64 build needed by the required CI gate. Main
-  # pushes build production `release` artifacts for every supported platform,
-  # consumed by latest release and Docker publication. Versioned tags are
-  # handled by release.yml.
+  # pushes build the four native production `release` artifacts here. Linux
+  # ARM64 runs in the isolated, policy-protected job below so no shared setup
+  # step or inherited environment can alter Cross. Versioned tags are handled
+  # by release.yml.
 
   build-binaries:
     name: Build (${{ matrix.asset_name }})
@@ -3335,14 +3346,6 @@ jobs:
           if ! dpkg -s libcurl4-openssl-dev > /dev/null 2>&1; then
             missing_packages+=(libcurl4-openssl-dev)
           fi
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            for package in gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu; do
-              if ! dpkg -s "$package" > /dev/null 2>&1; then
-                missing_packages+=("$package")
-              fi
-            done
-          fi
-
           if [ "${#missing_packages[@]}" -eq 0 ]; then
             echo "Required Linux build dependencies already available"
             exit 0
@@ -3417,43 +3420,12 @@ jobs:
           }
           $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
-      - name: Install cross (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
-        with:
-          # Preserve the current cross release while downloading its verified
-          # prebuilt binary instead of compiling cross and ~100 crates.
-          tool: cross@0.2.5
-          fallback: none
-
-      - name: Build PR verification binary (cross)
-        if: matrix.target == 'aarch64-unknown-linux-gnu' && github.event_name == 'pull_request'
-        run: cross build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
-        env:
-          RUSTC_WRAPPER: ""
-          RUSTFLAGS: ""
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-
-      - name: Build release binary (cross)
-        if: matrix.target == 'aarch64-unknown-linux-gnu' && github.event_name == 'push'
-        run: cross build --features cloud-secrets --release --target ${{ matrix.target }}
-        env:
-          RUSTC_WRAPPER: ""
-          RUSTFLAGS: ""
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-
-      - name: Build PR verification binary (cargo)
-        if: matrix.target != 'aarch64-unknown-linux-gnu' && github.event_name == 'pull_request'
+      - name: Build PR verification binary
+        if: github.event_name == 'pull_request'
         run: cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
 
-      - name: Build release binary (cargo)
-        if: matrix.target != 'aarch64-unknown-linux-gnu' && github.event_name == 'push'
+      - name: Build release binary
+        if: github.event_name == 'push'
         run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}
 
       - name: Prepare release assets
@@ -3483,10 +3455,89 @@ jobs:
           name: binary-${{ matrix.target }}
           path: release-assets/
 
+  build-arm64-cross:
+    name: Build (ferrum-edge-linux-aarch64)
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust and the ARM64 target
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install checksum-verified Cross 0.2.5
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cross@0.2.5
+          fallback: none
+
+      - name: Revalidate the complete trusted Cross input boundary
+        run: |
+          python3 .github/scripts/verify_cross_build_policy.py \
+            --config Cross.toml \
+            --cargo-config Cargo.toml \
+            --ci-workflow .github/workflows/ci.yml \
+            --release-workflow .github/workflows/release.yml
+
+      - name: Build release binary with a fixed empty Cross environment
+        run: |
+          set -euo pipefail
+          test -x /home/runner/.cargo/bin/cross
+          clean_path=/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          clean_hostname="$(/bin/hostname)"
+          env -i \
+            HOME=/home/runner \
+            USER=runner \
+            HOSTNAME="$clean_hostname" \
+            PATH="$clean_path" \
+            CARGO_HOME=/home/runner/.cargo \
+            RUSTUP_HOME=/home/runner/.rustup \
+            CARGO_TERM_COLOR=always \
+            TERM=xterm \
+            CI=true \
+            RUSTC_WRAPPER= \
+            RUSTFLAGS= \
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+            CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+            CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+            AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+            /home/runner/.cargo/bin/cross build \
+              --features cloud-secrets \
+              --release \
+              --target aarch64-unknown-linux-gnu
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp target/aarch64-unknown-linux-gnu/release/ferrum-edge release-assets/ferrum-edge-linux-aarch64
+          cp target/aarch64-unknown-linux-gnu/release/ferrum-cni release-assets/ferrum-cni-linux-aarch64
+          cd release-assets
+          for asset in *; do
+            sha256sum "$asset" > "$asset.sha256"
+            cat "$asset.sha256"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: binary-aarch64-unknown-linux-gnu
+          path: release-assets/
+
   latest-release:
     name: Update Latest Release
-    needs: [test, build-binaries]
-    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, build-binaries, build-arm64-cross]
+    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && needs.build-arm64-cross.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -3557,8 +3608,8 @@ jobs:
 
   docker:
     name: Docker (${{ matrix.platform }})
-    needs: [test, build-binaries]
-    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, build-binaries, build-arm64-cross]
+    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && needs.build-arm64-cross.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read

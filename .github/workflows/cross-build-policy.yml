@@ -19,8 +19,8 @@ jobs:
     timeout-minutes: 5
     steps:
       # pull_request_target loads this workflow from the base branch. Keep the
-      # checkout on the trusted base commit and treat the PR's Cross.toml only
-      # as data; no code from the PR is executed in this job.
+      # checkout on the trusted base commit and treat the PR's configuration
+      # and workflow files only as data; no code from the PR is executed here.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
         with:
           ref: ${{ github.event.pull_request.base.sha }}
@@ -33,7 +33,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          proposed_config="$RUNNER_TEMP/proposed-Cross.toml"
+          proposed_cross="$RUNNER_TEMP/proposed-Cross.toml"
+          proposed_cargo="$RUNNER_TEMP/proposed-Cargo.toml"
+          proposed_ci="$RUNNER_TEMP/proposed-ci.yml"
+          proposed_release="$RUNNER_TEMP/proposed-release.yml"
+          merge_base_ci="$RUNNER_TEMP/merge-base-ci.yml"
+          merge_base_release="$RUNNER_TEMP/merge-base-release.yml"
           git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
 
           # These files define and invoke the trusted policy. Once this
@@ -52,8 +57,21 @@ jobs:
             fi
           done
 
-          git show "FETCH_HEAD:Cross.toml" > "$proposed_config"
+          merge_base="$(git merge-base HEAD FETCH_HEAD)"
+          git show "FETCH_HEAD:Cross.toml" > "$proposed_cross"
+          git show "FETCH_HEAD:Cargo.toml" > "$proposed_cargo"
+          git show "FETCH_HEAD:.github/workflows/ci.yml" > "$proposed_ci"
+          git show "FETCH_HEAD:.github/workflows/release.yml" > "$proposed_release"
+          git show "${merge_base}:.github/workflows/ci.yml" > "$merge_base_ci"
+          git show "${merge_base}:.github/workflows/release.yml" > "$merge_base_release"
 
           python3 .github/scripts/verify_cross_build_policy.py \
             --self-test \
-            --config "$proposed_config"
+            --config "$proposed_cross" \
+            --cargo-config "$proposed_cargo" \
+            --ci-workflow .github/workflows/ci.yml \
+            --release-workflow .github/workflows/release.yml \
+            --merge-base-ci-workflow "$merge_base_ci" \
+            --proposed-ci-workflow "$proposed_ci" \
+            --merge-base-release-workflow "$merge_base_release" \
+            --proposed-release-workflow "$proposed_release"

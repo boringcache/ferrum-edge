@@ -1,7 +1,8 @@
 [target.aarch64-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
-# This target is always Debian arm64. Keep privileged architecture inputs fixed:
-# cross build options can otherwise override the injected value before this runs.
+# This dedicated file is a complete policy allowlist for the protected ARM64
+# jobs: no global/extra target keys, custom Dockerfile/runner/build mode, volume,
+# or unfixed passthrough input is permitted by the trusted verifier.
 pre-build = [
     "dpkg --add-architecture 'arm64'",
     "apt-get update && apt-get install --assume-yes perl make 'libcurl4-openssl-dev:arm64' cmake software-properties-common wget gnupg unzip",
@@ -41,4 +42,7 @@ passthrough = [
     "RUSTFLAGS=",
     "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc",
     "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc",
+    "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc",
+    "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++",
+    "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar",
 ]
