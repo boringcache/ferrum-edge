@@ -257,6 +257,44 @@ fn test_env_config_database_mode_missing_jwt() {
 }
 
 #[test]
+fn test_env_config_rejects_oversized_admin_jwt_max_ttl() {
+    // `0` is the only documented way to disable the admin JWT lifetime cap.
+    // A value that cannot be represented as an i64-second bound is a typo,
+    // not a disable request, and must fail startup instead of degrading into
+    // an effectively unlimited cap.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_ADMIN_JWT_MAX_TTL", "18446744073709551615"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("FERRUM_ADMIN_JWT_MAX_TTL"),
+                "startup must name the offending setting"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_accepts_admin_jwt_max_ttl_disable_sentinel() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_ADMIN_JWT_MAX_TTL", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().expect("0 is the documented disable sentinel");
+            assert_eq!(config.admin_jwt_max_ttl, 0);
+        },
+    );
+}
+
+#[test]
 fn test_env_config_database_mode_missing_db_type() {
     with_env_vars(
         &[
