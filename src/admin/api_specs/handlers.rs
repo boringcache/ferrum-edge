@@ -2601,8 +2601,18 @@ fn spec_content_response(
 
 /// Parse `GET /api-specs` query parameters into an [`ApiSpecListFilter`].
 ///
-/// Unknown parameters are silently ignored. Returns `Err` only for invalid
-/// `sort_by` values (rejected with 400 to prevent accidental SQL-like injection).
+/// Unknown parameters are silently ignored. Returns `Err` (400) for invalid
+/// `sort_by` values (rejected to prevent accidental SQL-like injection), for
+/// SQL `LIKE` wildcards in text filters, and for malformed `limit`/`offset`.
+///
+/// This endpoint keeps a stricter pagination scheme than the shared
+/// [`crate::admin::PaginationParams`] used elsewhere — default 50, maximum 200,
+/// and a `u32` offset — but shares its rejection contract: malformed values are
+/// never silently coerced into a default.
+fn invalid_pagination(field: &str) -> ApiSpecError {
+    ApiSpecError::BadRequest(format!("{field} must be a non-negative integer"))
+}
+
 fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError> {
     const DEFAULT_LIMIT: u32 = 50;
     const MAX_LIMIT: u32 = 200;
@@ -2627,12 +2637,22 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
         let val = percent_decode(raw_val)?;
 
         match key {
+            // `/api-specs` keeps its own stricter bounds (default 50, max 200)
+            // and its `{items, next_offset}` envelope, but malformed input is
+            // rejected with 400 exactly as `parse_pagination` does for every
+            // other list route — never silently coerced to a default.
             "limit" => {
-                let parsed = val.parse::<u32>().unwrap_or(DEFAULT_LIMIT);
-                filter.limit = parsed.clamp(1, MAX_LIMIT);
+                let parsed: u32 = val.parse().map_err(|_| invalid_pagination("limit"))?;
+                // `0` keeps the documented "server default" meaning; values
+                // above the maximum are capped.
+                filter.limit = if parsed == 0 {
+                    DEFAULT_LIMIT
+                } else {
+                    parsed.min(MAX_LIMIT)
+                };
             }
             "offset" => {
-                filter.offset = val.parse::<u32>().unwrap_or(0);
+                filter.offset = val.parse().map_err(|_| invalid_pagination("offset"))?;
             }
             "proxy_id" if !val.is_empty() => {
                 filter.proxy_id = Some(val);

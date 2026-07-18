@@ -3492,6 +3492,53 @@ async fn list_endpoint_invalid_order_returns_400() {
     );
 }
 
+/// Malformed `limit`/`offset` return 400 rather than being silently coerced to
+/// the endpoint default. `/api-specs` keeps its own stricter bounds (default
+/// 50, max 200) but shares the rejection contract of every other list endpoint.
+#[tokio::test]
+async fn list_endpoint_malformed_pagination_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    for query in [
+        "/api-specs?limit=abc",
+        "/api-specs?limit=-1",
+        "/api-specs?limit=1.5",
+        "/api-specs?offset=abc",
+        "/api-specs?offset=-1",
+        // Above u32::MAX: this endpoint's offset is a 32-bit value.
+        "/api-specs?offset=4294967296",
+        "/api-specs?limit=9223372036854775808",
+    ] {
+        let (status, body) = client.get_json(query).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{query} must be rejected with 400, not coerced: {body}"
+        );
+    }
+}
+
+/// `limit=0` means the endpoint default (50) and an over-max limit caps at 200,
+/// mirroring the shared parser's semantics at this endpoint's own bounds.
+#[tokio::test]
+async fn list_endpoint_limit_zero_and_over_max_are_bounded() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let (status, body) = client.get_json("/api-specs?limit=0").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "limit=0 body: {body}");
+    assert_eq!(body["limit"], 50, "limit=0 means the server default");
+
+    let (status, body) = client.get_json("/api-specs?limit=100000").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "over-max body: {body}");
+    assert_eq!(body["limit"], 200, "over-max limit caps at 200");
+}
+
 /// The list summary includes Tier 1 metadata fields but excludes resource_hash.
 #[tokio::test]
 async fn list_summary_includes_tier1_metadata_excludes_resource_hash() {

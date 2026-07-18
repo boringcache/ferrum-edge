@@ -314,7 +314,13 @@ These fields are stored at INSERT time and do not require re-parsing the spec fo
 
 ## List filters
 
-`GET /api-specs` supports the following query parameters in addition to `limit` and `offset`:
+`GET /api-specs` uses a stricter pagination scheme than the other admin list
+endpoints: `limit` defaults to 50 with a maximum of 200 (`0` means the default,
+higher values are capped), and `offset` is a 32-bit value defaulting to 0. As
+everywhere else, malformed or negative `limit`/`offset` values are rejected with
+HTTP 400 rather than coerced to a default.
+
+It supports the following query parameters in addition to `limit` and `offset`:
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -326,7 +332,8 @@ These fields are stored at INSERT time and do not require re-parsing the spec fo
 | `sort_by` | enum | `updated_at` (default), `title`, `operation_count`, `created_at` |
 | `order` | enum | `desc` (default), `asc` |
 
-Unknown `sort_by` or `order` values return HTTP 400.
+Unknown `sort_by` or `order` values, SQL `LIKE` wildcards in `spec_version` or
+`title_contains`, and malformed `limit`/`offset` values all return HTTP 400.
 
 ### List response shape
 
@@ -342,7 +349,7 @@ Unknown `sort_by` or `order` values return HTTP 400.
 
 - `items` — page of spec summaries (no `spec_content` or `resource_hash`).
 - `limit` / `offset` — the pagination parameters that were applied.
-- `next_offset` — set when `items.len() == limit`, indicating there may be more results; `null` on the last page.
+- `next_offset` — set to `offset + items.len()` when that value is still below `total`, i.e. when more results remain; `null` on the last page.
 - `total` — count of all rows matching the filter (ignoring `limit`/`offset`). Use this to build "showing 1–50 of 327" pagination UI.
 
 ### Tag-name rules

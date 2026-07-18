@@ -7035,8 +7035,13 @@ async fn handle_audit_list(
 
     match db.list_audit_events(namespace, &filter).await {
         Ok(result) => {
+            // `filter.offset` is user-controlled up to `u32::MAX`, so the
+            // advance is saturating rather than a bare `+`: a wrapping add
+            // would panic in debug builds and wrap in release at extreme
+            // offsets. Saturating here is safe because the guard below only
+            // yields `Some` when a further page actually exists.
             let next_offset = if (filter.offset as i64 + result.items.len() as i64) < result.total {
-                Some(filter.offset + result.items.len() as u32)
+                Some(filter.offset.saturating_add(result.items.len() as u32))
             } else {
                 None
             };
