@@ -246,6 +246,18 @@ HEREDOC_EXECUTABLE = re.compile(
     r"(?:env(?:\s+(?:--?[^\s]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+))*\s+)?"
     r"(?P<interpreter>bash|sh|python|python3)\b"
 )
+OPAQUE_INLINE_SHELL = re.compile(
+    r"(?:\b(?:bash|sh)\s+-c\s+[^\n]*(?:\$\(|`)|"
+    r"\beval\s+[^\n]*(?:\$\(|`)|"
+    r"(?:\bsource|(?<!\S)\.)\s+<\()"
+)
+NON_PYTHON_PROCESS_DISPATCH = re.compile(
+    r"(?:(?:\bchild_process|require\(['\"]child_process['\"]\))\s*\.\s*"
+    r"(?:exec|execFile|fork|spawn)(?:Sync)?\s*\(|"
+    r"\b(?:Bun\.spawn|Deno\.Command)\s*\(|"
+    r"\b(?:Process\.spawn|IO\.popen|Open3\.[A-Za-z_]+|system|exec)\s*\(|"
+    r"\b(?:os\.execute|io\.popen)\s*\()"
+)
 CD_COMMAND = re.compile(
     r"(?:^\s*|(?:&&|\|\||;|\|)\s*|\b(?:then|do|else)\s+)"
     r"cd(?:\s+--)?\s+"
@@ -1121,6 +1133,8 @@ def contains_cross_surface(
     """Return whether lexical normalization exposes a Cross-controlled input."""
 
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    if OPAQUE_INLINE_SHELL.search(logical_contents):
+        return True
     return any(
         STANDALONE_CROSS.search(variant) or CROSS_ENVIRONMENT.search(variant)
         for line in logical_contents.splitlines()
@@ -1325,10 +1339,16 @@ def generic_action_cross_surfaces(
 ) -> tuple[str, ...]:
     """Represent every Cross-sensitive local-action file by its full digest."""
 
-    if not contains_cross_surface(
-        contents,
-        include_opaque_shell_executable=include_opaque_shell_executable,
-    ):
+    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    sensitive = OPAQUE_INLINE_SHELL.search(logical_contents) is not None or any(
+        has_cross_command_context(variant) or CROSS_ENVIRONMENT.search(variant)
+        for line in logical_contents.splitlines()
+        for variant in scan_variants(
+            line,
+            include_opaque_shell_executable=include_opaque_shell_executable,
+        )
+    )
+    if not sensitive:
         return ()
     digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
     return (f"file:{digest}",)
@@ -1352,6 +1372,11 @@ def automation_file_cross_surfaces(name: str, contents: str) -> tuple[str, ...]:
         if process_failures:
             digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
             surfaces.append(f"opaque-python-process:{digest}")
+    elif name.endswith((".js", ".mjs", ".cjs", ".rb", ".lua")) and (
+        NON_PYTHON_PROCESS_DISPATCH.search(contents)
+    ):
+        digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+        surfaces.append(f"opaque-non-python-process:{digest}")
     return tuple(surfaces)
 
 
@@ -1399,7 +1424,7 @@ def normalize_repository_path(raw: str) -> str | None:
         raw,
     )
     if variable_prefix is not None:
-        raw = raw[variable_prefix.end() :]
+        return None
     value = raw[2:] if raw.startswith("./") else raw
     candidate = PurePosixPath(value)
     if (
@@ -1840,7 +1865,17 @@ def validate_automation_collection(
         **{f"workflows/{name}": contents for name, contents in workflows.items()},
         **{f"actions/{name}": contents for name, contents in actions.items()},
     }
-    _, errors = reachable_automation_references(sources, automation, source)
+    reachable, errors = reachable_automation_references(sources, automation, source)
+    for name in sorted(reachable):
+        contents = automation.get(name)
+        if contents is not None and generic_action_cross_surfaces(
+            contents,
+            include_opaque_shell_executable=True,
+        ):
+            errors.append(
+                f"{source}/{name} contains an unprotected Cross executable or "
+                "generated inline shell surface"
+            )
     return errors
 
 
@@ -1949,6 +1984,7 @@ def validate_workflow_contract(
         source,
         job_name,
         required_job=True,
+        include_opaque_shell_executable=True,
     )
     errors.extend(surface_failures)
     if surfaces:
@@ -2674,6 +2710,15 @@ pre_build = []
         failures.append(
             "merge-base comparison allowed a shell-variable Cross executable"
         )
+    if not validate_workflow_contract(
+        changed_shell_variable_cross,
+        "self-test workflow",
+        "protected-arm",
+        protected_hash,
+        protected_env_hash,
+        protected_trigger_hash,
+    ):
+        failures.append("trusted revalidation allowed an opaque Cross executable")
     changed_parenthesized_shell_cross = benign_workflow.replace(
         "echo unrelated-edit",
         "|\n          cmd=$(printf '\\143\\162\\157\\163\\163')\n"
@@ -3083,6 +3128,78 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("referenced-script Cross invocation was not rejected")
+    if not validate_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        cross_automation,
+        "self-test automation directory",
+    ):
+        failures.append("trusted revalidation allowed reached Cross automation")
+
+    hostname_automation = {
+        "scripts/safe.sh": "#!/bin/sh\necho cross.blackbox.example\n"
+    }
+    hostname_automation_edit = {
+        "scripts/safe.sh": "#!/bin/sh\n# benign\necho cross.blackbox.example\n"
+    }
+    if compare_pr_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        hostname_automation,
+        hostname_automation_edit,
+        "self-test automation directory",
+    ):
+        failures.append("non-executable cross hostname blocked a benign edit")
+
+    variable_prefix_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "bash $RUNNER_TEMP/scripts/safe.sh",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": variable_prefix_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("variable-prefixed script path was not rejected")
+
+    generated_shell_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "bash -c \"$(printf '\\143\\162\\157\\163\\163 build')\"",
+    )
+    if not compare_pr_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"ci.yml": generated_shell_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("generated inline shell was not rejected")
+
+    node_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "node scripts/safe.js",
+    )
+    node_baseline = {"scripts/safe.js": "console.log('safe');\n"}
+    node_proposed = {
+        "scripts/safe.js": (
+            "require('child_process').spawnSync('cr' + 'oss', ['build']);\n"
+        )
+    }
+    if not compare_pr_automation_collection(
+        {"ci.yml": node_workflow},
+        {"ci.yml": node_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        node_baseline,
+        node_proposed,
+        "self-test automation directory",
+    ):
+        failures.append("non-Python process dispatch was not protected")
 
     transitive_workflow = referenced_workflow.replace(
         "scripts/safe.sh",
