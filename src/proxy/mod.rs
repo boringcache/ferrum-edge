@@ -15325,8 +15325,8 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                 );
                 body_transformed = true;
             }
+            ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
         }
-        ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
     }
     (false, body_transformed)
 }

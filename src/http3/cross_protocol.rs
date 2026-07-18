@@ -2798,8 +2798,11 @@ where
                                 &mut response_headers,
                             );
                         }
+                        ctx.record_deadline_response_header_plugin(
+                            plugin.as_ref(),
+                            &response_headers,
+                        );
                     }
-                    ctx.record_deadline_response_header_plugin(plugin.as_ref(), &response_headers);
                 }
 
                 for plugin in plugins {
@@ -4585,11 +4588,11 @@ where
                             &mut plugin_response_headers,
                         );
                     }
+                    ctx.record_deadline_response_header_plugin(
+                        plugin.as_ref(),
+                        &plugin_response_headers,
+                    );
                 }
-                ctx.record_deadline_response_header_plugin(
-                    plugin.as_ref(),
-                    &plugin_response_headers,
-                );
             }
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
                 Arc::make_mut(policy_state)
