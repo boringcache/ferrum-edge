@@ -174,9 +174,7 @@ pub(crate) fn validate_api_spec_restore_inputs(
             ),
             Some(_) | None => {}
         }
-        if compensation_restore
-            && plugin.scope == PluginScope::Global
-            && plugin.proxy_id.is_some()
+        if compensation_restore && plugin.scope == PluginScope::Global && plugin.proxy_id.is_some()
         {
             anyhow::bail!(
                 "API-spec restore global plugin '{}' unexpectedly carries proxy_id '{}'",

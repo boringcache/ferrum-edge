@@ -2134,8 +2134,7 @@ async fn api_spec_delete_rejects_cascade_plugin_referenced_by_another_proxy() {
         .await
         .expect("inject cross-proxy plugin association");
 
-    let (delete_status, delete_body) =
-        client.delete_json(&format!("/api-specs/{spec_id}")).await;
+    let (delete_status, delete_body) = client.delete_json(&format!("/api-specs/{spec_id}")).await;
     assert_eq!(
         delete_status,
         reqwest::StatusCode::UNPROCESSABLE_ENTITY,
@@ -2150,8 +2149,14 @@ async fn api_spec_delete_rejects_cascade_plugin_referenced_by_another_proxy() {
     let error = delete_body["failures"][0]["errors"][0]
         .as_str()
         .expect("structured restore-snapshot error");
-    assert!(error.contains(&spec_id), "spec evidence missing: {delete_body}");
-    assert!(error.contains(&proxy_id), "owner evidence missing: {delete_body}");
+    assert!(
+        error.contains(&spec_id),
+        "spec evidence missing: {delete_body}"
+    );
+    assert!(
+        error.contains(&proxy_id),
+        "owner evidence missing: {delete_body}"
+    );
     assert!(
         error.contains(&other_proxy_id),
         "foreign referrer evidence missing: {delete_body}"
@@ -2199,8 +2204,7 @@ async fn api_spec_delete_rejects_owned_global_with_proxy_id_before_persistence()
         .await
         .expect("inject proxy_id on spec-owned global plugin");
 
-    let (delete_status, delete_body) =
-        client.delete_json(&format!("/api-specs/{spec_id}")).await;
+    let (delete_status, delete_body) = client.delete_json(&format!("/api-specs/{spec_id}")).await;
     assert_eq!(
         delete_status,
         reqwest::StatusCode::UNPROCESSABLE_ENTITY,
@@ -2214,8 +2218,14 @@ async fn api_spec_delete_rejects_owned_global_with_proxy_id_before_persistence()
     let error = delete_body["failures"][0]["errors"][0]
         .as_str()
         .expect("structured restore-snapshot error");
-    assert!(error.contains(&plugin_id), "plugin evidence missing: {delete_body}");
-    assert!(error.contains(&proxy_id), "proxy evidence missing: {delete_body}");
+    assert!(
+        error.contains(&plugin_id),
+        "plugin evidence missing: {delete_body}"
+    );
+    assert!(
+        error.contains(&proxy_id),
+        "proxy evidence missing: {delete_body}"
+    );
     assert!(
         error.contains("global plugin") && error.contains("proxy_id"),
         "malformed scope evidence missing: {delete_body}"
