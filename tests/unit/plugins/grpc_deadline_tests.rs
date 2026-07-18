@@ -3191,3 +3191,243 @@ async fn deadline_replacement_preserves_response_transformer_rename_destination(
         "the renamed-away backend source header must not reappear"
     );
 }
+
+/// An `after_proxy` hook that rejects the buffered backend response and authors
+/// its own `Set-Cookie` on the REPLACEMENT rejection map. The rejection headers
+/// it returns are a fresh map — the backend response map is not their base.
+struct CookieAuthoringRejector {
+    cookie: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Plugin for CookieAuthoringRejector {
+    fn name(&self) -> &str {
+        "cookie_authoring_rejector"
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"forbidden"}"#.to_string(),
+            headers: HashMap::from([
+                ("set-cookie".to_string(), self.cookie.to_string()),
+                ("x-gateway-reject".to_string(), "true".to_string()),
+            ]),
+        }
+    }
+}
+
+/// An `after_proxy` hook that rejects WITHOUT authoring any cookie, so the
+/// rejection map carries no `Set-Cookie` at all.
+struct CookielessRejector;
+
+#[async_trait::async_trait]
+impl Plugin for CookielessRejector {
+    fn name(&self) -> &str {
+        "cookieless_rejector"
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"forbidden"}"#.to_string(),
+            headers: HashMap::from([("x-gateway-reject".to_string(), "true".to_string())]),
+        }
+    }
+}
+
+/// Codex finding (#2707 discussion r3607827612): `adopt_gateway_rejection`
+/// receives a gateway-authored REPLACEMENT map, not the mutated backend response
+/// map, so filtering it against the backend `Set-Cookie` baseline was a false
+/// positive. A rejection that intentionally authors `Set-Cookie: X` while the
+/// (now discarded) backend response happened to send a byte-identical
+/// `Set-Cookie: X` scored zero surplus occurrences and was dropped, so the
+/// gRPC-deadline rebuild silently destroyed an authored rejection/session cookie.
+///
+/// This exercises the real rejection/adoption path — `run_after_proxy_hooks`
+/// converting a `PluginResult::Reject` and driving it through
+/// `apply_replaceable_after_proxy_hooks_to_rejection` — not a helper that
+/// bypasses the ownership transition.
+#[tokio::test]
+async fn deadline_rebuild_keeps_a_rejection_cookie_matching_a_backend_cookie() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_reject_for_test,
+        run_deadline_bounded_response_committed_hooks_for_test, set_grpc_deadline_budget_for_test,
+    };
+
+    const SHARED: &str = "sid=deterministic; Path=/";
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CookieAuthoringRejector { cookie: SHARED })];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    // The backend response carries a byte-identical cookie line.
+    let mut backend_headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("set-cookie".to_string(), SHARED.to_string()),
+    ]);
+
+    let (mut status, _body, mut headers) =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut backend_headers)
+            .await
+            .expect("the after_proxy hook must reject the backend response");
+    assert_eq!(status, 403);
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(SHARED),
+        "precondition: the rejection map carries the gateway-authored cookie"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut body = b"rejection body".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(SHARED),
+        "the rejection-authored cookie must survive the deadline rebuild even \
+         though the discarded backend response sent the same bytes"
+    );
+    assert_eq!(
+        headers.get("x-gateway-reject").map(String::as_str),
+        Some("true"),
+        "other rejection-authored headers survive alongside it"
+    );
+}
+
+/// The leak boundary that must NOT regress: when only the backend supplied a
+/// cookie and the rejection authors none, no `Set-Cookie` may cross the
+/// synthesized DEADLINE_EXCEEDED response. Retiring the backend baseline at the
+/// adoption transition is safe precisely because the backend map is replaced —
+/// a backend-only cookie is never in the rejection map to begin with.
+#[tokio::test]
+async fn deadline_rebuild_never_crosses_a_backend_only_cookie_through_a_rejection() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_reject_for_test,
+        run_deadline_bounded_response_committed_hooks_for_test, set_grpc_deadline_budget_for_test,
+    };
+
+    const BACKEND: &str = "backend_sid=leak; Path=/";
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CookielessRejector)];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    let mut backend_headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("set-cookie".to_string(), BACKEND.to_string()),
+        ("x-backend-secret".to_string(), "hunter2".to_string()),
+    ]);
+
+    let (mut status, _body, mut headers) =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut backend_headers)
+            .await
+            .expect("the after_proxy hook must reject the backend response");
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut body = b"rejection body".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert!(
+        !headers.contains_key("set-cookie"),
+        "a backend-only cookie must never cross a synthesized DEADLINE_EXCEEDED \
+         response, rejection path included"
+    );
+    assert!(
+        !headers.contains_key("x-backend-secret"),
+        "backend headers generally must not cross the rebuild"
+    );
+}
+
+/// Occurrence accounting on the BUFFERED path must remain intact across the
+/// adoption transition: a gateway hook that appends its own cookie onto the
+/// backend's value is credited only with its surplus line, and that prior
+/// decoration is preserved when a later hook rejects with a cookieless map.
+/// Neither the backend line nor its duplicate may reappear.
+#[tokio::test]
+async fn rejection_adoption_preserves_prior_cookie_decoration_without_backend_lines() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_reject_for_test,
+        run_deadline_bounded_response_committed_hooks_for_test, set_grpc_deadline_budget_for_test,
+    };
+
+    const BACKEND: &str = "backend_sid=leak; Path=/";
+    const GATEWAY: &str = "gw_session=fresh; Path=/";
+
+    // Decorator appends its cookie first; the later plugin then rejects.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(SessionCookieAppendingDecorator { cookie: GATEWAY }),
+        Arc::new(CookielessRejector),
+    ];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    // The backend sent the same line twice, to keep the duplicate-occurrence
+    // protection under test.
+    let mut backend_headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("set-cookie".to_string(), format!("{BACKEND}\n{BACKEND}")),
+    ]);
+
+    let (mut status, _body, mut headers) =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut backend_headers)
+            .await
+            .expect("the later after_proxy hook must reject the backend response");
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut body = b"rejection body".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(GATEWAY),
+        "the decorator's surplus line is preserved across adoption while both \
+         backend occurrences stay dropped"
+    );
+}

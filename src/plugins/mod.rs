@@ -607,25 +607,50 @@ impl BufferedDeadlineResponseHeaderProvenance {
     /// reject hook that runs next is tracked by mutation. When no gateway output
     /// was recorded yet, `gateway_headers` is empty and this is identical to
     /// starting a fresh [`Self::gateway_rejection`].
+    ///
+    /// # Why the backend `Set-Cookie` baseline is retired here
+    ///
+    /// `headers` is a gateway-authored REPLACEMENT map, never the mutated
+    /// backend response map. Every caller of
+    /// [`RequestContext::begin_rejection_deadline_response_header_provenance`]
+    /// reaches it with either a freshly constructed map, a
+    /// `PluginResult::Reject{,Binary}` header map lifted out by
+    /// `plugin_result_into_reject_parts`, or gateway-synthesized error headers.
+    /// The two sites whose caller-supplied map has backend lineage
+    /// (`apply_plugin_rejection_response` and
+    /// `apply_reject_after_proxy_and_synthetic_body_hooks`) both run
+    /// `rebuild_plugin_rejection_response_headers` first, which does
+    /// `response_headers.clear()` before re-populating from the rejection parts.
+    /// So no backend-sent header survives into this transition.
+    ///
+    /// That makes `backend_set_cookie_lines` — the baseline captured from the
+    /// BACKEND response map in [`Self::backend_response`] — no longer a
+    /// description of the map being tracked. Continuing to filter against it
+    /// misattributed authorship: a rejection that intentionally sets
+    /// `Set-Cookie: X` while the discarded backend response happened to have
+    /// sent a byte-identical `Set-Cookie: X` scored zero surplus occurrences and
+    /// was dropped, so a later gRPC-deadline rebuild silently discarded an
+    /// authored rejection/session cookie.
+    ///
+    /// Retiring the baseline does not weaken the leak boundary. It is the
+    /// buffered path's [`Self::record_gateway_mutations`] that defends against
+    /// backend cookies, and it still holds the baseline for as long as the
+    /// backend map is the response. A backend-only `Set-Cookie` can only reach a
+    /// deadline response by being present in some map, and after this transition
+    /// the backend map is gone — the response is rebuilt from the rejection.
+    /// Keeping a stale baseline could therefore only produce further false
+    /// drops, never prevent a real leak.
     fn adopt_gateway_rejection(&mut self, headers: &HashMap<String, String>) {
         let rejection = Self::canonical_snapshot(headers);
         for (name, value) in &rejection {
-            if name == "set-cookie" {
-                // Preserve the same backend-cookie exclusion the buffered path
-                // enforces: only gateway-authored cookie lines cross into the
-                // rejection's gateway-owned output.
-                match self.gateway_set_cookie_value(value) {
-                    Some(gateway_value) => {
-                        self.gateway_headers.insert(name.clone(), gateway_value);
-                    }
-                    None => {
-                        self.gateway_headers.remove(name);
-                    }
-                }
-            } else {
-                self.gateway_headers.insert(name.clone(), value.clone());
-            }
+            self.gateway_headers.insert(name.clone(), value.clone());
         }
+        // The backend response map has been replaced wholesale by gateway
+        // output, so the backend cookie baseline no longer describes what is
+        // being tracked. Retire it, matching [`Self::gateway_rejection`], so
+        // hooks that run after this transition are credited for what they
+        // actually author on the rejection map.
+        self.backend_set_cookie_lines = Vec::new();
         self.observed_headers = rejection;
     }
 
@@ -2115,6 +2140,20 @@ impl RequestContext {
     /// Start a rejection response at the gateway provenance boundary. The
     /// response did not come from a backend, so its plugin-produced fields are
     /// provenance-known gateway output.
+    ///
+    /// # Contract
+    ///
+    /// `response_headers` MUST be a gateway-authored REPLACEMENT map: a freshly
+    /// built map, a `PluginResult::Reject{,Binary}` header map, or
+    /// gateway-synthesized error headers. It must not be a backend response map,
+    /// nor a map that still carries backend-sent headers — callers whose map has
+    /// backend lineage clear it first (see
+    /// `rebuild_plugin_rejection_response_headers`). This transition declares
+    /// the whole map gateway-owned and retires the backend `Set-Cookie`
+    /// baseline (see `adopt_gateway_rejection`), so handing it a mixed map would
+    /// credit backend lines as gateway-authored. A future caller that cannot
+    /// satisfy this must clear or partition its map rather than relaxing the
+    /// transition.
     pub(crate) fn begin_rejection_deadline_response_header_provenance(
         &mut self,
         response_headers: &HashMap<String, String>,
