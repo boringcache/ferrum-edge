@@ -538,6 +538,45 @@ async fn unprotected_responses_are_never_rejected_by_the_gate() {
     }
 }
 
+/// Regression: the gate must parse exactly the way the enforcer does. A body the
+/// gate accepts but `apply_body_rules` cannot parse would return `None` from the
+/// transform, be read as "no rule matched", and forward the protected bytes —
+/// the same conflation this whole gate exists to close. A UTF-8 BOM is the
+/// concrete case: `serde_json` rejects it, so the gate must too.
+#[tokio::test]
+async fn bom_prefixed_json_is_rejected_rather_than_leniently_accepted() {
+    let mut body = vec![0xef, 0xbb, 0xbf];
+    body.extend_from_slice(br#"{"secret":"hunter2","keep":1}"#);
+
+    let (replaced, transformed, status, _, body, reason) =
+        run_backend_transform(200, json_headers(), body).await;
+
+    assert!(
+        replaced,
+        "a body the enforcer cannot parse must not be blessed by the gate"
+    );
+    assert!(!transformed);
+    assert_eq!(status, 502);
+    assert_eq!(reason.as_deref(), Some("unparseable_document"));
+    assert_secret_not_forwarded(&body);
+}
+
+/// A response with no `Content-Type` at all must not become a 502. Untyped
+/// bodies (minimal error pages, redirect bodies, plain-text health output) are
+/// outside what a JSON field policy can enforce, exactly like a mislabeled one.
+#[tokio::test]
+async fn untyped_response_is_not_claimed_and_is_forwarded_unchanged() {
+    let original = b"<html><body>backend error</body></html>".to_vec();
+    let (replaced, transformed, status, _, body, reason) =
+        run_backend_transform(200, HashMap::new(), original.clone()).await;
+
+    assert!(!replaced, "an untyped body must not be rejected");
+    assert!(!transformed);
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_eq!(body, original);
+}
+
 /// A non-JSON media type is a documented decline for this policy, not an
 /// inspection failure, so it must not be rejected.
 #[tokio::test]

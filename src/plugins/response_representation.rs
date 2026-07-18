@@ -51,6 +51,28 @@
 //! second case send still-plaintext bytes to a decoder. For a backend response
 //! the snapshot is mandatory: an unstamped backend response cannot prove its own
 //! representation and is rejected rather than assumed benign.
+//!
+//! # Known limits
+//!
+//! This gate governs the **buffered** response lifecycle. Three gaps are known
+//! and deliberately out of its scope; none is introduced here, and each needs a
+//! separate design rather than a widening of this module:
+//!
+//! * **Streaming responses.** A response that never buffers never reaches a body
+//!   transform, so no body policy applies to it. `response_transformer` declines
+//!   to buffer when the *client* sent `Accept: text/event-stream`, which means a
+//!   client can currently keep a configured body policy from running by asking
+//!   for SSE on a route that answers with ordinary JSON. Closing that requires
+//!   deciding on the response media type instead of the request's, plus a
+//!   streaming-side enforcement point — tracked separately.
+//! * **Backend-chosen media type.** A backend that labels a JSON payload
+//!   `text/plain`, `application/octet-stream`, or omits `Content-Type` is not
+//!   claimed by a JSON body policy, here or in the transform itself. Content-type
+//!   sniffing or an operator-configured media-type allowlist would be needed.
+//! * **Trailing bytes after a gzip member.** Decoding uses `MultiGzDecoder`, for
+//!   consistency with the bounded decoders in `ai_tool_governor` and
+//!   `ai_semantic_firewall`. It is stricter than browsers about padding after the
+//!   final member, so such a body is rejected rather than decoded.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -282,13 +304,20 @@ fn decode_response_body(encoding: &str, body: &[u8]) -> Result<Vec<u8>, Represen
 ///
 /// Only JSON is checked, because JSON is the document model every configured
 /// body rule in the gateway operates on. A policy that declines on media type
-/// (`response_transformer` skips non-JSON `Content-Type`s by design) never
-/// claims the response in the first place, so it never reaches here.
+/// never claims the response in the first place, so it never reaches here.
+///
+/// This parses **exactly** the way the enforcer does — `serde_json::from_slice`
+/// over the same bytes, with no normalization. That symmetry is load-bearing: if
+/// the gate were more lenient than [`crate::plugins::utils::body_transform::apply_body_rules`]
+/// (say, by stripping a UTF-8 BOM the enforcer chokes on), a body could pass the
+/// gate, fail to parse inside the transform, return `None`, and be forwarded
+/// unredacted — which is precisely the `None`-conflation bypass this module
+/// exists to close. A BOM-prefixed body is therefore rejected rather than
+/// accommodated; RFC 8259 forbids emitting one, and fail-closed is the posture.
 fn document_is_parseable(content_type: Option<&str>, body: &[u8]) -> bool {
     if content_type.is_some_and(|value| !is_json_content_type(value)) {
         return true;
     }
-    let body = body.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(body);
     serde_json::from_slice::<serde_json::Value>(body).is_ok()
 }
 

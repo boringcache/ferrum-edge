@@ -581,13 +581,20 @@ impl Plugin for ResponseTransformer {
         //     `return None` in `transform_response_body`;
         //   * SSE, which `should_buffer_response_body` keeps out of the buffered
         //     path entirely, so no transform ever runs over it.
-        // A non-JSON `Content-Type` is likewise a documented decline (the
-        // configured rules address JSON fields), so those responses are not
-        // claimed and are forwarded as before.
+        // The media-type condition requires a *positive* JSON `Content-Type`.
+        // A non-JSON type is a documented decline (the configured rules address
+        // JSON fields). An ABSENT type is treated the same way, deliberately: the
+        // gate would otherwise have to parse every untyped body as JSON and
+        // reject the ones that are not, which turns ordinary untyped responses —
+        // minimal error pages, redirect bodies, plain-text health output — into
+        // 502s without protecting anything, since no JSON field rule can be
+        // proven to target an untyped document in the first place. This shares
+        // the (pre-existing) property that a backend which mislabels or omits
+        // `Content-Type` is outside what this policy can enforce.
         !self.body_rules.is_empty()
             && self.rules_enabled()
             && !super::utils::sse::is_sse_request(ctx)
-            && response_content_type.is_none_or(body_transform::is_json_content_type)
+            && response_content_type.is_some_and(body_transform::is_json_content_type)
     }
 
     async fn after_proxy(
