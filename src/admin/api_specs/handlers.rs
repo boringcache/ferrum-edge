@@ -3360,6 +3360,33 @@ pub async fn handle_delete_api_spec(
         .flat_map(|proxy| proxy.plugins.iter())
         .map(|association| association.plugin_config_id.as_str())
         .collect();
+    for plugin in deletion_snapshot.plugin_configs.iter().filter(|plugin| {
+        owned_plugin_ids.contains(plugin.id.as_str())
+            || plugin.proxy_id.as_deref() == Some(existing.proxy_id.as_str())
+    }) {
+        let Some(other_proxy) = deletion_snapshot
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id != existing.proxy_id)
+            .find(|proxy| {
+                proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == plugin.id)
+            })
+        else {
+            continue;
+        };
+        let error = format!(
+            "API spec '{}' cannot delete proxy '{}': cascade plugin '{}' is also associated with proxy '{}', whose association is not part of the restore snapshot",
+            existing.id, existing.proxy_id, plugin.id, other_proxy.id
+        );
+        return Ok(error_response(restore_snapshot_validation_failure(
+            &existing,
+            plugin.id.clone(),
+            error,
+        )));
+    }
     let additional_plugin_ids = deletion_snapshot
         .plugin_configs
         .iter()

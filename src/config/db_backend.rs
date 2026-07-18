@@ -174,10 +174,21 @@ pub(crate) fn validate_api_spec_restore_inputs(
             ),
             Some(_) | None => {}
         }
+        if compensation_restore
+            && plugin.scope == PluginScope::Global
+            && plugin.proxy_id.is_some()
+        {
+            anyhow::bail!(
+                "API-spec restore global plugin '{}' unexpectedly carries proxy_id '{}'",
+                plugin.id,
+                plugin.proxy_id.as_deref().unwrap_or("<none>")
+            );
+        }
         let is_proxy_scoped_to_bundle = plugin.scope == PluginScope::Proxy
             && plugin.proxy_id.as_deref() == Some(bundle.proxy.id.as_str());
         let is_unassociated_compensation_global = compensation_restore
             && plugin.scope == PluginScope::Global
+            && plugin.proxy_id.is_none()
             && !association_ids.contains(plugin.id.as_str());
         if !is_proxy_scoped_to_bundle && !is_unassociated_compensation_global {
             anyhow::bail!(
