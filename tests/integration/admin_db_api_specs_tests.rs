@@ -897,6 +897,70 @@ async fn restore_bundle_rolls_back_resources_associations_spec_and_changes_on_la
 }
 
 #[tokio::test]
+async fn restore_bundle_preserves_preexisting_shared_additional_upstream() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let shared_upstream_id = uid("restore-shared-hand-upstream");
+    let keeper_proxy_id = uid("restore-shared-keeper");
+    let restored_proxy_id = uid("restore-shared-proxy");
+    let spec_id = uid("restore-shared-spec");
+
+    let mut current_upstream = make_upstream(&shared_upstream_id, ns);
+    current_upstream.name = Some("current shared upstream".to_string());
+    store
+        .create_upstream(&current_upstream)
+        .await
+        .expect("create shared upstream");
+    let mut keeper_proxy = make_proxy(&keeper_proxy_id, ns);
+    keeper_proxy.upstream_id = Some(shared_upstream_id.clone());
+    store
+        .create_proxy(&keeper_proxy)
+        .await
+        .expect("create proxy retaining shared upstream");
+
+    let mut restored_proxy = make_proxy(&restored_proxy_id, ns);
+    restored_proxy.api_spec_id = Some(spec_id.clone());
+    restored_proxy.upstream_id = Some(shared_upstream_id.clone());
+    let bundle = ExtractedBundle {
+        proxy: restored_proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &restored_proxy_id,
+        ns,
+        b"restore while shared hand upstream remains live",
+    );
+    let mut pre_delete_upstream = current_upstream.clone();
+    pre_delete_upstream.name = Some("stale pre-delete snapshot".to_string());
+
+    store
+        .restore_api_spec_bundle(&bundle, &spec, &[pre_delete_upstream], &[])
+        .await
+        .expect("restore must reuse the hand upstream retained by another proxy");
+
+    assert!(
+        store
+            .get_proxy(ns, &restored_proxy_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_some());
+    let preserved_upstream = store
+        .get_upstream(ns, &shared_upstream_id)
+        .await
+        .unwrap()
+        .expect("shared upstream must remain present");
+    assert_eq!(
+        preserved_upstream.name.as_deref(),
+        Some("current shared upstream")
+    );
+}
+
+#[tokio::test]
 async fn restore_bundle_rejects_intervening_schema_dependency_removal() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
@@ -958,6 +1022,7 @@ fn mongo_restore_keeps_additional_upstreams_inside_the_transaction() {
 
     assert!(restore.contains("prepare_api_spec_restore_docs("));
     assert!(restore.contains("prepared_docs.additional_upstreams"));
+    assert!(restore.contains("if existing.is_none()"));
     assert!(restore.contains("record_config_change_in_session("));
 }
 

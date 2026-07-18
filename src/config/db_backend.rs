@@ -1315,7 +1315,9 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     ) -> Result<(), anyhow::Error>;
 
     /// Atomically restore a deleted API spec together with upstreams and
-    /// non-spec-owned plugins that were removed by the proxy delete cascade.
+    /// non-spec-owned plugins affected by the proxy delete cascade. A
+    /// hand-owned additional upstream that remained live through the delete
+    /// is preserved rather than inserted again.
     ///
     /// SQL backends and replica-set MongoDB implement this transactionally for
     /// database and control-plane modes. A backend/topology without a

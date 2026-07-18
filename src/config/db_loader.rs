@@ -6485,17 +6485,39 @@ impl DatabaseStore {
         self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace)
             .await?;
 
-        // 1. INSERT upstream (if present), tagged with api_spec_id.
-        for (u, api_spec_id) in bundle
+        // 1. INSERT upstream (if present), tagged with api_spec_id. Additional
+        // hand-owned upstreams may still exist when another proxy or mesh
+        // dispatch kept them live through the delete. Preserve those current
+        // rows instead of turning compensation into a duplicate-key failure.
+        let mut inserted_additional_upstream_ids = HashSet::new();
+        for (u, api_spec_id, allow_existing) in bundle
             .upstream
             .iter()
-            .map(|upstream| (upstream, Some(spec.id.as_str())))
+            .map(|upstream| (upstream, Some(spec.id.as_str()), false))
             .chain(
                 additional_upstreams
                     .iter()
-                    .map(|upstream| (upstream, upstream.api_spec_id.as_deref())),
+                    .map(|upstream| (upstream, upstream.api_spec_id.as_deref(), true)),
             )
         {
+            if allow_existing {
+                let existing_sql = if self.db_type == "sqlite" {
+                    self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?")
+                } else {
+                    self.q(
+                        "SELECT id FROM upstreams WHERE id = ? AND namespace = ? FOR UPDATE",
+                    )
+                };
+                let existing: Option<String> = sqlx::query_scalar(&existing_sql)
+                    .bind(&u.id)
+                    .bind(&u.namespace)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                if existing.is_some() {
+                    continue;
+                }
+                inserted_additional_upstream_ids.insert(u.id.clone());
+            }
             let targets_json = serde_json::to_string(&u.targets)?;
             let algo_json = serde_json::to_string(&u.algorithm)?;
             let algo_str = algo_json.trim_matches('"');
@@ -6740,7 +6762,11 @@ impl DatabaseStore {
             self.validate_namespace_admission_tx(&mut tx, &spec.namespace)
                 .await?;
         }
-        for u in bundle.upstream.iter().chain(additional_upstreams) {
+        for u in bundle.upstream.iter().chain(
+            additional_upstreams
+                .iter()
+                .filter(|upstream| inserted_additional_upstream_ids.contains(&upstream.id)),
+        ) {
             self.record_config_change_tx(&mut tx, &u.namespace, "upstream", &u.id, "upsert")
                 .await?;
         }

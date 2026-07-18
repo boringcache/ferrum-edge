@@ -9279,13 +9279,6 @@ mod inner {
                         upstream.id.clone(),
                     ));
                 }
-                for upstream in additional_upstreams {
-                    upsert_changes.push((
-                        upstream.namespace.clone(),
-                        "upstream",
-                        upstream.id.clone(),
-                    ));
-                }
                 upsert_changes.push((
                     bundle.proxy.namespace.clone(),
                     "proxy",
@@ -9317,7 +9310,7 @@ mod inner {
                             connection,
                             prepared_docs,
                             guard_params,
-                            upsert_changes,
+                            mut upsert_changes,
                             namespace,
                             restored_proxy_id,
                         )| {
@@ -9328,11 +9321,34 @@ mod inner {
                                         .session(&mut *s)
                                         .await?;
                                 }
-                                for (_, doc) in &prepared_docs.additional_upstreams {
-                                    this.upstreams()
-                                        .insert_one(doc.clone())
+                                for (upstream_id, doc) in &prepared_docs.additional_upstreams {
+                                    let upstream_namespace = doc
+                                        .get_str("namespace")
+                                        .map_err(|error| {
+                                            mongodb::error::Error::custom(format!(
+                                                "additional restore upstream {} is missing namespace: {}",
+                                                upstream_id, error
+                                            ))
+                                        })?;
+                                    let existing = this
+                                        .upstreams()
+                                        .find_one(mongodb::bson::doc! {
+                                            "_id": upstream_id.as_str(),
+                                            "namespace": upstream_namespace,
+                                        })
                                         .session(&mut *s)
                                         .await?;
+                                    if existing.is_none() {
+                                        this.upstreams()
+                                            .insert_one(doc.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                        upsert_changes.push((
+                                            upstream_namespace.to_string(),
+                                            "upstream",
+                                            upstream_id.clone(),
+                                        ));
+                                    }
                                 }
                                 // Compensation may follow an intervening
                                 // writer. Reapply the same in-session route
