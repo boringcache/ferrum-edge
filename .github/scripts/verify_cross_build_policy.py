@@ -1204,7 +1204,7 @@ def cargo_cross_command(tokens: tuple[str, ...], index: int) -> bool:
         return False
     subcommand = tool_name(tokens[index])
     if subcommand == "cross":
-        return index + 1 < len(tokens)
+        return command_has_argument(tokens, index)
     if subcommand != "install":
         return False
 
@@ -1277,6 +1277,17 @@ def xargs_command_index(tokens: tuple[str, ...], index: int) -> int:
             continue
         break
     return index
+
+
+def command_has_argument(tokens: tuple[str, ...], index: int) -> bool:
+    """Return whether an executable has a real operand before shell syntax."""
+
+    if index + 1 >= len(tokens):
+        return False
+    following = tokens[index + 1]
+    return following not in {"&", "&&", ")", ";", ";;", "|", "||", "}"} and (
+        not redirection_token(following)
+    )
 
 
 def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
@@ -1389,7 +1400,7 @@ def token_command_has_cross(
         return False
     command = tool_name(tokens[index])
     if command == "cross":
-        return index + 1 < len(tokens)
+        return command_has_argument(tokens, index)
     if command == "cargo":
         return cargo_cross_command(tokens, index)
     if command == "xargs":
@@ -1947,7 +1958,11 @@ def unprotected_cross_surfaces(
         block_contents = "".join(lines[start:end]).rstrip() + "\n"
         job_digests[name] = hashlib.sha256(block_contents.encode("utf-8")).hexdigest()
 
-        logical_contents = re.sub(r"\\\r?\n[ \t]*", "", block_contents)
+        logical_contents = re.sub(
+            r"\\\r?\n[ \t]*",
+            "",
+            yaml_command_augmented(block_contents),
+        )
         if OPAQUE_INLINE_SHELL.search(logical_contents) or (
             OPAQUE_ARM_CROSS_EXECUTION.search(logical_contents)
         ):
@@ -2356,6 +2371,7 @@ def yaml_command_fields(
         line_number = index
         field_indent = len(match.group("indent"))
         sequence_field = lines[index][field_indent:].startswith("-")
+        mapping_indent = field_indent + (2 if sequence_field else 0)
         key = match.group("key").strip("'\"")
         value = match.group("value").strip()
         if BLOCK_SCALAR_HEADER.fullmatch(value) is None:
@@ -2380,7 +2396,7 @@ def yaml_command_fields(
             line = lines[index]
             if line.strip():
                 indentation = len(line) - len(line.lstrip(" "))
-                if indentation <= field_indent:
+                if indentation <= mapping_indent:
                     break
                 block.append(line)
             else:
@@ -2389,7 +2405,7 @@ def yaml_command_fields(
         nonblank_indents = [
             len(line) - len(line.lstrip(" ")) for line in block if line.strip()
         ]
-        block_indent = min(nonblank_indents, default=field_indent + 2)
+        block_indent = min(nonblank_indents, default=mapping_indent + 2)
         dedented = [line[block_indent:] if line.strip() else "" for line in block]
         literal = "\n".join(dedented)
         rendered = folded_block_text(dedented) if value.startswith(">") else literal
