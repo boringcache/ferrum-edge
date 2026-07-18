@@ -1870,7 +1870,7 @@ def validate_automation_collection(
         contents = automation.get(name)
         if contents is not None and generic_action_cross_surfaces(
             contents,
-            include_opaque_shell_executable=True,
+            include_opaque_shell_executable=False,
         ):
             errors.append(
                 f"{source}/{name} contains an unprotected Cross executable or "
