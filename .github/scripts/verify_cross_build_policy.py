@@ -3313,6 +3313,7 @@ def opaque_word_starts_command(
     start: int,
     *,
     shell_evaluated: bool,
+    starts_command: bool = True,
 ) -> bool:
     """Return whether an opaque word occupies a slot a shell dispatches.
 
@@ -3325,6 +3326,14 @@ def opaque_word_starts_command(
     `run:`, a statement separator, `$(`, a backtick, a conditional keyword —
     counts, and so does a bare line start.
 
+    `starts_command` withdraws only that bare-line-start allowance, for a raw
+    source line a backslash continuation joins onto the previous one. Such a
+    line has no line start of its own: `$(printf '...' *)` below
+    ``docker buildx imagetools create ... \\`` is that command's last argument.
+    An explicit executable slot on the same line still counts, and the joined
+    logical line is scanned separately, so nothing a shell would dispatch stops
+    being read as a command.
+
     A backslash-escaped backtick is literal text rather than a substitution, so
     ``echo "- Test: \\`${{ matrix.test }}\\`"`` writes Markdown in a real `run:`
     block and opens no slot.
@@ -3335,7 +3344,7 @@ def opaque_word_starts_command(
     prefix = line[:start].replace("\\`", "").replace("\\$", "")
     if EXPLICIT_COMMAND_WORD_PREFIX.search(prefix):
         return True
-    return not prefix.strip()
+    return starts_command and not prefix.strip()
 
 
 def opaque_executable_variants(
@@ -3343,6 +3352,7 @@ def opaque_executable_variants(
     spans: tuple[tuple[int, int], ...],
     *,
     shell_evaluated: bool = True,
+    starts_command: bool = True,
 ) -> tuple[str, ...]:
     """Substitute Cross into every opaque word that could hold the executable."""
 
@@ -3378,6 +3388,7 @@ def opaque_executable_variants(
                 line,
                 start,
                 shell_evaluated=shell_evaluated,
+                starts_command=starts_command,
             ):
                 whole_command = line[:start] + WHOLE_CROSS_COMMAND + line[end:]
                 if has_cross_command_context(whole_command):
@@ -3389,6 +3400,7 @@ def opaque_command_completion_variants(
     line: str,
     *,
     shell_evaluated: bool = True,
+    starts_command: bool = True,
 ) -> tuple[str, ...]:
     """Expose opaque substitutions that can complete a literal Cross token."""
 
@@ -3396,6 +3408,7 @@ def opaque_command_completion_variants(
         line,
         command_substitution_spans(line),
         shell_evaluated=shell_evaluated,
+        starts_command=starts_command,
     )
 
 
@@ -3403,6 +3416,7 @@ def opaque_github_expression_variants(
     line: str,
     *,
     shell_evaluated: bool = True,
+    starts_command: bool = True,
 ) -> tuple[str, ...]:
     """Fail closed when a dynamic expression occupies a Cross command slot."""
 
@@ -3424,6 +3438,7 @@ def opaque_github_expression_variants(
         line,
         tuple(dynamic_spans),
         shell_evaluated=shell_evaluated,
+        starts_command=starts_command,
     )
 
 
@@ -3431,6 +3446,7 @@ def opaque_shell_interpolation_variants(
     line: str,
     *,
     shell_evaluated: bool = True,
+    starts_command: bool = True,
 ) -> tuple[str, ...]:
     """Expose a shell interpolation that can occupy a Cross executable word."""
 
@@ -3444,6 +3460,7 @@ def opaque_shell_interpolation_variants(
         line,
         spans,
         shell_evaluated=shell_evaluated,
+        starts_command=starts_command,
     )
 
 
@@ -3575,6 +3592,7 @@ def scan_variants(
     *,
     include_opaque_shell_executable: bool = False,
     shell_evaluated: bool = True,
+    starts_command: bool = True,
 ) -> tuple[str, ...]:
     """Expose ordinary YAML/shell quoting variants to the lexical boundary."""
 
@@ -3583,12 +3601,14 @@ def scan_variants(
         opaque_command_completion_variants(
             line,
             shell_evaluated=shell_evaluated,
+            starts_command=starts_command,
         )
     )
     variants.extend(
         opaque_github_expression_variants(
             line,
             shell_evaluated=shell_evaluated,
+            starts_command=starts_command,
         )
     )
     if include_opaque_shell_executable:
@@ -3596,6 +3616,7 @@ def scan_variants(
             opaque_shell_interpolation_variants(
                 line,
                 shell_evaluated=shell_evaluated,
+                starts_command=starts_command,
             )
         )
     variants.extend(ansi_c_quoted_variants(line))
@@ -3911,6 +3932,63 @@ def shell_evaluated_lines(contents: str) -> frozenset[int]:
             delimiter for _, delimiter in quote_aware_heredoc_starts(line)
         )
     return frozenset(evaluated)
+
+
+def shell_continuation_lines(contents: str) -> frozenset[int]:
+    """Return the raw lines a backslash continuation joins onto a previous one.
+
+    A shell reads the logical line a trailing backslash builds, not the source
+    line. `$(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)` under
+    ``docker buildx imagetools create ... \\`` is that command's last argument,
+    so the bare line start that would otherwise let the substitution stand for
+    a whole command is not a command slot at all.
+
+    Only that bare-line-start allowance is withdrawn, exactly as in
+    `shell_evaluated_lines`. An explicit executable slot on the continuation
+    line still counts, and the joined logical line is scanned in its own right,
+    so a continuation that really does dispatch Cross is still read as one.
+
+    An even number of trailing backslashes is an escaped backslash rather than
+    a continuation, so `printf 'a\\\\'` does not swallow the next line.
+    """
+
+    continuations: set[int] = set()
+    for index, line in enumerate(contents.splitlines()):
+        trailing = len(line) - len(line.rstrip("\\"))
+        if trailing % 2 == 1:
+            continuations.add(index + 1)
+    return frozenset(continuations)
+
+
+def block_scalar_body_lines(lines: list[str]) -> frozenset[int]:
+    """Return every line that is block-scalar content rather than YAML syntax.
+
+    A `prompt: |` or `claude_args: |` body is one string value. Its text still
+    reaches the action, so it keeps being searched for Cross tokens, but it
+    declares no mapping key, anchor, alias, or merge key: reading
+    `Bash(gh pr comment:*)` inside a prompt as a `comment: *alias` indirection
+    is a misparse of literal prose, not evidence of a hidden input.
+    """
+
+    body: set[int] = set()
+    index = 0
+    while index < len(lines):
+        match = YAML_BLOCK_SCALAR_FIELD.match(lines[index])
+        if match is None or BLOCK_SCALAR_HEADER.fullmatch(
+            match.group("value").strip()
+        ) is None:
+            index += 1
+            continue
+        indent = len(match.group("indent"))
+        cursor = index + 1
+        while cursor < len(lines):
+            line = lines[cursor]
+            if line.strip() and len(line) - len(line.lstrip(" ")) <= indent:
+                break
+            body.add(cursor)
+            cursor += 1
+        index = cursor
+    return frozenset(body)
 
 
 def logical_scan_lines(contents: str) -> tuple[tuple[str, bool], ...]:
@@ -4404,6 +4482,9 @@ def remote_action_surface_lines(
     surfaces: dict[int, str] = {}
     errors: list[str] = []
     lines = contents.splitlines()
+    # A block-scalar body is one string value, so its lines carry no YAML
+    # structure to read. Their text is still scanned as an input value below.
+    scalar_body = block_scalar_body_lines(lines)
     for index, line in enumerate(lines):
         match = YAML_MAPPING_FIELD.match(line)
         if match is None:
@@ -4452,6 +4533,14 @@ def remote_action_surface_lines(
                 continue
             following = lines[offset]
             if not following.strip():
+                continue
+            if offset in scalar_body:
+                # Literal prose, not a mapping: `--allowedTools "...,Bash(gh pr
+                # comment:*)"` inside a `claude_args: |` body is not a
+                # `comment:` key aliased to `*)`, and a `#` in it is not a
+                # comment either. The whole line is still scanned as part of the
+                # input value the action receives.
+                scanned.append(following)
                 continue
             stripped = following.lstrip(" ")
             if stripped.startswith("#"):
@@ -4637,6 +4726,7 @@ def unprotected_cross_surfaces(
 
     lines = outside.splitlines(keepends=True)
     evaluated_lines = shell_evaluated_lines(outside)
+    continuation_lines = shell_continuation_lines(outside)
     jobs_index = next(
         index
         for index, line in enumerate(lines)
@@ -4728,6 +4818,7 @@ def unprotected_cross_surfaces(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
             shell_evaluated=index in evaluated_lines,
+            starts_command=index not in continuation_lines,
         ):
             normalized = re.sub(r"\s+", " ", variant).strip()
             if has_cross_command_context(
@@ -9319,6 +9410,102 @@ pre_build = []
         failures.append(
             "backtick substitution holding a whole command was not protected"
         )
+
+    # A backslash continuation joins the source line onto the command above it,
+    # so a substitution alone on that line is an argument rather than a command
+    # word. This is the published-manifest spelling, whose steps are frozen
+    # byte-for-byte by `PUBLISH_ARTIFACT_STEP_CONTRACTS` besides.
+    continuation_workflow = (
+        "name: Publish\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  docker-manifest:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          docker buildx imagetools create \\\n"
+        "            -t ferrumedge/ferrum-edge:latest \\\n"
+        "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n"
+    )
+    surfaces, errors = generic_workflow_cross_surfaces(
+        continuation_workflow,
+        "self-test continuation workflow",
+        include_opaque_shell_executable=True,
+    )
+    if surfaces or errors:
+        failures.append(
+            "a substitution continuing a literal command line was rejected"
+        )
+
+    # Only the bare-line-start allowance is withdrawn: an explicit executable
+    # slot on the continuation line still opens a command word.
+    continued_statement_surfaces, continued_statement_errors = (
+        generic_workflow_cross_surfaces(
+            continuation_workflow.replace(
+                "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n",
+                "            ; $(plan)\n",
+            ),
+            "self-test continuation workflow",
+            include_opaque_shell_executable=True,
+        )
+    )
+    if not continued_statement_surfaces and not continued_statement_errors:
+        failures.append(
+            "a whole-command substitution after a separator on a continuation "
+            "line was not protected"
+        )
+
+    # A block-scalar body is one string value. Prose in it declares no mapping
+    # key, alias, or merge key, so `Bash(gh pr comment:*)` in an action input is
+    # not a `comment:` key aliased to `*)`.
+    prose_input_workflow = (
+        "name: Review\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  review:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - name: Review\n"
+        f"        uses: anthropics/claude-code-action@{'0' * 40}\n"
+        "        with:\n"
+        "          claude_args: |\n"
+        '            --allowedTools "Bash(gh pr comment:*)"\n'
+    )
+    surfaces, errors = generic_workflow_cross_surfaces(
+        prose_input_workflow,
+        "self-test prose input workflow",
+    )
+    if surfaces or errors:
+        failures.append("prose in a block-scalar action input was rejected")
+
+    # The body's text still reaches the action, so a Cross token or the
+    # protected target inside it is a surface exactly as before, and an alias in
+    # a real value position still fails closed.
+    benign_input = '            --allowedTools "Bash(gh pr comment:*)"\n'
+    hostile_inputs = {
+        "block-scalar input naming the Cross executable": (
+            '            --allowedTools "Bash(cross build:*)"\n'
+        ),
+        "block-scalar input naming the protected target": (
+            f"            --add-dir /work/{TARGET}\n"
+        ),
+    }
+    for label, replacement in hostile_inputs.items():
+        surfaces, errors = generic_workflow_cross_surfaces(
+            prose_input_workflow.replace(benign_input, replacement),
+            "self-test prose input workflow",
+        )
+        if not surfaces and not errors:
+            failures.append(f"{label} was not protected")
+    surfaces, errors = generic_workflow_cross_surfaces(
+        prose_input_workflow.replace(
+            "        with:\n          claude_args: |\n" + benign_input,
+            "        with: *cross_inputs\n",
+        ),
+        "self-test prose input workflow",
+    )
+    if not surfaces and not errors:
+        failures.append("an aliased action input mapping was not protected")
     shell_automation_escapes(
         "env with a separate option operand",
         f"env -u FOO cross {arm_target}",

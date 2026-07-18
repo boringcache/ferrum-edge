@@ -429,7 +429,18 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   a shell does evaluate, an explicit executable slot — `run:`, a statement
   separator, `$(`, a backtick, a conditional keyword — counts, and so does a bare
   line start, so the same expression alone on its own line inside a `run: |`
-  block still fails closed. A backslash-escaped backtick is literal text and
+  block still fails closed. A raw source line that a backslash continuation
+  joins onto the previous one has no line start of its own — `$(printf
+  'ferrumedge/ferrum-edge@sha256:%s ' *)` under `docker buildx imagetools create
+  ... \` is that command's last argument — so only the bare-line-start allowance
+  is withdrawn there; an explicit slot on the continuation line still counts, and
+  the joined logical line is scanned in its own right.
+  A block-scalar body is one string value rather than YAML structure, so prose in
+  an action input declares no mapping key, alias, or merge key: `--allowedTools
+  "Bash(gh pr comment:*)"` inside a `claude_args: |` body is not a `comment:` key
+  aliased to `*)`. The body's text still reaches the action and is still searched
+  for the Cross executable, the Cross image, and the protected target.
+  A backslash-escaped backtick is literal text and
   opens no slot, so ``echo "- Test: \`${{ matrix.test }}\`"`` writes Markdown in a
   real `run:` block and stays editable. An executable heredoc is unaffected
   throughout: it is extracted and rescanned as its own program, where its lines
