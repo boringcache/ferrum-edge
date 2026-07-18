@@ -2997,8 +2997,9 @@ async fn deadline_replacement_strips_every_duplicate_backend_set_cookie_line() {
 
     // A real gateway hook must mutate `set-cookie`, otherwise no provenance is
     // recorded and the filter under test is never invoked at all.
-    let decorators: Vec<Arc<dyn Plugin>> =
-        vec![Arc::new(SessionCookieAppendingDecorator { cookie: GATEWAY })];
+    let decorators: Vec<Arc<dyn Plugin>> = vec![Arc::new(SessionCookieAppendingDecorator {
+        cookie: GATEWAY,
+    })];
     let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
 
     let mut ctx = create_grpc_context_with_timeout(None);
