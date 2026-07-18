@@ -5419,6 +5419,7 @@ impl CountryMmdbLoadSession {
         &self,
         path: &str,
     ) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
+        let path = path.trim();
         let path_key = PathBuf::from(path);
         let mut state = self.state.lock().map_err(|_| {
             CountryMmdbLoadError::Invalid(
@@ -8611,6 +8612,7 @@ impl GatewayConfig {
                     .get("db_path")
                     .and_then(serde_json::Value::as_str)
             })
+            .map(str::trim)
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
             .collect()
@@ -8635,6 +8637,7 @@ impl GatewayConfig {
             }
             if pc.plugin_name == "geo_restriction"
                 && let Some(db_path) = pc.config.get("db_path").and_then(|v| v.as_str())
+                && let db_path = db_path.trim()
                 && !db_path.is_empty()
                 && validated_paths.insert(db_path.to_string())
                 && let Err(e) = match generation {

@@ -1174,24 +1174,36 @@ fn country_mmdb_preload_required_for_scope(
     rebuild_globals: bool,
 ) -> bool {
     config.plugin_configs.iter().any(|plugin_config| {
-        if !country_mmdb_plugin_is_active(config, plugin_config) {
-            return false;
-        }
-        match &plugin_config.scope {
-            PluginScope::Global => rebuild_globals,
-            PluginScope::Proxy => plugin_config
-                .proxy_id
-                .as_ref()
-                .is_some_and(|proxy_id| proxy_ids_to_rebuild.contains(proxy_id)),
-            PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
-                proxy_ids_to_rebuild.contains(&proxy.id)
-                    && proxy
-                        .plugins
-                        .iter()
-                        .any(|association| association.plugin_config_id == plugin_config.id)
-            }),
-        }
+        country_mmdb_plugin_is_active(config, plugin_config)
+            && country_mmdb_plugin_is_in_rebuild_scope(
+                config,
+                plugin_config,
+                proxy_ids_to_rebuild,
+                rebuild_globals,
+            )
     })
+}
+
+fn country_mmdb_plugin_is_in_rebuild_scope(
+    config: &GatewayConfig,
+    plugin_config: &PluginConfig,
+    proxy_ids_to_rebuild: &HashSet<String>,
+    rebuild_globals: bool,
+) -> bool {
+    match &plugin_config.scope {
+        PluginScope::Global => rebuild_globals,
+        PluginScope::Proxy => plugin_config
+            .proxy_id
+            .as_ref()
+            .is_some_and(|proxy_id| proxy_ids_to_rebuild.contains(proxy_id)),
+        PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+            proxy_ids_to_rebuild.contains(&proxy.id)
+                && proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == plugin_config.id)
+        }),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3597,7 +3609,8 @@ impl PluginCache {
     /// `CountryMmdbLoadMode::NodeLocalRefresh` additionally rebuilds every
     /// active country MMDB instance for DP full snapshots whose CP source
     /// cannot hand off node-local validation snapshots. `PreloadedOnly`
-    /// forbids synchronous MMDB loading during an incremental async cache stage.
+    /// forbids synchronous MMDB loading during an incremental async cache stage
+    /// and refreshes only geo instances inside that stage's rebuild scope.
     /// Returns `Err` if any enabled plugin config cannot be resolved or fails
     /// validation during incremental update, matching the behavior of `rebuild()`.
     pub(crate) fn build_delta_inner(
@@ -3611,6 +3624,8 @@ impl PluginCache {
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
+        let restrict_country_mmdb_refresh_to_rebuild_scope =
+            matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
         let country_mmdb_load_session = match country_mmdb_load_mode {
             CountryMmdbLoadMode::NodeLocalRefresh if !paths.is_empty() => {
                 CountryMmdbLoadSession::for_node_local_refresh(&paths)?
@@ -3627,6 +3642,7 @@ impl PluginCache {
             removed_proxy_ids,
             rebuild_globals,
             &country_mmdb_load_session,
+            restrict_country_mmdb_refresh_to_rebuild_scope,
         )
     }
 
@@ -3662,6 +3678,7 @@ impl PluginCache {
             &[],
             false,
             &country_mmdb_load_session,
+            false,
         )
         .map(Some)
     }
@@ -3674,6 +3691,7 @@ impl PluginCache {
         removed_proxy_ids: &[String],
         rebuild_globals: bool,
         country_mmdb_load_session: &CountryMmdbLoadSession,
+        restrict_country_mmdb_refresh_to_rebuild_scope: bool,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let mut plugin_errors: Vec<String> = Vec::new();
@@ -3701,7 +3719,18 @@ impl PluginCache {
             .collect();
         let mut forced_country_mmdb_instances = CountryMmdbPluginInstanceMap::new();
         if force_country_mmdb_refresh {
-            for (id, plugin_config) in &active_country_mmdb_configs {
+            for (id, plugin_config) in active_country_mmdb_configs
+                .iter()
+                .filter(|(_, plugin_config)| {
+                    !restrict_country_mmdb_refresh_to_rebuild_scope
+                        || country_mmdb_plugin_is_in_rebuild_scope(
+                            config,
+                            plugin_config,
+                            &proxy_ids_to_rebuild,
+                            rebuild_globals,
+                        )
+                })
+            {
                 match try_create_plugin(
                     plugin_config,
                     config,
@@ -3723,16 +3752,15 @@ impl PluginCache {
                 }
             }
         }
-        let mut country_mmdb_instances = if force_country_mmdb_refresh {
-            forced_country_mmdb_instances.clone()
-        } else {
-            current
-                .country_mmdb_instances
-                .iter()
-                .filter(|(id, _)| active_country_mmdb_configs.contains_key(*id))
-                .map(|(id, plugin)| (id.clone(), Arc::clone(plugin)))
-                .collect()
-        };
+        let mut country_mmdb_instances: CountryMmdbPluginInstanceMap = current
+            .country_mmdb_instances
+            .iter()
+            .filter(|(id, _)| active_country_mmdb_configs.contains_key(*id))
+            .map(|(id, plugin)| (id.clone(), Arc::clone(plugin)))
+            .collect();
+        if force_country_mmdb_refresh {
+            country_mmdb_instances.extend(forced_country_mmdb_instances.clone());
+        }
         let forced_country_mmdb_instances =
             force_country_mmdb_refresh.then_some(&forced_country_mmdb_instances);
         let country_mmdb_replacements: HashMap<usize, Arc<dyn Plugin>> =
@@ -3950,7 +3978,11 @@ impl PluginCache {
                 {
                     return None;
                 }
-                if force_country_mmdb_refresh && pc.plugin_name == "geo_restriction" {
+                if pc.plugin_name == "geo_restriction"
+                    && forced_country_mmdb_instances.is_some_and(|forced| {
+                        forced.contains_key(&country_mmdb_plugin_id(pc))
+                    })
+                {
                     return None;
                 }
                 if same_proxy_group_plugin_config(&existing.config, pc) {
