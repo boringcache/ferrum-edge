@@ -817,6 +817,193 @@ async fn functional_cli_validate_reports_secret_sources_in_sorted_order() {
     );
 }
 
+/// The returned-error sanitizers cannot see a diagnostic that is never
+/// returned.
+///
+/// `FERRUM_TLS_EARLY_DATA_METHODS` is parsed inside `EnvConfig::from_env()`,
+/// which uppercases each token and `warn!`s about any non-`GET` one. That
+/// warning is written straight to the log sink on an **otherwise successful**
+/// `validate`: there is no `Err` for `redact_external_secret_values` to filter,
+/// so redaction has to happen where the record is serialized. The value is also
+/// uppercased before interpolation, so it shares no substring with the resolved
+/// value — exact-value matching alone would not catch it either.
+///
+/// Non-vacuous by construction: the sentinel is the only non-`GET` token, so
+/// the presence of the placeholder proves the warning fired and was filtered
+/// rather than never being emitted.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_redacts_resolved_value_in_startup_warning() {
+    const SENTINEL: &str = "ferrum-early-data-method-sentinel";
+
+    let temp_dir = TempDir::new().unwrap();
+    let jwt_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&jwt_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+    let methods_path = temp_dir.path().join("early-data-methods");
+    std::fs::write(&methods_path, SENTINEL).unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env("FERRUM_ADMIN_JWT_SECRET_FILE", jwt_path.to_str().unwrap())
+        .env(
+            "FERRUM_TLS_EARLY_DATA_METHODS_FILE",
+            methods_path.to_str().unwrap(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // A non-GET method is a warning, not a failure: this is the success path.
+    assert!(
+        output.status.success(),
+        "a non-GET early-data method must warn, not fail: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("FERRUM_TLS_EARLY_DATA_METHODS includes non-GET method"),
+        "the warning must still be emitted and actionable: {stderr}"
+    );
+    assert!(
+        stderr.contains("value from external secret source"),
+        "the warning must carry the withheld-value marker: {stderr}"
+    );
+    // Neither the resolved value nor the uppercased form the warning
+    // interpolates may appear on either stream.
+    let upper = SENTINEL.to_ascii_uppercase();
+    assert!(
+        !stderr.contains(SENTINEL)
+            && !stdout.contains(SENTINEL)
+            && !stderr.contains(&upper)
+            && !stdout.contains(&upper),
+        "an externally resolved value must not leak through a log record, \
+         in any case form: stdout={stdout}, stderr={stderr}"
+    );
+}
+
+/// Some validators echo a *transformed* form of the value, so matching the
+/// resolved value verbatim is not enough.
+///
+/// `FERRUM_CP_NAMESPACES` is parsed as `Vec<String>`, which splits on `,` and
+/// trims each entry, and `EnvConfig::validate()` then interpolates the trimmed
+/// **entry** into a hand-written error. The staged value carries leading
+/// whitespace that `read_secret` (which only trims the *trailing* end) leaves
+/// intact, so the resolved environment value and the echoed entry are different
+/// strings and only a derived candidate can match.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_redacts_transformed_list_entry() {
+    const ENTRY: &str = "ferrum-namespace-entry-sentinel!";
+
+    let temp_dir = TempDir::new().unwrap();
+    let jwt_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&jwt_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+    let namespaces_path = temp_dir.path().join("cp-namespaces");
+    // Leading whitespace survives `read_secret`'s trailing-only trim.
+    std::fs::write(&namespaces_path, format!("   {ENTRY}")).unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env("FERRUM_ADMIN_JWT_SECRET_FILE", jwt_path.to_str().unwrap())
+        .env(
+            "FERRUM_CP_NAMESPACES_FILE",
+            namespaces_path.to_str().unwrap(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "an invalid namespace entry must fail validation: stdout={stdout}, stderr={stderr}"
+    );
+    // The variable stays named, so the operator knows what to fix.
+    assert!(
+        stderr.contains("FERRUM_CP_NAMESPACES"),
+        "expected the namespace validation failure, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("value from external secret source"),
+        "expected the withheld-value marker, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains(ENTRY) && !stdout.contains(ENTRY),
+        "a trimmed form of an externally resolved value must not survive: \
+         stdout={stdout}, stderr={stderr}"
+    );
+}
+
+/// The settings path can itself come from an external secret source, and the
+/// resolved path must be installed *before* anything reads `ferrum.conf`.
+///
+/// `CONF_FILE_CACHE` is a process-wide `OnceLock` populated from whatever
+/// `FERRUM_CONF_PATH` says the first time any conf-file-aware lookup misses. If
+/// secret resolution itself performs such a lookup — as the fetch-timeout read
+/// used to — the cache is frozen on the default/discovered settings file before
+/// `FERRUM_CONF_PATH_FILE` is materialized, and the intended settings file is
+/// silently ignored for the rest of the process.
+///
+/// Non-vacuous by construction: `FERRUM_ADMIN_JWT_SECRET` is required in
+/// database mode and is supplied **only** by the resolved settings file, so
+/// `validate` can reach "Validation passed." only if that file was actually
+/// read. `FERRUM_CONF_PATH` is removed rather than set, which is the shape an
+/// operator using `FERRUM_CONF_PATH_FILE` has; the temp `current_dir` keeps
+/// `./ferrum.conf` discovery empty.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_uses_settings_path_from_file_secret_source() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let settings_path = temp_dir.path().join("resolved-ferrum.conf");
+    std::fs::write(
+        &settings_path,
+        "FERRUM_ADMIN_JWT_SECRET = settings-file-secret-with-well-over-32-bytes\n",
+    )
+    .unwrap();
+
+    let settings_pointer = temp_dir.path().join("settings-path-source");
+    std::fs::write(&settings_pointer, settings_path.to_str().unwrap()).unwrap();
+
+    let mut cmd = Command::new(binary_abs_path());
+    cmd.args(["validate"]);
+    apply_hermetic_validate_env(&mut cmd, &temp_dir);
+    // The hermetic helper pins an empty settings file; this test is precisely
+    // about the path being resolved instead of pre-set.
+    cmd.env_remove("FERRUM_CONF_PATH");
+    cmd.env("FERRUM_CONF_PATH_FILE", settings_pointer.to_str().unwrap());
+
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "the settings file resolved from FERRUM_CONF_PATH_FILE must be the one \
+         validated: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(stdout.contains("Validation passed."));
+    assert!(
+        stdout.contains("Loaded FERRUM_CONF_PATH from file"),
+        "the settings path must be reported as an externally resolved source: {stdout}"
+    );
+    // The resolved value here is a path, and a source reference is as sensitive
+    // as the value it points at.
+    assert!(
+        !stdout.contains(settings_pointer.to_str().unwrap())
+            && !stderr.contains(settings_pointer.to_str().unwrap()),
+        "source references must never be reported: stdout={stdout}, stderr={stderr}"
+    );
+}
+
 // ── run ─────────────────────────────────────────────────────────────────────
 
 #[ignore]

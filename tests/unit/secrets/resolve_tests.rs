@@ -425,6 +425,139 @@ fn test_resolve_all_env_secrets_ignores_empty_cloud_suffixes() {
     );
 }
 
+/// Unsupported-suffix discovery iterates `std::env::vars()`, whose order varies
+/// between processes, so returning on the first sighting would let two runs on
+/// an identical environment blame a different variable. Failures are collected
+/// and sorted, and the lexicographically first key is reported.
+///
+/// Only meaningful in a build without the cloud features — with them compiled
+/// in there is no unsupported suffix to order.
+#[cfg(not(any(
+    feature = "secrets-aws",
+    feature = "secrets-gcp",
+    feature = "secrets-azure"
+)))]
+#[test]
+fn test_resolve_all_env_secrets_reports_first_unsupported_suffix_deterministically() {
+    with_env_vars_async(
+        &[
+            // Staged in reverse of the expected order.
+            ("FERRUM_TEST_SECRET_ZULU_UNSUPPORTED_GCP", "projects/x/y"),
+            ("FERRUM_TEST_SECRET_ALPHA_UNSUPPORTED_AWS", "arn:aws:x"),
+            ("FERRUM_TEST_SECRET_MIKE_UNSUPPORTED_AZURE", "https://v/s/n"),
+        ],
+        || async {
+            let err = match resolve_all_env_secrets().await {
+                Ok(_) => panic!("expected unsupported cloud suffixes to fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("FERRUM_TEST_SECRET_ALPHA_UNSUPPORTED_AWS"),
+                "the lexicographically first offending key must be reported, got: {err}"
+            );
+            assert!(
+                !err.contains("FERRUM_TEST_SECRET_MIKE_UNSUPPORTED_AZURE")
+                    && !err.contains("FERRUM_TEST_SECRET_ZULU_UNSUPPORTED_GCP"),
+                "only the first offending key is reported, got: {err}"
+            );
+        },
+    );
+}
+
+/// A `_FILE` source can point at a FIFO with no writer, where the read blocks
+/// uninterruptibly. `tokio::time::timeout` around a `spawn_blocking` handle
+/// returns on schedule but does not stop the blocking task, and **dropping the
+/// runtime then waits for the blocking pool** — so the timeout was honored and
+/// the process hung anyway at runtime teardown. That made `validate`
+/// non-hermetic for exactly the bad local source it exists to catch.
+///
+/// This test must not be able to hang CI itself, so the whole resolve — runtime
+/// build, `block_on`, *and the runtime drop* — happens on a worker thread that
+/// the test body joins with a bounded `recv_timeout`. A regression fails the
+/// test loudly instead of parking the suite.
+///
+/// The env vars are set and left in place for the worker (which only reads
+/// them) and are cleared after the bounded wait; `ENV_LOCK` is held throughout.
+#[cfg(unix)]
+#[test]
+fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const FETCH_TIMEOUT_SECS: u64 = 2;
+    // Generous multiple of the fetch timeout: enough that a slow runner cannot
+    // flake, far below anything that looks like a hang.
+    const WATCHDOG: Duration = Duration::from_secs(30);
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("blocked-secret");
+    let created = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !created {
+        eprintln!("skipping: mkfifo unavailable");
+        return;
+    }
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    // SAFETY: ENV_LOCK is held for the whole test, including the worker thread.
+    unsafe {
+        std::env::set_var("FERRUM_TEST_SECRET_BLOCKED_FILE", &fifo);
+        // Read from the environment only — startup resolution deliberately does
+        // not consult `ferrum.conf`, so no settings file is needed here.
+        std::env::set_var(
+            "FERRUM_SECRET_FETCH_TIMEOUT_SECONDS",
+            FETCH_TIMEOUT_SECS.to_string(),
+        );
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(resolve_all_env_secrets())
+            // `rt` is dropped here. With a `spawn_blocking` read this is where
+            // the process parks forever; the send below would never happen.
+        };
+        let _ = sender.send((result, started.elapsed()));
+    });
+
+    let received = receiver.recv_timeout(WATCHDOG);
+
+    // SAFETY: ENV_LOCK is still held.
+    unsafe {
+        std::env::remove_var("FERRUM_TEST_SECRET_BLOCKED_FILE");
+        std::env::remove_var("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS");
+    }
+
+    let (result, elapsed) = received.expect(
+        "resolution and runtime teardown must complete; a blocked _FILE read \
+         must not be waited on",
+    );
+    let err = match result {
+        Ok(_) => panic!("a FIFO with no writer must not resolve"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("Timeout resolving FERRUM_TEST_SECRET_BLOCKED"),
+        "expected a fetch timeout naming the base key, got: {err}"
+    );
+    assert!(
+        !err.contains(fifo.to_str().unwrap()),
+        "the source reference must not be disclosed, got: {err}"
+    );
+    assert!(
+        elapsed < WATCHDOG,
+        "resolution must be bounded by the fetch timeout, took {elapsed:?}"
+    );
+}
+
 #[test]
 fn test_resolve_secret_rejects_unsupported_cloud_suffixes() {
     with_env_vars_async(

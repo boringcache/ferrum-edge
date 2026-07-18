@@ -305,7 +305,13 @@ pub fn execute_validate() -> Result<(), String> {
             return Err(format!("Port conflict errors:\n  {}", errors.join("\n  ")));
         }
 
-        println!("Spec ({}): OK", config_path);
+        // `FERRUM_FILE_CONFIG_PATH` can itself be materialized from an external
+        // secret source, and this `println!` bypasses the tracing sink's
+        // emission-boundary redaction. Filter it the same way.
+        println!(
+            "Spec ({}): OK",
+            crate::secrets::redact_external_secret_values(config_path)
+        );
         println!("  Proxies: {}", config.proxies.len());
         println!("  Consumers: {}", config.consumers.len());
         println!("  Upstreams: {}", config.upstreams.len());

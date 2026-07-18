@@ -39,35 +39,108 @@ const REDACTED_REFERENCE: &str = "<redacted source reference>";
 /// removed here as well. This is the single boundary every startup fetch passes
 /// through, so a new backend cannot bypass it.
 ///
-/// Both the full reference and its pre-`#` path half are replaced, longest
-/// first, so a `path#field` reference cannot leak its path. Very short
-/// references are left alone: they carry no meaningful location and replacing a
-/// one- or two-character substring would corrupt unrelated text.
+/// The full reference, its pre-`#` path half, and every provider-normalized
+/// component the fetch was actually issued with are replaced, longest first, so
+/// a `path#field` reference cannot leak its path and a rewritten reference
+/// cannot leak through the rewrite. Very short candidates are left alone: they
+/// carry no meaningful location and replacing a one- or two-character substring
+/// would corrupt unrelated text.
 fn redact_source_reference(mut error: String, reference: &str) -> String {
     const MIN_REDACTABLE_REFERENCE_LEN: usize = 3;
 
-    let mut candidates = vec![reference];
-    if let Some((path, _field)) = reference.split_once('#') {
-        candidates.push(path);
-    }
+    let mut candidates = source_reference_candidates(reference);
+    candidates.sort_unstable();
+    candidates.dedup();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.len()));
 
     for candidate in candidates {
-        if candidate.len() >= MIN_REDACTABLE_REFERENCE_LEN && error.contains(candidate) {
-            error = error.replace(candidate, REDACTED_REFERENCE);
+        if candidate.len() >= MIN_REDACTABLE_REFERENCE_LEN && error.contains(&candidate) {
+            error = error.replace(&candidate, REDACTED_REFERENCE);
         }
     }
     error
 }
 
+/// Every string form of a source reference that a backend error can plausibly
+/// echo.
+///
+/// The original reference is not always what the provider was asked for. Azure
+/// is the case that forces this: `parse_keyvault_reference` splits a Key Vault
+/// URL into `(vault_url, secret_name)` and deliberately *drops* a trailing
+/// `/<version>` segment, so a versioned reference like
+/// `https://vault/secrets/name/v1` produces a request against
+/// `https://vault` for `name`. An SDK error echoing that requested URL or
+/// secret name matches neither the versioned original nor its pre-`#` half, and
+/// would otherwise reach the operator intact. Adding the parsed components —
+/// and their recombined `<vault_url>/secrets/<secret_name>` form, so the
+/// longest-first pass replaces it as one span — closes that without touching
+/// reference parsing itself.
+///
+/// Parsing is attempted on every reference and simply yields nothing for the
+/// other providers: a Vault path, a GCP resource name, and an ARN are all
+/// rejected by URL-with-host parsing, so no spurious candidate is produced.
+fn source_reference_candidates(reference: &str) -> Vec<String> {
+    let mut candidates = vec![reference.to_string()];
+    if let Some((path, _field)) = reference.split_once('#') {
+        candidates.push(path.to_string());
+    }
+
+    #[cfg(feature = "secrets-azure")]
+    {
+        // The `key` argument only shapes the parse error, which is discarded.
+        // Both the reference and its pre-`#` half are parsed, because the Key
+        // Vault reference an operator writes may carry a `#` suffix that the
+        // URL parser would otherwise fold into the fragment.
+        let bases: Vec<String> = candidates.clone();
+        for base in bases {
+            if let Ok((vault_url, secret_name)) = azure::parse_keyvault_reference(&base, "") {
+                candidates.push(format!("{vault_url}/secrets/{secret_name}"));
+                candidates.push(vault_url);
+                candidates.push(secret_name);
+            }
+        }
+    }
+
+    candidates
+}
+
 /// Default timeout (seconds) for individual secret fetch operations from cloud backends.
 const DEFAULT_SECRET_FETCH_TIMEOUT_SECS: u64 = 30;
 
-/// Read the secret fetch timeout from `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` env var,
-/// falling back to the default. Called before EnvConfig is parsed (secrets are
-/// resolved first), so this reads the env var directly.
+/// Read the secret fetch timeout for the *runtime* single-key paths
+/// ([`resolve_secret`], [`resolve_external_reference`]), which run long after
+/// settings are loaded and where the conf file is a legitimate source.
 fn secret_fetch_timeout() -> Duration {
-    let secs = crate::config::conf_file::resolve_ferrum_var("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS")
+    parse_fetch_timeout(crate::config::conf_file::resolve_ferrum_var(
+        "FERRUM_SECRET_FETCH_TIMEOUT_SECONDS",
+    ))
+}
+
+/// Read the secret fetch timeout for startup resolution, from the process
+/// environment **only**.
+///
+/// Startup resolution runs before `ferrum.conf` is read, and must keep it that
+/// way. The conf-file-aware resolver initializes the process-wide
+/// `CONF_FILE_CACHE` on first miss, and that cache is populated from whatever
+/// `FERRUM_CONF_PATH` says *at that moment*. Consulting it here would prime the
+/// cache from the default/discovered settings file before
+/// [`resolve_all_env_secrets`] has had a chance to materialize
+/// `FERRUM_CONF_PATH_FILE` into `FERRUM_CONF_PATH` — so an operator who sources
+/// the settings path itself from an external secret would have the resolved
+/// path installed into an already-populated cache and silently ignored by
+/// `validate` and by the gateway for the rest of the process.
+///
+/// The documented `env > conf file` precedence is therefore deliberately narrowed
+/// for this one variable at this one stage: to change the startup fetch timeout,
+/// set `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` in the environment. A `ferrum.conf`
+/// value still applies to the runtime single-key fetches above. See
+/// `docs/configuration.md`.
+fn startup_secret_fetch_timeout() -> Duration {
+    parse_fetch_timeout(std::env::var("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS").ok())
+}
+
+fn parse_fetch_timeout(raw: Option<String>) -> Duration {
+    let secs = raw
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_SECRET_FETCH_TIMEOUT_SECS);
     Duration::from_secs(secs)
@@ -366,6 +439,12 @@ fn unsupported_cloud_suffix_for_base_key(key: &str) -> Option<(&'static str, &'s
 
 pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     let mut to_resolve: HashMap<String, Vec<(String, String, BackendKind)>> = HashMap::new();
+    // Collected rather than returned on first sight: `std::env::vars()` order
+    // varies between processes, so returning inside the loop would let two
+    // runs on an identical environment blame a different `FERRUM_*_AWS`/`_GCP`
+    // key. Sorted and reported after discovery, matching the determinism the
+    // rest of `ResolvedEnvSecrets` already guarantees.
+    let mut unsupported: Vec<(String, &'static str, &'static str)> = Vec::new();
 
     for (raw_key, value) in std::env::vars() {
         if !raw_key.starts_with(FERRUM_PREFIX) {
@@ -378,10 +457,8 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             continue;
         }
         if let Some((suffix, backend_name)) = unsupported_cloud_suffix(&raw_key) {
-            return Err(format!(
-                "Unsupported secret suffix {} on {}: {} support is not enabled in this build.",
-                suffix, raw_key, backend_name
-            ));
+            unsupported.push((raw_key.clone(), suffix, backend_name));
+            continue;
         }
         if let Some((backend, base_key)) = match_suffix(&raw_key) {
             if base_key.is_empty() {
@@ -393,6 +470,18 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
                 backend.kind(),
             ));
         }
+    }
+
+    // Fail closed on an unsupported suffix before anything is fetched, naming
+    // the lexicographically first offending variable so the message is
+    // identical across processes with the same environment.
+    if !unsupported.is_empty() {
+        unsupported.sort_by(|left, right| left.0.cmp(&right.0));
+        let (raw_key, suffix, backend_name) = &unsupported[0];
+        return Err(format!(
+            "Unsupported secret suffix {} on {}: {} support is not enabled in this build.",
+            suffix, raw_key, backend_name
+        ));
     }
 
     let mut pending: Vec<PendingSecret> = Vec::new();
@@ -441,7 +530,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
         });
     }
 
-    let fetch_timeout = secret_fetch_timeout();
+    let fetch_timeout = startup_secret_fetch_timeout();
 
     let mut results = ResolvedEnvSecrets {
         vars: Vec::new(),
@@ -648,19 +737,52 @@ impl SecretBackend for FileBackend {
         format!("file:{}", reference)
     }
 
+    /// Read the file on a **detached OS thread**, not `spawn_blocking`.
+    ///
+    /// A `_FILE` source can be a FIFO with no writer or a stalled network
+    /// mount, where `open`/`read` blocks indefinitely and is not interruptible.
+    /// `tokio::time::timeout` around a `spawn_blocking` join handle returns on
+    /// schedule but does not stop the blocking task, and dropping the runtime
+    /// waits for its blocking pool to quiesce — so the caller's timeout was
+    /// honored and the process then hung anyway, at runtime shutdown. That is
+    /// exactly the bad local source `validate` exists to catch, and it made the
+    /// new `validate` path unbounded.
+    ///
+    /// A detached thread is owned by no runtime: the timeout drops the receiver
+    /// and returns, the temporary startup runtime drops immediately, and the
+    /// process is free to exit — Rust does not join detached threads at exit.
+    ///
+    /// **Residual, deliberate and bounded:** the abandoned thread stays parked
+    /// in the kernel until the read completes or the process exits. Startup
+    /// treats a fetch timeout as fatal, so `run`/`validate` leak at most one
+    /// thread per configured `_FILE` source in the one run that is about to
+    /// exit non-zero. There is no path that leaks per request or in a loop.
     async fn resolve_one(&self, reference: &str, key: &str) -> Result<String, String> {
         let reference = reference.to_string();
         let key = key.to_string();
         let key_for_error = key.clone();
 
-        tokio::task::spawn_blocking(move || file::read_secret(&reference, &key))
-            .await
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("ferrum-secret-file".to_string())
+            .spawn(move || {
+                // The receiver is gone when the caller timed out; the result is
+                // then simply dropped.
+                let _ = sender.send(file::read_secret(&reference, &key));
+            })
             .map_err(|err| {
                 format!(
-                    "Blocking file secret read task failed for {}: {}",
+                    "Failed to start file secret read thread for {}: {}",
                     key_for_error, err
                 )
-            })?
+            })?;
+
+        receiver.await.map_err(|_| {
+            format!(
+                "File secret read for {} ended without producing a result",
+                key_for_error
+            )
+        })?
     }
 }
 
@@ -929,6 +1051,68 @@ mod tests {
         assert!(match_suffix("FERRUM_DB_URL_file").is_none());
         assert!(match_suffix("FERRUM_DB_URL_vault").is_none());
         assert!(match_suffix("FERRUM_DB_URL_aws").is_none());
+    }
+
+    /// A source reference is not always what the provider was asked for.
+    ///
+    /// `parse_keyvault_reference` drops a trailing `/<version>` segment, so a
+    /// versioned reference produces a request against the bare vault URL for
+    /// the bare secret name. An SDK error echoing *that* matches neither the
+    /// versioned original nor its pre-`#` half, so redacting only the operator's
+    /// string would let the vault URL and secret name through intact.
+    ///
+    /// Kept inline because `redact_source_reference` is private and the whole
+    /// point of the boundary is that no caller can bypass it; exercising it
+    /// externally would mean widening the API it exists to constrain.
+    #[cfg(feature = "secrets-azure")]
+    #[test]
+    fn redact_source_reference_covers_azure_normalized_components() {
+        const REFERENCE: &str =
+            "https://ferrum-vault-sentinel.vault.azure.net:8443/secrets/jwt-name-sentinel/v9abc";
+        // Shaped like an `azure_core` transport error, which echoes the URL it
+        // actually issued — version segment absent — plus the secret name.
+        let sdk_error = "Failed to get Azure secret for FERRUM_ADMIN_JWT_SECRET: \
+             HTTP 404 from https://ferrum-vault-sentinel.vault.azure.net:8443\
+             /secrets/jwt-name-sentinel?api-version=7.4 (secret 'jwt-name-sentinel' \
+             in https://ferrum-vault-sentinel.vault.azure.net:8443)"
+            .to_string();
+
+        let redacted = redact_source_reference(sdk_error, REFERENCE);
+
+        assert!(
+            !redacted.contains("ferrum-vault-sentinel")
+                && !redacted.contains("jwt-name-sentinel")
+                && !redacted.contains("vault.azure.net"),
+            "normalized Azure components must not survive redaction: {redacted}"
+        );
+        // Base key and failure class stay actionable.
+        assert!(
+            redacted.contains("FERRUM_ADMIN_JWT_SECRET") && redacted.contains("404"),
+            "redaction must keep the actionable parts: {redacted}"
+        );
+        assert!(
+            redacted.contains(REDACTED_REFERENCE),
+            "expected the placeholder to be present: {redacted}"
+        );
+    }
+
+    /// Non-Azure references must not gain spurious candidates from the Azure
+    /// parse attempt, which would over-redact unrelated diagnostics.
+    #[test]
+    fn source_reference_candidates_ignores_non_url_references() {
+        for reference in [
+            "secret/data/ferrum#admin_jwt",
+            "projects/p/secrets/s/versions/latest",
+            "arn:aws:secretsmanager:us-east-1:1:secret:ferrum",
+            "/run/secrets/admin-jwt",
+        ] {
+            let candidates = source_reference_candidates(reference);
+            assert!(
+                candidates.len() <= 2,
+                "{reference} produced unexpected candidates: {candidates:?}"
+            );
+            assert!(candidates.contains(&reference.to_string()));
+        }
     }
 
     #[test]

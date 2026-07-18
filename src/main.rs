@@ -143,7 +143,15 @@ fn emit_bootstrap_error(message: &str, fields: &[(&str, String)]) {
         serde_json::Value::String(message.to_string()),
     );
     for (key, value) in fields {
-        event.insert((*key).to_string(), serde_json::Value::String(value.clone()));
+        // This writer bypasses the tracing sink, so it also bypasses the
+        // emission-boundary redaction in `RecordWriter::submit`. Bootstrap
+        // errors raised *after* secret resolution succeeded (a logging-init
+        // failure on an externally resolved `FERRUM_LOG_*` value, say) would
+        // otherwise echo the fetched value; before it, this is a no-op.
+        event.insert(
+            (*key).to_string(),
+            serde_json::Value::String(secrets::redact_external_secret_values(value)),
+        );
     }
 
     let mut stderr = std::io::stderr().lock();

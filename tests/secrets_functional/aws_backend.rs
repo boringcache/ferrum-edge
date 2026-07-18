@@ -150,15 +150,31 @@ async fn aws_missing_json_field_errors() {
         .expect("seed json secret");
 
     set_aws_env(&guard, &ls.endpoint);
-    guard.set("FERRUM_ADMIN_JWT_SECRET_AWS", "ferrum/json#missing");
+    // A distinctive absent field name, so the absence assertion below cannot
+    // pass by accident on a common English word.
+    const ABSENT_FIELD: &str = "ferrum-absent-json-field-sentinel";
+    guard.set(
+        "FERRUM_ADMIN_JWT_SECRET_AWS",
+        &format!("ferrum/json#{ABSENT_FIELD}"),
+    );
 
     let err = resolve_all_env_secrets()
         .await
         .err()
         .expect("missing JSON field must fail");
+    // The failure class and the base key are the actionable parts and are kept.
     assert!(
-        err.contains("missing") && err.contains("does not contain"),
-        "error should name the missing field, got: {err}"
+        err.contains("does not contain the requested key")
+            && err.contains("FERRUM_ADMIN_JWT_SECRET"),
+        "error must stay actionable at base-key + failure-class level, got: {err}"
+    );
+    // The requested JSON field and the secret id are both parts of the source
+    // reference, which is as sensitive as the value it points at. Naming the
+    // field would also confirm which keys a secret does *not* have to anyone
+    // who can read startup output.
+    assert!(
+        !err.contains(ABSENT_FIELD) && !err.contains("ferrum/json"),
+        "error must not disclose the source reference or requested field, got: {err}"
     );
 }
 

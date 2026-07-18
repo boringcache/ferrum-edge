@@ -544,6 +544,25 @@ impl RecordWriter {
             return EnqueueResult::RecordTooLarge;
         }
 
+        // Emission boundary for externally resolved secret values. This is the
+        // one place a tracing record exists as complete bytes before it leaves
+        // the process, so it is where a `warn!`/`info!` emitted *during*
+        // config parsing — which never passes through a returned `Result` and
+        // so is untouched by the sanitizers on the `validate`/`run` error
+        // paths — stops echoing a value fetched from `_FILE`/`_VAULT`/`_AWS`/
+        // `_AZURE`/`_GCP`. Costs one relaxed atomic load when no external
+        // secret was resolved, which is every process that does not use them.
+        crate::secrets::redact_log_record(&mut self.bytes);
+        if self.bytes.len() > self.sink.state.options.max_record_bytes {
+            // Substitution can grow a record past the admission bound. Drop it
+            // through the existing oversized path (counted in
+            // `oversized_dropped`) rather than enqueueing a payload the byte
+            // reservation did not cover: losing one diagnostic is acceptable,
+            // breaking the reservation invariant or printing the secret is not.
+            self.discard_oversized();
+            return EnqueueResult::RecordTooLarge;
+        }
+
         // Vec growth can retain substantially more capacity than its length.
         // Convert to an exact-sized allocation before enqueueing so the byte
         // reservation remains a hard bound on retained queue payloads.
