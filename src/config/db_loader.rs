@@ -30,7 +30,7 @@ use crate::config::types::{
 };
 use crate::config::validation_pipeline::{
     ConfigValidationRejection, ValidationAction, ValidationPipeline,
-    collect_rejecting_runtime_config_errors,
+    collect_rejecting_runtime_config_errors, validate_plugin_file_dependencies_off_thread,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -50,11 +50,11 @@ use uuid::Uuid;
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, IncrementalResult,
-    MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend,
-    NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
-    SnapshotDataIntegrityError, SortOrder, TcpConnectionThrottleAttachmentConflict,
-    extract_db_hostname, redact_url,
+    ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
+    IncrementalResult, MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict,
+    NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts, NamespacedResourceId,
+    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
+    TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
 };
 
 const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
@@ -1979,6 +1979,17 @@ impl DatabaseStore {
 
     /// Load the full gateway configuration from the database.
     pub async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
+        self.load_full_config_for_purpose(namespace, FullConfigLoadPurpose::Runtime)
+            .await
+    }
+
+    /// Load the full gateway configuration for a runtime, control-plane, or
+    /// export consumer. Only runtime loads retain node-local plugin snapshots.
+    pub async fn load_full_config_for_purpose(
+        &self,
+        namespace: &str,
+        purpose: FullConfigLoadPurpose,
+    ) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
         // Capture timestamp before queries so the incremental polling safety
         // margin covers the full load duration.
@@ -2083,8 +2094,11 @@ impl DatabaseStore {
             .validate_unique_consumer_identities(ValidationAction::Warn)
             .validate_unique_consumer_credentials(ValidationAction::Warn)
             .validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn)
-            .validate_plugin_file_dependencies(ValidationAction::Warn)
             .run()?;
+        if purpose.loads_node_local_plugin_files() {
+            config = validate_plugin_file_dependencies_off_thread(config, ValidationAction::Warn)
+                .await?;
+        }
 
         // Hot-path isolation: strip api_spec_id from runtime config. The row
         // mappers preserve api_spec_id so admin GET/list paths can serialise
@@ -8229,8 +8243,19 @@ impl DatabaseBackend for DatabaseStore {
         self.backend_allow_ips = policy;
     }
 
-    async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
-        DatabaseStore::load_full_config(self, namespace).await
+    async fn load_full_config_for_purpose(
+        &self,
+        namespace: &str,
+        purpose: FullConfigLoadPurpose,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        match purpose {
+            FullConfigLoadPurpose::Runtime => {
+                DatabaseStore::load_full_config(self, namespace).await
+            }
+            FullConfigLoadPurpose::ControlPlane | FullConfigLoadPurpose::BackupExport => {
+                DatabaseStore::load_full_config_for_purpose(self, namespace, purpose).await
+            }
+        }
     }
 
     async fn load_namespace_snapshot(

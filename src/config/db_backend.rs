@@ -472,6 +472,16 @@ pub fn is_mtls_dns_identity_conflict(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<MtlsDnsIdentityConflict>())
 }
 
+/// Borrow the typed conflict itself so responders can render *its* `Display`
+/// rather than the anyhow chain's outermost message. Classification matches
+/// anywhere in the chain, so rendering the outermost error would echo any
+/// driver-provided context a future caller attaches above the conflict.
+pub fn mtls_dns_identity_conflict(error: &anyhow::Error) -> Option<&MtlsDnsIdentityConflict> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<MtlsDnsIdentityConflict>())
+}
+
 /// A datastore-serialized candidate would leave an enabled
 /// `tcp_connection_throttle` attached only to unsupported protocols (global
 /// scope) or directly attached to an unsupported proxy (proxy/proxy-group
@@ -864,6 +874,26 @@ impl std::error::Error for DeleteAllResourcesError {
     }
 }
 
+/// Why a full configuration is being loaded.
+///
+/// Only runtime loads are immediately followed by a `PluginCache` build, so
+/// only they may validate node-local plugin files and retain their immutable
+/// snapshots for that build. Control-plane distribution and backup exports
+/// validate portable configuration only; opening a data-plane-local MMDB there
+/// would waste up to the full aggregate budget and leave no cache consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullConfigLoadPurpose {
+    Runtime,
+    ControlPlane,
+    BackupExport,
+}
+
+impl FullConfigLoadPurpose {
+    pub fn loads_node_local_plugin_files(self) -> bool {
+        matches!(self, Self::Runtime)
+    }
+}
+
 /// Unified database backend trait.
 ///
 /// This trait defines all operations needed by the admin API, operating modes,
@@ -935,8 +965,18 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     // Full config loading
     // -----------------------------------------------------------------------
 
-    /// Load the full gateway configuration from the database.
-    async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error>;
+    /// Load the full gateway configuration for a specific consumer.
+    async fn load_full_config_for_purpose(
+        &self,
+        namespace: &str,
+        purpose: FullConfigLoadPurpose,
+    ) -> Result<GatewayConfig, anyhow::Error>;
+
+    /// Load a runtime configuration that will immediately build proxy caches.
+    async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
+        self.load_full_config_for_purpose(namespace, FullConfigLoadPurpose::Runtime)
+            .await
+    }
 
     /// Load a namespace's resources for a rollback snapshot WITHOUT running the
     /// semantic validation pipeline that [`load_full_config`](Self::load_full_config)

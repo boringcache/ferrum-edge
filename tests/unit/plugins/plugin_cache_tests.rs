@@ -76,6 +76,10 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "access_control" => json!({"allowed_consumers": ["testuser"]}),
         "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
         "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
+        "geo_restriction" => json!({
+            "db_path": "/nonexistent/GeoIP2-Country.mmdb",
+            "allow_countries": ["US"]
+        }),
         "rate_limiting" => json!({
             "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
         }),

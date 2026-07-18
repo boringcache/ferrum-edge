@@ -53,7 +53,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // `ctx.listen_port`, so stamping the app port here lets a port-scoped
     // AuthorizationPolicy DENY on the real service port be enforced.
     let app_port = proxy.backend_port;
-    let client_ip = remote_addr.ip().to_string();
+    let client_ip = remote_addr.ip().to_canonical().to_string();
     let backend_target = entry.backend_addr.to_string();
 
     // Run the L4 stream plugin chain (mesh `on_stream_connect` hooks: authz,

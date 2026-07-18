@@ -452,7 +452,7 @@ Given all built-in plugins enabled, the execution order is:
 | 4 | `request_termination` | 125 | on_request_received |
 | 5 | `mesh_outbound_registry` | 130 | on_request_received |
 | 6 | `ip_restriction` | 150 | on_request_received, on_stream_connect |
-| 7 | `geo_restriction` | 175 | on_request_received, on_stream_connect, before_proxy |
+| 7 | `geo_restriction` | 175 | on_request_received, on_stream_connect |
 | 8 | `bot_detection` | 200 | on_request_received |
 | 9 | `spec_expose` | 210 | on_request_received |
 | 10 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body |

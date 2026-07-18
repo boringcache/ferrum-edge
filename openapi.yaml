@@ -6398,10 +6398,12 @@ components:
           description: |
             Maximum allowed response amplification factor for UDP proxies.
             When set, backend→client datagrams are dropped if their size exceeds
-            `last_request_size * factor`. Protects against UDP amplification
-            attacks (e.g., spoofed-source reflection). When omitted (default),
-            no per-datagram amplification cap is applied. Only applicable for
-            `udp` / `dtls` proxies.
+            `payload_size * factor`. A zero-length request receives an explicit
+            one-byte reply allowance so it cannot black-hole the session;
+            nonempty requests retain the exact configured payload ratio. This
+            protects against UDP amplification attacks (e.g., spoofed-source
+            reflection). When omitted (default), no per-datagram amplification
+            cap is applied. Only applicable for `udp` / `dtls` proxies.
         allowed_methods:
           oneOf:
             - type: array
@@ -18758,26 +18760,57 @@ components:
 
     GeoRestrictionConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: geo_restriction — country-level access control backed by a
-        MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is mmap'd at
-        construction time for zero-copy lookups; the file dependency is
-        validated per-mode (fatal in file mode, warn in db mode, skipped on
-        the data plane so a missing file degrades to `on_lookup_failure`
-        instead of rejecting the whole config). `allow_countries` and
-        `deny_countries` are mutually exclusive; at least one must be
-        non-empty. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
+        MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is fully verified
+        and loaded into bounded owned immutable memory at construction. Files
+        larger than 512 MiB, aggregate verified MMDB content above 512 MiB per
+        validation generation/cache build, and records containing unsupported
+        country codes are rejected before publication. File dependency
+        validation is fatal in file mode and warns for absent/unreadable files
+        in database mode. CP performs structure-only validation without opening
+        node-local files; DP validates and refreshes its node-local files for
+        full snapshots and affected incremental rebuilds. On runtime nodes that
+        construct the plugin, a missing file uses
+        `on_lookup_failure`, while a readable corrupt, incompatible, or
+        wrong-product database is rejected.
+        Exactly one of `allow_countries` and `deny_countries` must be non-empty.
+        Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
       required: [db_path]
+      oneOf:
+        - title: Allow-list mode
+          required: [allow_countries]
+          properties:
+            allow_countries:
+              minItems: 1
+            deny_countries:
+              maxItems: 0
+        - title: Deny-list mode
+          required: [deny_countries]
+          properties:
+            allow_countries:
+              maxItems: 0
+            deny_countries:
+              minItems: 1
       properties:
         db_path:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: >-
-            Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database.
-            Required.
+            Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database no
+            larger than 512 MiB. Across one validation generation/cache build,
+            the verified sizes of all distinct content snapshots must also total
+            no more than 512 MiB; equivalent path spellings with identical
+            verified content are charged once. A changed candidate overlaps the live snapshot;
+            when their combined size exceeds 512 MiB, hot replacement is
+            rejected and the installed database must be loaded by restarting
+            the gateway. Required.
         allow_countries:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/GeoRestrictionCountryCode"
           default: []
           description: >-
             ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
@@ -18786,7 +18819,7 @@ components:
         deny_countries:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/GeoRestrictionCountryCode"
           default: []
           description: >-
             ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
@@ -18798,7 +18831,12 @@ components:
           description: >-
             When true, inject the resolved country code into the proxied
             request as the `x-geo-country` header (uppercase ISO 3166-1
-            alpha-2). HTTP-family proxies only — ignored on TCP/UDP streams.
+            alpha-2). Central header materialization strips any client-supplied
+            value even when no geo plugin is attached. The header remains
+            absent on fail-open lookup paths unless an earlier geo instance
+            already emitted an authoritative value; later non-injecting
+            instances preserve that value. HTTP-family proxies only — ignored
+            on TCP/UDP streams.
         on_lookup_failure:
           type: string
           enum: [allow, deny]
@@ -18812,6 +18850,17 @@ components:
             disables the geo gate. Set this explicitly to `deny` for fail-closed
             behaviour. When the default is used, a one-time warning is logged at
             startup, and the first request-time fail-open is logged at warn.
+
+    GeoRestrictionCountryCode:
+      type: string
+      minLength: 2
+      maxLength: 2
+      pattern: '^(?:[Aa][DdEeFfGgIiLlMmOoQqRrSsTtUuWwXxZz]|[Bb][AaBbDdEeFfGgHhIiJjLlMmNnOoQqRrSsTtVvWwYyZz]|[Cc][AaCcDdFfGgHhIiKkLlMmNnOoRrUuVvWwXxYyZz]|[Dd][EeJjKkMmOoZz]|[Ee][CcEeGgHhRrSsTt]|[Ff][IiJjKkMmOoRr]|[Gg][AaBbDdEeFfGgHhIiLlMmNnPpQqRrSsTtUuWwYy]|[Hh][KkMmNnRrTtUu]|[Ii][DdEeLlMmNnOoQqRrSsTt]|[Jj][EeMmOoPp]|[Kk][EeGgHhIiMmNnPpRrWwYyZz]|[Ll][AaBbCcIiKkRrSsTtUuVvYy]|[Mm][AaCcDdEeFfGgHhKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz]|[Nn][AaCcEeFfGgIiLlOoPpRrUuZz]|[Oo][Mm]|[Pp][AaEeFfGgHhKkLlMmNnRrSsTtWwYy]|[Qq][Aa]|[Rr][EeOoSsUuWw]|[Ss][AaBbCcDdEeGgHhIiJjKkLlMmNnOoRrSsTtVvXxYyZz]|[Tt][CcDdFfGgHhJjKkLlMmNnOoRrTtVvWwZz]|[Uu][AaGgMmSsYyZz]|[Vv][AaCcEeGgIiNnUu]|[Ww][FfSs]|[Xx][Kk]|[Yy][EeTt]|[Zz][AaMmWw])$'
+      description: >-
+        A currently assigned ISO 3166-1 alpha-2 country code, or XK (the
+        user-assigned Kosovo code emitted by MaxMind). Matching is
+        case-insensitive and runtime storage is normalized to uppercase. Other
+        reserved, user-assigned, deleted, and alias codes are rejected.
 
     RateSpec:
       type: object

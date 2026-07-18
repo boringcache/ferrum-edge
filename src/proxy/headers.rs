@@ -253,17 +253,17 @@ pub fn strip_backend_request_headers_for_grpc(headers: &mut http::HeaderMap) {
     headers.insert(http::header::TE, http::HeaderValue::from_static("trailers"));
 }
 
-/// Remove reserved gateway-asserted consumer-identity headers from a request
-/// `HeaderMap`.
+/// Remove reserved gateway-asserted headers from a request `HeaderMap`.
 ///
 /// `x-consumer-username` / `x-consumer-custom-id` are injected by the gateway
 /// only after a principal is resolved and are documented as "never trusted
-/// from clients". `HeaderMap::remove` clears every value for the
-/// case-insensitive name, so any client-supplied casing or duplication is
-/// dropped.
-fn strip_reserved_consumer_identity_headers(headers: &mut http::HeaderMap) {
+/// from clients". `x-geo-country` is likewise emitted only after a successful
+/// GeoIP lookup. `HeaderMap::remove` clears every value for the case-insensitive
+/// name, so any client-supplied casing or duplication is dropped.
+fn strip_reserved_gateway_assertion_headers(headers: &mut http::HeaderMap) {
     headers.remove("x-consumer-username");
     headers.remove("x-consumer-custom-id");
+    headers.remove("x-geo-country");
 }
 
 /// Merge plugin/proxy headers on top of `headers` and then run the
@@ -275,14 +275,14 @@ fn strip_reserved_consumer_identity_headers(headers: &mut http::HeaderMap) {
 /// `proxy-connection`, `te`, `trailer`, `transfer-encoding`,
 /// `content-length`, etc. straight back into the outbound map.
 ///
-/// Reserved gateway-identity headers (`x-consumer-username` /
-/// `x-consumer-custom-id`) are stripped from the raw base map FIRST,
-/// before the merge. The native gRPC path uses the raw inbound
+/// Reserved gateway-asserted headers (`x-consumer-username`,
+/// `x-consumer-custom-id`, and `x-geo-country`) are stripped from the raw base
+/// map FIRST, before the merge. The native gRPC path uses the raw inbound
 /// `HeaderMap` as its merge base (unlike the reqwest / direct-H2 /
 /// WebSocket paths, which build the outbound map from the sanitised
 /// `ctx.headers`), so a forged client value would otherwise survive when
-/// no principal is resolved — `proxy_headers` then carries no
-/// `x-consumer-*` key to overwrite it. Removing them before the merge
+/// no principal or GeoIP assertion is resolved — `proxy_headers` then carries
+/// no authoritative key to overwrite it. Removing these fields before the merge
 /// closes the spoof while still letting a genuinely gateway-asserted
 /// value (present in `proxy_headers` only after successful auth) layer
 /// back on and reach the backend.
@@ -295,10 +295,10 @@ pub fn merge_proxy_headers_and_strip_for_grpc(
     headers: &mut http::HeaderMap,
     proxy_headers: &std::collections::HashMap<String, String>,
 ) {
-    // Drop client-supplied reserved identity headers from the raw base BEFORE
+    // Drop client-supplied reserved assertion headers from the raw base BEFORE
     // the merge, so a verified gateway value carried in `proxy_headers`
     // (post-auth) is layered back on and preserved.
-    strip_reserved_consumer_identity_headers(headers);
+    strip_reserved_gateway_assertion_headers(headers);
 
     for (k, v) in proxy_headers {
         if let (Ok(name), Ok(val)) = (
