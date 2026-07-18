@@ -3802,10 +3802,12 @@ impl AdminResource for Proxy {
             .collect::<Vec<_>>();
         if let Some(api_spec_snapshot) = previous_api_spec {
             for upstream in &api_spec_snapshot.upstreams {
-                if !affected_upstreams
+                if let Some(existing_index) = affected_upstreams
                     .iter()
-                    .any(|affected| affected.id == upstream.id)
+                    .position(|affected| affected.id == upstream.id)
                 {
+                    affected_upstreams[existing_index] = upstream.clone();
+                } else {
                     affected_upstreams.push(upstream.clone());
                 }
             }

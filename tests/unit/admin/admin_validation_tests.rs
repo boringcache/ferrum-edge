@@ -271,6 +271,8 @@ fn direct_api_spec_proxy_delete_uses_atomic_restore_contract() {
 
     assert!(recovery.contains("proxy: previous.clone()"));
     assert!(recovery.contains("!spec_plugin_ids.contains(plugin.id.as_str())"));
+    assert!(recovery.contains(".position(|affected| affected.id == upstream.id)"));
+    assert!(recovery.contains("affected_upstreams[existing_index] = upstream.clone()"));
     assert!(recovery.contains(
         "restore_api_spec_bundle(&bundle, spec, &additional_upstreams, &additional_plugins)"
     ));

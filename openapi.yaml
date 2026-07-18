@@ -3545,7 +3545,9 @@ paths:
         SQL backends and replica-set MongoDB use the API-spec compensation
         transaction to restore the stamped spec resources, an orphaned
         hand-owned upstream, hand-owned cascade plugins, associations, and
-        config-change records together. A shared hand-owned upstream that
+        config-change records together. When the ownership-stripped namespace
+        snapshot overlaps the API-spec upstream, the API-spec snapshot supplies
+        its authoritative ownership metadata. A shared hand-owned upstream that
         remained live is reused rather than inserted again only when its stable
         creation identity and ownership match the pre-delete snapshot; a same-ID
         replacement rejects recovery. The recovered proxy graph's current
