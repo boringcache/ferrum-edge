@@ -1735,10 +1735,8 @@ async fn deadline_replacement_keeps_base_grpc_web_expose_list_under_partial_gate
 
         let mut ctx = create_grpc_context_with_timeout(None);
         set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
-        let mut headers = HashMap::from([(
-            "content-type".to_string(),
-            "application/grpc".to_string(),
-        )]);
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
         assert!(
             !run_after_proxy_hooks_for_test(&decorator, &mut ctx, 200, &mut headers).await,
             "the decorator must not reject the response"
