@@ -53,14 +53,14 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "build-arm64-cross",
-        "8ea20fea0ba8358c7e164bf3e2cdd67532b2a617fffe685d2dc5dace7c19a23d",
+        "cf21166e1e4513915055ab9a1a6260a580105b5143d460fe38defd3f4751f12b",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         "d775752cb399db3b0660e26e0d9bdb32d7d72cf4ed47694066ccbf629e87e80f",
     ),
     (
         "release workflow",
         "build-release-arm64-cross",
-        "8cb2fed36e8e569eb51d3e3e285ec41b1cd1b6841a79392d6e9cb293df9297e7",
+        "0aede8bfa17c33009a588bf1d3202df52c58168eb1d1c173add01e1f76c32cc1",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
@@ -116,6 +116,10 @@ STANDALONE_CROSS = re.compile(r"(?<![A-Za-z0-9_-])cross(?![A-Za-z0-9_-])")
 CROSS_ENVIRONMENT = re.compile(
     r"(?<![A-Za-z0-9_])(?:CROSS_[A-Z0-9_]*|DOCKER_OPTS|QEMU_STRACE|"
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
+)
+CROSS_COMMAND_CONTEXT = re.compile(
+    r"(?:^|(?:run|shell):\s*|(?:&&|\|\||;|\|)\s*)cross\s+"
+    r"(?:build|check|test|run)\b|cargo\s+install(?:\s+--[^\s]+)*\s+cross\b"
 )
 SHELL_INTERPOLATION = re.compile(
     r"\$\{[^{}\n]*\}|`[^`\n]*`|"
@@ -685,11 +689,110 @@ def opaque_command_completion_variants(line: str) -> tuple[str, ...]:
         suffix_match = re.match(r"[A-Za-z]+", line[end:])
         prefix = prefix_match.group() if prefix_match is not None else ""
         suffix = suffix_match.group() if suffix_match is not None else ""
-        if not prefix and not suffix:
-            continue
         for fragment in fragments:
             if f"{prefix}{fragment}{suffix}" == "cross":
-                variants.append(line[:start] + fragment + line[end:])
+                candidate = line[:start] + fragment + line[end:]
+                if CROSS_COMMAND_CONTEXT.search(candidate):
+                    variants.append(candidate)
+        if not prefix and not suffix:
+            candidate = line[:start] + "cross" + line[end:]
+            if CROSS_COMMAND_CONTEXT.search(candidate):
+                variants.append(candidate)
+    return tuple(variants)
+
+
+def opaque_github_expression_variants(line: str) -> tuple[str, ...]:
+    """Fail closed when a dynamic expression occupies a Cross command slot."""
+
+    variants: list[str] = []
+    fragments = {
+        "cross"[start:end]
+        for start in range(len("cross"))
+        for end in range(start + 1, len("cross") + 1)
+    }
+    for start, end in github_expression_spans(line):
+        raw = line[start:end]
+        if not raw.endswith("}}"):
+            continue
+        inner = raw[3:-2].strip()
+        is_quoted_literal = (
+            len(inner) >= 2
+            and inner[0] == inner[-1]
+            and inner[0] in "'\""
+        )
+        if is_quoted_literal or github_format_literal(inner) is not None:
+            continue
+
+        prefix_match = re.search(r"[A-Za-z]+$", line[:start])
+        suffix_match = re.match(r"[A-Za-z]+", line[end:])
+        prefix = prefix_match.group() if prefix_match is not None else ""
+        suffix = suffix_match.group() if suffix_match is not None else ""
+        for fragment in fragments:
+            if f"{prefix}{fragment}{suffix}" == "cross":
+                candidate = line[:start] + fragment + line[end:]
+                if CROSS_COMMAND_CONTEXT.search(candidate):
+                    variants.append(candidate)
+        if not prefix and not suffix:
+            candidate = line[:start] + "cross" + line[end:]
+            if CROSS_COMMAND_CONTEXT.search(candidate):
+                variants.append(candidate)
+    return tuple(variants)
+
+
+def decode_ansi_c_body(value: str) -> str:
+    """Decode the Bash ANSI-C escapes relevant to executable construction."""
+
+    decoded: list[str] = []
+    cursor = 0
+    simple_escapes = {
+        "a": "\a",
+        "b": "\b",
+        "e": "\x1b",
+        "E": "\x1b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+        "\\": "\\",
+        "'": "'",
+        '"': '"',
+    }
+    while cursor < len(value):
+        if value[cursor] != "\\" or cursor + 1 == len(value):
+            decoded.append(value[cursor])
+            cursor += 1
+            continue
+        cursor += 1
+        escape = value[cursor]
+        if escape in "01234567":
+            end = cursor + 1
+            while end < len(value) and end < cursor + 3 and value[end] in "01234567":
+                end += 1
+            decoded.append(chr(int(value[cursor:end], 8)))
+            cursor = end
+            continue
+        if escape == "x":
+            end = cursor + 1
+            while end < len(value) and end < cursor + 3 and value[end] in "0123456789abcdefABCDEF":
+                end += 1
+            if end > cursor + 1:
+                decoded.append(chr(int(value[cursor + 1 : end], 16)))
+                cursor = end
+                continue
+        decoded.append(simple_escapes.get(escape, escape))
+        cursor += 1
+    return "".join(decoded)
+
+
+def ansi_c_quoted_variants(line: str) -> tuple[str, ...]:
+    variants: list[str] = []
+    for match in re.finditer(r"\$'((?:[^'\\]|\\.)*)'", line):
+        variants.append(
+            line[: match.start()]
+            + decode_ansi_c_body(match.group(1))
+            + line[match.end() :]
+        )
     return tuple(variants)
 
 
@@ -764,6 +867,8 @@ def scan_variants(line: str) -> tuple[str, ...]:
 
     variants = [line]
     variants.extend(opaque_command_completion_variants(line))
+    variants.extend(opaque_github_expression_variants(line))
+    variants.extend(ansi_c_quoted_variants(line))
     collapsed = re.sub(r"[\\'\"]", "", line)
     if collapsed != line:
         variants.append(collapsed)
@@ -1508,6 +1613,12 @@ pre_build = []
             "cargo install cr$(printf '\\157')ss && "
             "cr$(printf '\\157')ss build --target aarch64-unknown-linux-gnu",
         ),
+        "unprotected whole command substitution": workflow.replace(
+            "echo safe",
+            "cargo install $(printf '\\143\\162\\157\\163\\163') && "
+            "$(printf '\\143\\162\\157\\163\\163') build "
+            "--target aarch64-unknown-linux-gnu",
+        ),
         "unprotected GitHub interpolation": workflow.replace(
             "echo safe",
             "cr${{ 'o' }}ss build --target aarch64-unknown-linux-gnu",
@@ -1517,9 +1628,18 @@ pre_build = []
             "${{ format('cr{0}ss', 'o') }} build "
             "--target aarch64-unknown-linux-gnu",
         ),
+        "unprotected dynamic GitHub expression": workflow.replace(
+            "echo safe",
+            "${{ github.event.pull_request.title }} build "
+            "--target aarch64-unknown-linux-gnu",
+        ),
         "unprotected Bash brace expansion": workflow.replace(
             "echo safe",
             "cr{o,}ss build --target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected Bash ANSI-C quote": workflow.replace(
+            "echo safe",
+            "$'cr\\157ss' build --target aarch64-unknown-linux-gnu",
         ),
         "unprotected positional shell expansion": workflow.replace(
             "echo safe",

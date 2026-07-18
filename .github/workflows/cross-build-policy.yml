@@ -104,7 +104,7 @@ jobs:
           extract_workflows FETCH_HEAD "$proposed_workflows"
           extract_workflows "$merge_base" "$merge_base_workflows"
 
-          python3 .github/scripts/verify_cross_build_policy.py \
+          python3 -I .github/scripts/verify_cross_build_policy.py \
             --self-test \
             --config "$proposed_cross" \
             --cargo-config "$proposed_cargo" \

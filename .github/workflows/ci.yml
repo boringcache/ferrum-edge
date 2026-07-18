@@ -55,15 +55,15 @@ jobs:
               git show "${base_ref}:${policy}" > "$trusted_policy"
               policy="$trusted_policy"
             else
-              # Bootstrap PR: syntax-compile the proposed source as inert data.
-              # The trusted pull_request_target workflow is the policy verdict.
+              # One-time bootstrap: the base has no verifier to execute yet.
+              # Compile, then run this reviewed proposal in isolated mode. All
+              # later PRs take the trusted-base branch above.
               PYTHONPYCACHEPREFIX="$RUNNER_TEMP/cross-policy-pyc" \
-                python3 -m py_compile "$policy"
-              exit 0
+                python3 -I -m py_compile "$policy"
             fi
           fi
 
-          python3 "$policy" \
+          python3 -I "$policy" \
             --self-test \
             --config Cross.toml \
             --cargo-config Cargo.toml \
@@ -3529,7 +3529,7 @@ jobs:
 
       - name: Revalidate the complete trusted Cross input boundary
         run: |
-          python3 .github/scripts/verify_cross_build_policy.py \
+          python3 -I .github/scripts/verify_cross_build_policy.py \
             --config Cross.toml \
             --cargo-config Cargo.toml \
             --ci-workflow .github/workflows/ci.yml \

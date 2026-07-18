@@ -296,7 +296,7 @@ jobs:
 
       - name: Revalidate the complete trusted Cross input boundary
         run: |
-          python3 .github/scripts/verify_cross_build_policy.py \
+          python3 -I .github/scripts/verify_cross_build_policy.py \
             --config Cross.toml \
             --cargo-config Cargo.toml \
             --ci-workflow .github/workflows/ci.yml \

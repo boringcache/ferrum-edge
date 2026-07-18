@@ -374,12 +374,12 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   as a collection, so a PR cannot move or add an invocation in a different
   workflow. Any new or changed Cross executable/configuration token outside
   the isolated jobs is rejected, including quoted or nested shell/GitHub-
-  interpolated executable spellings, literal GitHub `format()` expressions,
-  opaque command substitutions capable of completing `cross`, Bash brace
-  expansions, and Cross environment aliases; Bash backslash-newline
-  continuations are normalized before scanning. Unrelated workflow additions
-  and edits remain permitted. The isolated jobs use only pinned external setup
-  actions before revalidation.
+  interpolated executable spellings, literal or command-position dynamic
+  GitHub expressions, partial or whole opaque command substitutions, Bash
+  brace expansions and ANSI-C escapes, and Cross environment aliases; Bash
+  backslash-newline continuations are normalized before scanning. Unrelated
+  workflow additions and edits remain permitted. The isolated jobs use only
+  pinned external setup actions before revalidation.
 - The `needs` fields that connect ARM64 artifacts to `latest-release`, CI and
   release Docker publishing, and `create-release` are separately protected;
   the CI publishers' success conditions are protected too. Only those direct
@@ -402,12 +402,14 @@ compared with `HEAD...FETCH_HEAD`, preserving merge-base behavior for stale
 branches while rejecting a PR-authored modification, mode change, rename, or
 deletion. On pull requests, the ordinary `CI Plan` executes the base branch's
 trusted verifier when it exists and never imports or runs the proposed script.
-For this bootstrap PR, where the base has no verifier yet, it only syntax-
-compiles the proposed file as inert data; main pushes execute the newly trusted
-verifier and its hosted self-tests. This policy step runs before every other
-repository Python entry point in the plan job, and the subsequent planner
-self-test and its imported live-suite path filter are also extracted from the
-base branch on pull requests.
+For this one bootstrap PR, where no base verifier or base-loaded trusted
+workflow can exist yet, CI syntax-compiles and executes the reviewed proposed
+verifier; all later PRs necessarily execute the protected base copy. Every
+verifier invocation uses Python isolated mode so the script directory,
+`PYTHONPATH`, and user site cannot redirect its standard-library imports. This
+policy step runs before every other repository Python entry point in the plan
+job, and the subsequent planner self-test and its imported live-suite path
+filter are also extracted from the base branch on pull requests.
 
 #### 8. Latest Release and Docker Jobs
 
