@@ -380,12 +380,41 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
         health_request_plain(stream, &request)?
     };
 
-    if response.contains("200 OK") {
+    let status_code = parse_response_status_code(&response)
+        .map_err(|e| format!("Unhealthy: invalid response: {}", e))?;
+    if status_code == 200 {
         Ok(())
     } else {
         let status_line = response.lines().next().unwrap_or("(empty response)");
         Err(format!("Unhealthy: {}", status_line))
     }
+}
+
+/// Parse the HTTP status line (first line) of a raw response and return the
+/// numeric status code.
+///
+/// Only the status line determines health; header and body content (which may
+/// contain strings like "200 OK") must not influence the result. Malformed or
+/// missing status lines are rejected.
+fn parse_response_status_code(response: &str) -> Result<u16, String> {
+    let status_line = response
+        .lines()
+        .next()
+        .filter(|line| !line.trim().is_empty())
+        .ok_or_else(|| "missing HTTP status line".to_string())?;
+
+    let mut parts = status_line.splitn(3, ' ');
+    let version = parts.next().unwrap_or("");
+    if !version.starts_with("HTTP/") {
+        return Err(format!("malformed HTTP status line: {:?}", status_line));
+    }
+    let code_str = parts
+        .next()
+        .filter(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit()))
+        .ok_or_else(|| format!("malformed HTTP status line: {:?}", status_line))?;
+    code_str
+        .parse::<u16>()
+        .map_err(|e| format!("invalid HTTP status code {:?}: {}", code_str, e))
 }
 
 /// Send health request over plaintext TCP.

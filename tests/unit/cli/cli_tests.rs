@@ -504,9 +504,13 @@ fn test_execute_reload_no_pid_when_no_process_running() {
 
 // ── execute_health path selection ───────────────────────────────────────────
 
-/// Spawn a one-shot HTTP server on loopback that captures the request line,
-/// run `execute_health`, and return the request line the CLI sent.
-fn capture_health_request_line(live: bool) -> String {
+/// Spawn a one-shot HTTP server on loopback that replies with `response`,
+/// run `execute_health`, and return the CLI result plus the captured request
+/// line.
+fn run_health_against_response(
+    live: bool,
+    response: &'static [u8],
+) -> (Result<(), String>, String) {
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 
@@ -519,9 +523,7 @@ fn capture_health_request_line(live: bool) -> String {
         let mut buf = [0u8; 1024];
         let n = stream.read(&mut buf).unwrap();
         let request = String::from_utf8_lossy(&buf[..n]).into_owned();
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-            .unwrap();
+        stream.write_all(response).unwrap();
         request.lines().next().unwrap_or("").to_string()
     });
 
@@ -532,8 +534,18 @@ fn capture_health_request_line(live: bool) -> String {
         tls_no_verify: false,
         live,
     };
-    execute_health(&args).expect("health check against a 200 server should succeed");
-    server.join().unwrap()
+    let result = execute_health(&args);
+    let request_line = server.join().unwrap();
+    (result, request_line)
+}
+
+/// Spawn a one-shot HTTP server on loopback that captures the request line,
+/// run `execute_health`, and return the request line the CLI sent.
+fn capture_health_request_line(live: bool) -> String {
+    let (result, request_line) =
+        run_health_against_response(live, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    result.expect("health check against a 200 server should succeed");
+    request_line
 }
 
 #[test]
@@ -552,4 +564,63 @@ fn test_execute_health_live_targets_live_endpoint() {
         request_line.starts_with("GET /live "),
         "--live must probe liveness /live, got: {request_line}"
     );
+}
+
+// ── execute_health status-line parsing ──────────────────────────────────────
+
+#[test]
+fn test_execute_health_http10_200_succeeds() {
+    let (result, _) =
+        run_health_against_response(false, b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    assert!(result.is_ok(), "HTTP/1.0 200 must be healthy: {result:?}");
+}
+
+#[test]
+fn test_execute_health_rejects_503_with_200_ok_body() {
+    let (result, _) = run_health_against_response(
+        false,
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 6\r\n\r\n200 OK",
+    );
+    let err = result.expect_err("503 with '200 OK' body must be unhealthy");
+    assert!(
+        err.contains("503"),
+        "error should report the real status line, got: {err}"
+    );
+}
+
+#[test]
+fn test_execute_health_rejects_503_with_200_ok_header() {
+    let (result, _) = run_health_against_response(
+        false,
+        b"HTTP/1.1 503 Service Unavailable\r\nX-Status: 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    );
+    assert!(
+        result.is_err(),
+        "503 with '200 OK' header value must be unhealthy"
+    );
+}
+
+#[test]
+fn test_execute_health_rejects_non200_status() {
+    let (result, _) = run_health_against_response(
+        false,
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\nok",
+    );
+    assert!(result.is_err(), "404 must be unhealthy");
+}
+
+#[test]
+fn test_execute_health_rejects_malformed_status_line() {
+    let (result, _) = run_health_against_response(false, b"200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let err = result.expect_err("a status line missing the HTTP version must be rejected");
+    assert!(
+        err.contains("malformed HTTP status line"),
+        "error should describe the malformed status line, got: {err}"
+    );
+}
+
+#[test]
+fn test_execute_health_rejects_empty_response() {
+    let (result, _) = run_health_against_response(false, b"");
+    assert!(result.is_err(), "an empty response must be unhealthy");
 }
