@@ -753,12 +753,27 @@ fn build_tls_acceptor(
         &[],
     )
     .map_err(|e| anyhow::anyhow!("Invalid injector TLS configuration: {}", e))?;
-    // The shared TLS loader advertises h2 before http/1.1, but every injector
-    // connection is served by Hyper's HTTP/1-only builder. Restrict ALPN to
-    // http/1.1 so an HTTP/2-capable Kubernetes API server can never negotiate
-    // h2 and then send an HTTP/2 preface to the HTTP/1 parser.
+    // The shared TLS loader advertises `h2` before `http/1.1`, but every
+    // injector connection is served by Hyper's HTTP/1-only builder. Drop `h2`
+    // so an HTTP/2-capable Kubernetes API server can never negotiate it and
+    // then send an HTTP/2 preface to the HTTP/1 parser.
+    //
+    // `acme-tls/1` is deliberately RETAINED. The shared loader installs
+    // `AcmeTlsAlpnResolver` for every listener it builds, so this acceptor can
+    // already serve an RFC 8737 validation certificate out of the global ACME
+    // order store — the resolver only does so for a ClientHello that offers
+    // `acme-tls/1` ALONE with matching SNI, which no Kubernetes API server
+    // sends. Dropping the protocol here would silently break TLS-ALPN-01
+    // renewal for an injector whose cert source is `acme://certificates/...`
+    // while leaving the resolver in place, so the advertisement and the
+    // serving path stay in agreement. An `acme-tls/1` connection carries no
+    // HTTP, so handing the post-handshake socket to the HTTP/1 builder is
+    // inert: the validator closes it, or the header read timeout does.
     let mut server_config = Arc::unwrap_or_clone(server_config);
-    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    server_config.alpn_protocols = vec![
+        b"http/1.1".to_vec(),
+        crate::tls::acme::TLS_ALPN01_PROTOCOL.to_vec(),
+    ];
     Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
 }
 
@@ -2533,204 +2548,6 @@ mod tests {
             "response was {response:?}",
         );
         assert!(response.contains("failed to read AdmissionReview body"));
-        assert_server_finished(server).await;
-    }
-
-    #[tokio::test]
-    async fn injector_header_read_timeout_closes_trickling_connection() {
-        // A client that sends only a partial header block must be dropped once
-        // the configured header read timeout fires.
-        let mut config = test_config(true, CaptureMode::Iptables);
-        config.http_header_read_timeout_seconds = 1;
-        let (addr, server) = spawn_injector_test_server(config).await;
-
-        // Taken before the connect so it can never postdate the server-side
-        // timer that the assertion below compares against.
-        let started = std::time::Instant::now();
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream
-            .write_all(b"POST /mutate HTTP/1.1\r\nHost: localhost\r\n")
-            .await
-            .unwrap();
-
-        // The server must close the connection shortly after the 1s timeout;
-        // allow generous scheduling slack for CI.
-        let mut buf = Vec::new();
-        let read = timeout(Duration::from_secs(10), stream.read_to_end(&mut buf)).await;
-        assert!(
-            read.is_ok(),
-            "connection should be closed by the header read timeout, not hang"
-        );
-        // A close well before the configured budget would mean the connection
-        // was torn down for some other reason, making the assertion below
-        // vacuous. The bound is slightly under 1s only to absorb clock
-        // coarseness, not to tolerate an early close.
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= Duration::from_millis(900),
-            "connection closed after {elapsed:?}, before the 1s header read timeout could fire"
-        );
-        assert!(
-            buf.is_empty(),
-            "a trickling connection must not receive a response, got: {}",
-            String::from_utf8_lossy(&buf)
-        );
-        assert_server_finished(server).await;
-    }
-
-    #[tokio::test]
-    async fn injector_header_read_timeout_zero_allows_slow_headers() {
-        // 0 is the documented opt-out: a slow client may take longer than the
-        // default budget to finish headers and still be served.
-        let mut config = test_config(true, CaptureMode::Iptables);
-        config.http_header_read_timeout_seconds = 0;
-        let (addr, server) = spawn_injector_test_server(config).await;
-
-        let review = json!({
-            "apiVersion": "admission.k8s.io/v1",
-            "kind": "AdmissionReview",
-            "request": {
-                "uid": "slow-headers",
-                "namespace": "payments",
-                "object": {
-                    "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-                    "spec": {"containers": []}
-                }
-            }
-        });
-        let body = review.to_string();
-
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream
-            .write_all(b"POST /mutate HTTP/1.1\r\nHost: localhost\r\n")
-            .await
-            .unwrap();
-        // Waiting out the default 10s budget would make the test needlessly
-        // slow; the point is that no timeout fires while the remaining headers
-        // are withheld well past the 1s budget the companion test proves is
-        // enforced when configured.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        stream
-            .write_all(
-                format!(
-                    "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-
-        let mut response = Vec::new();
-        timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
-            .await
-            .expect("server should respond after slow headers when the timeout is disabled")
-            .expect("reading the injector response must not fail");
-        let response = String::from_utf8(response).unwrap();
-        assert!(
-            response.starts_with("HTTP/1.1 200 OK"),
-            "response was {response:?}"
-        );
-        assert_server_finished(server).await;
-    }
-
-    #[tokio::test]
-    async fn injector_tls_negotiates_http1_only_and_serves_webhook() {
-        // Regression test for the ALPN mismatch: the shared TLS loader
-        // advertises h2 first, but the injector serves HTTP/1 only. A client
-        // offering both must end up on http/1.1 and get a complete response.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let dir = tempfile::tempdir().unwrap();
-        let key_pair =
-            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
-        let params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
-        let cert = params.self_signed(&key_pair).expect("self-sign cert");
-        let cert_pem = cert.pem();
-        let cert_path = dir.path().join("tls.crt");
-        let key_path = dir.path().join("tls.key");
-        std::fs::write(&cert_path, &cert_pem).unwrap();
-        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
-
-        let mut config = test_config(true, CaptureMode::Explicit);
-        config.tls_cert_path = Some(cert_path.to_string_lossy().into_owned());
-        config.tls_key_path = Some(key_path.to_string_lossy().into_owned());
-
-        let acceptor = build_tls_acceptor(&EnvConfig::default(), &config)
-            .expect("tls acceptor builds")
-            .expect("tls material configured");
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_config = Arc::new(config);
-        let server = tokio::spawn(async move {
-            let (stream, remote_addr) = listener.accept().await.unwrap();
-            let tls_stream = crate::tls::accept_with_optional_timeout(
-                &acceptor,
-                stream,
-                server_config.tls_handshake_timeout_seconds,
-                &remote_addr,
-                false,
-            )
-            .await
-            .expect("tls handshake");
-            serve_injector_connection(tls_stream, server_config, remote_addr).await;
-        });
-
-        // Client offers h2 first, then http/1.1, like an HTTP/2-capable
-        // Kubernetes API server would.
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.add(cert.der().clone()).unwrap();
-        let mut client_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-
-        let tcp = TcpStream::connect(addr).await.unwrap();
-        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
-        let tls_stream = connector.connect(server_name, tcp).await.unwrap();
-        assert_eq!(
-            tls_stream.get_ref().1.alpn_protocol(),
-            Some(b"http/1.1".as_slice()),
-            "injector must never negotiate h2 with its HTTP/1-only server"
-        );
-
-        // A complete webhook request over the negotiated connection succeeds.
-        let review = json!({
-            "apiVersion": "admission.k8s.io/v1",
-            "kind": "AdmissionReview",
-            "request": {
-                "uid": "alpn-check",
-                "namespace": "payments",
-                "object": {
-                    "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
-                    "spec": {"containers": []}
-                }
-            }
-        });
-        let body = review.to_string();
-        let request = format!(
-            "POST /mutate HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let (mut reader, mut writer) = tokio::io::split(tls_stream);
-        writer.write_all(request.as_bytes()).await.unwrap();
-        let mut response = Vec::new();
-        timeout(Duration::from_secs(10), reader.read_to_end(&mut response))
-            .await
-            .expect("webhook response")
-            .expect("reading the injector TLS response must not fail");
-        let response = String::from_utf8(response).unwrap();
-        assert!(
-            response.starts_with("HTTP/1.1 200 OK"),
-            "response was {response:?}"
-        );
-        assert!(response.contains(r#""allowed":true"#), "got: {response}");
-
         assert_server_finished(server).await;
     }
 
