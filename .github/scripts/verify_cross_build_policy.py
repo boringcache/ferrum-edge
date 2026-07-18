@@ -5402,8 +5402,9 @@ pre_build = []
         failures.append("repository script outside scanned roots was not rejected")
 
     benign_heredoc_workflow = referenced_workflow.replace(
-        "bash scripts/safe.sh",
-        "python3 - <<'PY'\n"
+        "run: bash scripts/safe.sh",
+        "run: |\n"
+        "          python3 - <<'PY'\n"
         "          print('| GCP/Azure | src/plugins/mod.rs | n/a |')\n"
         "          print('attacker.sh is fixture data, not a command')\n"
         "          PY",
