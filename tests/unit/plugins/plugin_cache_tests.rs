@@ -2,7 +2,8 @@
 
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    plugin_cache_with_real_ip_header_for_test,
+    incremental_plugin_rebuild_targets_for_test, plugin_cache_with_real_ip_header_for_test,
+    reconcile_fault_plugin_generations_for_test,
     validate_correlation_id_composition_with_real_ip_header_for_test,
     validate_plugin_composition_candidate_with_real_ip_header_for_test,
 };
@@ -87,6 +88,10 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
         }
         "request_mirror" => json!({"mirror_host": "mirror.local"}),
+        "fault_injection" => json!({
+            "abort": {"status_code": 503, "percentage": 100.0},
+            "runtime_overlay_scope": "checkout"
+        }),
         "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
         "kafka_logging" => json!({"broker_list": "localhost:9092", "topic": "test-logs"}),
         "request_deduplication" => json!({}),
@@ -708,7 +713,8 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
         ],
     );
     let stream_delta = ConfigDelta::compute(&initial, &stream_interleaved);
-    let stream_proxy_ids = stream_delta.proxy_ids_needing_plugin_rebuild(&stream_interleaved);
+    let stream_proxy_ids =
+        stream_delta.proxy_ids_needing_plugin_rebuild(&initial, &stream_interleaved);
     cache
         .apply_delta(
             &stream_interleaved,
@@ -742,7 +748,8 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
         ],
     );
     let http_delta = ConfigDelta::compute(&stream_interleaved, &http_interleaved);
-    let http_proxy_ids = http_delta.proxy_ids_needing_plugin_rebuild(&http_interleaved);
+    let http_proxy_ids =
+        http_delta.proxy_ids_needing_plugin_rebuild(&stream_interleaved, &http_interleaved);
     let err = cache
         .apply_delta(
             &http_interleaved,
@@ -811,7 +818,7 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
         ],
     );
     let composed_delta = ConfigDelta::compute(&initial, &composed);
-    let composed_proxy_ids = composed_delta.proxy_ids_needing_plugin_rebuild(&composed);
+    let composed_proxy_ids = composed_delta.proxy_ids_needing_plugin_rebuild(&initial, &composed);
     cache
         .apply_delta(
             &composed,
@@ -836,7 +843,7 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
         vec![cors_config("cors-narrow", &["GET"], &["X-Test"], None)],
     );
     let reduced_delta = ConfigDelta::compute(&composed, &reduced);
-    let reduced_proxy_ids = reduced_delta.proxy_ids_needing_plugin_rebuild(&reduced);
+    let reduced_proxy_ids = reduced_delta.proxy_ids_needing_plugin_rebuild(&composed, &reduced);
     cache
         .apply_delta(
             &reduced,
@@ -2689,7 +2696,7 @@ fn test_apply_delta_global_to_proxy_scope_refreshes_all_proxy_views() {
         vec![proxy_scoped],
     );
     let delta = ConfigDelta::compute(&old_config, &new_config);
-    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
 
     assert!(delta.global_plugin_configs_changed);
     cache
@@ -2711,6 +2718,346 @@ fn test_apply_delta_global_to_proxy_scope_refreshes_all_proxy_views() {
     assert!(
         cache.get_plugins("unknown").is_empty(),
         "global fallback must drop plugins that changed away from global scope"
+    );
+}
+
+#[test]
+fn fault_delta_proxy_id_move_rebuilds_former_and_new_placements() {
+    let old_fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    let p1 = make_proxy("p1", "/one", vec!["fault"]);
+    let p2 = make_proxy("p2", "/two", vec![]);
+    let old_config = make_config(vec![p1.clone(), p2.clone()], vec![old_fault.clone()]);
+    let cache = PluginCache::new(&old_config).expect("initial fault cache");
+    assert_eq!(cache.get_plugins("p1")[0].name(), "fault_injection");
+    assert!(cache.get_plugins("p2").is_empty());
+
+    let mut moved_from = p1;
+    moved_from.plugins.clear();
+    let mut moved_to = p2;
+    moved_to.plugins.push(PluginAssociation {
+        plugin_config_id: "fault".to_string(),
+    });
+    let mut moved_fault = old_fault;
+    moved_fault.proxy_id = Some("p2".to_string());
+    moved_fault.updated_at += chrono::Duration::seconds(1);
+    let new_config = make_config(vec![moved_from, moved_to], vec![moved_fault]);
+
+    let delta = ConfigDelta::compute(&old_config, &new_config);
+    assert!(delta.modified_proxies.is_empty());
+    assert_eq!(delta.modified_plugin_configs.len(), 1);
+    assert_eq!(
+        delta
+            .plugin_association_changed_proxy_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>(),
+        HashSet::from(["p1".to_string(), "p2".to_string()])
+    );
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
+    assert_eq!(
+        proxy_ids,
+        HashSet::from(["p1".to_string(), "p2".to_string()])
+    );
+
+    cache
+        .apply_delta(
+            &new_config,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect("proxy_id move should rebuild both placements");
+
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "former proxy must not retain the moved fault plugin"
+    );
+    assert_eq!(cache.get_plugins("p2")[0].name(), "fault_injection");
+}
+
+#[test]
+fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
+    let proxy_fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    let p1 = make_proxy("p1", "/one", vec!["fault"]);
+    let p2 = make_proxy("p2", "/two", vec![]);
+    let p3 = make_proxy("p3", "/three", vec![]);
+    let proxy_config = make_config(
+        vec![p1.clone(), p2.clone(), p3.clone()],
+        vec![proxy_fault.clone()],
+    );
+    let cache = PluginCache::new(&proxy_config).expect("initial proxy-scoped fault cache");
+
+    let mut former_proxy = p1.clone();
+    former_proxy.plugins.clear();
+    let mut group_member_one = p2.clone();
+    group_member_one.plugins.push(PluginAssociation {
+        plugin_config_id: "fault".to_string(),
+    });
+    let mut group_member_two = p3.clone();
+    group_member_two.plugins.push(PluginAssociation {
+        plugin_config_id: "fault".to_string(),
+    });
+    let mut group_fault = proxy_fault;
+    group_fault.scope = PluginScope::ProxyGroup;
+    group_fault.proxy_id = None;
+    group_fault.updated_at += chrono::Duration::seconds(1);
+    let group_config = make_config(
+        vec![former_proxy, group_member_one, group_member_two],
+        vec![group_fault.clone()],
+    );
+    let to_group = ConfigDelta::compute(&proxy_config, &group_config);
+    let to_group_ids = to_group.proxy_ids_needing_plugin_rebuild(&proxy_config, &group_config);
+    assert_eq!(
+        to_group_ids,
+        HashSet::from(["p1".to_string(), "p2".to_string(), "p3".to_string()])
+    );
+    cache
+        .apply_delta(
+            &group_config,
+            &to_group_ids,
+            &to_group.removed_proxy_ids,
+            to_group.global_plugin_configs_changed,
+        )
+        .expect("proxy-to-group scope move");
+    assert!(cache.get_plugins("p1").is_empty());
+    assert_eq!(cache.get_plugins("p2")[0].name(), "fault_injection");
+    assert_eq!(cache.get_plugins("p3")[0].name(), "fault_injection");
+
+    let mut new_proxy = p1;
+    new_proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "fault".to_string(),
+    }];
+    let former_group_one = p2;
+    let former_group_two = p3;
+    let mut moved_back = group_fault;
+    moved_back.scope = PluginScope::Proxy;
+    moved_back.proxy_id = Some("p1".to_string());
+    moved_back.updated_at += chrono::Duration::seconds(1);
+    let moved_back_config = make_config(
+        vec![new_proxy, former_group_one, former_group_two],
+        vec![moved_back],
+    );
+    let from_group = ConfigDelta::compute(&group_config, &moved_back_config);
+    let from_group_ids =
+        from_group.proxy_ids_needing_plugin_rebuild(&group_config, &moved_back_config);
+    assert_eq!(
+        from_group_ids,
+        HashSet::from(["p1".to_string(), "p2".to_string(), "p3".to_string()])
+    );
+    cache
+        .apply_delta(
+            &moved_back_config,
+            &from_group_ids,
+            &from_group.removed_proxy_ids,
+            from_group.global_plugin_configs_changed,
+        )
+        .expect("group-to-proxy scope move");
+    assert_eq!(cache.get_plugins("p1")[0].name(), "fault_injection");
+    assert!(cache.get_plugins("p2").is_empty());
+    assert!(cache.get_plugins("p3").is_empty());
+}
+
+#[test]
+fn fault_delta_group_membership_move_and_removal_invalidate_former_associations() {
+    let group_fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::ProxyGroup,
+        None,
+        true,
+    );
+    let p1 = make_proxy("p1", "/one", vec!["fault"]);
+    let p2 = make_proxy("p2", "/two", vec!["fault"]);
+    let p3 = make_proxy("p3", "/three", vec![]);
+    let old_config = make_config(
+        vec![p1.clone(), p2.clone(), p3.clone()],
+        vec![group_fault.clone()],
+    );
+    let cache = PluginCache::new(&old_config).expect("initial group fault cache");
+    let unchanged_before = cache.get_plugins("p2");
+
+    let mut former_member = p1;
+    former_member.plugins.clear();
+    let unchanged_member = p2;
+    let mut new_member = p3;
+    new_member.plugins.push(PluginAssociation {
+        plugin_config_id: "fault".to_string(),
+    });
+    let moved_config = make_config(
+        vec![former_member, unchanged_member, new_member],
+        vec![group_fault],
+    );
+    let moved_delta = ConfigDelta::compute(&old_config, &moved_config);
+    assert!(moved_delta.modified_plugin_configs.is_empty());
+    assert!(!moved_delta.is_empty());
+    let moved_ids = moved_delta.proxy_ids_needing_plugin_rebuild(&old_config, &moved_config);
+    assert_eq!(
+        moved_ids,
+        HashSet::from(["p1".to_string(), "p3".to_string()])
+    );
+    cache
+        .apply_delta(
+            &moved_config,
+            &moved_ids,
+            &moved_delta.removed_proxy_ids,
+            moved_delta.global_plugin_configs_changed,
+        )
+        .expect("group association move");
+    assert!(cache.get_plugins("p1").is_empty());
+    assert!(Arc::ptr_eq(&unchanged_before, &cache.get_plugins("p2")));
+    assert_eq!(cache.get_plugins("p3")[0].name(), "fault_injection");
+
+    let mut removed_proxies = moved_config.proxies.clone();
+    for proxy in &mut removed_proxies {
+        proxy.plugins.clear();
+    }
+    let removed_config = make_config(removed_proxies, vec![]);
+    let removed_delta = ConfigDelta::compute(&moved_config, &removed_config);
+    let removed_ids =
+        removed_delta.proxy_ids_needing_plugin_rebuild(&moved_config, &removed_config);
+    cache
+        .apply_delta(
+            &removed_config,
+            &removed_ids,
+            &removed_delta.removed_proxy_ids,
+            removed_delta.global_plugin_configs_changed,
+        )
+        .expect("fault plugin removal");
+    assert!(cache.get_plugins("p2").is_empty());
+    assert!(cache.get_plugins("p3").is_empty());
+}
+
+#[test]
+fn fault_delta_priority_change_is_targeted_and_unchanged_config_is_noop() {
+    let fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/one", vec!["fault"]),
+            make_proxy("p2", "/two", vec![]),
+        ],
+        vec![fault],
+    );
+    let cache = PluginCache::new(&config).expect("initial priority fault cache");
+    let p1_before = cache.get_plugins("p1");
+    let p2_before = cache.get_plugins("p2");
+
+    let unchanged = ConfigDelta::compute(&config, &config);
+    assert!(unchanged.is_empty());
+    assert!(
+        unchanged
+            .proxy_ids_needing_plugin_rebuild(&config, &config)
+            .is_empty()
+    );
+    assert!(Arc::ptr_eq(&p1_before, &cache.get_plugins("p1")));
+
+    let mut reprioritized = config.clone();
+    reprioritized.plugin_configs[0].priority_override = Some(42);
+    reprioritized.plugin_configs[0].updated_at += chrono::Duration::seconds(1);
+    let delta = ConfigDelta::compute(&config, &reprioritized);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config, &reprioritized);
+    assert_eq!(proxy_ids, HashSet::from(["p1".to_string()]));
+    cache
+        .apply_delta(
+            &reprioritized,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect("fault priority change");
+
+    let p1_after = cache.get_plugins("p1");
+    assert!(!Arc::ptr_eq(&p1_before[0], &p1_after[0]));
+    assert!(Arc::ptr_eq(&p2_before, &cache.get_plugins("p2")));
+}
+
+#[test]
+fn fault_reconciliation_scope_move_advances_the_actual_generation() {
+    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let mut fault = make_plugin_config("fault", "fault_injection", PluginScope::Global, None, true);
+    fault.created_at = generation;
+    fault.updated_at = generation;
+    let accepted = make_config(vec![], vec![fault]);
+
+    let mut candidate = accepted.clone();
+    candidate.plugin_configs[0].scope = PluginScope::Proxy;
+    candidate.plugin_configs[0].proxy_id = Some("p1".to_string());
+    reconcile_fault_plugin_generations_for_test(&mut candidate, &accepted);
+
+    assert!(candidate.plugin_configs[0].updated_at > generation);
+    let delta = ConfigDelta::compute(&accepted, &candidate);
+    assert_eq!(delta.modified_plugin_configs.len(), 1);
+    assert!(delta.global_plugin_configs_changed);
+}
+
+#[test]
+fn fault_reconciliation_priority_change_advances_the_actual_generation() {
+    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let mut fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    fault.created_at = generation;
+    fault.updated_at = generation;
+    let accepted = make_config(vec![make_proxy("p1", "/one", vec!["fault"])], vec![fault]);
+
+    let mut candidate = accepted.clone();
+    candidate.plugin_configs[0].priority_override = Some(42);
+    reconcile_fault_plugin_generations_for_test(&mut candidate, &accepted);
+
+    assert!(candidate.plugin_configs[0].updated_at > generation);
+    let delta = ConfigDelta::compute(&accepted, &candidate);
+    assert_eq!(delta.modified_plugin_configs.len(), 1);
+    assert_eq!(
+        incremental_plugin_rebuild_targets_for_test(&accepted, &candidate),
+        HashSet::from(["p1".to_string()]),
+        "the staged rebuild count and targets must come from this accepted snapshot"
+    );
+}
+
+#[test]
+fn fault_reconciliation_comparison_is_schema_complete_and_normalizes_only_timestamps() {
+    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let mut fault = make_plugin_config("fault", "fault_injection", PluginScope::Global, None, true);
+    fault.created_at = generation;
+    fault.updated_at = generation;
+    let accepted = make_config(vec![], vec![fault]);
+
+    let mut persistence_only = accepted.clone();
+    persistence_only.plugin_configs[0].created_at += chrono::Duration::seconds(1);
+    reconcile_fault_plugin_generations_for_test(&mut persistence_only, &accepted);
+    assert_eq!(persistence_only.plugin_configs[0].updated_at, generation);
+
+    let mut metadata_changed = accepted.clone();
+    metadata_changed.plugin_configs[0].api_spec_id = Some("spec-owner".to_string());
+    reconcile_fault_plugin_generations_for_test(&mut metadata_changed, &accepted);
+    assert!(metadata_changed.plugin_configs[0].updated_at > generation);
+    assert_eq!(
+        ConfigDelta::compute(&accepted, &metadata_changed)
+            .modified_plugin_configs
+            .len(),
+        1,
+        "a field outside the former hand-written list must not retain a stale generation"
     );
 }
 
@@ -2754,7 +3101,7 @@ fn test_apply_delta_invalid_optional_proxy_scoped_plugin_shadows_global() {
         ],
     );
     let delta = ConfigDelta::compute(&config1, &config2);
-    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config2);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config1, &config2);
 
     cache
         .apply_delta(
@@ -2816,7 +3163,7 @@ fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
         ],
     );
     let delta = ConfigDelta::compute(&config1, &config2);
-    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config2);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config1, &config2);
 
     cache
         .apply_delta(
@@ -2945,7 +3292,7 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
     new_schema.updated_at += chrono::Duration::seconds(1);
     let new_config = make_config(vec![make_proxy("p1", "/api", vec![])], vec![new_schema]);
     let delta = ConfigDelta::compute(&old_config, &new_config);
-    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
     cache
         .apply_delta(
             &new_config,
