@@ -56,7 +56,7 @@ const DEFAULT_CONTENT_TYPES: &[&str] = &[
 ];
 
 /// HTTP status codes that should never be compressed (no body or cache-only).
-const UNCOMPRESSIBLE_STATUS_CODES: &[u16] = &[204, 304];
+const UNCOMPRESSIBLE_STATUS_CODES: &[u16] = &[204, 205, 304];
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 const REQUEST_NO_TRANSFORM_METADATA_KEY: &str = "compression:request_no_transform";
@@ -628,10 +628,10 @@ impl Plugin for CompressionPlugin {
     ) -> bool {
         // Mirror the `after_proxy` skip checks that are knowable from the
         // response headers so we never pin a body onto the buffered path that
-        // we are going to decline to compress. Range responses (`206` or any
-        // `Content-Range`) are skipped there to preserve byte-offset semantics,
-        // so they must stream instead of being fully collected (which would also
-        // risk tripping the response body size limit on large ranged downloads).
+        // we are going to decline to compress. Preserved representation
+        // statuses (`206` and `226`) and any `Content-Range` response are
+        // skipped there, so they must stream instead of being fully collected
+        // (which would also risk tripping the response body size limit).
         //
         // On paths that run `after_proxy` *before* this refine decision (e.g.
         // the H3 cross-protocol path stamps `RANGE_RESPONSE_METADATA_KEY` from
@@ -642,7 +642,8 @@ impl Plugin for CompressionPlugin {
         // here too; otherwise the partial body stays pinned on the buffered path
         // (uncompressed, since `transform_response_body` is buffered-only) and
         // can trip the response body size limit instead of streaming.
-        if response_status == 206
+        if UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status)
+            || !super::response_body_rewrite_allowed(response_status)
             || response_headers.contains_key("content-range")
             || ctx
                 .metadata
@@ -668,7 +669,8 @@ impl Plugin for CompressionPlugin {
         response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
-        response_status == 206
+        UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status)
+            || !super::response_body_rewrite_allowed(response_status)
             || response_headers.contains_key("content-range")
             || ctx
                 .metadata
@@ -830,6 +832,13 @@ impl Plugin for CompressionPlugin {
             return PluginResult::Continue;
         }
 
+        // The shared response lifecycle preserves range and delta bytes for
+        // 206/226 responses. Do not commit Content-Encoding or remove framing
+        // headers when the corresponding body transform cannot run.
+        if !super::response_body_rewrite_allowed(response_status) {
+            return PluginResult::Continue;
+        }
+
         // Skip uncompressible status codes.
         if UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status) {
             return PluginResult::Continue;
@@ -853,8 +862,7 @@ impl Plugin for CompressionPlugin {
         // headers may already have been rewritten by an earlier-ordered hook
         // (e.g. `response_transformer` removing `Content-Range`), so also honor
         // the original backend range decision captured before `after_proxy`.
-        if response_status == 206
-            || response_headers.contains_key("content-range")
+        if response_headers.contains_key("content-range")
             || ctx
                 .metadata
                 .contains_key(crate::proxy::RANGE_RESPONSE_METADATA_KEY)

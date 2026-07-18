@@ -2641,6 +2641,18 @@ async fn mesh_route_dispatch_override_destinations(
 fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
     let mut body = json!(resource);
     if let Some(config) = body.get_mut("config") {
+        if resource.plugin_name == "serverless_function"
+            && let Some(url) = config.get_mut("function_url")
+        {
+            *url = match url.as_str() {
+                Some(raw) => {
+                    json!(crate::plugins::serverless_function::redact_serverless_url(
+                        raw
+                    ))
+                }
+                None => json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER),
+            };
+        }
         redact_sensitive_plugin_config_fields(config);
         if resource.plugin_name == "loki_logging" {
             redact_loki_logging_config_projection(config);
@@ -2738,6 +2750,7 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
         || normalized.contains("api_key")
         || normalized.contains("apikey")
         || normalized.contains("access_key")
+        || normalized.contains("function_key")
         || normalized.contains("client_secret")
         || normalized.contains("credential")
         || normalized.contains("private_key")

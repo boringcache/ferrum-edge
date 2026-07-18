@@ -115,6 +115,71 @@ async fn test_request_transformer_add_query_param() {
 }
 
 #[tokio::test]
+async fn test_query_transform_marks_metadata_for_raw_query_consumers() {
+    // Mirror of `QUERY_PARAMS_TRANSFORMED_METADATA_KEY` (pub(crate) in proxy).
+    // Raw-query consumers (serverless_function) fail closed on this marker.
+    const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
+
+    // A query rule that actually mutates the decoded map sets the marker.
+    let mutating = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "query", "key": "token"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.query_params
+        .insert("token".to_string(), "secret".to_string());
+    let mut headers: HashMap<String, String> = HashMap::new();
+    let _ = mutating.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        ctx.metadata
+            .contains_key(QUERY_PARAMS_TRANSFORMED_METADATA_KEY),
+        "an applied query transform must mark metadata for raw-query consumers"
+    );
+
+    // A query rule that no-ops (nothing to remove) must NOT set the marker, so a
+    // safe raw-query composition is not needlessly rejected.
+    let noop = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "query", "key": "absent"}
+        ]
+    }))
+    .unwrap();
+    let mut noop_ctx = make_ctx();
+    noop_ctx
+        .query_params
+        .insert("keep".to_string(), "value".to_string());
+    let mut noop_headers: HashMap<String, String> = HashMap::new();
+    let _ = noop.before_proxy(&mut noop_ctx, &mut noop_headers).await;
+    assert!(
+        !noop_ctx
+            .metadata
+            .contains_key(QUERY_PARAMS_TRANSFORMED_METADATA_KEY),
+        "a no-op query rule must not mark a query transform"
+    );
+
+    // A header-only transform must not set the query-transform marker.
+    let header_only = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Test", "value": "1"}
+        ]
+    }))
+    .unwrap();
+    let mut header_ctx = make_ctx();
+    let mut header_headers: HashMap<String, String> = HashMap::new();
+    let _ = header_only
+        .before_proxy(&mut header_ctx, &mut header_headers)
+        .await;
+    assert!(
+        !header_ctx
+            .metadata
+            .contains_key(QUERY_PARAMS_TRANSFORMED_METADATA_KEY),
+        "a header-only transform must not mark a query transform"
+    );
+}
+
+#[tokio::test]
 async fn test_request_transformer_remove_query_param() {
     let plugin = RequestTransformer::new(&json!({
         "rules": [

@@ -673,6 +673,50 @@ async fn test_after_proxy_rewrites_content_type_text() {
 }
 
 #[tokio::test]
+async fn test_preserved_statuses_keep_native_headers_and_release_buffering() {
+    let plugin = create_plugin_default();
+
+    for status in [206, 226] {
+        let mut ctx = create_grpc_web_context("application/grpc-web-text+proto");
+        plugin.on_request_received(&mut ctx).await;
+        let mut response_headers = HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("content-length".to_string(), "17".to_string()),
+        ]);
+
+        assert!(!plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/grpc"),
+            status,
+            &response_headers
+        ));
+        assert!(
+            plugin.should_release_response_body_before_content_type_rewrite(
+                &ctx,
+                status,
+                &response_headers
+            )
+        );
+        assert!(matches!(
+            plugin
+                .after_proxy(&mut ctx, status, &mut response_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            response_headers.get("content-type").map(String::as_str),
+            Some("application/grpc")
+        );
+        assert_eq!(
+            response_headers.get("content-length").map(String::as_str),
+            Some("17")
+        );
+        assert!(!response_headers.contains_key("x-grpc-web"));
+        assert!(!response_headers.contains_key("access-control-expose-headers"));
+    }
+}
+
+#[tokio::test]
 async fn test_after_proxy_noop_for_non_grpc_web() {
     let plugin = create_plugin_default();
     let mut ctx = create_grpc_web_context("application/grpc");

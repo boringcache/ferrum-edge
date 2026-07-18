@@ -612,6 +612,27 @@ impl Plugin for GrpcWebPlugin {
         ctx.metadata.contains_key(META_GRPC_WEB_MODE)
     }
 
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        _content_type: Option<&str>,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && super::response_body_rewrite_allowed(response_status)
+    }
+
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && !super::response_body_rewrite_allowed(response_status)
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Always strip the internal mode marker from inbound headers so a client
         // cannot spoof it. The plugin re-injects it in `before_proxy` only when
@@ -782,9 +803,16 @@ impl Plugin for GrpcWebPlugin {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // The shared lifecycle cannot embed trailers or base64-rewrite a
+        // preserved 206/226 representation. Leave its native headers coherent
+        // with the untouched bytes instead of falsely labelling it gRPC-Web.
+        if !super::response_body_rewrite_allowed(response_status) {
+            return PluginResult::Continue;
+        }
+
         let original_ct = match ctx.metadata.get(META_GRPC_WEB_ORIGINAL_CT) {
             Some(ct) => ct.clone(),
             None => return PluginResult::Continue,

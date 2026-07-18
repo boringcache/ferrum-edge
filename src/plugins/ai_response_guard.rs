@@ -17,6 +17,7 @@ use regex::{NoExpand, Regex, RegexSet};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
@@ -26,6 +27,8 @@ use super::utils::sse::{
     parse_sse_data_frames_checked,
 };
 use super::{Plugin, PluginResult, RequestContext};
+
+static NEXT_RESPONSE_GUARD_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// JSON object keys that are structural metadata (IDs, timestamps, model
 /// names, roles, etc.) and must never be redacted, even in `ScanMode::All`.
@@ -103,6 +106,7 @@ enum ScanMode {
 }
 
 pub struct AiResponseGuard {
+    instance_id: u64,
     action: GuardAction,
     pii_patterns: Vec<ContentPattern>,
     blocked_phrases: Vec<ContentPattern>,
@@ -361,6 +365,7 @@ impl AiResponseGuard {
         })?;
 
         Ok(Self {
+            instance_id: NEXT_RESPONSE_GUARD_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             action,
             pii_patterns,
             blocked_phrases,
@@ -1007,7 +1012,12 @@ impl AiResponseGuard {
             .insert("ai_response_guard_rejected".to_string(), reason.into());
     }
 
-    fn respond_to_detection(&self, ctx: &mut RequestContext, detected: &[String]) -> PluginResult {
+    fn respond_to_detection(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        detected: &[String],
+    ) -> PluginResult {
         match self.action {
             GuardAction::Reject => {
                 debug!(
@@ -1038,8 +1048,31 @@ impl AiResponseGuard {
                 PluginResult::Continue
             }
             GuardAction::Redact => {
+                if !super::response_body_rewrite_allowed(response_status) {
+                    debug!(
+                        response_status,
+                        "ai_response_guard: governed range/delta response cannot be safely redacted; rejecting"
+                    );
+                    Self::mark_rejected(ctx, detected.join(","));
+                    let types_json: Vec<String> = detected
+                        .iter()
+                        .map(|t| format!("\"{}\"", escape_json_string(t)))
+                        .collect();
+                    return PluginResult::Reject {
+                        status_code: 502,
+                        body: format!(
+                            r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                            types_json.join(","),
+                        ),
+                        headers: HashMap::new(),
+                    };
+                }
                 ctx.metadata
                     .insert("ai_response_guard_redacted".to_string(), detected.join(","));
+                if ctx.deduplication_replay_response_finalized {
+                    ctx.ai_response_guard_replay_redactions
+                        .insert(self.instance_id);
+                }
                 PluginResult::Continue
             }
         }
@@ -1501,7 +1534,7 @@ impl Plugin for AiResponseGuard {
                 };
             }
 
-            return self.respond_to_detection(ctx, &detected);
+            return self.respond_to_detection(ctx, response_status, &detected);
         }
 
         // Scan-all can safely inspect arbitrary UTF-8 representations as raw
@@ -1539,7 +1572,7 @@ impl Plugin for AiResponseGuard {
                 return if detected.is_empty() {
                     PluginResult::Continue
                 } else {
-                    self.respond_to_detection(ctx, &detected)
+                    self.respond_to_detection(ctx, response_status, &detected)
                 };
             }
             return self.respond_to_uninspectable(
@@ -1655,7 +1688,7 @@ impl Plugin for AiResponseGuard {
             };
         }
 
-        self.respond_to_detection(ctx, &detected)
+        self.respond_to_detection(ctx, response_status, &detected)
     }
 
     async fn transform_response_body(
@@ -1729,6 +1762,11 @@ impl Plugin for AiResponseGuard {
         }
 
         serde_json::to_vec(&json).ok()
+    }
+
+    fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
+        ctx.ai_response_guard_replay_redactions
+            .contains(&self.instance_id)
     }
 
     fn on_response_body_transformed(

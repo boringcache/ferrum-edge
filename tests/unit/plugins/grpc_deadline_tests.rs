@@ -343,7 +343,7 @@ impl Plugin for StalledContextFreeBodyTransformer {
 #[tokio::test]
 async fn rejection_hook_deadline_selects_terminal_status_and_finishes_cleanup_once() {
     use ferrum_edge::_test_support::{
-        finalize_plugin_rejection_for_test, gateway_deadline_response_selected_for_test,
+        finalize_plugin_rejection_parts_for_test, gateway_deadline_response_selected_for_test,
         set_grpc_deadline_budget_for_test,
     };
 
@@ -377,7 +377,7 @@ async fn rejection_hook_deadline_selects_terminal_status_and_finishes_cleanup_on
 
     let (status, body, headers) = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        finalize_plugin_rejection_for_test(
+        finalize_plugin_rejection_parts_for_test(
             &plugins,
             &mut ctx,
             429,
