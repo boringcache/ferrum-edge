@@ -398,6 +398,62 @@ async fn start_blocking_counting_backend_on(
     Ok(handle)
 }
 
+async fn start_counting_large_function_on(
+    listener: tokio::net::TcpListener,
+    hits: Arc<AtomicUsize>,
+    body_len: usize,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    let body = Arc::new(vec![b'x'; body_len]);
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let hits = Arc::clone(&hits);
+            let body = Arc::clone(&body);
+            tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut buf_reader = tokio::io::BufReader::new(reader);
+                use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+                let mut request_line = String::new();
+                if buf_reader.read_line(&mut request_line).await.is_err()
+                    || !request_line.starts_with("POST ")
+                {
+                    return;
+                }
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    let _ = buf_reader.read_line(&mut line).await;
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((key, value)) = trimmed.split_once(':')
+                        && key.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut request_body = vec![0u8; content_length];
+                    let _ = buf_reader.read_exact(&mut request_body).await;
+                }
+
+                hits.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = writer.write_all(response.as_bytes()).await;
+                let _ = writer.write_all(body.as_slice()).await;
+            });
+        }
+    });
+    Ok(handle)
+}
+
 /// Start a mock LLM backend that returns OpenAI-compatible token usage responses.
 async fn start_ai_backend(
     port: u16,
@@ -1392,6 +1448,21 @@ async fn test_request_deduplication_redis_blocks_concurrent_cross_instance() {
     .await
     .unwrap();
 
+    // A body of this size fits the 1 MiB local retained-entry limit, while its
+    // base64 Redis representation exceeds that limit and retains the owned
+    // terminal in-flight lock.
+    const LARGE_FUNCTION_BODY_LEN: usize = 800 * 1024;
+    let function_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let function_port = function_listener.local_addr().unwrap().port();
+    let function_hits = Arc::new(AtomicUsize::new(0));
+    let _function = start_counting_large_function_on(
+        function_listener,
+        Arc::clone(&function_hits),
+        LARGE_FUNCTION_BODY_LEN,
+    )
+    .await
+    .unwrap();
+
     let unique_prefix = format!("ferrum:test:dedup:{}", Uuid::new_v4().simple());
     let config = |prefix: &str| {
         format!(
@@ -1406,6 +1477,15 @@ proxies:
     strip_listen_path: true
     plugins:
       - plugin_config_id: "shared-dedup-plugin"
+  - id: "terminal-dedup-proxy"
+    listen_path: "/terminal-dedup"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "terminal-dedup-plugin"
+      - plugin_config_id: "terminal-serverless-plugin"
 
 consumers: []
 
@@ -1423,6 +1503,32 @@ plugin_configs:
       inflight_ttl_seconds: 10
       scope_by_consumer: false
       applicable_methods: ["POST"]
+  - id: "terminal-dedup-plugin"
+    plugin_name: "request_deduplication"
+    scope: "proxy"
+    proxy_id: "terminal-dedup-proxy"
+    enabled: true
+    config:
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      redis_key_prefix: "{prefix}"
+      ttl_seconds: 60
+      inflight_ttl_seconds: 10
+      max_entries: 1
+      max_entry_size_bytes: 1048576
+      max_total_size_bytes: 2097152
+      scope_by_consumer: false
+      applicable_methods: ["POST"]
+  - id: "terminal-serverless-plugin"
+    plugin_name: "serverless_function"
+    scope: "proxy"
+    proxy_id: "terminal-dedup-proxy"
+    enabled: true
+    config:
+      provider: "gcp_cloud_functions"
+      mode: "terminate"
+      function_url: "http://127.0.0.1:{function_port}/invoke"
+      max_response_body_bytes: 1048576
 "#,
         )
     };
@@ -1544,6 +1650,80 @@ plugin_configs:
         1,
         "Redis replay must not execute the backend again"
     );
+
+    delete_redis_keys_by_prefix(&unique_prefix).await;
+    sleep(Duration::from_millis(200)).await;
+
+    let terminal_key = "local-terminal-replay-key";
+    let terminal_url1 = format!("http://127.0.0.1:{port1}/terminal-dedup/invoke");
+    let terminal_url2 = format!("http://127.0.0.1:{port2}/terminal-dedup/invoke");
+    let first_terminal = client
+        .post(&terminal_url1)
+        .header("Idempotency-Key", terminal_key)
+        .header("Host", authority)
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("first terminal request failed");
+    assert_eq!(first_terminal.status().as_u16(), 200);
+    assert_eq!(
+        first_terminal
+            .bytes()
+            .await
+            .expect("first terminal body failed")
+            .len(),
+        LARGE_FUNCTION_BODY_LEN
+    );
+    assert_eq!(function_hits.load(Ordering::SeqCst), 1);
+    assert!(
+        redis_key_count_by_prefix(&inflight_prefix).await > 0,
+        "oversized Redis serialization must retain the distributed in-flight lock"
+    );
+
+    let local_replay = client
+        .post(&terminal_url1)
+        .header("Idempotency-Key", terminal_key)
+        .header("Host", authority)
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("same-gateway terminal retry failed");
+    assert_eq!(local_replay.status().as_u16(), 200);
+    assert_eq!(
+        local_replay
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "the lock-owning gateway must replay its matching local completion"
+    );
+    assert_eq!(
+        local_replay
+            .bytes()
+            .await
+            .expect("local replay body failed")
+            .len(),
+        LARGE_FUNCTION_BODY_LEN
+    );
+    assert_eq!(function_hits.load(Ordering::SeqCst), 1);
+
+    let peer_retry = client
+        .post(&terminal_url2)
+        .header("Idempotency-Key", terminal_key)
+        .header("Host", authority)
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("peer terminal retry failed");
+    assert_eq!(
+        peer_retry.status().as_u16(),
+        409,
+        "a peer without the local completion must honor the retained Redis lock"
+    );
+    assert_eq!(function_hits.load(Ordering::SeqCst), 1);
 
     gw1.shutdown();
     gw2.shutdown();

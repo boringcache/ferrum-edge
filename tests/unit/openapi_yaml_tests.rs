@@ -1628,6 +1628,73 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
     assert_component_validity(
         &spec,
         "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://functions.example/run",
+            "forwad_body": true
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://functions.example/run",
+            "mode": null
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://functions.example/run",
+            "error_status_code": 399
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://functions.example/run",
+            "error_status_code": 400
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://user:password@functions.example/run"
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "gcp_cloud_functions",
+            "function_url": "https://functions.example/run#credential"
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "aws_lambda",
+            "aws_endpoint_url": "https://lambda.example/not-an-origin"
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
         &json!({"provider": "gcp_cloud_functions", "function_url": "ftp://functions.example"}),
         false,
     );
@@ -3177,6 +3244,7 @@ fn plugin_graph_delete_rejections_have_openapi_parity() {
         .and_then(serde_json::Value::as_array)
         .expect("API-spec validation resource types");
     assert!(resource_types.contains(&json!("plugin_composition")));
+    assert!(resource_types.contains(&json!("upstream_graph")));
 }
 
 #[test]

@@ -1,12 +1,18 @@
+use async_trait::async_trait;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
-    request_deduplication_completed_size_snapshot_for_test,
+    finalize_plugin_rejection_for_test, request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
     request_deduplication_expire_inflight_entries_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
-    request_deduplication_redis_payload_for_test,
+    request_deduplication_redis_payload_for_test, request_deduplication_request_identity_for_test,
+    request_deduplication_with_instance_id_for_test,
 };
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+use ferrum_edge::plugins::ai_response_guard::AiResponseGuard;
+use ferrum_edge::plugins::ai_tool_governor::AiToolGovernor;
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
+use ferrum_edge::plugins::serverless_function::ServerlessFunction;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
 };
@@ -16,11 +22,89 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 
-const DEDUP_KEY_METADATA: &str = "_dedup_key";
-const DEDUP_FINGERPRINT_METADATA: &str = "_dedup_fingerprint";
+struct AppendingResponseTransform;
+
+struct FailingMandatoryReplayTransform;
+
+#[async_trait]
+impl Plugin for FailingMandatoryReplayTransform {
+    fn name(&self) -> &str {
+        "failing_mandatory_replay_transform"
+    }
+
+    fn requires_replay_response_body_transform(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true
+    }
+
+    async fn transform_response_body(
+        &self,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+#[async_trait]
+impl Plugin for AppendingResponseTransform {
+    fn name(&self) -> &str {
+        "appending_response_transform"
+    }
+
+    fn priority(&self) -> u16 {
+        4000
+    }
+
+    fn supported_protocols(&self) -> &'static [ferrum_edge::plugins::ProxyProtocol] {
+        HTTP_ONLY_PROTOCOLS
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true
+    }
+
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    async fn on_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        ctx.metadata
+            .insert("test:replay-inspected".to_string(), "true".to_string());
+        PluginResult::Continue
+    }
+
+    async fn transform_response_body(
+        &self,
+        body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        let mut transformed = body.to_vec();
+        transformed.extend_from_slice(b"|transformed");
+        Some(transformed)
+    }
+}
 
 fn make_plugin(config: serde_json::Value) -> RequestDeduplication {
     RequestDeduplication::new(&config, PluginHttpClient::default()).unwrap()
+}
+
+fn request_identity(
+    plugin: &RequestDeduplication,
+    ctx: &RequestContext,
+) -> Option<(String, String)> {
+    request_deduplication_request_identity_for_test(plugin, ctx)
 }
 
 fn keyed_headers(key: &str, host: &str, body_len: usize) -> HashMap<String, String> {
@@ -323,7 +407,7 @@ async fn test_first_request_passes_then_replay() {
 
     let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx1.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx1).is_some());
 
     // Simulate response caching
     let mut response_headers = HashMap::new();
@@ -359,11 +443,285 @@ async fn test_first_request_passes_then_replay() {
     }
 }
 
+#[tokio::test]
+async fn committed_replay_skips_second_response_body_transform() {
+    let dedup = make_plugin(json!({}));
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "finalized".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(
+                &mut first_ctx,
+                200,
+                &HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+                b"presented-once",
+            )
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut replay_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut replay_headers =
+        HashMap::from([("idempotency-key".to_string(), "finalized".to_string())]);
+    let replay = dedup
+        .before_proxy(&mut replay_ctx, &mut replay_headers)
+        .await;
+    let transforms: Vec<Arc<dyn Plugin>> = vec![Arc::new(AppendingResponseTransform)];
+    match finalize_plugin_rejection_for_test(&transforms, &mut replay_ctx, replay).await {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"presented-once"),
+        other => panic!("expected finalized replay, got {other:?}"),
+    }
+    assert_eq!(
+        replay_ctx
+            .metadata
+            .get("test:replay-inspected")
+            .map(String::as_str),
+        Some("true"),
+        "finalized replays must still run response inspection"
+    );
+
+    let mut ordinary_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let ordinary = PluginResult::RejectBinary {
+        status_code: 200,
+        body: Bytes::from_static(b"presented-once"),
+        headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+    };
+    match finalize_plugin_rejection_for_test(&transforms, &mut ordinary_ctx, ordinary).await {
+        PluginResult::RejectBinary { body, .. } => {
+            assert_eq!(&body[..], b"presented-once|transformed")
+        }
+        other => panic!("expected ordinary transformed response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn committed_replay_runs_current_ai_response_redaction() {
+    let dedup = make_plugin(json!({}));
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let stale_body = br#"{"choices":[{"message":{"content":"Contact user@example.com"}}]}"#;
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "guard-replay".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, 200, &response_headers, stale_body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let guard = AiResponseGuard::new(&json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }))
+    .unwrap();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(guard)];
+    let mut replay_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    let mut replay_headers =
+        HashMap::from([("idempotency-key".to_string(), "guard-replay".to_string())]);
+    let replay = dedup
+        .before_proxy(&mut replay_ctx, &mut replay_headers)
+        .await;
+
+    match finalize_plugin_rejection_for_test(&plugins, &mut replay_ctx, replay).await {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 200);
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                !body.contains("user@example.com"),
+                "stale PII replayed: {body}"
+            );
+            assert!(body.contains("[REDACTED:pii:email]"), "{body}");
+        }
+        other => panic!("expected redacted finalized replay, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn committed_replay_runs_current_tool_argument_redaction() {
+    let dedup = make_plugin(json!({}));
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let stale_body = json!({
+        "id": "chatcmpl-replay",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "filesystem.write",
+                        "arguments": "{\"token\":\"sk-STALESECRET123\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string()
+    .into_bytes();
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "governor-replay".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, 200, &response_headers, &stale_body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let governor = AiToolGovernor::new(
+        &json!({
+            "default_action": "allow",
+            "tools": {
+                "filesystem.write": {
+                    "action": "redact_args",
+                    "blocked_arg_patterns": [{
+                        "name": "secret",
+                        "regex": "sk-[A-Za-z0-9]+"
+                    }]
+                }
+            }
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(governor)];
+    let mut replay_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    let mut replay_headers =
+        HashMap::from([("idempotency-key".to_string(), "governor-replay".to_string())]);
+    let replay = dedup
+        .before_proxy(&mut replay_ctx, &mut replay_headers)
+        .await;
+
+    match finalize_plugin_rejection_for_test(&plugins, &mut replay_ctx, replay).await {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 200);
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                !body.contains("sk-STALESECRET123"),
+                "stale tool secret replayed: {body}"
+            );
+            assert!(body.contains("[REDACTED_TOOL_ARG:secret]"), "{body}");
+        }
+        other => panic!("expected governed finalized replay, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn committed_replay_fails_closed_when_required_transform_cannot_rewrite() {
+    let dedup = make_plugin(json!({}));
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "failed-redaction".to_string(),
+    )]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(
+                &mut first_ctx,
+                200,
+                &HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+                b"sensitive replay",
+            )
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut replay_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut replay_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "failed-redaction".to_string(),
+    )]);
+    let replay = dedup
+        .before_proxy(&mut replay_ctx, &mut replay_headers)
+        .await;
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(FailingMandatoryReplayTransform)];
+
+    match finalize_plugin_rejection_for_test(&plugins, &mut replay_ctx, replay).await {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert_eq!(&body[..], br#"{"error":"response redaction failed"}"#);
+        }
+        other => panic!("required replay rewrite must fail closed, got {other:?}"),
+    }
+}
+
 // Marker set by the proxy on `ctx.metadata` while the response-body hooks run
 // over a synthetic 2xx plugin short-circuit body (mirrors
 // `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
 // therefore not reachable from this external test crate).
 const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
+// Marker set by an ownership producer (e.g. `ai_federation`) on `ctx.metadata`
+// once a billable/side-effecting external operation has a committed or ambiguous
+// outcome behind a synthetic short-circuit (mirrors the `pub(crate)`
+// `crate::plugins::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`, which is not
+// reachable from this external test crate).
+const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str = "ferrum:external_operation_completed";
 
 // A FRESH request that this plugin marked in-flight, then short-circuited by a
 // LATER `before_proxy` plugin (e.g. a 2xx `fault_injection` abort / synthetic AI
@@ -385,7 +743,7 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
 
     let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx1.metadata.contains_key(DEDUP_KEY_METADATA));
+    assert!(request_identity(&plugin, &ctx1).is_some());
 
     // A later before_proxy plugin short-circuits with a synthetic 2xx body. The
     // proxy marks the context before running the response-body hooks; emulate it.
@@ -423,7 +781,900 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
         matches!(result, PluginResult::Continue),
         "second request with same key must pass through, not replay a synthetic body; got {result:?}"
     );
-    assert!(ctx2.metadata.contains_key(DEDUP_KEY_METADATA));
+    assert!(request_identity(&plugin, &ctx2).is_some());
+}
+
+// A FRESH request marked in-flight by this plugin, then short-circuited by a
+// synthetic response AFTER a committed/ambiguous external operation (the
+// `ai_federation` provider-call lifecycle), must not release the in-flight
+// marker on the early final-body pass and must not cache the synthetic body.
+// Instead the observe-only committed hook publishes a non-replayable 409
+// tombstone so an identical retry is rejected deterministically for the cache
+// TTL rather than either re-running the side effect (fresh) or eating a bare
+// "already in progress" in-flight conflict. This isolates the shared dedup
+// lifecycle exercised end-to-end by the `ai_federation` suite, without the
+// federation plugin, so a future dedup refactor cannot silently drop it again.
+#[tokio::test]
+async fn external_operation_completed_publishes_non_replayable_tombstone_at_commit() {
+    let plugin = make_plugin(json!({}));
+
+    // First request acquires the in-flight marker and a dedup key.
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "ext-op-key".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx1, &mut headers1).await,
+        PluginResult::Continue
+    ));
+    assert!(request_identity(&plugin, &ctx1).is_some());
+
+    // The proxy marks the synthetic short-circuit before running the response
+    // body hooks; the external-operation marker is what a committed provider
+    // call sets. The early final-body pass must retain ownership: it neither
+    // stores the synthetic body nor releases the in-flight marker.
+    ctx1.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    ctx1.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut ctx1, 200, &response_headers, b"{\"synthetic\": true}")
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        assert_completed_size_exact(&plugin),
+        0,
+        "synthetic external-operation body must not be stored as a replayable response"
+    );
+
+    // The proxy clears the synthetic marker before the committed hook. The
+    // observe-only committed hook then publishes the non-replayable tombstone.
+    ctx1.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+    plugin
+        .on_response_committed(&mut ctx1, 200, &response_headers, b"{\"synthetic\": true}")
+        .await;
+
+    // A retry with the SAME key must be rejected as a completed non-replayable
+    // operation (409 "cannot be replayed safely"), NOT treated as fresh (which
+    // would re-run the side effect) and NOT returned as a bare in-flight 409.
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "ext-op-key".to_string());
+    match plugin.before_proxy(&mut ctx2, &mut headers2).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 409);
+            assert!(
+                String::from_utf8_lossy(&body).contains("cannot be replayed safely"),
+                "retry after a committed external operation must return the non-replayable tombstone, got {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+        }
+        other => panic!("expected non-replayable completed tombstone, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn terminal_serverless_remote_502_is_stored_at_response_commit() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(502).set_body_string("executed-once"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers = HashMap::new();
+    first_headers.insert("idempotency-key".to_string(), "side-effect-key".to_string());
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) = match serverless
+        .before_proxy(&mut first_ctx, &mut first_headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+        } => (status_code, headers, body),
+        other => panic!("expected terminal serverless response, got {other:?}"),
+    };
+    assert_eq!(status, 502);
+    assert!(dedup.requires_response_committed_hook());
+    dedup
+        .on_response_committed(&mut first_ctx, status, &response_headers, &body)
+        .await;
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert("idempotency-key".to_string(), "side-effect-key".to_string());
+    match dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 502);
+            assert_eq!(&body[..], b"executed-once");
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+        }
+        other => panic!("retry must replay without invoking again, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("one-side-effect"))
+        .mount(&server)
+        .await;
+
+    let first = make_plugin(json!({"header_name": "idempotency-key-a"}));
+    let second = make_plugin(json!({"header_name": "idempotency-key-b"}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::from([
+        ("idempotency-key-a".to_string(), "owner-a".to_string()),
+        ("idempotency-key-b".to_string(), "owner-b".to_string()),
+    ]);
+    for plugin in [&first, &second] {
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected terminal serverless response, got {other:?}"),
+        };
+    assert_eq!(status, 503);
+
+    // The ordinary final-body phase must leave both owners pending until the
+    // settled committed terminal response is available.
+    for plugin in [&first, &second] {
+        assert!(matches!(
+            plugin
+                .on_final_response_body(&mut ctx, status, &response_headers, &body)
+                .await,
+            PluginResult::Continue
+        ));
+        assert_eq!(plugin.tracked_keys_count(), Some(1));
+    }
+
+    // Each committed hook consumes only its own provenance and publishes into
+    // its own cache. The first hook must not clear the second owner's marker.
+    first
+        .on_response_committed(&mut ctx, status, &response_headers, &body)
+        .await;
+    second
+        .on_response_committed(&mut ctx, status, &response_headers, &body)
+        .await;
+
+    for (plugin, header_name, key) in [
+        (&first, "idempotency-key-a", "owner-a"),
+        (&second, "idempotency-key-b", "owner-b"),
+    ] {
+        let mut retry_ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        let mut retry_headers = HashMap::from([
+            ("idempotency-key-a".to_string(), "owner-a".to_string()),
+            ("idempotency-key-b".to_string(), "owner-b".to_string()),
+        ]);
+        assert_eq!(
+            retry_headers.get(header_name).map(String::as_str),
+            Some(key)
+        );
+        match plugin
+            .before_proxy(&mut retry_ctx, &mut retry_headers)
+            .await
+        {
+            PluginResult::RejectBinary {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 503);
+                assert_eq!(&body[..], b"one-side-effect");
+            }
+            other => panic!("instance {header_name} did not retain its replay: {other:?}"),
+        }
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn terminal_serverless_ambiguous_query_releases_every_dedup_owner() {
+    let first = make_plugin(json!({}));
+    let second = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://function.example/invoke",
+            "mode": "terminate",
+            "forward_query_params": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.set_raw_query_string("role=user&role=admin".to_string());
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "correctable".to_string())]);
+    for dedup in [&first, &second] {
+        assert!(matches!(
+            dedup.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("ambiguous query must reject before invocation, got {other:?}"),
+        };
+    assert!(body.contains("duplicate_query_parameter"));
+    for dedup in [&first, &second] {
+        dedup
+            .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+            .await;
+    }
+
+    for dedup in [&first, &second] {
+        let mut retry_ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        retry_ctx.set_raw_query_string("role=user&role=admin".to_string());
+        let mut retry_headers =
+            HashMap::from([("idempotency-key".to_string(), "correctable".to_string())]);
+        assert!(matches!(
+            dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+#[tokio::test]
+async fn terminal_serverless_encoded_body_releases_dedup_owner() {
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://function.example/invoke",
+            "mode": "terminate",
+            "forward_body": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let compressed = gzip_body(b"opaque");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(&compressed));
+    let mut headers = HashMap::from([
+        ("idempotency-key".to_string(), "encoded".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+        ("content-length".to_string(), compressed.len().to_string()),
+    ]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("encoded body must reject before invocation, got {other:?}"),
+        };
+    assert!(body.contains("encoded_request_body_unsupported"));
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    retry_ctx.request_body_bytes = Some(Bytes::from(compressed.clone()));
+    let mut retry_headers = HashMap::from([
+        ("idempotency-key".to_string(), "encoded".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+        ("content-length".to_string(), compressed.len().to_string()),
+    ]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn terminal_serverless_origin_encoded_marker_releases_dedup_owner() {
+    // A header-only request_transformer that stripped Content-Encoding leaves
+    // the live header map identity-clean, but the init-time marker preserves the
+    // original non-identity coding, so the serverless egress still fails closed —
+    // and because nothing external ran, the dedup in-flight lock is released.
+    const ORIGIN_ENCODED_REQUEST_METADATA_KEY: &str = "ferrum:origin_encoded_request";
+
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://function.example/invoke",
+            "mode": "terminate",
+            "forward_body": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.request_body_bytes = Some(Bytes::from_static(b"opaque-compressed"));
+    ctx.metadata.insert(
+        ORIGIN_ENCODED_REQUEST_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    // No content-encoding on the live map — the transformer removed it.
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "stripped".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("stripped-but-original encoding must reject, got {other:?}"),
+        };
+    assert!(body.contains("encoded_request_body_unsupported"));
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    retry_ctx.request_body_bytes = Some(Bytes::from_static(b"opaque-compressed"));
+    let mut retry_headers =
+        HashMap::from([("idempotency-key".to_string(), "stripped".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn terminal_serverless_query_transform_releases_dedup_owner() {
+    // A request_transformer query rule recorded a decoded-query transform that
+    // the raw-query payload cannot faithfully honor. The serverless egress fails
+    // closed before any external call, so the dedup in-flight lock is released.
+    const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
+
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://function.example/invoke",
+            "mode": "terminate",
+            "forward_query_params": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    // Raw query is otherwise valid; the transform marker alone drives the reject.
+    ctx.set_raw_query_string("page=1&sort=asc".to_string());
+    ctx.metadata.insert(
+        QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "transformed".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("transformed-query composition must reject, got {other:?}"),
+        };
+    assert!(body.contains("query_params_transformed"));
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    retry_ctx.set_raw_query_string("page=1&sort=asc".to_string());
+    retry_ctx.metadata.insert(
+        QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let mut retry_headers =
+        HashMap::from([("idempotency-key".to_string(), "transformed".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn terminal_serverless_pre_wire_invocation_failure_releases_dedup_owner() {
+    // A proven pre-wire transport failure (connection refused: nothing reached
+    // the function) must release the dedup in-flight lock rather than retain the
+    // anticipatory side-effect marker, so an identical retry is not blocked/
+    // replayed until inflight_ttl for an operation that never ran.
+    let closed_addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    // Listener dropped above — the port is now refused.
+
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("http://{closed_addr}/invoke"),
+            "mode": "terminate",
+            "timeout_ms": 2000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "pre-wire".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("pre-wire failure must reject, got {other:?}"),
+        };
+    assert!(body.contains("invocation_failed"));
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers =
+        HashMap::from([("idempotency-key".to_string(), "pre-wire".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn terminal_serverless_literal_ip_egress_denial_releases_dedup_owner() {
+    let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "http://169.254.169.254/invoke",
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default_with_backend_allow_ips(policy),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers =
+        HashMap::from([("idempotency-key".to_string(), "literal-denial".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("literal-IP denial must reject pre-wire, got {other:?}"),
+        };
+    assert!(body.contains("invocation_failed"));
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers =
+        HashMap::from([("idempotency-key".to_string(), "literal-denial".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("side-effect-result"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({
+        "max_entries": 1,
+        "ttl_seconds": 300,
+        "inflight_ttl_seconds": 300
+    }));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "terminal-a".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) = match serverless
+        .before_proxy(&mut first_ctx, &mut first_headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+        } => (status_code, headers, body),
+        other => panic!("expected terminal serverless response, got {other:?}"),
+    };
+
+    // A distinct active request saturates max_entries before the terminal
+    // response publishes. The owned completion must remain replayable instead
+    // of being selected as the only capacity-eviction candidate.
+    let mut second_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/other".to_string(),
+    );
+    let mut second_headers =
+        HashMap::from([("idempotency-key".to_string(), "ordinary-b".to_string())]);
+    assert!(matches!(
+        dedup
+            .before_proxy(&mut second_ctx, &mut second_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, status, &response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    dedup
+        .on_response_committed(&mut first_ctx, status, &response_headers, &body)
+        .await;
+
+    let mut replay_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut replay_headers =
+        HashMap::from([("idempotency-key".to_string(), "terminal-a".to_string())]);
+    match dedup
+        .before_proxy(&mut replay_ctx, &mut replay_headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(&body[..], b"side-effect-result");
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+        }
+        other => panic!("owned completion was not replayable under active pressure: {other:?}"),
+    }
+
+    // Once the other request completes, strict capacity can no longer retain
+    // both responses. Evicting the protected terminal replay must leave an
+    // in-flight tombstone, so a later Redis outage/lock expiry cannot allow the
+    // external side effect to execute again.
+    complete_response(&dedup, &mut second_ctx).await;
+    let mut tombstone_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut tombstone_headers =
+        HashMap::from([("idempotency-key".to_string(), "terminal-a".to_string())]);
+    assert!(matches!(
+        dedup
+            .before_proxy(&mut tombstone_ctx, &mut tombstone_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 409,
+            ..
+        }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn oversized_terminal_serverless_response_retains_inflight_protection() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 128]))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({"max_entry_size_bytes": 32}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "oversized-key".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) = match serverless
+        .before_proxy(&mut first_ctx, &mut first_headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+        } => (status_code, headers, body),
+        other => panic!("expected oversized terminal response, got {other:?}"),
+    };
+    dedup
+        .on_response_committed(&mut first_ctx, status, &response_headers, &body)
+        .await;
+    assert_eq!(dedup.tracked_keys_count(), Some(1));
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers =
+        HashMap::from([("idempotency-key".to_string(), "oversized-key".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Reject {
+            status_code: 409,
+            ..
+        }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn oversized_buffered_fallback_retains_uncertain_serverless_protection() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(600).set_body_string("invalid status"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({"max_entry_size_bytes": 32}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate",
+            "on_error": "continue"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "oversized-fallback-key".to_string(),
+    )]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        serverless
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let backend_body = vec![b'y'; 128];
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, 200, &HashMap::new(), &backend_body)
+            .await,
+        PluginResult::Continue
+    ));
+    dedup
+        .on_response_committed(&mut first_ctx, 200, &HashMap::new(), &backend_body)
+        .await;
+    assert_eq!(dedup.tracked_keys_count(), Some(1));
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "oversized-fallback-key".to_string(),
+    )]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Reject {
+            status_code: 409,
+            ..
+        }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -598,7 +1849,7 @@ async fn test_put_method_deduplicates() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx).is_some());
 }
 
 #[tokio::test]
@@ -619,7 +1870,7 @@ async fn test_custom_applicable_methods() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(!ctx.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx).is_none());
 
     // DELETE should be deduplication-eligible
     let mut ctx2 = RequestContext::new(
@@ -632,7 +1883,7 @@ async fn test_custom_applicable_methods() {
 
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx2.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx2).is_some());
 }
 
 #[test]
@@ -736,7 +1987,7 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_clean_completion
     assert!(matches!(result, PluginResult::Continue));
     // The fresh key is marked in-flight and stays that way for the stream.
     assert_eq!(plugin.tracked_keys_count(), Some(1));
-    assert!(ctx.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx).is_some());
 
     // The SSE response is streamed (not buffered), confirmed by the content-type
     // refinement declining to buffer it.
@@ -792,6 +2043,81 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_clean_completion
         matches!(result, PluginResult::Continue),
         "duplicate after a cleanly completed streamed SSE response should re-execute, not get stale 409 or cached replay; got {result:?}"
     );
+}
+
+/// A terminate-mode function can execute externally and then fail before a
+/// usable response is available. With `on_error: continue`, a streamed backend
+/// response has no replay body to publish, so even clean stream completion must
+/// retain the in-flight marker until TTL rather than re-executing the uncertain
+/// function side effect on an immediate retry.
+#[tokio::test]
+async fn test_streamed_fallback_retains_marker_after_uncertain_serverless_side_effect() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(600).set_body_string("invalid status"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate",
+            "on_error": "continue"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "idempotency-key".to_string(),
+        "serverless-stream-key".to_string(),
+    );
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        serverless.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    dedup
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(32))
+        .await;
+    assert_eq!(
+        dedup.tracked_keys_count(),
+        Some(1),
+        "an uncertain serverless side effect must retain the streamed fallback marker until TTL"
+    );
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert(
+        "idempotency-key".to_string(),
+        "serverless-stream-key".to_string(),
+    );
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Reject {
+            status_code: 409,
+            ..
+        }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 /// An interrupted streamed SSE response — client disconnect or mid-stream error,
@@ -938,7 +2264,7 @@ async fn test_buffered_response_transitions_inflight_to_completed() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(plugin.tracked_keys_count(), Some(1));
-    assert!(ctx.metadata.contains_key("_dedup_key"));
+    assert!(request_identity(&plugin, &ctx).is_some());
 
     // A JSON response is buffered (the content-type refinement still votes to
     // buffer), so `on_final_response_body` runs and caches it.
@@ -1643,7 +2969,7 @@ async fn test_keyed_idempotency_header_can_fingerprint_prebuffered_body() {
     let mut headers = keyed_headers("transformed-key", "api.example", 7);
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx.metadata.contains_key(DEDUP_FINGERPRINT_METADATA));
+    assert!(request_identity(&plugin, &ctx).is_some());
 }
 
 #[tokio::test]
@@ -2222,8 +3548,8 @@ async fn test_delimiter_containing_identities_and_keys_do_not_collide() {
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let key1 = ctx1.metadata.get(DEDUP_KEY_METADATA).unwrap();
-    let key2 = ctx2.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    let (key1, _) = request_identity(&plugin, &ctx1).unwrap();
+    let (key2, _) = request_identity(&plugin, &ctx2).unwrap();
     assert_ne!(key1, key2);
     assert!(!key1.contains("alice"));
     assert!(!key1.contains("key"));
@@ -2252,8 +3578,8 @@ async fn test_peer_spiffe_id_scopes_logical_key() {
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let key1 = ctx1.metadata.get(DEDUP_KEY_METADATA).unwrap();
-    let key2 = ctx2.metadata.get(DEDUP_KEY_METADATA).unwrap();
+    let (key1, _) = request_identity(&plugin, &ctx1).unwrap();
+    let (key2, _) = request_identity(&plugin, &ctx2).unwrap();
     assert_ne!(key1, key2);
     assert!(!key1.contains("blue"));
     assert!(!key2.contains("green"));
@@ -2274,9 +3600,8 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let logical_key = ctx.metadata.get(DEDUP_KEY_METADATA).unwrap();
-    let fingerprint = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA).unwrap();
-    assert!(logical_key.starts_with("v2:"));
+    let (logical_key, fingerprint) = request_identity(&plugin, &ctx).unwrap();
+    assert!(logical_key.starts_with("v3:"));
     assert!(fingerprint.starts_with("sha256-"));
     for secret in [
         "super-secret-body",
@@ -2288,6 +3613,53 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
         assert!(!logical_key.contains(secret));
         assert!(!fingerprint.contains(secret));
     }
+}
+
+#[tokio::test]
+async fn stable_plugin_config_identity_partitions_distributed_logical_keys() {
+    let config = json!({});
+    let first_gateway = request_deduplication_with_instance_id_for_test(
+        &config,
+        PluginHttpClient::default(),
+        "dedup-primary",
+    )
+    .unwrap();
+    let second_gateway = request_deduplication_with_instance_id_for_test(
+        &config,
+        PluginHttpClient::default(),
+        "dedup-primary",
+    )
+    .unwrap();
+    let sibling_instance = request_deduplication_with_instance_id_for_test(
+        &config,
+        PluginHttpClient::default(),
+        "dedup-secondary",
+    )
+    .unwrap();
+
+    let mut identities = Vec::new();
+    for plugin in [&first_gateway, &second_gateway, &sibling_instance] {
+        let mut ctx = body_ctx("POST", "/api/orders", b"{}");
+        let mut headers = keyed_headers("shared-key", "api.example", 2);
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        identities.push(request_identity(plugin, &ctx).unwrap());
+    }
+
+    assert_eq!(
+        identities[0], identities[1],
+        "the same plugin_config_id must share Redis identity across gateways"
+    );
+    assert_ne!(
+        identities[0].0, identities[2].0,
+        "sibling plugin instances must not share completed or in-flight Redis keys"
+    );
+    assert_eq!(
+        identities[0].1, identities[2].1,
+        "plugin instance partitioning must not alter request fingerprints"
+    );
 }
 
 #[tokio::test]
@@ -2316,11 +3688,11 @@ async fn test_local_and_redis_modes_compute_identical_request_identity() {
     assert!(matches!(redis_result, PluginResult::Continue));
 
     assert_eq!(
-        local_ctx.metadata.get(DEDUP_KEY_METADATA),
-        redis_ctx.metadata.get(DEDUP_KEY_METADATA)
+        request_identity(&local_plugin, &local_ctx).map(|identity| identity.0),
+        request_identity(&redis_plugin, &redis_ctx).map(|identity| identity.0)
     );
     assert_eq!(
-        local_ctx.metadata.get(DEDUP_FINGERPRINT_METADATA),
-        redis_ctx.metadata.get(DEDUP_FINGERPRINT_METADATA)
+        request_identity(&local_plugin, &local_ctx).map(|identity| identity.1),
+        request_identity(&redis_plugin, &redis_ctx).map(|identity| identity.1)
     );
 }

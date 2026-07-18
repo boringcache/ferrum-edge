@@ -3655,6 +3655,44 @@ async fn redaction_placeholder_not_reflagged_on_final() {
     );
 }
 
+#[tokio::test]
+async fn redact_args_findings_on_range_and_delta_responses_fail_closed() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        }
+    }));
+    let governed = response_with_tool_call("filesystem.write", "{\"token\":\"sk-SECRET123\"}");
+    let clean = response_with_tool_call("filesystem.write", "{\"path\":\"/safe\"}");
+
+    for status in [206, 226] {
+        let mut governed_ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_response_body(&mut governed_ctx, status, &json_headers(), &governed)
+                .await,
+            Some(502),
+        );
+        assert_eq!(
+            governed_ctx
+                .metadata
+                .get("ai_tool_governor.decision")
+                .map(String::as_str),
+            Some("deny")
+        );
+
+        let mut clean_ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut clean_ctx, status, &json_headers(), &clean)
+                .await,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Round 6 review fixes: buffered-SSE ungovernable, header relabeling, placeholder
 // ---------------------------------------------------------------------------

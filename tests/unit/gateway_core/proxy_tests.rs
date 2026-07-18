@@ -734,7 +734,7 @@ fn test_no_match() {
 use async_trait::async_trait;
 use ferrum_edge::_test_support::{
     apply_request_body_plugins, can_dispatch_direct_http2_pool, can_use_direct_http2_pool,
-    extract_grpc_reject_message, finalize_plugin_rejection_for_test,
+    extract_grpc_reject_message, finalize_plugin_rejection_parts_for_test,
     finalized_upload_deadline_response_for_test, insert_grpc_error_metadata,
     map_http_reject_status_to_grpc_status, normalize_reject_response, request_may_have_body,
     set_grpc_deadline_budget_for_test,
@@ -1692,7 +1692,7 @@ async fn terminal_deadline_reject_runs_decorators_but_not_replacers() {
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     mark_gateway_deadline_response_selected_for_test(&mut ctx);
 
-    let (status, body, headers) = finalize_plugin_rejection_for_test(
+    let (status, body, headers) = finalize_plugin_rejection_parts_for_test(
         &plugins,
         &mut ctx,
         200,
@@ -1753,7 +1753,7 @@ async fn rejection_hook_pending_at_deadline_does_not_delay_status_four() {
 
     let (status, body, headers) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        finalize_plugin_rejection_for_test(
+        finalize_plugin_rejection_parts_for_test(
             &plugins,
             &mut ctx,
             503,
@@ -1795,7 +1795,7 @@ async fn deadline_text_without_typed_provenance_does_not_claim_gateway_ownership
         "/my.Service/Unary".to_string(),
     );
 
-    let (status, body, headers) = finalize_plugin_rejection_for_test(
+    let (status, body, headers) = finalize_plugin_rejection_parts_for_test(
         &plugins,
         &mut ctx,
         200,

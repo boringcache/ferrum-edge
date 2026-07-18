@@ -4760,7 +4760,7 @@ async fn handle_list_plugin_types() -> Result<Response<Full<Bytes>>, hyper::Erro
     ))
 }
 
-fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClient {
+pub(crate) fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClient {
     state
         .proxy_state
         .as_ref()
@@ -6270,7 +6270,7 @@ async fn handle_restore(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
                         "error": format!(
-                            "Restore aborted: HMAC request-transform composition could not be validated: {}. Existing config was NOT deleted.",
+                            "Restore aborted: plugin security composition could not be validated: {}. Existing config was NOT deleted.",
                             error
                         )
                     }),

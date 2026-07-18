@@ -52,6 +52,38 @@ struct PriorityOverridePlugin {
     priority: u16,
 }
 
+/// Pure capability view used by candidate admission. Runtime construction of
+/// `serverless_function` resolves node-local credentials and environment, which
+/// must happen only where the data-plane plugin instance will execute.
+struct ServerlessSecurityCompositionPlugin {
+    priority: u16,
+    forward_body: bool,
+    terminate: bool,
+}
+
+#[async_trait]
+impl Plugin for ServerlessSecurityCompositionPlugin {
+    fn name(&self) -> &str {
+        "serverless_function"
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        crate::plugins::HTTP_GRPC_PROTOCOLS
+    }
+
+    fn egresses_request_body_before_finalization(&self) -> bool {
+        self.forward_body
+    }
+
+    fn requires_prior_request_deduplication(&self) -> bool {
+        self.terminate
+    }
+}
+
 /// Per-chain CORS wrapper. It avoids mutating a shared plugin instance when a
 /// proxy-group or global CORS policy participates in a multiple-instance chain
 /// for only some proxies.
@@ -225,30 +257,61 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
     Ok(())
 }
 
-/// HMAC authenticates the exact client-visible request body and digest. A later
-/// body transform would make the backend-visible bytes disagree with the
-/// signed `Digest`/`Content-Digest` and `Authorization` fields. Reject that
-/// composition at cache build time instead of forwarding stale integrity
-/// metadata or silently weakening authentication.
-fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
+/// Reject security-sensitive plugin compositions whose ordering or body view
+/// cannot preserve the configured enforcement contract.
+fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
     for protocol in ALL_PROXY_PROTOCOLS {
-        if !plugins
+        let has_hmac = plugins
             .iter()
             .filter(|plugin| plugin.supported_protocols().contains(&protocol))
-            .any(|plugin| plugin.name() == "hmac_auth")
-        {
-            continue;
-        }
-        if let Some(transformer) = plugins
-            .iter()
-            .filter(|plugin| plugin.supported_protocols().contains(&protocol))
-            .find(|plugin| plugin.modifies_request_body())
+            .any(|plugin| plugin.name() == "hmac_auth");
+        if has_hmac
+            && let Some(transformer) = plugins
+                .iter()
+                .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+                .find(|plugin| plugin.modifies_request_body())
         {
             return Err(format!(
                 "hmac_auth cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; HMAC authenticates the client-to-gateway representation and Ferrum will not forward stale signed digest metadata",
                 transformer.name(),
                 protocol
             ));
+        }
+
+        if let Some(egress_plugin) = plugins
+            .iter()
+            .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+            .find(|plugin| plugin.egresses_request_body_before_finalization())
+            && let Some(transformer) = plugins
+                .iter()
+                .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+                .find(|plugin| plugin.modifies_request_body())
+        {
+            return Err(format!(
+                "request-body egress plugin '{}' cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; the external decision runs before body transformation and Ferrum will not let it govern bytes different from those sent to the backend",
+                egress_plugin.name(),
+                transformer.name(),
+                protocol
+            ));
+        }
+
+        for side_effecting_plugin in plugins.iter().filter(|plugin| {
+            plugin.supported_protocols().contains(&protocol)
+                && plugin.requires_prior_request_deduplication()
+        }) {
+            if let Some(deduplication) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() == "request_deduplication"
+                    && plugin.priority() >= side_effecting_plugin.priority()
+            }) {
+                return Err(format!(
+                    "{} at effective priority {} must run after every request_deduplication instance for protocol {:?}; request_deduplication priority {} would let a terminal external side effect execute before retry ownership is acquired",
+                    side_effecting_plugin.name(),
+                    side_effecting_plugin.priority(),
+                    protocol,
+                    deduplication.priority(),
+                ));
+            }
         }
     }
     Ok(())
@@ -317,14 +380,6 @@ pub(crate) fn validate_correlation_id_composition(
     Ok(())
 }
 
-fn validate_plugin_composition(
-    plugins: &[Arc<dyn Plugin>],
-    real_ip_header: Option<&str>,
-) -> Result<(), String> {
-    validate_hmac_request_transform_composition(plugins)?;
-    validate_correlation_id_composition(plugins, real_ip_header)
-}
-
 #[async_trait]
 impl Plugin for PriorityOverridePlugin {
     fn name(&self) -> &str {
@@ -369,6 +424,12 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn modifies_request_body(&self) -> bool {
         self.inner.modifies_request_body()
+    }
+    fn egresses_request_body_before_finalization(&self) -> bool {
+        self.inner.egresses_request_body_before_finalization()
+    }
+    fn requires_prior_request_deduplication(&self) -> bool {
+        self.inner.requires_prior_request_deduplication()
     }
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.inner.requires_request_body_before_before_proxy()
@@ -696,6 +757,9 @@ impl Plugin for PriorityOverridePlugin {
             .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await
     }
+    fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
+        self.inner.requires_replay_response_body_transform(ctx)
+    }
     fn on_response_body_transformed(
         &self,
         ctx: &mut RequestContext,
@@ -950,6 +1014,20 @@ fn try_create_plugin(
             current_adaptive_states,
             staged_adaptive_states,
         )
+    } else if pc.plugin_name == "serverless_function" {
+        crate::plugins::serverless_function::ServerlessFunction::new_with_instance_id(
+            &pc.config,
+            http_client.clone(),
+            &pc.id,
+        )
+        .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
+    } else if pc.plugin_name == "request_deduplication" {
+        crate::plugins::request_deduplication::RequestDeduplication::new_with_instance_id(
+            &pc.config,
+            http_client.clone(),
+            &pc.id,
+        )
+        .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else if pc.plugin_name == "tcp_connection_throttle" {
         create_tcp_connection_throttle_plugin(
             pc,
@@ -1029,7 +1107,8 @@ type RequestBufferingMap = HashMap<String, bool>;
 type WsFrameMap = HashMap<String, bool>;
 /// Map from proxy_group plugin_config_id to its shared plugin instance.
 type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
-type CompositionPluginMap<'a> = HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
+type SecurityCompositionPluginMap<'a> =
+    HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct AdaptiveConcurrencyPolicyId {
@@ -2161,14 +2240,18 @@ struct ProxyGroupPluginInstance {
     config: PluginConfig,
 }
 
-/// Built-in plugin types whose constructed instances participate in a
-/// cross-plugin composition invariant. Keep the HMAC portion aligned with
-/// `Plugin::modifies_request_body()` implementations. Registered custom
-/// plugins are also constructed because their capability is defined by their
-/// `Plugin` implementation rather than a core allowlist.
-const COMPOSITION_PLUGIN_NAMES: &[&str] = &[
+/// Built-in plugin types whose constructed instance can participate in a
+/// security or cross-plugin composition invariant. Keep this list aligned with
+/// the relevant `Plugin` capabilities (`modifies_request_body()`,
+/// `egresses_request_body_before_finalization()`, `requires_prior_request_deduplication()`,
+/// and `correlation_id_header_name()`). Registered custom plugins are also
+/// constructed because their capability is defined by their implementation
+/// rather than a core allowlist.
+const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "correlation_id",
     "hmac_auth",
+    "request_deduplication",
+    "serverless_function",
     "request_transformer",
     "compression",
     "grpc_web",
@@ -2179,34 +2262,25 @@ const COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "ai_request_guard",
 ];
 
-/// Validate cross-plugin composition invariants against a candidate config
-/// before an admin Proxy or PluginConfig write is persisted. Runtime cache
-/// construction repeats the same checks as a fail-closed backstop.
-pub(crate) fn validate_plugin_composition_candidate(
+fn is_security_composition_candidate_plugin(
+    plugin_name: &str,
+    custom_plugin_names: &[&str],
+) -> bool {
+    SECURITY_COMPOSITION_PLUGIN_NAMES.contains(&plugin_name)
+        || custom_plugin_names.contains(&plugin_name)
+}
+
+/// Validate security-sensitive and cross-plugin composition invariants against a
+/// candidate config before an admin Proxy or PluginConfig write is persisted.
+/// Runtime cache construction repeats the same checks as a fail-closed backstop.
+pub(crate) fn validate_plugin_security_composition_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,
 ) -> Result<(), String> {
-    let has_hmac = config
-        .plugin_configs
-        .iter()
-        .any(|plugin| plugin.enabled && plugin.plugin_name == "hmac_auth");
-    let has_correlation = config
-        .plugin_configs
-        .iter()
-        .any(|plugin| plugin.enabled && plugin.plugin_name == "correlation_id");
-    let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
-    // A custom plugin's composition capabilities are known only after its
-    // registered factory constructs the Plugin implementation.
-    let has_custom_composition_candidate = config
-        .plugin_configs
-        .iter()
-        .any(|plugin| plugin.enabled && custom_plugin_names.contains(&plugin.plugin_name.as_str()));
-    if !has_hmac && !has_correlation && !has_custom_composition_candidate {
-        return Ok(());
-    }
     let mut errors = Vec::new();
     let mut global_plugins: BTreeMap<&str, Vec<Arc<dyn Plugin>>> = BTreeMap::new();
-    let mut scoped_plugins: CompositionPluginMap<'_> = HashMap::new();
+    let mut scoped_plugins: SecurityCompositionPluginMap<'_> = HashMap::new();
+    let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let current_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
@@ -2214,20 +2288,38 @@ pub(crate) fn validate_plugin_composition_candidate(
 
     for plugin_config in &config.plugin_configs {
         if !plugin_config.enabled
-            || (!COMPOSITION_PLUGIN_NAMES.contains(&plugin_config.plugin_name.as_str())
-                && !custom_plugin_names.contains(&plugin_config.plugin_name.as_str()))
+            || !is_security_composition_candidate_plugin(
+                plugin_config.plugin_name.as_str(),
+                &custom_plugin_names,
+            )
         {
             continue;
         }
-        match try_create_plugin(
-            plugin_config,
-            config,
-            http_client,
-            &current_adaptive_states,
-            &mut staged_adaptive_states,
-            &current_tcp_throttle_states,
-            &mut staged_tcp_throttle_states,
-        ) {
+        let created = if plugin_config.plugin_name == "serverless_function" {
+            crate::plugins::serverless_function::security_composition_capabilities(
+                &plugin_config.config,
+            )
+            .map(|(forward_body, terminate)| {
+                Some(Arc::new(ServerlessSecurityCompositionPlugin {
+                    priority: plugin_config
+                        .priority_override
+                        .unwrap_or(crate::plugins::priority::SERVERLESS_FUNCTION),
+                    forward_body,
+                    terminate,
+                }) as Arc<dyn Plugin>)
+            })
+        } else {
+            try_create_plugin(
+                plugin_config,
+                config,
+                http_client,
+                &current_adaptive_states,
+                &mut staged_adaptive_states,
+                &current_tcp_throttle_states,
+                &mut staged_tcp_throttle_states,
+            )
+        };
+        match created {
             Ok(Some(plugin)) if plugin_config.scope == PluginScope::Global => {
                 global_plugins
                     .entry(plugin_config.namespace.as_str())
@@ -2272,13 +2364,23 @@ pub(crate) fn validate_plugin_composition_candidate(
             remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
             merged.push(Arc::clone(plugin));
         }
-        if let Err(error) = validate_plugin_composition(&merged, http_client.real_ip_header()) {
+        if let Err(error) = validate_plugin_security_composition(&merged) {
+            errors.push(format!("proxy_id={}: {error}", proxy.id));
+        }
+        if let Err(error) =
+            validate_correlation_id_composition(&merged, http_client.real_ip_header())
+        {
             errors.push(format!("proxy_id={}: {error}", proxy.id));
         }
     }
 
     for (namespace, plugins) in &global_plugins {
-        if let Err(error) = validate_plugin_composition(plugins, http_client.real_ip_header()) {
+        if let Err(error) = validate_plugin_security_composition(plugins) {
+            errors.push(format!("global plugins namespace={namespace:?}: {error}"));
+        }
+        if let Err(error) =
+            validate_correlation_id_composition(plugins, http_client.real_ip_header())
+        {
             errors.push(format!("global plugins namespace={namespace:?}: {error}"));
         }
     }
@@ -2287,7 +2389,7 @@ pub(crate) fn validate_plugin_composition_candidate(
         Ok(())
     } else {
         Err(format!(
-            "{} plugin composition error(s): {}",
+            "{} plugin security composition error(s): {}",
             errors.len(),
             errors.join("; ")
         ))
@@ -2303,6 +2405,19 @@ fn remove_shadowed_global_plugin(
         plugin.name() != plugin_name
             || !global_ptrs.contains(&(Arc::as_ptr(plugin) as *const () as usize))
     });
+}
+
+/// Cross-plugin composition candidate validation. The security composition
+/// candidate walker constructs every composition-relevant plugin once, except
+/// for the environment-bound serverless plugin whose static capability view is
+/// sufficient, and runs both the security-sensitive ordering/body-view
+/// invariants and the correlation-header invariants. This remains the single
+/// admission entrypoint for both concerns.
+pub(crate) fn validate_plugin_composition_candidate(
+    config: &GatewayConfig,
+    http_client: &PluginHttpClient,
+) -> Result<(), String> {
+    validate_plugin_security_composition_candidate(config, http_client)
 }
 
 fn same_proxy_group_plugin_config(left: &PluginConfig, right: &PluginConfig) -> bool {
@@ -3369,9 +3484,13 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
-            if let Err(e) =
-                validate_plugin_composition(&global_plugins, self.http_client.real_ip_header())
-            {
+            if let Err(e) = validate_plugin_security_composition(&global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
+            if let Err(e) = validate_correlation_id_composition(
+                &global_plugins,
+                self.http_client.real_ip_header(),
+            ) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
             Arc::new(global_plugins)
@@ -3625,7 +3744,11 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) = validate_plugin_composition(&merged, self.http_client.real_ip_header())
+            if let Err(e) = validate_plugin_security_composition(&merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
+            if let Err(e) =
+                validate_correlation_id_composition(&merged, self.http_client.real_ip_header())
             {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
@@ -4195,7 +4318,12 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) = validate_plugin_composition(&merged, http_client.real_ip_header()) {
+            if let Err(e) = validate_plugin_security_composition(&merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
+            if let Err(e) =
+                validate_correlation_id_composition(&merged, http_client.real_ip_header())
+            {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
 
@@ -4224,7 +4352,12 @@ impl PluginCache {
         if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
-        if let Err(e) = validate_plugin_composition(&global_plugins, http_client.real_ip_header()) {
+        if let Err(e) = validate_plugin_security_composition(&global_plugins) {
+            plugin_errors.push(format!("global plugins: {e}"));
+        }
+        if let Err(e) =
+            validate_correlation_id_composition(&global_plugins, http_client.real_ip_header())
+        {
             plugin_errors.push(format!("global plugins: {e}"));
         }
 

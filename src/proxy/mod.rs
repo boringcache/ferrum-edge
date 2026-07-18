@@ -185,8 +185,9 @@ pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_
 /// Marker recorded in `ctx.metadata` for the duration of
 /// [`apply_synthetic_response_body_hooks`] — i.e. while the response-body hook
 /// pipeline (`on_response_body`, `transform_response_body_with_context`,
-/// `on_final_response_body`) runs over a synthetic 2xx plugin short-circuit body
-/// rather than a real backend response. Unlike
+/// `on_final_response_body`) runs over a governed synthetic plugin short-circuit
+/// body rather than a real backend response. This includes final 2xx-5xx
+/// terminate-mode serverless responses. Unlike
 /// [`REJECTION_RESPONSE_METADATA_KEY`] (scoped to the `after_proxy` reject hooks
 /// only), this marker stays set across the body-hook phase so that a storing
 /// plugin's `on_final_response_body` can tell apart "this body was produced by a
@@ -302,6 +303,34 @@ pub(crate) const LATER_STRONG_ETAG_RESPONSE_METADATA_KEY: &str =
 /// or renames `Cache-Control` before compression's own `before_proxy` hook.
 pub(crate) const NO_TRANSFORM_REQUEST_METADATA_KEY: &str = "ferrum:no_transform_request";
 
+/// Marker recorded in `ctx.metadata` when the ORIGINAL client request declared a
+/// non-identity `Content-Encoding`, captured before any `before_proxy` hook can
+/// mutate request headers. `serverless_function` reads this so a header-only
+/// `request_transformer` (priority 3000) that removes or renames
+/// `Content-Encoding` before the serverless egress (priority 3025) cannot smuggle
+/// the original compressed body past the fail-closed encoded-body boundary — the
+/// buffered `ctx.request_body_bytes` are the original client bytes, so their
+/// content coding is described by the original request headers, not the
+/// transformed map the plugin receives.
+pub(crate) const ORIGIN_ENCODED_REQUEST_METADATA_KEY: &str = "ferrum:origin_encoded_request";
+
+/// Marker recorded in `ctx.metadata` when a `request_transformer` query rule
+/// actually mutated `ctx.query_params` (add/remove/update/rename). Query
+/// transformations operate on the decoded parameter map, which cannot be
+/// reconciled with `serverless_function`'s raw-query payload without losing the
+/// raw plus/duplicate/decode/auth-strip invariants the raw path exists to
+/// preserve, so the serverless egress fails closed on the composition rather than
+/// emitting a payload that silently ignores the operator's query transform.
+pub(crate) const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
+
+/// True when a `Content-Encoding` field-line declares a coding other than
+/// `identity`. Whitespace-only and empty values are treated as encoded
+/// (fail-closed): a present-but-empty encoding is malformed and cannot be proven
+/// to describe identity-coded bytes.
+pub(crate) fn content_encoding_declares_non_identity(value: &str) -> bool {
+    !value.trim().eq_ignore_ascii_case("identity")
+}
+
 pub(crate) fn stamp_original_request_metadata(ctx: &mut RequestContext) {
     let raw_has_no_transform = ctx
         .raw_header_values("cache-control")
@@ -309,6 +338,26 @@ pub(crate) fn stamp_original_request_metadata(ctx: &mut RequestContext) {
     if raw_has_no_transform || headers_have_cache_control_directive(&ctx.headers, "no-transform") {
         ctx.metadata.insert(
             NO_TRANSFORM_REQUEST_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+
+    // Capture the original non-identity content coding before any before_proxy
+    // header transform can drop it. Check raw field-lines first (the pristine
+    // wire header, available here because `set_raw_headers` runs immediately
+    // before this) and fall back to the materialized map for paths that already
+    // consumed the raw headers.
+    let raw_declares_encoding = ctx
+        .raw_header_values("content-encoding")
+        .any(content_encoding_declares_non_identity);
+    let materialized_declares_encoding = ctx
+        .headers
+        .get("content-encoding")
+        .map(String::as_str)
+        .is_some_and(content_encoding_declares_non_identity);
+    if raw_declares_encoding || materialized_declares_encoding {
+        ctx.metadata.insert(
+            ORIGIN_ENCODED_REQUEST_METADATA_KEY.to_string(),
             "true".to_string(),
         );
     }
@@ -14313,19 +14362,20 @@ pub(crate) async fn apply_plugin_rejection_response(
 }
 
 /// Decide whether response-body guardrails / transforms should run over a
-/// synthetic 2xx plugin short-circuit body (e.g. `ai_federation` /
-/// `ai_semantic_cache` synthetic responses surfaced via `RejectBinary{200}`).
+/// synthetic plugin short-circuit body. This includes ordinary successful
+/// synthetic responses (e.g. `ai_federation` / `ai_semantic_cache` surfaced via
+/// `RejectBinary{200}`) and every final 2xx-5xx terminate-mode serverless
+/// response, which is application-owned content rather than a gateway error.
 ///
 /// General rule: these hooks (`on_response_body`,
 /// `transform_response_body_with_context`, `on_final_response_body`) run over a
-/// 2xx short-circuit body **only** when there is a body to inspect and the same
-/// response-body-buffering capability gate the normal response path uses is
-/// satisfied. Specifically we skip when:
+/// governed short-circuit body **only** when there is a body to inspect and the
+/// same response-body-buffering capability gate the normal response path uses
+/// is satisfied. Specifically we skip when:
 /// - the request is gRPC (synthetic gRPC bodies are handled as trailers-only),
-/// - the status is not 2xx,
-/// - the status is 204 (a body-emitting transform there is protocol-incorrect —
-///   `204 No Content` MUST NOT carry a body; 304 is already outside the 2xx
-///   range checked above),
+/// - the status is neither 2xx nor a marked final serverless response,
+/// - the status is 204, 205, or 304 (a body-emitting transform there is
+///   protocol-incorrect),
 /// - the synthetic body is empty (nothing to inspect/transform), or
 /// - no active plugin wants to buffer this response. We mirror the normal
 ///   response path's two-tier gate exactly: a plugin's per-request
@@ -14345,16 +14395,18 @@ fn should_apply_synthetic_response_body_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
 ) -> bool {
+    let governed_synthetic_status = (200..300).contains(&status_code)
+        || (ctx.serverless_terminate_response && (200..=599).contains(&status_code));
     !is_grpc_request
-        && (200..300).contains(&status_code)
-        && status_code != 204
+        && governed_synthetic_status
+        && !matches!(status_code, 204 | 205 | 304)
         && !response_body.is_empty()
         && plugins.iter().any(|plugin| {
             plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
         })
 }
 
-/// Run the synthetic 2xx short-circuit response-body hook pipeline
+/// Run the governed synthetic short-circuit response-body hook pipeline
 /// (`on_response_body`, `transform_response_body_with_context`,
 /// `on_final_response_body`) over a plugin-generated body, replacing the
 /// response when a body guardrail rejects it.
@@ -14364,7 +14416,7 @@ fn should_apply_synthetic_response_body_hooks(
 /// run the `after_proxy` reject hooks. The caller
 /// ([`apply_reject_after_proxy_and_synthetic_body_hooks`]) runs those hooks
 /// exactly once after this function returns, over whatever the final response
-/// turned out to be (the synthetic 2xx or the body-rejection response), so
+/// turned out to be (the synthetic response or the body-rejection response), so
 /// one-shot `after_proxy` response state (e.g. the `oidc_relying_party` rotated
 /// session cookie, `response_transformer` route overrides) lands on the final
 /// response exactly once instead of being consumed by an earlier pass and lost
@@ -14418,26 +14470,61 @@ async fn apply_synthetic_response_body_hooks(
 
     let content_type = response_headers.get("content-type").cloned();
     let ct_ref = content_type.as_deref();
-    for plugin in plugins.iter() {
-        let deadline = ctx.grpc_deadline_at();
-        let transformed = match crate::plugins::await_grpc_deadline(
-            deadline,
-            plugin.transform_response_body_with_context(
-                ctx,
-                response_body,
-                ct_ref,
+    if crate::plugins::response_body_rewrite_allowed(*response_status) {
+        let mut mandatory_replay_transform_failed = None;
+        for plugin in plugins.iter() {
+            let mandatory_replay_transform = ctx.deduplication_replay_response_finalized
+                && plugin.requires_replay_response_body_transform(ctx);
+            if ctx.deduplication_replay_response_finalized && !mandatory_replay_transform {
+                continue;
+            }
+            let deadline = ctx.grpc_deadline_at();
+            let transformed = match crate::plugins::await_grpc_deadline(
+                deadline,
+                plugin.transform_response_body_with_context(
+                    ctx,
+                    response_body,
+                    ct_ref,
+                    response_headers,
+                ),
+            )
+            .await
+            {
+                Ok(transformed) => transformed,
+                Err(()) if mandatory_replay_transform => {
+                    mandatory_replay_transform_failed = Some(plugin.name());
+                    break;
+                }
+                Err(()) => break,
+            };
+            if let Some(transformed) = transformed {
+                response_headers
+                    .insert("content-length".to_string(), transformed.len().to_string());
+                *response_body = transformed;
+                crate::plugins::finalize_response_body_transformation(
+                    plugin.as_ref(),
+                    ctx,
+                    response_headers,
+                );
+            } else if mandatory_replay_transform {
+                mandatory_replay_transform_failed = Some(plugin.name());
+                break;
+            }
+        }
+        if let Some(plugin_name) = mandatory_replay_transform_failed {
+            warn!(
+                plugin = plugin_name,
+                "Mandatory replay response redaction transform failed; rejecting response"
+            );
+            *response_body = rebuild_plugin_rejection_response_headers(
+                response_status,
                 response_headers,
-            ),
-        )
-        .await
-        {
-            Ok(transformed) => transformed,
-            Err(()) => break,
-        };
-        if let Some(transformed) = transformed {
-            response_headers.insert("content-length".to_string(), transformed.len().to_string());
-            *response_body = transformed;
-            plugin.on_response_body_transformed(ctx, response_headers);
+                RejectedResponseParts {
+                    status_code: 502,
+                    body: br#"{"error":"response redaction failed"}"#.to_vec(),
+                    headers: HashMap::new(),
+                },
+            );
         }
     }
 
@@ -14501,17 +14588,17 @@ async fn apply_synthetic_response_body_hooks(
 ///
 /// Ordering: the synthetic body hooks run first (they may *replace* the
 /// response when `ai_response_guard` / `ai_semantic_firewall` rejects the
-/// synthetic 2xx body — see [`apply_synthetic_response_body_hooks`], which
+/// synthetic body — see [`apply_synthetic_response_body_hooks`], which
 /// rebuilds headers via [`rebuild_plugin_rejection_response_headers`] without
 /// running `after_proxy`). The `after_proxy` reject hooks then run a single
-/// time over whatever the FINAL response is (the synthetic 2xx OR the
+/// time over whatever the FINAL response is (the synthetic response OR the
 /// body-rejection response). Running `after_proxy` exactly once — and last —
 /// preserves one-shot response state that those hooks emit: the
 /// `oidc_relying_party` rotated session cookie and `response_transformer`
 /// route-override headers are staged from metadata that the hook consumes on
 /// first invocation, so they must be applied to the final response, not
-/// consumed against a synthetic 2xx that a later body rejection discards. The
-/// reject-path `after_proxy` hooks are header-only and do not depend on the
+/// consumed against a synthetic response that a later body rejection discards.
+/// The reject-path `after_proxy` hooks are header-only and do not depend on the
 /// body-hook output (`compression::after_proxy` deliberately no-ops on the
 /// rejection path), so deferring them past the body hooks is safe.
 pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
@@ -14547,15 +14634,16 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         // ahead of the body hooks: doing so would re-break the one-shot
         // `after_proxy` response-state contract that the caller relies on. The
         // body hooks may REPLACE the response when a guardrail rejects the
-        // synthetic 2xx body (`apply_synthetic_response_body_hooks` rebuilds
+        // synthetic body (`apply_synthetic_response_body_hooks` rebuilds
         // headers via `rebuild_plugin_rejection_response_headers`). The
         // `after_proxy` reject hooks therefore have to run exactly once and LAST,
         // over the FINAL response, so one-shot state emitted from consumed
         // metadata — the `oidc_relying_party` rotated session cookie, the
         // `response_transformer` route override — lands on whatever the client
-        // actually receives instead of being consumed against a synthetic 2xx
-        // that a later body rejection discards (see commit 36de1bf0 and the
-        // function-level doc on `apply_reject_after_proxy_and_synthetic_body_hooks`).
+        // actually receives instead of being consumed against a synthetic
+        // response that a later body rejection discards (see commit 36de1bf0
+        // and the function-level doc on
+        // `apply_reject_after_proxy_and_synthetic_body_hooks`).
         // The two requirements directly conflict; we keep the one-shot guarantee
         // and accept the minor body-transform divergence on the synthetic path.
         apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
@@ -14564,7 +14652,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         ctx.method = original_method;
     }
     // Apply the after_proxy reject hooks exactly once, over the final response
-    // (the synthetic 2xx or the body-rejection response produced above), so
+    // (the synthetic response or the body-rejection response produced above), so
     // one-shot response state (rotated session cookie, route overrides) is
     // emitted onto whatever the client actually receives. Runs LAST by design —
     // see the divergence note above.
@@ -15246,36 +15334,45 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     let content_type = response_headers.get("content-type").cloned();
     let content_type = content_type.as_deref();
     let mut body_transformed = false;
-    for plugin in plugins {
-        let transformed = match crate::plugins::await_grpc_deadline(
-            ctx.grpc_deadline_at(),
-            plugin.transform_response_body_with_context(
-                ctx,
-                response_body,
-                content_type,
-                response_headers,
-            ),
-        )
-        .await
-        {
-            Ok(transformed) => transformed,
-            Err(()) => {
-                *response_status = replace_buffered_grpc_response_with_deadline(
+    // Range/delta representations (206/226) are only a selected slice, so they
+    // are not rewritten into a truthful full representation here.
+    if crate::plugins::response_body_rewrite_allowed(*response_status) {
+        for plugin in plugins {
+            let transformed = match crate::plugins::await_grpc_deadline(
+                ctx.grpc_deadline_at(),
+                plugin.transform_response_body_with_context(
                     ctx,
-                    grpc_web_response_content_type,
-                    response_headers,
                     response_body,
-                    initial_response_header_policy_plugins,
-                )
-                .as_u16();
-                return (true, body_transformed);
+                    content_type,
+                    response_headers,
+                ),
+            )
+            .await
+            {
+                Ok(transformed) => transformed,
+                Err(()) => {
+                    *response_status = replace_buffered_grpc_response_with_deadline(
+                        ctx,
+                        grpc_web_response_content_type,
+                        response_headers,
+                        response_body,
+                        initial_response_header_policy_plugins,
+                    )
+                    .as_u16();
+                    return (true, body_transformed);
+                }
+            };
+            if let Some(transformed) = transformed {
+                response_headers
+                    .insert("content-length".to_string(), transformed.len().to_string());
+                *response_body = transformed;
+                crate::plugins::finalize_response_body_transformation(
+                    plugin.as_ref(),
+                    ctx,
+                    response_headers,
+                );
+                body_transformed = true;
             }
-        };
-        if let Some(transformed) = transformed {
-            response_headers.insert("content-length".to_string(), transformed.len().to_string());
-            *response_body = transformed;
-            plugin.on_response_body_transformed(ctx, response_headers);
-            body_transformed = true;
         }
     }
     (false, body_transformed)
@@ -22978,6 +23075,7 @@ async fn handle_proxy_request_inner(
     // intentionally remain after on_response_body.
     if !after_proxy_rejected
         && !plugins.is_empty()
+        && crate::plugins::response_body_rewrite_allowed(response_status)
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
@@ -23045,6 +23143,7 @@ async fn handle_proxy_request_inner(
     // JSON fields in the response body before it is sent to the client.
     if !after_proxy_rejected
         && !plugins.is_empty()
+        && crate::plugins::response_body_rewrite_allowed(response_status)
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
@@ -32649,6 +32748,8 @@ mod tests {
         should_buffer: bool,
     }
 
+    struct SyntheticBodyTransformPlugin;
+
     struct SyntheticNormalizationProbePlugin;
 
     struct HeadSkippingSyntheticGuardPlugin;
@@ -32675,6 +32776,26 @@ mod tests {
 
         fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
             self.should_buffer
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for SyntheticBodyTransformPlugin {
+        fn name(&self) -> &str {
+            "synthetic_body_transform"
+        }
+
+        fn requires_response_body_buffering(&self) -> bool {
+            true
+        }
+
+        async fn transform_response_body(
+            &self,
+            _body: &[u8],
+            _content_type: Option<&str>,
+            _response_headers: &HashMap<String, String>,
+        ) -> Option<Vec<u8>> {
+            Some(b"transformed application response".to_vec())
         }
     }
 
@@ -33459,6 +33580,64 @@ mod tests {
         assert_eq!(
             ctx.metadata.get("test:committed_body").map(String::as_str),
             Some(r#"{"error":"blocked"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_serverless_non_2xx_runs_synthetic_body_transforms() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(SyntheticBodyTransformPlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/invoke".to_string(),
+        );
+        ctx.serverless_terminate_response = true;
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 429,
+            body: bytes::Bytes::from_static(b"original function error"),
+            headers: HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("etag".to_string(), "\"function-v1\"".to_string()),
+                ("content-digest".to_string(), "sha-256=:stale:".to_string()),
+            ]),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.body, b"transformed application response");
+        assert!(!response.headers.contains_key("etag"));
+        assert!(!response.headers.contains_key("content-digest"));
+        assert_eq!(
+            response.headers.get("content-length").map(String::as_str),
+            Some("32")
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_non_2xx_reject_does_not_run_synthetic_body_transforms() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(SyntheticBodyTransformPlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/invoke".to_string(),
+        );
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 429,
+            body: bytes::Bytes::from_static(b"ordinary gateway rejection"),
+            headers: HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("etag".to_string(), "\"gateway-v1\"".to_string()),
+            ]),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.body, b"ordinary gateway rejection");
+        assert_eq!(
+            response.headers.get("etag").map(String::as_str),
+            Some("\"gateway-v1\"")
         );
     }
 
