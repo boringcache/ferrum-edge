@@ -2139,8 +2139,8 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     if is_mtls_dns_admission_unavailable(error) {
         return super::mtls_dns_admission_unavailable_response();
     }
-    let unique_conflict = is_mtls_dns_identity_conflict(error)
-        || super::chain_has_unique_constraint_violation(error);
+    let unique_conflict =
+        is_mtls_dns_identity_conflict(error) || super::chain_has_unique_constraint_violation(error);
     let message = consumer_persist_error_message(error);
     let status = if unique_conflict {
         StatusCode::CONFLICT
