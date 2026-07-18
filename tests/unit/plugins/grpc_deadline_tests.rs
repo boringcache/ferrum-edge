@@ -4033,9 +4033,12 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
         set_grpc_deadline_budget_for_test,
     };
 
-    let caching = create_plugin("response_caching", &json!({"add_cache_status_header": true}))
-        .unwrap()
-        .unwrap();
+    let caching = create_plugin(
+        "response_caching",
+        &json!({"add_cache_status_header": true}),
+    )
+    .unwrap()
+    .unwrap();
     let after_proxy_plugins = vec![caching];
     let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
 
@@ -4084,16 +4087,22 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
 fn exact_value_telemetry_decorators_declare_only_what_they_write() {
     let ctx = create_test_context();
 
-    let caching = create_plugin("response_caching", &json!({"add_cache_status_header": true}))
-        .unwrap()
-        .unwrap();
+    let caching = create_plugin(
+        "response_caching",
+        &json!({"add_cache_status_header": true}),
+    )
+    .unwrap()
+    .unwrap();
     assert!(caching.owns_deadline_response_header(&ctx, "x-cache-status"));
     assert!(caching.owns_deadline_response_header(&ctx, "X-Cache-Status"));
     assert!(!caching.owns_deadline_response_header(&ctx, "x-other"));
 
-    let caching_off = create_plugin("response_caching", &json!({"add_cache_status_header": false}))
-        .unwrap()
-        .unwrap();
+    let caching_off = create_plugin(
+        "response_caching",
+        &json!({"add_cache_status_header": false}),
+    )
+    .unwrap()
+    .unwrap();
     assert!(
         !caching_off.owns_deadline_response_header(&ctx, "x-cache-status"),
         "ownership must not be claimed when the header is not configured to be written"
