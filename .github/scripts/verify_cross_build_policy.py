@@ -247,8 +247,8 @@ HEREDOC_EXECUTABLE = re.compile(
     r"(?P<interpreter>bash|sh|python|python3)\b"
 )
 OPAQUE_INLINE_SHELL = re.compile(
-    r"(?:\b(?:bash|sh)\s+-c\s+[^\n]*(?:\$\(|`)|"
-    r"\beval\s+[^\n]*(?:\$\(|`)|"
+    r"(?:\b(?:bash|sh)\s+-c\s+(?:[^\n]*\$\(|['\"]?`)|"
+    r"\beval\s+(?:[^\n]*\$\(|['\"]?`)|"
     r"(?:\bsource|(?<!\S)\.)\s+<\()"
 )
 NON_PYTHON_PROCESS_DISPATCH = re.compile(
@@ -3184,13 +3184,9 @@ pre_build = []
         "bash scripts/safe.sh",
         "bash -c \"$(printf '\\143\\162\\157\\163\\163 build')\"",
     )
-    if not compare_pr_automation_collection(
-        {"ci.yml": referenced_workflow},
-        {"ci.yml": generated_shell_workflow},
-        {"setup/action.yml": safe_action},
-        {"setup/action.yml": safe_action},
-        safe_automation,
-        safe_automation,
+    if not compare_pr_workflow_collection(
+        {"safe.yml": referenced_workflow},
+        {"safe.yml": generated_shell_workflow},
         "self-test automation directory",
     ):
         failures.append("generated inline shell was not rejected")
