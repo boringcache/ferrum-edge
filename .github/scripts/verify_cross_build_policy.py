@@ -139,11 +139,15 @@ CROSS_ENVIRONMENT = re.compile(
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
 )
 # A command word can start a new statement after an operator, at the start of a
-# line, or immediately inside a grouping/function-body delimiter. `{` matters
-# because a one-line function such as `f(){ cross build ...; }` places the
-# executable directly after the brace with no other separator.
+# line, or immediately inside a function body/group. `{` matters because a
+# one-line function such as `f(){ cross build ...; }` places the executable
+# directly after the brace with no other separator. Bash requires blank space
+# after that brace, and requiring it here keeps ordinary `{"cross": ...}` data
+# out of the executable slot. `(` is deliberately not a context: a real
+# subshell is already covered by the optional `\(` that follows each context,
+# whereas a bare `(` also appears literally inside quoted prose.
 COMMAND_START_CONTEXT = (
-    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|[{(]\s*|"
+    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|"
     r"\b(?:if|elif|while|until|then|do|else)\s+)"
     r"(?:!\s*)?"
 )
@@ -167,8 +171,11 @@ WRAPPER_OPTION = (
     r"--?[A-Za-z0-9][A-Za-z0-9-]*(?:=[^\s]+)?|"
     r"[0-9]+(?:\.[0-9]+)?[smhd]?)"
 )
+# `command -v`/`-V` only looks a name up and prints it; it does not execute the
+# operand, so it must not open an executable slot.
 WRAPPER_PREFIX = (
-    r"(?:(?:command|exec|nohup|sudo|time|timeout|stdbuf|nice|ionice|setsid)"
+    r"(?:(?!command\s+-[vV]\b)"
+    r"(?:command|exec|nohup|sudo|time|timeout|stdbuf|nice|ionice|setsid)"
     rf"(?:\s+{WRAPPER_OPTION})*\s+)*"
 )
 CROSS_COMMAND_CONTEXT = re.compile(
@@ -234,7 +241,7 @@ LOCAL_ACTION_CANDIDATE = re.compile(
 )
 LOCAL_COMMAND_REFERENCE = re.compile(
     r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\$\(\s*|"
-    r"(?:<|>)\(\s*|[{(]\s*|"
+    r"(?:<|>)\(\s*|\{\s+|"
     r"\b(?:if|elif|while|until|then|do|else)\s+)"
     r"(?:!\s*)?"
     r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
@@ -277,7 +284,7 @@ BLOCK_SCALAR_HEADER = re.compile(
     r"^[|>](?:(?:[1-9][+-]?)|(?:[+-][1-9]?))?(?:\s+#.*)?$"
 )
 HEREDOC_EXECUTABLE = re.compile(
-    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\$\(\s*|[{(]\s*|"
+    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\$\(\s*|\{\s+|"
     r"\b(?:if|elif|while|until|then|do|else)\s+)"
     r"(?:!\s*)?"
     r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
@@ -300,11 +307,14 @@ OPAQUE_EXPANSION = (
     r"\$\([^()\n]*\)|`[^`\n]*`)"
 )
 OPAQUE_ARM_CROSS_EXECUTION = re.compile(
-    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|[{(]\s*|\b(?:then|do|else)\s+)"
+    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|\b(?:then|do|else)\s+)"
     r"(?:\(\s*)?['\"]?"
     rf"(?:[A-Za-z]*{OPAQUE_EXPANSION}['\"]?)+[A-Za-z]*['\"]?\s+"
     r"(?:\+[^\s]+\s+)?(?:build|rustc|run|test|check|clippy|doc|bench)\b"
-    r"[^\n]*--target(?:=|\s+)aarch64-unknown-linux-gnu\b"
+    r"[^\n]*--target(?:=|\s+)aarch64-unknown-linux-gnu\b",
+    # The leading context anchors on a line start, so this must match every
+    # line of a multi-line script, not only the first.
+    re.MULTILINE,
 )
 NON_PYTHON_PROCESS_DISPATCH = re.compile(
     r"(?:(?:\bchild_process|require\(['\"]child_process['\"]\))\s*\.\s*"
@@ -314,7 +324,7 @@ NON_PYTHON_PROCESS_DISPATCH = re.compile(
     r"\b(?:os\.execute|io\.popen)\s*\()"
 )
 CD_COMMAND = re.compile(
-    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|[{(]\s*|\b(?:then|do|else)\s+)"
+    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|\b(?:then|do|else)\s+)"
     r"cd(?:\s+--)?\s+"
     r"(?P<quote>['\"]?)(?P<path>[^\s;&|]+)(?P=quote)"
 )
@@ -1317,12 +1327,12 @@ def yaml_command_augmented(contents: str) -> str:
     """Append the shell text that YAML `run`/`shell` scalars actually produce.
 
     Raw-text scanning misses a folded (`run: >`) block whose executable and
-    arguments live on different source lines. Appending the resolved command
-    scripts keeps the original text intact while exposing the folded form.
+    arguments live on different source lines. Appending only the folded scalars
+    keeps the original text intact and leaves every other line scanned once.
     """
 
     try:
-        scripts = workflow_command_scripts(contents)
+        scripts = workflow_command_scripts(contents, folded_only=True)
     except (RecursionError, ValueError):
         return contents
     if not scripts:
@@ -1595,11 +1605,21 @@ def folded_block_text(lines: list[str]) -> str:
     return "\n".join(paragraphs)
 
 
-def workflow_command_scripts(contents: str) -> tuple[str, ...]:
-    """Extract literal run and shell scalars from workflows and actions."""
+def workflow_command_scripts(
+    contents: str,
+    *,
+    folded_only: bool = False,
+) -> tuple[str, ...]:
+    """Extract literal run and shell scalars from workflows and actions.
+
+    With `folded_only`, return just the folded (`run: >`) blocks rendered the
+    way YAML joins them. Those are the only scalars whose text differs from the
+    raw source, so scanning them adds coverage without rescanning everything.
+    """
 
     lines = contents.splitlines()
     scripts: list[str] = []
+    folded_scripts: list[str] = []
     index = 0
     while index < len(lines):
         match = YAML_RUN_FIELD.match(lines[index])
@@ -1639,16 +1659,16 @@ def workflow_command_scripts(contents: str) -> tuple[str, ...]:
         ]
         block_indent = min(nonblank_indents, default=field_indent + 2)
         dedented = [line[block_indent:] if line.strip() else "" for line in block]
-        scripts.append("\n".join(dedented))
+        literal = "\n".join(dedented)
+        scripts.append(literal)
         if value.startswith(">"):
             # A folded scalar joins successive lines with a space before the
             # shell ever sees them, so `cross` on one line and its `--target`
-            # arguments on the next are a single command. Scan the folded form
-            # as well; the literal join above stays so nothing regresses.
+            # arguments on the next are a single command.
             folded = folded_block_text(dedented)
-            if folded != "\n".join(dedented):
-                scripts.append(folded)
-    return tuple(scripts)
+            if folded != literal:
+                folded_scripts.append(folded)
+    return tuple(folded_scripts if folded_only else scripts)
 
 
 def executable_heredocs(contents: str) -> tuple[tuple[str, str], ...]:
