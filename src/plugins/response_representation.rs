@@ -253,10 +253,7 @@ fn decode_one_coding(
 /// undone in reverse. `identity` tokens are skipped; an empty or whitespace-only
 /// token is malformed rather than absent, and is rejected — a present-but-empty
 /// coding cannot be proven to describe identity-coded bytes.
-fn decode_response_body(
-    encoding: &str,
-    body: &[u8],
-) -> Result<Vec<u8>, RepresentationRejection> {
+fn decode_response_body(encoding: &str, body: &[u8]) -> Result<Vec<u8>, RepresentationRejection> {
     let codings: Vec<&str> = encoding
         .split(',')
         .map(str::trim)
@@ -360,7 +357,8 @@ pub(crate) fn install_decoded_response_body(
 ) {
     *response_body = decoded;
     response_headers.retain(|name, _| !name.eq_ignore_ascii_case("content-encoding"));
-    response_headers.insert("content-length".to_string(), response_body.len().to_string());
+    let length = response_body.len().to_string();
+    response_headers.insert("content-length".to_string(), length);
     ctx.metadata
         .remove(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
 }

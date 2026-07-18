@@ -51,17 +51,17 @@ fn json_headers() -> HashMap<String, String> {
 }
 
 fn gzip(data: &[u8]) -> Vec<u8> {
-    let mut encoder =
-        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let level = flate2::Compression::default();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), level);
     encoder.write_all(data).expect("gzip write must succeed");
     encoder.finish().expect("gzip finish must succeed")
 }
 
 fn brotli(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
     let params = brotli::enc::BrotliEncoderParams::default();
-    brotli::BrotliCompress(&mut &data[..], &mut out, &params)
-        .expect("brotli compress must succeed");
+    let mut out = Vec::new();
+    let mut input = &data[..];
+    brotli::BrotliCompress(&mut input, &mut out, &params).expect("brotli must compress");
     out
 }
 
@@ -109,7 +109,8 @@ async fn identity_json_body_is_redacted_and_representation_metadata_is_invalidat
     let mut headers = json_headers();
     headers.insert("etag".to_string(), "\"v1\"".to_string());
     headers.insert("content-digest".to_string(), "sha-256=:abc:".to_string());
-    headers.insert("last-modified".to_string(), "Tue, 15 Nov 2022 12:45:26 GMT".to_string());
+    let modified = "Tue, 15 Nov 2022 12:45:26 GMT".to_string();
+    headers.insert("last-modified".to_string(), modified);
     headers.insert("accept-ranges".to_string(), "bytes".to_string());
 
     let (replaced, transformed, status, headers, body, reason) = run_backend_transform(
@@ -622,41 +623,51 @@ async fn multiple_transformer_instances_all_apply_to_a_decoded_body() {
 }
 
 // ---------------------------------------------------------------------------
-// gRPC flavor: a rejection must be a trailers-only gRPC error, not a bare 502.
+// gRPC-Web flavor: a rejection must be a gRPC-Web trailer frame, not a bare 502.
 // ---------------------------------------------------------------------------
 
+/// A gRPC-Web response whose merged view is JSON *is* claimed by a JSON body
+/// policy, so this composition genuinely reaches the gate. The rejection must
+/// come back in the client's flavor: HTTP 200 carrying a gRPC-Web trailer frame,
+/// not an HTTP 502 the gRPC-Web client cannot interpret.
 #[tokio::test]
-async fn grpc_representation_rejection_is_a_trailers_only_grpc_error() {
+async fn grpc_web_representation_rejection_uses_the_grpc_web_error_shape() {
     let plugins = redacting_plugins();
     let mut ctx = make_ctx();
-    let mut status = 200;
-    let mut headers = HashMap::from([
-        ("content-type".to_string(), "application/grpc".to_string()),
-        ("content-range".to_string(), "bytes 0-9/100".to_string()),
-    ]);
+    let mut status = 206;
+    let mut headers = json_headers();
+    headers.insert("content-range".to_string(), "bytes 0-9/100".to_string());
     let mut body = br#"{"secret":"hunter2"}"#.to_vec();
-    stamp_original_response_metadata_for_test(&mut ctx, 206, &headers);
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
-    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+    let (replaced, transformed) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
         &mut ctx,
         &mut status,
         &mut headers,
         &mut body,
-        None,
+        Some("application/grpc-web+proto"),
     )
     .await;
 
-    assert!(replaced);
+    assert!(replaced, "a protected fragment must be rejected");
+    assert!(!transformed);
     assert_eq!(
         status, 200,
-        "a gRPC error rides in trailers under HTTP 200, not an HTTP status"
+        "a gRPC-Web error rides in a trailer frame under HTTP 200"
     );
     assert_eq!(
-        headers.get("grpc-status").map(String::as_str),
-        Some("13"),
-        "gRPC rejections must carry INTERNAL in grpc-status"
+        representation_rejection_reason_for_test(&ctx),
+        Some("partial_representation")
     );
-    assert!(body.is_empty(), "trailers-only gRPC errors carry no body");
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc-web+proto")
+    );
+    assert_eq!(headers.get("x-grpc-web").map(String::as_str), Some("1"));
+    assert!(
+        !headers.contains_key("content-range"),
+        "the replacement must not carry the fragment's range metadata"
+    );
     assert_secret_not_forwarded(&body);
 }

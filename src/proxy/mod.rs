@@ -21631,6 +21631,14 @@ async fn handle_proxy_request_inner(
                 let mut authoritative_trailers_only_terminal_metadata = (response_body.is_empty()
                     && response_trailers.is_empty())
                 .then(|| grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers));
+                // Capture original response invariants before `after_proxy`
+                // rewrites the header view, matching the H1/H2, native H3, and
+                // H3 bridge paths. `response_headers` is still the backend's
+                // untouched initial header map here, so the shared
+                // representation gate can prove this response's original content
+                // coding and range/delta state rather than reading a map a hook
+                // has already rewritten.
+                stamp_original_response_metadata(&mut ctx, response_status, &response_headers);
                 ctx.begin_buffered_initial_response_header_policy(
                     initial_response_header_policy_names,
                     &response_headers,
