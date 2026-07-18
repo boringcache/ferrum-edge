@@ -1387,3 +1387,261 @@ async fn h3_goaway_after_complete_body_is_treated_as_graceful() {
     assert_eq!(status, 200);
     assert_eq!(body, b"ok-from-h3-b");
 }
+
+// ─── H3 sticky-affinity cookie vs. gRPC deadline provenance ──────────────────
+//
+// Codex finding: the buffered H3 paths inject the sticky-affinity `Set-Cookie`
+// without recording it in gRPC-deadline header provenance, unlike the H1/H2
+// paths. A `response_committed` hook that then exhausts the RPC deadline rebuilds
+// the response from gateway-owned headers only, so the freshly injected affinity
+// cookie is stripped and the client silently loses stickiness.
+
+/// A committed-response observer that never completes, driving the RPC deadline
+/// to expiry inside the response-committed phase.
+struct H3StickyStalledCommittedHook;
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::Plugin for H3StickyStalledCommittedHook {
+    fn name(&self) -> &str {
+        "h3_sticky_stalled_committed_hook"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut ferrum_edge::plugins::RequestContext,
+        _response_status: u16,
+        _response_headers: &std::collections::HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        std::future::pending().await
+    }
+}
+
+fn create_sticky_cookie_upstream() -> ferrum_edge::config::types::Upstream {
+    ferrum_edge::config::types::Upstream {
+        id: "sticky-upstream".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        name: Some("sticky upstream".to_string()),
+        targets: vec![ferrum_edge::config::types::UpstreamTarget {
+            host: "10.0.0.1".to_string(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: std::collections::HashMap::new(),
+            locality: None,
+            path: None,
+        }],
+        algorithm: ferrum_edge::config::types::LoadBalancerAlgorithm::RoundRobin,
+        // The cookie-affinity strategy the injector keys on.
+        hash_on: Some("cookie:ferrum-affinity".to_string()),
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: std::collections::HashMap::new(),
+        source_locality: None,
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: std::collections::HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+/// Build an epoch whose single proxy uses the cookie-affinity upstream, plus the
+/// proxy and target the injector is called with.
+#[allow(clippy::type_complexity)]
+fn sticky_cookie_epoch() -> (
+    Arc<ferrum_edge::request_epoch::RequestEpoch>,
+    Proxy,
+    ferrum_edge::config::types::UpstreamTarget,
+) {
+    let upstream = create_sticky_cookie_upstream();
+    let target = upstream.targets[0].clone();
+
+    let mut proxy = create_http3_test_proxy();
+    proxy.upstream_id = Some(upstream.id.clone());
+    proxy.upstream_subset = None;
+
+    let gc = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![proxy.clone()],
+        consumers: vec![],
+        plugin_configs: vec![],
+        upstreams: vec![upstream],
+        loaded_at: chrono::Utc::now(),
+        known_namespaces: Vec::new(),
+        ..Default::default()
+    };
+
+    let plugin_cache = Arc::new(PluginCache::new(&gc).unwrap());
+    let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
+    let lb_cache = Arc::new(ferrum_edge::LoadBalancerCache::new(&gc));
+    let store = ferrum_edge::request_epoch::RequestEpochStore::from_runtime_parts(
+        gc,
+        &plugin_cache,
+        &consumer_index,
+        &lb_cache,
+    );
+    (store.load(), proxy, target)
+}
+
+/// `inject_sticky_cookie` must report whether it actually injected — that return
+/// value is what the buffered H3 call sites use to record `set-cookie` as
+/// gateway-owned.
+#[tokio::test]
+async fn h3_inject_sticky_cookie_reports_whether_it_injected() {
+    let (epoch, proxy, target) = sticky_cookie_epoch();
+    let mut ctx = ferrum_edge::plugins::RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Service/Call".to_string(),
+    );
+
+    let mut headers = std::collections::HashMap::new();
+    assert!(
+        ferrum_edge::_test_support::h3_inject_sticky_cookie_for_test(
+            &mut ctx,
+            &epoch,
+            &proxy,
+            Some(&target),
+            true,
+            &mut headers,
+        ),
+        "a cookie-affinity upstream with a selected target must inject"
+    );
+    assert!(
+        headers
+            .get("set-cookie")
+            .is_some_and(|value| value.starts_with("ferrum-affinity=")),
+        "the affinity cookie must be written, got {:?}",
+        headers.get("set-cookie")
+    );
+
+    // The request already carried the affinity cookie, so no injection is needed.
+    let mut untouched = std::collections::HashMap::new();
+    assert!(
+        !ferrum_edge::_test_support::h3_inject_sticky_cookie_for_test(
+            &mut ctx,
+            &epoch,
+            &proxy,
+            Some(&target),
+            false,
+            &mut untouched,
+        ),
+        "no injection must be reported when the cookie is not needed"
+    );
+    assert!(untouched.is_empty());
+
+    // No selected target: nothing to pin to.
+    let mut no_target = std::collections::HashMap::new();
+    assert!(
+        !ferrum_edge::_test_support::h3_inject_sticky_cookie_for_test(
+            &mut ctx,
+            &epoch,
+            &proxy,
+            None,
+            true,
+            &mut no_target,
+        ),
+        "no injection must be reported without a selected upstream target"
+    );
+    assert!(no_target.is_empty());
+}
+
+/// End-to-end: an H3 buffered response whose sticky-affinity cookie is injected
+/// by proxy core (not by a plugin mutation) must keep that cookie when a
+/// `response_committed` hook exhausts the RPC deadline — while a co-present
+/// backend cookie is still stripped from the synthesized DEADLINE_EXCEEDED
+/// response.
+#[tokio::test]
+async fn h3_injected_sticky_cookie_survives_committed_hook_grpc_deadline() {
+    use ferrum_edge::_test_support::{
+        h3_inject_sticky_cookie_for_test, run_after_proxy_hooks_for_test,
+        run_deadline_bounded_response_committed_hooks_for_test, set_grpc_deadline_budget_for_test,
+    };
+    use ferrum_edge::plugins::Plugin;
+
+    let (epoch, proxy, target) = sticky_cookie_epoch();
+
+    let no_plugins: Vec<Arc<dyn Plugin>> = vec![];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(H3StickyStalledCommittedHook)];
+
+    let mut ctx = ferrum_edge::plugins::RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Service/Call".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    // The backend response carries its own cookie; provenance captures it as the
+    // backend baseline before any gateway output.
+    let mut headers = std::collections::HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (
+            "set-cookie".to_string(),
+            "backend_sid=leak; Path=/".to_string(),
+        ),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&no_plugins, &mut ctx, 200, &mut headers).await,
+        "seeding backend provenance must not reject the response"
+    );
+
+    // The production buffered-H3 injector: writes the cookie AND records it as
+    // gateway-owned. Nothing in this test reproduces that recording, so dropping
+    // it from the production helper fails the assertions below.
+    assert!(
+        h3_inject_sticky_cookie_for_test(
+            &mut ctx,
+            &epoch,
+            &proxy,
+            Some(&target),
+            true,
+            &mut headers,
+        ),
+        "the affinity cookie must be injected onto the buffered H3 response"
+    );
+
+    // A committed-response hook then exhausts the RPC deadline.
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    let surviving = headers
+        .get("set-cookie")
+        .expect("the injected affinity cookie must survive the deadline rebuild");
+    assert!(
+        surviving.starts_with("ferrum-affinity="),
+        "the H3-injected sticky-affinity cookie must cross the deadline rebuild, got {surviving:?}"
+    );
+    assert!(
+        !surviving.contains("backend_sid"),
+        "the backend cookie present at injection must not ride the DEADLINE_EXCEEDED response"
+    );
+}

@@ -295,4 +295,10 @@ impl Plugin for CorrelationId {
     fn applies_after_proxy_on_reject(&self) -> bool {
         self.echo_downstream
     }
+
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        self.echo_downstream
+            && self.request_id(ctx).is_some()
+            && name.eq_ignore_ascii_case(&self.header_name)
+    }
 }

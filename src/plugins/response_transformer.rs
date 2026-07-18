@@ -37,12 +37,14 @@ use async_trait::async_trait;
 use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use tracing::debug;
 
 use super::utils::body_transform::{self, BodyRule};
 use super::utils::route_header_transform::{
     RouteHeaderTransformOp, RouteHeaderTransformRule, apply_route_header_transforms,
+    apply_route_header_transforms_tracked,
 };
 use super::{Plugin, PluginResult, RequestContext};
 use crate::util::http_headers::{cache_control_has_directive, etag_value_is_strong};
@@ -70,6 +72,12 @@ struct HeaderRule {
 
 pub struct ResponseTransformer {
     header_rules: Vec<HeaderRule>,
+    /// Pre-lowercased keys of static `update` rules. These are unconditional
+    /// gateway overwrites, so a completed `after_proxy` owns them on a gRPC
+    /// deadline rebuild even when the backend pre-populated the identical value
+    /// (mutation tracking alone cannot see an exact-value write). Precomputed
+    /// once so the deadline-provenance path allocates nothing per request.
+    static_update_keys: Vec<String>,
     body_rules: Vec<BodyRule>,
     /// When `Some`, the plugin reads
     /// `ferrum.response_transformer.<scope>.enabled` from the mesh
@@ -159,21 +167,49 @@ impl ResponseTransformer {
             })
     }
 
+    /// `fired_write_keys`, when `Some`, collects every key this rule set wrote
+    /// WHOLE — that is, wrote a complete value that net-diff mutation tracking
+    /// cannot be relied on to notice:
+    ///
+    /// * the destination key of every `rename` that actually fired. A rename can
+    ///   land a value on the destination that is byte-identical to something a
+    ///   backend could have sent (the backend may even have sent that exact
+    ///   destination header itself), and mutation tracking sees only the source
+    ///   removal.
+    /// * the key of every `add` that actually INSERTED (a static `add` fires only
+    ///   into an absent slot). An `add` following a `remove` of the same key can
+    ///   leave the final map byte-identical to the backend's, so the net diff is
+    ///   empty even though the gateway authored the surviving value.
+    ///
+    /// Callers that track gRPC-deadline provenance pass a sink and declare these
+    /// keys owned; everyone else passes `None` and stays allocation-free.
     fn apply_static_header_rules(
         &self,
         response_headers: &mut HashMap<String, String>,
         emit_debug: bool,
+        mut fired_write_keys: Option<&mut Vec<String>>,
     ) {
         for rule in &self.header_rules {
             match rule.operation {
                 HeaderOp::Add => {
-                    if let Some(value) = rule.value.as_ref() {
-                        response_headers.entry(rule.key.clone()).or_insert_with(|| {
-                            if emit_debug {
-                                debug!("response_transformer: added header {}={}", rule.key, value);
-                            }
-                            value.clone()
-                        });
+                    if let Some(value) = rule.value.as_ref()
+                        && let Entry::Vacant(slot) = response_headers.entry(rule.key.clone())
+                    {
+                        // A static `add` only ever fires into an ABSENT slot, so
+                        // the whole inserted value is gateway-authored. Record it
+                        // for the same reason as a fired `rename` destination: an
+                        // `add` that follows a `remove` of the same key can leave
+                        // the map byte-identical to the backend's, and net-diff
+                        // mutation tracking would then never credit the
+                        // reintroduced header — silently dropping it from a
+                        // synthesized DEADLINE_EXCEEDED response.
+                        if emit_debug {
+                            debug!("response_transformer: added header {}={}", rule.key, value);
+                        }
+                        slot.insert(value.clone());
+                        if let Some(sink) = fired_write_keys.as_mut() {
+                            sink.push(rule.key.clone());
+                        }
                     }
                 }
                 HeaderOp::Update => {
@@ -201,6 +237,9 @@ impl ResponseTransformer {
                             );
                         }
                         response_headers.insert(new_key.clone(), value);
+                        if let Some(sink) = fired_write_keys.as_mut() {
+                            sink.push(new_key.clone());
+                        }
                     }
                 }
             }
@@ -426,8 +465,15 @@ impl ResponseTransformer {
             }
         };
 
+        let static_update_keys = header_rules
+            .iter()
+            .filter(|rule| rule.operation == HeaderOp::Update)
+            .map(|rule| rule.key.clone())
+            .collect::<Vec<_>>();
+
         Ok(Self {
             header_rules,
+            static_update_keys,
             body_rules,
             runtime_overlay_scope,
             default_enabled,
@@ -493,7 +539,7 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return;
         }
-        self.apply_static_header_rules(response_headers, false);
+        self.apply_static_header_rules(response_headers, false, None);
         if let Some(route_rules) = ctx.route_override_response_transform.take() {
             apply_route_header_transforms(route_rules.as_ref(), response_headers);
         }
@@ -530,15 +576,65 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return PluginResult::Continue;
         }
-        self.apply_static_header_rules(response_headers, true);
+        // Collect fired whole-value writes only when a deadline rebuild could
+        // consult them, keeping the common path allocation-free.
+        let track_owned = ctx.has_buffered_deadline_response_header_provenance();
+        let mut fired_write_keys: Vec<String> = Vec::new();
+        self.apply_static_header_rules(
+            response_headers,
+            true,
+            track_owned.then_some(&mut fired_write_keys),
+        );
         // Per-rule overrides published by `mesh_route_dispatch` run AFTER
         // static rules so route-level writes win on conflict — see module
         // docstring. Take the Arc out so a later response_transformer
         // instance in the chain does not re-apply the same list.
         let route_rules: Option<Arc<Vec<RouteHeaderTransformRule>>> =
             ctx.route_override_response_transform.take();
-        if let Some(route_rules) = route_rules {
-            apply_route_header_transforms(route_rules.as_ref(), response_headers);
+        if let Some(route_rules) = route_rules.as_ref() {
+            apply_route_header_transforms_tracked(
+                route_rules.as_ref(),
+                response_headers,
+                track_owned.then_some(&mut fired_write_keys),
+            );
+        }
+        // Declare every WHOLE-VALUE gateway write (static and route-override) as
+        // gateway-owned for a gRPC deadline rebuild, because net-diff mutation
+        // tracking cannot see such a write when the backend already carried the
+        // identical bytes:
+        //
+        // * `update` overwrites with the configured value, so a backend that
+        //   pre-populated the identical key/value must not be able to suppress
+        //   the decoration on a synthesized DEADLINE_EXCEEDED response.
+        // * a fired `rename` destination: mutation tracking observes only the
+        //   source removal, so a backend that also sent the destination key with
+        //   the same value it is being renamed to would suppress the write.
+        // * an `add` that actually INSERTED into an absent slot — including the
+        //   `remove`-then-`add` sequence whose final map is byte-identical to the
+        //   backend's, where the net diff is empty. `fired_write_keys` carries
+        //   these from both rule sets.
+        //
+        // An `add` that APPENDED onto an existing value is deliberately absent:
+        // it must stay on mutation tracking's append-partition branch so the
+        // backend portion of the value never crosses onto the deadline response.
+        //
+        // The provenance state exists only for deadline-bound buffered responses,
+        // so this is gated to avoid per-request allocation otherwise. Owned names
+        // are borrowed, not cloned.
+        if track_owned {
+            let mut owned: Vec<&str> = Vec::new();
+            owned.extend(self.static_update_keys.iter().map(String::as_str));
+            owned.extend(fired_write_keys.iter().map(String::as_str));
+            if let Some(route_rules) = route_rules.as_ref() {
+                for rule in route_rules.iter() {
+                    if rule.operation == RouteHeaderTransformOp::Update {
+                        owned.push(rule.key.as_str());
+                    }
+                }
+            }
+            if !owned.is_empty() {
+                ctx.record_deadline_owned_response_headers(&owned, response_headers);
+            }
         }
         PluginResult::Continue
     }

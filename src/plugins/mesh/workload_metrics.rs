@@ -897,6 +897,16 @@ impl Plugin for WorkloadMetrics {
         true
     }
 
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        // When `workload_metrics` is the mesh tracing plugin its `after_proxy`
+        // echoes the gateway-authored `traceparent` from `ctx.metadata`, exactly
+        // like `otel_tracing`. If the backend already echoed that identical
+        // value, mutation tracking sees no change, so declare ownership so a
+        // buffered gRPC deadline rebuild preserves the gateway trace context.
+        name.eq_ignore_ascii_case(TRACEPARENT_HEADER)
+            && ctx.metadata.contains_key(TRACEPARENT_HEADER)
+    }
+
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let stamped_direction = ctx.mesh_direction;
         let peer_identity = ctx
