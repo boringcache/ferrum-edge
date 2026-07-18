@@ -36,10 +36,11 @@ use crate::admin::backup::{
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
-    BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
-    NamespaceResourceCounts, PROXY_ROUTE_CONFLICT_ERROR, SnapshotDataIntegrityError,
-    classify_atomic_clear_verification, is_mtls_dns_admission_unavailable,
-    mtls_dns_identity_conflict, tcp_connection_throttle_attachment_conflict,
+    BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
+    MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE, NamespaceResourceCounts, PROXY_ROUTE_CONFLICT_ERROR,
+    SnapshotDataIntegrityError, classify_atomic_clear_verification,
+    is_mtls_dns_admission_unavailable, mtls_dns_identity_conflict,
+    tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
@@ -6011,7 +6012,10 @@ async fn handle_backup(
 
     // Try database first, then cached config
     let (config, source) = if let Some(ref db) = state.db {
-        match db.load_full_config(namespace).await {
+        match db
+            .load_full_config_for_purpose(namespace, FullConfigLoadPurpose::BackupExport)
+            .await
+        {
             Ok(config) => (config, "database"),
             Err(_e) => {
                 warn_persistence_failure_redacted("backup_database_load");

@@ -30,7 +30,7 @@ use tracing::{debug, error, info, warn};
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
-use crate::config::db_backend::{self, DatabaseBackend, IncrementalResult};
+use crate::config::db_backend::{self, DatabaseBackend, FullConfigLoadPurpose, IncrementalResult};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::config::types::GatewayConfig;
@@ -394,16 +394,24 @@ async fn load_full_config_multi(
 ) -> Result<GatewayConfig, anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
-        let config = db.load_full_config(ns).await?;
+        let config = db
+            .load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane)
+            .await?;
         return prepare_cp_full_snapshot(config);
     }
 
     // First namespace seeds the loaded_at / version / trust_bundles fields,
     // then we extend with the remaining namespaces' resource vectors.
     let first = namespaces.first().expect("namespaces is non-empty");
-    let mut combined = prepare_cp_full_snapshot(db.load_full_config(first).await?)?;
+    let mut combined = prepare_cp_full_snapshot(
+        db.load_full_config_for_purpose(first, FullConfigLoadPurpose::ControlPlane)
+            .await?,
+    )?;
     for ns in namespaces.iter().skip(1) {
-        let mut next = prepare_cp_full_snapshot(db.load_full_config(ns).await?)?;
+        let mut next = prepare_cp_full_snapshot(
+            db.load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane)
+                .await?,
+        )?;
         combined.proxies.append(&mut next.proxies);
         combined.consumers.append(&mut next.consumers);
         combined.plugin_configs.append(&mut next.plugin_configs);

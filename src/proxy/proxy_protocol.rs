@@ -363,17 +363,18 @@ fn parse_v2_addresses(
 ///
 /// Returns `(resolved_ip_string, direct_ip_string)` where:
 /// - `resolved_ip_string` is the forwarded client IP (becomes `client_ip`).
-/// - `direct_ip_string` is the raw socket peer (always `direct_client_ip`).
+/// - `direct_ip_string` is the socket peer (always `direct_client_ip`).
 ///
-/// On `NoAddress` both strings are the socket peer IP.
+/// Both values canonicalize IPv4-mapped IPv6 to native IPv4 before stream
+/// plugins run. On `NoAddress` both strings are the canonical socket peer IP.
 pub fn apply_proxy_result(
     result: ProxyProtocolResult,
     socket_peer: &std::net::SocketAddr,
 ) -> (String, String) {
-    let direct = socket_peer.ip().to_string();
+    let direct = socket_peer.ip().to_canonical().to_string();
     match result {
         ProxyProtocolResult::Forwarded { src, .. } => {
-            let resolved = src.ip().to_string();
+            let resolved = src.ip().to_canonical().to_string();
             (resolved, direct)
         }
         ProxyProtocolResult::NoAddress => (direct.clone(), direct),

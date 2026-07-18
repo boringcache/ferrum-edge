@@ -125,6 +125,16 @@ impl OnUnmeteredResponse {
     }
 }
 
+/// `(metadata key, response header)` pairs this plugin exposes downstream when
+/// `expose_headers` is set. Single source of truth for both the `after_proxy`
+/// write and the gRPC-deadline ownership declaration.
+const EXPOSED_RATELIMIT_HEADERS: &[(&str, &str)] = &[
+    ("ai_ratelimit_limit", "x-ai-ratelimit-limit"),
+    ("ai_ratelimit_remaining", "x-ai-ratelimit-remaining"),
+    ("ai_ratelimit_window", "x-ai-ratelimit-window"),
+    ("ai_ratelimit_usage", "x-ai-ratelimit-usage"),
+];
+
 pub struct AiRateLimiter {
     token_limit: u64,
     window_seconds: u64,
@@ -1639,18 +1649,34 @@ impl Plugin for AiRateLimiter {
             return PluginResult::Continue;
         }
 
-        for (meta_key, header_name) in &[
-            ("ai_ratelimit_limit", "x-ai-ratelimit-limit"),
-            ("ai_ratelimit_remaining", "x-ai-ratelimit-remaining"),
-            ("ai_ratelimit_window", "x-ai-ratelimit-window"),
-            ("ai_ratelimit_usage", "x-ai-ratelimit-usage"),
-        ] {
+        for (meta_key, header_name) in EXPOSED_RATELIMIT_HEADERS {
             if let Some(value) = ctx.metadata.get(*meta_key) {
                 response_headers.insert(header_name.to_string(), value.clone());
             }
         }
 
         PluginResult::Continue
+    }
+
+    /// These telemetry writes are unconditional `insert`s of a gateway-computed
+    /// value, so a backend that pre-populates the identical bytes makes them
+    /// invisible to net-diff mutation tracking. Without this declaration, a
+    /// later body/committed hook that exhausts the gRPC deadline would rebuild
+    /// the DEADLINE_EXCEEDED response with the operator's rate-limit telemetry
+    /// silently dropped. Sourced from the same [`EXPOSED_RATELIMIT_HEADERS`]
+    /// table `after_proxy` writes from, so the two cannot drift apart, and
+    /// gated on the same `expose_headers` + metadata-presence conditions so
+    /// nothing is claimed that was not actually written.
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        if !self.expose_headers {
+            return false;
+        }
+        for (meta_key, header_name) in EXPOSED_RATELIMIT_HEADERS {
+            if name.eq_ignore_ascii_case(header_name) && ctx.metadata.contains_key(*meta_key) {
+                return true;
+            }
+        }
+        false
     }
 
     async fn on_response_body(

@@ -1,4 +1,5 @@
 use chrono::Utc;
+use ferrum_edge::config::db_backend::FullConfigLoadPurpose;
 use ferrum_edge::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, anchor_regex_pattern, hosts_overlap,
     redact_consumer_credentials, validate_host_entry,
@@ -539,6 +540,76 @@ fn cp_full_and_incremental_rejection_share_plugin_security_composition_validatio
             .contains("collect_rejecting_runtime_config_errors"),
         "CP incremental snapshots must use the shared rejecting contract"
     );
+}
+
+#[test]
+fn non_runtime_full_loads_skip_node_local_plugin_files() {
+    assert!(FullConfigLoadPurpose::Runtime.loads_node_local_plugin_files());
+    assert!(!FullConfigLoadPurpose::ControlPlane.loads_node_local_plugin_files());
+    assert!(!FullConfigLoadPurpose::BackupExport.loads_node_local_plugin_files());
+
+    let control_plane = include_str!("../../../src/modes/control_plane.rs");
+    assert_eq!(
+        control_plane
+            .matches("FullConfigLoadPurpose::ControlPlane")
+            .count(),
+        3,
+        "single- and multi-namespace CP full loads must use the non-serving purpose"
+    );
+    assert!(!control_plane.contains("CountryMmdbLoadSession"));
+
+    let admin = include_str!("../../../src/admin/mod.rs");
+    let backup_start = admin
+        .find("async fn handle_backup(")
+        .expect("backup handler");
+    let restore_start = admin[backup_start..]
+        .find("async fn handle_restore(")
+        .map(|offset| backup_start + offset)
+        .expect("restore handler after backup");
+    assert!(
+        admin[backup_start..restore_start].contains("FullConfigLoadPurpose::BackupExport"),
+        "backup export must not create a runtime MMDB validation handoff"
+    );
+
+    for source in [
+        include_str!("../../../src/config/db_loader.rs"),
+        include_str!("../../../src/config/mongo_store.rs"),
+    ] {
+        assert!(source.contains("if purpose.loads_node_local_plugin_files() {"));
+    }
+}
+
+#[test]
+fn runtime_mmdb_validation_runs_off_async_workers() {
+    let validation = include_str!("../../../src/config/validation_pipeline.rs");
+    assert!(validation.contains("validate_plugin_file_dependencies_off_thread"));
+    assert!(validation.contains("tokio::task::spawn_blocking"));
+    assert!(validation.contains("GeoRestriction::validate_config"));
+
+    for source in [
+        include_str!("../../../src/config/db_loader.rs"),
+        include_str!("../../../src/config/mongo_store.rs"),
+    ] {
+        assert!(source.contains("validate_plugin_file_dependencies_off_thread("));
+        assert!(source.contains("ValidationAction::Warn"));
+        assert!(source.contains(".await?"));
+    }
+
+    let dp_client = include_str!("../../../src/grpc/dp_client.rs");
+    assert!(dp_client.contains("update_config_off_thread(config).await"));
+
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let plugin_cache = include_str!("../../../src/plugin_cache.rs");
+    assert!(proxy.contains("country_mmdb_preload_required("));
+    assert!(proxy.contains("validate_plugin_file_dependencies_off_thread("));
+    assert!(plugin_cache.contains("pub(crate) fn country_mmdb_preload_required("));
+
+    let file_loader = include_str!("../../../src/config/file_loader.rs");
+    let file_mode = include_str!("../../../src/modes/file.rs");
+    assert!(file_loader.contains("load_config_from_file_off_thread"));
+    assert!(file_loader.contains("reload_config_from_file_off_thread"));
+    assert!(file_mode.contains("load_config_from_file_off_thread("));
+    assert!(file_mode.contains("reload_config_from_file_off_thread("));
 }
 
 #[test]

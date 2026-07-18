@@ -2094,6 +2094,7 @@ Limits concurrent TCP connections per observed client identity on a per-proxy ba
 - Otherwise the key is `proxy:{proxy_id}:ip:{client_ip}`, with IPv4-mapped IPv6 addresses canonicalized to their IPv4 form
 
 The proxy ID is included so the same identity can hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners. Each successful admission owns an opaque permit for the exact plugin instance and counter entry it incremented. Multiple throttle instances, priority/authentication boundaries, later plugin rejection, and config reloads do not share mutable metadata or release one another's entries.
+IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 once when the stream client identity is resolved, before plugin execution, so the two textual forms share one connection budget without per-plugin reparsing.
 
 Accounting is **process-local**. Each replica independently permits up to `max_connections_per_key`, so a deployment with _N_ replicas can collectively admit as many as _N × max_connections_per_key_ connections for one identity when traffic is distributed across them. There is no distributed synchronization mode. Compatible cache generations share accounting by plugin namespace and configuration ID, so reload does not reset live counts; removing a policy and later recreating it starts a new generation whose permits cannot be decremented by old connections.
 
@@ -2178,28 +2179,33 @@ Restricts access based on the geographic location of the client IP address using
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `db_path` | String | (required) | Path to MaxMind `.mmdb` file |
-| `allow_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to allow (whitelist mode). Case-insensitive — normalized to uppercase at load. |
-| `deny_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to deny (blacklist mode). Case-insensitive — normalized to uppercase at load. |
-| `inject_headers` | bool | `false` | Inject `x-geo-country` (uppercase ISO code) into the proxied request. HTTP-family proxies only — ignored for TCP/UDP streams. |
+| `db_path` | String | (required) | Path to a MaxMind `.mmdb` file no larger than 512 MiB. The verified sizes of all distinct MMDB content snapshots in one validation generation, the snapshots retained by a resulting cache generation, and the peak of live plus in-flight candidate snapshots must each total no more than 512 MiB. Equivalent path spellings resolving to identical verified content are charged once. |
+| `allow_countries` | String[] | `[]` | Currently assigned ISO 3166-1 alpha-2 country codes, plus MaxMind's `XK` Kosovo extension, to allow (whitelist mode). Case-insensitive — normalized to uppercase at load. Other reserved, user-assigned, deleted, alias, and nonexistent codes are rejected. |
+| `deny_countries` | String[] | `[]` | Currently assigned ISO 3166-1 alpha-2 country codes, plus MaxMind's `XK` Kosovo extension, to deny (blacklist mode). Case-insensitive — normalized to uppercase at load. Other reserved, user-assigned, deleted, alias, and nonexistent codes are rejected. |
+| `inject_headers` | bool | `false` | Inject `x-geo-country` (uppercase ISO code) into the proxied request. Client-supplied values are centrally stripped even when no geo plugin is attached and remain absent on fail-open lookups. The lookup result is also retained in private request state and reasserted at HTTP, gRPC, native-H3, and WebSocket backend boundaries, so later mutable request hooks cannot spoof it. A later non-injecting instance preserves an authoritative value emitted by an earlier instance. HTTP-family proxies only — ignored for TCP/UDP streams. |
 | `on_lookup_failure` | String | `"allow"` | Action when GeoIP lookup fails (private IP, unallocated range, missing `.mmdb` on data plane): `allow` or `deny`. |
 
 `allow_countries` and `deny_countries` are mutually exclusive. At least one must be non-empty.
 
-Country code matches are O(1) — both lists are stored as `HashSet<String>` and compared in uppercase.
+Country code matches are O(1) and allocation-free on the default request path: codes are decoded as borrowed MMDB strings, packed into two bytes, and matched against precomputed bitsets. A `String` is created only when `inject_headers: true` emits an authoritative value.
+IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 before lookup, so both forms receive the same GeoIP decision.
 
-The `.mmdb` file is memory-mapped at plugin startup for zero-copy lookups on the hot path. A gateway restart (or config reload) is required to pick up a new database file.
+The `.mmdb` file is read into an owned immutable byte buffer at plugin startup, with metadata and bounded-read checks rejecting files larger than 512 MiB before parsing. Non-regular paths (including FIFOs and devices) are rejected by path metadata before open; Unix also opens non-blocking so a regular path raced to a special file cannot wedge startup or reload, then verifies the opened handle's type and identity. One validation generation and its cache-build load session also have a fixed 512 MiB aggregate budget across the declared sizes of all distinct MMDB paths. Ferrum first streams a SHA-256 digest through a fixed-size buffer, allowing identical content to reuse a live snapshot without allocating a duplicate. Changed content must reserve the candidate size against all live and concurrently in-flight snapshots before allocating its owned buffer; a reload that would exceed the 512 MiB peak fails closed before that allocation. Because a changed candidate overlaps the live snapshot until atomic publication, any replacement whose live plus candidate sizes exceed 512 MiB cannot be hot-replaced: install the replacement and restart the gateway so it loads without the outgoing snapshot. This restart-required constraint commonly applies to same-sized databases larger than 256 MiB; unchanged content reuses the live digest snapshot and does not incur the overlap. The resulting plugin-cache generation independently enforces the same limit across all distinct snapshots it retains, including geo instances preserved from the preceding generation during an incremental update. Ferrum fully verifies the search tree and data section, checks for a supported country-capable product (`GeoIP2`/`GeoLite2` Country or City, or GeoIP2 Enterprise), and scans every country record against the same supported-code set used by policy admission before publishing the plugin. Generic plugin validation checks policy structure without opening node-local files; the mode-aware dependency stage deduplicates identical content by its verified digest and owns every successful snapshot or classified load failure as part of that configuration generation. Async file, database, MongoDB, and DP full or incremental reload paths perform the synchronous digest, verification, and record scan on Tokio's blocking pool rather than a runtime worker. A successful generation hands its snapshots, failures, and aggregate accounting to a build-scoped load session, which shares one verified snapshot or prior failure among every geo instance using the path; rejected generations release their handoffs, and a newly accepted generation supersedes any older unclaimed generation. Claiming an accepted handoff refreshes the relevant geo plugin instances and atomically republishes the request epoch even when only file contents changed and the serialized config has no delta; unrelated stateful plugin instances remain shared with the prior cache. Every reload candidate is bounded-read and SHA-256 digested because portable filesystem metadata cannot prove content identity. After both the identity pass and owned-buffer read, Ferrum re-stats the configured path and rejects a target change; Unix compares device/inode plus size and timestamps, while other platforms additionally re-open and stream the path digest without retaining another snapshot buffer. Identical bytes reuse a live content-addressed snapshot without another verification or record scan, while the accepted validation handoff avoids a second construction-time read entirely. Consequently, an atomic rename during a reload or a same-length, timestamp-preserving replacement cannot leave the new generation serving stale bytes. Existing live plugin generations keep their immutable snapshot while a restart or eligible config reload validates and publishes the replacement. A readable oversized, aggregate-over-budget, corrupt, incompatible, wrong-product, or unsupported-code database is rejected; only an initially absent or unreadable node-local file degrades to `on_lookup_failure` in modes that permit that fallback.
+
+Aggregate admission identifies snapshots by the SHA-256 digest computed from the already-opened, identity-checked file. It does not canonicalize path strings, so symlink resolution cannot introduce a new path-based TOCTOU window; different spellings of identical content consume one snapshot charge.
+
+Database full loads carry an explicit purpose. Runtime loads validate node-local plugin files and hand snapshots to the immediately following plugin-cache build; CP distribution and backup-export loads skip node-local files entirely because neither consumer constructs proxy plugins. Every accepted DP full snapshot explicitly refreshes each configured node-local MMDB under the same aggregate budget even though CP file validation was skipped, including snapshots with no serialized config delta.
 
 **CP/DP deployment note:** In control plane / data plane deployments, the `.mmdb` file only needs to exist on the **data plane** nodes where proxy traffic is handled. The control plane accepts `geo_restriction` plugin configs via the admin API without requiring the file locally. If the `.mmdb` file is missing on a data plane node at startup, the plugin degrades gracefully — all GeoIP lookups fall back to the `on_lookup_failure` policy (default: `allow`) until the file is deployed and the config is reloaded. Other proxies and plugins are unaffected.
 
 **Behavior by mode:**
 
-| Mode | Missing `.mmdb` file at startup |
-|------|-------------------------------|
-| **File** | Fatal — gateway refuses to start |
-| **Database** | Warning logged, plugin degrades to `on_lookup_failure` policy |
-| **Control Plane** | Admin API accepts config normally (CP does not proxy traffic) |
-| **Data Plane** | Warning logged, plugin degrades to `on_lookup_failure` policy; all other proxies/plugins work normally |
+| Mode | MMDB dependency behavior at startup/reload |
+|------|--------------------------------------------|
+| **File** | An absent, unreadable, or invalid file is fatal — the gateway refuses to publish the config. |
+| **Database** | Warning logged for an absent/unreadable file; plugin degrades to `on_lookup_failure`. Readable invalid files are rejected during plugin construction. |
+| **Control Plane** | Strict plugin structure is validated, but the CP does not open the node-local path because it does not proxy traffic. |
+| **Data Plane** | Warning logged for an absent/unreadable node-local file and the plugin degrades to `on_lookup_failure`; a readable invalid file rejects the new plugin generation. |
 
 > **Note:** Ferrum Edge does not ship or bundle any GeoIP database. Operators are responsible for obtaining a MaxMind GeoIP2 or GeoLite2 `.mmdb` file, accepting MaxMind's license terms, and managing updates. GeoLite2 (free) requires a [MaxMind account](https://www.maxmind.com/en/geolite2/signup) and is subject to the [GeoLite2 EULA](https://www.maxmind.com/en/geolite2/eula). MaxMind publishes weekly database updates.
 
@@ -2258,6 +2264,8 @@ At least one rate window must be configured in every rule. Do not combine the cu
 - `limit_by: "consumer"` — Enforces in `authorize` phase (after auth), keyed by the authenticated identity: mapped consumer username when present, otherwise external `authenticated_identity`. Falls back to client IP if neither exists.
 - `limit_by: "spiffe_identity"` — Enforces in `authorize` phase (after `spiffe_identity`), keyed by `ctx.peer_spiffe_id`. Falls back to client IP if no peer SPIFFE identity exists.
 - Stream (`on_stream_connect`) — `consumer` mode uses the stream Consumer identity when available. `spiffe_identity` mode uses `peer_spiffe_id` metadata written by the stream `spiffe_identity` hook. Both modes fall back to client IP when their identity is absent.
+
+The resolved request client identity canonicalizes IPv4-mapped IPv6 to native IPv4 once before plugin execution. Every local or Redis fallback key therefore uses the same canonical text without reparsing it in each limiter.
 
 **Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`. The limiter key/identity is never exposed: for `limit_by: "consumer"`/`"spiffe_identity"` it would echo the gateway's internal caller identity (consumer username) or the peer workload SVID back to the client.
 
@@ -4321,6 +4329,8 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 
 `provider` is parsed case-insensitively and ignores surrounding whitespace.
 
+When `limit_by: "ip"`, the request client identity has already canonicalized IPv4-mapped IPv6 to native IPv4 before plugin execution, so local and Redis keys share one token budget without per-limiter reparsing.
+
 **Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster. Database-backed token counters are intentionally unsupported.
 
 **Streaming token accounting**: SSE responses (Anthropic `message_start` / `message_delta`, OpenAI `stream_options.include_usage`) are counted when the final usage signal is available. Configure OpenAI-compatible clients to send `stream_options.include_usage: true` whenever possible. If a streamed 2xx response has no final usage, the default `on_unmetered_response: "charge_estimate"` keeps the pre-request reservation so streaming is not free. When only a partial token signal is observed (e.g., a `message_delta` carrying `output_tokens` without a preceding `message_start`), the available count is still recorded against the budget — partial information is preferred over dropping the request entirely. Token sums use saturating arithmetic.
@@ -4819,6 +4829,7 @@ Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm 
 | `redis_password` | String (optional) | — | Redis password |
 
 At least one of `datagrams_per_second` or `bytes_per_second` must be set; if both are configured each is enforced independently and the first to trip drops the datagram.
+IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 once at UDP/DTLS session admission, before local or Redis key construction, so both textual forms share one datagram and byte budget without adding per-datagram allocation.
 
 **Counter storage** (`sync_mode`): UDP rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode centralizes datagram and byte counters across data planes and falls back to local counters while Redis is unavailable.
 

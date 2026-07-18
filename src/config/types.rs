@@ -15,7 +15,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
-use std::sync::LazyLock;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
+use std::time::SystemTime;
 
 /// Maximum length for resource IDs.
 pub(crate) const MAX_ID_LENGTH: usize = 254;
@@ -56,6 +58,19 @@ pub const MAX_TAG_LENGTH: usize = 255;
 pub const MAX_LOCALITY_LENGTH: usize = 255;
 /// Maximum size of plugin config JSON in bytes.
 pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
+/// Maximum size of an owned country-capable MaxMind database snapshot.
+///
+/// This accommodates current GeoIP2 Enterprise MMDB releases while bounding
+/// admission-time allocation before any untrusted file contents are parsed.
+pub const MAX_COUNTRY_MMDB_SIZE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+/// Maximum aggregate bytes admitted for country MMDB snapshots in one config
+/// validation generation or plugin-cache build session, and for the global
+/// peak of live plus in-flight candidate snapshot buffers.
+///
+/// Keeping this equal to the per-file ceiling permits one maximum-size
+/// Enterprise database while preventing several individually valid files from
+/// exhausting the heap before a candidate config is accepted or rejected.
+pub const MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES: u64 = MAX_COUNTRY_MMDB_SIZE_BYTES;
 /// Maximum OpenAPI validator config JSON size in bytes.
 ///
 /// Generated validator configs embed resolved operation schemas, so they need
@@ -83,6 +98,40 @@ pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
 pub const MIN_JWT_SECRET_LENGTH: usize = 32;
 /// Minimum length for hmac_auth shared secrets.
 pub const MIN_HMAC_SECRET_LENGTH: usize = 32;
+
+// Current ISO 3166-1 alpha-2 assignments plus XK, the user-assigned Kosovo
+// code emitted by MaxMind country-capable products. Keeping this list in the
+// config layer lets policy admission and MMDB record validation share exactly
+// one supported-code contract.
+pub(crate) const SUPPORTED_GEO_COUNTRY_CODES: &[u8] = concat!(
+    "ADAEAFAGAIALAMAOAQARASATAUAWAXAZ",
+    "BABBBDBEBFBGBHBIBJBLBMBNBOBQBRBSBTBVBWBYBZ",
+    "CACCCDCFCGCHCICKCLCMCNCOCRCUCVCWCXCYCZ",
+    "DEDJDKDMDODZ",
+    "ECEEEGEHERESET",
+    "FIFJFKFMFOFR",
+    "GAGBGDGEGFGGGHGIGLGMGNGPGQGRGSGTGUGWGY",
+    "HKHMHNHRHTHU",
+    "IDIEILIMINIOIQIRISIT",
+    "JEJMJOJP",
+    "KEKGKHKIKMKNKPKRKWKYKZ",
+    "LALBLCLILKLRLSLTLULVLY",
+    "MAMCMDMEMFMGMHMKMLMMMNMOMPMQMRMSMTMUMVMWMXMYMZ",
+    "NANCNENFNGNINLNONPNRNUNZ",
+    "OM",
+    "PAPEPFPGPHPKPLPMPNPRPSPTPWPY",
+    "QA",
+    "RERORSRURW",
+    "SASBSCSDSESGSHSISJSKSLSMSNSOSRSSSTSVSXSYSZ",
+    "TCTDTFTGTHTJTKTLTMTNTOTRTTTVTWTZ",
+    "UAUGUMUSUYUZ",
+    "VAVCVEVGVIVNVU",
+    "WFWS",
+    "XK",
+    "YEYT",
+    "ZAZMZW",
+)
+.as_bytes();
 
 /// Effective strength of an hmac_auth secret: whitespace does not count
 /// toward [`MIN_HMAC_SECRET_LENGTH`]. Shared by admission-time field
@@ -2119,8 +2168,9 @@ pub struct Proxy {
     pub udp_idle_timeout_seconds: u64,
     /// Maximum allowed response amplification factor for UDP proxies.
     /// When set, backend→client datagrams are dropped if their size exceeds
-    /// `last_request_size * factor`. Protects against UDP amplification attacks.
-    /// `None` (default) = no limit.
+    /// `payload_size * factor`. A zero-length request receives a one-byte reply
+    /// allowance so it cannot black-hole the session; nonempty requests retain
+    /// the exact configured payload ratio. `None` (default) = no limit.
     #[serde(default)]
     pub udp_max_response_amplification_factor: Option<f32>,
     /// TCP stream idle timeout in seconds. After this duration of no data
@@ -4863,33 +4913,1105 @@ fn validate_pkcs11_key_source(
     ))
 }
 
-/// Validate that a MaxMind `.mmdb` database file exists and can be parsed.
-/// This catches unreadable/corrupt/empty files so file-mode startup doesn't
-/// silently fail open when geo_restriction falls back to `on_lookup_failure`.
-/// Per-mode callers decide whether a failure is fatal (file mode), a warning
-/// (db mode), or a config-rejection (dp mode).
-pub fn validate_mmdb_file(field_name: &str, path: &str) -> Result<(), String> {
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        format!(
-            "{}: MaxMind database file '{}' not accessible: {}",
-            field_name, path, e
+/// Failure class for a country MMDB dependency.
+///
+/// A node-local file that is absent or unreadable remains eligible for the
+/// configured request-time lookup-failure policy. A file that was read but is
+/// corrupt, the wrong MaxMind product, or incompatible with country lookups is
+/// rejected instead of being published as an apparently working policy.
+#[derive(Clone, Debug)]
+pub enum CountryMmdbLoadError {
+    Unavailable(String),
+    Invalid(String),
+}
+
+type CountryMmdbReader = maxminddb::Reader<Vec<u8>>;
+type CountryMmdbDigest = [u8; 32];
+
+#[derive(Debug, Eq, PartialEq)]
+struct CountryMmdbFileVersion {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl CountryMmdbFileVersion {
+    fn from_metadata(path: &str, metadata: &std::fs::Metadata) -> Self {
+        Self {
+            path: PathBuf::from(path),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: std::os::unix::fs::MetadataExt::dev(metadata),
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(metadata),
+            #[cfg(unix)]
+            changed_seconds: std::os::unix::fs::MetadataExt::ctime(metadata),
+            #[cfg(unix)]
+            changed_nanoseconds: std::os::unix::fs::MetadataExt::ctime_nsec(metadata),
+        }
+    }
+}
+
+/// Immutable, fully validated country MMDB snapshot shared by live plugins.
+pub struct CountryMmdbSnapshot {
+    reader: CountryMmdbReader,
+    size_bytes: u64,
+}
+
+impl CountryMmdbSnapshot {
+    pub(crate) fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+}
+
+impl std::ops::Deref for CountryMmdbSnapshot {
+    type Target = maxminddb::Reader<Vec<u8>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.reader
+    }
+}
+
+struct CountryMmdbGenerationHandoff {
+    expected_paths: HashSet<PathBuf>,
+    snapshots: HashMap<PathBuf, Arc<CountryMmdbSnapshot>>,
+    failures: HashMap<PathBuf, CountryMmdbLoadError>,
+    aggregate_budget: CountryMmdbAggregateBudget,
+}
+
+#[derive(Default)]
+struct CountryMmdbAggregateBudget {
+    // The content cache retains one snapshot per digest, so aggregate
+    // accounting uses that same stable identity. Equivalent path spellings
+    // (relative/absolute, symlink aliases, or redundant components) cannot
+    // double-charge bytes that ultimately resolve to one immutable snapshot.
+    admitted_snapshots: HashMap<CountryMmdbDigest, u64>,
+    admitted_bytes: u64,
+}
+
+impl CountryMmdbAggregateBudget {
+    fn admit(
+        &mut self,
+        path: &str,
+        digest: CountryMmdbDigest,
+        size: u64,
+    ) -> Result<(), CountryMmdbLoadError> {
+        if let Some(admitted_size) = self.admitted_snapshots.get(&digest) {
+            if *admitted_size == size {
+                return Ok(());
+            }
+            return Err(CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database content for '{path}' changed size from {admitted_size} to {size} bytes during aggregate admission"
+            )));
+        }
+
+        let next_bytes = self.admitted_bytes.checked_add(size).ok_or_else(|| {
+            CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database aggregate snapshot size overflow while admitting '{path}'"
+            ))
+        })?;
+        if next_bytes > MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES {
+            return Err(CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database aggregate snapshot budget exceeded: loading '{path}' ({size} bytes) would bring this generation/load session to {next_bytes} bytes; maximum aggregate size is {MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES} bytes"
+            )));
+        }
+
+        self.admitted_snapshots.insert(digest, size);
+        self.admitted_bytes = next_bytes;
+        Ok(())
+    }
+}
+
+fn validate_country_mmdb_snapshot_peak(
+    path: &str,
+    live_bytes: u64,
+    inflight_bytes: u64,
+    candidate_bytes: u64,
+) -> Result<u64, CountryMmdbLoadError> {
+    let retained_bytes = live_bytes.checked_add(inflight_bytes).ok_or_else(|| {
+        CountryMmdbLoadError::Invalid(
+            "MaxMind database retained snapshot size overflow".to_string(),
         )
+    })?;
+    let peak_bytes = retained_bytes.checked_add(candidate_bytes).ok_or_else(|| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database peak snapshot size overflow while admitting '{path}'"
+        ))
+    })?;
+    if peak_bytes > MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database peak snapshot budget exceeded: loading '{path}' ({candidate_bytes} bytes) while retaining {live_bytes} live and {inflight_bytes} in-flight bytes would require {peak_bytes} bytes; maximum aggregate size is {MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES} bytes. If this changes a live database, it cannot be hot-replaced under the bounded overlap budget and requires a gateway restart after the replacement is installed; otherwise the resulting configuration itself exceeds the aggregate budget"
+        )));
+    }
+    Ok(peak_bytes)
+}
+
+#[derive(Default)]
+struct CountryMmdbCache {
+    by_digest: HashMap<CountryMmdbDigest, Weak<CountryMmdbSnapshot>>,
+    /// Candidate buffers that passed peak admission but have not yet become
+    /// content-addressed snapshots. Tracking them globally prevents concurrent
+    /// reloads from each admitting against the same live-only baseline.
+    inflight_snapshot_bytes: u64,
+    /// Generation-owned strong references bridge dependency validation to the
+    /// immediately following plugin-cache build. A failed validation pipeline
+    /// aborts its generation; an accepted generation supersedes the previous
+    /// unclaimed generation atomically, and construction claims every snapshot
+    /// into a build-scoped session.
+    validation_handoffs: HashMap<u64, CountryMmdbGenerationHandoff>,
+    active_validation_generations: HashSet<u64>,
+    accepted_validation_generation: Option<u64>,
+    next_validation_generation: u64,
+}
+
+impl CountryMmdbCache {
+    fn retain_live(&mut self) {
+        self.by_digest.retain(|_, reader| reader.strong_count() > 0);
+    }
+
+    fn get_by_digest(&self, digest: &CountryMmdbDigest) -> Option<Arc<CountryMmdbSnapshot>> {
+        self.by_digest.get(digest).and_then(Weak::upgrade)
+    }
+
+    fn live_snapshot_bytes(&self) -> Result<u64, CountryMmdbLoadError> {
+        self.by_digest
+            .values()
+            .filter_map(Weak::upgrade)
+            .try_fold(0_u64, |total, snapshot| {
+                total.checked_add(snapshot.size_bytes()).ok_or_else(|| {
+                    CountryMmdbLoadError::Invalid(
+                        "MaxMind database live snapshot size overflow".to_string(),
+                    )
+                })
+            })
+    }
+
+    fn reserve_snapshot_allocation(
+        &mut self,
+        path: &str,
+        candidate_bytes: u64,
+    ) -> Result<(), CountryMmdbLoadError> {
+        let live_bytes = self.live_snapshot_bytes()?;
+        validate_country_mmdb_snapshot_peak(
+            path,
+            live_bytes,
+            self.inflight_snapshot_bytes,
+            candidate_bytes,
+        )?;
+        self.inflight_snapshot_bytes = self
+            .inflight_snapshot_bytes
+            .checked_add(candidate_bytes)
+            .ok_or_else(|| {
+                CountryMmdbLoadError::Invalid(
+                    "MaxMind database in-flight snapshot size overflow".to_string(),
+                )
+            })?;
+        Ok(())
+    }
+
+    fn release_snapshot_allocation(&mut self, candidate_bytes: u64) {
+        if let Some(remaining) = self.inflight_snapshot_bytes.checked_sub(candidate_bytes) {
+            self.inflight_snapshot_bytes = remaining;
+        } else {
+            tracing::error!(
+                candidate_bytes,
+                inflight_bytes = self.inflight_snapshot_bytes,
+                "MaxMind database snapshot allocation accounting underflow"
+            );
+            self.inflight_snapshot_bytes = 0;
+        }
+    }
+
+    fn prepare_snapshot_return(
+        &mut self,
+        path: &str,
+        snapshot: Arc<CountryMmdbSnapshot>,
+        validation_generation: Option<u64>,
+    ) -> Arc<CountryMmdbSnapshot> {
+        if let Some(generation) = validation_generation
+            && let Some(handoff) = self.validation_handoffs.get_mut(&generation)
+        {
+            handoff
+                .snapshots
+                .insert(PathBuf::from(path), Arc::clone(&snapshot));
+        }
+
+        snapshot
+    }
+
+    fn admit_validation_snapshot(
+        &mut self,
+        generation: u64,
+        path: &str,
+        digest: CountryMmdbDigest,
+        size: u64,
+    ) -> Result<(), CountryMmdbLoadError> {
+        let handoff = self
+            .validation_handoffs
+            .get_mut(&generation)
+            .ok_or_else(|| {
+                CountryMmdbLoadError::Invalid(
+                    "MaxMind database validation generation is no longer active".to_string(),
+                )
+            })?;
+        handoff.aggregate_budget.admit(path, digest, size)
+    }
+
+    fn record_validation_failure(
+        &mut self,
+        generation: u64,
+        path: &str,
+        error: CountryMmdbLoadError,
+    ) -> Result<(), CountryMmdbLoadError> {
+        let handoff = self
+            .validation_handoffs
+            .get_mut(&generation)
+            .ok_or_else(|| {
+                CountryMmdbLoadError::Invalid(
+                    "MaxMind database validation generation is no longer active".to_string(),
+                )
+            })?;
+        handoff.failures.insert(PathBuf::from(path), error);
+        Ok(())
+    }
+
+    fn abort_validation_generation(&mut self, generation: u64) {
+        self.active_validation_generations.remove(&generation);
+        self.validation_handoffs.remove(&generation);
+        if self.accepted_validation_generation == Some(generation) {
+            self.accepted_validation_generation = None;
+        }
+    }
+
+    fn commit_validation_generation(&mut self, generation: u64) {
+        self.active_validation_generations.remove(&generation);
+        if let Some(previous) = self.accepted_validation_generation.replace(generation)
+            && previous != generation
+        {
+            self.validation_handoffs.remove(&previous);
+        }
+        let active_generations = &self.active_validation_generations;
+        self.validation_handoffs.retain(|candidate, _| {
+            *candidate == generation || active_generations.contains(candidate)
+        });
+    }
+
+    fn claim_validation_handoffs(
+        &mut self,
+        paths: &HashSet<PathBuf>,
+    ) -> Option<CountryMmdbGenerationHandoff> {
+        let generation = self.accepted_validation_generation.take()?;
+        let matching_generation = self
+            .validation_handoffs
+            .get(&generation)
+            .is_some_and(|handoff| &handoff.expected_paths == paths);
+        if !matching_generation {
+            self.accepted_validation_generation = Some(generation);
+            return None;
+        }
+        self.validation_handoffs.remove(&generation)
+    }
+}
+
+/// RAII reservation for one not-yet-published MMDB snapshot buffer. Error
+/// paths release the global peak-memory charge automatically; successful
+/// publication converts the reservation to a weak-cache entry while holding
+/// the same cache lock.
+struct CountryMmdbAllocationReservation {
+    size_bytes: u64,
+    active: bool,
+}
+
+impl CountryMmdbAllocationReservation {
+    fn reserve(path: &str, size_bytes: u64) -> Result<Self, CountryMmdbLoadError> {
+        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
+            CountryMmdbLoadError::Invalid(
+                "MaxMind database snapshot cache is unavailable".to_string(),
+            )
+        })?;
+        cache.retain_live();
+        cache.reserve_snapshot_allocation(path, size_bytes)?;
+        Ok(Self {
+            size_bytes,
+            active: true,
+        })
+    }
+
+    fn release_with_cache(&mut self, cache: &mut CountryMmdbCache) {
+        if self.active {
+            cache.release_snapshot_allocation(self.size_bytes);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for CountryMmdbAllocationReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        match country_mmdb_snapshot_cache().lock() {
+            Ok(mut cache) => self.release_with_cache(&mut cache),
+            Err(poisoned) => {
+                let mut cache = poisoned.into_inner();
+                self.release_with_cache(&mut cache);
+            }
+        }
+    }
+}
+
+fn country_mmdb_snapshot_cache() -> &'static Mutex<CountryMmdbCache> {
+    static CACHE: OnceLock<Mutex<CountryMmdbCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(CountryMmdbCache::default()))
+}
+
+fn lock_country_mmdb_cache_recovering_poison(
+    cache: &Mutex<CountryMmdbCache>,
+) -> std::sync::MutexGuard<'_, CountryMmdbCache> {
+    match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// RAII owner for one plugin-file validation generation. The pipeline commits
+/// only after every later validation step succeeds; any early return drops the
+/// guard and releases every strong MMDB handoff owned by the rejected config.
+pub(crate) struct CountryMmdbValidationGeneration {
+    id: u64,
+    committed: bool,
+}
+
+impl CountryMmdbValidationGeneration {
+    pub(crate) fn begin(expected_paths: HashSet<PathBuf>) -> Result<Self, String> {
+        let mut cache = country_mmdb_snapshot_cache()
+            .lock()
+            .map_err(|_| "MaxMind database snapshot cache is unavailable".to_string())?;
+        cache.next_validation_generation = cache.next_validation_generation.wrapping_add(1);
+        if cache.next_validation_generation == 0 {
+            cache.next_validation_generation = 1;
+        }
+        let id = cache.next_validation_generation;
+        cache.active_validation_generations.insert(id);
+        cache.validation_handoffs.insert(
+            id,
+            CountryMmdbGenerationHandoff {
+                expected_paths,
+                snapshots: HashMap::new(),
+                failures: HashMap::new(),
+                aggregate_budget: CountryMmdbAggregateBudget::default(),
+            },
+        );
+        Ok(Self {
+            id,
+            committed: false,
+        })
+    }
+
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn commit(mut self) -> Result<(), String> {
+        let mut cache = country_mmdb_snapshot_cache()
+            .lock()
+            .map_err(|_| "MaxMind database snapshot cache is unavailable".to_string())?;
+        cache.commit_validation_generation(self.id);
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for CountryMmdbValidationGeneration {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut cache = lock_country_mmdb_cache_recovering_poison(country_mmdb_snapshot_cache());
+        cache.abort_validation_generation(self.id);
+    }
+}
+
+/// One plugin-cache build's MMDB ownership. The accepted validation generation
+/// seeds this per-path map, so every geo instance consumes the exact snapshot
+/// that passed dependency validation without another read or record scan.
+#[derive(Default)]
+struct CountryMmdbLoadSessionState {
+    snapshots: HashMap<PathBuf, Arc<CountryMmdbSnapshot>>,
+    failures: HashMap<PathBuf, CountryMmdbLoadError>,
+    aggregate_budget: CountryMmdbAggregateBudget,
+}
+
+pub(crate) struct CountryMmdbLoadSession {
+    state: Mutex<CountryMmdbLoadSessionState>,
+    refresh_country_mmdb_plugins: bool,
+    allow_synchronous_load: bool,
+}
+
+impl Default for CountryMmdbLoadSession {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(CountryMmdbLoadSessionState::default()),
+            refresh_country_mmdb_plugins: false,
+            allow_synchronous_load: true,
+        }
+    }
+}
+
+impl CountryMmdbLoadSession {
+    pub(crate) fn claim(paths: &HashSet<PathBuf>) -> Result<Self, String> {
+        let handoff = {
+            let mut cache = country_mmdb_snapshot_cache()
+                .lock()
+                .map_err(|_| "MaxMind database snapshot cache is unavailable".to_string())?;
+            cache.retain_live();
+            cache.claim_validation_handoffs(paths)
+        };
+        let refresh_country_mmdb_plugins = handoff.is_some();
+        let state = handoff
+            .map(|handoff| CountryMmdbLoadSessionState {
+                snapshots: handoff.snapshots,
+                failures: handoff.failures,
+                aggregate_budget: handoff.aggregate_budget,
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            state: Mutex::new(state),
+            refresh_country_mmdb_plugins,
+            allow_synchronous_load: true,
+        })
+    }
+
+    /// Claim an off-thread validation handoff for an incremental cache stage.
+    /// If cache construction reaches an unvalidated path, fail closed instead
+    /// of synchronously opening and scanning an MMDB on the async caller.
+    pub(crate) fn claim_preloaded(paths: &HashSet<PathBuf>) -> Result<Self, String> {
+        let mut session = Self::claim(paths)?;
+        session.allow_synchronous_load = false;
+        Ok(session)
+    }
+
+    /// Build a load session for a node-local refresh when the configuration
+    /// source intentionally skipped file validation (DP full snapshots). Any
+    /// matching handoff is still consumed, but its absence must not suppress
+    /// the refresh: each path is loaded directly under the same aggregate
+    /// budget before the replacement cache generation can publish.
+    pub(crate) fn for_node_local_refresh(paths: &HashSet<PathBuf>) -> Result<Self, String> {
+        let mut session = Self::claim(paths)?;
+        session.refresh_country_mmdb_plugins = true;
+        Ok(session)
+    }
+
+    pub(crate) fn refresh_country_mmdb_plugins(&self) -> bool {
+        self.refresh_country_mmdb_plugins
+    }
+
+    pub(crate) fn load(
+        &self,
+        path: &str,
+    ) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
+        let path = path.trim();
+        let path_key = PathBuf::from(path);
+        let mut state = self.state.lock().map_err(|_| {
+            CountryMmdbLoadError::Invalid(
+                "MaxMind database build-session cache is unavailable".to_string(),
+            )
+        })?;
+        if let Some(snapshot) = state.snapshots.get(&path_key) {
+            return Ok(Arc::clone(snapshot));
+        }
+        if let Some(error) = state.failures.get(&path_key) {
+            return Err(error.clone());
+        }
+        if !self.allow_synchronous_load {
+            return Err(CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database file '{path}' was not preloaded before incremental plugin-cache staging"
+            )));
+        }
+
+        let loaded =
+            load_validated_country_mmdb_inner(path, None, Some(&mut state.aggregate_budget))?;
+        Ok(Arc::clone(
+            state.snapshots.entry(path_key).or_insert(loaded),
+        ))
+    }
+}
+
+impl std::fmt::Display for CountryMmdbLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(message) | Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+fn is_supported_country_mmdb_type(database_type: &str) -> bool {
+    matches!(
+        database_type,
+        "GeoIP2-Country"
+            | "GeoLite2-Country"
+            | "GeoIP2-City"
+            | "GeoLite2-City"
+            | "GeoIP2-Enterprise"
+    )
+}
+
+fn is_mmdb_country_code(code: &str) -> bool {
+    code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+
+fn is_supported_mmdb_country_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    if bytes.len() != 2 || !bytes.iter().all(u8::is_ascii_alphabetic) {
+        return false;
+    }
+    let normalized = [bytes[0].to_ascii_uppercase(), bytes[1].to_ascii_uppercase()];
+    SUPPORTED_GEO_COUNTRY_CODES
+        .chunks_exact(2)
+        .any(|supported| supported == normalized.as_slice())
+}
+
+#[cfg(unix)]
+fn open_country_mmdb_path(path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        // A regular-file path can be replaced with a FIFO/device after the
+        // pre-open metadata check. Non-blocking open makes that race safe; the
+        // opened-handle file-type/identity checks below still reject it.
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_country_mmdb_path(path: &str) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+fn verify_country_mmdb_path_still_matches(
+    path: &str,
+    opened_version: &CountryMmdbFileVersion,
+) -> Result<(), CountryMmdbLoadError> {
+    let path_metadata = std::fs::metadata(path).map_err(|error| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path '{path}' could not be re-statted after loading: {error}"
+        ))
+    })?;
+    let path_version = CountryMmdbFileVersion::from_metadata(path, &path_metadata);
+    if !path_metadata.is_file() || &path_version != opened_version {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' changed while it was being loaded"
+        )));
+    }
+    Ok(())
+}
+
+/// Platforms without a stable std file-identity API re-open the configured
+/// path and stream its digest without retaining a second snapshot buffer. A
+/// metadata-equivalent atomic replacement therefore cannot preserve stale
+/// bytes in the candidate generation.
+#[cfg(not(unix))]
+fn verify_country_mmdb_path_digest(
+    path: &str,
+    opened_version: &CountryMmdbFileVersion,
+    expected_digest: &CountryMmdbDigest,
+) -> Result<(), CountryMmdbLoadError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let mut path_file = std::fs::File::open(path).map_err(|error| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path '{path}' could not be re-opened after loading: {error}"
+        ))
+    })?;
+    let metadata_before = path_file.metadata().map_err(|error| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path '{path}' metadata not readable during portable identity verification: {error}"
+        ))
+    })?;
+    let path_version_before = CountryMmdbFileVersion::from_metadata(path, &metadata_before);
+    if !metadata_before.is_file() || &path_version_before != opened_version {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' changed before portable identity verification"
+        )));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut total_bytes = 0_u64;
+    {
+        let mut bounded_reader = (&mut path_file).take(opened_version.len + 1);
+        loop {
+            let read = bounded_reader.read(&mut buffer).map_err(|error| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database path '{path}' not readable during portable identity verification: {error}"
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            total_bytes = total_bytes.checked_add(read as u64).ok_or_else(|| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database path '{path}' size overflow during portable identity verification"
+                ))
+            })?;
+            if total_bytes > opened_version.len {
+                return Err(CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database path target '{path}' grew during portable identity verification"
+                )));
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    if total_bytes != opened_version.len {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' changed size during portable identity verification"
+        )));
+    }
+
+    let metadata_after = path_file.metadata().map_err(|error| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path '{path}' metadata not readable after portable identity verification: {error}"
+        ))
+    })?;
+    let path_version_after = CountryMmdbFileVersion::from_metadata(path, &metadata_after);
+    if &path_version_after != opened_version {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' changed during portable identity verification"
+        )));
+    }
+    verify_country_mmdb_path_still_matches(path, opened_version)?;
+
+    let observed_digest: CountryMmdbDigest = hasher.finalize().into();
+    if &observed_digest != expected_digest {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' was replaced while it was being loaded"
+        )));
+    }
+    Ok(())
+}
+
+/// Load and comprehensively validate a MaxMind country-capable database into
+/// an owned immutable buffer.
+///
+/// Owning the bytes keeps live readers independent from external in-place file
+/// rewrites and truncation. Verification traverses the complete search tree and
+/// data section, while the record scan proves that the advertised product is
+/// structurally compatible with the fields used by `geo_restriction`. Every
+/// load digests the bounded contents because portable filesystem metadata does
+/// not prove content identity. A weak content-addressed cache then skips repeat
+/// verification and record enumeration for identical bytes.
+pub fn load_validated_country_mmdb(
+    path: &str,
+) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
+    load_validated_country_mmdb_inner(path, None, None)
+}
+
+fn load_validated_country_mmdb_inner(
+    path: &str,
+    validation_generation: Option<u64>,
+    aggregate_budget: Option<&mut CountryMmdbAggregateBudget>,
+) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    // Reject FIFOs, devices, sockets, and directories before opening. On Unix
+    // the open itself is also non-blocking so a regular path replaced after
+    // this check cannot wedge startup/reload before the opened-handle fstat.
+    let path_metadata_before_open = std::fs::metadata(path).map_err(|e| {
+        CountryMmdbLoadError::Unavailable(format!(
+            "MaxMind database file '{path}' not accessible before open: {e}"
+        ))
+    })?;
+    if !path_metadata_before_open.is_file() {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "'{path}' exists but is not a regular file"
+        )));
+    }
+    let path_version_before_open =
+        CountryMmdbFileVersion::from_metadata(path, &path_metadata_before_open);
+
+    let mut file = open_country_mmdb_path(path).map_err(|e| {
+        CountryMmdbLoadError::Unavailable(format!(
+            "MaxMind database file '{path}' not accessible: {e}"
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|e| {
+        CountryMmdbLoadError::Unavailable(format!(
+            "MaxMind database file '{path}' metadata not readable: {e}"
+        ))
     })?;
     if !metadata.is_file() {
-        return Err(format!(
-            "{}: '{}' exists but is not a regular file",
-            field_name, path
-        ));
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "'{path}' exists but is not a regular file"
+        )));
     }
-    // SAFETY: Validation is read-only and the file descriptor is scoped to
-    // this function. We do not mutate or truncate the file while mapped.
-    unsafe { maxminddb::Reader::open_mmap(path) }.map_err(|e| {
-        format!(
-            "{}: MaxMind database file '{}' is not a valid readable .mmdb: {}",
-            field_name, path, e
-        )
+    let file_version = CountryMmdbFileVersion::from_metadata(path, &metadata);
+    if file_version != path_version_before_open {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' changed before it was opened"
+        )));
+    }
+
+    if metadata.len() > MAX_COUNTRY_MMDB_SIZE_BYTES {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' is {} bytes; maximum supported size is {} bytes",
+            metadata.len(),
+            MAX_COUNTRY_MMDB_SIZE_BYTES
+        )));
+    }
+    // Stream the content identity before allocating a candidate snapshot. An
+    // unchanged reload can then reuse its live content-addressed snapshot with
+    // only a fixed-size digest buffer, while changed content must pass the
+    // global live + in-flight + candidate peak-memory admission below.
+    let mut hasher = Sha256::new();
+    let mut digest_buffer = [0_u8; 16 * 1024];
+    let mut digested_bytes = 0_u64;
+    {
+        let mut bounded_reader = (&mut file).take(metadata.len() + 1);
+        loop {
+            let read = bounded_reader.read(&mut digest_buffer).map_err(|e| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' could not be hashed consistently: {e}"
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            digested_bytes = digested_bytes.checked_add(read as u64).ok_or_else(|| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' size overflow while hashing"
+                ))
+            })?;
+            if digested_bytes > metadata.len() {
+                return Err(CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' grew while it was being hashed"
+                )));
+            }
+            hasher.update(&digest_buffer[..read]);
+        }
+    }
+    if digested_bytes != metadata.len() {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' changed size while it was being hashed"
+        )));
+    }
+    let metadata_after_digest = file.metadata().map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' metadata not readable after hashing: {e}"
+        ))
     })?;
-    Ok(())
+    if CountryMmdbFileVersion::from_metadata(path, &metadata_after_digest) != file_version {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' changed while it was being hashed"
+        )));
+    }
+    verify_country_mmdb_path_still_matches(path, &file_version)?;
+
+    let digest: CountryMmdbDigest = hasher.finalize().into();
+    #[cfg(not(unix))]
+    verify_country_mmdb_path_digest(path, &file_version, &digest)?;
+    // Charge the same content identity used by the snapshot cache. This runs
+    // after a bounded, fixed-buffer digest and before any candidate Vec
+    // allocation, so equivalent path spellings deduplicate without weakening
+    // the aggregate memory gate or introducing path-canonicalization TOCTOU.
+    if let Some(aggregate_budget) = aggregate_budget {
+        aggregate_budget.admit(path, digest, metadata.len())?;
+    } else if let Some(generation) = validation_generation {
+        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
+            CountryMmdbLoadError::Invalid(
+                "MaxMind database snapshot cache is unavailable".to_string(),
+            )
+        })?;
+        cache.admit_validation_snapshot(generation, path, digest, metadata.len())?;
+    }
+    {
+        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
+            CountryMmdbLoadError::Invalid(
+                "MaxMind database snapshot cache is unavailable".to_string(),
+            )
+        })?;
+        cache.retain_live();
+        if let Some(reader) = cache.get_by_digest(&digest) {
+            return Ok(cache.prepare_snapshot_return(path, reader, validation_generation));
+        }
+    }
+
+    let mut allocation_reservation =
+        CountryMmdbAllocationReservation::reserve(path, metadata.len())?;
+    let initial_capacity = usize::try_from(metadata.len()).map_err(|_| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' is too large for this platform"
+        ))
+    })?;
+    file.seek(SeekFrom::Start(0)).map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' could not be rewound after hashing: {e}"
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(initial_capacity).map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' cannot reserve its bounded snapshot buffer: {e}"
+        ))
+    })?;
+    {
+        let mut bounded_reader = (&mut file).take(metadata.len() + 1);
+        bounded_reader.read_to_end(&mut bytes).map_err(|e| {
+            CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database file '{path}' could not be read consistently: {e}"
+            ))
+        })?;
+    }
+    if bytes.len() as u64 != metadata.len() {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' changed size while it was being loaded"
+        )));
+    }
+    let metadata_after_read = file.metadata().map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' metadata not readable after load: {e}"
+        ))
+    })?;
+    if CountryMmdbFileVersion::from_metadata(path, &metadata_after_read) != file_version {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' changed while it was being loaded"
+        )));
+    }
+    verify_country_mmdb_path_still_matches(path, &file_version)?;
+
+    let loaded_digest: CountryMmdbDigest = Sha256::digest(&bytes).into();
+    if loaded_digest != digest {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' changed between identity and snapshot reads"
+        )));
+    }
+    #[cfg(not(unix))]
+    verify_country_mmdb_path_digest(path, &file_version, &digest)?;
+
+    let reader = maxminddb::Reader::from_source(bytes).map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' is not a valid readable .mmdb: {e}"
+        ))
+    })?;
+
+    reader.verify().map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' failed comprehensive verification: {e}"
+        ))
+    })?;
+
+    if !is_supported_country_mmdb_type(&reader.metadata.database_type) {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' has unsupported database type '{}'; expected a GeoIP2/GeoLite2 Country or City database, or GeoIP2 Enterprise",
+            reader.metadata.database_type
+        )));
+    }
+
+    let mut found_country_code = false;
+    let networks = reader.networks(Default::default()).map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' cannot enumerate country records: {e}"
+        ))
+    })?;
+    for network in networks {
+        let lookup = network.map_err(|e| {
+            CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database file '{path}' contains an invalid network record: {e}"
+            ))
+        })?;
+        let country: Option<&str> = lookup
+            .decode_path(&maxminddb::path!["country", "iso_code"])
+            .map_err(|e| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' has an incompatible country record: {e}"
+                ))
+            })?;
+        let registered_country: Option<&str> = lookup
+            .decode_path(&maxminddb::path!["registered_country", "iso_code"])
+            .map_err(|e| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' has an incompatible registered-country record: {e}"
+                ))
+            })?;
+
+        for code in [country, registered_country].into_iter().flatten() {
+            if !is_mmdb_country_code(code) {
+                return Err(CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' contains an invalid country code {code:?}"
+                )));
+            }
+            if !is_supported_mmdb_country_code(code) {
+                return Err(CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' contains unsupported country code {code:?}"
+                )));
+            }
+            found_country_code = true;
+        }
+    }
+
+    if !found_country_code {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' contains no country or registered-country ISO codes"
+        )));
+    }
+
+    let reader = Arc::new(CountryMmdbSnapshot {
+        reader,
+        size_bytes: metadata.len(),
+    });
+    let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
+        CountryMmdbLoadError::Invalid("MaxMind database snapshot cache is unavailable".to_string())
+    })?;
+    cache.retain_live();
+    if let Some(cached) = cache.get_by_digest(&digest) {
+        // The concurrently published snapshot wins. Drop our duplicate owned
+        // buffer before releasing its reservation so another loader cannot
+        // admit against bytes that are still physically retained.
+        drop(reader);
+        allocation_reservation.release_with_cache(&mut cache);
+        return Ok(cache.prepare_snapshot_return(path, cached, validation_generation));
+    }
+    cache.by_digest.insert(digest, Arc::downgrade(&reader));
+    allocation_reservation.release_with_cache(&mut cache);
+    Ok(cache.prepare_snapshot_return(path, reader, validation_generation))
+}
+
+/// Validate that a MaxMind `.mmdb` database file exists, is fully intact, and
+/// contains a supported country record shape. Per-mode callers decide whether
+/// a failure is fatal (file mode) or a warning/fallback (database mode). CP
+/// skips node-local files; DP invokes the same validation during node-local
+/// plugin refresh and rejects readable invalid candidates.
+pub fn validate_mmdb_file(field_name: &str, path: &str) -> Result<(), String> {
+    load_validated_country_mmdb(path)
+        .map(|_| ())
+        .map_err(|error| format!("{field_name}: {error}"))
+}
+
+fn validate_mmdb_file_for_generation(
+    field_name: &str,
+    path: &str,
+    generation: &CountryMmdbValidationGeneration,
+) -> Result<(), String> {
+    match load_validated_country_mmdb_inner(path, Some(generation.id()), None) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let mut cache = country_mmdb_snapshot_cache()
+                .lock()
+                .map_err(|_| "MaxMind database snapshot cache is unavailable".to_string())?;
+            cache
+                .record_validation_failure(generation.id(), path, error.clone())
+                .map_err(|record_error| record_error.to_string())?;
+            Err(format!("{field_name}: {error}"))
+        }
+    }
+}
+
+// Testing-policy exception: peak-budget, digest-identity, and poisoned-lock
+// bookkeeping is private by design and cannot be exercised externally without
+// widening the runtime API. Public MMDB behavior remains covered externally.
+#[cfg(test)]
+mod country_mmdb_admission_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_budget_rejects_before_exceeding_the_generation_limit() {
+        let mut budget = CountryMmdbAggregateBudget::default();
+        budget
+            .admit(
+                "first.mmdb",
+                [1; 32],
+                MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES - 1,
+            )
+            .expect("the first snapshot fits");
+
+        let error = budget
+            .admit("second.mmdb", [2; 32], 2)
+            .expect_err("the aggregate must reject before retaining a second snapshot");
+        assert!(
+            error
+                .to_string()
+                .contains("aggregate snapshot budget exceeded")
+        );
+        assert_eq!(
+            budget.admitted_bytes,
+            MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES - 1
+        );
+        assert!(!budget.admitted_snapshots.contains_key(&[2; 32]));
+    }
+
+    #[test]
+    fn aggregate_budget_deduplicates_equivalent_path_spellings_by_digest() {
+        let mut budget = CountryMmdbAggregateBudget::default();
+        let snapshot_size = (MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES / 2) + 1;
+        budget
+            .admit("country.mmdb", [1; 32], snapshot_size)
+            .expect("the first snapshot fits");
+        budget
+            .admit("./country.mmdb", [1; 32], snapshot_size)
+            .expect("the same content must not be charged twice");
+
+        assert_eq!(budget.admitted_bytes, snapshot_size);
+        assert_eq!(budget.admitted_snapshots.len(), 1);
+        assert!(budget.admit("other.mmdb", [2; 32], snapshot_size).is_err());
+    }
+
+    #[test]
+    fn peak_budget_diagnoses_large_live_snapshot_as_restart_required() {
+        let snapshot_size = (MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES / 2) + 1;
+        let error =
+            validate_country_mmdb_snapshot_peak("country.mmdb", snapshot_size, 0, snapshot_size)
+                .expect_err("two overlapping large snapshots exceed the peak bound");
+
+        assert!(error.to_string().contains("requires a gateway restart"));
+    }
+
+    #[test]
+    fn poisoned_cache_lock_is_recovered_for_generation_cleanup() {
+        let cache = Mutex::new(CountryMmdbCache::default());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = cache.lock().expect("cache lock");
+            guard.active_validation_generations.insert(7);
+            panic!("poison the private cache lock");
+        }));
+        assert!(panic.is_err());
+
+        let mut guard = lock_country_mmdb_cache_recovering_poison(&cache);
+        guard.abort_validation_generation(7);
+        assert!(!guard.active_validation_generations.contains(&7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_restat_rejects_an_atomic_replacement_of_the_opened_file() {
+        let directory = tempfile::TempDir::new().expect("temporary directory");
+        let path = directory.path().join("country.mmdb");
+        let replacement = directory.path().join("replacement.mmdb");
+        std::fs::write(&path, b"opened snapshot").expect("write original");
+        std::fs::write(&replacement, b"new path target").expect("write replacement");
+
+        let opened_file = std::fs::File::open(&path).expect("open original path target");
+        let path_text = path.to_str().expect("temporary path is UTF-8");
+        let opened_version = CountryMmdbFileVersion::from_metadata(
+            path_text,
+            &opened_file.metadata().expect("opened metadata"),
+        );
+        std::fs::rename(&replacement, &path).expect("atomically replace configured path");
+
+        let error = verify_country_mmdb_path_still_matches(path_text, &opened_version)
+            .expect_err("the configured path must still target the opened inode");
+        assert!(error.to_string().contains("path target"));
+    }
 }
 
 /// Validate a u64 field is within a range.
@@ -7477,6 +8599,36 @@ impl GatewayConfig {
     ///
     /// Deduplicates paths so each file is checked at most once.
     pub fn validate_plugin_file_dependencies(&self) -> Vec<String> {
+        self.validate_plugin_file_dependencies_inner(None)
+    }
+
+    pub(crate) fn country_mmdb_file_dependency_paths(&self) -> HashSet<PathBuf> {
+        self.plugin_configs
+            .iter()
+            .filter(|plugin| plugin.enabled && plugin.plugin_name == "geo_restriction")
+            .filter_map(|plugin| {
+                plugin
+                    .config
+                    .get("db_path")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    pub(crate) fn validate_plugin_file_dependencies_for_generation(
+        &self,
+        generation: &CountryMmdbValidationGeneration,
+    ) -> Vec<String> {
+        self.validate_plugin_file_dependencies_inner(Some(generation))
+    }
+
+    fn validate_plugin_file_dependencies_inner(
+        &self,
+        generation: Option<&CountryMmdbValidationGeneration>,
+    ) -> Vec<String> {
         let mut errors = Vec::new();
         let mut validated_paths = std::collections::HashSet::new();
         for pc in &self.plugin_configs {
@@ -7485,9 +8637,17 @@ impl GatewayConfig {
             }
             if pc.plugin_name == "geo_restriction"
                 && let Some(db_path) = pc.config.get("db_path").and_then(|v| v.as_str())
+                && let db_path = db_path.trim()
                 && !db_path.is_empty()
                 && validated_paths.insert(db_path.to_string())
-                && let Err(e) = validate_mmdb_file("geo_restriction.db_path", db_path)
+                && let Err(e) = match generation {
+                    Some(generation) => validate_mmdb_file_for_generation(
+                        "geo_restriction.db_path",
+                        db_path,
+                        generation,
+                    ),
+                    None => validate_mmdb_file("geo_restriction.db_path", db_path),
+                }
             {
                 errors.push(format!("PluginConfig '{}': {}", pc.id, e));
             }

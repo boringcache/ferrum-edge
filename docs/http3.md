@@ -200,6 +200,38 @@ so policy replay cannot remove or replace it. This is also the path used after
 gRPC-Web binary or text response framing, so security policy cannot disappear
 with the native trailer map.
 
+When an absolute deadline instead replaces an uncommitted buffered response,
+the H3 native and cross-protocol paths use the same gateway-header provenance
+boundary as H1/H2. The pristine backend view is captured before response hooks;
+only non-terminal-owned output from completed gateway hooks (including
+configurable correlation fields, exact-value `update` writes and fired `rename`
+destinations a hook declares it owns, and a gateway hook's own `Set-Cookie`),
+plus exact `Vary: Origin`, can cross into the terminal response. The
+sticky-affinity `Set-Cookie` that proxy core injects on buffered H3 and
+cross-protocol responses is recorded as gateway output before committed hooks
+run, so a committed-hook deadline cannot strip it and break client stickiness.
+That injection APPENDS, so it records its mutation without claiming ownership:
+ownership means a whole-value replacement and retires the backend cookie
+baseline, which here would credit a co-present backend cookie as gateway output.
+The occurrence partition credits the affinity line even when it is byte-identical
+to a backend cookie.
+Because ownership is declared rather than inferred from a value diff, a backend
+cannot suppress an owned gateway write by pre-populating the identical
+key/value. If a completed decorator chain is followed by a later hook that
+itself exhausts the deadline, the terminal rejection keeps the gateway output
+already recorded rather than restarting from the deadline error headers. Cache
+state, discarded-representation metadata, transport framing, and prior gRPC
+terminal fields are removed even when a gateway hook wrote them.
+Backend-supplied safe-looking trace/CORS names, arbitrary metadata, cookies,
+credentials, and discarded-representation fields do not become trusted by
+name — every backend-supplied `Set-Cookie` occurrence is dropped, and only the
+surplus a trusted phase added crosses. H3 gateway-error paths that reach a
+committed hook directly, without the shared rejection decorator pipeline,
+establish the same boundary, so their gateway-authored headers survive a
+committed-hook deadline instead of being stripped for lack of provenance.
+Native gRPC and binary/text gRPC-Web framing are regenerated after this
+sanitation, then deterministic initial-response policy is reapplied.
+
 After route resolution, HTTP/3 method-filter errors and native-gRPC gateway
 errors (including request deadlines, size limits, backend unavailability, and
 mesh fail-closed responses) also apply the route's precomputed initial-response
