@@ -156,6 +156,32 @@ impl TestGateway {
         wait_for_health_inner(self.admin_port, timeout).await
     }
 
+    /// Poll the admin `/health` endpoint until it reports `"ready": true`.
+    ///
+    /// Every serving mode binds the admin HTTP listener *before* the rest of
+    /// startup (admin HTTPS setup, the CP gRPC bind, `wait_for_start_signals`),
+    /// so a bare TCP accept — or any check that tolerates a non-2xx `/health` —
+    /// does not prove startup completed. `ready` is stored only after that
+    /// barrier. `/health` currently also answers `503` until then, which makes
+    /// [`wait_for_health`](Self::wait_for_health) a readiness barrier too; this
+    /// method asserts the flag itself, so a test that depends on full startup
+    /// stays correct independently of that status-code policy.
+    pub async fn wait_for_ready(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        wait_for_ready_inner(self.admin_port, timeout).await
+    }
+
+    /// Whether the gateway subprocess is still running. `false` once it has
+    /// exited, or if the child was already shut down / taken by the caller.
+    pub fn is_running(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
+
     /// Poll an authenticated admin endpoint until the configured JWT is
     /// accepted. This keeps parallel functional tests from mistaking another
     /// gateway's unauthenticated `/health` response for this child process.
@@ -954,7 +980,7 @@ fn resolve_db(db: &DbType, temp: &TempDir) -> (String, String) {
 /// Bind an ephemeral port, then drop the listener. Not race-free — the
 /// caller must retry if the gateway binds fail. This is what the
 /// `max_attempts` loop in [`TestGatewayBuilder::spawn`] exists for.
-async fn ephemeral_port() -> Result<u16, std::io::Error> {
+pub async fn ephemeral_port() -> Result<u16, std::io::Error> {
     let l = TcpListener::bind("127.0.0.1:0").await?;
     let port = l.local_addr()?.port();
     drop(l);
@@ -981,6 +1007,46 @@ async fn wait_for_health_inner(
             Ok(r) if r.status().is_success() => return Ok(()),
             Ok(r) => {
                 last_observation = format!("HTTP {}", r.status());
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => {
+                last_observation = err.to_string();
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+async fn wait_for_ready_inner(
+    admin_port: u16,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
+    let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
+    let deadline = Instant::now() + timeout;
+    let mut last_observation = String::from("no response yet");
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "gateway admin /health did not report ready on port {} within {:?} (last observation: {})",
+                admin_port, timeout, last_observation
+            )
+            .into());
+        }
+        match client.get(&health_url).send().await {
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                // `ready` is part of the unauthenticated `/health` tier
+                // (status + ready), so no admin JWT is needed here.
+                let ready = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("ready").and_then(|r| r.as_bool()))
+                    .unwrap_or(false);
+                if status.is_success() && ready {
+                    return Ok(());
+                }
+                last_observation = format!("HTTP {}: {}", status, body);
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(err) => {
