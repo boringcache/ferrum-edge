@@ -122,7 +122,7 @@ async fn test_tcp_connection_throttle_rejects_second_connection_for_same_ip() {
 
 #[tokio::test]
 async fn test_tcp_connection_throttle_uses_canonical_ingress_identity() {
-    let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
 
     let mut native = make_ctx("tcp-proxy", "192.0.2.10", None);
     assert!(matches!(
