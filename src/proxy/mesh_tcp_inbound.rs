@@ -160,44 +160,39 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     };
 
     let consumer_index = Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
-    let mut stream_ctx = StreamConnectionContext {
-        client_ip: client_ip.clone(),
+    let mut stream_ctx = StreamConnectionContext::new(
+        client_ip.clone(),
         // Mesh sidecar inbound relay never uses PROXY protocol (mesh peers speak
         // plain mTLS-HTTP or raw TCP over mesh tunnels, not PROXY protocol).
         // direct_client_ip always equals client_ip for mesh inbound connections.
-        direct_client_ip: client_ip.clone(),
-        canonical_client_ip: Default::default(),
-        proxy_id: proxy.id.clone(),
-        proxy_name: proxy.name.clone(),
+        client_ip.clone(),
+        proxy.id.clone(),
+        proxy.name.clone(),
         // Authorize on the captured app port, not the capture listener.
-        listen_port: app_port,
-        backend_scheme: proxy.effective_scheme(),
+        app_port,
+        proxy.effective_scheme(),
         consumer_index,
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        // Populated above for opaque-TLS captures; `None` for raw-TCP streams.
-        sni_hostname,
-        // Captured plaintext Sidecar inbound is, by direction, inbound mesh
-        // traffic — so `mesh_authz` treats `listen_port` as the inbound
-        // destination port (parity with the materialized HTTP inbound path).
-        mesh_direction: Some(MeshTrafficDirection::Inbound),
-        // Sidecar topology never installs the node-waypoint resolver, so the
-        // per-pod scope is absent and `mesh_authz` evaluates mesh-wide +
-        // namespace/selector policies against the connection identity.
-        node_waypoint_policy_scope: None,
-        first_bytes,
-        first_bytes_kind,
-    };
+    );
+    // Populated above for opaque-TLS captures; `None` for raw-TCP streams.
+    stream_ctx.sni_hostname = sni_hostname;
+    // Captured plaintext Sidecar inbound is, by direction, inbound mesh
+    // traffic — so `mesh_authz` treats `listen_port` as the inbound
+    // destination port (parity with the materialized HTTP inbound path).
+    stream_ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    // The constructor intentionally leaves per-pod scope absent because
+    // Sidecar topology never installs the node-waypoint resolver;
+    // `mesh_authz` evaluates mesh-wide + namespace/selector policies against
+    // the connection identity.
+    // Populate the first-byte snapshot captured above before hooks run.
+    stream_ctx.first_bytes = first_bytes;
+    stream_ctx.first_bytes_kind = first_bytes_kind;
 
     let connected_wall_at = chrono::Utc::now();
     let connected_at = std::time::Instant::now();
 
     for plugin in plugins.iter() {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
+            stream_ctx.release_admission_permits();
             debug!(
                 service = %entry.service_fqdn,
                 orig_dst = %orig_dst,
@@ -486,10 +481,9 @@ async fn relay_to_loopback(
 }
 
 /// Build the `StreamTransactionSummary` and run the `on_stream_disconnect`
-/// chain. Mirrors `tcp_proxy`'s accept-loop disconnect path so stateful plugins
-/// (throttle active counts, span emission, byte-based metrics) release/flush per
-/// connection, and so RST/transaction runtime metrics are recorded for captured
-/// inbound streams too.
+/// chain. Mirrors `tcp_proxy`'s accept-loop disconnect path so admission permits
+/// release before observers run, stateful observers flush per connection, and
+/// RST/transaction runtime metrics are recorded for captured inbound streams too.
 #[allow(clippy::too_many_arguments)]
 async fn emit_disconnect(
     plugins: &[Arc<dyn crate::plugins::Plugin>],
@@ -506,6 +500,9 @@ async fn emit_disconnect(
     disconnect_direction: Option<crate::plugins::Direction>,
     disconnect_cause: Option<DisconnectCause>,
 ) {
+    // The relay (or setup attempt) has ended. Do not retain admission capacity
+    // while asynchronous disconnect observers flush logs and metrics.
+    stream_ctx.release_admission_permits();
     let disconnected_wall_at = chrono::Utc::now();
     let summary = StreamTransactionSummary {
         namespace: proxy.namespace.clone(),

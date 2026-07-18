@@ -249,6 +249,10 @@ config:
 
 `filesystem.write` calls are POSTed to the approval webhook with request
 correlation, consumer/proxy/model/provider, tool name, arguments hash, and risk.
+Request correlation prefers private canonical state from the built-in
+`correlation_id` plugin. On custom-only chains it falls back to transaction
+metadata `request_id`, then legacy `correlation_id`; canonical state always wins
+over either plugin-writable compatibility key.
 Identical calls reuse the cached decision for `cache_ttl_seconds`; the cache
 key covers consumer, proxy, model, **provider**, tool name, and arguments (every
 field the webhook receives that can change its decision). For streamed and

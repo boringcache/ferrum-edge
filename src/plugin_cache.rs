@@ -16,11 +16,11 @@
 //! lists (including their stateful instances) and only rebuild affected proxies.
 
 use arc_swap::ArcSwap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::types::{GatewayConfig, PluginScope};
+use crate::config::types::{BackendScheme, GatewayConfig, PluginScope};
 use tracing::{error, warn};
 
 use crate::adaptive_concurrency::{
@@ -28,6 +28,7 @@ use crate::adaptive_concurrency::{
     adaptive_concurrency_scope,
 };
 use crate::config::types::PluginConfig;
+use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnectionThrottleState};
 use crate::plugins::utils::jwks_cache::retain_active_requirements;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client,
@@ -38,9 +39,9 @@ use crate::plugins::{
 // ---------------------------------------------------------------------------
 
 use crate::plugins::{
-    BackendPathPolicyPhase, PluginResult, RequestContext, ResponseStreamInspector,
-    StreamConnectionContext, StreamTransactionSummary, TransactionSummary, UdpDatagramContext,
-    UdpDatagramVerdict, WebSocketFrameDirection,
+    PluginResult, RequestContext, ResponseStreamInspector, StreamConnectionContext,
+    StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
+    WebSocketFrameDirection, WebSocketSizeLimits,
 };
 use async_trait::async_trait;
 
@@ -253,10 +254,84 @@ fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> R
     Ok(())
 }
 
+/// A correlation header names one trust-domain value. Allowing two instances
+/// that can execute for the same protocol to own the same normalized header
+/// would make their instance-scoped metadata and stream-generated IDs
+/// contradictory. Equal priorities would make the canonical owner depend on
+/// storage/load order. Reject either ambiguity before the chain is published,
+/// while allowing disjoint protocol owners that can never contend at runtime.
+pub(crate) fn validate_correlation_id_composition(
+    plugins: &[Arc<dyn Plugin>],
+    real_ip_header: Option<&str>,
+) -> Result<(), String> {
+    for protocol in ALL_PROXY_PROTOCOLS {
+        let mut headers = HashSet::new();
+        let mut priorities = HashSet::new();
+        for plugin in plugins
+            .iter()
+            .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+        {
+            let Some(header_name) = plugin.correlation_id_header_name() else {
+                continue;
+            };
+            // Custom plugins are expected to normalize this capability, but
+            // composition admission must not trust third-party implementations
+            // to trim or case-fold it. This allocation happens only while
+            // building/validating a cache generation, never on the request hot
+            // path.
+            let trimmed_header_name = header_name.trim();
+            if trimmed_header_name.is_empty() {
+                return Err(format!(
+                    "correlation_id: plugin {:?} returned an empty correlation_id_header_name capability claim for protocol {protocol:?}; return None when the plugin does not own a correlation header",
+                    plugin.name()
+                ));
+            }
+            let normalized_header_name = trimmed_header_name.to_ascii_lowercase();
+            if crate::plugins::correlation_id::is_reserved_header_name(&normalized_header_name) {
+                return Err(format!(
+                    "correlation_id: effective header_name {normalized_header_name:?} for plugin {:?} and protocol {protocol:?} violates reserved protocol-managed or security-sensitive header ownership",
+                    plugin.name()
+                ));
+            }
+            if real_ip_header
+                .is_some_and(|configured| normalized_header_name.eq_ignore_ascii_case(configured))
+            {
+                return Err(format!(
+                    "correlation_id: effective header_name {normalized_header_name:?} for plugin {:?} and protocol {protocol:?} conflicts with the effective FERRUM_REAL_IP_HEADER client-attribution header",
+                    plugin.name()
+                ));
+            }
+            if !headers.insert(normalized_header_name.clone()) {
+                return Err(format!(
+                    "correlation_id: duplicate effective header_name {normalized_header_name:?} for protocol {protocol:?} on the same plugin chain; each overlapping correlation trust domain must use a distinct header"
+                ));
+            }
+            let priority = plugin.priority();
+            if !priorities.insert(priority) {
+                return Err(format!(
+                    "correlation_id: duplicate effective priority {priority} for protocol {protocol:?} on the same plugin chain; configure distinct effective priorities with priority_override so canonical ownership is deterministic"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_plugin_composition(
+    plugins: &[Arc<dyn Plugin>],
+    real_ip_header: Option<&str>,
+) -> Result<(), String> {
+    validate_hmac_request_transform_composition(plugins)?;
+    validate_correlation_id_composition(plugins, real_ip_header)
+}
+
 #[async_trait]
 impl Plugin for PriorityOverridePlugin {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+    fn correlation_id_header_name(&self) -> Option<&str> {
+        self.inner.correlation_id_header_name()
     }
     fn priority(&self) -> u16 {
         self.priority
@@ -348,11 +423,20 @@ impl Plugin for PriorityOverridePlugin {
         &self,
         ctx: &mut RequestContext,
         backend_path: &str,
-        phase: BackendPathPolicyPhase,
     ) -> PluginResult {
-        self.inner
-            .on_backend_path_resolved(ctx, backend_path, phase)
-            .await
+        self.inner.on_backend_path_resolved(ctx, backend_path).await
+    }
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner.apply_websocket_handshake_response_headers(
+            ctx,
+            response_status,
+            response_headers,
+        );
     }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();
@@ -587,6 +671,10 @@ impl Plugin for PriorityOverridePlugin {
     fn needs_final_request_body_context(&self) -> bool {
         self.inner.needs_final_request_body_context()
     }
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+        self.inner
+            .requires_final_request_body_before_backend_dispatch()
+    }
     async fn transform_response_body(
         &self,
         body: &[u8],
@@ -681,6 +769,12 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_ws_frame_hooks(&self) -> bool {
         self.inner.requires_ws_frame_hooks()
     }
+    fn websocket_size_limits(&self) -> Option<WebSocketSizeLimits> {
+        self.inner.websocket_size_limits()
+    }
+    fn requires_websocket_framing(&self) -> bool {
+        self.inner.requires_websocket_framing()
+    }
     async fn on_ws_frame(
         &self,
         proxy_id: &str,
@@ -748,6 +842,91 @@ impl Plugin for PriorityOverridePlugin {
     }
 }
 
+fn validate_tcp_connection_throttle_attachment(
+    pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
+) -> Result<(), String> {
+    let attached = gateway_config.proxies.iter().filter(|proxy| {
+        tcp_connection_throttle_effectively_applies_to_proxy(pc, proxy, gateway_config)
+    });
+    let mut attached_count = 0usize;
+    let mut unsupported = Vec::new();
+    for proxy in attached {
+        attached_count += 1;
+        if !matches!(
+            proxy.effective_scheme(),
+            BackendScheme::Tcp | BackendScheme::Tcps
+        ) {
+            unsupported.push(format!("{} ({})", proxy.id, proxy.effective_scheme()));
+        }
+    }
+
+    match pc.scope {
+        PluginScope::Global if attached_count > 0 && unsupported.len() == attached_count => {
+            Err(format!(
+                "tcp_connection_throttle: global plugin config '{}' has no TCP/TCP+TLS proxy to protect; UDP/DTLS and HTTP-family proxies are unsupported",
+                pc.id
+            ))
+        }
+        PluginScope::Proxy | PluginScope::ProxyGroup if !unsupported.is_empty() => Err(format!(
+            "tcp_connection_throttle: plugin config '{}' is attached to unsupported UDP/DTLS or HTTP-family proxy/proxies {}; only TCP/TCP+TLS is supported (use udp_rate_limiting for datagram/session admission)",
+            pc.id,
+            unsupported.join(", ")
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Validate protocol attachment semantics for every enabled TCP throttle in a
+/// complete candidate graph. Admin admission and config-source validation use
+/// this before persistence/publication so unsupported protection is never
+/// accepted only to be silently filtered from a UDP/DTLS or HTTP plugin list.
+pub(crate) fn validate_tcp_connection_throttle_attachments(
+    gateway_config: &GatewayConfig,
+) -> Result<(), Vec<String>> {
+    let errors: Vec<String> = gateway_config
+        .plugin_configs
+        .iter()
+        .filter(|pc| pc.enabled && pc.plugin_name == "tcp_connection_throttle")
+        .filter_map(|pc| validate_tcp_connection_throttle_attachment(pc, gateway_config).err())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn create_tcp_connection_throttle_plugin(
+    pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
+    http_client: &PluginHttpClient,
+    current: &TcpConnectionThrottleInstanceMap,
+    staged: &mut TcpConnectionThrottleInstanceMap,
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    validate_tcp_connection_throttle_attachment(pc, gateway_config)?;
+    let identity = tcp_connection_throttle_policy_id(pc);
+    let existing_state = staged
+        .get(&identity)
+        .or_else(|| current.get(&identity))
+        .map(|instance| Arc::clone(&instance.state));
+    let plugin = match existing_state {
+        Some(state) => TcpConnectionThrottle::with_shared_state(&pc.config, state)?,
+        None => TcpConnectionThrottle::new_with_pool_shard_amount(
+            &pc.config,
+            http_client.pool_shard_amount(),
+        )?,
+    };
+    staged.insert(
+        identity,
+        TcpConnectionThrottleInstance {
+            state: plugin.shared_state(),
+            cleanup_interval_seconds: plugin.cleanup_interval_seconds(),
+        },
+    );
+    Ok(Some(Arc::new(plugin)))
+}
+
 /// Try to create a plugin and apply `priority_override` from the plugin config.
 ///
 /// Enabled plugin configs are load-bearing configuration: unknown plugin names
@@ -760,6 +939,8 @@ fn try_create_plugin(
     http_client: &PluginHttpClient,
     current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
     staged_adaptive_states: &mut AdaptiveConcurrencyInstanceMap,
+    current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
+    staged_tcp_throttle_states: &mut TcpConnectionThrottleInstanceMap,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     let created = if pc.plugin_name == "adaptive_concurrency" {
         create_adaptive_concurrency_plugin(
@@ -768,6 +949,14 @@ fn try_create_plugin(
             http_client,
             current_adaptive_states,
             staged_adaptive_states,
+        )
+    } else if pc.plugin_name == "tcp_connection_throttle" {
+        create_tcp_connection_throttle_plugin(
+            pc,
+            gateway_config,
+            http_client,
+            current_tcp_throttle_states,
+            staged_tcp_throttle_states,
         )
     } else {
         create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone())
@@ -836,12 +1025,11 @@ type BufferingMap = HashMap<String, bool>;
 /// Map from proxy_id to whether any plugin may require request body buffering
 /// for at least some requests.
 type RequestBufferingMap = HashMap<String, bool>;
-/// Map from proxy_id to whether any plugin requires per-frame WebSocket hooks.
+/// Map from proxy_id to whether any plugin requires parsed WebSocket framing.
 type WsFrameMap = HashMap<String, bool>;
 /// Map from proxy_group plugin_config_id to its shared plugin instance.
 type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
-type HmacCompositionPluginMap<'a> =
-    HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
+type CompositionPluginMap<'a> = HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct AdaptiveConcurrencyPolicyId {
@@ -896,6 +1084,28 @@ struct AdaptiveConcurrencyInstance {
 
 type AdaptiveConcurrencyInstanceMap =
     HashMap<AdaptiveConcurrencyPolicyId, AdaptiveConcurrencyInstance>;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TcpConnectionThrottlePolicyId {
+    namespace: String,
+    plugin_config_id: String,
+}
+
+#[derive(Clone)]
+struct TcpConnectionThrottleInstance {
+    state: Arc<TcpConnectionThrottleState>,
+    cleanup_interval_seconds: u64,
+}
+
+type TcpConnectionThrottleInstanceMap =
+    HashMap<TcpConnectionThrottlePolicyId, TcpConnectionThrottleInstance>;
+
+fn tcp_connection_throttle_policy_id(pc: &PluginConfig) -> TcpConnectionThrottlePolicyId {
+    TcpConnectionThrottlePolicyId {
+        namespace: pc.namespace.clone(),
+        plugin_config_id: pc.id.clone(),
+    }
+}
 
 fn adaptive_concurrency_policy_id(pc: &PluginConfig) -> AdaptiveConcurrencyPolicyId {
     AdaptiveConcurrencyPolicyId {
@@ -953,6 +1163,56 @@ fn plugin_config_effectively_applies_to_proxy(
             scoped_plugin_config_applies_to_proxy(pc, proxy)
         }
     }
+}
+
+fn tcp_connection_throttle_effectively_applies_to_proxy(
+    pc: &PluginConfig,
+    proxy: &crate::config::types::Proxy,
+    config: &GatewayConfig,
+) -> bool {
+    if !pc.enabled || proxy.namespace != pc.namespace {
+        return false;
+    }
+    match &pc.scope {
+        PluginScope::Global => !config.plugin_configs.iter().any(|candidate| {
+            candidate.namespace == pc.namespace
+                && candidate.enabled
+                && candidate.plugin_name == pc.plugin_name
+                && scoped_plugin_config_applies_to_proxy(candidate, proxy)
+        }),
+        PluginScope::Proxy | PluginScope::ProxyGroup => {
+            scoped_plugin_config_applies_to_proxy(pc, proxy)
+        }
+    }
+}
+
+fn tcp_connection_throttle_policy_is_active(pc: &PluginConfig, config: &GatewayConfig) -> bool {
+    match pc.scope {
+        PluginScope::Global => true,
+        PluginScope::Proxy | PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+            proxy.namespace == pc.namespace && scoped_plugin_config_applies_to_proxy(pc, proxy)
+        }),
+    }
+}
+
+fn retained_tcp_connection_throttle_states(
+    current: &TcpConnectionThrottleInstanceMap,
+    config: &GatewayConfig,
+) -> TcpConnectionThrottleInstanceMap {
+    let mut retained = HashMap::new();
+    for pc in &config.plugin_configs {
+        if !pc.enabled
+            || pc.plugin_name != "tcp_connection_throttle"
+            || !tcp_connection_throttle_policy_is_active(pc, config)
+        {
+            continue;
+        }
+        let identity = tcp_connection_throttle_policy_id(pc);
+        if let Some(existing) = current.get(&identity) {
+            retained.insert(identity, existing.clone());
+        }
+    }
+    retained
 }
 
 fn target_matches_subset(
@@ -1901,12 +2161,13 @@ struct ProxyGroupPluginInstance {
     config: PluginConfig,
 }
 
-/// Built-in plugin types whose constructed instance can participate in the
-/// HMAC request-body composition invariant. Keep this list aligned with
+/// Built-in plugin types whose constructed instances participate in a
+/// cross-plugin composition invariant. Keep the HMAC portion aligned with
 /// `Plugin::modifies_request_body()` implementations. Registered custom
 /// plugins are also constructed because their capability is defined by their
 /// `Plugin` implementation rather than a core allowlist.
-const HMAC_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
+const COMPOSITION_PLUGIN_NAMES: &[&str] = &[
+    "correlation_id",
     "hmac_auth",
     "request_transformer",
     "compression",
@@ -1918,30 +2179,42 @@ const HMAC_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "ai_request_guard",
 ];
 
-/// Validate the HMAC/request-body-transform invariant against a candidate
-/// config before an admin Proxy or PluginConfig write is persisted. Runtime
-/// cache construction repeats the same check as a fail-closed backstop.
-pub(crate) fn validate_hmac_request_transform_candidate(
+/// Validate cross-plugin composition invariants against a candidate config
+/// before an admin Proxy or PluginConfig write is persisted. Runtime cache
+/// construction repeats the same checks as a fail-closed backstop.
+pub(crate) fn validate_plugin_composition_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,
 ) -> Result<(), String> {
-    if !config
+    let has_hmac = config
         .plugin_configs
         .iter()
-        .any(|plugin| plugin.enabled && plugin.plugin_name == "hmac_auth")
-    {
+        .any(|plugin| plugin.enabled && plugin.plugin_name == "hmac_auth");
+    let has_correlation = config
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.enabled && plugin.plugin_name == "correlation_id");
+    let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
+    // A custom plugin's composition capabilities are known only after its
+    // registered factory constructs the Plugin implementation.
+    let has_custom_composition_candidate = config
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.enabled && custom_plugin_names.contains(&plugin.plugin_name.as_str()));
+    if !has_hmac && !has_correlation && !has_custom_composition_candidate {
         return Ok(());
     }
     let mut errors = Vec::new();
-    let mut global_plugins = Vec::new();
-    let mut scoped_plugins: HmacCompositionPluginMap<'_> = HashMap::new();
-    let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
+    let mut global_plugins: BTreeMap<&str, Vec<Arc<dyn Plugin>>> = BTreeMap::new();
+    let mut scoped_plugins: CompositionPluginMap<'_> = HashMap::new();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
+    let current_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
+    let mut staged_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
 
     for plugin_config in &config.plugin_configs {
         if !plugin_config.enabled
-            || (!HMAC_COMPOSITION_PLUGIN_NAMES.contains(&plugin_config.plugin_name.as_str())
+            || (!COMPOSITION_PLUGIN_NAMES.contains(&plugin_config.plugin_name.as_str())
                 && !custom_plugin_names.contains(&plugin_config.plugin_name.as_str()))
         {
             continue;
@@ -1952,9 +2225,14 @@ pub(crate) fn validate_hmac_request_transform_candidate(
             http_client,
             &current_adaptive_states,
             &mut staged_adaptive_states,
+            &current_tcp_throttle_states,
+            &mut staged_tcp_throttle_states,
         ) {
             Ok(Some(plugin)) if plugin_config.scope == PluginScope::Global => {
-                global_plugins.push(plugin);
+                global_plugins
+                    .entry(plugin_config.namespace.as_str())
+                    .or_default()
+                    .push(plugin);
             }
             Ok(Some(plugin)) => {
                 scoped_plugins.insert(
@@ -1968,7 +2246,10 @@ pub(crate) fn validate_hmac_request_transform_candidate(
     }
 
     for proxy in &config.proxies {
-        let mut merged = global_plugins.clone();
+        let mut merged = global_plugins
+            .get(proxy.namespace.as_str())
+            .cloned()
+            .unwrap_or_default();
         let global_ptrs: HashSet<usize> = merged
             .iter()
             .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
@@ -1991,20 +2272,22 @@ pub(crate) fn validate_hmac_request_transform_candidate(
             remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
             merged.push(Arc::clone(plugin));
         }
-        if let Err(error) = validate_hmac_request_transform_composition(&merged) {
+        if let Err(error) = validate_plugin_composition(&merged, http_client.real_ip_header()) {
             errors.push(format!("proxy_id={}: {error}", proxy.id));
         }
     }
 
-    if let Err(error) = validate_hmac_request_transform_composition(&global_plugins) {
-        errors.push(format!("global plugins: {error}"));
+    for (namespace, plugins) in &global_plugins {
+        if let Err(error) = validate_plugin_composition(plugins, http_client.real_ip_header()) {
+            errors.push(format!("global plugins namespace={namespace:?}: {error}"));
+        }
     }
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "{} HMAC request-transform composition error(s): {}",
+            "{} plugin composition error(s): {}",
             errors.len(),
             errors.join("; ")
         ))
@@ -2056,6 +2339,7 @@ impl PluginCapabilities {
     pub const HAS_BODY_BEFORE_AUTHORIZE: u16 = 1 << 10;
     pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
     pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
+    pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -2162,6 +2446,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.needs_final_request_body_context() {
             caps |= PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT;
+        }
+        if p.requires_final_request_body_before_backend_dispatch() {
+            caps |= PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH;
         }
         if p.requires_response_committed_hook() {
             caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;
@@ -2358,9 +2645,9 @@ pub(crate) struct PluginCacheInner {
     /// Pre-computed per-protocol plugin lists + phase data (auth plugin lists,
     /// capability bitsets).
     protocol_snapshot: ProtocolSnapshot,
-    /// Pre-computed: does any plugin for this proxy require per-frame WebSocket hooks?
+    /// Pre-computed: does any plugin require parser policy or message hooks?
     requires_ws_frame: WsFrameMap,
-    /// Whether global-only plugins require per-frame WebSocket hooks (fallback).
+    /// Whether global-only plugins require parsed WebSocket framing (fallback).
     global_requires_ws_frame: bool,
     /// Shared proxy-group plugin instances, keyed by plugin_config_id. Kept
     /// across incremental updates so rebuilt proxies can keep sharing state
@@ -2370,6 +2657,10 @@ pub(crate) struct PluginCacheInner {
     /// ID. Replacement plugin objects share these limiters so live permits and
     /// learned target state remain coherent across cache generations.
     adaptive_concurrency_instances: AdaptiveConcurrencyInstanceMap,
+    /// Stable process-local TCP throttle accounting keyed by namespace +
+    /// plugin config ID. Replacement plugin objects share these maps so live
+    /// connection permits remain counted across cache generations.
+    tcp_connection_throttle_instances: TcpConnectionThrottleInstanceMap,
 }
 
 impl PluginCacheInner {
@@ -2386,6 +2677,7 @@ impl PluginCacheInner {
         global_requires_ws_frame: bool,
         proxy_group_plugins: ProxyGroupInstanceMap,
         adaptive_concurrency_instances: AdaptiveConcurrencyInstanceMap,
+        tcp_connection_throttle_instances: TcpConnectionThrottleInstanceMap,
     ) -> Self {
         Self {
             proxy_plugins,
@@ -2399,6 +2691,15 @@ impl PluginCacheInner {
             global_requires_ws_frame,
             proxy_group_plugins,
             adaptive_concurrency_instances,
+            tcp_connection_throttle_instances,
+        }
+    }
+
+    fn apply_tcp_connection_throttle_cleanup_intervals(&self) {
+        for instance in self.tcp_connection_throttle_instances.values() {
+            instance
+                .state
+                .set_cleanup_interval(instance.cleanup_interval_seconds);
         }
     }
 
@@ -2751,7 +3052,7 @@ impl PluginCacheRequestView {
         self.requires_request_body_buffering
     }
 
-    /// Check WebSocket frame-hook requirement from this request view.
+    /// Check parsed WebSocket relay requirement from this request view.
     pub fn requires_ws_frame_hooks(&self) -> bool {
         self.requires_ws_frame_hooks
     }
@@ -2838,15 +3139,17 @@ impl PluginCache {
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
     ) -> Result<Arc<PluginCacheInner>, String> {
-        Self::build_inner_with_prior_adaptive_states(config, http_client, &HashMap::new())
+        Self::build_inner_with_prior_states(config, http_client, &HashMap::new(), &HashMap::new())
     }
 
-    fn build_inner_with_prior_adaptive_states(
+    fn build_inner_with_prior_states(
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
         current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
+        current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
+        validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
             globals,
@@ -2858,7 +3161,13 @@ impl PluginCache {
             global_needs_ws_frame,
             proxy_group_plugins,
             adaptive_concurrency_instances,
-        ) = Self::build_cache(config, http_client, current_adaptive_states)?;
+            tcp_connection_throttle_instances,
+        ) = Self::build_cache(
+            config,
+            http_client,
+            current_adaptive_states,
+            current_tcp_throttle_states,
+        )?;
         let snapshot = build_protocol_snapshot(&proxy_map, &globals);
 
         Ok(Arc::new(PluginCacheInner::new(
@@ -2873,6 +3182,7 @@ impl PluginCache {
             global_needs_ws_frame,
             proxy_group_plugins,
             adaptive_concurrency_instances,
+            tcp_connection_throttle_instances,
         )))
     }
 
@@ -2881,17 +3191,28 @@ impl PluginCache {
         config: &GatewayConfig,
     ) -> Result<Arc<PluginCacheInner>, String> {
         let current = self.inner.load();
-        Self::build_inner_with_prior_adaptive_states(
+        Self::build_inner_with_prior_states(
             config,
             &self.http_client,
             &current.adaptive_concurrency_instances,
+            &current.tcp_connection_throttle_instances,
         )
     }
 
     pub(crate) fn store_inner(&self, inner: Arc<PluginCacheInner>) {
+        let previous = self.inner.load_full();
         inner.prepare_adaptive_concurrency_generations();
         self.inner.store(Arc::clone(&inner));
         inner.commit_adaptive_concurrency_generations();
+        for (identity, instance) in &previous.tcp_connection_throttle_instances {
+            if !inner
+                .tcp_connection_throttle_instances
+                .contains_key(identity)
+            {
+                instance.state.set_cleanup_interval(0);
+            }
+        }
+        inner.apply_tcp_connection_throttle_cleanup_intervals();
     }
 
     pub(crate) fn load_inner(&self) -> Arc<PluginCacheInner> {
@@ -2916,8 +3237,8 @@ impl PluginCache {
 
     /// Atomically rebuild the cache when config changes. Most old plugin
     /// instances are dropped only after in-flight requests release them;
-    /// adaptive-concurrency policies additionally carry coherent admission
-    /// state into compatible replacement generations.
+    /// adaptive-concurrency and TCP-throttle policies additionally carry
+    /// coherent admission state into compatible replacement generations.
     ///
     /// Returns `Err` if any enabled plugin config cannot be resolved or fails validation.
     pub fn rebuild(&self, config: &GatewayConfig) -> Result<(), String> {
@@ -2951,6 +3272,7 @@ impl PluginCache {
         rebuild_globals: bool,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
+        validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
@@ -2963,6 +3285,10 @@ impl PluginCache {
         let global_plugins_changed = rebuild_globals || rebuild_adaptive_globals;
         let mut adaptive_concurrency_instances =
             retained_adaptive_concurrency_states(&current.adaptive_concurrency_instances, config);
+        let mut tcp_connection_throttle_instances = retained_tcp_connection_throttle_states(
+            &current.tcp_connection_throttle_instances,
+            config,
+        );
 
         // Rebuild globals if any global plugin config changed
         let new_globals = if rebuild_globals {
@@ -2981,7 +3307,8 @@ impl PluginCache {
             // cheap (one Mutex acquire + empty HashMap) and guarantees
             // the registry stays in sync even if a sibling global plugin
             // was the trigger for the rebuild.
-            crate::plugins::utils::log_schema::registry::begin_reload();
+            crate::plugins::utils::log_schema::registry::begin_reload()
+                .map_err(|error| format!("Config reload rejected: {error}"))?;
             for pc in &config.plugin_configs {
                 if !pc.enabled || pc.scope != PluginScope::Global {
                     continue;
@@ -2995,8 +3322,12 @@ impl PluginCache {
                     &self.http_client,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
+                    &current.tcp_connection_throttle_instances,
+                    &mut tcp_connection_throttle_instances,
                 ) {
-                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    // Config-only: construction stages the registry entry, but
+                    // the instance must never enter runtime hook/cache lists.
+                    Ok(Some(_)) => {}
                     Ok(None) => {}
                     Err(e) => {
                         error!("Config reload: {}", e);
@@ -3019,6 +3350,8 @@ impl PluginCache {
                         &self.http_client,
                         &current.adaptive_concurrency_instances,
                         &mut adaptive_concurrency_instances,
+                        &current.tcp_connection_throttle_instances,
+                        &mut tcp_connection_throttle_instances,
                     ) {
                         Ok(Some(plugin)) => global_plugins.push(plugin),
                         Ok(None) => {}
@@ -3036,7 +3369,9 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
-            if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
+            if let Err(e) =
+                validate_plugin_composition(&global_plugins, self.http_client.real_ip_header())
+            {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
             Arc::new(global_plugins)
@@ -3063,6 +3398,8 @@ impl PluginCache {
                     &self.http_client,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
+                    &current.tcp_connection_throttle_instances,
+                    &mut tcp_connection_throttle_instances,
                 ) {
                     Ok(Some(plugin)) => global_plugins.push(plugin),
                     Ok(None) => {}
@@ -3174,6 +3511,8 @@ impl PluginCache {
                             &self.http_client,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
+                            &current.tcp_connection_throttle_instances,
+                            &mut tcp_connection_throttle_instances,
                         ) {
                             Ok(Some(plugin)) => {
                                 // Detect when an auto-emitted plugin instance
@@ -3240,6 +3579,8 @@ impl PluginCache {
                             &self.http_client,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
+                            &current.tcp_connection_throttle_instances,
+                            &mut tcp_connection_throttle_instances,
                         ) {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
@@ -3284,7 +3625,8 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
+            if let Err(e) = validate_plugin_composition(&merged, self.http_client.real_ip_header())
+            {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
             new_map.insert(proxy.id.clone(), Arc::new(merged));
@@ -3313,7 +3655,7 @@ impl PluginCache {
                 );
                 new_ws_frame.insert(
                     proxy.id.clone(),
-                    plugins.iter().any(|p| p.requires_ws_frame_hooks()),
+                    plugins.iter().any(|p| p.requires_websocket_framing()),
                 );
             }
         }
@@ -3325,8 +3667,10 @@ impl PluginCache {
         // bracket above — abort it so the process-global named-schema
         // registry doesn't get mutated by a config that's being rejected.
         if !plugin_errors.is_empty() {
-            if rebuild_globals {
-                crate::plugins::utils::log_schema::registry::abort_reload();
+            if rebuild_globals
+                && let Err(error) = crate::plugins::utils::log_schema::registry::abort_reload()
+            {
+                plugin_errors.push(error);
             }
             return Err(format!(
                 "Config reload rejected: {} plugin config(s) failed validation: {}",
@@ -3337,7 +3681,13 @@ impl PluginCache {
 
         if let Err(error) = start_background_tasks(&new_map, &new_globals) {
             if rebuild_globals {
-                crate::plugins::utils::log_schema::registry::abort_reload();
+                crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                    |registry_error| {
+                        format!(
+                            "Config reload rejected: {error}; registry abort also failed: {registry_error}"
+                        )
+                    },
+                )?;
             }
             return Err(format!("Config reload rejected: {error}"));
         }
@@ -3392,7 +3742,7 @@ impl PluginCache {
             current.global_requires_request_buffering
         };
         let new_global_requires_ws_frame = if global_plugins_changed {
-            new_globals.iter().any(|p| p.requires_ws_frame_hooks())
+            new_globals.iter().any(|p| p.requires_websocket_framing())
         } else {
             current.global_requires_ws_frame
         };
@@ -3401,7 +3751,8 @@ impl PluginCache {
         // above (rebuild_globals == true), promote the staged named
         // schemas now — pairs with the `begin_reload` at the top.
         if rebuild_globals {
-            crate::plugins::utils::log_schema::registry::commit_reload();
+            crate::plugins::utils::log_schema::registry::commit_reload()
+                .map_err(|error| format!("Config reload rejected: {error}"))?;
         }
 
         Ok(Arc::new(PluginCacheInner::new(
@@ -3421,6 +3772,7 @@ impl PluginCache {
             new_global_requires_ws_frame,
             group_plugin_instances,
             adaptive_concurrency_instances,
+            tcp_connection_throttle_instances,
         )))
     }
 
@@ -3523,7 +3875,7 @@ impl PluginCache {
         inner.requires_request_body_buffering(proxy_id)
     }
 
-    /// Check whether any plugin for this proxy requires per-frame WebSocket hooks.
+    /// Check whether any plugin for this proxy requires parsed WebSocket framing.
     /// When false, the WebSocket frame forwarding loop skips plugins entirely (zero overhead).
     /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
     ///
@@ -3611,6 +3963,7 @@ impl PluginCache {
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
         current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
+        current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
     ) -> Result<
         (
             ProxyPluginMap,
@@ -3623,6 +3976,7 @@ impl PluginCache {
             bool,
             ProxyGroupInstanceMap,
             AdaptiveConcurrencyInstanceMap,
+            TcpConnectionThrottleInstanceMap,
         ),
         String,
     > {
@@ -3630,6 +3984,8 @@ impl PluginCache {
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
         let mut adaptive_concurrency_instances =
             retained_adaptive_concurrency_states(current_adaptive_states, config);
+        let mut tcp_connection_throttle_instances =
+            retained_tcp_connection_throttle_states(current_tcp_throttle_states, config);
 
         // Pre-index proxy-scoped plugin configs by proxy_id for O(1) lookup
         // instead of scanning all plugin_configs for every proxy (O(P×C) → O(P+C)).
@@ -3654,7 +4010,8 @@ impl PluginCache {
         // the rest of the plugin-cache build succeeds; `abort_reload`
         // runs if any plugin fails validation, so the process-global
         // registry stays atomically tied to the cache.
-        crate::plugins::utils::log_schema::registry::begin_reload();
+        crate::plugins::utils::log_schema::registry::begin_reload()
+            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
         for pc in &config.plugin_configs {
             if !pc.enabled || pc.scope != PluginScope::Global {
                 continue;
@@ -3668,8 +4025,12 @@ impl PluginCache {
                 http_client,
                 current_adaptive_states,
                 &mut adaptive_concurrency_instances,
+                current_tcp_throttle_states,
+                &mut tcp_connection_throttle_instances,
             ) {
-                Ok(Some(plugin)) => global_plugins.push(plugin),
+                // Config-only: construction stages the registry entry, but
+                // the instance must never enter runtime hook/cache lists.
+                Ok(Some(_)) => {}
                 Ok(None) => {}
                 Err(e) => plugin_errors.push(e),
             }
@@ -3691,6 +4052,8 @@ impl PluginCache {
                     http_client,
                     current_adaptive_states,
                     &mut adaptive_concurrency_instances,
+                    current_tcp_throttle_states,
+                    &mut tcp_connection_throttle_instances,
                 ) {
                     Ok(Some(plugin)) => global_plugins.push(plugin),
                     Ok(None) => {}
@@ -3749,6 +4112,8 @@ impl PluginCache {
                             http_client,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
+                            current_tcp_throttle_states,
+                            &mut tcp_connection_throttle_instances,
                         ) {
                             Ok(Some(plugin)) => {
                                 // Remove only GLOBAL plugins of the same name —
@@ -3791,6 +4156,8 @@ impl PluginCache {
                             http_client,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
+                            current_tcp_throttle_states,
+                            &mut tcp_connection_throttle_instances,
                         ) {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
@@ -3828,7 +4195,7 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
+            if let Err(e) = validate_plugin_composition(&merged, http_client.real_ip_header()) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
 
@@ -3840,8 +4207,9 @@ impl PluginCache {
             let needs_req_buffering = merged.iter().any(|p| p.requires_request_body_buffering());
             req_buffering_map.insert(proxy.id.clone(), needs_req_buffering);
 
-            // Pre-compute whether any plugin requires per-frame WebSocket hooks
-            let needs_ws_frame = merged.iter().any(|p| p.requires_ws_frame_hooks());
+            // Pre-compute whether any plugin requires WebSocket parsing for a
+            // parser policy or post-reassembly message hook.
+            let needs_ws_frame = merged.iter().any(|p| p.requires_websocket_framing());
             ws_frame_map.insert(proxy.id.clone(), needs_ws_frame);
 
             proxy_map.insert(proxy.id.clone(), Arc::new(merged));
@@ -3856,7 +4224,7 @@ impl PluginCache {
         if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
-        if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
+        if let Err(e) = validate_plugin_composition(&global_plugins, http_client.real_ip_header()) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
 
@@ -3867,7 +4235,9 @@ impl PluginCache {
         // live PluginCache stays on the old plugins while the registry
         // already reflects the rejected reload's schemas.
         if !plugin_errors.is_empty() {
-            crate::plugins::utils::log_schema::registry::abort_reload();
+            if let Err(error) = crate::plugins::utils::log_schema::registry::abort_reload() {
+                plugin_errors.push(error);
+            }
             for err in &plugin_errors {
                 error!("{}", err);
             }
@@ -3879,13 +4249,20 @@ impl PluginCache {
         }
 
         if let Err(error) = start_background_tasks(&proxy_map, &global_plugins) {
-            crate::plugins::utils::log_schema::registry::abort_reload();
+            crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                |registry_error| {
+                    format!(
+                        "Gateway startup aborted: {error}; registry abort also failed: {registry_error}"
+                    )
+                },
+            )?;
             return Err(format!("Gateway startup aborted: {error}"));
         }
 
         // All plugins validated — promote the staged named schemas to live.
         // Pairs with the `begin_reload` at the start of this function.
-        crate::plugins::utils::log_schema::registry::commit_reload();
+        crate::plugins::utils::log_schema::registry::commit_reload()
+            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
 
         let global_needs_buffering = global_plugins
             .iter()
@@ -3893,7 +4270,9 @@ impl PluginCache {
         let global_needs_req_buffering = global_plugins
             .iter()
             .any(|p| p.requires_request_body_buffering());
-        let global_needs_ws_frame = global_plugins.iter().any(|p| p.requires_ws_frame_hooks());
+        let global_needs_ws_frame = global_plugins
+            .iter()
+            .any(|p| p.requires_websocket_framing());
 
         Ok((
             proxy_map,
@@ -3906,6 +4285,7 @@ impl PluginCache {
             global_needs_ws_frame,
             group_plugin_instances,
             adaptive_concurrency_instances,
+            tcp_connection_throttle_instances,
         ))
     }
 }

@@ -2,8 +2,8 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → backend-path policy preview → deferred routing-header hooks →
-//! final backend-path enforcement → remaining deferred `before_proxy` hooks →
+//! `before_proxy` → backend-path policy enforcement →
+//! deferred routing-header hooks → remaining deferred `before_proxy` hooks →
 //! `transform_request_body` →
 //! `on_final_request_body` → `backend_admission` → `after_proxy` →
 //! `normalize_response_body` → `on_response_body` →
@@ -115,7 +115,7 @@ use percent_encoding::percent_decode_str;
 use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -129,6 +129,19 @@ use crate::modes::mesh::MeshTrafficDirection;
 use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
 };
+
+/// Internal provenance marker set after a request-phase plugin has issued an
+/// external operation whose result must not be replayed from an ambiguous
+/// synthetic-response pipeline.
+pub(crate) const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str =
+    "ferrum:external_operation_completed";
+
+/// Internal marker set when a request is committed to a synthetic rejection
+/// before any external operation or backend dispatch could have started.
+/// Ownership plugins consume it from `on_response_committed` to release this
+/// request's exact local/distributed in-flight token safely.
+pub(crate) const RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY: &str =
+    "ferrum:release_dedup_inflight_on_commit";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JwtAuthAttributeValue {
@@ -152,19 +165,6 @@ pub enum ProxyProtocol {
     Tcp,
     /// Raw UDP datagram proxy (includes DTLS termination/origination)
     Udp,
-}
-
-/// Whether a backend-effective path policy hook is validating a provisional
-/// selection or enforcing the final selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendPathPolicyPhase {
-    /// Validate access rules before a deferred routing hook performs external
-    /// work. Stateful policy such as rate limiting must not be charged here.
-    Preview,
-    /// Enforce the settled backend-effective path immediately before the
-    /// remaining deferred hooks, a deferred-hook rejection, or backend
-    /// dispatch. Stateful policy is committed exactly once in this phase.
-    Enforce,
 }
 
 /// All protocol variants, for plugins that support every protocol.
@@ -201,6 +201,30 @@ pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
 
 /// WebSocket-only (plugins that operate on WebSocket frames, not HTTP request/response).
 pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
+
+/// Canonical metadata key for the request ID selected by the first configured
+/// correlation-ID instance in lifecycle order.
+///
+/// Later instances retain their independently resolved values in
+/// header-scoped slots and must not overwrite this consumer-facing key. The
+/// first correlation instance claims ownership independently of any generic
+/// metadata value an earlier custom plugin may have stored under this key.
+pub const REQUEST_ID_METADATA_KEY: &str = "request_id";
+
+/// Parser-level limits contributed by a WebSocket size-policy plugin.
+///
+/// The relay combines every applicable instance before either peer is read,
+/// so the strictest frame and reassembled-message ceilings are enforced by
+/// tungstenite itself rather than by a post-reassembly `on_ws_frame` hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSizeLimits {
+    /// Maximum payload bytes accepted in any one wire frame.
+    pub max_frame_bytes: usize,
+    /// Maximum payload bytes accepted after continuation reassembly.
+    pub max_message_bytes: usize,
+    /// RFC 6455 Close reason paired with code 1009 on either violation.
+    pub close_reason: Arc<str>,
+}
 
 /// gRPC-only (single protocol).
 pub const GRPC_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Grpc];
@@ -647,9 +671,49 @@ pub struct WsDisconnectContext {
 /// IPv4-mapped IPv6, and publishes the result here. Every later plugin instance
 /// performs only the lock-free `OnceLock::get_or_init` fast path. `None` is
 /// cached as well, preserving fail-closed behavior for malformed identities.
+/// When embedded privately in [`RequestContext`], the same typed state also
+/// retains authoritative HTTP correlation values. Stream contexts keep their
+/// correlation lifecycle state separately so replacing this public cache to
+/// reparse a changed client IP cannot erase stream correlation ownership.
 #[derive(Debug, Clone, Default)]
 pub struct CanonicalClientIpCache {
     value: OnceLock<Option<IpAddr>>,
+    correlation_ids: CorrelationIdState,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CorrelationIdState {
+    canonical: Option<String>,
+    instances: HashMap<String, String>,
+}
+
+impl CorrelationIdState {
+    fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
+        let publish_canonical = self.canonical.is_none();
+        self.instances
+            .insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            self.canonical = Some(request_id);
+        }
+        publish_canonical
+    }
+
+    fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.instances.get(instance_key).map(String::as_str)
+    }
+
+    fn canonical_correlation_id(&self) -> Option<&str> {
+        self.canonical.as_deref()
+    }
+
+    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        for (key, value) in &self.instances {
+            metadata.insert(key.clone(), value.clone());
+        }
+        if let Some(request_id) = &self.canonical {
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.clone());
+        }
+    }
 }
 
 impl CanonicalClientIpCache {
@@ -668,6 +732,23 @@ impl CanonicalClientIpCache {
     pub fn is_initialized(&self) -> bool {
         self.value.get().is_some()
     }
+
+    fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
+        self.correlation_ids
+            .publish_correlation_id(instance_key, request_id)
+    }
+
+    fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.correlation_ids.correlation_id(instance_key)
+    }
+
+    fn canonical_correlation_id(&self) -> Option<&str> {
+        self.correlation_ids.canonical_correlation_id()
+    }
+
+    fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        self.correlation_ids.project_correlation_ids(metadata);
+    }
 }
 
 fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
@@ -676,11 +757,11 @@ fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
 
 /// Parse the legacy client/rule literal forms without allocation.
 ///
-/// IPv4 accepts the same four decimal-octet grammar used by the original
-/// `ip_restriction` matcher. Brackets and zone identifiers remain IPv6-only;
-/// accepting them on IPv4 would broaden the established policy grammar.
+/// IPv4 uses the standard library's strict literal grammar. Brackets and zone
+/// identifiers remain IPv6-only; accepting them on IPv4 would broaden the
+/// established policy grammar.
 fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
-    if let Some(ipv4) = parse_ipv4_client_ip_literal(client_ip) {
+    if let Ok(ipv4) = client_ip.parse() {
         return Some(IpAddr::V4(ipv4));
     }
 
@@ -694,18 +775,72 @@ fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
     without_zone.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
 }
 
-fn parse_ipv4_client_ip_literal(client_ip: &str) -> Option<Ipv4Addr> {
-    let mut octets = client_ip.split('.');
-    let ipv4 = [
-        octets.next()?.parse::<u8>().ok()?,
-        octets.next()?.parse::<u8>().ok()?,
-        octets.next()?.parse::<u8>().ok()?,
-        octets.next()?.parse::<u8>().ok()?,
-    ];
-    if octets.next().is_some() {
-        return None;
+/// AI usage that was produced by a built-in accounting path.
+///
+/// This is deliberately carried outside [`RequestContext::metadata`]. Backend
+/// responses and operator-configured metadata writers can populate arbitrary
+/// public metadata keys, so those keys are not authoritative provenance for
+/// Prometheus token or cost export.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiCost {
+    /// Whole micro-units of configured currency.
+    pub microunits: u64,
+    /// Fractional micro-units at 10^-12 precision. Kept separate so the full
+    /// supported whole-cost range still fits in `u64`.
+    pub submicrounits: u64,
+}
+
+/// Number of fixed-point remainder units in one micro-unit.
+pub(crate) const AI_COST_SUBMICRO_SCALE: u64 = 1_000_000_000_000;
+
+impl AiCost {
+    pub(crate) fn from_currency_units(value: f64) -> Option<Self> {
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+
+        let scaled = value * 1_000_000.0;
+        if !scaled.is_finite() || scaled > u64::MAX as f64 {
+            return None;
+        }
+
+        let whole_microunits = scaled.floor();
+        let mut microunits = whole_microunits as u64;
+        let mut submicrounits =
+            ((scaled - whole_microunits) * AI_COST_SUBMICRO_SCALE as f64).round() as u64;
+        if submicrounits >= AI_COST_SUBMICRO_SCALE {
+            microunits = microunits.checked_add(1)?;
+            submicrounits -= AI_COST_SUBMICRO_SCALE;
+        }
+        Some(Self {
+            microunits,
+            submicrounits,
+        })
     }
-    Some(Ipv4Addr::from(ipv4))
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiUsageExport {
+    pub prefix: Arc<str>,
+    pub provider: &'static str,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cost: Option<AiCost>,
+}
+
+impl AiUsageExport {
+    fn token_completeness(&self) -> usize {
+        usize::from(self.prompt_tokens.is_some())
+            + usize::from(self.completion_tokens.is_some())
+            + usize::from(self.total_tokens.is_some())
+    }
+
+    fn completeness(&self) -> usize {
+        self.token_completeness() + usize::from(self.cost.is_some())
+    }
 }
 
 /// Context passed through the plugin pipeline for a single request.
@@ -736,6 +871,14 @@ pub struct RequestContext {
     /// non-default port is retained. HTTP frontends populate this after
     /// Host/`:authority` validation and before authentication.
     pub request_authority: Option<String>,
+    /// Whether the browser-facing request used a cryptographic transport.
+    /// HTTP/1.1, HTTP/2, and HTTP/3 initialize this from the accepted frontend
+    /// transport, then a direct peer in `FERRUM_TRUSTED_PROXIES` may override it
+    /// with a valid singleton overwrite or XFF-correlated appended
+    /// `X-Forwarded-Proto: http` or `https` value. Cookie storage checks combine
+    /// this with `request_authority` because browsers also trust HTTP localhost
+    /// and loopback origins.
+    pub request_is_secure: bool,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
     /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
@@ -817,6 +960,22 @@ pub struct RequestContext {
     gateway_deadline_response_selected: bool,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Most complete built-in AI usage snapshot for Prometheus export.
+    /// Kept outside public metadata so backend/operator metadata cannot mint or
+    /// overwrite trusted token and cost series.
+    pub(crate) ai_usage_export: Option<AiUsageExport>,
+    /// Prefix that supplied the selected token fields. Cost is selected
+    /// independently, so its provenance cannot distort later token tie-breaks.
+    ai_usage_export_token_prefix: Option<Arc<str>>,
+    /// Prefix that supplied the selected trusted cost. This remains private so
+    /// public metadata cannot influence deterministic multi-instance pricing.
+    ai_usage_export_cost_prefix: Option<Arc<str>>,
+    /// Per-request ownership state for each live request-deduplication plugin
+    /// instance. Multiple instances may coexist on one proxy; keeping their
+    /// correlation state in a private instance-keyed map prevents one hook
+    /// from consuming another instance's key or local/Redis owner token.
+    pub(crate) request_deduplication_state:
+        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
     /// Aggregate CORS policy state staged across every attached CORS instance
     /// and consumed by the cache-inserted CORS finalizer. Kept outside public
     /// metadata so policy details never enter transaction logs.
@@ -1199,6 +1358,7 @@ impl RequestContext {
             method,
             path,
             request_authority: None,
+            request_is_secure: false,
             frontend_listen_port: None,
             frontend_sni_hostname: None,
             lb_generation: 1,
@@ -1222,6 +1382,10 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             metadata: HashMap::new(),
+            ai_usage_export: None,
+            ai_usage_export_token_prefix: None,
+            ai_usage_export_cost_prefix: None,
+            request_deduplication_state: HashMap::new(),
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
@@ -1289,6 +1453,112 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
+    }
+
+    pub(crate) fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) {
+        let publish_canonical = self
+            .canonical_client_ip
+            .publish_correlation_id(instance_key, request_id.clone());
+        self.metadata
+            .insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            self.metadata
+                .insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+        }
+    }
+
+    pub(crate) fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.canonical_client_ip.correlation_id(instance_key)
+    }
+
+    pub(crate) fn canonical_correlation_id(&self) -> Option<&str> {
+        self.canonical_client_ip.canonical_correlation_id()
+    }
+
+    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        self.canonical_client_ip.project_correlation_ids(metadata);
+    }
+
+    fn replace_ai_usage_export(&mut self, candidate: AiUsageExport) {
+        self.ai_usage_export_token_prefix =
+            (candidate.token_completeness() != 0).then(|| Arc::clone(&candidate.prefix));
+        self.ai_usage_export_cost_prefix = candidate
+            .cost
+            .as_ref()
+            .map(|_| Arc::clone(&candidate.prefix));
+        self.ai_usage_export = Some(candidate);
+    }
+
+    pub(crate) fn stage_ai_usage_export(&mut self, candidate: AiUsageExport) {
+        if candidate.completeness() == 0 {
+            return;
+        }
+        let Some(mut current) = self.ai_usage_export.take() else {
+            self.replace_ai_usage_export(candidate);
+            return;
+        };
+
+        // Different providers must never be combined. Preserve the existing
+        // whole-snapshot selection rule for that defensive edge case.
+        if candidate.provider != current.provider {
+            let replace = candidate.completeness() > current.completeness()
+                || (candidate.completeness() == current.completeness()
+                    && candidate.prefix.as_ref() < current.prefix.as_ref());
+            if replace {
+                self.replace_ai_usage_export(candidate);
+            } else {
+                self.ai_usage_export = Some(current);
+            }
+            return;
+        }
+
+        // Token detail and trusted cost are independent dimensions. A detailed
+        // unpriced instance must not discard a cost from a less-detailed priced
+        // instance, and neither dimension may be counted more than once.
+        let candidate_token_completeness = candidate.token_completeness();
+        let current_token_completeness = current.token_completeness();
+        let current_token_prefix = self
+            .ai_usage_export_token_prefix
+            .as_deref()
+            .unwrap_or(current.prefix.as_ref());
+        let replace_tokens = candidate_token_completeness > current_token_completeness
+            || (candidate_token_completeness != 0
+                && candidate_token_completeness == current_token_completeness
+                && candidate.prefix.as_ref() < current_token_prefix);
+        if replace_tokens {
+            current.prompt_tokens = candidate.prompt_tokens;
+            current.completion_tokens = candidate.completion_tokens;
+            current.total_tokens = candidate.total_tokens;
+            self.ai_usage_export_token_prefix = Some(Arc::clone(&candidate.prefix));
+        }
+
+        if let Some(candidate_cost) = candidate.cost {
+            let replace_cost = self
+                .ai_usage_export_cost_prefix
+                .as_ref()
+                .is_none_or(|prefix| candidate.prefix.as_ref() < prefix.as_ref());
+            if replace_cost {
+                current.cost = Some(candidate_cost);
+                self.ai_usage_export_cost_prefix = Some(Arc::clone(&candidate.prefix));
+            }
+        }
+
+        if let Some(prefix) = self
+            .ai_usage_export_cost_prefix
+            .as_ref()
+            .or(self.ai_usage_export_token_prefix.as_ref())
+        {
+            current.prefix = Arc::clone(prefix);
+        }
+        self.ai_usage_export = Some(current);
+    }
+
+    /// Return the typed built-in usage snapshot carried to transaction logs.
+    /// Public only for external contract tests; runtime metadata producers
+    /// cannot access or populate this path.
+    #[doc(hidden)]
+    pub fn authoritative_ai_usage_export(&self) -> Option<AiUsageExport> {
+        self.ai_usage_export.clone()
     }
 
     /// Return the one absolute gRPC deadline established for this request.
@@ -1423,6 +1693,7 @@ impl RequestContext {
             method: self.method.clone(),
             path: self.path.clone(),
             request_authority: self.request_authority.clone(),
+            request_is_secure: self.request_is_secure,
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             lb_generation: self.lb_generation,
@@ -1457,6 +1728,13 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            ai_usage_export: self.ai_usage_export.clone(),
+            ai_usage_export_token_prefix: self.ai_usage_export_token_prefix.clone(),
+            ai_usage_export_cost_prefix: self.ai_usage_export_cost_prefix.clone(),
+            // Deduplication has no final request-body hook, and the caller only
+            // copies selected hook results back. Keep ownership solely on the
+            // live context instead of cloning request keys and tokens here.
+            request_deduplication_state: HashMap::new(),
             // Final request-body hooks cannot observe or mutate the real CORS
             // aggregate. CORS has no body hook, and only metadata is copied
             // back from this compatibility context.
@@ -1929,6 +2207,20 @@ impl RequestContext {
             .iter()
             .flat_map(move |headers| headers.get_all(name).iter())
             .filter_map(|value| value.to_str().ok())
+    }
+
+    /// Iterate every raw field-line value as bytes, including values that are
+    /// not valid UTF-8. Security decisions that depend on the final field line
+    /// must use this instead of silently skipping an unparseable value.
+    #[inline]
+    pub fn raw_header_value_bytes<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a [u8]> + 'a {
+        self.raw_headers
+            .iter()
+            .flat_map(move |headers| headers.get_all(name).iter())
+            .map(|value| value.as_bytes())
     }
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
@@ -2936,6 +3228,12 @@ pub struct TransactionSummary {
     /// replaced with `[REDACTED]` at serialize time. The in-memory value is
     /// untouched so other plugin phases can still read the original.
     pub metadata: HashMap<String, String>,
+    /// Built-in AI usage provenance for Prometheus. This is intentionally not
+    /// serialized into transaction logs; the operator-visible usage metadata
+    /// remains in `metadata` while trust stays typed and private to the request
+    /// pipeline.
+    #[doc(hidden)]
+    pub ai_usage_export: Option<AiUsageExport>,
 }
 
 impl Serialize for TransactionSummary {
@@ -3216,11 +3514,37 @@ async fn collect_mirror_result(
     }
 }
 
+/// Opaque release action for state acquired by a stream admission plugin.
+///
+/// The constructor is crate-private so plugins can attach permits without
+/// exposing their keys or counter identities through transaction metadata.
+/// Each permit invokes its release action exactly once, either when the stream
+/// runner releases it at rejection/teardown or when the connection context is
+/// dropped as a fallback.
+pub struct StreamAdmissionPermit {
+    release: Option<Box<dyn FnOnce() + Send + Sync + 'static>>,
+}
+
+impl StreamAdmissionPermit {
+    pub(crate) fn new(release: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
+    }
+}
+
+impl Drop for StreamAdmissionPermit {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
 /// Context for stream proxy (TCP/UDP) plugin hooks.
 ///
 /// Fields like `proxy_id`, `proxy_name`, `listen_port`, and `backend_scheme`
 /// are available for custom plugins to use in their `on_stream_connect` logic.
-#[derive(Clone)]
 #[allow(dead_code)]
 pub struct StreamConnectionContext {
     /// Gateway-resolved client IP. For TCP stream proxies with inbound PROXY
@@ -3238,9 +3562,16 @@ pub struct StreamConnectionContext {
     /// `mesh_authz` to populate Istio's `source.ip` principal (socket peer)
     /// separately from `remote.ip` (forwarded/resolved address).
     pub direct_client_ip: String,
-    /// Shared typed-client-IP cache for stream policy instances.
+    /// Shared typed client-IP cache for stream policy instances.
+    /// Replacing this cache after changing `client_ip` invalidates only typed
+    /// client-IP parsing; authoritative correlation ownership is independent.
     #[doc(hidden)]
     pub canonical_client_ip: CanonicalClientIpCache,
+    /// Authoritative per-instance and canonical stream correlation values.
+    ///
+    /// This must remain private and non-replaceable by custom plugins. Public
+    /// metadata is only a compatibility projection of this lifecycle state.
+    correlation_ids: CorrelationIdState,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub listen_port: u16,
@@ -3262,6 +3593,12 @@ pub struct StreamConnectionContext {
     /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
     /// for stream connections that have no metadata-writing plugins configured.
     pub metadata: Option<HashMap<String, String>>,
+    /// Core-owned admission permits. External plugins should leave this empty
+    /// and use metadata for their own connection state. Built-in admission
+    /// plugins attach opaque permits through `add_admission_permit()` so state
+    /// release does not depend on mutable metadata keys.
+    #[doc(hidden)]
+    pub admission_permits: Vec<StreamAdmissionPermit>,
     /// DER-encoded client certificate from frontend TLS handshake (first cert in chain).
     /// Populated for TCP/TLS proxies after the TLS handshake completes.
     /// Used by plugins like `tcp_connection_throttle` for consumer-based throttling.
@@ -3298,6 +3635,47 @@ pub struct StreamConnectionContext {
 }
 
 impl StreamConnectionContext {
+    /// Create a stream plugin context with empty optional lifecycle state.
+    ///
+    /// External plugins and tests must use this constructor rather than a
+    /// struct literal because authoritative correlation ownership is private.
+    /// The public fields may still be populated or updated before hooks run;
+    /// if `client_ip` changes, replace `canonical_client_ip` with its default
+    /// value to force an independent typed-IP reparse.
+    pub fn new(
+        client_ip: String,
+        direct_client_ip: String,
+        proxy_id: String,
+        proxy_name: Option<String>,
+        listen_port: u16,
+        backend_scheme: BackendScheme,
+        consumer_index: Arc<ConsumerIndex>,
+    ) -> Self {
+        Self {
+            client_ip,
+            direct_client_ip,
+            canonical_client_ip: CanonicalClientIpCache::default(),
+            correlation_ids: CorrelationIdState::default(),
+            proxy_id,
+            proxy_name,
+            listen_port,
+            backend_scheme,
+            consumer_index,
+            identified_consumer: None,
+            authenticated_identity: None,
+            auth_method: None,
+            metadata: None,
+            admission_permits: Vec::new(),
+            tls_client_cert_der: None,
+            tls_client_cert_chain_der: None,
+            sni_hostname: None,
+            mesh_direction: None,
+            node_waypoint_policy_scope: None,
+            first_bytes: None,
+            first_bytes_kind: None,
+        }
+    }
+
     /// Return the authoritative stream client IP as a canonical typed address.
     ///
     /// The value is parsed at most once per TCP connection or UDP/DTLS session
@@ -3310,6 +3688,17 @@ impl StreamConnectionContext {
     #[doc(hidden)]
     pub fn canonical_client_ip_is_initialized(&self) -> bool {
         self.canonical_client_ip.is_initialized()
+    }
+
+    pub(crate) fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) {
+        let publish_canonical = self
+            .correlation_ids
+            .publish_correlation_id(instance_key, request_id.clone());
+        let metadata = self.metadata.get_or_insert_with(HashMap::new);
+        metadata.insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+        }
     }
 
     /// Return the stable authenticated identity for stream policies. A mapped
@@ -3330,7 +3719,41 @@ impl StreamConnectionContext {
 
     /// Take the metadata map, returning an empty map if never allocated.
     pub fn take_metadata(&mut self) -> HashMap<String, String> {
-        self.metadata.take().unwrap_or_default()
+        let mut metadata = self.metadata.take().unwrap_or_default();
+        self.correlation_ids.project_correlation_ids(&mut metadata);
+        metadata
+    }
+
+    /// Transfer plugin-writable metadata and private correlation ownership to a
+    /// session that can receive additional metadata before its terminal summary.
+    ///
+    /// UDP and DTLS keep the correlation state immutable after admission, then
+    /// re-project it after all per-datagram metadata has been merged. This avoids
+    /// cloning correlation values per datagram while preventing those hooks from
+    /// replacing the authoritative terminal values.
+    pub(crate) fn take_metadata_with_correlation_ids(
+        &mut self,
+    ) -> (HashMap<String, String>, CorrelationIdState) {
+        (
+            self.metadata.take().unwrap_or_default(),
+            std::mem::take(&mut self.correlation_ids),
+        )
+    }
+
+    pub(crate) fn add_admission_permit(&mut self, permit: StreamAdmissionPermit) {
+        self.admission_permits.push(permit);
+    }
+
+    /// Release every admission permit acquired so far, in reverse plugin order.
+    ///
+    /// TCP runners call this immediately when a later plugin rejects and when
+    /// transport teardown completes, before awaiting disconnect observers.
+    /// Draining the vector is idempotent, and dropping the context remains the
+    /// fallback for exceptional exit paths.
+    pub fn release_admission_permits(&mut self) {
+        while let Some(permit) = self.admission_permits.pop() {
+            drop(permit);
+        }
     }
 }
 
@@ -3627,6 +4050,15 @@ pub trait Plugin: Send + Sync {
     /// Returns the plugin name.
     fn name(&self) -> &str;
 
+    /// Return the non-empty correlation header owned by this instance, or
+    /// `None` when it owns no correlation header. Plugin-cache admission trims
+    /// and ASCII-case-folds claims before rejecting empty, deployment-owned
+    /// `FERRUM_REAL_IP_HEADER`, or ambiguous writers.
+    #[doc(hidden)]
+    fn correlation_id_header_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Returns the execution priority (lower = runs first).
     ///
     /// Plugins are sorted by priority within each lifecycle phase.
@@ -3837,9 +4269,9 @@ pub trait Plugin: Send + Sync {
 
     /// Returns `true` when a deferred `before_proxy` hook can mutate headers
     /// that normally participate in upstream target selection. The gateway
-    /// runs these hooks in a separate deferred subphase after an access preview
-    /// and pins that previewed target across the external call; the returned
-    /// headers cannot steer this request onto an unpreviewed path.
+    /// runs these hooks in a separate deferred subphase after backend-path
+    /// enforcement and pins the authorized target across the external call;
+    /// the returned headers cannot steer this request onto a different path.
     fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
         false
     }
@@ -3855,17 +4287,14 @@ pub trait Plugin: Send + Sync {
 
     /// Called after the backend-effective path has been assembled from the
     /// route override, listen-path stripping, proxy/backend path, and selected
-    /// upstream target path, but before any backend is dialed.
-    ///
-    /// When a deferred hook can mutate routing headers, `Preview` runs before
-    /// that hook and `Enforce` runs afterward against the same pinned target.
-    /// Otherwise only `Enforce` runs. Implementations must keep `Preview` free
-    /// of state-consuming effects such as rate-limit charges.
+    /// upstream target path. The selected target is pinned and this hook runs
+    /// exactly once before deferred external/synthetic hooks or backend dial,
+    /// so implementations may safely commit stateful policy such as rate-limit
+    /// charges here.
     async fn on_backend_path_resolved(
         &self,
         _ctx: &mut RequestContext,
         _backend_path: &str,
-        _phase: BackendPathPolicyPhase,
     ) -> PluginResult {
         PluginResult::Continue
     }
@@ -3910,6 +4339,24 @@ pub trait Plugin: Send + Sync {
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Decorate the successful WebSocket handshake response before the
+    /// frontend commits it.
+    ///
+    /// H1 Upgrade and H2/H3 Extended CONNECT bypass the ordinary
+    /// `after_proxy` response lifecycle. This deliberately non-rejecting,
+    /// synchronous hook gives request-local header decorators an equivalent
+    /// boundary without introducing backend-handshake rollback or I/O after
+    /// the upstream has already accepted the session. Protocol-managed fields
+    /// are removed after the ordered hook chain, then the frontend restores
+    /// its authoritative Upgrade/subprotocol fields.
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
     }
 
     /// Returns `true` when this plugin defines deterministic response-header
@@ -4317,6 +4764,22 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns true when the final request-body hook is a terminal dispatch
+    /// boundary and must run before backend-only circuit-breaker, egress,
+    /// admission, pool, or TLS work. When backend-path policy is active, the
+    /// selected path is authorized and deferred `before_proxy` hooks finish
+    /// before this terminal hook may perform external dispatch.
+    ///
+    /// This is narrower than [`Plugin::needs_final_request_body_context`]. It
+    /// is intended for plugins such as provider federators that consume the
+    /// finalized HTTP request body, perform their own external dispatch, and
+    /// return the complete client response from the hook. Ordinary validators
+    /// should keep the default so fail-fast backend gates can reject without
+    /// first draining a client upload.
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+        false
+    }
+
     /// Transform the response body before it is sent to the client.
     ///
     /// Called after `on_response_body` hooks, only for buffered responses
@@ -4544,7 +5007,28 @@ pub trait Plugin: Send + Sync {
         false
     }
 
-    /// Called for each WebSocket frame when at least one plugin on the proxy opts in.
+    /// Optional parser-level WebSocket size policy.
+    ///
+    /// Implementations must return immutable construction-time values. The
+    /// shared H1/H2/H3 relay evaluates this once per upgraded connection and
+    /// applies the strictest values before reading frames from either peer.
+    fn websocket_size_limits(&self) -> Option<WebSocketSizeLimits> {
+        None
+    }
+
+    /// Returns `true` when this plugin requires the parsed WebSocket relay.
+    ///
+    /// Parser-policy plugins automatically opt out of raw tunnel mode even if
+    /// they do not need the post-reassembly [`Plugin::on_ws_frame`] hook.
+    fn requires_websocket_framing(&self) -> bool {
+        self.requires_ws_frame_hooks() || self.websocket_size_limits().is_some()
+    }
+
+    /// Called for each complete WebSocket message when a plugin opts in.
+    ///
+    /// Tungstenite reassembles Text/Binary continuation frames before this
+    /// hook. Plugins that require actual wire-frame enforcement must contribute
+    /// parser policy through [`Plugin::websocket_size_limits`] instead.
     ///
     /// `connection_id` is a unique per-connection identifier (monotonic counter) that
     /// stateful plugins (e.g., ws_rate_limiting) can use to track per-connection state.
@@ -4825,7 +5309,10 @@ pub fn create_plugin_with_http_client(
         )?))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
         "tcp_connection_throttle" => Ok(Some(Arc::new(
-            tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
+            tcp_connection_throttle::TcpConnectionThrottle::new_with_pool_shard_amount(
+                config,
+                http_client.pool_shard_amount(),
+            )?,
         ))),
         "adaptive_concurrency" => Ok(Some(Arc::new(
             adaptive_concurrency::AdaptiveConcurrency::new(config, http_client.clone())?,
@@ -4840,7 +5327,16 @@ pub fn create_plugin_with_http_client(
             config,
         )?))),
         "bot_detection" => Ok(Some(Arc::new(bot_detection::BotDetection::new(config)?))),
-        "correlation_id" => Ok(Some(Arc::new(correlation_id::CorrelationId::new(config)?))),
+        "correlation_id" => {
+            let plugin = match http_client.real_ip_header() {
+                Some(real_ip_header) => correlation_id::CorrelationId::new_with_real_ip_header(
+                    config,
+                    Some(real_ip_header),
+                )?,
+                None => correlation_id::CorrelationId::new(config)?,
+            };
+            Ok(Some(Arc::new(plugin)))
+        }
         "request_transformer" => Ok(Some(Arc::new(
             request_transformer::RequestTransformer::new(config)?,
         ))),
@@ -5078,8 +5574,24 @@ pub fn validate_plugin_config_with_policy(
     config: &Value,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
-    let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
+    let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
+        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header());
     validate_plugin_config_with_http_client(name, config, http_client)?;
+    validate_plugin_config_policy_only(name, config, backend_allow_ips)
+}
+
+/// Apply admission-policy checks that live outside plugin construction.
+///
+/// Prospective named-schema validation constructs `schema_ref` consumers while
+/// an isolated schema registry is staged. Callers therefore skip a second full
+/// construction after that bracket is aborted, but must still apply these
+/// policy-only checks so an unrelated plugin cannot add an ignored
+/// `schema_ref` key to bypass egress admission.
+pub(crate) fn validate_plugin_config_policy_only(
+    name: &str,
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
     // The HTTP-endpoint screen above does not cover a plugin's own
     // literal-IP backend fields that aren't dialed through the shared
     // client (mesh_route_dispatch route destinations).

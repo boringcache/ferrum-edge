@@ -10,7 +10,7 @@ The CORS plugin handles the [CORS protocol](https://developer.mozilla.org/en-US/
 
 1. **Preflight interception** -- When a browser sends an `OPTIONS` request with `Origin` and `Access-Control-Request-Method` headers, the native direct plugin validates the origin and requested method against the configured allow-lists. If both pass, it responds with `204 No Content` and all required CORS headers. If either fails, it responds with `403 Forbidden` and a descriptive error body. The request never reaches the backend unless `preflight_continue` is enabled.
 
-2. **Actual-request origin enforcement** -- Non-preflight requests that carry an `Origin` header are checked against the allowed origins list. A native direct policy rejects disallowed origins with `403 Forbidden` and the body `CORS origin not allowed`; an Istio projection forwards unmatched actual requests without gateway-added CORS fields. `allowed_methods` and `allowed_headers` are preflight policy only: they never reject an actual request or re-authorize headers on that phase.
+2. **Actual-request origin enforcement** -- Non-preflight requests that carry an `Origin` header are checked against the allowed origins list. A native direct policy rejects disallowed origins with `403 Forbidden` and the body `CORS origin not allowed`; an Istio projection forwards unmatched actual requests while stripping every upstream `Access-Control-*` response field and adding no gateway CORS authorization fields. `allowed_methods` and `allowed_headers` are preflight policy only: they never reject an actual request or re-authorize headers on that phase.
 
 3. **Response header injection** -- For allowed cross-origin requests that pass through to the backend, the plugin injects `Access-Control-Allow-Origin`, `Vary`, and optionally `Access-Control-Allow-Credentials` and `Access-Control-Expose-Headers` into the backend response before it reaches the client.
 
@@ -205,11 +205,20 @@ plugin_configs:
 ## Istio translation semantics
 
 An Istio `VirtualService.http[].corsPolicy` is projected through the gateway and
-mesh slice with source behavior intact:
+mesh slice with its source request-handling behavior intact. Ferrum remains
+authoritative over the browser-facing response fields:
 
-- omitted, `UNSPECIFIED`, and `FORWARD` unmatched preflights go to the backend;
+- omitted, `UNSPECIFIED`, and `FORWARD` unmatched preflights go to the backend,
+  preserving its status/body but stripping every upstream `Access-Control-*`
+  response field;
 - `IGNORE` unmatched preflights receive a local 200 without CORS authorization;
-- unmatched actual requests go to the backend and Ferrum adds no CORS fields;
+- unmatched actual requests go to the backend with its status/body preserved,
+  every upstream `Access-Control-*` response field stripped, and no gateway
+  CORS authorization fields added;
+- a participating translated policy owns `Access-Control-*` response fields
+  even when the request has no `Origin`; Ferrum strips those upstream fields
+  while preserving unrelated response headers, preventing a shared-cache replay
+  from widening the gateway policy;
 - omitted/empty method and header lists stay empty, and omitted `maxAge` stays
   absent; and
 - `StringMatch.exact: "*"` and legacy `allowOrigin: ["*"]` mean allow-all.

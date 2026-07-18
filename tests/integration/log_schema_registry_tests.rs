@@ -56,6 +56,7 @@ fn fully_populated_http() -> TransactionSummary {
             ("request_protocol".to_string(), "grpc".to_string()),
             ("grpc_status".to_string(), "14".to_string()),
         ]),
+        ai_usage_export: None,
     }
 }
 

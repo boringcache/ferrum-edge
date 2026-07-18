@@ -26,6 +26,184 @@ fn h3_native_mesh_refusal_screens_plain_and_grpc_before_dispatch() {
 }
 
 #[test]
+fn h3_final_body_rejects_use_complete_synthetic_response_pipeline() {
+    let src = include_str!("../../../src/http3/server.rs");
+    let request_scoped_gate = src
+        .find("let has_terminal_body_dispatch = capabilities")
+        .expect("H3 terminal dispatch must retain a request-scoped applicability gate");
+    let dispatch_marker = src
+        .find("// Terminal final-body hooks may perform provider egress.")
+        .expect("H3 terminal final-body dispatch boundary must remain present");
+    let early_dispatch = src[dispatch_marker..]
+        .find("if final_body_before_backend_dispatch {")
+        .map(|offset| dispatch_marker + offset)
+        .expect("H3 terminal final-body dispatch gate must remain present");
+    let applicability = &src[request_scoped_gate..early_dispatch];
+    assert!(applicability.contains("if let Some(transformed_headers)"));
+    assert!(applicability.contains("std::mem::swap(&mut ctx.headers, transformed_headers)"));
+    assert!(applicability.contains("crate::proxy::final_request_body_requirements("));
+
+    let early_start = src
+        .find("let raw_request_body_bytes = body_data.len() as u64;")
+        .expect("H3 early request-body finalization must remain present");
+    let early_end = src[early_start..]
+        .find("let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();")
+        .map(|offset| early_start + offset)
+        .expect("H3 early finalization boundary must remain present");
+    let early = &src[early_start..early_end];
+    assert!(early.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
+    assert!(!early.contains("apply_replaceable_after_proxy_hooks_to_rejection("));
+    assert!(early.contains("matches!(http_flavor, HttpFlavor::Grpc)"));
+    let terminal_reject = early
+        .split("let rejection_hook_start = std::time::Instant::now();")
+        .nth(1)
+        .expect("H3 terminal rejection latency timer must remain present");
+    let commit = terminal_reject
+        .find("run_h3_reject_response_committed_hooks(")
+        .expect("H3 terminal rejection commit hook");
+    let account = terminal_reject
+        .find("plugin_execution_ns += rejection_hook_start.elapsed().as_nanos() as u64;")
+        .expect("H3 terminal rejection hook latency accounting");
+    let log = terminal_reject
+        .find("log_rejected_request_with_path(")
+        .expect("H3 terminal rejection log");
+    assert!(commit < account && account < log);
+
+    let late_start = src
+        .find("// Skip the per-plugin context-aware dispatch")
+        .expect("H3 late request-body finalization must remain present");
+    let late_end = src[late_start..]
+        .find("backend_admission_start = std::time::Instant::now();")
+        .map(|offset| late_start + offset)
+        .expect("H3 backend-admission boundary must remain present");
+    let late = &src[late_start..late_end];
+    assert!(late.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
+    assert!(!late.contains("apply_replaceable_after_proxy_hooks_to_rejection("));
+    assert!(late.contains("matches!(http_flavor, HttpFlavor::Grpc)"));
+}
+
+#[test]
+fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
+    let src = include_str!("../../../src/http3/server.rs");
+    let finalizer = src
+        .split("async fn finalize_h3_terminal_body_read_rejection(")
+        .nth(1)
+        .expect("H3 terminal-body rejection finalizer must remain present")
+        .split("/// Optional HTTP/3 listener settings")
+        .next()
+        .expect("H3 terminal-body rejection finalizer must remain bounded");
+    assert!(finalizer.contains("RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY"));
+    assert_eq!(
+        finalizer
+            .matches("apply_reject_after_proxy_and_synthetic_body_hooks(")
+            .count(),
+        1
+    );
+    assert!(finalizer.contains("matches!(http_flavor, HttpFlavor::Grpc),\n        false,"));
+    assert_eq!(
+        finalizer
+            .matches("run_h3_reject_response_committed_hooks(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        finalizer.matches("log_rejected_request_with_path(").count(),
+        1
+    );
+    assert_eq!(finalizer.matches("record_request(state,").count(), 1);
+    let decorate = finalizer
+        .find("apply_reject_after_proxy_and_synthetic_body_hooks(")
+        .expect("terminal rejection decorators");
+    let commit = finalizer
+        .find("run_h3_reject_response_committed_hooks(")
+        .expect("terminal rejection commit");
+    let account = finalizer
+        .find("*plugin_execution_ns += rejection_hook_start.elapsed().as_nanos() as u64;")
+        .expect("terminal rejection hook latency accounting");
+    let log = finalizer
+        .find("log_rejected_request_with_path(")
+        .expect("terminal rejection log");
+    let metric = finalizer
+        .find("record_request(state,")
+        .expect("terminal rejection metric");
+    assert!(decorate < commit && commit < account && account < log && log < metric);
+    assert!(finalizer.contains("FinalizedH3TerminalBodyRejection {"));
+    assert!(finalizer.contains("http_status,\n        headers,\n        body,"));
+
+    let content_length_fast_path = src
+        .split("// Enforce request body size limit via Content-Length fast path.")
+        .nth(1)
+        .expect("H3 Content-Length fast path must remain present")
+        .split("// Finalize a body that can affect response streaming")
+        .next()
+        .expect("H3 Content-Length fast path must remain bounded");
+    assert!(content_length_fast_path.contains("if final_body_before_backend_dispatch"));
+    let content_length_finalize = content_length_fast_path
+        .find("finalize_h3_terminal_body_read_rejection(")
+        .expect("Content-Length rejection finalizer");
+    let content_length_send = content_length_fast_path
+        .find("send_h3_plugin_reject_flavor_aware(")
+        .expect("Content-Length rejection send");
+    assert!(content_length_finalize < content_length_send);
+    assert!(content_length_fast_path.contains("&rejection.body"));
+    assert!(content_length_fast_path.contains("&rejection.headers"));
+
+    let terminal_dispatch = src
+        .split("// Terminal final-body hooks may perform provider egress.")
+        .nth(1)
+        .expect("H3 terminal provider dispatch must remain present")
+        .split("let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();")
+        .next()
+        .expect("H3 terminal provider dispatch must remain bounded");
+    assert!(terminal_dispatch.contains("collect_h3_request_body_with_deadline("));
+    for (failure, next_failure, sends_response) in [
+        ("Ok(false)", "H3RequestBodyReadError::Read(error)", true),
+        (
+            "H3RequestBodyReadError::Read(error)",
+            "H3RequestBodyReadError::TimedOut",
+            false,
+        ),
+        (
+            "H3RequestBodyReadError::TimedOut",
+            "H3RequestBodyReadError::DeadlineExceeded",
+            true,
+        ),
+    ] {
+        let branch = terminal_dispatch
+            .split(failure)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing terminal upload branch: {failure}"))
+            .split(next_failure)
+            .next()
+            .expect("bounded terminal upload branch");
+        assert_eq!(
+            branch
+                .matches("finalize_h3_terminal_body_read_rejection(")
+                .count(),
+            1
+        );
+        if sends_response {
+            let finalize = branch
+                .find("finalize_h3_terminal_body_read_rejection(")
+                .expect("terminal upload rejection finalizer");
+            let send = branch
+                .find("send_h3_plugin_reject_flavor_aware(")
+                .expect("terminal upload rejection send");
+            assert!(finalize < send);
+            assert!(branch.contains("&rejection.body"));
+            assert!(branch.contains("&rejection.headers"));
+        } else {
+            assert!(
+                !branch.contains("send_h3_plugin_reject_flavor_aware("),
+                "a disconnected H3 stream must finalize cleanup without attempting a write"
+            );
+        }
+    }
+    assert!(terminal_dispatch.contains("H3RequestBodyReadError::DeadlineExceeded"));
+    assert!(terminal_dispatch.contains("finalize_h3_upload_deadline_rejection("));
+}
+
+#[test]
 fn translated_h3_grpc_web_threads_preacquired_admission_into_grpc_dispatch() {
     let server = include_str!("../../../src/http3/server.rs");
     let bridge = server
@@ -710,10 +888,47 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
     assert!(helper.contains("log_rejected_request("));
     assert!(helper.contains("send_h3_plugin_reject_flavor_aware("));
     assert!(helper.contains("await_terminal_response_write_before_deadline("));
+    assert_eq!(
+        helper
+            .matches("apply_reject_after_proxy_and_synthetic_body_hooks(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        helper
+            .matches("run_h3_reject_response_committed_hooks(")
+            .count(),
+        1
+    );
+    assert_eq!(helper.matches("log_rejected_request(").count(), 1);
+    assert_eq!(helper.matches("record_request(state,").count(), 1);
+    assert_eq!(
+        helper
+            .matches("send_h3_plugin_reject_flavor_aware(")
+            .count(),
+        1
+    );
+    let decorate = helper
+        .find("apply_reject_after_proxy_and_synthetic_body_hooks(")
+        .expect("upload deadline decorators");
+    let commit = helper
+        .find("run_h3_reject_response_committed_hooks(")
+        .expect("upload deadline commit");
+    let log = helper
+        .find("log_rejected_request(")
+        .expect("upload deadline log");
+    let metric = helper
+        .find("record_request(state,")
+        .expect("upload deadline metric");
+    let send = helper
+        .find("send_h3_plugin_reject_flavor_aware(")
+        .expect("upload deadline send");
+    assert!(decorate < commit && commit < log && log < metric && metric < send);
     for phase in [
         "grpc_deadline_upload_before_authenticate",
         "grpc_deadline_upload_before_authorize",
         "grpc_deadline_upload_before_before_proxy",
+        "grpc_deadline_terminal_h3_upload",
         "grpc_deadline_upload_before_dispatch",
         "grpc_deadline_upload_before_cross_protocol_dispatch",
         "grpc_deadline_buffered_h3_upload",
@@ -727,8 +942,8 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
         source
             .matches("finalize_h3_upload_deadline_rejection(")
             .count(),
-        7,
-        "the helper definition plus every native H3 buffered upload phase must remain finalized"
+        8,
+        "the helper definition plus all seven native H3 buffered upload exits must remain finalized"
     );
 }
 

@@ -62,7 +62,7 @@ pub mod udp_proxy;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use futures_util::{SinkExt, Stream, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -80,6 +80,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{
     WebSocketStream, client_async_tls_with_config, client_async_with_config,
@@ -107,9 +109,10 @@ use crate::modes::mesh::node_waypoint::{
 };
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
-    BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
-    PluginResult, ProxyProtocol, RequestContext, TransactionSummary, WebSocketFrameDirection,
-    is_builtin_plugin_name, mesh_route_dispatch::MeshRouteDispatchConfig,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
+    RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, TransactionSummary,
+    WebSocketFrameDirection, WebSocketSizeLimits, is_builtin_plugin_name,
+    mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
 use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
@@ -170,12 +173,13 @@ pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
     "ferrum:replaceable_rejection_response";
 
 /// One-shot handoff for requester-owned auth session state that changed before
-/// authentication attempts rejected. Distinct cookie names are newline-joined;
-/// a later attempt replaces an earlier candidate with the same exact name. The
-/// authentication phase removes this key on every exit: it attaches the cookies
-/// only to the final rejection and discards them when a later credential
-/// succeeds. The key contains "cookie" so metadata serialization still redacts
-/// the sealed values defensively.
+/// authentication attempts rejected. Distinct cookie storage keys are
+/// newline-joined; a later attempt replaces an earlier candidate with the same
+/// exact name/domain/host-only/path/partitioned scope. The authentication phase
+/// removes this key on every exit: it attaches the cookies only to the final
+/// rejection and discards them when a later credential succeeds. The key
+/// contains "cookie" so metadata serialization still redacts the sealed values
+/// defensively.
 pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_set_cookie";
 
 /// Marker recorded in `ctx.metadata` for the duration of
@@ -2482,6 +2486,45 @@ pub(crate) fn request_body_requirements_before_before_proxy(
     requirements
 }
 
+/// Resolve request-time body buffering and terminal-dispatch applicability.
+///
+/// Callers run this once against the client headers for phases that precede
+/// `before_proxy`, then again against the effective header map when a plugin
+/// transformed headers. This keeps a header transformer that exposes a JSON AI
+/// request from accidentally bypassing terminal federation dispatch.
+pub(crate) fn final_request_body_requirements(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    request_may_need_buffering: bool,
+    has_terminal_body_dispatch: bool,
+    has_contextual_final_body_hook: bool,
+) -> (bool, bool, bool) {
+    if request_may_need_buffering && (has_terminal_body_dispatch || has_contextual_final_body_hook)
+    {
+        let mut requires_buffering = false;
+        let mut terminal_dispatch = false;
+        let mut needs_final_context = false;
+        for plugin in plugins {
+            if plugin.should_buffer_request_body(ctx) {
+                requires_buffering = true;
+                terminal_dispatch |= plugin.requires_final_request_body_before_backend_dispatch();
+                needs_final_context |= plugin.needs_final_request_body_context();
+            }
+        }
+        (requires_buffering, terminal_dispatch, needs_final_context)
+    } else if request_may_need_buffering {
+        (
+            plugins
+                .iter()
+                .any(|plugin| plugin.should_buffer_request_body(ctx)),
+            false,
+            false,
+        )
+    } else {
+        (false, false, false)
+    }
+}
+
 pub(crate) fn request_body_requirements_before_authenticate(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
@@ -2536,6 +2579,7 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
     let mut metadata = ctx.metadata.clone();
+    ctx.project_correlation_ids(&mut metadata);
     redact_request_body_from_log_metadata(&mut metadata);
     ctx.apply_waf_owned_log_metadata(&mut metadata);
     metadata
@@ -3302,6 +3346,31 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
         push_forwarded_param_value(&mut val, h);
     }
     val
+}
+
+/// Replace proxy-managed scheme metadata with the effective browser-facing
+/// request scheme. Direct gRPC and WebSocket dispatch start from a sanitized
+/// request map instead of the canonical HTTP backend builders, so normalize
+/// these fields before those protocol-specific paths merge or forward it.
+/// Remove every case-insensitive variant first because this string-keyed map
+/// does not otherwise provide HTTP header-name equality.
+pub(crate) fn apply_effective_backend_scheme_headers(
+    headers: &mut HashMap<String, String>,
+    client_ip: &str,
+    request_is_secure: bool,
+    add_forwarded_header: bool,
+) {
+    let scheme = if request_is_secure { "https" } else { "http" };
+    let forwarded = add_forwarded_header
+        .then(|| build_forwarded_value(client_ip, scheme, headers.get("host").map(String::as_str)));
+    headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("x-forwarded-proto")
+            && (!add_forwarded_header || !name.eq_ignore_ascii_case("forwarded"))
+    });
+    headers.insert("x-forwarded-proto".to_string(), scheme.to_string());
+    if let Some(forwarded) = forwarded {
+        headers.insert("forwarded".to_string(), forwarded);
+    }
 }
 
 fn push_forwarded_param_value(buf: &mut String, value: &str) {
@@ -5122,7 +5191,8 @@ impl ProxyState {
             env_config_arc.backend_allow_ips.clone(),
             mesh_egress_strip_baggage_keys.clone(),
             env_config_arc.pool_shard_amount,
-        );
+        )
+        .with_real_ip_header(env_config_arc.real_ip_header.clone());
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will
         // route `__mesh_bpf_metrics` to use it via `with_state`.
@@ -8402,6 +8472,28 @@ pub(crate) fn finalize_websocket_response_headers(
     strip_websocket_transport_managed_response_header_map(response_headers);
 }
 
+/// Apply the successful-handshake response chain in configured plugin order.
+///
+/// Static initial-response policies and request-local WebSocket decorators
+/// share this pass so priority overrides remain authoritative across both
+/// categories. The hook contract is non-rejecting; once the backend handshake
+/// succeeds, this boundary always proceeds to a protocol-correct client
+/// handshake after transport-managed fields are stripped.
+pub(crate) fn finalize_successful_websocket_response_headers(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+) {
+    for plugin in plugins {
+        plugin.apply_websocket_handshake_response_headers(ctx, response_status, response_headers);
+        if plugin.is_initial_response_header_policy() {
+            plugin.apply_initial_response_header_policy(response_headers);
+        }
+    }
+    strip_websocket_transport_managed_response_header_map(response_headers);
+}
+
 fn build_websocket_error_response(
     status: StatusCode,
     body: &str,
@@ -8454,7 +8546,7 @@ async fn handle_websocket_request_authenticated(
     mesh_inbound_pre_handshake_app_port: Option<u16>,
     cb_target_key: Option<String>,
     cb_is_half_open_probe: bool,
-    requires_ws_frame_hooks: bool,
+    requires_websocket_framing: bool,
     query_string: String,
     strip_len: usize,
     backend_path_is_policy_bound: bool,
@@ -8590,6 +8682,12 @@ async fn handle_websocket_request_authenticated(
     // If the backend is unreachable, we return 502 instead of a premature 101.
     // Supports retry with upstream target rotation for connection failures.
     let env_config = state.env_config.clone();
+    // Compute the strictest parser limits before the backend handshake so its
+    // framer is born with the same per-proxy bounds as the client-side framer.
+    // This precedes every retry attempt and uses the immutable request plugin
+    // generation, so target rotation cannot change policy mid-upgrade.
+    let ws_size_limits =
+        EffectiveWsSizeLimits::from_plugins(state.max_websocket_frame_size_bytes, &plugins);
     // The client-sent Host: the mesh egress Extended CONNECT `:authority` is
     // derived from it (the egress route is `preserve_host_header`) so the peer's
     // inbound route matches on the SERVICE host, exactly like HTTP egress. Read
@@ -8778,7 +8876,8 @@ async fn handle_websocket_request_authenticated(
                     ws_client_host.as_deref(),
                     ws_path_and_query.as_ref(),
                     &client_headers,
-                    state.max_websocket_frame_size_bytes,
+                    ws_size_limits.max_frame_bytes,
+                    ws_size_limits.max_message_bytes,
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
                     // Preserve the original authenticated mesh peer's identity into
@@ -8799,7 +8898,8 @@ async fn handle_websocket_request_authenticated(
                     &client_headers,
                     state.tls_policy.as_deref(),
                     &state.crls,
-                    state.max_websocket_frame_size_bytes,
+                    ws_size_limits.max_frame_bytes,
+                    ws_size_limits.max_message_bytes,
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
                     Some(&state.dns_cache),
@@ -9125,6 +9225,7 @@ async fn handle_websocket_request_authenticated(
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
                             error_class: Some(ws_error_class),
                             metadata,
+                            ai_usage_export: ctx.ai_usage_export.clone(),
                             ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror_before_buffered_response(
@@ -9286,6 +9387,7 @@ async fn handle_websocket_request_authenticated(
         latency_gateway_overhead_ms: ws_gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         metadata: clone_log_metadata(&ctx),
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
 
@@ -9295,9 +9397,16 @@ async fn handle_websocket_request_authenticated(
     // This matches ordinary HTTP/gRPC ordering: operator policy governs backend
     // metadata, while the gateway's selected-target cookie and mandatory
     // handshake fields are committed at the client boundary afterward.
+    let response_status = if is_h2_websocket {
+        StatusCode::OK
+    } else {
+        StatusCode::SWITCHING_PROTOCOLS
+    };
     let mut response_headers = HashMap::new();
-    finalize_websocket_response_headers(
-        &initial_response_header_policy_plugins,
+    finalize_successful_websocket_response_headers(
+        &plugins,
+        &ctx,
+        response_status.as_u16(),
         &mut response_headers,
     );
     if sticky_cookie_needed
@@ -9325,11 +9434,6 @@ async fn handle_websocket_request_authenticated(
     // HTTP/2 Extended CONNECT (RFC 8441): 200 OK — the H2 stream becomes the WebSocket
     // transport. No Upgrade/Connection/Sec-WebSocket-Accept headers (those are HTTP/1.1).
     // HTTP/1.1: 101 Switching Protocols with standard WebSocket handshake headers.
-    let response_status = if is_h2_websocket {
-        StatusCode::OK
-    } else {
-        StatusCode::SWITCHING_PROTOCOLS
-    };
     let mut ws_resp_builder = headers_mod::apply_response_headers(
         Response::builder().status(response_status),
         &response_headers,
@@ -9365,18 +9469,11 @@ async fn handle_websocket_request_authenticated(
             response
         });
 
-    // Collect plugins that opted into per-frame WebSocket hooks. `plugins`
-    // was resolved from the request's plugin-cache snapshot, so the upgrade
-    // path does not reload the cache and risk mixing generations.
-    let ws_frame_plugins: Vec<Arc<dyn Plugin>> = if requires_ws_frame_hooks {
-        plugins
-            .iter()
-            .filter(|p| p.requires_ws_frame_hooks())
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Keep parser-policy plugins out of the post-reassembly hook loop. The
+    // lists come from the same request-cache snapshot, so neither path reloads
+    // the cache or risks mixing generations.
+    let (ws_framing_plugins, ws_frame_plugins) =
+        collect_websocket_relay_plugins(&plugins, requires_websocket_framing);
     // Collect disconnect-hook plugins separately. These fire exactly once at
     // session end instead of per-frame, so keeping them in their own list
     // avoids the per-frame filter cost paid by the frame-hook path.
@@ -9481,6 +9578,7 @@ async fn handle_websocket_request_authenticated(
                             handshake.stream,
                             &proxy_id,
                             ws_conn_id,
+                            ws_framing_plugins,
                             ws_frame_plugins,
                             ws_disconnect_plugins,
                             session_meta,
@@ -9506,6 +9604,7 @@ async fn handle_websocket_request_authenticated(
                             handshake.stream,
                             &proxy_id,
                             ws_conn_id,
+                            ws_framing_plugins,
                             ws_frame_plugins,
                             ws_disconnect_plugins,
                             session_meta,
@@ -9594,7 +9693,7 @@ fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(
 /// handshake-equivalent repeated headers such as multiple
 /// `Sec-WebSocket-Protocol` values, while still honoring plugin-driven strips
 /// and rewrites reflected in `proxy_headers`.
-fn collect_forwardable_websocket_headers(
+pub(crate) fn collect_forwardable_websocket_headers(
     raw_headers: &hyper::HeaderMap,
     proxy_headers: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
@@ -10152,6 +10251,7 @@ pub(crate) async fn connect_websocket_backend(
     tls_policy: Option<&TlsPolicy>,
     crls: &crate::tls::CrlList,
     max_websocket_frame_size_bytes: usize,
+    max_websocket_message_size_bytes: usize,
     websocket_write_buffer_size: usize,
     idle_tracker: Option<Arc<WsIdleTracker>>,
     // When `Some`, the backend host is resolved through the gateway DNS cache so
@@ -10162,7 +10262,7 @@ pub(crate) async fn connect_websocket_backend(
 ) -> Result<BackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
-    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    ws_config.max_message_size = Some(max_websocket_message_size_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
 
     let mut ws_request = backend_url.into_client_request()?;
@@ -10385,6 +10485,7 @@ async fn connect_mesh_websocket_backend(
     path_and_query: &str,
     client_headers: &[(String, String)],
     max_websocket_frame_size_bytes: usize,
+    max_websocket_message_size_bytes: usize,
     websocket_write_buffer_size: usize,
     idle_tracker: Option<Arc<WsIdleTracker>>,
     // The ASSERTED source identity to stamp into the Ambient HBONE baggage — the
@@ -10398,7 +10499,7 @@ async fn connect_mesh_websocket_backend(
 ) -> Result<MeshBackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
-    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    ws_config.max_message_size = Some(max_websocket_message_size_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
 
     match egress {
@@ -10793,9 +10894,11 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 }
 
 /// `connection_id` — unique per-connection identifier for stateful frame plugins.
-/// `ws_frame_plugins` — plugins that opted into per-frame hooks by returning `true`
-/// from `requires_ws_frame_hooks()`. Pass an empty `Vec` for zero-overhead forwarding
-/// when no plugin on this proxy needs frame inspection.
+/// `ws_framing_plugins` — plugins that require parsing for a parser-level
+/// policy or post-reassembly hook. Pass an empty `Vec` for zero-overhead
+/// forwarding when no plugin on this proxy needs WebSocket framing.
+/// `ws_frame_plugins` — the subset that opted into post-reassembly hooks.
+/// Parser-policy-only plugins must not enter the per-message loop.
 /// `ws_disconnect_plugins` — plugins that opted into end-of-session hooks by
 /// returning `true` from `requires_ws_disconnect_hooks()`. Pass an empty `Vec`
 /// to skip disconnect bookkeeping entirely.
@@ -10813,6 +10916,193 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 /// on a healthy TCP connection, so 100ms is generous for the happy path while
 /// still bounding teardown for pathological peers.
 const WS_CANCEL_CLOSE_TIMEOUT_MS: u64 = 100;
+
+#[derive(Clone)]
+struct WsSizeLimitRule {
+    max_bytes: usize,
+    close_reason: Arc<str>,
+}
+
+pub(crate) type WebSocketRelayPluginLists = (Vec<Arc<dyn Plugin>>, Vec<Arc<dyn Plugin>>);
+
+pub(crate) struct EffectiveWsSizeLimits {
+    pub(crate) max_frame_bytes: usize,
+    pub(crate) max_message_bytes: usize,
+    plugin_frame: Option<WsSizeLimitRule>,
+    plugin_message: Option<WsSizeLimitRule>,
+}
+
+pub(crate) fn collect_websocket_relay_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    requires_websocket_framing: bool,
+) -> WebSocketRelayPluginLists {
+    if !requires_websocket_framing {
+        return (Vec::new(), Vec::new());
+    }
+    let framing_plugins: Vec<_> = plugins
+        .iter()
+        .filter(|plugin| plugin.requires_websocket_framing())
+        .cloned()
+        .collect();
+    let frame_plugins = framing_plugins
+        .iter()
+        .filter(|plugin| plugin.requires_ws_frame_hooks())
+        .cloned()
+        .collect();
+    (framing_plugins, frame_plugins)
+}
+
+impl EffectiveWsSizeLimits {
+    pub(crate) fn from_plugins(global_frame_bytes: usize, plugins: &[Arc<dyn Plugin>]) -> Self {
+        let mut plugin_frame: Option<WsSizeLimitRule> = None;
+        let mut plugin_message: Option<WsSizeLimitRule> = None;
+
+        for plugin in plugins {
+            let Some(WebSocketSizeLimits {
+                max_frame_bytes,
+                max_message_bytes,
+                close_reason,
+            }) = plugin.websocket_size_limits()
+            else {
+                continue;
+            };
+
+            if plugin_frame
+                .as_ref()
+                .is_none_or(|current| max_frame_bytes < current.max_bytes)
+            {
+                plugin_frame = Some(WsSizeLimitRule {
+                    max_bytes: max_frame_bytes,
+                    close_reason: Arc::clone(&close_reason),
+                });
+            }
+            if plugin_message
+                .as_ref()
+                .is_none_or(|current| max_message_bytes < current.max_bytes)
+            {
+                plugin_message = Some(WsSizeLimitRule {
+                    max_bytes: max_message_bytes,
+                    close_reason,
+                });
+            }
+        }
+
+        let global_message_bytes = global_frame_bytes.saturating_mul(4);
+        let max_frame_bytes = plugin_frame
+            .as_ref()
+            .map(|rule| global_frame_bytes.min(rule.max_bytes))
+            .unwrap_or(global_frame_bytes);
+        let max_message_bytes = plugin_message
+            .as_ref()
+            .map(|rule| global_message_bytes.min(rule.max_bytes))
+            .unwrap_or(global_message_bytes);
+        Self {
+            max_frame_bytes,
+            max_message_bytes,
+            // Keep only rules that actually determine an effective parser
+            // ceiling. This prevents an inactive plugin frame rule from being
+            // mistaken for a numerically equal global message rejection.
+            plugin_frame: plugin_frame.filter(|rule| rule.max_bytes == max_frame_bytes),
+            plugin_message: plugin_message.filter(|rule| rule.max_bytes == max_message_bytes),
+        }
+    }
+
+    fn plugin_close_for_error(
+        &self,
+        error: &tokio_tungstenite::tungstenite::Error,
+    ) -> Option<(CloseFrame, &'static str, usize, usize)> {
+        use tokio_tungstenite::tungstenite::Error;
+        use tokio_tungstenite::tungstenite::error::CapacityError;
+
+        let (size, max_size, rule, kind) = match error {
+            Error::Capacity(CapacityError::FrameTooLong { size, max_size }) => {
+                let rule = self.plugin_frame.as_ref().filter(|rule| {
+                    self.max_frame_bytes == *max_size && rule.max_bytes == *max_size
+                })?;
+                (*size, *max_size, rule, "frame")
+            }
+            Error::Capacity(CapacityError::MessageTooLong { size, max_size }) => {
+                let rule = self.plugin_message.as_ref().filter(|rule| {
+                    self.max_message_bytes == *max_size && rule.max_bytes == *max_size
+                })?;
+                (*size, *max_size, rule, "message")
+            }
+            _ => return None,
+        };
+        Some((
+            CloseFrame {
+                code: CloseCode::Size,
+                reason: rule.close_reason.as_ref().to_owned().into(),
+            },
+            kind,
+            size,
+            max_size,
+        ))
+    }
+}
+
+fn ws_close_write_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
+    use tokio_tungstenite::tungstenite::Error;
+
+    match error {
+        Error::ConnectionClosed => "connection_closed",
+        Error::AlreadyClosed => "already_closed",
+        Error::Io(_) => "io",
+        Error::Protocol(_) => "protocol",
+        Error::Capacity(_) => "capacity",
+        _ => "other",
+    }
+}
+
+pub(crate) async fn send_bounded_ws_close<S>(sink: &mut S, close: Option<CloseFrame>)
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+    let result = crate::lazy_timeout::lazy_timeout(
+        Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
+        async {
+            match sink.send(Message::Close(close)).await {
+                Err(Error::Protocol(ProtocolError::SendAfterClosing)) => {
+                    // Reading a peer Close makes tungstenite queue the required
+                    // echo and enter ClosedByPeer. A second send is rejected,
+                    // so drive the already-queued control frame out instead.
+                    ("flush_queued_peer_echo", sink.flush().await)
+                }
+                result => ("send", result),
+            }
+        },
+    )
+    .await;
+
+    // Timeout is an expected teardown bound and stays quiet. Completed
+    // failures get a low-cardinality diagnostic without logging Close reasons
+    // or any peer-controlled payload.
+    if let Ok((phase, Err(error))) = result {
+        debug!(
+            phase,
+            error_kind = ws_close_write_error_kind(&error),
+            "Bounded WebSocket close write failed"
+        );
+    }
+}
+
+pub(crate) fn publish_ws_policy_close(
+    policy_close: &std::sync::OnceLock<CloseFrame>,
+    cancel: &tokio_util::sync::CancellationToken,
+    close: Option<CloseFrame>,
+) -> Option<CloseFrame> {
+    if let Some(details) = close {
+        let _ = policy_close.set(details);
+    }
+    // This helper is synchronous: callers cannot begin a bounded write until
+    // the first detailed Close is published and both relay halves can observe
+    // cancellation.
+    cancel.cancel();
+    policy_close.get().cloned()
+}
 
 /// Drain grace used after one WebSocket relay half exits and the other half is
 /// cancelled. Also acts as the fallback safety bound for tunnel-mode residual
@@ -11073,6 +11363,7 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     backend_ws_stream: WebSocketStream<B>,
     proxy_id: &str,
     connection_id: u64,
+    ws_framing_plugins: Vec<Arc<dyn Plugin>>,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
     ws_disconnect_plugins: Vec<Arc<dyn Plugin>>,
     session_meta: WsSessionMeta,
@@ -11111,13 +11402,13 @@ where
     );
     let websocket_idle_timeout = ws_idle_tracker.as_ref().map(|tracker| tracker.timeout);
 
-    // When tunnel mode is enabled and no plugins need frame-level hooks, bypass
+    // When tunnel mode is enabled and no plugins need parsed framing, bypass
     // WebSocket frame parsing entirely and do raw TCP bidirectional copy. This
     // avoids per-frame header parsing, masking validation, and opcode dispatch —
     // critical for large frames (9 MB+). Trade-off: FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES
     // is not enforced, but data streams through a fixed-size copy buffer so there
     // is no large-allocation DoS risk.
-    if websocket_tunnel_mode && ws_frame_plugins.is_empty() {
+    if websocket_tunnel_mode && ws_framing_plugins.is_empty() {
         debug!(
             proxy_id = %proxy_id,
             connection_id,
@@ -11257,9 +11548,13 @@ where
         return Ok(());
     }
 
+    let effective_size_limits = Arc::new(EffectiveWsSizeLimits::from_plugins(
+        max_websocket_frame_size_bytes,
+        &ws_framing_plugins,
+    ));
     let mut ws_config = WebSocketConfig::default();
-    ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
-    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    ws_config.max_frame_size = Some(effective_size_limits.max_frame_bytes);
+    ws_config.max_message_size = Some(effective_size_limits.max_message_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
     // RFC 9220 §5: frames over HTTP/3 are NOT masked. H1/H2 callers
     // pass `false` (RFC 6455 / RFC 8441 mandate masked client frames);
@@ -11322,12 +11617,17 @@ where
     // framers, so mid-message read progress also refreshes the watermark.
     let ws_idle_tracker_ctb = ws_idle_tracker.clone();
     let ws_idle_tracker_btc = ws_idle_tracker;
+    let size_limits_ctb = Arc::clone(&effective_size_limits);
+    let size_limits_btc = effective_size_limits;
 
     // Cancellation token for clean bidirectional close when a plugin triggers Close.
     // Each direction checks this token to know if the other side initiated a close.
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_ctb = cancel.clone();
     let cancel_btc = cancel.clone();
+    let policy_close: Arc<std::sync::OnceLock<CloseFrame>> = Arc::new(std::sync::OnceLock::new());
+    let policy_close_ctb = Arc::clone(&policy_close);
+    let policy_close_btc = policy_close;
 
     // Forward messages from client to backend
     let client_to_backend = async move {
@@ -11345,9 +11645,9 @@ where
                     // healthy TCP) and only registers a timer on Pending.
                     // Cannot use select+cancel here — cancel is already signaled
                     // and would skip the Close entirely.
-                    let _ = crate::lazy_timeout::lazy_timeout(
-                        Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
-                        backend_sink.send(Message::Close(None)),
+                    send_bounded_ws_close(
+                        &mut backend_sink,
+                        policy_close_ctb.get().cloned(),
                     )
                     .await;
                     break;
@@ -11405,18 +11705,24 @@ where
                                     WebSocketFrameDirection::ClientToBackend,
                                 )
                             };
-                            // If a plugin transformed the frame into a Close, close both sides.
-                            // Race cancel in case the opposite direction already exited while we
-                            // were running plugin hooks — keeps teardown prompt without dropping
-                            // the Close on the happy path.
-                            if matches!(&outgoing, Message::Close(_)) {
+                            // If a plugin transformed the message into a Close, publish its
+                            // details and cancel both halves before any bounded polite write.
+                            if let Message::Close(close_frame) = &outgoing {
                                 debug!("Plugin triggered close on client->backend frame");
-                                tokio::select! {
-                                    biased;
-                                    _ = cancel_ctb.cancelled() => {}
-                                    _ = backend_sink.send(outgoing) => {}
-                                }
-                                cancel_ctb.cancel(); // signal other direction
+                                // Publish the detailed Close first, then cancel before the
+                                // bounded destination write. The opposite half can therefore
+                                // notify the offending sender immediately even if this sink is
+                                // permanently backpressured.
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    close_frame.clone(),
+                                );
+                                send_bounded_ws_close(
+                                    &mut backend_sink,
+                                    close,
+                                )
+                                .await;
                                 break;
                             }
                             match &outgoing {
@@ -11490,12 +11796,37 @@ where
                             trace!("Client -> Backend: Frame");
                         }
                         Err(e) => {
-                            error!("Error receiving from client: {}", e);
+                            let error_class = if let Some((close, limit_kind, size, max_size)) =
+                                size_limits_ctb.plugin_close_for_error(&e)
+                            {
+                                warn!(
+                                    plugin = "ws_message_size_limiting",
+                                    proxy_id = %proxy_id_ctb,
+                                    connection_id,
+                                    direction = "client->backend",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket size policy rejected input before forwarding"
+                                );
+                                // Cancellation precedes the bounded polite write so policy
+                                // teardown cannot be held by a non-reading destination.
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                retry::ErrorClass::RequestBodyTooLarge
+                            } else {
+                                error!("Error receiving from client: {}", e);
+                                retry::classify_boxed_error(&e)
+                            };
                             // Read-side failure on the c2b path means the client
                             // dropped / reset the socket.
                             let _ = first_failure_ctb.set((
                                 crate::plugins::Direction::ClientToBackend,
-                                retry::classify_boxed_error(&e),
+                                error_class,
                                 Some(tcp_proxy::StreamIoSide::Read),
                             ));
                             break;
@@ -11526,9 +11857,9 @@ where
                     // `lazy_timeout` so the client sink cannot hang `tokio::join!`
                     // forever if the client socket is dead or not reading. See
                     // `WS_CANCEL_CLOSE_TIMEOUT_MS` for the rationale.
-                    let _ = crate::lazy_timeout::lazy_timeout(
-                        Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
-                        ws_sink.send(Message::Close(None)),
+                    send_bounded_ws_close(
+                        &mut ws_sink,
+                        policy_close_btc.get().cloned(),
                     )
                     .await;
                     break;
@@ -11586,17 +11917,16 @@ where
                                     WebSocketFrameDirection::BackendToClient,
                                 )
                             };
-                            // If a plugin transformed the frame into a Close, close both sides.
-                            // Race cancel — the opposite direction may have already exited while
-                            // we were running plugin hooks.
-                            if matches!(&outgoing, Message::Close(_)) {
+                            // If a plugin transformed the message into a Close, publish its
+                            // details and cancel both halves before any bounded polite write.
+                            if let Message::Close(close_frame) = &outgoing {
                                 debug!("Plugin triggered close on backend->client frame");
-                                tokio::select! {
-                                    biased;
-                                    _ = cancel_btc.cancelled() => {}
-                                    _ = ws_sink.send(outgoing) => {}
-                                }
-                                cancel_btc.cancel(); // signal other direction
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    close_frame.clone(),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
                                 break;
                             }
                             match &outgoing {
@@ -11666,12 +11996,35 @@ where
                             trace!("Backend -> Client: Frame");
                         }
                         Err(e) => {
-                            error!("Error receiving from backend: {}", e);
+                            let error_class = if let Some((close, limit_kind, size, max_size)) =
+                                size_limits_btc.plugin_close_for_error(&e)
+                            {
+                                warn!(
+                                    plugin = "ws_message_size_limiting",
+                                    proxy_id = %proxy_id_btc,
+                                    connection_id,
+                                    direction = "backend->client",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket size policy rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                retry::ErrorClass::ResponseBodyTooLarge
+                            } else {
+                                error!("Error receiving from backend: {}", e);
+                                retry::classify_boxed_error(&e)
+                            };
                             // Read-side failure on the b2c path means the
                             // backend closed / reset the socket.
                             let _ = first_failure_btc.set((
                                 crate::plugins::Direction::BackendToClient,
-                                retry::classify_boxed_error(&e),
+                                error_class,
                                 Some(tcp_proxy::StreamIoSide::Read),
                             ));
                             break;
@@ -13393,6 +13746,7 @@ pub(crate) async fn log_rejected_request_with_path(
         // is typically small and flowing through the main handler's buffered
         // arm, which populates `bytes_received` separately. Leave 0 here.
         metadata,
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
 
@@ -13844,9 +14198,10 @@ async fn run_after_proxy_hooks_on_rejection(
                 // reject hooks run), so a hook cannot replace it here — it is
                 // ignored and only logged. Known consequence: `ai_rate_limiter`'s
                 // `on_unmetered_response: "reject"` is best-effort for synthetic
-                // `before_proxy` responses such as `ai_federation`'s — a federated
-                // 2xx missing usage metadata is still returned to the client. See
-                // docs/plugins.md (ai_rate_limiter federation limitation).
+                // responses such as `ai_federation`'s final-request-body
+                // short-circuit — a federated 2xx missing usage metadata is still
+                // returned to the client. See docs/plugins.md (ai_rate_limiter
+                // federation limitation).
                 warn!(
                     rejecting_plugin = plugin.name(),
                     attempted_reject_status = reject_status,
@@ -15226,14 +15581,13 @@ async fn run_backend_path_plugins_or_build_reject(
     original_request_path: &str,
     is_grpc_request: bool,
     grpc_web_response_content_type: Option<&str>,
-    phase: BackendPathPolicyPhase,
 ) -> Option<Response<ProxyBody>> {
     let phase_start = Instant::now();
     for plugin in backend_path_plugins {
         let deadline = ctx.grpc_deadline_at();
         match crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
-            plugin.on_backend_path_resolved(ctx, backend_path, phase),
+            plugin.on_backend_path_resolved(ctx, backend_path),
         )
         .await
         .into_plugin_result(ctx)
@@ -15350,6 +15704,50 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     );
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
     normalize_reject_response(status, &response_body, &headers, is_grpc_request)
+}
+
+/// Finalize a terminal request-body read failure before any external operation
+/// or backend dispatch could start. The committed-response hook owns cleanup of
+/// exact local/distributed in-flight tokens, so every failure shape must pass
+/// through the same rejection pipeline exactly once.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_terminal_request_body_read_rejection(
+    state: &ProxyState,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    body: &[u8],
+    is_grpc_request: bool,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    request_path: &str,
+) -> Response<ProxyBody> {
+    ctx.metadata.insert(
+        RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let normalized = finalize_reject_response_with_after_proxy_hooks(
+        plugins,
+        ctx,
+        status,
+        body,
+        HashMap::new(),
+        is_grpc_request,
+    )
+    .await;
+    apply_grpc_reject_metadata(ctx, &normalized);
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        normalized.http_status.as_u16(),
+        start_time,
+        "on_final_request_body",
+        plugin_execution_ns,
+        Some(request_path),
+    )
+    .await;
+    record_request(state, normalized.http_status.as_u16());
+    build_response_from_normalized_reject(normalized)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15538,14 +15936,27 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     PluginResult::Continue
 }
 
-/// Return the RFC 6265 cookie-name from the leading cookie-pair only.
-/// Attributes, padded names, and lines without a valid token are not names.
+const MAX_SET_COOKIE_NAME_VALUE_BYTES: usize = 4096;
+
+/// Return the RFC 10025 cookie-name from a browser-comparable leading
+/// cookie-pair. Keep the existing strict producer grammar for names, but use
+/// the user-agent value boundary: browsers accept non-control value syntax
+/// that producers are discouraged from emitting, including spaces, commas,
+/// quotes, and backslashes.
 fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     let cookie_pair = set_cookie
         .split_once(';')
         .map_or(set_cookie, |(pair, _)| pair);
-    let (name, _) = cookie_pair.split_once('=')?;
-    if name.is_empty()
+    let (name, value) = cookie_pair.split_once('=')?;
+    // RFC 6265 strips leading and trailing SP/HTAB from both sides of the
+    // cookie-pair before validating its name and value.
+    let name = name.trim_matches([' ', '\t']);
+    let value = value.trim_matches([' ', '\t']);
+    // RFC 10025 rejects a cookie when its trimmed name and value total more
+    // than 4096 octets. Such a line cannot own and suppress a valid staged
+    // cleanup cookie that the browser can actually store.
+    if name.len().saturating_add(value.len()) > MAX_SET_COOKIE_NAME_VALUE_BYTES
+        || name.is_empty()
         || !name.bytes().all(|byte| {
             matches!(
                 byte,
@@ -15571,18 +15982,338 @@ fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     {
         return None;
     }
+
+    // The first semicolon already terminated `cookie_pair`. Reject C0/DEL so
+    // malformed or header-injection-bearing values remain non-comparable,
+    // while retaining ownership for values a user agent can actually store.
+    if value.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+        return None;
+    }
+
     Some(name)
 }
 
+/// RFC 6265 ignores one leading dot on Domain attributes and compares the
+/// resulting canonicalized domain case-insensitively. Ferrum accepts the full
+/// RFC 3986 reg-name and bracketed IP-literal forms at request admission, so
+/// apply the same validation here instead of narrowing comparable cookie
+/// scopes to LDH names. Normalize IPv6 text so equivalent compressed and
+/// expanded forms cannot evade storage-key ownership.
+enum CanonicalSetCookieDomain<'a> {
+    Text(&'a str),
+    Ipv6(std::net::Ipv6Addr),
+}
+
+fn canonical_set_cookie_domain(domain: &str) -> Option<CanonicalSetCookieDomain<'_>> {
+    let domain = domain.strip_prefix('.').unwrap_or(domain);
+    if let Some(content) = domain
+        .strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+    {
+        if let Ok(ipv6) = content.parse::<std::net::Ipv6Addr>() {
+            return Some(CanonicalSetCookieDomain::Ipv6(ipv6));
+        }
+        return is_valid_ip_literal_contents(content)
+            .then_some(CanonicalSetCookieDomain::Text(domain));
+    }
+    if domain.ends_with('.') || !is_valid_reg_name(domain) {
+        return None;
+    }
+    Some(CanonicalSetCookieDomain::Text(domain))
+}
+
+fn canonical_set_cookie_domain_ip(domain: &CanonicalSetCookieDomain<'_>) -> Option<IpAddr> {
+    match domain {
+        CanonicalSetCookieDomain::Text(domain) => domain.parse().ok(),
+        CanonicalSetCookieDomain::Ipv6(domain) => Some(IpAddr::V6(*domain)),
+    }
+}
+
+fn set_cookie_request_host(authority: Option<&str>) -> Option<&str> {
+    split_request_authority(authority?).map(|(host, _)| host)
+}
+
+fn set_cookie_request_host_ip(request_host: Option<&str>) -> Option<IpAddr> {
+    let host = request_host?;
+    host.strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
+fn set_cookie_domain_is_public_suffix(domain: &str) -> bool {
+    let lowercase_domain = domain.to_ascii_lowercase();
+    psl::suffix_str(&lowercase_domain).is_some_and(|suffix| suffix == lowercase_domain.as_str())
+}
+
+fn valid_set_cookie_path(path: &str) -> bool {
+    path.starts_with('/') && !path.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
+}
+
+fn default_set_cookie_path(request_path: &str) -> &str {
+    if !request_path.starts_with('/') {
+        return "/";
+    }
+    match request_path.rfind('/') {
+        Some(0) | None => "/",
+        Some(last_slash) => &request_path[..last_slash],
+    }
+}
+
+/// Browsers treat HTTP loopback and `localhost` origins as potentially
+/// trustworthy, so they may store `Secure` cookies even without TLS. Match the
+/// default trust boundary from Secure Contexts; user-configured browser
+/// allowlists are intentionally unknowable at the proxy.
+fn request_authority_is_potentially_trustworthy(authority: &str) -> bool {
+    let Some((host, _)) = split_request_authority(authority) else {
+        return false;
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let localhost_suffix = ".localhost";
+    if host.eq_ignore_ascii_case("localhost")
+        || (host.len() > localhost_suffix.len()
+            && host
+                .get(host.len() - localhost_suffix.len()..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(localhost_suffix)))
+    {
+        return true;
+    }
+
+    let ip_literal = host
+        .strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+        .unwrap_or(host);
+    match ip_literal.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => address.octets()[0] == 127,
+        Ok(std::net::IpAddr::V6(address)) => address.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+fn request_can_store_secure_cookie(ctx: &RequestContext) -> bool {
+    ctx.request_is_secure
+        || ctx
+            .request_authority
+            .as_deref()
+            .is_some_and(request_authority_is_potentially_trustworthy)
+}
+
+struct SetCookieStorageKey<'a> {
+    name: &'a str,
+    domain: Option<CanonicalSetCookieDomain<'a>>,
+    path: &'a str,
+    host_only: bool,
+    partitioned: bool,
+}
+
+/// Return the effective RFC 10025 cookie storage key. Omitted Domain resolves
+/// to the exact validated request host used for browser cookie comparison while
+/// retaining its host-only state. Omitted, empty, or non-absolute Path
+/// attributes use the request path's default directory. Host-only and
+/// Partitioned cookies remain independent from otherwise equivalent domain and
+/// unpartitioned cookies.
+fn set_cookie_storage_key<'a>(
+    set_cookie: &'a str,
+    default_path: &'a str,
+    request_is_secure: bool,
+    request_host: Option<&'a str>,
+    request_host_ip: Option<IpAddr>,
+) -> Option<SetCookieStorageKey<'a>> {
+    let name = set_cookie_name(set_cookie)?;
+    let mut domain_attribute = None;
+    let mut path_attribute = None;
+    let mut partitioned = false;
+    let mut secure = false;
+    let mut http_only = false;
+    let mut same_site_none = false;
+
+    for attribute in set_cookie.split(';').skip(1) {
+        let attribute = attribute.trim_matches([' ', '\t']);
+        // User agents reject control-bearing cookie attributes. Do not treat a
+        // hostile Path control as ordinary invalid syntax and resolve it to the
+        // default path, which could suppress a valid staged cleanup cookie.
+        if attribute.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+            return None;
+        }
+        let (attribute_name, attribute_value) = match attribute.split_once('=') {
+            Some((name, value)) => (
+                name.trim_matches([' ', '\t']),
+                Some(value.trim_matches([' ', '\t'])),
+            ),
+            None => (attribute, None),
+        };
+        if attribute_name.eq_ignore_ascii_case("partitioned") {
+            partitioned = true;
+        } else if attribute_name.eq_ignore_ascii_case("secure") {
+            secure = true;
+        } else if attribute_name.eq_ignore_ascii_case("httponly") {
+            http_only = true;
+        } else if attribute_name.eq_ignore_ascii_case("samesite") {
+            // The last SameSite attribute wins; invalid and bare values map to
+            // the default enforcement rather than preserving an earlier None.
+            same_site_none =
+                attribute_value.is_some_and(|value| value.eq_ignore_ascii_case("none"));
+        } else if attribute_name.eq_ignore_ascii_case("domain") {
+            // User agents ignore empty and bare Domain cookie-avs. A later
+            // empty value therefore does not erase an earlier valid Domain.
+            if let Some(value) = attribute_value.filter(|value| !value.is_empty()) {
+                domain_attribute = Some(value);
+            }
+        } else if attribute_name.eq_ignore_ascii_case("path") {
+            // A bare Path is the last Path attribute with an empty value, so
+            // it supersedes an earlier value and resolves to default_path.
+            path_attribute = Some(attribute_value.unwrap_or(""));
+        }
+    }
+
+    // RFC 6265 uses the last effective Domain/Path attribute. Empty Domain
+    // values were ignored above, while a trailing-dot or otherwise malformed
+    // non-empty Domain rejects the cookie. Mainstream user agents treat an
+    // exact-IP Domain as a host cookie and reject a nonmatching IP Domain.
+    // An invalid Path value falls back to the request's default path.
+    let (domain, host_only) = match domain_attribute {
+        None => (request_host.and_then(canonical_set_cookie_domain), true),
+        Some(domain) => {
+            let domain = canonical_set_cookie_domain(domain)?;
+            if let Some(domain_ip) = canonical_set_cookie_domain_ip(&domain) {
+                if request_host_ip != Some(domain_ip) {
+                    return None;
+                }
+                (Some(domain), true)
+            } else {
+                // RFC 6265bis public-suffix handling is storage-key-visible:
+                // a Domain equal to the request host is converted to a
+                // host-only cookie, while any other public-suffix Domain is
+                // rejected. Use the current Mozilla PSL (including private
+                // suffixes such as github.io) so Ferrum compares the same key
+                // a browser will actually store.
+                let CanonicalSetCookieDomain::Text(domain_text) = &domain else {
+                    return None;
+                };
+                if set_cookie_domain_is_public_suffix(domain_text) {
+                    if !request_host.is_some_and(|host| host.eq_ignore_ascii_case(domain_text)) {
+                        return None;
+                    }
+                    (Some(domain), true)
+                } else {
+                    (Some(domain), false)
+                }
+            }
+        }
+    };
+    let path = match path_attribute {
+        Some(path) if valid_set_cookie_path(path) => path,
+        Some(_) | None => default_path,
+    };
+
+    // RFC 10025 §5.4 requires user agents to match cookie-name prefix strings
+    // case-insensitively; §5.7 applies that rule in the __Secure-/__Host-
+    // storage checks. Keep every browser-prefix check here case-insensitive.
+    let secure_prefix = name
+        .get(.."__Secure-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Secure-"));
+    let host_prefix = name
+        .get(.."__Host-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Host-"));
+    let http_prefix = name
+        .get(.."__Http-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Http-"));
+    let host_http_prefix = name
+        .get(.."__Host-Http-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Host-Http-"));
+    // Cookies that a browser will reject cannot own a staged cookie's storage
+    // key. Keep the selected line in the response, but make it non-comparable
+    // so a valid earlier cleanup is appended after it. `__Host-` additionally
+    // requires an explicit Path=/ attribute, not merely a default path of `/`;
+    // `__Http-` and `__Host-Http-` additionally require HttpOnly.
+    if (secure && !request_is_secure)
+        || (partitioned && !secure)
+        || (same_site_none && !secure)
+        || (secure_prefix && !secure)
+        || (host_prefix && (!secure || !host_only || path_attribute != Some("/")))
+        || (http_prefix && (!secure || !http_only))
+        || (host_http_prefix && !http_only)
+    {
+        return None;
+    }
+
+    Some(SetCookieStorageKey {
+        name,
+        domain,
+        path,
+        host_only,
+        partitioned,
+    })
+}
+
+fn set_cookie_same_storage_key(
+    existing: &str,
+    candidate: &str,
+    default_path: &str,
+    request_is_secure: bool,
+    request_host: Option<&str>,
+    request_host_ip: Option<IpAddr>,
+) -> bool {
+    let Some(existing_key) = set_cookie_storage_key(
+        existing,
+        default_path,
+        request_is_secure,
+        request_host,
+        request_host_ip,
+    ) else {
+        return false;
+    };
+    let Some(candidate_key) = set_cookie_storage_key(
+        candidate,
+        default_path,
+        request_is_secure,
+        request_host,
+        request_host_ip,
+    ) else {
+        return false;
+    };
+
+    existing_key.name == candidate_key.name
+        && existing_key.path == candidate_key.path
+        && existing_key.host_only == candidate_key.host_only
+        && existing_key.partitioned == candidate_key.partitioned
+        && match (existing_key.domain, candidate_key.domain) {
+            (
+                Some(CanonicalSetCookieDomain::Text(existing_domain)),
+                Some(CanonicalSetCookieDomain::Text(candidate_domain)),
+            ) => existing_domain.eq_ignore_ascii_case(candidate_domain),
+            (
+                Some(CanonicalSetCookieDomain::Ipv6(existing_domain)),
+                Some(CanonicalSetCookieDomain::Ipv6(candidate_domain)),
+            ) => existing_domain == candidate_domain,
+            (None, None) => true,
+            _ => false,
+        }
+}
+
 /// Add newline-joined `Set-Cookie` lines in encounter order, replacing an
-/// earlier line when a later line owns the same exact, case-sensitive cookie
-/// name. Invalid cookie-pairs can only replace byte-identical lines.
-fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
+/// earlier line only when a later line owns the same RFC 10025 storage key.
+/// Invalid cookie-pairs can only replace byte-identical lines.
+fn collect_later_set_cookies(
+    cookies: &mut Vec<String>,
+    joined: &str,
+    default_path: &str,
+    request_is_secure: bool,
+    request_host: Option<&str>,
+    request_host_ip: Option<IpAddr>,
+) {
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
-        let candidate_name = set_cookie_name(candidate);
         if let Some(index) = cookies.iter().position(|existing| {
             existing == candidate
-                || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+                || set_cookie_same_storage_key(
+                    existing,
+                    candidate,
+                    default_path,
+                    request_is_secure,
+                    request_host,
+                    request_host_ip,
+                )
         }) {
             cookies.remove(index);
         }
@@ -15590,22 +16321,53 @@ fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
     }
 }
 
-fn set_cookie_conflicts(cookies: &[String], candidate: &str) -> bool {
-    let candidate_name = set_cookie_name(candidate);
+fn set_cookie_conflicts(
+    cookies: &[String],
+    candidate: &str,
+    default_path: &str,
+    request_is_secure: bool,
+    request_host: Option<&str>,
+    request_host_ip: Option<IpAddr>,
+) -> bool {
     cookies.iter().any(|existing| {
         existing == candidate
-            || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+            || set_cookie_same_storage_key(
+                existing,
+                candidate,
+                default_path,
+                request_is_secure,
+                request_host,
+                request_host_ip,
+            )
     })
 }
 
 /// Stage requester-owned cookies from rejecting auth attempts. This remains on
 /// the rejection path: successful authentication only removes the metadata.
 pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
+    let default_path = default_set_cookie_path(&ctx.path);
+    let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
+    let request_host = set_cookie_request_host(ctx.request_authority.as_deref());
+    let request_host_ip = set_cookie_request_host_ip(request_host);
     let mut staged = Vec::new();
     if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
-        collect_later_set_cookies(&mut staged, existing);
+        collect_later_set_cookies(
+            &mut staged,
+            existing,
+            default_path,
+            can_store_secure_cookie,
+            request_host,
+            request_host_ip,
+        );
     }
-    collect_later_set_cookies(&mut staged, &cookie);
+    collect_later_set_cookies(
+        &mut staged,
+        &cookie,
+        default_path,
+        can_store_secure_cookie,
+        request_host,
+        request_host_ip,
+    );
 
     if staged.is_empty() {
         ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
@@ -15624,6 +16386,10 @@ fn attach_auth_rejection_set_cookie(
     let Some(staged) = ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) else {
         return;
     };
+    let default_path = default_set_cookie_path(&ctx.path);
+    let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
+    let request_host = set_cookie_request_host(ctx.request_authority.as_deref());
+    let request_host_ip = set_cookie_request_host_ip(request_host);
 
     // A custom plugin can return multiple case variants because rejection
     // headers use a String-keyed HashMap. Sort the variants by their exact key
@@ -15640,16 +16406,37 @@ fn attach_auth_rejection_set_cookie(
 
     let mut merged = Vec::new();
     for (_, value) in selected_variants {
-        collect_later_set_cookies(&mut merged, &value);
+        collect_later_set_cookies(
+            &mut merged,
+            &value,
+            default_path,
+            can_store_secure_cookie,
+            request_host,
+            request_host_ip,
+        );
     }
 
     let mut staged_cookies = Vec::new();
-    collect_later_set_cookies(&mut staged_cookies, &staged);
+    collect_later_set_cookies(
+        &mut staged_cookies,
+        &staged,
+        default_path,
+        can_store_secure_cookie,
+        request_host,
+        request_host_ip,
+    );
     for candidate in staged_cookies {
         // The selected final rejection owns conflicts. Preserve each selected
         // line's full attributes and deterministic order, appending only
-        // independently named requester-owned cookies from earlier rejects.
-        if !set_cookie_conflicts(&merged, &candidate) {
+        // independently scoped requester-owned cookies from earlier rejects.
+        if !set_cookie_conflicts(
+            &merged,
+            &candidate,
+            default_path,
+            can_store_secure_cookie,
+            request_host,
+            request_host_ip,
+        ) {
             merged.push(candidate);
         }
     }
@@ -15786,6 +16573,30 @@ pub async fn run_authentication_phase(
             }
         }
     }
+}
+
+/// Apply the original HTTP-family scheme reported by a directly connected
+/// trusted proxy through either a singleton overwrite or an XFF-correlated
+/// appended chain. The same accepted fact drives browser cookie storage checks,
+/// authority normalization, and canonical frontend URL metadata consumed by
+/// authentication plugins.
+pub fn apply_trusted_forwarded_request_scheme(
+    ctx: &mut RequestContext,
+    socket_addr: &IpAddr,
+    trusted_proxies: &client_ip::TrustedProxies,
+) -> Option<&'static str> {
+    let forwarded_scheme = client_ip::trusted_forwarded_request_scheme(
+        socket_addr,
+        ctx.raw_header_value_bytes("x-forwarded-for"),
+        ctx.raw_header_value_bytes("x-forwarded-proto"),
+        trusted_proxies,
+    );
+    if let Some(scheme) = forwarded_scheme {
+        ctx.request_is_secure = scheme == "https";
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), scheme.to_string());
+    }
+    forwarded_scheme
 }
 
 /// Handle a single proxy request.
@@ -15934,9 +16745,11 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    let mut request_scheme = if is_tls { "https" } else { "http" };
+    ctx.request_is_secure = is_tls;
     ctx.metadata.insert(
         "ferrum.frontend_scheme".to_string(),
-        if is_tls { "https" } else { "http" }.to_string(),
+        request_scheme.to_string(),
     );
     ctx.frontend_listen_port = Some(connection_metadata.frontend_listen_port.unwrap_or(
         if is_tls {
@@ -16169,6 +16982,11 @@ async fn handle_proxy_request_inner(
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         if let Some(ref addr) = socket_addr {
+            if let Some(forwarded_scheme) =
+                apply_trusted_forwarded_request_scheme(&mut ctx, addr, &state.trusted_proxies)
+            {
+                request_scheme = forwarded_scheme;
+            }
             let real_ip_header_val =
                 state
                     .env_config
@@ -16276,10 +17094,7 @@ async fn handle_proxy_request_inner(
         None => None,
     };
     let request_authority = raw_host.and_then(|authority| {
-        normalize_request_authority_for_signing(
-            authority,
-            Some(if is_tls { "https" } else { "http" }),
-        )
+        normalize_request_authority_for_signing(authority, Some(request_scheme))
     });
     ctx.request_authority = request_authority;
 
@@ -17225,13 +18040,25 @@ async fn handle_proxy_request_inner(
     // HBONE CONNECT requests must keep hyper's upgrade handle in the streaming
     // body (see `handle_hbone_request`), so pre-`before_proxy` buffering is
     // skipped — same reason as the pre-authenticate buffering guard above.
-    let requires_request_body_buffering = !is_hbone_connect_any
+    let request_may_need_buffering = !is_hbone_connect_any
         && allows_request_body_buffering
-        && maybe_requires_request_body_buffering
-        && plugins
-            .iter()
-            .any(|plugin| plugin.should_buffer_request_body(&ctx));
-    let before_proxy_body_requirements = if requires_request_body_buffering
+        && maybe_requires_request_body_buffering;
+    let has_terminal_body_dispatch = capabilities
+        .has(crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH);
+    let has_contextual_final_body_hook =
+        capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    let (
+        initial_requires_request_body_buffering,
+        initial_final_body_before_backend_dispatch,
+        initial_needs_final_request_body_context,
+    ) = final_request_body_requirements(
+        &plugins,
+        &ctx,
+        request_may_need_buffering,
+        has_terminal_body_dispatch,
+        has_contextual_final_body_hook,
+    );
+    let before_proxy_body_requirements = if initial_requires_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
     {
         request_body_requirements_before_before_proxy(&plugins, &ctx)
@@ -17476,6 +18303,33 @@ async fn handle_proxy_request_inner(
         ctx.headers = tmp_headers;
     }
 
+    // A header-transforming before_proxy hook can change the applicability of
+    // body plugins (for example, text/plain -> application/json). Re-evaluate
+    // against the effective outbound headers before choosing terminal versus
+    // backend dispatch. Swap maps temporarily to avoid another full clone.
+    let (
+        requires_request_body_buffering,
+        final_body_before_backend_dispatch,
+        needs_final_request_body_context,
+    ) = if let Some(transformed_headers) = owned_proxy_headers.as_mut() {
+        std::mem::swap(&mut ctx.headers, transformed_headers);
+        let requirements = final_request_body_requirements(
+            &plugins,
+            &ctx,
+            request_may_need_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+        );
+        std::mem::swap(&mut ctx.headers, transformed_headers);
+        requirements
+    } else {
+        (
+            initial_requires_request_body_buffering,
+            initial_final_body_before_backend_dispatch,
+            initial_needs_final_request_body_context,
+        )
+    };
+
     // HBONE CONNECT short-circuits the rest of the dispatch ladder: the relay
     // is a transparent TCP tunnel, so identity-header injection, egress
     // baggage strip on `owned_proxy_headers`, the WS/gRPC branches, and the
@@ -17562,11 +18416,14 @@ async fn handle_proxy_request_inner(
         && requires_request_body_buffering
         && (maybe_requires_response_body_buffering || stream_hooks_enabled);
     let mut request_body_prepared = false;
-    // Pre-computed at config reload (see `PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT`)
-    // so the proxy hot path does not re-scan the plugin list per request.
-    let needs_final_request_body_context = requires_request_body_buffering
-        && capabilities
-            .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    // The config-time capability above avoids a full scan when no contextual
+    // final-body hook is configured. The request-time value also requires that
+    // same plugin's body-applicability predicate to match, avoiding an unrelated
+    // body plugin triggering a context clone.
+    // Provider-dispatch plugins synthesize the complete response from the
+    // finalized request body. The config-time bit above avoids extra work when
+    // none are configured; the request-time value is true only when that same
+    // terminal plugin's `should_buffer_request_body` matched this request.
     let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
@@ -17616,56 +18473,39 @@ async fn handle_proxy_request_inner(
     let has_deferred_routing_header_hooks = backend_path_is_policy_bound
         && capabilities.has(PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
     let mut deferred_result = PluginResult::Continue;
-    let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
-
-    loop {
-        // Preview access rules for the already-selected target before a
-        // deferred routing function performs external work, then enforce
-        // stateful policy exactly once after its header mutations settle. The
-        // target is deliberately pinned across this hook: otherwise a cloud
-        // function could cause side effects before its hash header selected a
-        // different, denied backend-effective method.
-        if backend_path_is_policy_bound {
-            let backend_path = build_backend_effective_path(
-                &proxy,
-                &path,
-                strip_len,
-                upstream_target
-                    .as_ref()
-                    .and_then(|target| target.path.as_deref()),
-            );
-            let phase = if run_deferred_routing_headers {
-                BackendPathPolicyPhase::Preview
-            } else {
-                BackendPathPolicyPhase::Enforce
-            };
-            if let Some(response) = run_backend_path_plugins_or_build_reject(
-                backend_path_plugins,
-                &plugins,
-                &mut ctx,
-                &backend_path,
-                &state,
-                start_time,
-                &mut plugin_execution_ns,
-                &original_request_path,
-                is_grpc_request,
-                grpc_web_response_content_type,
-                phase,
-            )
-            .await
-            {
-                return Ok(response);
-            }
-            if phase == BackendPathPolicyPhase::Enforce {
-                ctx.bind_authorized_backend_path(backend_path);
-            }
+    // The selected target is pinned before deferred routing-header hooks run,
+    // so enforce its backend-effective path before those hooks can perform
+    // external work. This also ensures an exhausted method rate limit rejects
+    // before a pre-proxy serverless function is invoked.
+    if backend_path_is_policy_bound {
+        let backend_path = build_backend_effective_path(
+            &proxy,
+            &path,
+            strip_len,
+            upstream_target
+                .as_ref()
+                .and_then(|target| target.path.as_deref()),
+        );
+        if let Some(response) = run_backend_path_plugins_or_build_reject(
+            backend_path_plugins,
+            &plugins,
+            &mut ctx,
+            &backend_path,
+            &state,
+            start_time,
+            &mut plugin_execution_ns,
+            &original_request_path,
+            is_grpc_request,
+            grpc_web_response_content_type,
+        )
+        .await
+        {
+            return Ok(response);
         }
+        ctx.bind_authorized_backend_path(backend_path);
+    }
 
-        if !run_deferred_routing_headers {
-            break;
-        }
-        run_deferred_routing_headers = false;
-
+    if has_deferred_routing_header_hooks {
         // These hooks moved later for authorization ordering, but their
         // documented request view remains the original client path.
         let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
@@ -17708,9 +18548,6 @@ async fn handle_proxy_request_inner(
                 &state.mesh_egress_strip_baggage_keys,
             );
         }
-        // Always make one more pass after the routing-header hook, including
-        // when it rejects, so final enforcement charges the pinned method
-        // exactly once before any external-hook rejection is returned.
     }
 
     // Hooks that can dispatch external work or synthesize a terminal response
@@ -17838,6 +18675,179 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
+    // A terminal final-body plugin (currently `ai_federation`) owns its own
+    // external dispatch and returns the complete response. Finalize and invoke
+    // it after inbound transport policy, but before the placeholder route's
+    // backend circuit breaker and every backend-only preflight. Besides
+    // preventing an unrelated backend policy from suppressing provider calls,
+    // returning here keeps synthetic provider outcomes out of backend health,
+    // breaker, and latency accounting.
+    if final_body_before_backend_dispatch {
+        let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &hook_headers,
+                    state.max_request_body_size_bytes,
+                    proxy.backend_read_timeout_ms,
+                    ctx.grpc_deadline_at(),
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        return Ok(finalize_terminal_request_body_read_rejection(
+                            &state,
+                            &plugins,
+                            &mut ctx,
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            br#"{"error":"Request body exceeds maximum size"}"#,
+                            is_grpc_request,
+                            start_time,
+                            plugin_execution_ns,
+                            &original_request_path,
+                        )
+                        .await);
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while finalizing terminal request body before backend dispatch"
+                        );
+                        return Ok(finalize_terminal_request_body_read_rejection(
+                            &state,
+                            &plugins,
+                            &mut ctx,
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            br#"{"error":"Client disconnected"}"#,
+                            is_grpc_request,
+                            start_time,
+                            plugin_execution_ns,
+                            &original_request_path,
+                        )
+                        .await);
+                    }
+                    Err(RequestBodyBufferError::TimedOut) => {
+                        return Ok(finalize_terminal_request_body_read_rejection(
+                            &state,
+                            &plugins,
+                            &mut ctx,
+                            StatusCode::REQUEST_TIMEOUT,
+                            br#"{"error":"Request body read timed out"}"#,
+                            is_grpc_request,
+                            start_time,
+                            plugin_execution_ns,
+                            &original_request_path,
+                        )
+                        .await);
+                    }
+                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                        ctx.metadata.insert(
+                            RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
+                            "true".to_string(),
+                        );
+                        return Ok(finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_terminal_request_body",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            grpc_web_response_content_type,
+                        )
+                        .await);
+                    }
+                }
+            }
+            buffered => buffered,
+        };
+
+        client_request_body = match client_request_body {
+            ClientRequestBody::Buffered(body) => {
+                ctx.bytes_sent_observed
+                    .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                let mut body_hook_ctx = needs_final_request_body_context
+                    .then(|| ctx.clone_for_final_request_body_hooks());
+                let terminal_hook_start = Instant::now();
+                let grpc_deadline_at = ctx.grpc_deadline_at();
+                let transformed = apply_request_body_plugins_with_context(
+                    &plugins,
+                    body_hook_ctx.as_mut(),
+                    grpc_deadline_at,
+                    &hook_headers,
+                    body,
+                )
+                .await;
+                let final_body_result = run_final_request_body_hooks(
+                    &plugins,
+                    body_hook_ctx.as_mut(),
+                    grpc_deadline_at,
+                    &hook_headers,
+                    &transformed,
+                )
+                .await;
+                plugin_execution_ns += terminal_hook_start.elapsed().as_nanos() as u64;
+                if let Some(body_hook_ctx) = body_hook_ctx {
+                    let request_body = ctx.metadata.remove("request_body");
+                    ctx.metadata = body_hook_ctx.metadata;
+                    if let Some(body) = request_body {
+                        ctx.metadata.insert("request_body".to_string(), body);
+                    }
+                    ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                    ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
+                    ctx.waf_score = body_hook_ctx.waf_score;
+                }
+                match final_body_result {
+                    PluginResult::Continue => {
+                        request_body_prepared = true;
+                        ClientRequestBody::Buffered(transformed)
+                    }
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            record_request(&state, 500);
+                            return Ok(build_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                r#"{"error":"Internal error"}"#,
+                            ));
+                        };
+                        let status = StatusCode::from_u16(reject.status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let normalized = finalize_reject_response_with_after_proxy_hooks(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            &reject.body,
+                            reject.headers,
+                            is_grpc_request,
+                        )
+                        .await;
+                        apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        log_rejected_request_with_path(
+                            &plugins,
+                            &ctx,
+                            normalized.http_status.as_u16(),
+                            start_time,
+                            "on_final_request_body",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await;
+                        record_request(&state, normalized.http_status.as_u16());
+                        return Ok(build_response_from_normalized_reject(normalized));
+                    }
+                }
+            }
+            bodyless => bodyless,
+        };
+    }
+
     let upstream_balancer = selection.balancer;
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
@@ -17894,15 +18904,17 @@ async fn handle_proxy_request_inner(
             }
         };
 
-    // Finalize the body only after fail-fast routing and breaker gates have
-    // admitted the request. This preserves the open-breaker behavior (no slow
-    // upload drain or body-plugin I/O before the immediate 503) while still
-    // updating response buffering and transport preference before dispatch.
+    // For ordinary response-policy reevaluation, finalize the body only after
+    // fail-fast routing and breaker gates have admitted the request. This
+    // preserves the open-breaker behavior (no slow upload drain or body-plugin
+    // I/O before the immediate 503). Terminal dispatch plugins were finalized
+    // above and skip this second pass via `request_body_prepared`.
     let preparation_backend_host = upstream_target
         .as_deref()
         .map(|target| target.host.as_str())
         .unwrap_or(proxy.backend_host.as_str());
-    let preparation_requires_direct_h2_for_sni = reevaluate_response_policy_after_request_body
+    let preparation_requires_direct_h2_for_sni = !request_body_prepared
+        && reevaluate_response_policy_after_request_body
         && resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref())
             .resolved_tls
             .sni
@@ -17916,7 +18928,10 @@ async fn handle_proxy_request_inner(
         .is_some()
         || backend_dispatch::direct_http_mesh_transport_refusal(upstream_target.as_deref())
             .is_some();
-    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_dispatch_policy {
+    if reevaluate_response_policy_after_request_body
+        && !request_body_prepared
+        && !preparation_blocked_by_dispatch_policy
+    {
         if !backend_admission_plugins.is_empty() {
             let admission_proxy =
                 resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
@@ -18071,6 +19086,7 @@ async fn handle_proxy_request_inner(
                     }
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
+                    ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
                     if let Some(body) = request_body {
                         ctx.metadata.insert("request_body".to_string(), body);
                     }
@@ -18133,12 +19149,6 @@ async fn handle_proxy_request_inner(
     // Early-prepared bodies already ran both hook phases above.
     let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
         .then(|| ctx.clone_for_final_request_body_hooks());
-    // Keep only the independently owned header map borrowed across dispatch.
-    // When no owned map exists, borrow `ctx.headers` at each use so final-body
-    // deadline provenance can still update the rest of `ctx` without cloning
-    // the hot-path request headers.
-    let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
-
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
     // (plaintext `http` or TLS `https`) can serve WebSocket upgrades; the
@@ -18192,8 +19202,15 @@ async fn handle_proxy_request_inner(
                 ));
             }
         };
-        let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
-        let websocket_proxy_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
+        let requires_websocket_framing = plugin_cache_view.requires_ws_frame_hooks();
+        let mut websocket_proxy_headers =
+            owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        apply_effective_backend_scheme_headers(
+            &mut websocket_proxy_headers,
+            &ctx.client_ip,
+            ctx.request_is_secure,
+            state.add_forwarded_header,
+        );
         return handle_websocket_request_authenticated(
             request,
             state,
@@ -18216,7 +19233,7 @@ async fn handle_proxy_request_inner(
             mesh_inbound_pre_handshake_app_port,
             cb_target_key,
             cb_is_half_open_probe,
-            requires_ws_frame_hooks,
+            requires_websocket_framing,
             effective_query_string.to_string(),
             strip_len,
             backend_path_is_policy_bound,
@@ -18284,6 +19301,17 @@ async fn handle_proxy_request_inner(
             )
         });
     if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
+        {
+            let grpc_proxy_headers = owned_proxy_headers.as_mut().unwrap_or(&mut ctx.headers);
+            apply_effective_backend_scheme_headers(
+                grpc_proxy_headers,
+                &ctx.client_ip,
+                ctx.request_is_secure,
+                state.add_forwarded_header,
+            );
+        }
+        let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
+
         // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
         // branch cannot dispatch over its secured transport (issue #2003):
         //   * CROSS-CLUSTER east-west targets (Ambient `mesh.hbone` or Sidecar
@@ -18651,6 +19679,7 @@ async fn handle_proxy_request_inner(
                 // it). Disjoint field assignments avoid a whole-`ctx` borrow.
                 let request_body = ctx.metadata.remove("request_body");
                 ctx.metadata = body_hook_ctx.metadata;
+                ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
                 if let Some(body) = request_body {
                     ctx.metadata.insert("request_body".to_string(), body);
                 }
@@ -19835,6 +20864,7 @@ async fn handle_proxy_request_inner(
                         error_class: final_error_class,
                         bytes_sent,
                         metadata,
+                        ai_usage_export: ctx.ai_usage_export.clone(),
                         ..TransactionSummary::default()
                     };
                     if body_exceeded {
@@ -20602,6 +21632,7 @@ async fn handle_proxy_request_inner(
                         bytes_sent,
                         bytes_received,
                         metadata: clone_log_metadata(&ctx),
+                        ai_usage_export: ctx.ai_usage_export.clone(),
                         ..TransactionSummary::default()
                     };
                     crate::plugins::log_with_mirror_before_buffered_response(
@@ -20784,6 +21815,7 @@ async fn handle_proxy_request_inner(
                             error_class: Some(grpc_error_class),
                             bytes_sent,
                             metadata,
+                            ai_usage_export: ctx.ai_usage_export.clone(),
                             ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror_before_buffered_response(
@@ -20839,6 +21871,12 @@ async fn handle_proxy_request_inner(
             }
         }
     }
+
+    // Keep only the independently owned header map borrowed across the
+    // selected generic dispatch. When no owned map exists, borrow
+    // `ctx.headers` at each use so final-body deadline provenance can still
+    // update the rest of `ctx` without cloning the hot-path request headers.
+    let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
 
     // Build backend URL (using upstream target if available)
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
@@ -21150,7 +22188,7 @@ async fn handle_proxy_request_inner(
             request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
-            is_tls,
+            ctx.request_is_secure,
             false,
             false,
             current_dispatch_h3,
@@ -21168,6 +22206,7 @@ async fn handle_proxy_request_inner(
             // Disjoint field assignments avoid a whole-`ctx` borrow.
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
             if let Some(body) = request_body {
                 ctx.metadata.insert("request_body".to_string(), body);
             }
@@ -21496,7 +22535,7 @@ async fn handle_proxy_request_inner(
                     &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
-                    is_tls,
+                    ctx.request_is_secure,
                     inbound_version,
                 )
                 .await
@@ -21514,7 +22553,7 @@ async fn handle_proxy_request_inner(
                     &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
-                    is_tls,
+                    ctx.request_is_secure,
                     inbound_version,
                 )
                 .await
@@ -21558,7 +22597,7 @@ async fn handle_proxy_request_inner(
             request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
-            is_tls,
+            ctx.request_is_secure,
             current_dispatch_hbone,
             current_dispatch_mesh_mtls,
             current_dispatch_h3,
@@ -21576,6 +22615,7 @@ async fn handle_proxy_request_inner(
             // Disjoint field assignments avoid a whole-`ctx` borrow.
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
             if let Some(body) = request_body {
                 ctx.metadata.insert("request_body".to_string(), body);
             }
@@ -22216,6 +23256,7 @@ async fn handle_proxy_request_inner(
                 bytes_sent,
                 bytes_received: bytes_received_buffered,
                 metadata: clone_log_metadata(&ctx),
+                ai_usage_export: ctx.ai_usage_export.clone(),
                 ..TransactionSummary::default()
             };
 
@@ -23345,7 +24386,7 @@ pub(crate) async fn proxy_to_backend_retry(
     request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
     // Honor DestinationRule per-port `connect_timeout_ms` overrides for this
@@ -23522,7 +24563,7 @@ pub(crate) async fn proxy_to_backend_retry(
         xff_append_ip,
         &state.trusted_proxies,
     );
-    let proto_str = if is_tls { "https" } else { "http" };
+    let proto_str = if request_is_secure { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
@@ -24154,7 +25195,7 @@ async fn proxy_to_backend(
     request_body_prepared: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     dispatch_hbone: bool,
     dispatch_mesh_mtls: bool,
     dispatch_h3: bool,
@@ -24290,7 +25331,7 @@ async fn proxy_to_backend(
             stream_response,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
         )
@@ -24376,7 +25417,7 @@ async fn proxy_to_backend(
             stream_response,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
         )
@@ -24446,7 +25487,7 @@ async fn proxy_to_backend(
             upstream_target,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             inbound_version,
             stream_request_body,
             retain_request_body,
@@ -24689,7 +25730,7 @@ async fn proxy_to_backend(
                         stream_response,
                         client_ip,
                         xff_append_ip,
-                        is_tls,
+                        request_is_secure,
                         resolved_ip,
                         ctx_bytes_sent_observed,
                     )
@@ -24885,7 +25926,7 @@ async fn proxy_to_backend(
         xff_append_ip,
         &state.trusted_proxies,
     );
-    let proto_str = if is_tls { "https" } else { "http" };
+    let proto_str = if request_is_secure { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
@@ -26073,7 +27114,7 @@ fn normalize_authority_for_consistency(value: &str, scheme: Option<&str>) -> Opt
 /// Canonicalize a validated Host/`:authority` value for request signatures.
 /// Default ports are omitted so equivalent HTTP authorities have one signing
 /// representation; non-default ports and bracketed IPv6 literals are retained.
-pub(crate) fn normalize_request_authority_for_signing(
+pub fn normalize_request_authority_for_signing(
     value: &str,
     scheme: Option<&str>,
 ) -> Option<String> {
@@ -26757,7 +27798,7 @@ async fn proxy_to_backend_hbone(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (
@@ -27190,7 +28231,7 @@ async fn proxy_to_backend_hbone(
         "hbone",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -27213,7 +28254,7 @@ async fn proxy_to_backend_hbone(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -27456,7 +28497,7 @@ async fn proxy_to_backend_mesh_mtls(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (
@@ -28116,7 +29157,7 @@ async fn proxy_to_backend_mesh_mtls(
         "mesh_mtls",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -28139,7 +29180,7 @@ async fn proxy_to_backend_mesh_mtls(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -28564,7 +29605,7 @@ async fn proxy_to_backend_http2(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     // Shared counter for request body bytes. The H2 direct pool forwards
     // the body via hyper without the reqwest adapter layer, so we wrap
@@ -28702,7 +29743,7 @@ async fn proxy_to_backend_http2(
         "direct_h2",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -28725,7 +29766,7 @@ async fn proxy_to_backend_http2(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -28915,7 +29956,7 @@ struct Http3BackendHeaderContext<'a> {
     client_ip: &'a str,
     xff_append_ip: &'a str,
     effective_host: &'a str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
     content_length: Option<&'a str>,
 }
@@ -28988,7 +30029,11 @@ fn build_http3_backend_headers(
     if let Ok(v) = xff.parse() {
         http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
     }
-    let proto = if ctx.is_tls { "https" } else { "http" };
+    let proto = if ctx.request_is_secure {
+        "https"
+    } else {
+        "http"
+    };
     if let Ok(v) = proto.parse() {
         http3_headers.push((
             hyper::header::HeaderName::from_static("x-forwarded-proto"),
@@ -29045,7 +30090,7 @@ async fn proxy_to_backend_http3(
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
     stream_request_body: bool,
     retain_request_body: bool,
@@ -29142,7 +30187,7 @@ async fn proxy_to_backend_http3(
                         client_ip,
                         xff_append_ip,
                         effective_host,
-                        is_tls,
+                        request_is_secure,
                         inbound_version,
                         content_length: headers.get("content-length").map(String::as_str),
                     },
@@ -29502,7 +30547,7 @@ async fn proxy_to_backend_http3(
             client_ip,
             xff_append_ip,
             effective_host,
-            is_tls,
+            request_is_secure,
             inbound_version,
             content_length: request_content_length.as_deref(),
         },
@@ -30130,7 +31175,7 @@ async fn proxy_to_backend_http3_retry(
     request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
     // reqwest dispatch receives `upstream_target` separately, so it only
@@ -30178,7 +31223,7 @@ async fn proxy_to_backend_http3_retry(
             client_ip,
             xff_append_ip,
             effective_host,
-            is_tls,
+            request_is_secure,
             inbound_version,
             content_length: None,
         },
@@ -32430,10 +33475,12 @@ mod tests {
             "model": "gpt-test",
             "messages": [{"role": "user", "content": "hello"}]
         });
+        let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
         let mut ctx = request_ctx_with_ai_body(request_body);
-        let mut headers =
-            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let synthetic = plugins[0].before_proxy(&mut ctx, &mut headers).await;
+        let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let synthetic = plugins[0]
+            .on_final_request_body_with_context(&mut ctx, &headers, &request_body_bytes)
+            .await;
 
         let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
 
@@ -33681,7 +34728,7 @@ mod tests {
                 false, // request_body_prepared
                 "127.0.0.1",
                 "127.0.0.1",
-                false, // is_tls
+                false, // request_is_secure
                 false, // dispatch_hbone
                 false, // dispatch_mesh_mtls
                 false, // dispatch_h3
@@ -33866,7 +34913,7 @@ mod tests {
                 client_ip: "203.0.113.44",
                 xff_append_ip: "127.0.0.1",
                 effective_host: "backend.internal",
-                is_tls: false,
+                request_is_secure: false,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,
             },
@@ -33914,7 +34961,7 @@ mod tests {
                 client_ip: "203.0.113.9",
                 xff_append_ip: "10.0.0.7",
                 effective_host: "h3-backend.example",
-                is_tls: true,
+                request_is_secure: true,
                 inbound_version: hyper::Version::HTTP_2,
                 content_length: None,
             },

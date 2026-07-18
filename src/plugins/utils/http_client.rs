@@ -11,6 +11,8 @@
 //! - **HTTP/2 multiplexing**: Multiple log/metric streams over one connection
 //! - **Idle timeout**: Stale connections cleaned up automatically
 //! - **DNS caching**: Uses the gateway's `DnsCache` for shared, warmed DNS
+//! - **No ambient proxy discovery**: standard client builders ignore
+//!   process-level proxy environment variables
 //! - **No redirect following**: outbound calls reach only the configured
 //!   endpoint; server-chosen 3xx targets (e.g. a cloud metadata IP) are never
 //!   followed — SSRF defense-in-depth
@@ -57,6 +59,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Sanitized failure from a redacted plugin HTTP request.
+///
+/// `request_reached_wire` is false for request-construction failures and for
+/// transport classes that prove no request bytes reached the destination. A
+/// caller sending a non-idempotent request can use this boundary to avoid
+/// replaying ambiguous outcomes.
+#[derive(Debug, Clone, Copy)]
+pub struct PluginHttpFailure {
+    pub error_class: ErrorClass,
+    pub request_reached_wire: bool,
+}
+
 /// Shared, pooled HTTP client for plugin outbound calls.
 ///
 /// Wraps a `reqwest::Client` configured with the gateway's connection pool
@@ -99,6 +113,10 @@ pub struct PluginHttpClient {
     /// collisions when multiple gateway instances with different namespaces share
     /// the same external backend.
     namespace: String,
+    /// Effective authoritative client-IP header after env/conf precedence and
+    /// normalization. Plugin construction uses this cold-path value to keep
+    /// correlation writers from claiming gateway-owned attribution state.
+    real_ip_header: Option<String>,
     /// Resolved backend IP policy (`FERRUM_BACKEND_ALLOW_IPS` after CLI/env/conf
     /// precedence). Used by plugins that validate outbound endpoints outside the
     /// proxy backend path.
@@ -375,6 +393,7 @@ impl PluginHttpClient {
             tls_ca_bundle_path: tls_ca_bundle_path.map(|s| s.to_string()),
             tls_crls,
             namespace: namespace.to_string(),
+            real_ip_header: None,
             backend_allow_ips,
             mesh_egress_strip_baggage_keys,
             bpf_metrics_state: None,
@@ -459,6 +478,7 @@ impl PluginHttpClient {
             tls_ca_bundle_path: None,
             tls_crls: Arc::new(Vec::new()),
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
+            real_ip_header: None,
             backend_allow_ips: BackendEgressPolicy::unrestricted(),
             mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
             bpf_metrics_state: None,
@@ -515,6 +535,19 @@ impl PluginHttpClient {
             Arc::new(Vec::new()),
             0, // pool_shard_amount → auto
         )
+    }
+
+    /// Carry the already-resolved authoritative real-IP header into plugin
+    /// construction and candidate admission. This remains cache-build state;
+    /// request handling continues to use `EnvConfig` directly.
+    pub(crate) fn with_real_ip_header(mut self, real_ip_header: Option<String>) -> Self {
+        self.real_ip_header = real_ip_header;
+        self
+    }
+
+    /// Effective authoritative real-IP header for cold-path plugin validation.
+    pub(crate) fn real_ip_header(&self) -> Option<&str> {
+        self.real_ip_header.as_deref()
     }
 
     /// Build a plugin HTTP client from pool config with custom slow-call and
@@ -718,6 +751,39 @@ impl PluginHttpClient {
             .map_err(|e| {
                 let error_class = classify_reqwest_error(&e);
                 format!("{error_class} calling {redacted_url}")
+            })
+    }
+
+    /// Send a redacted, latency-tracked request while retaining a replay-safety
+    /// classification for non-idempotent callers.
+    pub async fn execute_redacted_tracked_classified(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+        redacted_url: &str,
+        accumulator: &AtomicU64,
+    ) -> Result<reqwest::Response, PluginHttpFailure> {
+        let request = request.build().map_err(|error| PluginHttpFailure {
+            error_class: classify_reqwest_error(&error),
+            request_reached_wire: false,
+        })?;
+        self.execute_request(request, label, Some(accumulator), Some(redacted_url))
+            .await
+            .map_err(|error| {
+                let error_class = classify_reqwest_error(&error);
+                PluginHttpFailure {
+                    error_class,
+                    // `DispatchPolicyRejected` is intentionally treated as a
+                    // post-wire class by the backend retry machinery so a
+                    // terminal route policy rejection is never amplified.
+                    // Here the caller needs the literal provider-I/O boundary:
+                    // a DnsCacheResolver egress denial happens before any dial,
+                    // so a non-idempotent provider request remains safe to send
+                    // to a configured fallback.
+                    request_reached_wire: error_class
+                        != crate::retry::ErrorClass::DispatchPolicyRejected
+                        && crate::retry::request_reached_wire(error_class),
+                }
             })
     }
 

@@ -4832,6 +4832,16 @@ impl EnvConfig {
     }
 }
 
+/// Resolve the effective authoritative client-IP header for cold paths that
+/// do not own an `EnvConfig` (notably CP snapshot and admin admission). This
+/// uses the same env-over-conf precedence as startup and matches the lowercase
+/// normalization stored in `EnvConfig::real_ip_header`. CP config sync rejects
+/// DPs that do not explicitly advertise this same cluster ownership value.
+pub(crate) fn resolve_real_ip_header() -> Option<String> {
+    crate::config::conf_file::resolve_ferrum_var("FERRUM_REAL_IP_HEADER")
+        .map(|header| header.to_ascii_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

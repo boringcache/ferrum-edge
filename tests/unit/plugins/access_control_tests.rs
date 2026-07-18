@@ -16,27 +16,17 @@ use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 fn create_stream_context(
     consumer: Option<Arc<Consumer>>,
 ) -> ferrum_edge::plugins::StreamConnectionContext {
-    ferrum_edge::plugins::StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "tcp-proxy".to_string(),
-        proxy_name: Some("TCP Proxy".to_string()),
-        listen_port: 5432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
-        identified_consumer: consumer,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    let mut ctx = ferrum_edge::plugins::StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "tcp-proxy".to_string(),
+        Some("TCP Proxy".to_string()),
+        5432,
+        BackendScheme::Tcp,
+        Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    );
+    ctx.identified_consumer = consumer;
+    ctx
 }
 
 fn make_consumer_with_groups(username: &str, groups: Vec<&str>) -> Consumer {

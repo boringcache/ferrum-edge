@@ -355,6 +355,7 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
 
     let secret_key = "super-secret-load-test-key";
     let nested_api_key = "nested-api-key-value";
+    let service_account_json = r#"{"private_key":"federation-private-key"}"#;
     let plugin = json!({
         "id": "audit-plugin-secret",
         "plugin_name": "load_testing",
@@ -365,6 +366,7 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
             "duration_seconds": 1,
             "nested": {
                 "api_key": nested_api_key,
+                "google_service_account_json": service_account_json,
                 "label": "safe-label"
             }
         }
@@ -388,6 +390,10 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
         "[REDACTED]"
     );
     assert_eq!(
+        event["diff"]["after"]["config"]["nested"]["google_service_account_json"],
+        "[REDACTED]"
+    );
+    assert_eq!(
         event["diff"]["after"]["config"]["nested"]["label"],
         "safe-label"
     );
@@ -399,6 +405,10 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
     assert!(
         !serialized.contains(nested_api_key),
         "nested API key leaked: {event:?}"
+    );
+    assert!(
+        !serialized.contains(service_account_json),
+        "service account JSON leaked: {event:?}"
     );
 }
 
@@ -413,6 +423,7 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
 
     let secret_key = "read-secret-load-test-key";
     let nested_api_key = "read-nested-api-key-value";
+    let service_account_json = r#"{"private_key":"federation-private-key"}"#;
     let plugin = json!({
         "id": "read-plugin-secret",
         "plugin_name": "load_testing",
@@ -423,6 +434,7 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
             "duration_seconds": 1,
             "nested": {
                 "api_key": nested_api_key,
+                "google_service_account_json": service_account_json,
                 "label": "safe-label"
             }
         }
@@ -436,6 +448,10 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
     assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
     assert_eq!(viewer_body["config"]["key"], "[REDACTED]");
     assert_eq!(viewer_body["config"]["nested"]["api_key"], "[REDACTED]");
+    assert_eq!(
+        viewer_body["config"]["nested"]["google_service_account_json"],
+        "[REDACTED]"
+    );
     assert!(
         !viewer_body.to_string().contains(secret_key),
         "viewer response leaked plugin secret: {viewer_body:?}"
@@ -443,6 +459,10 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
     assert!(
         !viewer_body.to_string().contains(nested_api_key),
         "viewer response leaked nested plugin secret: {viewer_body:?}"
+    );
+    assert!(
+        !viewer_body.to_string().contains(service_account_json),
+        "viewer response leaked service account JSON: {viewer_body:?}"
     );
 
     let (status, operator_body) =

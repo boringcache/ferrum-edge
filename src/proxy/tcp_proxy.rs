@@ -1383,41 +1383,27 @@ async fn run_tcp_accept_loop(
 
                     // Build stream context — plugins run inside handle_tcp_connection
                     // (after TLS handshake for TLS proxies, so client cert is available).
-                    let mut stream_ctx = StreamConnectionContext {
-                        client_ip: client_ip.clone(),
+                    let mut stream_ctx = StreamConnectionContext::new(
+                        client_ip.clone(),
                         // `direct_client_ip` is always the raw socket peer. When PROXY
                         // protocol is active `client_ip` may differ (forwarded source IP).
-                        direct_client_ip: direct_client_ip.clone(),
-                        canonical_client_ip: Default::default(),
-                        proxy_id: proxy_id.to_string(),
-                        proxy_name: base_proxy.and_then(|p| p.name.clone()),
-                        listen_port: port,
-                        backend_scheme: base_proxy
+                        direct_client_ip.clone(),
+                        proxy_id.to_string(),
+                        base_proxy.and_then(|p| p.name.clone()),
+                        port,
+                        base_proxy
                             .map(|p| p.effective_scheme())
                             .unwrap_or(BackendScheme::Tcp),
                         consumer_index,
-                        identified_consumer: None,
-                        authenticated_identity: None,
-                        auth_method: None,
-                        metadata: None,
-                        tls_client_cert_der: None,
-                        tls_client_cert_chain_der: None,
-                        sni_hostname: None,
-                        mesh_direction: None,
-                        // Populated above from the node-waypoint resolver in
-                        // NodeWaypoint topology so `mesh_authz` enforces
-                        // namespace/selector-scoped policies per source pod
-                        // (parity with the HTTP/HBONE path). `None` for every
-                        // other topology and non-mesh TCP proxies, and when the
-                        // connection's source pod identity cannot be resolved
-                        // (mesh-wide-only fallback + `mesh_authz.scope_missing`).
-                        node_waypoint_policy_scope,
-                        // Populated later (after frontend handshake / peek, before
-                        // on_stream_connect) when a plugin opts into first-bytes
-                        // inspection via requires_stream_first_bytes().
-                        first_bytes: None,
-                        first_bytes_kind: None,
-                    };
+                    );
+                    // Populated above from the node-waypoint resolver in
+                    // NodeWaypoint topology so `mesh_authz` enforces
+                    // namespace/selector-scoped policies per source pod
+                    // (parity with the HTTP/HBONE path). `None` for every
+                    // other topology and non-mesh TCP proxies, and when the
+                    // connection's source pod identity cannot be resolved
+                    // (mesh-wide-only fallback + `mesh_authz.scope_missing`).
+                    stream_ctx.node_waypoint_policy_scope = node_waypoint_policy_scope;
                     // In node-waypoint topology the resolved pod SPIFFE ID is
                     // the authenticated source principal for this connection
                     // (mirrors `RequestContext.peer_spiffe_id` on the HTTP
@@ -1460,6 +1446,9 @@ async fn run_tcp_accept_loop(
                         mesh_enforcement_snapshot.as_ref(),
                     )
                     .await;
+                    // The transport has ended. Release admission capacity before
+                    // awaiting disconnect observers, which may perform network I/O.
+                    stream_ctx.release_admission_permits();
 
                     let duration_ms = connected_at.elapsed().as_millis() as f64;
                     let final_proxy_id = stream_ctx.proxy_id.clone();
@@ -1899,6 +1888,7 @@ async fn run_tcp_stream_connect_plugins(
             tokio::select! {
                 result = plugin.on_stream_connect(stream_ctx) => result,
                 () = wait_for_tcp_peer_reset(client_stream) => {
+                    stream_ctx.release_admission_permits();
                     return Err(StreamSetupError::new(
                         StreamSetupKind::ClientDisconnectedDuringAdmission,
                         connection_label,
@@ -1909,6 +1899,7 @@ async fn run_tcp_stream_connect_plugins(
             plugin.on_stream_connect(stream_ctx).await
         };
         if let PluginResult::Reject { .. } = result {
+            stream_ctx.release_admission_permits();
             debug!(
                 proxy_id = %proxy_id,
                 client = %client_ip,

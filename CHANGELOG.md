@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added release governance requiring version tags to match the package version and
   requiring build-out breaking changes to be recorded here.
+- Hardened `tcp_connection_throttle` config loading to fail closed for
+  unsupported-only global targets, non-TCP scoped attachments, unknown config
+  fields, and cleanup intervals above 86400 seconds. Existing deployments must
+  remediate these rows before upgrade; see the
+  [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
 ## [0.9.0]
 
