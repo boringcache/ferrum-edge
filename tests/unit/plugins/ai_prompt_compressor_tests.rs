@@ -1,5 +1,6 @@
 //! Tests for the ai_prompt_compressor plugin.
 
+use ferrum_edge::_test_support::ai_prompt_compressor_marker_scan_work_for_test;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext,
     ai_prompt_compressor::AiPromptCompressor, compression::CompressionPlugin, priority,
@@ -957,6 +958,166 @@ async fn escaped_preserve_markers_are_removed_without_json_canonicalization() {
         output,
         br#"{ "messages": [{"role":"user","content":"before critical after"}], "n": 1e8 }"#
     );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn preserve_marker_cleanup_never_rewrites_json_member_names() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let raw = br#"{"messages":[{"role":"user","content":"<keep>short</keep>"}],"tool<keep>s":[],"response_format<keep>":{"type":"json_object"}}"#;
+    let output = plugin
+        .transform_request_body(raw, Some("application/json"), &json_headers())
+        .await
+        .expect("prompt markers must be sanitized");
+
+    assert_eq!(
+        output,
+        br#"{"messages":[{"role":"user","content":"short"}],"tool<keep>s":[],"response_format<keep>":{"type":"json_object"}}"#,
+        "sanitation must not create backend-visible object members"
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn preserve_marker_cleanup_preserves_member_name_bytes_across_json_shapes() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let raw = br#"{
+  "messages" : [{"role":"user","content":"say \"<keep>short</keep>\\done"}],
+  "tool<keep>s" : {
+    "quote\"<keep>key" : "<keep>one</keep>",
+    "slash\\<keep>key": "\u003ckeep\u003etwo\u003c\/keep\u003e",
+    "\u006bey\u003ckeep\u003e": [
+      {"nested<keep>" : "<keep>three</keep>"},
+      "<keep>array</keep>"
+    ]
+  },
+  "dup<keep>" : "first<keep>value</keep>",
+  "dup<keep>" : "second</keep>"
+}"#;
+    let output = plugin
+        .transform_request_body(raw, Some("application/json"), &json_headers())
+        .await
+        .expect("every JSON string value must be sanitized");
+
+    assert_eq!(
+        output,
+        br#"{
+  "messages" : [{"role":"user","content":"say \"short\\done"}],
+  "tool<keep>s" : {
+    "quote\"<keep>key" : "one",
+    "slash\\<keep>key": "two",
+    "\u006bey\u003ckeep\u003e": [
+      {"nested<keep>" : "three"},
+      "array"
+    ]
+  },
+  "dup<keep>" : "firstvalue",
+  "dup<keep>" : "second"
+}"#,
+        "keys, duplicate members, escapes, whitespace, and nesting must remain byte-exact"
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn preserve_marker_cleanup_scans_large_literal_unicode_strings_linearly() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let unicode_key = format!("{}<keep>key", "鍵".repeat(32_768));
+    let unicode_value = "値".repeat(32_768);
+    let raw = format!(
+        "{{\"messages\":[{{\"role\":\"user\",\"content\":\"short\"}}],\"{unicode_key}\":\"<keep>{unicode_value}</keep>\"}}"
+    );
+    let expected = format!(
+        "{{\"messages\":[{{\"role\":\"user\",\"content\":\"short\"}}],\"{unicode_key}\":\"{unicode_value}\"}}"
+    );
+
+    let output = plugin
+        .transform_request_body(raw.as_bytes(), Some("application/json"), &json_headers())
+        .await
+        .expect("large literal Unicode strings must be sanitized");
+
+    assert_eq!(output, expected.as_bytes());
+
+    let (instrumented_output, utf8_validation_bytes, scalar_scan_bytes) =
+        ai_prompt_compressor_marker_scan_work_for_test(raw.as_bytes(), "keep")
+            .expect("the instrumented production scanner must sanitize the same body");
+    assert_eq!(instrumented_output, expected.as_bytes());
+    // The scanner retains a validated `&str`; restoring validation of every
+    // remaining non-ASCII suffix would make this count quadratic.
+    assert_eq!(
+        utf8_validation_bytes,
+        raw.len(),
+        "UTF-8 validation must examine the bounded body exactly once"
+    );
+    assert!(
+        scalar_scan_bytes <= raw.len().saturating_mul(4),
+        "scalar scanner work must remain linear: {scalar_scan_bytes} units for {} input bytes",
+        raw.len()
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn preserve_markers_in_member_names_alone_do_not_trigger_a_rewrite() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let raw = br#"{"messages":[{"role":"user","content":"plain"}],"only<keep>key":1,"\u003ckeep\u003e":2}"#;
+
+    assert!(
+        plugin
+            .transform_request_body(raw, Some("application/json"), &json_headers())
+            .await
+            .is_none(),
+        "markers confined to member names must leave the original representation untouched"
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn malformed_or_truncated_json_never_reaches_member_name_sanitation() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let malformed: &[&[u8]] = &[
+        br#"{"messages":[{"role":"user","content":"<keep>value</keep>"}],"unterminated<keep>:"#,
+        br#"{"messages":[{"role":"user","content":"<keep>value</keep>"}],"escape\<keep>":"x"}"#,
+        br#"{"messages":[{"role":"user","content":"<keep>value</keep>"}],"unicode\u003":"x"}"#,
+        br#"{"messages":[{"role":"user","content":"<keep>value</keep>"}],"key":"unterminated<keep>}"#,
+        br#"{"messages":[{"role":"user","content":"<keep>value</keep>"}]"#,
+    ];
+
+    for raw in malformed {
+        assert!(
+            plugin
+                .transform_request_body(raw, Some("application/json"), &json_headers())
+                .await
+                .is_none(),
+            "malformed input must remain an unchanged passthrough: {:?}",
+            String::from_utf8_lossy(raw)
+        );
+    }
 }
 
 #[tokio::test]
