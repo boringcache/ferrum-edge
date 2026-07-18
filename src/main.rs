@@ -493,6 +493,19 @@ fn resolve_startup_secrets() -> Result<secrets::ResolvedEnvSecrets, String> {
             std::env::remove_var(suffixed_key);
         }
     }
+
+    // Record which base variables now hold externally resolved material, before
+    // any configuration is parsed. Everything downstream that renders a config
+    // failure — `EnvConfig`'s typed parse boundary and the sanitizers on the
+    // `validate`/`run` error paths — keys off this set to withhold the value
+    // while still naming the variable.
+    secrets::record_external_secret_keys(
+        resolved
+            .vars
+            .iter()
+            .map(|(base_key, _value)| base_key.to_string()),
+    );
+
     Ok(resolved)
 }
 
@@ -595,7 +608,15 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         match cli::execute_validate() {
             Ok(()) => return 0,
             Err(e) => {
-                error!("Validation error: {}", e);
+                // Settings and spec validation run against an environment that
+                // now contains externally resolved secrets, and their messages
+                // interpolate the offending value. Filter the rendered failure
+                // against the keys resolved above so `validate` cannot echo
+                // fetched secret material.
+                error!(
+                    "Validation error: {}",
+                    secrets::redact_external_secret_values(&e)
+                );
                 return 1;
             }
         }
@@ -665,7 +686,12 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     let env_config = match EnvConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
-            error!("Configuration error: {}", e);
+            // Same redaction contract as `validate`: a settings failure on an
+            // externally resolved variable names the variable, never its value.
+            error!(
+                "Configuration error: {}",
+                secrets::redact_external_secret_values(&e)
+            );
             return 1;
         }
     };

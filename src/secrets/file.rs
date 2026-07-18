@@ -18,16 +18,20 @@ pub fn resolve_ref(key: &str) -> Option<String> {
 /// Read a secret value from a file path. Trims trailing whitespace
 /// (trailing newlines are common in Docker secrets and heredocs).
 /// Returns an error if the file cannot be read or is empty after trimming.
+///
+/// The errors name the suffixed variable and the `io::Error` reason ("No such
+/// file or directory", "Permission denied") but never the path itself: a
+/// secret's source reference is treated as sensitive alongside its value, and
+/// `run` logs / `validate` prints this text. `std::fs::read_to_string` does not
+/// attach the path to its `io::Error`, so the reason is safe to forward
+/// verbatim.
 pub fn read_secret(path: &str, key: &str) -> Result<String, String> {
     let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {}_FILE from '{}': {}", key, path, e))?;
+        .map_err(|e| format!("Failed to read {}_FILE: {}", key, e))?;
 
     let trimmed = content.trim_end().to_string();
     if trimmed.is_empty() {
-        return Err(format!(
-            "File '{}' (from {}_FILE) is empty after trimming",
-            path, key
-        ));
+        return Err(format!("{}_FILE source is empty after trimming", key));
     }
 
     Ok(trimmed)

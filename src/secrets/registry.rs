@@ -21,7 +21,44 @@ use super::{env, file};
 
 /// Only scan environment variables with this prefix.
 const FERRUM_PREFIX: &str = "FERRUM_";
+
 const NON_SECRET_FILE_SUFFIX_KEYS: &[&str] = &["FERRUM_DNS_RESOLVER_HOSTS_FILE"];
+
+/// Substituted for a secret's source reference in an operator-facing error.
+const REDACTED_REFERENCE: &str = "<redacted source reference>";
+
+/// Strip a secret's source reference out of a backend error before it reaches
+/// an operator.
+///
+/// A source reference — a file path, a Vault path, an ARN, a Key Vault URL — is
+/// treated as sensitive alongside the value it points at: `run` logs this text
+/// and `validate` prints it, while the success report deliberately reports the
+/// base key and provider name only. Ferrum's own leaf errors no longer
+/// interpolate the reference, but provider SDK errors are outside our control
+/// and routinely echo the resource they were asked for, so the reference is
+/// removed here as well. This is the single boundary every startup fetch passes
+/// through, so a new backend cannot bypass it.
+///
+/// Both the full reference and its pre-`#` path half are replaced, longest
+/// first, so a `path#field` reference cannot leak its path. Very short
+/// references are left alone: they carry no meaningful location and replacing a
+/// one- or two-character substring would corrupt unrelated text.
+fn redact_source_reference(mut error: String, reference: &str) -> String {
+    const MIN_REDACTABLE_REFERENCE_LEN: usize = 3;
+
+    let mut candidates = vec![reference];
+    if let Some((path, _field)) = reference.split_once('#') {
+        candidates.push(path);
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.len()));
+
+    for candidate in candidates {
+        if candidate.len() >= MIN_REDACTABLE_REFERENCE_LEN && error.contains(candidate) {
+            error = error.replace(candidate, REDACTED_REFERENCE);
+        }
+    }
+    error
+}
 
 /// Default timeout (seconds) for individual secret fetch operations from cloud backends.
 const DEFAULT_SECRET_FETCH_TIMEOUT_SECS: u64 = 30;
@@ -47,12 +84,24 @@ pub struct ResolvedSecret {
 }
 
 /// The result of resolving all env-based secrets at startup.
+///
+/// Every vector is sorted by base key. Candidate sources are discovered by
+/// iterating `std::env::vars()` into a `HashMap`, whose order varies between
+/// processes, so an unsorted result would let two runs of `ferrum-edge
+/// validate` on identical input print the `Loaded <KEY> from <provider>` lines
+/// in different orders. Base keys are unique across the result (two sources for
+/// one base key is a conflict error), so ordering by base key is total and
+/// stable. See [`resolve_all_env_secrets`].
 pub struct ResolvedEnvSecrets {
     /// Resolved `(base_key, value)` pairs to inject into the environment.
+    /// Sorted by base key.
     pub vars: Vec<(String, String)>,
-    /// Suffixed source keys (e.g., `FERRUM_X_FILE`) to remove from the environment.
+    /// Suffixed source keys (e.g., `FERRUM_X_FILE`) to remove from the
+    /// environment. Sorted lexicographically, which is base-key order because a
+    /// suffixed key is its base key plus a fixed provider suffix.
     pub source_keys_to_remove: Vec<String>,
-    /// `(base_key, backend display name)` pairs to log once tracing is initialized.
+    /// `(base_key, backend display name)` pairs to report once tracing is
+    /// initialized. Sorted by base key.
     pub loaded_sources: Vec<(String, &'static str)>,
 }
 
@@ -132,7 +181,8 @@ pub(crate) trait SecretBackend: Sync + Send {
                     self.display_name(),
                     timeout.as_secs()
                 )
-            })??;
+            })?
+            .map_err(|error| redact_source_reference(error, &secret.reference))?;
             resolved.push(ResolvedPendingSecret {
                 base_key: secret.base_key.clone(),
                 value,
@@ -254,7 +304,8 @@ where
             let value =
                 tokio::time::timeout(timeout, fetch(client, &secret.reference, &secret.base_key))
                     .await
-                    .map_err(|_| timeout_error(&secret.base_key, backend_name, timeout))??;
+                    .map_err(|_| timeout_error(&secret.base_key, backend_name, timeout))?
+                    .map_err(|error| redact_source_reference(error, &secret.reference))?;
             Ok::<_, String>(ResolvedPendingSecret {
                 base_key: secret.base_key.clone(),
                 value,
@@ -346,7 +397,15 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
 
     let mut pending: Vec<PendingSecret> = Vec::new();
 
-    for (base_key, sources) in &to_resolve {
+    // Iterate base keys in sorted order rather than `HashMap` order. This fixes
+    // both which conflict is reported first when several keys are misconfigured
+    // and the order of the resolved results, so two runs on identical input
+    // produce byte-identical output. See [`ResolvedEnvSecrets`].
+    let mut base_keys: Vec<&String> = to_resolve.keys().collect();
+    base_keys.sort();
+
+    for base_key in base_keys {
+        let sources = &to_resolve[base_key];
         let direct_set = std::env::var(base_key)
             .ok()
             .filter(|s| !s.is_empty())
@@ -355,11 +414,16 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
         let total_sources = sources.len() + if direct_set { 1 } else { 0 };
         if total_sources > 1 {
             let mut names: Vec<String> = Vec::new();
-            if direct_set {
-                names.push("direct env var".to_string());
-            }
             for (suffixed_key, _, _) in sources {
                 names.push(suffixed_key.clone());
+            }
+            // Suffixed sources arrive in `std::env::vars()` order; sort them so
+            // the conflict message is byte-identical across processes. The
+            // direct variable is prepended afterwards because it is the source
+            // an operator is most likely to have forgotten about.
+            names.sort();
+            if direct_set {
+                names.insert(0, "direct env var".to_string());
             }
             return Err(format!(
                 "Multiple secret sources configured for {}: {}. Only one source is allowed.",
@@ -370,7 +434,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
 
         let (suffixed_key, reference, backend) = &sources[0];
         pending.push(PendingSecret {
-            base_key: base_key.clone(),
+            base_key: base_key.to_string(),
             reference: reference.clone(),
             suffixed_key: suffixed_key.clone(),
             backend_kind: *backend,
@@ -408,6 +472,16 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             results.source_keys_to_remove.push(item.suffixed_key);
         }
     }
+
+    // Results are accumulated provider by provider, so they are grouped by
+    // backend rather than ordered by base key. Sort them into the documented
+    // base-key order: this is what `validate` prints, and an operator diffing
+    // two reports must not see spurious reordering.
+    results.vars.sort_by(|left, right| left.0.cmp(&right.0));
+    results
+        .loaded_sources
+        .sort_by(|left, right| left.0.cmp(&right.0));
+    results.source_keys_to_remove.sort();
 
     Ok(results)
 }
@@ -447,7 +521,8 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
 
     let value = tokio::time::timeout(secret_fetch_timeout(), backend.resolve_one(&reference, key))
         .await
-        .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))??;
+        .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))?
+        .map_err(|error| redact_source_reference(error, &reference))?;
 
     if backend.log_loaded() {
         info!("Loaded {} from {}", key, backend.display_name());
@@ -488,7 +563,8 @@ pub async fn resolve_external_reference(
 
     let value = tokio::time::timeout(secret_fetch_timeout(), backend.resolve_one(reference, key))
         .await
-        .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))??;
+        .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))?
+        .map_err(|error| redact_source_reference(error, reference))?;
 
     if backend.log_loaded() {
         info!("Loaded {} from {}", key, backend.display_name());

@@ -82,21 +82,16 @@ async fn fetch_with_client(
         .set_name(reference)
         .send()
         .await
-        .map_err(|e| {
-            format!(
-                "Failed to access GCP secret '{}' for {}: {}",
-                reference, key, e
-            )
-        })?;
+        // Errors name the base key and the failure class only — the resource
+        // name is the source reference and is treated as sensitive. The
+        // registry additionally redacts any residual occurrence echoed back by
+        // the SDK error itself.
+        .map_err(|e| format!("Failed to access GCP secret for {}: {}", key, e))?;
 
     let payload = response
         .payload
-        .ok_or_else(|| format!("GCP secret '{}' has no payload for {}", reference, key))?;
+        .ok_or_else(|| format!("GCP secret for {} has no payload", key))?;
 
-    String::from_utf8(payload.data.to_vec()).map_err(|e| {
-        format!(
-            "GCP secret '{}' for {} is not valid UTF-8: {}",
-            reference, key, e
-        )
-    })
+    String::from_utf8(payload.data.to_vec())
+        .map_err(|e| format!("GCP secret for {} is not valid UTF-8: {}", key, e))
 }

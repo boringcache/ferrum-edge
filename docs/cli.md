@@ -102,6 +102,11 @@ Validation passed.
 ```
 
 `run` reports the same non-secret facts as structured `info!` records instead, so serving modes keep normal log-level semantics.
+
+The report lines are sorted by base variable name. Candidate sources are discovered by iterating the environment into a hash map, so without an explicit sort two runs on identical input could list them in different orders; sorting keeps `validate` output diffable between machines and CI runs.
+
+Failures are held to the same disclosure rule as the success report. A failed fetch names the base variable, the provider, and the failure reason — an unreadable `_FILE` source reports `Failed to read FERRUM_X_FILE: No such file or directory` — but never the source reference itself, even when a provider SDK echoes the resource it was asked for. Once external values are materialized into the environment they are also withheld from *subsequent* settings and spec diagnostics: a malformed `FERRUM_DB_PORT_FILE` reports `Invalid FERRUM_DB_PORT value <redacted: value from external secret source>. Expected a valid u16 integer` rather than printing the fetched secret. Variables that were not resolved from an external source are unaffected and still show their value, which is usually the fastest way to spot a typo.
+
 1. **Settings** (`ferrum.conf`) — all 300+ environment variables are parsed and validated (ports, paths, TLS configuration, pool sizes, etc.)
 2. **Spec** (resources YAML/JSON, file mode only):
    - YAML/JSON syntax and deserialization

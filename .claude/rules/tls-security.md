@@ -93,6 +93,9 @@ paths:
 - Backends are grouped per provider so one client is reused.
 - Two providers setting the same base key is a conflict and must fail.
 - Do not expose resolved secret values in errors or logs.
+- Do not expose a secret's *source reference* either — file paths, Vault paths, ARNs, Key Vault URLs. Backend errors are sanitized at one boundary in `src/secrets/registry.rs` (`redact_source_reference`), which every startup and single-key fetch passes through; leaf backends additionally do not interpolate the reference themselves. Errors stay at base-key + provider + failure-class level.
+- Resolved values must not resurface in later config diagnostics. `secrets::record_external_secret_keys()` records the externally loaded base keys before config load; `config::env_config_macro::invalid_env_value` withholds the value for those keys, and `secrets::redact_external_secret_values()` filters the final rendered `validate`/`run` failure as a backstop.
+- `ResolvedEnvSecrets` vectors are sorted by base key. Candidate discovery iterates a `HashMap`, so reporting order would otherwise vary between processes.
 
 ## Identity And SPIFFE
 

@@ -164,6 +164,151 @@ fn test_resolve_all_env_secrets_resolves_multiple_file_sources() {
     );
 }
 
+/// `resolve_all_env_secrets` discovers sources by iterating `std::env::vars()`
+/// into a `HashMap`, so without an explicit sort the resolved vectors — and the
+/// `Loaded <KEY> from <provider>` lines `validate` prints from them — can
+/// reorder between processes on identical input.
+///
+/// The three sources are staged in deliberately non-alphabetical order, and the
+/// assertions are on the exact sequence, not on set membership. Results are
+/// filtered to this test's own prefix so an unrelated `FERRUM_*_FILE` in the
+/// runner environment cannot make the assertion vacuous or flaky.
+#[test]
+fn test_resolve_all_env_secrets_orders_results_by_base_key() {
+    let mut tmp_c = NamedTempFile::new().unwrap();
+    let mut tmp_a = NamedTempFile::new().unwrap();
+    let mut tmp_b = NamedTempFile::new().unwrap();
+    writeln!(tmp_c, "order-charlie").unwrap();
+    writeln!(tmp_a, "order-alpha").unwrap();
+    writeln!(tmp_b, "order-bravo").unwrap();
+    let path_c = tmp_c.path().to_str().unwrap().to_string();
+    let path_a = tmp_a.path().to_str().unwrap().to_string();
+    let path_b = tmp_b.path().to_str().unwrap().to_string();
+
+    with_env_vars_async(
+        &[
+            ("FERRUM_TEST_SECRET_ORDER_C_FILE", &path_c),
+            ("FERRUM_TEST_SECRET_ORDER_A_FILE", &path_a),
+            ("FERRUM_TEST_SECRET_ORDER_B_FILE", &path_b),
+        ],
+        || async {
+            let resolved = resolve_all_env_secrets().await.unwrap();
+
+            let vars: Vec<(String, String)> = resolved
+                .vars
+                .into_iter()
+                .filter(|(key, _)| key.starts_with("FERRUM_TEST_SECRET_ORDER_"))
+                .collect();
+            assert_eq!(
+                vars,
+                vec![
+                    (
+                        "FERRUM_TEST_SECRET_ORDER_A".to_string(),
+                        "order-alpha".to_string()
+                    ),
+                    (
+                        "FERRUM_TEST_SECRET_ORDER_B".to_string(),
+                        "order-bravo".to_string()
+                    ),
+                    (
+                        "FERRUM_TEST_SECRET_ORDER_C".to_string(),
+                        "order-charlie".to_string()
+                    ),
+                ],
+                "resolved vars must be ordered by base key"
+            );
+
+            let loaded: Vec<(String, &'static str)> = resolved
+                .loaded_sources
+                .into_iter()
+                .filter(|(key, _)| key.starts_with("FERRUM_TEST_SECRET_ORDER_"))
+                .collect();
+            assert_eq!(
+                loaded,
+                vec![
+                    ("FERRUM_TEST_SECRET_ORDER_A".to_string(), "file"),
+                    ("FERRUM_TEST_SECRET_ORDER_B".to_string(), "file"),
+                    ("FERRUM_TEST_SECRET_ORDER_C".to_string(), "file"),
+                ],
+                "reported secret sources must be ordered by base key"
+            );
+
+            let source_keys: Vec<String> = resolved
+                .source_keys_to_remove
+                .into_iter()
+                .filter(|key| key.starts_with("FERRUM_TEST_SECRET_ORDER_"))
+                .collect();
+            assert_eq!(
+                source_keys,
+                vec![
+                    "FERRUM_TEST_SECRET_ORDER_A_FILE".to_string(),
+                    "FERRUM_TEST_SECRET_ORDER_B_FILE".to_string(),
+                    "FERRUM_TEST_SECRET_ORDER_C_FILE".to_string(),
+                ],
+                "suffixed source keys must be ordered by base key"
+            );
+        },
+    );
+}
+
+/// A source reference is as sensitive as the value it points at, so a failed
+/// `_FILE` fetch must name the variable and the `io::Error` reason but not the
+/// path.
+#[test]
+fn test_resolve_all_env_secrets_file_error_omits_source_reference() {
+    let missing_path = "/nonexistent/ferrum-secret-source-reference-sentinel/value";
+
+    with_env_vars_async(
+        &[("FERRUM_TEST_SECRET_REDACT_FILE", missing_path)],
+        || async {
+            let err = match resolve_all_env_secrets().await {
+                Ok(_) => panic!("expected an unreadable _FILE source to fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("Failed to read FERRUM_TEST_SECRET_REDACT_FILE"),
+                "error must stay actionable at base-key level: {err}"
+            );
+            assert!(
+                !err.contains(missing_path)
+                    && !err.contains("ferrum-secret-source-reference-sentinel"),
+                "error must not disclose the source reference: {err}"
+            );
+        },
+    );
+}
+
+/// The same contract for a provider-shaped failure. An unparseable Vault
+/// reference fails during reference parsing, so this needs no live Vault — only
+/// the client env vars the wrapper requires before it gets that far.
+#[cfg(feature = "secrets-vault")]
+#[test]
+fn test_resolve_all_env_secrets_vault_error_omits_source_reference() {
+    let reference = "ferrum-vault-source-reference-sentinel";
+
+    with_env_vars_async(
+        &[
+            ("VAULT_ADDR", "http://127.0.0.1:1"),
+            ("VAULT_TOKEN", "test-token"),
+            ("FERRUM_TEST_SECRET_VAULT_REDACT_VAULT", reference),
+        ],
+        || async {
+            let err = match resolve_all_env_secrets().await {
+                Ok(_) => panic!("expected an invalid Vault reference to fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("FERRUM_TEST_SECRET_VAULT_REDACT"),
+                "error must stay actionable at base-key level: {err}"
+            );
+            assert!(
+                !err.contains(reference),
+                "error must not disclose the source reference: {err}"
+            );
+        },
+    );
+}
+
 #[test]
 fn test_resolve_all_env_secrets_ignores_non_secret_file_suffix_config() {
     with_env_vars_async(

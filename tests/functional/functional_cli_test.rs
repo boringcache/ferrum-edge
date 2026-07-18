@@ -160,8 +160,7 @@ async fn functional_cli_validate_valid_spec() {
     )
     .unwrap();
 
-    let output = Command::new(binary_path())
-        .args(["validate", "--spec", spec_path.to_str().unwrap()])
+    let output = hermetic_validate_command(&temp_dir, &["--spec", spec_path.to_str().unwrap()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -181,8 +180,9 @@ async fn functional_cli_validate_valid_spec() {
 #[ignore]
 #[tokio::test]
 async fn functional_cli_validate_nonexistent_spec() {
-    let output = Command::new(binary_path())
-        .args(["validate", "--spec", "/nonexistent/config.yaml"])
+    let temp_dir = TempDir::new().unwrap();
+
+    let output = hermetic_validate_command(&temp_dir, &["--spec", "/nonexistent/config.yaml"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -204,8 +204,7 @@ async fn functional_cli_validate_invalid_yaml() {
     let spec_path = temp_dir.path().join("bad.yaml");
     std::fs::write(&spec_path, "this is not: [valid yaml: for ferrum\n").unwrap();
 
-    let output = Command::new(binary_path())
-        .args(["validate", "--spec", spec_path.to_str().unwrap()])
+    let output = hermetic_validate_command(&temp_dir, &["--spec", spec_path.to_str().unwrap()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -236,8 +235,7 @@ plugin_configs: []
     )
     .unwrap();
 
-    let output = Command::new(binary_path())
-        .args(["validate", "--spec", spec_path.to_str().unwrap()])
+    let output = hermetic_validate_command(&temp_dir, &["--spec", spec_path.to_str().unwrap()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -273,18 +271,19 @@ async fn functional_cli_validate_with_settings() {
     )
     .unwrap();
 
-    let output = Command::new(binary_path())
-        .args([
-            "validate",
+    let output = hermetic_validate_command(
+        &temp_dir,
+        &[
             "--settings",
             settings_path.to_str().unwrap(),
             "--spec",
             spec_path.to_str().unwrap(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("Failed to run ferrum-edge validate");
+        ],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .expect("Failed to run ferrum-edge validate");
 
     assert!(
         output.status.success(),
@@ -350,18 +349,16 @@ const HERMETIC_ENV_PASSTHROUGH: &[&str] = &[
 /// an unset value still falls through to the `/etc/ferrum/ferrum.conf`
 /// candidate on machines that have one. The variable is therefore pinned to an
 /// empty settings file inside the temp dir, which suppresses discovery
-/// entirely. `FERRUM_FILE_CONFIG_PATH` is likewise pinned to a valid empty spec
-/// in the temp dir so host-level spec discovery stays disabled even if the test
-/// mode changes later.
-fn apply_hermetic_validate_env(cmd: &mut Command, temp_dir: &TempDir) {
+/// entirely. An explicit `--settings` flag still wins, because
+/// `resolve_settings_path()` returns the flag path before consulting the
+/// environment.
+///
+/// This base helper deliberately does *not* pin a mode or a spec, so it is
+/// usable by the `validate --spec ...` tests that rely on file-mode inference.
+/// [`apply_hermetic_validate_env`] layers database mode on top.
+fn apply_hermetic_env(cmd: &mut Command, temp_dir: &TempDir) {
     let conf_path = temp_dir.path().join("hermetic-ferrum.conf");
     std::fs::write(&conf_path, "").unwrap();
-    let spec_path = temp_dir.path().join("hermetic-resources.yaml");
-    std::fs::write(
-        &spec_path,
-        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
-    )
-    .unwrap();
 
     cmd.env_clear();
     for key in HERMETIC_ENV_PASSTHROUGH {
@@ -370,12 +367,54 @@ fn apply_hermetic_validate_env(cmd: &mut Command, temp_dir: &TempDir) {
         }
     }
 
+    cmd.env("FERRUM_CONF_PATH", &conf_path)
+        .current_dir(temp_dir.path());
+}
+
+/// Spawn `ferrum-edge validate` with the given arguments in the hermetic
+/// environment, without pinning an operating mode.
+///
+/// Every `validate` subprocess in this file goes through this or
+/// [`validate_database_mode_command`]. Validate now resolves the entire
+/// `FERRUM_*` external-secret suffix inventory before settings are parsed, so a
+/// stale `FERRUM_DB_URL_FILE` (or any other suffixed variable) inherited from
+/// the invoking shell or CI runner can fail the command on an unrelated fetch,
+/// conflict, or unsupported-suffix error before a test's own assertions are
+/// reached. Isolation is a property of the whole file, not just the
+/// secret-specific tests.
+fn hermetic_validate_command(temp_dir: &TempDir, args: &[&str]) -> Command {
+    let mut cmd = Command::new(binary_abs_path());
+    cmd.arg("validate").args(args);
+    apply_hermetic_env(&mut cmd, temp_dir);
+    cmd
+}
+
+/// Database-mode `validate` in the hermetic environment.
+///
+/// Database-mode validate requires *both* `FERRUM_DB_TYPE` and `FERRUM_DB_URL`
+/// (`EnvConfig::validate`), so both are supplied explicitly; sqlite in-memory
+/// keeps the check hermetic and reachable without a live database.
+/// `FERRUM_FILE_CONFIG_PATH` is pinned to a valid empty spec in the temp dir so
+/// host-level spec discovery stays disabled even if the test mode changes
+/// later.
+///
+/// Any variable set on `cmd` before this call is dropped by the `env_clear()`
+/// inside [`apply_hermetic_env`], which is what lets a test stage stand-ins for
+/// inherited variables and prove they do not survive.
+fn apply_hermetic_validate_env(cmd: &mut Command, temp_dir: &TempDir) {
+    apply_hermetic_env(cmd, temp_dir);
+
+    let spec_path = temp_dir.path().join("hermetic-resources.yaml");
+    std::fs::write(
+        &spec_path,
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+
     cmd.env("FERRUM_MODE", "database")
         .env("FERRUM_DB_TYPE", "sqlite")
         .env("FERRUM_DB_URL", "sqlite::memory:")
-        .env("FERRUM_CONF_PATH", &conf_path)
-        .env("FERRUM_FILE_CONFIG_PATH", &spec_path)
-        .current_dir(temp_dir.path());
+        .env("FERRUM_FILE_CONFIG_PATH", &spec_path);
 }
 
 fn validate_database_mode_command(temp_dir: &TempDir) -> Command {
@@ -574,6 +613,117 @@ async fn functional_cli_validate_fails_on_secret_resolution_error() {
     assert!(
         stderr.contains("Failed to read FERRUM_ADMIN_JWT_SECRET_FILE"),
         "expected a secret read failure error, got: {stderr}"
+    );
+    // The source reference is as sensitive as the value it points at, and the
+    // success report already reports base key + provider only. A failure must
+    // not be the path that discloses it.
+    let missing_path = temp_dir.path().join("does-not-exist");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stderr.contains(missing_path.to_str().unwrap())
+            && !stdout.contains(missing_path.to_str().unwrap()),
+        "secret source references must never be reported: stdout={stdout}, stderr={stderr}"
+    );
+}
+
+/// External values are materialized into the environment before
+/// `EnvConfig::from_env()`, so an ordinary typed parse failure on a
+/// secret-backed variable would otherwise echo the fetched secret verbatim
+/// (`Invalid FERRUM_PROXY_HTTP_PORT value '<secret>'`).
+///
+/// Non-vacuous by construction: the sentinel is the *only* thing that could
+/// make `FERRUM_PROXY_HTTP_PORT` fail to parse, so reaching the expected error
+/// proves the `_FILE` source really was materialized, and the absence
+/// assertions then cover both streams.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_redacts_resolved_value_in_settings_error() {
+    const SENTINEL: &str = "ferrum-resolved-secret-sentinel-must-not-be-printed";
+
+    let temp_dir = TempDir::new().unwrap();
+    let jwt_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&jwt_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+    let port_path = temp_dir.path().join("proxy-port");
+    std::fs::write(&port_path, SENTINEL).unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env("FERRUM_ADMIN_JWT_SECRET_FILE", jwt_path.to_str().unwrap())
+        .env("FERRUM_PROXY_HTTP_PORT_FILE", port_path.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "an unparseable resolved value must fail validation: stdout={stdout}, stderr={stderr}"
+    );
+    // The variable name and expected shape stay actionable.
+    assert!(
+        stderr.contains("Invalid FERRUM_PROXY_HTTP_PORT"),
+        "expected a typed settings parse failure, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("value from external secret source"),
+        "expected the withheld-value marker, got: {stderr}"
+    );
+    // The resolved value itself must not appear on either stream.
+    assert!(
+        !stderr.contains(SENTINEL) && !stdout.contains(SENTINEL),
+        "externally resolved secret values must never be printed: \
+         stdout={stdout}, stderr={stderr}"
+    );
+}
+
+/// `loaded_sources` is derived from `HashMap` iteration over the environment,
+/// so without an explicit sort two runs on identical input can print the report
+/// lines in different orders.
+///
+/// The two sources are staged in reverse of the expected order, and the
+/// assertion is on relative position rather than mere presence.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_reports_secret_sources_in_sorted_order() {
+    let temp_dir = TempDir::new().unwrap();
+    let admin_path = temp_dir.path().join("admin-jwt-secret");
+    std::fs::write(&admin_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+    let cp_dp_path = temp_dir.path().join("cp-dp-jwt-secret");
+    std::fs::write(&cp_dp_path, "validate-cp-dp-secret-with-well-over-32-bytes").unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_CP_DP_GRPC_JWT_SECRET_FILE",
+            cp_dp_path.to_str().unwrap(),
+        )
+        .env("FERRUM_ADMIN_JWT_SECRET_FILE", admin_path.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "validate failed: stdout={stdout}, stderr={stderr}"
+    );
+
+    let admin_line = stdout
+        .find("Loaded FERRUM_ADMIN_JWT_SECRET from file")
+        .unwrap_or_else(|| panic!("missing FERRUM_ADMIN_JWT_SECRET report line: {stdout}"));
+    let cp_dp_line = stdout
+        .find("Loaded FERRUM_CP_DP_GRPC_JWT_SECRET from file")
+        .unwrap_or_else(|| panic!("missing FERRUM_CP_DP_GRPC_JWT_SECRET report line: {stdout}"));
+    assert!(
+        admin_line < cp_dp_line,
+        "secret source lines must be ordered by base key: {stdout}"
+    );
+    assert!(
+        stdout.contains("Resolved 2 env var(s) from external secret sources"),
+        "expected both sources to be counted: {stdout}"
     );
 }
 
