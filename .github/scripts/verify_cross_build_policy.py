@@ -4685,14 +4685,15 @@ def contains_literal_executable_cross(contents: str) -> bool:
     """Recognize a literal Cross command or environment input in executable text."""
 
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
-    return any(
-        has_cross_command_context(variant) or CROSS_ENVIRONMENT.search(variant)
-        for line in logical_scan_lines(logical_contents)
-        for variant in scan_variants(
-            line,
-            include_opaque_shell_executable=False,
+    with shell_argv_dispatch_scope(logical_contents):
+        return any(
+            has_cross_command_context(variant) or CROSS_ENVIRONMENT.search(variant)
+            for line in logical_scan_lines(logical_contents)
+            for variant in scan_variants(
+                line,
+                include_opaque_shell_executable=False,
+            )
         )
-    )
 
 
 def is_dispatcher_manifest(name: str) -> bool:
