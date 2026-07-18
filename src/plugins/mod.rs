@@ -288,13 +288,26 @@ pub struct BufferedInitialResponseHeaderPolicyState {
 struct BufferedDeadlineResponseHeaderProvenance {
     observed_headers: HashMap<String, String>,
     gateway_headers: HashMap<String, String>,
+    /// The backend response's original `Set-Cookie` lines (newline-separated,
+    /// captured before any trusted hook runs). `Set-Cookie` provenance is
+    /// line-granular: a trusted hook (sticky-affinity injection,
+    /// `oidc_relying_party`'s rolling session, ...) commonly APPENDS its cookie
+    /// onto the backend's existing `Set-Cookie` value, which mutation tracking
+    /// would otherwise record wholesale — dragging the backend cookie across a
+    /// synthesized DEADLINE_EXCEEDED response. Only lines absent from this
+    /// backend baseline are gateway-authored and may cross. Empty for gateway
+    /// rejections (no backend contributed the response).
+    backend_set_cookie_lines: Vec<String>,
 }
 
 impl BufferedDeadlineResponseHeaderProvenance {
     fn backend_response(headers: &HashMap<String, String>) -> Self {
+        let observed_headers = Self::canonical_snapshot(headers);
+        let backend_set_cookie_lines = Self::set_cookie_lines(observed_headers.get("set-cookie"));
         Self {
-            observed_headers: Self::canonical_snapshot(headers),
+            observed_headers,
             gateway_headers: HashMap::new(),
+            backend_set_cookie_lines,
         }
     }
 
@@ -307,7 +320,37 @@ impl BufferedDeadlineResponseHeaderProvenance {
         Self {
             observed_headers,
             gateway_headers,
+            // A gateway rejection has no backend contribution, so every
+            // `Set-Cookie` line is gateway-authored.
+            backend_set_cookie_lines: Vec::new(),
         }
+    }
+
+    /// Split a `Set-Cookie` header value into its individual cookie lines. The
+    /// gateway stores multiple `Set-Cookie` values newline-joined (RFC 6265
+    /// requires separate header lines downstream); this recovers each line so
+    /// backend-vs-gateway provenance can be tracked per cookie.
+    fn set_cookie_lines(value: Option<&String>) -> Vec<String> {
+        value
+            .map(|value| value.split('\n').map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// Reduce a live `Set-Cookie` value to only its gateway-authored lines by
+    /// dropping every line the backend originally supplied. Returns `None` when
+    /// nothing gateway-authored remains, so the caller drops the header entirely
+    /// rather than crossing a backend cookie onto the deadline response.
+    fn gateway_set_cookie_value(&self, value: &str) -> Option<String> {
+        let gateway_lines = value
+            .split('\n')
+            .filter(|line| {
+                !self
+                    .backend_set_cookie_lines
+                    .iter()
+                    .any(|backend| backend == line)
+            })
+            .collect::<Vec<_>>();
+        (!gateway_lines.is_empty()).then(|| gateway_lines.join("\n"))
     }
 
     fn canonical_snapshot(headers: &HashMap<String, String>) -> HashMap<String, String> {
@@ -330,9 +373,26 @@ impl BufferedDeadlineResponseHeaderProvenance {
     ) {
         let current = Self::canonical_snapshot(headers);
         for (name, value) in &current {
-            if self.observed_headers.get(name) != Some(value)
-                || plugin_owned_headers.iter().any(|owned| owned == name)
-            {
+            let changed = self.observed_headers.get(name) != Some(value)
+                || plugin_owned_headers.iter().any(|owned| owned == name);
+            if !changed {
+                continue;
+            }
+            if name == "set-cookie" {
+                // `Set-Cookie` is line-granular: record only the gateway-authored
+                // cookie lines so a hook that appends its cookie onto the
+                // backend's existing value never drags the backend cookie into
+                // gateway-owned output. When only backend lines remain, drop the
+                // header from gateway output entirely.
+                match self.gateway_set_cookie_value(value) {
+                    Some(gateway_value) => {
+                        self.gateway_headers.insert(name.clone(), gateway_value);
+                    }
+                    None => {
+                        self.gateway_headers.remove(name);
+                    }
+                }
+            } else {
                 self.gateway_headers.insert(name.clone(), value.clone());
             }
         }
@@ -357,9 +417,11 @@ impl BufferedDeadlineResponseHeaderProvenance {
         // transport/framing fields and stale cache/representation metadata that
         // must never ride a synthesized DEADLINE_EXCEEDED response. `set-cookie`
         // is deliberately absent: a trusted hook (e.g. `oidc_relying_party`'s
-        // refreshed session cookie) authors it precisely so the client applies
-        // the update, and a backend-supplied cookie never reaches
-        // `gateway_headers` (it is not a gateway mutation), so retaining
+        // refreshed session cookie or sticky-affinity injection) authors it
+        // precisely so the client applies the update. Backend-supplied cookie
+        // lines never reach `gateway_headers` even when a hook APPENDS its cookie
+        // onto the backend value — `record_gateway_mutations` records only the
+        // gateway-authored lines (see `gateway_set_cookie_value`) — so retaining
         // gateway-authored `set-cookie` cannot re-open backend cookie leakage.
         // `x-grpc-web` is gRPC-Web framing regenerated by the deadline error
         // response; a completed hook must not overwrite the canonical
@@ -433,7 +495,21 @@ impl BufferedDeadlineResponseHeaderProvenance {
     fn adopt_gateway_rejection(&mut self, headers: &HashMap<String, String>) {
         let rejection = Self::canonical_snapshot(headers);
         for (name, value) in &rejection {
-            self.gateway_headers.insert(name.clone(), value.clone());
+            if name == "set-cookie" {
+                // Preserve the same backend-cookie exclusion the buffered path
+                // enforces: only gateway-authored cookie lines cross into the
+                // rejection's gateway-owned output.
+                match self.gateway_set_cookie_value(value) {
+                    Some(gateway_value) => {
+                        self.gateway_headers.insert(name.clone(), gateway_value);
+                    }
+                    None => {
+                        self.gateway_headers.remove(name);
+                    }
+                }
+            } else {
+                self.gateway_headers.insert(name.clone(), value.clone());
+            }
         }
         self.observed_headers = rejection;
     }

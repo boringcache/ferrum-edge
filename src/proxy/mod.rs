@@ -21516,6 +21516,17 @@ async fn handle_proxy_request_inner(
                                 v.push_str(&cookie_val);
                             })
                             .or_insert(cookie_val);
+                        // Record the gateway-authored affinity cookie in deadline
+                        // provenance: it is injected here (not by a plugin
+                        // mutation), so a later response-committed hook that
+                        // exhausts the RPC deadline would otherwise rebuild the
+                        // DEADLINE_EXCEEDED response without it and the client
+                        // would not stay pinned. Line-granular recording keeps
+                        // any co-present backend cookie out of gateway output.
+                        ctx.record_deadline_owned_response_headers(
+                            &["set-cookie".to_string()],
+                            &response_headers,
+                        );
                     }
                 }
 
@@ -23069,6 +23080,14 @@ async fn handle_proxy_request_inner(
                     v.push_str(&cookie_val);
                 })
                 .or_insert(cookie_val);
+            // Record the gateway-authored affinity cookie in deadline provenance
+            // before the committed-hook phase can exhaust the RPC deadline and
+            // rebuild the response from gateway-owned output only. Line-granular
+            // recording keeps any co-present backend cookie out of gateway output.
+            ctx.record_deadline_owned_response_headers(
+                &["set-cookie".to_string()],
+                &response_headers,
+            );
         }
     }
 

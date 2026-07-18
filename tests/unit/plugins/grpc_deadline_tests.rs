@@ -1084,6 +1084,342 @@ fn deadline_replacement_preserves_gateway_authored_set_cookie() {
     }
 }
 
+/// A trusted response decorator that APPENDS its gateway cookie onto any
+/// existing `Set-Cookie`, exactly as `oidc_relying_party::after_proxy` does when
+/// it rotates a session on a response that already carries a backend cookie.
+struct SessionCookieAppendingDecorator {
+    cookie: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Plugin for SessionCookieAppendingDecorator {
+    fn name(&self) -> &str {
+        "session_cookie_appending_decorator"
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        response_headers
+            .entry("set-cookie".to_string())
+            .and_modify(|existing| {
+                existing.push('\n');
+                existing.push_str(self.cookie);
+            })
+            .or_insert_with(|| self.cookie.to_string());
+        PluginResult::Continue
+    }
+}
+
+/// A committed-response observer that never completes, used to drive the RPC
+/// deadline to expiry inside the response-committed phase.
+struct StalledCommittedHook;
+
+#[async_trait::async_trait]
+impl Plugin for StalledCommittedHook {
+    fn name(&self) -> &str {
+        "stalled_committed_hook"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        std::future::pending().await
+    }
+}
+
+/// A non-replacing reject-path decorator that completes synchronously, writing
+/// one gateway header. Used to exercise a CHAIN of owned-hook clone/adopt cycles
+/// before a later hook exhausts the deadline.
+struct CompletingRejectDecorator {
+    name: &'static str,
+    header: &'static str,
+    value: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Plugin for CompletingRejectDecorator {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        response_headers.insert(self.header.to_string(), self.value.to_string());
+        PluginResult::Continue
+    }
+}
+
+/// Finding 4: when a trusted hook (`oidc_relying_party`) appends its gateway
+/// session cookie onto the backend's existing `Set-Cookie`, only the
+/// gateway-authored cookie line may cross a terminal deadline rebuild; the
+/// backend cookie must be stripped.
+#[tokio::test]
+async fn deadline_replacement_strips_backend_cookie_when_gateway_appends_session() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_reject_for_test, set_grpc_deadline_budget_for_test,
+    };
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(SessionCookieAppendingDecorator {
+            cookie: "ferrum_session=refreshed; HttpOnly; Path=/",
+        }),
+        Arc::new(StalledAfterProxyDecorator),
+    ];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (
+            "set-cookie".to_string(),
+            "backend_sid=leak; Path=/".to_string(),
+        ),
+    ]);
+
+    let (status, body, headers) =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut headers)
+            .await
+            .expect("a stalled after_proxy hook must terminate as a deadline rejection");
+
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("ferrum_session=refreshed; HttpOnly; Path=/"),
+        "only the gateway-authored session cookie may cross a deadline rebuild"
+    );
+    assert!(
+        !headers
+            .get("set-cookie")
+            .is_some_and(|value| value.contains("backend_sid")),
+        "a backend-supplied cookie must never ride the DEADLINE_EXCEEDED response"
+    );
+}
+
+/// Finding 1: the sticky-session affinity cookie injected by proxy core (not by
+/// a plugin mutation) must survive a later response-committed hook exhausting
+/// the RPC deadline so the client stays pinned; a co-present backend cookie is
+/// still stripped.
+#[tokio::test]
+async fn deadline_replacement_preserves_injected_sticky_cookie_and_strips_backend() {
+    use ferrum_edge::_test_support::{
+        record_deadline_owned_response_headers_for_test, run_after_proxy_hooks_for_test,
+        run_deadline_bounded_response_committed_hooks_for_test, set_grpc_deadline_budget_for_test,
+    };
+
+    let no_plugins: Vec<Arc<dyn Plugin>> = vec![];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    // Backend response carries its own cookie; provenance captures it as the
+    // backend baseline before any gateway output.
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (
+            "set-cookie".to_string(),
+            "backend_sid=leak; Path=/".to_string(),
+        ),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&no_plugins, &mut ctx, 200, &mut headers).await,
+        "seeding backend provenance must not reject the response"
+    );
+
+    // Proxy core injects the sticky-affinity cookie (append) and records it as
+    // gateway-owned, exactly as the gRPC / committed-hook path does.
+    headers
+        .entry("set-cookie".to_string())
+        .and_modify(|existing| {
+            existing.push('\n');
+            existing.push_str("ferrum_affinity=target-a; Path=/");
+        })
+        .or_insert_with(|| "ferrum_affinity=target-a; Path=/".to_string());
+    record_deadline_owned_response_headers_for_test(
+        &mut ctx,
+        &["set-cookie".to_string()],
+        &headers,
+    );
+
+    // A committed-response hook then exhausts the RPC deadline.
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("ferrum_affinity=target-a; Path=/"),
+        "the injected sticky-affinity cookie must survive a committed-hook deadline"
+    );
+    assert!(
+        !headers
+            .get("set-cookie")
+            .is_some_and(|value| value.contains("backend_sid")),
+        "the backend cookie present at injection must not cross the deadline rebuild"
+    );
+}
+
+/// Finding 2: `workload_metrics` echoing the gateway `traceparent` from metadata
+/// owns that header, so an exact backend echo (invisible to mutation tracking)
+/// still preserves the mesh trace context across a gRPC deadline rebuild.
+#[tokio::test]
+async fn deadline_replacement_preserves_workload_metrics_traceparent_on_exact_backend_echo() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
+        transform_buffered_response_body_with_deadline_for_test,
+    };
+
+    let workload_metrics =
+        create_plugin("workload_metrics", &json!({ "sampling_percentage": 100.0 }))
+            .unwrap()
+            .unwrap();
+    let after_proxy_plugins = vec![Arc::clone(&workload_metrics)];
+    let transform_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledResponseTransformer)];
+
+    let gateway_trace = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01";
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    // The gateway trace context lives in metadata; workload_metrics echoes it in
+    // after_proxy exactly like otel_tracing.
+    ctx.metadata
+        .insert("traceparent".to_string(), gateway_trace.to_string());
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    // The backend already echoed the identical traceparent, so mutation tracking
+    // alone cannot see the gateway write.
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("traceparent".to_string(), gateway_trace.to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "workload_metrics after_proxy must not reject the response"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        transform_buffered_response_body_with_deadline_for_test(
+            &transform_plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+        )
+        .await
+    );
+
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("traceparent").map(String::as_str),
+        Some(gateway_trace),
+        "workload_metrics must own its echoed traceparent so the mesh deadline response keeps trace context"
+    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert!(body.is_empty());
+}
+
+/// Finding 3 (regression lock): a chain of completing decorators run through the
+/// owned-hook clone/adopt path under an active deadline; every adopted context
+/// must retain the previously recorded gateway output before a later hook
+/// exhausts the deadline.
+#[tokio::test]
+async fn owned_hook_clone_adopt_chain_preserves_all_recorded_decorators() {
+    use ferrum_edge::_test_support::{
+        finalize_plugin_rejection_for_test, set_grpc_deadline_budget_for_test,
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let completion = Arc::new(tokio::sync::Notify::new());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(CompletingRejectDecorator {
+            name: "first-reject-decorator",
+            header: "x-first-decorator",
+            value: "first",
+        }),
+        Arc::new(CompletingRejectDecorator {
+            name: "second-reject-decorator",
+            header: "x-second-decorator",
+            value: "second",
+        }),
+        Arc::new(SlowRejectDecorator {
+            name: "pending-after-decorator",
+            delay: std::time::Duration::from_millis(20),
+            calls: Arc::clone(&calls),
+            completed: Arc::clone(&completed),
+            completion: Arc::clone(&completion),
+        }),
+    ];
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(10));
+
+    let (status, body, headers) = finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        503,
+        b"discarded rejection".to_vec(),
+        HashMap::new(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("x-first-decorator").map(String::as_str),
+        Some("first"),
+        "the first adopted owned-hook decoration must survive the chain"
+    );
+    assert_eq!(
+        headers.get("x-second-decorator").map(String::as_str),
+        Some("second"),
+        "a later adopted owned-hook context must keep the earlier recorded output"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), completion.notified())
+        .await
+        .expect("pending decorator must finish on detached cleanup state");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 #[test]
 fn deadline_replacement_regenerates_canonical_grpc_web_framing_header() {
     use ferrum_edge::_test_support::buffered_grpc_deadline_replacement_for_test;

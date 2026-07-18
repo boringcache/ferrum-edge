@@ -1355,6 +1355,18 @@ pub mod _test_support {
             .map(|reject| (reject.status_code, reject.body, reject.headers))
     }
 
+    /// Record gateway-authored response-header keys as deadline-provenance
+    /// owned, mirroring what proxy core does after injecting the sticky-session
+    /// affinity `Set-Cookie` outside any plugin mutation. Lets tests exercise
+    /// the sticky-cookie-then-deadline path without a full proxy request.
+    pub fn record_deadline_owned_response_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        owned_header_names: &[String],
+        response_headers: &HashMap<String, String>,
+    ) {
+        ctx.record_deadline_owned_response_headers(owned_header_names, response_headers);
+    }
+
     pub async fn transform_buffered_response_body_with_deadline_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
