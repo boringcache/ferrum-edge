@@ -107,6 +107,27 @@ fn request_identity(
     request_deduplication_request_identity_for_test(plugin, ctx)
 }
 
+#[tokio::test]
+async fn request_context_debug_redacts_request_deduplication_state() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = body_ctx("POST", "/payments", br#"{"amount":100}"#);
+    for (key, value) in keyed_headers("sensitive-idempotency-key", "api.example.test", 14) {
+        ctx.headers.insert(key, value);
+    }
+    let (dedup_key, fingerprint) = request_identity(&plugin, &ctx).unwrap();
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let debug_output = format!("{ctx:?}");
+    assert!(debug_output.contains("RequestDeduplicationRequestState"));
+    assert!(debug_output.contains("<redacted>"));
+    assert!(!debug_output.contains(&dedup_key));
+    assert!(!debug_output.contains(&fingerprint));
+}
+
 fn keyed_headers(key: &str, host: &str, body_len: usize) -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("idempotency-key".to_string(), key.to_string());

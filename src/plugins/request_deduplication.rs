@@ -247,12 +247,26 @@ enum CompletionSkipReason {
 /// The values are hashed identities or opaque owner tokens, but they still do
 /// not belong in public transaction metadata. `RequestContext` holds at most
 /// one entry per deduplication instance attached to the matched proxy.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct RequestDeduplicationRequestState {
     key: String,
     fingerprint: String,
     local_inflight_owner_token: String,
     redis_lock_token: Option<String>,
+}
+
+impl fmt::Debug for RequestDeduplicationRequestState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestDeduplicationRequestState")
+            .field("key", &"<redacted>")
+            .field("fingerprint", &"<redacted>")
+            .field("local_inflight_owner_token", &"<redacted>")
+            .field(
+                "redis_lock_token",
+                &self.redis_lock_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 static NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
