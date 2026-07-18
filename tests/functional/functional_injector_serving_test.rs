@@ -175,9 +175,7 @@ async fn try_start_injector(
 
     if seed_acme_tls_alpn_challenge {
         if !tls {
-            return Err(
-                "cannot seed a TLS-ALPN-01 challenge for a plaintext injector".to_string(),
-            );
+            return Err("cannot seed a TLS-ALPN-01 challenge for a plaintext injector".to_string());
         }
         seed_pending_tls_alpn_order(tmp.path())?;
     }
@@ -224,8 +222,8 @@ async fn try_start_injector(
 /// order creation; the spawned binary then has to resolve the challenge from
 /// `acme-orders.json` and synthesize the RFC 8737 certificate itself.
 fn seed_pending_tls_alpn_order(store_dir: &std::path::Path) -> Result<(), String> {
-    let store = AcmeOrderStore::open(store_dir)
-        .map_err(|e| format!("open ACME order store: {e}"))?;
+    let store =
+        AcmeOrderStore::open(store_dir).map_err(|e| format!("open ACME order store: {e}"))?;
     let order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
         id: "injector-tls-alpn-order".to_string(),
         certificate_id: Some("injector-certificate".to_string()),
@@ -390,9 +388,7 @@ async fn connect_tls(
 /// Connect like an RFC 8737 validator: offer only `acme-tls/1` and accept the
 /// purpose-built self-signed validation certificate so the caller can inspect
 /// its ACME identifier extension.
-async fn connect_acme_tls(
-    gateway: &InjectorGateway,
-) -> tokio_rustls::client::TlsStream<TcpStream> {
+async fn connect_acme_tls(gateway: &InjectorGateway) -> tokio_rustls::client::TlsStream<TcpStream> {
     install_crypto_provider();
     let mut client_config = rustls::ClientConfig::builder()
         .dangerous()
@@ -510,8 +506,7 @@ async fn functional_injector_tls_serves_pending_acme_tls_alpn_challenge_certific
     // The extension value is the DER encoding of an OCTET STRING containing
     // SHA-256(keyAuthorization): 0x04, 0x20, then the 32-byte digest.
     let mut expected_extension_value = vec![0x04, 0x20];
-    expected_extension_value
-        .extend_from_slice(&Sha256::digest(ACME_KEY_AUTHORIZATION.as_bytes()));
+    expected_extension_value.extend_from_slice(&Sha256::digest(ACME_KEY_AUTHORIZATION.as_bytes()));
     assert_eq!(
         acme_identifier.value,
         expected_extension_value.as_slice(),
