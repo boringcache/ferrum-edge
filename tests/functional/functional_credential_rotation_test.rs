@@ -520,7 +520,7 @@ async fn test_credential_rotation_jwt() {
         &auth,
         "rot-jwt-consumer",
         "jwt",
-        &json!({"secret": secret1, "iss": "test-iss"}),
+        &json!({"secret": secret1}),
     )
     .await
     .unwrap();
@@ -588,7 +588,7 @@ async fn test_credential_rotation_jwt() {
         &auth,
         "rot-jwt-consumer",
         "jwt",
-        &json!({"secret": secret2, "iss": "test-iss"}),
+        &json!({"secret": secret2}),
     )
     .await
     .unwrap();

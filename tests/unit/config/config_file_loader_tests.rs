@@ -702,7 +702,6 @@ consumers:
     credentials:
       jwt:
         - secret: "jwt-secret-key-padding-1234567890"
-          algorithm: "HS256"
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
