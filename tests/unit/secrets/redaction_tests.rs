@@ -590,6 +590,7 @@ fn the_withheld_record_does_not_disclose_a_colliding_short_secret() {
 /// operator's Vault path.
 #[test]
 fn a_provider_rewritten_source_reference_is_redacted() {
+    arm_redaction();
     let message = redact_external_secret_values(&format!(
         "Failed to parse PEM from {SOURCE_URI_REPORTED}: malformed"
     ));
@@ -606,6 +607,7 @@ fn a_provider_rewritten_source_reference_is_redacted() {
 /// A `file://` source is reported by bare path, the scheme stripped.
 #[test]
 fn a_scheme_stripped_file_source_is_redacted() {
+    arm_redaction();
     let message =
         redact_external_secret_values(&format!("Invalid certificate at {FILE_URI_STRIPPED}"));
     assert!(
@@ -619,6 +621,7 @@ fn a_scheme_stripped_file_source_is_redacted() {
 /// host, path, and query of the externally resolved value intact.
 #[test]
 fn a_credential_redacted_url_form_is_redacted() {
+    arm_redaction();
     let rendered = ferrum_edge::config::db_backend::redact_url(DB_URL_VALUE);
     assert!(
         rendered != DB_URL_VALUE && rendered.contains("host-sentinel"),
@@ -639,6 +642,7 @@ fn a_credential_redacted_url_form_is_redacted() {
 /// `configured=3601`, which matches no exact-value candidate.
 #[test]
 fn a_canonicalized_numeric_rendering_is_redacted() {
+    arm_redaction();
     let message = redact_external_secret_values(&format!(
         "pool statement timeout configured={NUMBER_CANON_RENDERED}s"
     ));
