@@ -684,6 +684,34 @@ fn invalid_pagination_response(field: &str, reason: &str) -> Box<Response<Full<B
     ))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaginationValueError {
+    Malformed,
+    Overflow,
+}
+
+impl PaginationValueError {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Malformed => "must be a non-negative integer",
+            Self::Overflow => "exceeds the maximum supported value",
+        }
+    }
+}
+
+/// Parse an unsigned pagination value while keeping malformed and numeric
+/// overflow diagnostics distinct. The distinction is part of the stable 400
+/// contract, not a reflection of parser internals.
+pub(crate) fn parse_unsigned_pagination_value(value: &str) -> Result<u64, PaginationValueError> {
+    value.parse().map_err(|_| {
+        if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+            PaginationValueError::Overflow
+        } else {
+            PaginationValueError::Malformed
+        }
+    })
+}
+
 fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<Full<Bytes>>>> {
     let mut offset = 0i64;
     let mut limit = DEFAULT_PAGE_SIZE;
@@ -691,8 +719,8 @@ fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<F
         for (key, val) in url::form_urlencoded::parse(query.as_bytes()) {
             match key.as_ref() {
                 "offset" => {
-                    let parsed: u64 = val.parse().map_err(|_| {
-                        invalid_pagination_response("offset", "must be a non-negative integer")
+                    let parsed = parse_unsigned_pagination_value(&val).map_err(|error| {
+                        invalid_pagination_response("offset", error.reason())
                     })?;
                     if parsed > i64::MAX as u64 {
                         return Err(invalid_pagination_response(
@@ -705,8 +733,8 @@ fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<F
                     })?;
                 }
                 "limit" => {
-                    let parsed: u64 = val.parse().map_err(|_| {
-                        invalid_pagination_response("limit", "must be a non-negative integer")
+                    let parsed = parse_unsigned_pagination_value(&val).map_err(|error| {
+                        invalid_pagination_response("limit", error.reason())
                     })?;
                     // `0` keeps the documented "server default" meaning; values
                     // above the maximum are capped, both per openapi.yaml.
@@ -864,19 +892,21 @@ pub(crate) fn log_audit_enqueue_failure(_error: &anyhow::Error) {
     );
 }
 
-/// Apply pagination to a serializable collection.
-/// Always wraps the response in an envelope with metadata.
-fn paginate_response(items: &Value, pagination: &PaginationParams) -> Value {
-    let arr = match items.as_array() {
-        Some(a) => a,
-        None => return items.clone(),
-    };
-    let total = arr.len();
-    let paginated: Vec<_> = match pagination.in_memory_offset() {
-        Some(offset) => arr
-            .iter()
+/// Apply pagination before mapping or serializing an in-memory collection.
+/// The iterator is cloned only to compute the total; the mapper runs for the
+/// selected page, so role-aware redaction and JSON conversion stay bounded by
+/// the applied limit.
+fn paginate_mapped_response<I, F>(items: I, pagination: &PaginationParams, map: F) -> Value
+where
+    I: Iterator + Clone,
+    F: FnMut(I::Item) -> Value,
+{
+    let total = items.clone().count();
+    let paginated: Vec<Value> = match pagination.in_memory_offset() {
+        Some(offset) => items
             .skip(offset)
             .take(pagination.in_memory_limit())
+            .map(map)
             .collect(),
         None => Vec::new(),
     };
@@ -888,6 +918,12 @@ fn paginate_response(items: &Value, pagination: &PaginationParams) -> Value {
             "total": total
         }
     })
+}
+
+/// Apply pagination to a serializable slice and wrap it in the shared
+/// response envelope. Serialization happens only for the selected page.
+fn paginate_response<T: Serialize>(items: &[T], pagination: &PaginationParams) -> Value {
+    paginate_mapped_response(items.iter(), pagination, |item| json!(item))
 }
 
 /// Build pagination envelope from database-paginated results.
@@ -7654,7 +7690,7 @@ mod tests {
     fn unpaginated_response_applies_default_page_size() {
         let uri: hyper::Uri = "/proxies".parse().unwrap();
         let pagination = parse_pagination(&uri).expect("no query string is valid");
-        let items = json!((0..150).collect::<Vec<_>>());
+        let items = (0..150).collect::<Vec<_>>();
 
         let response = paginate_response(&items, &pagination);
 
@@ -7670,7 +7706,7 @@ mod tests {
     fn explicit_limit_still_caps_response() {
         let uri: hyper::Uri = "/proxies?limit=25&offset=10".parse().unwrap();
         let pagination = parse_pagination(&uri).expect("valid pagination");
-        let items = json!((0..150).collect::<Vec<_>>());
+        let items = (0..150).collect::<Vec<_>>();
 
         let response = paginate_response(&items, &pagination);
 
@@ -7679,6 +7715,26 @@ mod tests {
         assert_eq!(response["pagination"]["limit"], 25);
         assert_eq!(pagination.query_limit_i64(), 25);
         assert_eq!(pagination.query_offset_i64(), 10);
+    }
+
+    #[test]
+    fn in_memory_pagination_maps_only_the_selected_page() {
+        use std::cell::Cell;
+
+        let uri: hyper::Uri = "/proxies?limit=2&offset=10".parse().unwrap();
+        let pagination = parse_pagination(&uri).expect("valid pagination");
+        let mapped = Cell::new(0);
+
+        let response = paginate_mapped_response(0..150, &pagination, |item| {
+            mapped.set(mapped.get() + 1);
+            json!(item)
+        });
+
+        assert_eq!(mapped.get(), 2, "only page items may be mapped/redacted");
+        assert_eq!(response["data"], json!([10, 11]));
+        assert_eq!(response["pagination"]["offset"], 10);
+        assert_eq!(response["pagination"]["limit"], 2);
+        assert_eq!(response["pagination"]["total"], 150);
     }
 
     #[test]

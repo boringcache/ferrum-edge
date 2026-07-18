@@ -1887,12 +1887,12 @@ pub(crate) async fn handle_list<R: AdminResource>(
     }
 
     if let Some(config) = state.cached_gateway_config() {
-        let items: Vec<Value> = R::cached_items(&config)
+        let items = R::cached_items(&config)
             .iter()
-            .filter(|resource| resource.namespace() == namespace)
-            .map(|resource| R::response_body_for_role(resource, role))
-            .collect();
-        let body = super::paginate_response(&json!(items), pagination);
+            .filter(|resource| resource.namespace() == namespace);
+        let body = super::paginate_mapped_response(items, pagination, |resource| {
+            R::response_body_for_role(resource, role)
+        });
         Ok(super::json_response_with_stale(StatusCode::OK, &body))
     } else {
         Ok(super::json_response(

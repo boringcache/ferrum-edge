@@ -1318,6 +1318,8 @@ async fn test_list_proxies_with_offset_and_limit() {
     assert_eq!(data.len(), 2);
     assert_eq!(data[0]["id"], "proxy-2");
     assert_eq!(data[1]["id"], "proxy-3");
+    assert_eq!(body["pagination"]["offset"], 2);
+    assert_eq!(body["pagination"]["limit"], 2);
     assert_eq!(body["pagination"]["total"], 5);
 }
 
@@ -1442,18 +1444,37 @@ async fn test_malformed_pagination_is_rejected_with_400() {
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    for query in [
-        "/proxies?limit=abc",
-        "/proxies?limit=-1",
-        "/proxies?offset=abc",
-        "/proxies?offset=-1",
-        "/proxies?limit=18446744073709551616",
-        // i64::MAX + 1: wrapped negative under the old `as i64` cast and became
+    for (query, expected_message) in [
+        (
+            "/proxies?limit=abc",
+            "Invalid limit pagination parameter: must be a non-negative integer",
+        ),
+        (
+            "/proxies?limit=-1",
+            "Invalid limit pagination parameter: must be a non-negative integer",
+        ),
+        (
+            "/proxies?offset=abc",
+            "Invalid offset pagination parameter: must be a non-negative integer",
+        ),
+        (
+            "/proxies?offset=-1",
+            "Invalid offset pagination parameter: must be a non-negative integer",
+        ),
+        (
+            "/proxies?limit=18446744073709551616",
+            "Invalid limit pagination parameter: exceeds the maximum supported value",
+        ),
+        // i64::MAX + 1 wrapped negative under the old `as i64` cast and became
         // an enormous MongoDB u64 skip.
-        "/proxies?offset=9223372036854775808",
+        (
+            "/proxies?offset=9223372036854775808",
+            "Invalid offset pagination parameter: exceeds the maximum supported value",
+        ),
     ] {
         let (status, body, _) = admin_get(&base_url, query, &token).await;
         assert_eq!(status, 400, "{query} must be rejected: {body:?}");
+        assert_eq!(body["error"], expected_message, "wrong error for {query}");
     }
 }
 

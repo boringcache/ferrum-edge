@@ -2599,6 +2599,11 @@ fn spec_content_response(
 // Helper: parse list filter from query string (Wave 5)
 // ---------------------------------------------------------------------------
 
+/// Build the stable API-spec pagination error without exposing parser internals.
+fn invalid_pagination(field: &str, error: crate::admin::PaginationValueError) -> ApiSpecError {
+    ApiSpecError::BadRequest(format!("{field} {}", error.reason()))
+}
+
 /// Parse `GET /api-specs` query parameters into an [`ApiSpecListFilter`].
 ///
 /// Unknown parameters are silently ignored. Returns `Err` (400) for invalid
@@ -2609,10 +2614,6 @@ fn spec_content_response(
 /// [`crate::admin::PaginationParams`] used elsewhere — default 50, maximum 200,
 /// and a `u32` offset — but shares its rejection contract: malformed values are
 /// never silently coerced into a default.
-fn invalid_pagination(field: &str) -> ApiSpecError {
-    ApiSpecError::BadRequest(format!("{field} must be a non-negative integer"))
-}
-
 fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError> {
     const DEFAULT_LIMIT: u32 = 50;
     const MAX_LIMIT: u32 = 200;
@@ -2644,18 +2645,28 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
             // rejected with 400 exactly as `parse_pagination` does for every
             // other list route — never silently coerced to a default.
             "limit" => {
-                let parsed: u64 = val.parse().map_err(|_| invalid_pagination("limit"))?;
+                let parsed = crate::admin::parse_unsigned_pagination_value(&val)
+                    .map_err(|error| invalid_pagination("limit", error))?;
                 // `0` keeps the documented "server default" meaning; values
                 // above the maximum are capped.
                 filter.limit = if parsed == 0 {
                     DEFAULT_LIMIT
                 } else {
                     u32::try_from(parsed.min(u64::from(MAX_LIMIT)))
-                        .map_err(|_| invalid_pagination("limit"))?
+                        .map_err(|_| {
+                            invalid_pagination(
+                                "limit",
+                                crate::admin::PaginationValueError::Overflow,
+                            )
+                        })?
                 };
             }
             "offset" => {
-                filter.offset = val.parse().map_err(|_| invalid_pagination("offset"))?;
+                let parsed = crate::admin::parse_unsigned_pagination_value(&val)
+                    .map_err(|error| invalid_pagination("offset", error))?;
+                filter.offset = u32::try_from(parsed).map_err(|_| {
+                    invalid_pagination("offset", crate::admin::PaginationValueError::Overflow)
+                })?;
             }
             "proxy_id" if !val.is_empty() => {
                 filter.proxy_id = Some(val);

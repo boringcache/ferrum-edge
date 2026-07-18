@@ -3502,18 +3502,18 @@ async fn list_endpoint_malformed_pagination_returns_400() {
     let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
     let client = AdminClient::new(base);
 
-    for query in [
-        "/api-specs?limit=abc",
-        "/api-specs?limit=-1",
-        "/api-specs?limit=1.5",
-        "/api-specs?offset=abc",
-        "/api-specs?offset=-1",
+    for (query, expected_message) in [
+        ("/api-specs?limit=abc", "limit must be a non-negative integer"),
+        ("/api-specs?limit=-1", "limit must be a non-negative integer"),
+        ("/api-specs?limit=1.5", "limit must be a non-negative integer"),
+        ("/api-specs?offset=abc", "offset must be a non-negative integer"),
+        ("/api-specs?offset=-1", "offset must be a non-negative integer"),
         // Above u32::MAX: this endpoint's offset is a 32-bit value.
-        "/api-specs?offset=4294967296",
+        ("/api-specs?offset=4294967296", "offset exceeds the maximum supported value"),
         // Percent-encoding the key must not bypass the same narrower ceiling.
-        "/api-specs?%6fffset=4294967296",
+        ("/api-specs?%6fffset=4294967296", "offset exceeds the maximum supported value"),
         // One past u64::MAX cannot be represented by the coercion parser.
-        "/api-specs?limit=18446744073709551616",
+        ("/api-specs?limit=18446744073709551616", "limit exceeds the maximum supported value"),
     ] {
         let (status, body) = client.get_json(query).await;
         assert_eq!(
@@ -3521,6 +3521,7 @@ async fn list_endpoint_malformed_pagination_returns_400() {
             reqwest::StatusCode::BAD_REQUEST,
             "{query} must be rejected with 400, not coerced: {body}"
         );
+        assert_eq!(body["error"], expected_message, "wrong error for {query}");
     }
 }
 
