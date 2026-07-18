@@ -4046,7 +4046,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
     proxy_v1.plugins = vec![PluginAssociation {
         plugin_config_id: plugin_id.clone(),
     }];
-    let plugin_v1 = make_plugin(&plugin_id, &proxy_id, ns, Some(&spec_id));
+    let plugin_v1 = make_plugin(&plugin_id, &proxy_id, ns, None);
     let bundle_v1 = ExtractedBundle {
         proxy: proxy_v1,
         upstream: None,
