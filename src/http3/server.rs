@@ -7258,11 +7258,14 @@ pub(crate) fn inject_sticky_cookie_with_deadline_provenance(
     ) {
         return false;
     }
-    // Borrowed static name: allocation-free, and `record_deadline_owned_…`
+    // The injection APPENDS onto any co-present backend cookie, so it records
+    // mutations rather than declaring ownership — ownership means whole-value
+    // replacement and retires the backend cookie baseline, which would credit a
+    // backend cookie as gateway output. `record_deadline_response_header_…`
     // returns immediately when no deadline provenance is being tracked, so
     // ordinary sticky traffic pays nothing here (same shape as the H1/H2
     // buffered sites in `src/proxy/mod.rs`).
-    ctx.record_deadline_owned_response_headers(&["set-cookie"], response_headers);
+    ctx.record_deadline_response_header_mutations(response_headers);
     true
 }
 

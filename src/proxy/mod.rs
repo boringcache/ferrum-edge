@@ -21640,10 +21640,17 @@ async fn handle_proxy_request_inner(
                         // DEADLINE_EXCEEDED response without it and the client
                         // would not stay pinned. Line-granular recording keeps
                         // any co-present backend cookie out of gateway output.
-                        ctx.record_deadline_owned_response_headers(
-                            &["set-cookie"],
-                            &response_headers,
-                        );
+                        //
+                        // This is an APPEND, so it deliberately does not declare
+                        // ownership: ownership means whole-value replacement and
+                        // retires the backend cookie baseline, which here would
+                        // credit a co-present backend cookie as gateway output.
+                        // The injection always changes the field (`or_insert`
+                        // into an absent slot, or `and_modify` adding a line), so
+                        // mutation tracking sees it unconditionally, and the
+                        // occurrence partition credits the affinity line even
+                        // when it is byte-identical to a backend cookie.
+                        ctx.record_deadline_response_header_mutations(&response_headers);
                     }
                 }
 
@@ -23203,7 +23210,9 @@ async fn handle_proxy_request_inner(
             // before the committed-hook phase can exhaust the RPC deadline and
             // rebuild the response from gateway-owned output only. Line-granular
             // recording keeps any co-present backend cookie out of gateway output.
-            ctx.record_deadline_owned_response_headers(&["set-cookie"], &response_headers);
+            // An APPEND, so it records mutations rather than declaring ownership
+            // (which means whole-value replacement) — see the sibling site above.
+            ctx.record_deadline_response_header_mutations(&response_headers);
         }
     }
 

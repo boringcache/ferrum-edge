@@ -210,6 +210,11 @@ plus exact `Vary: Origin`, can cross into the terminal response. The
 sticky-affinity `Set-Cookie` that proxy core injects on buffered H3 and
 cross-protocol responses is recorded as gateway output before committed hooks
 run, so a committed-hook deadline cannot strip it and break client stickiness.
+That injection APPENDS, so it records its mutation without claiming ownership:
+ownership means a whole-value replacement and retires the backend cookie
+baseline, which here would credit a co-present backend cookie as gateway output.
+The occurrence partition credits the affinity line even when it is byte-identical
+to a backend cookie.
 Because ownership is declared rather than inferred from a value diff, a backend
 cannot suppress an owned gateway write by pre-populating the identical
 key/value. If a completed decorator chain is followed by a later hook that

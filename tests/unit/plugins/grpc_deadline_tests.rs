@@ -1231,7 +1231,7 @@ async fn deadline_replacement_strips_backend_cookie_when_gateway_appends_session
 #[tokio::test]
 async fn deadline_replacement_preserves_injected_sticky_cookie_and_strips_backend() {
     use ferrum_edge::_test_support::{
-        record_deadline_owned_response_headers_for_test, run_after_proxy_hooks_for_test,
+        record_deadline_response_header_mutations_for_test, run_after_proxy_hooks_for_test,
         run_deadline_bounded_response_committed_hooks_for_test, set_grpc_deadline_budget_for_test,
     };
 
@@ -1255,8 +1255,10 @@ async fn deadline_replacement_preserves_injected_sticky_cookie_and_strips_backen
         "seeding backend provenance must not reject the response"
     );
 
-    // Proxy core injects the sticky-affinity cookie (append) and records it as
-    // gateway-owned, exactly as the gRPC / committed-hook path does.
+    // Proxy core injects the sticky-affinity cookie (an APPEND) and records the
+    // mutation without claiming ownership, exactly as the gRPC / committed-hook
+    // path does. Ownership would mean whole-value replacement and retire the
+    // backend baseline, crossing `backend_sid` onto the deadline response.
     headers
         .entry("set-cookie".to_string())
         .and_modify(|existing| {
@@ -1264,7 +1266,7 @@ async fn deadline_replacement_preserves_injected_sticky_cookie_and_strips_backen
             existing.push_str("ferrum_affinity=target-a; Path=/");
         })
         .or_insert_with(|| "ferrum_affinity=target-a; Path=/".to_string());
-    record_deadline_owned_response_headers_for_test(&mut ctx, &["set-cookie"], &headers);
+    record_deadline_response_header_mutations_for_test(&mut ctx, &headers);
 
     // A committed-response hook then exhausts the RPC deadline.
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
@@ -1355,6 +1357,352 @@ async fn deadline_replacement_preserves_workload_metrics_traceparent_on_exact_ba
     );
     assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
     assert!(body.is_empty());
+}
+
+/// An owned `set-cookie` REPLACEMENT that writes the same bytes the backend
+/// sent, followed by an append before the same provenance record, must keep
+/// BOTH the operator-configured replacement cookie and the appended one. The
+/// replacement overwrote the whole field, so no backend line survives under it
+/// and the surplus partition must not be consulted; inferring "replacement" from
+/// an empty surplus dropped the configured cookie whenever an append followed.
+#[tokio::test]
+async fn deadline_replacement_keeps_owned_set_cookie_write_followed_by_append() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
+        transform_buffered_response_body_with_deadline_for_test,
+    };
+    use ferrum_edge::plugins::utils::route_header_transform::{
+        RawRouteHeaderTransformRule, parse_route_header_transforms,
+    };
+
+    // The backend sends exactly the bytes the trusted `update` rule writes, so
+    // the replacement is invisible to net-diff mutation tracking.
+    let shared_cookie = "sid=shared; Path=/";
+
+    let response_transformer = create_plugin(
+        "response_transformer",
+        &json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "set-cookie",
+                "value": shared_cookie
+            }]
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let after_proxy_plugins = vec![response_transformer];
+    let transform_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledResponseTransformer)];
+
+    // A route-level `add` appends a second cookie line onto the just-replaced
+    // value, inside the same `after_proxy` and therefore before the single
+    // provenance record response_transformer emits.
+    let route_rules = parse_route_header_transforms(
+        &[RawRouteHeaderTransformRule {
+            operation: "add".to_string(),
+            target: "header".to_string(),
+            key: "set-cookie".to_string(),
+            value: Some("route=1; Path=/".to_string()),
+        }],
+        "route_override",
+    )
+    .unwrap();
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+    ctx.route_override_response_transform = Some(Arc::new(route_rules));
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("set-cookie".to_string(), shared_cookie.to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "response transformer must not reject the buffered response"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        transform_buffered_response_body_with_deadline_for_test(
+            &transform_plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    let set_cookie = headers
+        .get("set-cookie")
+        .map(String::as_str)
+        .expect("owned set-cookie replacement plus append must survive the deadline rebuild");
+    let lines = set_cookie.split('\n').collect::<Vec<_>>();
+    assert!(
+        lines.contains(&shared_cookie),
+        "the owned replacement cookie must not be filtered as a backend line: {set_cookie:?}"
+    );
+    assert!(
+        lines.contains(&"route=1; Path=/"),
+        "the appended route cookie must survive: {set_cookie:?}"
+    );
+    assert_eq!(
+        lines.len(),
+        2,
+        "exactly the two gateway-authored lines, no duplicates: {set_cookie:?}"
+    );
+}
+
+/// The companion half of the same finding: once an owned `set-cookie`
+/// replacement has retired the backend baseline, a LATER gateway append that
+/// happens to match the overwritten backend value must not be filtered out as
+/// though the backend had supplied it.
+#[tokio::test]
+async fn deadline_replacement_keeps_later_append_matching_overwritten_backend_cookie() {
+    use ferrum_edge::_test_support::{
+        record_deadline_owned_response_headers_for_test,
+        record_deadline_response_header_mutations_for_test, run_after_proxy_hooks_for_test,
+        run_deadline_bounded_response_committed_hooks_for_test, set_grpc_deadline_budget_for_test,
+    };
+
+    let no_plugins: Vec<Arc<dyn Plugin>> = vec![];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+    let backend_cookie = "sid=backend; Path=/";
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("set-cookie".to_string(), backend_cookie.to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&no_plugins, &mut ctx, 200, &mut headers).await,
+        "seeding backend provenance must not reject the response"
+    );
+
+    // A trusted hook REPLACES the whole field with an operator-configured value,
+    // retiring the backend baseline.
+    headers.insert("set-cookie".to_string(), "sid=gateway; Path=/".to_string());
+    record_deadline_owned_response_headers_for_test(&mut ctx, &["set-cookie"], &headers);
+
+    // A later gateway append re-adds a line byte-identical to the OVERWRITTEN
+    // backend cookie. The backend value is long gone from the response, so this
+    // line is gateway-authored and must not be filtered against a stale baseline.
+    headers.entry("set-cookie".to_string()).and_modify(|value| {
+        value.push('\n');
+        value.push_str(backend_cookie);
+    });
+    record_deadline_response_header_mutations_for_test(&mut ctx, &headers);
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    let set_cookie = headers
+        .get("set-cookie")
+        .map(String::as_str)
+        .expect("gateway-authored cookies must survive the deadline rebuild");
+    let lines = set_cookie.split('\n').collect::<Vec<_>>();
+    assert!(
+        lines.contains(&"sid=gateway; Path=/"),
+        "the owned replacement cookie must survive: {set_cookie:?}"
+    );
+    assert!(
+        lines.contains(&backend_cookie),
+        "a gateway append matching the overwritten backend value must not be filtered: {set_cookie:?}"
+    );
+}
+
+/// The regular `rate_limiting` plugin owns the telemetry it exposes, so a
+/// backend that pre-populates the identical values cannot hide the write from
+/// mutation tracking and strip gateway rate-limit telemetry off a synthesized
+/// DEADLINE_EXCEEDED response.
+#[tokio::test]
+async fn deadline_replacement_preserves_rate_limiting_telemetry_on_exact_backend_spoof() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
+        transform_buffered_response_body_with_deadline_for_test,
+    };
+
+    let rate_limiting = create_plugin(
+        "rate_limiting",
+        &json!({
+            "expose_headers": true,
+            "limits": [{ "requests_per_minute": 60 }]
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let after_proxy_plugins = vec![rate_limiting];
+    let transform_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledResponseTransformer)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+    // The limiter records its decision in metadata during authorize; after_proxy
+    // publishes it when `expose_headers` is on.
+    ctx.metadata
+        .insert("ratelimit_limit".to_string(), "60".to_string());
+    ctx.metadata
+        .insert("ratelimit_remaining".to_string(), "59".to_string());
+    ctx.metadata
+        .insert("ratelimit_window".to_string(), "60".to_string());
+
+    // The backend spoofs the identical values, so net-diff mutation tracking
+    // sees no change at all.
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("x-ratelimit-limit".to_string(), "60".to_string()),
+        ("x-ratelimit-remaining".to_string(), "59".to_string()),
+        ("x-ratelimit-window".to_string(), "60".to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "rate_limiting after_proxy must not reject the response"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        transform_buffered_response_body_with_deadline_for_test(
+            &transform_plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("x-ratelimit-limit").map(String::as_str),
+        Some("60"),
+        "gateway rate-limit telemetry must survive the deadline rebuild"
+    );
+    assert_eq!(
+        headers.get("x-ratelimit-remaining").map(String::as_str),
+        Some("59")
+    );
+    assert_eq!(
+        headers.get("x-ratelimit-window").map(String::as_str),
+        Some("60")
+    );
+}
+
+/// `grpc_web` must keep its operator-configured expose list on a deadline
+/// rebuild even when the backend pre-populated the identical combined value —
+/// while never promoting a backend-only token onto the synthesized response.
+#[tokio::test]
+async fn deadline_replacement_keeps_configured_grpc_web_expose_headers_on_exact_backend_spoof() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
+        transform_buffered_response_body_with_deadline_for_test,
+    };
+
+    // Both gRPC-Web framings run this one `after_proxy`, so both are covered.
+    for content_type in [
+        "application/grpc-web+proto",
+        "application/grpc-web-text+proto",
+    ] {
+        let grpc_web = create_plugin(
+            "grpc_web",
+            &json!({ "expose_headers": ["x-custom-trailer-bin"] }),
+        )
+        .unwrap()
+        .unwrap();
+        let after_proxy_plugins = vec![Arc::clone(&grpc_web)];
+        let transform_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledResponseTransformer)];
+
+        let mut ctx = create_grpc_context_with_timeout(None);
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        assert_continue(grpc_web.on_request_received(&mut ctx).await);
+        set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+        // The backend already carries every configured token, so the plugin
+        // appends nothing and its write is completely invisible to net-diff
+        // mutation tracking. It also carries one token only the backend supplied,
+        // which must NOT be promoted to gateway output.
+        let mut headers = HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            (
+                "access-control-expose-headers".to_string(),
+                "grpc-status, grpc-message, grpc-status-details-bin, \
+                 x-custom-trailer-bin, x-backend-only"
+                    .to_string(),
+            ),
+        ]);
+        assert!(
+            !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+            "grpc_web after_proxy must not reject the response"
+        );
+
+        // The rebuild takes the gRPC-Web branch off the response content-type
+        // `after_proxy` just relabelled, which is what selects the expose-header
+        // merge in `finalize_grpc_web_error_response_headers`.
+        let grpc_web_ct = headers
+            .get("content-type")
+            .cloned()
+            .expect("grpc_web after_proxy must relabel the response content-type");
+
+        set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+        let mut status = 200;
+        let mut body = b"discarded backend response".to_vec();
+        assert!(
+            transform_buffered_response_body_with_deadline_for_test(
+                &transform_plugins,
+                &mut ctx,
+                &mut status,
+                &mut headers,
+                &mut body,
+                Some(grpc_web_ct.as_str()),
+            )
+            .await
+        );
+
+        let exposed = headers
+            .get("access-control-expose-headers")
+            .map(String::as_str)
+            .unwrap_or_default();
+        let tokens = exposed
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.eq_ignore_ascii_case("x-custom-trailer-bin")),
+            "the operator-configured trailer header must stay readable on the \
+             deadline response for {content_type}: {exposed:?}"
+        );
+        assert!(
+            !tokens
+                .iter()
+                .any(|token| token.eq_ignore_ascii_case("x-backend-only")),
+            "a backend-only expose token must not cross onto the deadline \
+             response for {content_type}: {exposed:?}"
+        );
+    }
 }
 
 /// Finding 3 (regression lock): a chain of completing decorators run through the

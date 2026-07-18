@@ -1445,16 +1445,32 @@ pub mod _test_support {
             .map(|reject| (reject.status_code, reject.body, reject.headers))
     }
 
-    /// Record gateway-authored response-header keys as deadline-provenance
-    /// owned, mirroring what proxy core does after injecting the sticky-session
-    /// affinity `Set-Cookie` outside any plugin mutation. Lets tests exercise
-    /// the sticky-cookie-then-deadline path without a full proxy request.
+    /// Declare response-header keys a trusted hook wrote as a WHOLE-VALUE
+    /// REPLACEMENT (a `response_transformer` `update`/`rename` destination, or
+    /// an `add` into a slot a `remove` cleared), mirroring the declaration
+    /// `response_transformer` makes. Lets tests exercise the
+    /// owned-replacement-then-deadline path without a full proxy request.
+    ///
+    /// This is NOT the sticky-affinity cookie path — that is an APPEND and uses
+    /// [`record_deadline_response_header_mutations_for_test`].
     pub fn record_deadline_owned_response_headers_for_test(
         ctx: &mut crate::plugins::RequestContext,
         owned_header_names: &[&str],
         response_headers: &HashMap<String, String>,
     ) {
         ctx.record_deadline_owned_response_headers(owned_header_names, response_headers);
+    }
+
+    /// Record a gateway-authored response-header APPEND into deadline
+    /// provenance without claiming ownership, mirroring what proxy core does
+    /// after injecting the sticky-session affinity `Set-Cookie` outside any
+    /// plugin mutation. Lets tests exercise the sticky-cookie-then-deadline
+    /// path without a full proxy request.
+    pub fn record_deadline_response_header_mutations_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) {
+        ctx.record_deadline_response_header_mutations(response_headers);
     }
 
     pub async fn transform_buffered_response_body_with_deadline_for_test(
