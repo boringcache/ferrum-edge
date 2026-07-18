@@ -37,8 +37,9 @@ use crate::admin::backup::{
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
-    NamespaceResourceCounts, SnapshotDataIntegrityError, classify_atomic_clear_verification,
-    is_mtls_dns_admission_unavailable,
+    NamespaceResourceCounts, PROXY_ROUTE_CONFLICT_ERROR, SnapshotDataIntegrityError,
+    classify_atomic_clear_verification, is_mtls_dns_admission_unavailable,
+    is_mtls_dns_identity_conflict, tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
@@ -3534,11 +3535,30 @@ async fn validate_batch_route_override_conflicts(
     Ok(())
 }
 
+/// Sanitize a batch/restore persistence error before it reaches an admin
+/// response. Internally constructed conflict messages (mTLS DNS identity,
+/// tcp_connection_throttle attachment, proxy route conflicts) are safe to
+/// surface; driver-provided strings are classified and replaced so schema,
+/// constraint, and backend details never reach the wire. Full diagnostics
+/// stay in internal logs.
 fn payload_persist_error_message(error: &anyhow::Error) -> String {
     if is_mtls_dns_admission_unavailable(error) {
-        MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
+        return MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string();
+    }
+    if is_mtls_dns_identity_conflict(error) {
+        return error.to_string();
+    }
+    if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
+        return conflict.errors().join("; ");
+    }
+    let raw = error.to_string();
+    if raw.contains(PROXY_ROUTE_CONFLICT_ERROR) {
+        PROXY_ROUTE_CONFLICT_ERROR.to_string()
+    } else if is_unique_constraint_violation(&raw) {
+        "Resource identity conflicts with an existing resource in the namespace".to_string()
     } else {
-        error.to_string()
+        warn!("Batch persistence error in admin API: {:#}", error);
+        "Database unavailable — operation failed".to_string()
     }
 }
 
@@ -7335,6 +7355,56 @@ mod tests {
         assert!(message.contains("conflicts with another Consumer"));
         assert!(!message.contains(secret));
         assert!(!message.contains("credentials.hmac_auth.secret"));
+    }
+
+    #[test]
+    fn consumer_persist_error_message_redacts_generic_backend_details() {
+        // Sentinel schema/driver details must never reach the wire on a
+        // non-conflict persistence failure.
+        let error = anyhow::anyhow!(
+            "error returned from database: relation \"gateway.consumers_pkey\" violates check constraint \"ck_consumers_hmac_hash\" with value sha256:9f86d081884c7d65"
+        );
+
+        let message = crud::consumer_persist_error_message(&error);
+        assert_eq!(message, "Database unavailable — operation failed");
+        for sentinel in [
+            "gateway.consumers_pkey",
+            "ck_consumers_hmac_hash",
+            "sha256:9f86d081884c7d65",
+        ] {
+            assert!(
+                !message.contains(sentinel),
+                "response leaked backend detail {sentinel:?}: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_persist_error_message_classifies_without_leaking() {
+        // Unique-constraint driver strings name indexes/columns; the wire
+        // message must only carry the conflict disposition.
+        let unique = anyhow::anyhow!("UNIQUE constraint failed: upstreams.namespace, upstreams.id");
+        let message = payload_persist_error_message(&unique);
+        assert!(message.contains("conflicts with an existing resource"));
+        assert!(!message.contains("upstreams.namespace"));
+        assert!(!message.contains("UNIQUE constraint"));
+
+        // Generic driver failures collapse to the sanitized 500 body.
+        let driver = anyhow::anyhow!(
+            "connection to server at \"db.internal:5432\", database \"ferrum_prod\" refused"
+        );
+        let message = payload_persist_error_message(&driver);
+        assert_eq!(message, "Database unavailable — operation failed");
+        assert!(!message.contains("db.internal:5432"));
+        assert!(!message.contains("ferrum_prod"));
+
+        // The proxy-route-conflict sentinel is a static contract string and
+        // survives classification.
+        let route = anyhow::anyhow!("{}: listen_path /api", PROXY_ROUTE_CONFLICT_ERROR);
+        assert_eq!(
+            payload_persist_error_message(&route),
+            PROXY_ROUTE_CONFLICT_ERROR
+        );
     }
 
     #[test]

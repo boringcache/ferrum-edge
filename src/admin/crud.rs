@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, MutexGuard};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::admin::AdminState;
@@ -2009,20 +2010,24 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     super::json_response(status, &json!({"error": message}))
 }
 
-/// Redact persistence-level uniqueness diagnostics before they reach an admin
-/// response. MongoDB duplicate-key errors can echo indexed credential-derived
-/// values; callers need the conflict disposition, never credential or index
-/// metadata.
+/// Redact persistence-level diagnostics before they reach an admin response.
+/// MongoDB duplicate-key errors can echo indexed credential-derived values;
+/// callers need the conflict disposition, never credential or index metadata.
+/// Other backend failures are logged in full internally but return a generic
+/// body so schema, constraint, and driver details never reach the wire.
 pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
     if is_mtls_dns_admission_unavailable(error) {
         MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
     } else if is_mtls_dns_identity_conflict(error) {
+        // Internally constructed validation message; the mTLS DNS identities
+        // it names are not secrets.
         error.to_string()
     } else if super::is_unique_constraint_violation(&error.to_string()) {
         "Consumer identity or credential conflicts with another Consumer in the namespace"
             .to_string()
     } else {
-        error.to_string()
+        warn!("Consumer persistence error in admin API: {:#}", error);
+        "Database unavailable — operation failed".to_string()
     }
 }
 
