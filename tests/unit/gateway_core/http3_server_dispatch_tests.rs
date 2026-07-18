@@ -312,39 +312,11 @@ fn buffered_h3_deadline_replacements_keep_grpc_web_wire_flavor() {
     assert!(replacement.contains("replace_buffered_h3_response_with_grpc_deadline("));
 }
 
-#[test]
-fn buffered_response_transforms_are_not_status_gated_before_security_redaction() {
-    let proxy = include_str!("../../../src/proxy/mod.rs");
-    let transform_helper = proxy
-        .split("pub(crate) async fn transform_buffered_response_body_with_deadline")
-        .nth(1)
-        .expect("shared buffered response transform helper must remain present")
-        .split("pub(crate) fn strip_content_length_for_streaming_grpc_deadline")
-        .next()
-        .expect("bounded shared buffered response transform helper");
-    assert!(
-        !transform_helper.contains("response_body_rewrite_allowed"),
-        "security response-body transforms must still run for buffered 206/226 responses"
-    );
-    assert!(
-        transform_helper.contains("if matches!(*response_status, 206 | 226)")
-            && transform_helper.contains("*response_status = 200;"),
-        "rewritten range/delta responses must be normalized to a full-response status"
-    );
-
-    let server = include_str!("../../../src/http3/server.rs");
-    let h3_transform_phase = server
-        .split("// transform_response_body hooks — only for buffered responses.")
-        .nth(1)
-        .expect("buffered H3 response transform phase must remain present")
-        .split("// on_final_response_body hooks")
-        .next()
-        .expect("bounded buffered H3 response transform phase");
-    assert!(
-        !h3_transform_phase.contains("response_body_rewrite_allowed"),
-        "H3 must not skip configured response-body redaction solely because the status is 206/226"
-    );
-}
+// Buffered response-body policy enforcement across encoded, partial, and
+// non-parseable representations is covered behaviorally — by driving the real
+// shared transform phase with a real `response_transformer` — in
+// `gateway_core::response_representation_tests`. Source-text assertions were
+// removed: they passed while the runtime still forwarded protected bytes.
 
 #[test]
 fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {

@@ -1419,6 +1419,56 @@ pub mod _test_support {
         .await
     }
 
+    /// Like [`transform_buffered_response_body_with_deadline_for_test`] but
+    /// returns the full `(response_replaced, body_transformed)` pair, so a test
+    /// can distinguish "the gate rejected and replaced the response" from "the
+    /// transforms ran and rewrote the body" from "nothing happened".
+    pub async fn transform_buffered_response_body_with_deadline_full_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut Vec<u8>,
+        grpc_web_response_content_type: Option<&str>,
+    ) -> (bool, bool) {
+        crate::proxy::transform_buffered_response_body_with_deadline(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            grpc_web_response_content_type,
+            &[],
+        )
+        .await
+    }
+
+    /// Take the pre-`after_proxy` snapshot of a backend response exactly as the
+    /// H1/H2, native H3, and H3 bridge paths do before running response hooks.
+    ///
+    /// Tests that drive the buffered body phase need this because the shared
+    /// representation gate treats an unstamped backend response as unprovable
+    /// (and therefore rejects it): the snapshot *is* the production precondition,
+    /// so exercising the gate without it would test a state the proxy never
+    /// produces.
+    pub fn stamp_original_response_metadata_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) {
+        crate::proxy::stamp_original_response_metadata(ctx, response_status, response_headers);
+    }
+
+    /// The low-cardinality reason the shared representation gate rejected this
+    /// response, or `None` when it was never rejected.
+    pub fn representation_rejection_reason_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<&str> {
+        ctx.metadata
+            .get(crate::proxy::REPRESENTATION_REJECTED_METADATA_KEY)
+            .map(String::as_str)
+    }
+
     pub async fn run_after_proxy_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
