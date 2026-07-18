@@ -3472,3 +3472,386 @@ async fn rejection_adoption_preserves_prior_cookie_decoration_without_backend_li
          backend occurrences stay dropped"
     );
 }
+
+/// Codex finding (#2707 discussion r3607966247): an OWNED `Set-Cookie` write is
+/// not always an append. `response_transformer`'s `update` rule replaces the
+/// whole field with an operator-configured value, and
+/// `record_deadline_owned_response_headers` declares that key owned. When the
+/// backend happened to send a byte-identical cookie, the surplus-occurrence
+/// partition scored zero surplus, returned `None`, and REMOVED the
+/// gateway-authored cookie — so a later gRPC deadline rebuild dropped the
+/// operator-owned `Set-Cookie` entirely.
+///
+/// Appending can only grow the cookie-line multiset, so a zero-surplus owned
+/// write is unambiguously a replacement and must be credited.
+#[tokio::test]
+async fn deadline_rebuild_keeps_an_owned_set_cookie_update_matching_a_backend_line() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+
+    const SHARED: &str = "sid=deterministic; Path=/; HttpOnly";
+
+    let transformer = create_plugin(
+        "response_transformer",
+        &json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "set-cookie",
+                "value": SHARED,
+            }]
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let after_proxy_plugins = vec![transformer];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    // The backend sent exactly the cookie the trusted `update` writes, so the
+    // post-hook value carries no surplus occurrence over the backend baseline.
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("set-cookie".to_string(), SHARED.to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "the response_transformer must not reject the buffered response"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(SHARED),
+        "an operator-owned `update` to `set-cookie` must survive the deadline \
+         rebuild even when the backend sent the identical cookie line"
+    );
+}
+
+/// Same owned-replacement boundary as
+/// [`deadline_rebuild_keeps_an_owned_set_cookie_update_matching_a_backend_line`],
+/// reached through a fired `rename` whose destination is `set-cookie`.
+/// Mutation tracking observes only the source removal, so ownership is the sole
+/// signal that the destination is gateway-authored.
+#[tokio::test]
+async fn deadline_rebuild_keeps_an_owned_set_cookie_rename_destination() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+
+    const SHARED: &str = "sid=renamed; Path=/";
+
+    let transformer = create_plugin(
+        "response_transformer",
+        &json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "header",
+                "key": "x-session-source",
+                "new_key": "set-cookie",
+            }]
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let after_proxy_plugins = vec![transformer];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    // The backend supplies BOTH the rename source and a `set-cookie` that is
+    // byte-identical to what the rename will produce, so the post-rename value
+    // has zero surplus over the backend baseline.
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("x-session-source".to_string(), SHARED.to_string()),
+        ("set-cookie".to_string(), SHARED.to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "the response_transformer must not reject the buffered response"
+    );
+    assert!(
+        !headers.contains_key("x-session-source"),
+        "precondition: the rename consumed the source header"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(SHARED),
+        "the fired rename destination is gateway-authored and must survive"
+    );
+    assert!(
+        !headers.contains_key("x-session-source"),
+        "the renamed-away backend source header must not reappear"
+    );
+}
+
+/// The owned-replacement credit must not become a blanket "owned means keep
+/// everything currently in the field" rule: a replacing `update` discards the
+/// backend's own cookies, and none of them may cross onto the rebuild.
+#[tokio::test]
+async fn deadline_rebuild_drops_backend_cookies_replaced_by_an_owned_set_cookie_update() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+
+    const GATEWAY: &str = "gw_session=fresh; Path=/";
+
+    let transformer = create_plugin(
+        "response_transformer",
+        &json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "set-cookie",
+                "value": GATEWAY,
+            }]
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let after_proxy_plugins = vec![transformer];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (
+            "set-cookie".to_string(),
+            "backend_sid=leak; Path=/\nbackend_csrf=leak".to_string(),
+        ),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "the response_transformer must not reject the buffered response"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    let rebuilt = headers.get("set-cookie").map(String::as_str);
+    assert_eq!(
+        rebuilt,
+        Some(GATEWAY),
+        "only the operator-configured replacement may cross the rebuild"
+    );
+    let rebuilt = rebuilt.unwrap_or_default();
+    assert!(
+        !rebuilt.contains("backend_sid") && !rebuilt.contains("backend_csrf"),
+        "no backend cookie may cross a synthesized DEADLINE_EXCEEDED response"
+    );
+}
+
+/// Codex finding (#2707 discussion r3607966248): a route-level response `add`
+/// rule APPENDS to an existing backend value with a comma, so the post-hook
+/// value is `backend,gateway`. Mutation tracking saw only "the field changed"
+/// and recorded the whole value as gateway-authored, so a gRPC deadline rebuild
+/// emitted the backend's portion even though the backend response was
+/// discarded. Only the appended element is gateway output.
+#[tokio::test]
+async fn deadline_rebuild_credits_only_the_appended_portion_of_a_route_added_header() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+    use ferrum_edge::plugins::utils::route_header_transform::{
+        RawRouteHeaderTransformRule, parse_route_header_transforms,
+    };
+
+    // Zero static rules; this instance exists only to consume the route
+    // override Arc, which is exactly what the K8s VirtualService translator
+    // emits (`apply_route_overrides` is the config-time flag for that shape).
+    let transformer = create_plugin(
+        "response_transformer",
+        &json!({"rules": [], "apply_route_overrides": true}),
+    )
+    .unwrap()
+    .unwrap();
+    let after_proxy_plugins = vec![transformer];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let route_rules = parse_route_header_transforms(
+        &[RawRouteHeaderTransformRule {
+            operation: "add".to_string(),
+            target: "header".to_string(),
+            key: "x-meta".to_string(),
+            value: Some("public".to_string()),
+        }],
+        "route_override",
+    )
+    .unwrap();
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+    ctx.route_override_response_transform = Some(Arc::new(route_rules));
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("x-meta".to_string(), "secret".to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "the response_transformer must not reject the buffered response"
+    );
+    assert_eq!(
+        headers.get("x-meta").map(String::as_str),
+        Some("secret,public"),
+        "precondition: the route `add` appended onto the backend value"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("x-meta").map(String::as_str),
+        Some("public"),
+        "only the route-appended element is gateway-authored; the backend \
+         portion must not cross the deadline rebuild"
+    );
+}
+
+/// The append partition must not shrink a replacing `update` that legitimately
+/// configures a comma list sharing an element with the backend value: `update`
+/// is declared owned, so the whole operator-configured value is gateway output.
+#[tokio::test]
+async fn deadline_rebuild_keeps_a_whole_owned_update_list_sharing_a_backend_element() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+    use ferrum_edge::plugins::utils::route_header_transform::{
+        RawRouteHeaderTransformRule, parse_route_header_transforms,
+    };
+
+    let transformer = create_plugin(
+        "response_transformer",
+        &json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "x-static-list",
+                "value": "shared,gateway",
+            }]
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let after_proxy_plugins = vec![transformer];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let route_rules = parse_route_header_transforms(
+        &[RawRouteHeaderTransformRule {
+            operation: "update".to_string(),
+            target: "header".to_string(),
+            key: "x-route-list".to_string(),
+            value: Some("shared,route".to_string()),
+        }],
+        "route_override",
+    )
+    .unwrap();
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+    ctx.route_override_response_transform = Some(Arc::new(route_rules));
+
+    // Both backend values already carry the `shared` element the trusted
+    // `update` re-states, so an element-wise surplus filter alone would strip it.
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("x-static-list".to_string(), "shared".to_string()),
+        ("x-route-list".to_string(), "shared".to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "the response_transformer must not reject the buffered response"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("x-static-list").map(String::as_str),
+        Some("shared,gateway"),
+        "a static `update` is an owned replacement: the whole configured value \
+         is gateway output"
+    );
+    assert_eq!(
+        headers.get("x-route-list").map(String::as_str),
+        Some("shared,route"),
+        "a route-override `update` is an owned replacement too"
+    );
+}

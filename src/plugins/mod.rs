@@ -369,6 +369,20 @@ struct BufferedDeadlineResponseHeaderProvenance {
     /// backend baseline are gateway-authored and may cross. Empty for gateway
     /// rejections (no backend contributed the response).
     backend_set_cookie_lines: Vec<String>,
+    /// The pristine BACKEND header snapshot, captured before any trusted hook
+    /// runs. `Set-Cookie` is not the only field a trusted hook APPENDS to: a
+    /// route-level response `add` rule appends onto an existing backend value
+    /// with a comma (`apply_route_header_transforms`), so a backend
+    /// `x-meta: secret` plus a route `add` of `public` yields
+    /// `x-meta: secret,public`. Mutation tracking sees only "the field changed"
+    /// and would record the whole post-hook value, crediting the backend
+    /// portion as gateway-authored and crossing it onto a synthesized
+    /// DEADLINE_EXCEEDED response. This baseline lets
+    /// [`Self::gateway_appended_value`] partition such a value and keep only the
+    /// appended elements. Empty for gateway rejections, and retired per field
+    /// once a trusted hook declares authoritative ownership of it (see
+    /// [`Self::record_gateway_mutations`]).
+    backend_headers: HashMap<String, String>,
 }
 
 impl BufferedDeadlineResponseHeaderProvenance {
@@ -376,6 +390,7 @@ impl BufferedDeadlineResponseHeaderProvenance {
         let observed_headers = Self::canonical_snapshot(headers);
         let backend_set_cookie_lines = Self::set_cookie_lines(observed_headers.get("set-cookie"));
         Self {
+            backend_headers: observed_headers.clone(),
             observed_headers,
             gateway_headers: HashMap::new(),
             backend_set_cookie_lines,
@@ -392,8 +407,10 @@ impl BufferedDeadlineResponseHeaderProvenance {
             observed_headers,
             gateway_headers,
             // A gateway rejection has no backend contribution, so every
-            // `Set-Cookie` line is gateway-authored.
+            // `Set-Cookie` line — and every element of every other field — is
+            // gateway-authored.
             backend_set_cookie_lines: Vec::new(),
+            backend_headers: HashMap::new(),
         }
     }
 
@@ -429,38 +446,92 @@ impl BufferedDeadlineResponseHeaderProvenance {
     /// treated as gateway-authored, which is the deliberate trade for not
     /// silently destroying deterministic gateway cookies.
     ///
-    /// Implemented by comparing per-line occurrence counts rather than
-    /// materializing a consumed-set, so a deadline-tracked response with a long
-    /// hook chain stays allocation-free here (cookie-line counts are tiny).
+    /// Implemented by [`Self::gateway_surplus_value`], which compares per-line
+    /// occurrence counts rather than materializing a consumed-set, so a
+    /// deadline-tracked response with a long hook chain stays allocation-free
+    /// here (cookie-line counts are tiny).
+    ///
+    /// Surplus filtering is the APPEND defence and is therefore not the whole
+    /// story for a field a trusted hook authoritatively OWNS: an owned write
+    /// that carries no surplus is a replacement, and
+    /// [`Self::record_gateway_mutations`] credits it there rather than letting
+    /// this function's `None` destroy an operator-configured cookie.
     fn gateway_set_cookie_value(&self, value: &str) -> Option<String> {
         if self.backend_set_cookie_lines.is_empty() {
             // No backend contributed to this response (a gateway rejection), so
             // every line is gateway-authored. Skips the per-line recount below.
             return Some(value.to_string());
         }
-        let backend_occurrences = |line: &str| {
+        Self::gateway_surplus_value(value, "\n", |line| {
             self.backend_set_cookie_lines
                 .iter()
                 .filter(|backend| backend.as_str() == line)
                 .count()
+        })
+    }
+
+    /// The ordinary-header counterpart of [`Self::gateway_set_cookie_value`]:
+    /// reduce a changed list-valued header to only the elements a trusted hook
+    /// APPENDED beyond the backend baseline, comma being the RFC 9110 list
+    /// separator that route-level `add` rules use.
+    ///
+    /// Without this partition, a route override adding `x-meta: public` on top
+    /// of a backend `x-meta: secret` produced `secret,public`, and mutation
+    /// tracking recorded that whole value as gateway-authored — so a gRPC
+    /// deadline rebuild emitted the backend's `secret` even though the backend
+    /// response itself was discarded.
+    ///
+    /// Occurrence semantics, the trade they make, and the reason surplus (not
+    /// value membership) is the test are identical to
+    /// [`Self::gateway_set_cookie_value`]; see that docstring. A pure
+    /// replacement is unaffected: none of its elements match the baseline, so
+    /// the entire new value is surplus. A header with no backend baseline (a
+    /// field the gateway introduced, or a gateway rejection) is wholly
+    /// gateway-authored.
+    fn gateway_appended_value(&self, name: &str, value: &str) -> Option<String> {
+        let Some(backend_value) = self.backend_headers.get(name) else {
+            return Some(value.to_string());
         };
-        let gateway_lines = value
-            .split('\n')
+        Self::gateway_surplus_value(value, ",", |element| {
+            backend_value
+                .split(',')
+                .filter(|backend| *backend == element)
+                .count()
+        })
+    }
+
+    /// Occurrence-surplus partition shared by the `Set-Cookie` (newline-joined
+    /// lines) and ordinary list-valued (comma-joined elements) paths.
+    ///
+    /// An element survives only to the extent the live value carries MORE
+    /// occurrences of it than `backend_occurrences` reports for the backend
+    /// baseline. Returns `None` when nothing gateway-authored remains, so the
+    /// caller drops the field rather than crossing backend data onto the
+    /// deadline response. Implemented by recounting rather than materializing a
+    /// consumed-set, so a long hook chain stays allocation-free here (per-field
+    /// element counts are tiny).
+    fn gateway_surplus_value(
+        value: &str,
+        separator: &str,
+        backend_occurrences: impl Fn(&str) -> usize,
+    ) -> Option<String> {
+        let gateway_elements = value
+            .split(separator)
             .enumerate()
-            .filter(|(index, line)| {
-                // Occurrences of this same line earlier in the live value. Once
-                // the backend baseline's count is used up, further copies are the
-                // gateway-authored surplus.
+            .filter(|(index, element)| {
+                // Occurrences of this same element earlier in the live value.
+                // Once the backend baseline's count is used up, further copies
+                // are the gateway-authored surplus.
                 let seen_before = value
-                    .split('\n')
+                    .split(separator)
                     .take(*index)
-                    .filter(|earlier| earlier == line)
+                    .filter(|earlier| earlier == element)
                     .count();
-                seen_before >= backend_occurrences(line)
+                seen_before >= backend_occurrences(element)
             })
-            .map(|(_, line)| line)
+            .map(|(_, element)| element)
             .collect::<Vec<_>>();
-        (!gateway_lines.is_empty()).then(|| gateway_lines.join("\n"))
+        (!gateway_elements.is_empty()).then(|| gateway_elements.join(separator))
     }
 
     fn canonical_snapshot(headers: &HashMap<String, String>) -> HashMap<String, String> {
@@ -483,8 +554,8 @@ impl BufferedDeadlineResponseHeaderProvenance {
     ) {
         let current = Self::canonical_snapshot(headers);
         for (name, value) in &current {
-            let changed = self.observed_headers.get(name) != Some(value)
-                || plugin_owned_headers.iter().any(|owned| owned == name);
+            let owned = plugin_owned_headers.iter().any(|declared| declared == name);
+            let changed = self.observed_headers.get(name) != Some(value) || owned;
             if !changed {
                 continue;
             }
@@ -498,12 +569,53 @@ impl BufferedDeadlineResponseHeaderProvenance {
                     Some(gateway_value) => {
                         self.gateway_headers.insert(name.clone(), gateway_value);
                     }
+                    // An OWNED write with zero surplus is a REPLACEMENT, not an
+                    // append. Appending can only grow the line multiset, so an
+                    // owned value that carries no line beyond the backend
+                    // baseline cannot have come from the appending sites
+                    // (sticky-affinity injection) — it came from a
+                    // `response_transformer` `update` to `set-cookie`, or a
+                    // `rename` whose destination is `set-cookie`, both of which
+                    // write an operator-configured value over the field. That
+                    // value is gateway-authored even when the backend happened
+                    // to send a byte-identical cookie, so surplus filtering here
+                    // was destroying an operator-owned cookie on the deadline
+                    // rebuild. Credit it and retire the baseline: the backend
+                    // lines were overwritten, so they no longer describe the
+                    // tracked map (same rationale as `adopt_gateway_rejection`).
+                    None if owned => {
+                        self.gateway_headers.insert(name.clone(), value.clone());
+                        self.backend_set_cookie_lines = Vec::new();
+                        self.backend_headers.remove(name);
+                    }
                     None => {
                         self.gateway_headers.remove(name);
                     }
                 }
-            } else {
+            } else if owned {
+                // Ownership of an ordinary header is only ever declared for
+                // unconditional replacements (`update` rules and fired `rename`
+                // destinations), so the whole configured value is gateway
+                // output. Retire this field's backend baseline for the same
+                // reason as the `set-cookie` branch above — the backend value
+                // was overwritten, and leaving a stale baseline would make a
+                // later append partition against data no longer in the response.
                 self.gateway_headers.insert(name.clone(), value.clone());
+                self.backend_headers.remove(name);
+            } else {
+                // A mutation-detected change may be an append rather than a
+                // replacement (a route-level `add` rule appends onto the
+                // existing backend value with a comma). Credit only the
+                // appended elements so the backend portion never crosses onto a
+                // synthesized DEADLINE_EXCEEDED response.
+                match self.gateway_appended_value(name, value) {
+                    Some(gateway_value) => {
+                        self.gateway_headers.insert(name.clone(), gateway_value);
+                    }
+                    None => {
+                        self.gateway_headers.remove(name);
+                    }
+                }
             }
         }
         for name in self.observed_headers.keys() {
@@ -538,6 +650,10 @@ impl BufferedDeadlineResponseHeaderProvenance {
         // re-appends a byte-identical copy of a backend line is credited with
         // authoring that copy, because the alternative destroys deterministic
         // gateway cookies.
+        // Ordinary list-valued headers get the same treatment through
+        // `gateway_appended_value`: a route-level `add` rule appends onto the
+        // backend value with a comma, so only the appended elements reach
+        // `gateway_headers` and the backend portion never crosses here either.
         // `x-grpc-web` is gRPC-Web framing regenerated by the deadline error
         // response; a completed hook must not overwrite the canonical
         // `x-grpc-web: 1` (the buffered replacement extends the generated error
@@ -608,7 +724,11 @@ impl BufferedDeadlineResponseHeaderProvenance {
     /// was recorded yet, `gateway_headers` is empty and this is identical to
     /// starting a fresh [`Self::gateway_rejection`].
     ///
-    /// # Why the backend `Set-Cookie` baseline is retired here
+    /// # Why the backend baselines are retired here
+    ///
+    /// (The reasoning below is written for `backend_set_cookie_lines`; it
+    /// applies verbatim to the `backend_headers` append baseline, which is
+    /// captured from the same discarded backend map.)
     ///
     /// `headers` is a gateway-authored REPLACEMENT map, never the mutated
     /// backend response map. Every caller of
@@ -646,11 +766,13 @@ impl BufferedDeadlineResponseHeaderProvenance {
             self.gateway_headers.insert(name.clone(), value.clone());
         }
         // The backend response map has been replaced wholesale by gateway
-        // output, so the backend cookie baseline no longer describes what is
-        // being tracked. Retire it, matching [`Self::gateway_rejection`], so
-        // hooks that run after this transition are credited for what they
-        // actually author on the rejection map.
+        // output, so neither the backend cookie baseline nor the backend
+        // header baseline describes what is being tracked. Retire both,
+        // matching [`Self::gateway_rejection`], so hooks that run after this
+        // transition are credited for what they actually author on the
+        // rejection map.
         self.backend_set_cookie_lines = Vec::new();
+        self.backend_headers = HashMap::new();
         self.observed_headers = rejection;
     }
 
