@@ -7237,7 +7237,8 @@ impl ProxyState {
         staged_config: Arc<GatewayConfig>,
         delta: &crate::config_delta::ConfigDelta,
     ) -> Result<StagedRequestEpoch, String> {
-        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
+        let proxy_ids_to_rebuild =
+            delta.proxy_ids_needing_plugin_rebuild(&current.config, new_config);
         let rebuild_globals = delta.global_plugin_configs_changed;
         // A route-indexed proxy delta OR a change to the route table's mesh
         // inputs (e.g. `mesh.local_inbound_tcp_routes`, invisible to `ConfigDelta`)
@@ -7631,7 +7632,9 @@ impl ProxyState {
             debug!("Config update: mesh-only change republished (caches reused)");
             return ConfigApplyOutcome::Applied;
         };
-        let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
+        let proxy_plugin_rebuild_count = delta
+            .proxy_ids_needing_plugin_rebuild(&old_config, &new_config)
+            .len();
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -7766,11 +7769,12 @@ impl ProxyState {
             + delta.added_plugin_configs.len()
             + delta.removed_plugin_config_ids.len()
             + delta.modified_plugin_configs.len()
+            + delta.plugin_association_changed_proxy_ids.len()
             + delta.added_upstreams.len()
             + delta.removed_upstream_ids.len()
             + delta.modified_upstreams.len();
         info!(
-            "Config updated incrementally: {} changes (proxies: +{} -{} ~{}, consumers: +{} -{} ~{}, plugins: +{} -{} ~{}, upstreams: +{} -{} ~{}, {} proxy plugin lists rebuilt)",
+            "Config updated incrementally: {} changes (proxies: +{} -{} ~{}, consumers: +{} -{} ~{}, plugins: +{} -{} ~{}, plugin associations: ~{}, upstreams: +{} -{} ~{}, {} proxy plugin lists rebuilt)",
             total_changes,
             delta.added_proxies.len(),
             delta.removed_proxy_ids.len(),
@@ -7781,6 +7785,7 @@ impl ProxyState {
             delta.added_plugin_configs.len(),
             delta.removed_plugin_config_ids.len(),
             delta.modified_plugin_configs.len(),
+            delta.plugin_association_changed_proxy_ids.len(),
             delta.added_upstreams.len(),
             delta.removed_upstream_ids.len(),
             delta.modified_upstreams.len(),
