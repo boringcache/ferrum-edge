@@ -4827,20 +4827,22 @@ impl PluginCache {
             ));
         }
 
-        let country_mmdb_snapshot_bytes =
-            match country_mmdb_snapshot_bytes(&proxy_map, &global_plugins) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    crate::plugins::utils::log_schema::registry::abort_reload().map_err(
-                        |registry_error| {
-                            format!(
-                                "Gateway startup aborted: {error}; registry abort also failed: {registry_error}"
-                            )
-                        },
-                    )?;
-                    return Err(format!("Gateway startup aborted: {error}"));
-                }
-            };
+        let country_mmdb_snapshot_bytes = match country_mmdb_snapshot_bytes(
+            &proxy_map,
+            &global_plugins,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                    |registry_error| {
+                        format!(
+                            "Gateway startup aborted: {error}; registry abort also failed: {registry_error}"
+                        )
+                    },
+                )?;
+                return Err(format!("Gateway startup aborted: {error}"));
+            }
+        };
 
         if let Err(error) = start_background_tasks(&proxy_map, &global_plugins) {
             crate::plugins::utils::log_schema::registry::abort_reload().map_err(
