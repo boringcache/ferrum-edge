@@ -912,7 +912,7 @@ async fn restore_bundle_rejects_intervening_schema_dependency_removal() {
     }];
     let mut plugin = make_plugin(&plugin_id, &proxy_id, ns, Some(&spec_id));
     plugin.plugin_name = "stdout_logging".to_string();
-    plugin.config = json!({"schema_ref": "removed-during-delete"});
+    plugin.config = serde_json::json!({"schema_ref": "removed-during-delete"});
     let bundle = ExtractedBundle {
         proxy,
         upstream: None,
