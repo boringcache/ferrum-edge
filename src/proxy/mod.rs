@@ -8030,9 +8030,9 @@ impl ProxyState {
                     Arc::clone(&staged_config),
                     &delta,
                 )?;
-                route_changed.set(staged.route_changed);
+                route_changed.set(staged.request_epoch.route_changed);
                 applied_delta = Some(delta);
-                Ok(Some(staged))
+                Ok(Some(staged.request_epoch))
             },
             |published| {
                 self.mirror_request_epoch_wrappers(published, route_changed.get(), false);
