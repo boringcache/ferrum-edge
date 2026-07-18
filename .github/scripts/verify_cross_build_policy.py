@@ -66,6 +66,45 @@ WORKFLOW_CONTRACTS = (
     ),
 )
 
+# Only the publication-control fields that consume the protected ARM64
+# artifacts are frozen. The rest of each publishing job remains editable.
+PUBLISH_CONTROL_CONTRACTS = {
+    "CI workflow": {
+        "latest-release": {
+            "needs": "    needs: [test, build-binaries, build-arm64-cross]\n",
+            "if": (
+                "    if: always() && needs.test.result == 'success' && "
+                "needs.build-binaries.result == 'success' && "
+                "needs.build-arm64-cross.result == 'success' && "
+                "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
+            ),
+        },
+        "docker": {
+            "needs": "    needs: [test, build-binaries, build-arm64-cross]\n",
+            "if": (
+                "    if: always() && needs.test.result == 'success' && "
+                "needs.build-binaries.result == 'success' && "
+                "needs.build-arm64-cross.result == 'success' && "
+                "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
+            ),
+        },
+    },
+    "release workflow": {
+        "create-release": {
+            "needs": (
+                "    needs: [build-release-binaries, build-release-arm64-cross, "
+                "docker-manifest, docker-ebpf-manifest]\n"
+            ),
+        },
+        "docker": {
+            "needs": (
+                "    needs: [build-release-binaries, "
+                "build-release-arm64-cross]\n"
+            ),
+        },
+    },
+}
+
 ATTACK_PAYLOADS = {
     "whitespace": "arm64 amd64",
     "leading option": "--help",
@@ -79,7 +118,7 @@ CROSS_ENVIRONMENT = re.compile(
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
 )
 SHELL_INTERPOLATION = re.compile(
-    r"\$\{\{[^{}\n]*\}\}|\$\{[^{}\n]*\}|`[^`\n]*`|"
+    r"\$\{[^{}\n]*\}|`[^`\n]*`|"
     r"\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]"
 )
 WORKFLOW_FILENAME = re.compile(r"^[A-Za-z0-9._-]+\.(?:yml|yaml)$")
@@ -303,6 +342,104 @@ def extract_job_block(
     return block, []
 
 
+def extract_job_field_block(
+    contents: str,
+    source: str,
+    job_name: str,
+    field_name: str,
+    *,
+    required: bool,
+) -> tuple[str | None, list[str]]:
+    """Extract one direct job field without freezing the rest of the job."""
+
+    job_block, failures = extract_job_block(
+        contents,
+        source,
+        job_name,
+        required=required,
+    )
+    if failures or job_block is None:
+        return None, failures
+
+    lines = job_block.splitlines(keepends=True)
+    matches = [
+        index
+        for index, line in enumerate(lines)
+        if decode_simple_yaml_key(line.rstrip("\r\n")) == (4, field_name)
+    ]
+    if not matches and not required:
+        return None, []
+    if len(matches) != 1:
+        return None, [
+            f"{source} job {job_name!r} must contain direct field "
+            f"{field_name!r} exactly once"
+        ]
+
+    start = matches[0]
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        decoded = decode_simple_yaml_key(lines[index].rstrip("\r\n"))
+        if decoded is not None and decoded[0] <= 4:
+            end = index
+            break
+    return "".join(lines[start:end]).rstrip() + "\n", []
+
+
+def validate_publish_control_contract(contents: str, source: str) -> list[str]:
+    contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
+    errors: list[str] = []
+    for job_name, fields in contracts.items():
+        for field_name, expected in fields.items():
+            actual, failures = extract_job_field_block(
+                contents,
+                source,
+                job_name,
+                field_name,
+                required=True,
+            )
+            errors.extend(failures)
+            if not failures and actual != expected:
+                errors.append(
+                    f"{source} job {job_name!r} field {field_name!r} differs "
+                    "from the trusted ARM64 publication dependency contract"
+                )
+    return errors
+
+
+def compare_pr_publish_control_contract(
+    merge_base_contents: str,
+    proposed_contents: str,
+    source: str,
+) -> list[str]:
+    contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
+    errors: list[str] = []
+    for job_name, fields in contracts.items():
+        for field_name in fields:
+            baseline, baseline_failures = extract_job_field_block(
+                merge_base_contents,
+                f"merge-base {source}",
+                job_name,
+                field_name,
+                required=False,
+            )
+            proposed, proposed_failures = extract_job_field_block(
+                proposed_contents,
+                f"proposed {source}",
+                job_name,
+                field_name,
+                required=False,
+            )
+            errors.extend(baseline_failures)
+            errors.extend(proposed_failures)
+            if not baseline_failures and not proposed_failures:
+                if baseline != proposed:
+                    errors.append(
+                        f"{source} job {job_name!r} ARM64 publication field "
+                        f"{field_name!r} cannot be changed by a pull request"
+                    )
+    return errors
+
+
 def extract_top_level_block(
     contents: str,
     source: str,
@@ -422,6 +559,64 @@ def github_format_literal(inner: str) -> str | None:
         return None
 
 
+def github_expression_spans(line: str) -> tuple[tuple[int, int], ...]:
+    """Locate outer GitHub expression spans while allowing braces in strings."""
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while (start := line.find("${{", cursor)) >= 0:
+        quote: str | None = None
+        closed = False
+        index = start + 3
+        while index < len(line):
+            character = line[index]
+            if quote is not None:
+                if quote == "'" and line.startswith("''", index):
+                    index += 2
+                    continue
+                if character == "\\" and quote == '"':
+                    index += 2
+                    continue
+                if character == quote:
+                    quote = None
+                index += 1
+                continue
+            if character in "'\"":
+                quote = character
+                index += 1
+                continue
+            if line.startswith("}}", index):
+                index += 2
+                closed = True
+                break
+            index += 1
+
+        end = index if closed else len(line)
+        spans.append((start, end))
+        cursor = end
+    return tuple(spans)
+
+
+def replace_github_expressions(line: str, *, literal: bool) -> str:
+    spans = github_expression_spans(line)
+    if not spans:
+        return line
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        parts.append(line[cursor:start])
+        raw = line[start:end]
+        parts.append(
+            interpolation_literal(raw)
+            if literal and raw.endswith("}}")
+            else ""
+        )
+        cursor = end
+    parts.append(line[cursor:])
+    return "".join(parts)
+
+
 def command_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
     """Locate complete outer $(...) spans, including nested parentheses."""
 
@@ -474,6 +669,28 @@ def replace_command_substitutions(line: str, *, literal: bool) -> str:
         cursor = end
     parts.append(line[cursor:])
     return "".join(parts)
+
+
+def opaque_command_completion_variants(line: str) -> tuple[str, ...]:
+    """Expose opaque substitutions that can complete a literal Cross token."""
+
+    variants: list[str] = []
+    fragments = {
+        "cross"[start:end]
+        for start in range(len("cross"))
+        for end in range(start + 1, len("cross") + 1)
+    }
+    for start, end in command_substitution_spans(line):
+        prefix_match = re.search(r"[A-Za-z]+$", line[:start])
+        suffix_match = re.match(r"[A-Za-z]+", line[end:])
+        prefix = prefix_match.group() if prefix_match is not None else ""
+        suffix = suffix_match.group() if suffix_match is not None else ""
+        if not prefix and not suffix:
+            continue
+        for fragment in fragments:
+            if f"{prefix}{fragment}{suffix}" == "cross":
+                variants.append(line[:start] + fragment + line[end:])
+    return tuple(variants)
 
 
 def brace_options(value: str) -> tuple[str, ...] | None:
@@ -546,18 +763,24 @@ def scan_variants(line: str) -> tuple[str, ...]:
     """Expose ordinary YAML/shell quoting variants to the lexical boundary."""
 
     variants = [line]
+    variants.extend(opaque_command_completion_variants(line))
     collapsed = re.sub(r"[\\'\"]", "", line)
     if collapsed != line:
         variants.append(collapsed)
 
     without_commands = replace_command_substitutions(line, literal=False)
-    without_interpolation = SHELL_INTERPOLATION.sub("", without_commands)
+    without_github = replace_github_expressions(without_commands, literal=False)
+    without_interpolation = SHELL_INTERPOLATION.sub("", without_github)
     if without_interpolation != line:
         variants.append(without_interpolation)
     with_literal_commands = replace_command_substitutions(line, literal=True)
+    with_literal_github = replace_github_expressions(
+        with_literal_commands,
+        literal=True,
+    )
     with_literal_defaults = SHELL_INTERPOLATION.sub(
         lambda match: interpolation_literal(match.group()),
-        with_literal_commands,
+        with_literal_github,
     )
     if with_literal_defaults != line:
         variants.append(with_literal_defaults)
@@ -817,6 +1040,7 @@ def validate_workflow_contract(
             f"{source} contains Cross executable or configuration input outside "
             f"protected job {job_name!r}"
         )
+    errors.extend(validate_publish_control_contract(contents, source))
     return errors
 
 
@@ -897,6 +1121,13 @@ def compare_pr_workflow_job(
                 f"{source} cannot add or change Cross executable/configuration "
                 "surfaces outside the protected ARM64 job"
             )
+    errors.extend(
+        compare_pr_publish_control_contract(
+            merge_base_contents,
+            proposed_contents,
+            source,
+        )
+    )
     return errors
 
 
@@ -1272,6 +1503,11 @@ pre_build = []
             "cr$(python3 -c 'print(\"o\")')ss build "
             "--target aarch64-unknown-linux-gnu",
         ),
+        "unprotected opaque command substitution": workflow.replace(
+            "echo safe",
+            "cargo install cr$(printf '\\157')ss && "
+            "cr$(printf '\\157')ss build --target aarch64-unknown-linux-gnu",
+        ),
         "unprotected GitHub interpolation": workflow.replace(
             "echo safe",
             "cr${{ 'o' }}ss build --target aarch64-unknown-linux-gnu",
@@ -1437,6 +1673,60 @@ pre_build = []
         "self-test workflow directory",
     ):
         failures.append("malformed Cross workflow was not rejected")
+
+    ci_publish_contract = PUBLISH_CONTROL_CONTRACTS["CI workflow"]
+    publish_workflow = (
+        "name: Publish fixture\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  latest-release:\n"
+        + ci_publish_contract["latest-release"]["needs"]
+        + ci_publish_contract["latest-release"]["if"]
+        + "    runs-on: ubuntu-latest\n"
+        + "    steps:\n"
+        + "      - run: echo latest\n"
+        + "  docker:\n"
+        + ci_publish_contract["docker"]["needs"]
+        + ci_publish_contract["docker"]["if"]
+        + "    runs-on: ubuntu-latest\n"
+        + "    steps:\n"
+        + "      - run: echo docker\n"
+    )
+    if validate_publish_control_contract(publish_workflow, "CI workflow"):
+        failures.append("valid ARM64 publication dependency controls were rejected")
+
+    benign_publish_edit = publish_workflow.replace("echo latest", "echo updated")
+    if compare_pr_publish_control_contract(
+        publish_workflow,
+        benign_publish_edit,
+        "CI workflow",
+    ):
+        failures.append("benign publishing job implementation edit was rejected")
+
+    changed_publish_needs = publish_workflow.replace(
+        ci_publish_contract["latest-release"]["needs"],
+        "    needs: [test, build-binaries]\n",
+        1,
+    )
+    if not validate_publish_control_contract(changed_publish_needs, "CI workflow"):
+        failures.append("removed ARM64 publication dependency was not rejected")
+    if not compare_pr_publish_control_contract(
+        publish_workflow,
+        changed_publish_needs,
+        "CI workflow",
+    ):
+        failures.append(
+            "merge-base comparison allowed an ARM64 publication dependency edit"
+        )
+
+    duplicate_publish_needs = publish_workflow.replace(
+        ci_publish_contract["latest-release"]["needs"],
+        ci_publish_contract["latest-release"]["needs"]
+        + "    needs: [test, build-binaries]\n",
+        1,
+    )
+    if not validate_publish_control_contract(duplicate_publish_needs, "CI workflow"):
+        failures.append("duplicate publication needs field was not rejected")
 
     return failures
 

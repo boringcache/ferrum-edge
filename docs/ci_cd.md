@@ -375,10 +375,16 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   workflow. Any new or changed Cross executable/configuration token outside
   the isolated jobs is rejected, including quoted or nested shell/GitHub-
   interpolated executable spellings, literal GitHub `format()` expressions,
-  Bash brace expansions, and Cross environment aliases; Bash backslash-newline
+  opaque command substitutions capable of completing `cross`, Bash brace
+  expansions, and Cross environment aliases; Bash backslash-newline
   continuations are normalized before scanning. Unrelated workflow additions
   and edits remain permitted. The isolated jobs use only pinned external setup
   actions before revalidation.
+- The `needs` fields that connect ARM64 artifacts to `latest-release`, CI and
+  release Docker publishing, and `create-release` are separately protected;
+  the CI publishers' success conditions are protected too. Only those direct
+  publication-control fields are frozen, so unrelated implementation changes
+  inside the publishing jobs remain permitted.
 - The Cross process starts through `env -i` with an explicit minimal host
   environment and fixed compiler variables. This removes `CROSS_CONFIG`, every
   `CROSS_BUILD_*`/`CROSS_TARGET_*` alias, image/Dockerfile/pre-build/runner
