@@ -4550,6 +4550,15 @@ where
                         &mut authoritative_trailers_only_terminal_metadata,
                     );
                 } else {
+                    // Same ordering contract as the transform phase below: the
+                    // decode-only normalize rewrite must not let the trailer
+                    // retirement masquerade as a policy-owned header removal.
+                    if let Some(policy_state) =
+                        buffered_initial_response_header_policy_state.as_mut()
+                    {
+                        Arc::make_mut(policy_state)
+                            .record_later_response_header_mutations(&mut plugin_response_headers);
+                    }
                     crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
                         &mut plugin_response_headers,
                         &mut response_trailers,
@@ -4707,16 +4716,20 @@ where
                     );
                 }
             }
+            // Mirror the main buffered gRPC path: record genuine transform-phase
+            // edits before retiring stale compatibility-view trailers, so a
+            // policy-owned initial header the backend also sent as a trailer is
+            // not mistaken for a later intentional removal.
+            if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
+                Arc::make_mut(policy_state)
+                    .record_later_response_header_mutations(&mut plugin_response_headers);
+            }
             if representation_rewritten {
                 crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
                     &mut plugin_response_headers,
                     &mut response_trailers,
                     &header_shadowed_trailer_keys,
                 );
-            }
-            if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
-                Arc::make_mut(policy_state)
-                    .record_later_response_header_mutations(&mut plugin_response_headers);
             }
             for plugin in plugins.iter() {
                 let result = match crate::plugins::await_grpc_deadline(

@@ -21951,18 +21951,26 @@ async fn handle_proxy_request_inner(
                             &mut authoritative_trailers_only_terminal_metadata,
                         );
                         buffered_initial_response_header_policy_state = None;
-                    } else if representation_rewritten {
-                        grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
-                            &mut plugin_response_headers,
-                            &mut response_trailers,
-                            &header_shadowed_trailer_keys,
-                        );
                     }
+                    // Record genuine transform-phase edits BEFORE retiring stale
+                    // compatibility-view trailers below. The discard removes
+                    // trailer-only names from the merged view; if it ran first, a
+                    // policy-owned initial header whose name the backend also
+                    // sent as a trailer would look like a later intentional
+                    // removal, and the policy would drop its desired value
+                    // instead of replaying it into initial HEADERS.
                     if let Some(policy_state) =
                         buffered_initial_response_header_policy_state.as_mut()
                     {
                         Arc::make_mut(policy_state)
                             .record_later_response_header_mutations(&mut plugin_response_headers);
+                    }
+                    if !response_replaced && representation_rewritten {
+                        grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+                            &mut plugin_response_headers,
+                            &mut response_trailers,
+                            &header_shadowed_trailer_keys,
+                        );
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
