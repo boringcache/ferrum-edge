@@ -1861,6 +1861,387 @@ fn test_multiple_global_and_proxy_plugins() {
     assert!(names.contains(&"key_auth"));
 }
 
+#[tokio::test]
+async fn serverless_instances_keep_independent_transaction_metadata() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let first_server = MockServer::start().await;
+    let second_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "metadata": {"decision": "first"}
+        })))
+        .mount(&first_server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "metadata": {"decision": "second"}
+        })))
+        .mount(&second_server)
+        .await;
+
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["policy.primary", "policy-secondary"],
+        )],
+        vec![
+            make_plugin_config_with_json(
+                "policy.primary",
+                "serverless_function",
+                json!({
+                    "provider": "azure_functions",
+                    "function_url": format!("{}/first", first_server.uri())
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "policy-secondary",
+                "serverless_function",
+                json!({
+                    "provider": "azure_functions",
+                    "function_url": format!("{}/second", second_server.uri())
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy%2Eprimary.metadata.decision")
+            .map(String::as_str),
+        Some("first")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy-secondary.metadata.decision")
+            .map(String::as_str),
+        Some("second")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy%2Eprimary.status")
+            .map(String::as_str),
+        Some("200")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy-secondary.status")
+            .map(String::as_str),
+        Some("200")
+    );
+}
+
+#[test]
+fn serverless_body_egress_rejects_request_body_transform_composition() {
+    let mut transform_cases = vec![
+        (
+            "body-transform",
+            "request_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "trusted",
+                    "value": true
+                }]
+            }),
+        ),
+        (
+            "request-decompression",
+            "compression",
+            json!({"decompress_request": true}),
+        ),
+    ];
+    if ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        transform_cases.push((
+            "custom-body-transform",
+            "example_plugin",
+            json!({"request_body_prefix": "governed:"}),
+        ));
+    }
+
+    for (transform_id, transform_name, transform_config) in transform_cases {
+        let config = make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                vec!["external-policy", transform_id],
+            )],
+            vec![
+                make_plugin_config_with_json(
+                    "external-policy",
+                    "serverless_function",
+                    json!({
+                        "provider": "azure_functions",
+                        "function_url": "https://example.com/policy",
+                        "forward_body": true
+                    }),
+                    PluginScope::Proxy,
+                    Some("p1"),
+                ),
+                make_plugin_config_with_json(
+                    transform_id,
+                    transform_name,
+                    transform_config,
+                    PluginScope::Proxy,
+                    Some("p1"),
+                ),
+            ],
+        );
+
+        let error = match PluginCache::new(&config) {
+            Ok(_) => panic!("serverless body egress plus {transform_name} must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("request-body") || error.contains("validation"),
+            "transform={transform_name}, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn candidate_security_validation_constructs_custom_capabilities_without_builtin_gate() {
+    let source = include_str!("../../../src/plugin_cache.rs");
+    let start = source
+        .find("pub(crate) fn validate_plugin_security_composition_candidate(")
+        .expect("candidate security validator must exist");
+    let end = source[start..]
+        .find("\nfn remove_shadowed_global_plugin(")
+        .map(|offset| start + offset)
+        .expect("candidate security validator boundary must exist");
+    let candidate = &source[start..end];
+
+    assert!(candidate.contains("crate::custom_plugins::custom_plugin_names()"));
+    assert!(candidate.contains("is_security_composition_candidate_plugin("));
+    assert!(candidate.contains("security_composition_capabilities("));
+    assert!(candidate.contains("ServerlessSecurityCompositionPlugin"));
+    assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
+    assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
+}
+
+#[test]
+fn candidate_serverless_composition_uses_pure_capabilities_not_runtime_credentials() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "function"])],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "function",
+                "serverless_function",
+                json!({
+                    "provider": "aws_lambda",
+                    "mode": "terminate",
+                    // Pin an explicit region so runtime construction reaches the
+                    // malformed-credential check deterministically instead of
+                    // depending on an ambient AWS_REGION / AWS_DEFAULT_REGION.
+                    "aws_region": "us-east-1",
+                    "aws_access_key_id": 7
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+        .expect("candidate composition must not construct an environment-bound AWS client");
+    let runtime_error = PluginCache::new(&config)
+        .err()
+        .expect("runtime construction must still reject malformed credentials");
+    assert!(
+        runtime_error.contains("aws_access_key_id"),
+        "{runtime_error}"
+    );
+}
+
+#[test]
+fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egress() {
+    let mut terminal = make_plugin_config_with_json(
+        "function",
+        "serverless_function",
+        json!({
+            "provider": "aws_lambda",
+            "mode": "terminate",
+            "aws_access_key_id": 7
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    terminal.priority_override = Some(2700);
+    let unsafe_order = make_config(
+        vec![make_proxy("p1", "/api", vec!["function", "dedup"])],
+        vec![
+            terminal,
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let order_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&unsafe_order, None)
+            .expect_err("pure terminate capability must retain dedup ordering enforcement");
+    assert!(
+        order_error.contains("request_deduplication"),
+        "{order_error}"
+    );
+
+    let unsafe_body = make_config(
+        vec![make_proxy("p1", "/api", vec!["function", "transform"])],
+        vec![
+            make_plugin_config_with_json(
+                "function",
+                "serverless_function",
+                json!({
+                    "provider": "aws_lambda",
+                    "forward_body": true,
+                    "aws_access_key_id": 7
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "x",
+                        "value": true
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let body_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&unsafe_body, None)
+            .expect_err("pure forward_body capability must retain body-view enforcement");
+    assert!(body_error.contains("request-body"), "{body_error}");
+}
+
+#[test]
+fn terminate_serverless_must_run_after_every_request_deduplication_instance() {
+    for serverless_priority in [2700, 2750] {
+        let mut serverless = make_plugin_config_with_json(
+            "terminal-function",
+            "serverless_function",
+            json!({
+                "provider": "azure_functions",
+                "function_url": "https://example.com/function",
+                "mode": "terminate"
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        serverless.priority_override = Some(serverless_priority);
+        let config = make_config(
+            vec![make_proxy("p1", "/api", vec!["dedup", "terminal-function"])],
+            vec![
+                make_plugin_config(
+                    "dedup",
+                    "request_deduplication",
+                    PluginScope::Proxy,
+                    Some("p1"),
+                    true,
+                ),
+                serverless,
+            ],
+        );
+
+        let error = PluginCache::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("unsafe serverless priority {serverless_priority} admitted"));
+        assert!(error.contains("serverless_function"), "{error}");
+        assert!(error.contains("request_deduplication"), "{error}");
+    }
+}
+
+#[test]
+fn safe_serverless_dedup_order_and_pre_proxy_override_are_admitted() {
+    let terminate_default = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "terminal-function"])],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "terminal-function",
+                "serverless_function",
+                json!({
+                    "provider": "azure_functions",
+                    "function_url": "https://example.com/function",
+                    "mode": "terminate"
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    PluginCache::new(&terminate_default).expect("default dedup order is safe");
+
+    let mut pre_proxy = make_plugin_config_with_json(
+        "policy-function",
+        "serverless_function",
+        json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/function",
+            "mode": "pre_proxy"
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    pre_proxy.priority_override = Some(2700);
+    let pre_proxy_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "policy-function"])],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            pre_proxy,
+        ],
+    );
+    PluginCache::new(&pre_proxy_config)
+        .expect("pre_proxy serverless does not produce a terminal replay obligation");
+}
+
 #[test]
 fn test_proxy_count() {
     let config = make_config(

@@ -191,6 +191,63 @@ async fn classified_execute_marks_dns_egress_denial_pre_wire() {
 }
 
 #[tokio::test]
+async fn classified_execute_marks_literal_ip_egress_denial_pre_wire() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+    use ferrum_edge::retry::ErrorClass;
+
+    let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
+    let client = PluginHttpClient::default_with_backend_allow_ips(policy);
+    let external_latency = AtomicU64::new(0);
+    let request = client
+        .get()
+        .post("http://169.254.169.254/provider")
+        .body("non-idempotent");
+
+    let failure = client
+        .execute_redacted_tracked_classified(
+            request,
+            "classified_literal_egress_test",
+            "http://169.254.169.254/[REDACTED_PATH]",
+            &external_latency,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.error_class, ErrorClass::DispatchPolicyRejected);
+    assert!(!failure.request_reached_wire);
+    assert_eq!(external_latency.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn classified_execute_preserves_remote_502_as_a_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/provider"))
+        .respond_with(ResponseTemplate::new(502).set_body_string("remote application response"))
+        .mount(&server)
+        .await;
+    let client = default_client();
+    let external_latency = AtomicU64::new(0);
+    let request = client
+        .get()
+        .post(format!("{}/provider", server.uri()))
+        .body("non-idempotent");
+
+    let response = client
+        .execute_redacted_tracked_classified(
+            request,
+            "classified_remote_502_test",
+            &format!("{}/provider", server.uri()),
+            &external_latency,
+        )
+        .await
+        .expect("a remote 502 is an application response, not a pre-wire failure");
+
+    assert_eq!(response.status(), 502);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn test_execute_returns_redirect_response_without_following() {
     let redirect_server = MockServer::start().await;
     let target_server = MockServer::start().await;

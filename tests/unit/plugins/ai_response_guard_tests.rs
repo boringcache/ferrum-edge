@@ -2418,6 +2418,58 @@ async fn test_non_json_scan_all_is_governed_and_redactable() {
 }
 
 #[tokio::test]
+async fn redaction_findings_on_range_and_delta_responses_fail_closed() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let governed = serde_json::to_vec(&json!({
+        "choices": [{"message": {"content": "contact secret@example.com"}}]
+    }))
+    .unwrap();
+    let clean = serde_json::to_vec(&json!({
+        "choices": [{"message": {"content": "safe response"}}]
+    }))
+    .unwrap();
+
+    for status in [206, 226] {
+        let mut governed_ctx = ctx_with_content_type("GET", "application/json");
+        let result = plugin
+            .on_response_body(&mut governed_ctx, status, &headers, &governed)
+            .await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 502,
+                    ..
+                }
+            ),
+            "status {status} forwarded governed bytes without an available redaction transform: {result:?}"
+        );
+        assert!(
+            governed_ctx
+                .metadata
+                .contains_key("ai_response_guard_rejected")
+        );
+        assert!(
+            !governed_ctx
+                .metadata
+                .contains_key("ai_response_guard_redacted")
+        );
+
+        let mut clean_ctx = ctx_with_content_type("GET", "application/json");
+        assert!(matches!(
+            plugin
+                .on_response_body(&mut clean_ctx, status, &headers, &clean)
+                .await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+#[tokio::test]
 async fn test_uninspectable_sse_fails_closed_except_warn_mode() {
     let malformed = b"data: {\"choices\":[\n\n";
     let non_utf8 = b"data: \xff\xfe\n\n";

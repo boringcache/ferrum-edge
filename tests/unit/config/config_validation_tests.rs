@@ -511,11 +511,11 @@ fn test_redact_consumer_entry_without_target_field_unchanged() {
 }
 
 #[test]
-fn cp_full_and_incremental_rejection_share_plugin_composition_validation() {
+fn cp_full_and_incremental_rejection_share_plugin_security_composition_validation() {
     let shared = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(
-        shared.contains("validate_plugin_composition_candidate("),
-        "the shared rejecting contract must include plugin composition"
+        shared.contains("validate_plugin_security_composition_candidate("),
+        "the shared rejecting contract must include plugin security composition"
     );
 
     let control_plane = include_str!("../../../src/modes/control_plane.rs");

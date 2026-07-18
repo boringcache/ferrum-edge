@@ -62,11 +62,13 @@
 //! ```
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use chrono::Utc;
-use http::header::HeaderName;
+use http::header::{HeaderName, HeaderValue};
+use percent_encoding::percent_decode_str;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 
@@ -75,6 +77,82 @@ use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+
+const ALLOWED_CONFIG_FIELDS: &[&str] = &[
+    "provider",
+    "mode",
+    "function_url",
+    "aws_region",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_function_name",
+    "aws_session_token",
+    "aws_qualifier",
+    "aws_endpoint_url",
+    "azure_function_key",
+    "gcp_bearer_token",
+    "forward_body",
+    "forward_headers",
+    "forward_query_params",
+    "timeout_ms",
+    "max_response_body_bytes",
+    "on_error",
+    "error_status_code",
+];
+
+const DEFAULT_INSTANCE_ID: &str = "standalone";
+
+#[derive(Debug)]
+struct InvocationFailure {
+    code: &'static str,
+    operator_detail: String,
+    must_reject: bool,
+    /// True when the failure is proven to have occurred before any request bytes
+    /// could reach the function: payload serialization, provider request signing,
+    /// or a transport class that never went on the wire (connect refused/timeout,
+    /// DNS, TLS, pool/port exhaustion, or an egress-policy denial). Such a failure
+    /// caused no external side effect, so a terminate-mode dedup owner marked in
+    /// anticipation of the call must be released rather than retained until TTL.
+    /// Defaults to `false` so ambiguous/post-wire outcomes stay fail-closed.
+    proven_pre_wire: bool,
+}
+
+impl InvocationFailure {
+    fn new(code: &'static str, operator_detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            operator_detail: operator_detail.into(),
+            must_reject: false,
+            proven_pre_wire: false,
+        }
+    }
+
+    /// A failure proven to have occurred before any request reached the function.
+    fn pre_wire(code: &'static str, operator_detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            operator_detail: operator_detail.into(),
+            must_reject: false,
+            proven_pre_wire: true,
+        }
+    }
+
+    fn governed_input(code: &'static str, operator_detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            operator_detail: operator_detail.into(),
+            must_reject: true,
+            // Governed-input rejections happen in `build_invocation_payload`,
+            // before the outbound call, so no external side effect can exist.
+            proven_pre_wire: true,
+        }
+    }
+
+    fn with_pre_wire(mut self, proven_pre_wire: bool) -> Self {
+        self.proven_pre_wire = proven_pre_wire;
+        self
+    }
+}
 
 /// Cloud provider for the serverless function.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +171,32 @@ enum InvocationMode {
     Terminate,
 }
 
+fn parse_invocation_mode(config: &Value) -> Result<InvocationMode, String> {
+    match config.get("mode") {
+        Some(Value::String(s)) => match s.as_str() {
+            "pre_proxy" => Ok(InvocationMode::PreProxy),
+            "terminate" => Ok(InvocationMode::Terminate),
+            other => Err(format!(
+                "serverless_function: unknown mode '{other}' (expected 'pre_proxy' or 'terminate')"
+            )),
+        },
+        None => Ok(InvocationMode::PreProxy),
+        Some(_) => Err("serverless_function: 'mode' must be a string".to_string()),
+    }
+}
+
+/// Parse only the static capabilities used by cross-plugin composition
+/// admission. This deliberately does not resolve provider credentials or any
+/// node-local environment values.
+pub(crate) fn security_composition_capabilities(config: &Value) -> Result<(bool, bool), String> {
+    if !config.is_object() {
+        return Err("serverless_function: config must be an object".to_string());
+    }
+    let mode = parse_invocation_mode(config)?;
+    let forward_body = optional_bool(config, "forward_body")?.unwrap_or(false);
+    Ok((forward_body, mode == InvocationMode::Terminate))
+}
+
 /// What to do when the function call fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ErrorAction {
@@ -101,7 +205,7 @@ enum ErrorAction {
 }
 
 /// AWS Lambda–specific configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(dead_code)]
 struct AwsLambdaConfig {
     region: String,
@@ -118,7 +222,13 @@ pub struct ServerlessFunction {
     mode: InvocationMode,
     /// For Azure/GCP: the user-supplied URL. For AWS: the computed Lambda Invoke API URL.
     function_url: String,
+    /// Parsed destination used to prevent signed path/query credentials from
+    /// returning to clients through function-controlled URL-valued headers.
+    function_destination: FunctionDestination,
+    /// Credential-safe structural form used in every diagnostic and client error path.
+    function_display_url: String,
     function_hostname: Option<String>,
+    metadata_prefix: String,
     aws_config: Option<AwsLambdaConfig>,
     azure_function_key: Option<String>,
     gcp_authorization_header: Option<String>,
@@ -135,11 +245,46 @@ pub struct ServerlessFunction {
 
 impl ServerlessFunction {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("serverless_function: config must be an object".to_string());
+        Self::new_with_instance_id(config, http_client, DEFAULT_INSTANCE_ID)
+    }
+
+    pub(crate) fn new_with_instance_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        instance_id: &str,
+    ) -> Result<Self, String> {
+        let config_object = config
+            .as_object()
+            .ok_or_else(|| "serverless_function: config must be an object".to_string())?;
+
+        let mut unknown_fields: Vec<&str> = config_object
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !ALLOWED_CONFIG_FIELDS.contains(key))
+            .collect();
+        unknown_fields.sort_unstable();
+        if !unknown_fields.is_empty() {
+            return Err(format!(
+                "serverless_function: unknown configuration field(s): {}",
+                unknown_fields.join(", ")
+            ));
+        }
+        if let Some((key, _)) = config_object.iter().find(|(_, value)| value.is_null()) {
+            let is_required = key == "provider"
+                || (key == "function_url"
+                    && matches!(
+                        config_object.get("provider").and_then(Value::as_str),
+                        Some("azure_functions") | Some("gcp_cloud_functions")
+                    ));
+            let detail = if is_required {
+                "is required and must not be null"
+            } else {
+                "must not be null; omit the field instead"
+            };
+            return Err(format!("serverless_function: '{key}' {detail}"));
         }
 
-        let provider = match config["provider"].as_str() {
+        let provider = match config.get("provider").and_then(Value::as_str) {
             Some("aws_lambda") => Provider::AwsLambda,
             Some("azure_functions") => Provider::AzureFunctions,
             Some("gcp_cloud_functions") => Provider::GcpCloudFunctions,
@@ -162,21 +307,7 @@ impl ServerlessFunction {
         // Strict mode validation. Silently defaulting an unknown value (e.g.
         // a typo'd "terminat") to `pre_proxy` would mask configuration errors
         // and silently change semantic intent.
-        let mode = match config.get("mode") {
-            Some(Value::String(s)) => match s.as_str() {
-                "pre_proxy" => InvocationMode::PreProxy,
-                "terminate" => InvocationMode::Terminate,
-                other => {
-                    return Err(format!(
-                        "serverless_function: unknown mode '{other}' (expected 'pre_proxy' or 'terminate')"
-                    ));
-                }
-            },
-            Some(Value::Null) | None => InvocationMode::PreProxy,
-            Some(_) => {
-                return Err("serverless_function: 'mode' must be a string".to_string());
-            }
-        };
+        let mode = parse_invocation_mode(config)?;
 
         let forward_body = optional_bool(config, "forward_body")?.unwrap_or(false);
         let forward_query_params = optional_bool(config, "forward_query_params")?.unwrap_or(false);
@@ -208,16 +339,16 @@ impl ServerlessFunction {
                     ));
                 }
             },
-            Some(Value::Null) | None => ErrorAction::Reject,
+            None => ErrorAction::Reject,
             Some(_) => {
                 return Err("serverless_function: 'on_error' must be a string".to_string());
             }
         };
 
         let raw_status = optional_u64(config, "error_status_code")?.unwrap_or(502);
-        if !(100..=599).contains(&raw_status) {
+        if !(400..=599).contains(&raw_status) {
             return Err(format!(
-                "serverless_function: error_status_code must be in range 100-599 (got {raw_status})"
+                "serverless_function: error_status_code must be in range 400-599 (got {raw_status})"
             ));
         }
         let error_status_code = raw_status as u16;
@@ -297,7 +428,7 @@ impl ServerlessFunction {
                     let endpoint_override = optional_config_string(config, "aws_endpoint_url")?
                         .or_else(|| env_non_empty("AWS_LAMBDA_ENDPOINT_URL"));
                     if let Some(ref endpoint) = endpoint_override {
-                        validate_http_url_field(endpoint, "aws_endpoint_url")?;
+                        validate_aws_endpoint_url(endpoint)?;
                     }
 
                     // Log which values came from env vars (without leaking secrets)
@@ -399,6 +530,12 @@ impl ServerlessFunction {
         let function_hostname = Url::parse(&function_url)
             .ok()
             .and_then(|u| http_url_hostname(&u, "function_url").ok());
+        let function_destination = FunctionDestination::new(&function_url)?;
+        let function_display_url = redact_serverless_url(&function_url);
+        let metadata_prefix = format!(
+            "serverless_function.{}.",
+            encode_metadata_segment(instance_id)
+        );
 
         let requires_body = forward_body;
 
@@ -407,7 +544,10 @@ impl ServerlessFunction {
             provider,
             mode,
             function_url,
+            function_destination,
+            function_display_url,
             function_hostname,
+            metadata_prefix,
             aws_config,
             azure_function_key,
             gcp_authorization_header,
@@ -427,7 +567,7 @@ impl ServerlessFunction {
         &self,
         ctx: &RequestContext,
         proxy_headers: &HashMap<String, String>,
-    ) -> Value {
+    ) -> Result<Value, InvocationFailure> {
         let mut payload = serde_json::Map::new();
 
         payload.insert("method".into(), Value::String(ctx.method.clone()));
@@ -463,28 +603,54 @@ impl ServerlessFunction {
         }
 
         // Forward query params
-        if self.forward_query_params && !ctx.query_params.is_empty() {
-            let params: serde_json::Map<String, Value> = ctx
-                .query_params
-                .iter()
-                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-                .collect();
-            payload.insert("query_params".into(), Value::Object(params));
-        }
-
-        // Forward request body
-        if self.forward_body
-            && let Some(body) = ctx.metadata.get("request_body")
-        {
-            // Try to parse as JSON for structured forwarding, otherwise send as string
-            if let Ok(json_body) = serde_json::from_str::<Value>(body) {
-                payload.insert("body".into(), json_body);
-            } else {
-                payload.insert("body".into(), Value::String(body.clone()));
+        if self.forward_query_params {
+            let params = unambiguous_query_params(ctx)?;
+            if !params.is_empty() {
+                payload.insert("query_params".into(), Value::Object(params));
             }
         }
 
-        Value::Object(payload)
+        // Forward request body
+        if self.forward_body {
+            reject_encoded_request_body(ctx, proxy_headers)?;
+            let empty_body = Bytes::new();
+            let body = if let Some(body) = ctx.request_body_bytes.as_ref() {
+                body
+            } else if !crate::proxy::request_may_have_body(&ctx.method, proxy_headers) {
+                &empty_body
+            } else {
+                return Err(InvocationFailure::governed_input(
+                    "request_body_unavailable",
+                    "governed request body was unavailable before function invocation",
+                ));
+            };
+            // Keep a single authoritative, lossless body representation. JSON
+            // parsing here would collapse duplicate object members and rewrite
+            // lexical number/whitespace forms before the external policy sees
+            // them, while the unchanged bytes continue to the backend. Valid
+            // UTF-8 has a unique byte encoding, so a JSON string round-trip is
+            // lossless; arbitrary bytes use base64. Always emit the encoding,
+            // and carry the active hook Content-Type separately as an
+            // interpretation hint rather than letting it change the bytes.
+            if let Ok(text) = std::str::from_utf8(body) {
+                payload.insert("body".into(), Value::String(text.to_string()));
+                payload.insert("body_encoding".into(), Value::String("utf8".into()));
+            } else {
+                payload.insert(
+                    "body".into(),
+                    Value::String(base64::engine::general_purpose::STANDARD.encode(body)),
+                );
+                payload.insert("body_encoding".into(), Value::String("base64".into()));
+            }
+            if let Some(content_type) = proxy_headers.get("content-type") {
+                payload.insert(
+                    "body_content_type".into(),
+                    Value::String(content_type.clone()),
+                );
+            }
+        }
+
+        Ok(Value::Object(payload))
     }
 
     /// Invoke the serverless function and return (status_code, headers, body_bytes).
@@ -492,9 +658,13 @@ impl ServerlessFunction {
         &self,
         payload: &Value,
         ctx: &RequestContext,
-    ) -> Result<(u16, HashMap<String, String>, Bytes), String> {
-        let payload_bytes = serde_json::to_vec(payload)
-            .map_err(|e| format!("serverless_function: failed to serialize payload: {e}"))?;
+    ) -> Result<(u16, HashMap<String, String>, Bytes), InvocationFailure> {
+        let payload_bytes = serde_json::to_vec(payload).map_err(|_| {
+            InvocationFailure::pre_wire(
+                "payload_serialization_failed",
+                "failed to serialize function payload",
+            )
+        })?;
 
         let mut req_builder = self
             .http_client
@@ -509,7 +679,14 @@ impl ServerlessFunction {
                 if let Some(ref aws) = self.aws_config {
                     let now = Utc::now();
                     let auth_headers =
-                        sign_aws_request(aws, &self.function_url, &payload_bytes, &now)?;
+                        sign_aws_request(aws, &self.function_url, &payload_bytes, &now).map_err(
+                            |_| {
+                                InvocationFailure::pre_wire(
+                                    "request_signing_failed",
+                                    "failed to sign AWS Lambda invocation",
+                                )
+                            },
+                        )?;
                     for (k, v) in &auth_headers {
                         req_builder = req_builder.header(k.as_str(), v.as_str());
                     }
@@ -531,17 +708,39 @@ impl ServerlessFunction {
 
         let response = self
             .http_client
-            .execute_tracked(request, "serverless_function", &ctx.plugin_http_call_ns)
+            .execute_redacted_tracked_classified(
+                request,
+                "serverless_function",
+                &self.function_display_url,
+                &ctx.plugin_http_call_ns,
+            )
             .await
-            .map_err(|e| format!("serverless_function: invocation failed: {e}"))?;
+            .map_err(|failure| {
+                // `request_reached_wire` is the authoritative provider-I/O
+                // boundary: a false value proves no request bytes reached the
+                // function (request-build failure, connect refused/timeout, DNS,
+                // TLS, pool/port exhaustion, or an egress-policy denial), so the
+                // dedup owner can be released instead of retained. A true value
+                // (timeout after send, reset mid-response, etc.) is an ambiguous
+                // outcome and stays fail-closed.
+                InvocationFailure::new(
+                    "invocation_failed",
+                    format!("{} invoking serverless function", failure.error_class),
+                )
+                .with_pre_wire(!failure.request_reached_wire)
+            })?;
 
         let status = response.status().as_u16();
-
-        let response_headers: HashMap<String, String> = response
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
-            .collect();
+        let lambda_function_error = self.provider == Provider::AwsLambda
+            && response.headers().contains_key("x-amz-function-error");
+        // Only terminate mode can return function response headers. Avoid the
+        // filtering and destination-inspection work for pre_proxy responses,
+        // whose JSON body alone supplies request-header candidates/metadata.
+        let response_headers = if self.mode == InvocationMode::Terminate {
+            sanitize_function_response_headers(response.headers(), &self.function_destination)
+        } else {
+            HashMap::new()
+        };
 
         // Stream the response body with a hard cap. Calling `.bytes().await`
         // would buffer the whole payload before any size check fires — a
@@ -550,32 +749,81 @@ impl ServerlessFunction {
         // soon as the running total crosses the limit.
         let body = read_response_body_bounded(response, self.max_response_body_bytes)
             .await
-            .map_err(|e| match e {
-                BoundedReadError::LimitExceeded { .. } => format!("serverless_function: {e}"),
-                BoundedReadError::Stream(_) => {
-                    format!("serverless_function: failed to read response body: {e}")
-                }
+            .map_err(|error| match error {
+                BoundedReadError::LimitExceeded { .. } => InvocationFailure::new(
+                    "response_body_too_large",
+                    "function response exceeded max_response_body_bytes",
+                ),
+                BoundedReadError::Stream(_) => InvocationFailure::new(
+                    "response_body_read_failed",
+                    "failed to read function response body",
+                ),
             })?;
 
         // AWS Lambda returns HTTP 200 even on function errors, signaling via
         // X-Amz-Function-Error header. Treat this as an invocation failure.
-        if self.provider == Provider::AwsLambda
-            && let Some(error_type) = response_headers.get("x-amz-function-error")
-        {
-            return Err(format!(
-                "serverless_function: Lambda function error ({})",
-                error_type,
+        if lambda_function_error {
+            return Err(InvocationFailure::new(
+                "lambda_function_error",
+                "AWS Lambda reported a function error",
             ));
         }
 
         Ok((status, response_headers, body))
+    }
+
+    fn metadata_key(&self, suffix: &str) -> String {
+        let mut key = String::with_capacity(self.metadata_prefix.len() + suffix.len());
+        key.push_str(&self.metadata_prefix);
+        key.push_str(suffix);
+        key
+    }
+
+    fn record_failure(&self, ctx: &mut RequestContext, failure: &InvocationFailure) {
+        ctx.metadata
+            .insert(self.metadata_key("error_class"), failure.code.to_string());
+    }
+
+    fn failure_result(&self, ctx: &mut RequestContext, failure: InvocationFailure) -> PluginResult {
+        warn!(
+            error_class = failure.code,
+            destination = %self.function_display_url,
+            detail = %failure.operator_detail,
+            "serverless_function invocation failed"
+        );
+        self.record_failure(ctx, &failure);
+        if self.on_error == ErrorAction::Continue && !failure.must_reject {
+            PluginResult::Continue
+        } else {
+            PluginResult::Reject {
+                status_code: self.error_status_code,
+                body: format!(
+                    r#"{{"error":"serverless function invocation failed","code":"{}"}}"#,
+                    failure.code
+                ),
+                headers: HashMap::new(),
+            }
+        }
+    }
+
+    fn pre_invocation_failure_result(
+        &self,
+        ctx: &mut RequestContext,
+        failure: InvocationFailure,
+    ) -> PluginResult {
+        let result = self.failure_result(ctx, failure);
+        if !matches!(&result, PluginResult::Continue) {
+            ctx.serverless_pre_invocation_rejection_owners
+                .extend(ctx.request_deduplication_states.keys().copied());
+        }
+        result
     }
 }
 
 fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
     match config.get(key) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(Value::Null) | None => Ok(None),
+        None => Ok(None),
         Some(_) => Err(format!("serverless_function: '{key}' must be a boolean")),
     }
 }
@@ -586,7 +834,7 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
             .as_u64()
             .map(Some)
             .ok_or_else(|| format!("serverless_function: '{key}' must be an unsigned integer")),
-        Some(Value::Null) | None => Ok(None),
+        None => Ok(None),
         Some(_) => Err(format!(
             "serverless_function: '{key}' must be an unsigned integer"
         )),
@@ -596,7 +844,7 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
 fn optional_config_string(config: &Value, key: &str) -> Result<Option<String>, String> {
     match config.get(key) {
         Some(Value::String(value)) => Ok((!value.is_empty()).then(|| value.clone())),
-        Some(Value::Null) | None => Ok(None),
+        None => Ok(None),
         Some(_) => Err(format!("serverless_function: '{key}' must be a string")),
     }
 }
@@ -611,9 +859,6 @@ fn parse_forward_headers(config: &Value) -> Result<Vec<String>, String> {
     };
 
     let Value::Array(headers) = value else {
-        if value.is_null() {
-            return Ok(Vec::new());
-        }
         return Err("serverless_function: 'forward_headers' must be an array".to_string());
     };
 
@@ -631,67 +876,22 @@ fn parse_forward_headers(config: &Value) -> Result<Vec<String>, String> {
     Ok(parsed)
 }
 
-/// Escape special characters for safe JSON string interpolation.
-fn escape_json_string(s: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let mut escaped = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            '\u{08}' => escaped.push_str("\\b"),
-            '\u{0c}' => escaped.push_str("\\f"),
-            '<' => escaped.push_str("\\u003c"),
-            '>' => escaped.push_str("\\u003e"),
-            ch if ch < '\u{20}' => {
-                escaped.push_str("\\u00");
-                let byte = ch as u8;
-                escaped.push(HEX[(byte >> 4) as usize] as char);
-                escaped.push(HEX[(byte & 0x0f) as usize] as char);
-            }
-            ch => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
 /// Validate a function URL (Azure/GCP `function_url`).
 fn validate_function_url(url: &str) -> Result<(), String> {
     validate_http_url_field(url, "function_url")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn serverless_escape_json_string_round_trips_control_characters() {
-        let raw = "invoke failed\"\n<script>\u{00}\u{1f}\\";
-        let body = format!(r#"{{"details":"{}"}}"#, escape_json_string(raw));
-        let parsed: Value =
-            serde_json::from_str(&body).expect("escaped serverless error should be valid JSON");
-
-        assert_eq!(parsed["details"], raw);
-        assert!(!escape_json_string(raw).chars().any(|ch| ch < '\u{20}'));
-    }
 }
 
 /// Shared HTTP(S) URL validator for `function_url` (Azure/GCP) and the AWS
 /// Lambda `aws_endpoint_url` override. Surfaces the field name in the error
 /// so operators see exactly which config key was rejected.
 fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
-    let parsed =
-        Url::parse(url).map_err(|e| format!("serverless_function: invalid {field}: {e}"))?;
+    let parsed = Url::parse(url).map_err(|_| format!("serverless_function: invalid {field}"))?;
 
     match parsed.scheme() {
         "http" | "https" => {}
-        scheme => {
+        _ => {
             return Err(format!(
-                "serverless_function: {field} must use http:// or https:// (got '{scheme}')"
+                "serverless_function: {field} must use http:// or https://"
             ));
         }
     }
@@ -703,7 +903,983 @@ fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
     }
     http_url_hostname(&parsed, field)?;
 
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "serverless_function: {field} must not contain URL userinfo; use the provider credential fields"
+        ));
+    }
+    if parsed.fragment().is_some() {
+        return Err(format!(
+            "serverless_function: {field} must not contain a URL fragment"
+        ));
+    }
+
     Ok(())
+}
+
+fn validate_aws_endpoint_url(url: &str) -> Result<(), String> {
+    validate_http_url_field(url, "aws_endpoint_url")?;
+    let parsed =
+        Url::parse(url).map_err(|_| "serverless_function: invalid aws_endpoint_url".to_string())?;
+    if parsed.path() != "/" || parsed.query().is_some() {
+        return Err(
+            "serverless_function: aws_endpoint_url must be an HTTP(S) origin without a path, query, or fragment"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Return a credential-safe structural URL suitable for logs, diagnostics, and
+/// admin projections. Paths and queries can carry signed trigger credentials,
+/// so only the origin is retained verbatim.
+pub fn redact_serverless_url(url: &str) -> String {
+    let Ok(parsed) = Url::parse(url) else {
+        return "[REDACTED_URL]".to_string();
+    };
+    let mut redacted = parsed.origin().ascii_serialization();
+    if parsed.path() != "/" {
+        redacted.push_str("/[REDACTED_PATH]");
+    }
+    if parsed.query().is_some() {
+        redacted.push_str("?[REDACTED_QUERY]");
+    }
+    redacted
+}
+
+fn encode_metadata_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
+}
+
+fn reject_encoded_request_body(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> Result<(), InvocationFailure> {
+    // The buffered body in `ctx.request_body_bytes` is the ORIGINAL client body,
+    // so its content coding is described by the ORIGINAL request headers. A
+    // header-only `request_transformer` (priority 3000) that removed or renamed
+    // `Content-Encoding` before this serverless egress (priority 3025) leaves the
+    // transformed `headers` map identity-clean while the compressed bytes remain;
+    // the init-time marker preserves that original state so the boundary cannot be
+    // bypassed by an earlier header transform.
+    if ctx
+        .metadata
+        .contains_key(crate::proxy::ORIGIN_ENCODED_REQUEST_METADATA_KEY)
+    {
+        return Err(InvocationFailure::governed_input(
+            "encoded_request_body_unsupported",
+            "governed request body used a non-identity content-encoding",
+        ));
+    }
+    if let Some(encoding) = headers.get("content-encoding")
+        && crate::proxy::content_encoding_declares_non_identity(encoding)
+    {
+        return Err(InvocationFailure::governed_input(
+            "encoded_request_body_unsupported",
+            "governed request body used a non-identity content-encoding",
+        ));
+    }
+    Ok(())
+}
+
+fn unambiguous_query_params(
+    ctx: &RequestContext,
+) -> Result<serde_json::Map<String, Value>, InvocationFailure> {
+    // A `request_transformer` (priority 3000) query rule that ran before this
+    // serverless egress (priority 3025) recorded its add/remove/update/rename on
+    // the decoded `ctx.query_params` map. The function payload is rebuilt from the
+    // raw query string to preserve plus/duplicate/decode/auth-strip invariants,
+    // and that raw representation cannot faithfully honor a decoded-parameter
+    // transform without reintroducing the ambiguity the raw path exists to
+    // eliminate (for example resurrecting a `token` the operator removed). Fail
+    // closed on the composition rather than emit a payload that silently ignores
+    // the transform.
+    if ctx
+        .metadata
+        .contains_key(crate::proxy::QUERY_PARAMS_TRANSFORMED_METADATA_KEY)
+    {
+        return Err(InvocationFailure::governed_input(
+            "query_params_transformed",
+            "query forwarding cannot reconcile a request_transformer query transform with the raw-query payload",
+        ));
+    }
+    let mut ordered = BTreeMap::new();
+    if let Some(raw_query) = ctx.raw_query_string() {
+        // Authentication plugins retain the original raw query for security
+        // inspection but mark hidden credentials for removal before backend
+        // dispatch. Apply that same removal before parsing the function
+        // payload so policy egress cannot resurrect a credential that the
+        // backend will not receive.
+        let effective_query = crate::proxy::query_string_after_plugin_strips(ctx, raw_query);
+        for pair in effective_query.split('&').filter(|pair| !pair.is_empty()) {
+            let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+            if raw_key.contains('+') || raw_value.contains('+') {
+                return Err(InvocationFailure::governed_input(
+                    "ambiguous_query_encoding",
+                    "query forwarding rejected a raw '+' character",
+                ));
+            }
+            if !has_valid_percent_triplets(raw_key) || !has_valid_percent_triplets(raw_value) {
+                return Err(InvocationFailure::governed_input(
+                    "invalid_query_encoding",
+                    "query forwarding rejected malformed percent encoding",
+                ));
+            }
+            let key = percent_decode_str(raw_key).decode_utf8().map_err(|_| {
+                InvocationFailure::governed_input(
+                    "invalid_query_encoding",
+                    "query parameter name was not valid percent-encoded UTF-8",
+                )
+            })?;
+            let value = percent_decode_str(raw_value).decode_utf8().map_err(|_| {
+                InvocationFailure::governed_input(
+                    "invalid_query_encoding",
+                    "query parameter value was not valid percent-encoded UTF-8",
+                )
+            })?;
+            if ordered
+                .insert(key.into_owned(), value.into_owned())
+                .is_some()
+            {
+                return Err(InvocationFailure::governed_input(
+                    "duplicate_query_parameter",
+                    "query forwarding rejected a duplicate decoded parameter name",
+                ));
+            }
+        }
+    } else if !ctx.query_params.is_empty() {
+        return Err(InvocationFailure::governed_input(
+            "raw_query_unavailable",
+            "query parameters were materialized without their original encoded representation",
+        ));
+    }
+    Ok(ordered
+        .into_iter()
+        .map(|(key, value)| (key, Value::String(value)))
+        .collect())
+}
+
+fn has_valid_percent_triplets(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+#[derive(Clone)]
+struct FunctionDestination {
+    url: Url,
+    sensitive_path: Option<String>,
+    sensitive_query_pairs: Vec<(String, String)>,
+    sensitive_authority_scalars: Vec<String>,
+    has_unresolved_encoding: bool,
+}
+
+impl FunctionDestination {
+    fn new(raw: &str) -> Result<Self, String> {
+        let url = Url::parse(raw)
+            .map_err(|_| "serverless_function: invalid function destination URL".to_string())?;
+        let mut has_unresolved_encoding = false;
+        let sensitive_path = if url.path() != "/" && !url.path().is_empty() {
+            let decoded = decode_percent_layers(url.path());
+            has_unresolved_encoding |= !decoded.fully_decoded;
+            Some(decoded.value)
+        } else {
+            None
+        };
+        let (sensitive_query_pairs, query_has_unresolved_encoding) = decoded_url_query_pairs(&url);
+        let sensitive_authority_scalars = normalized_authority_scalar_forms(&sensitive_query_pairs);
+        has_unresolved_encoding |= query_has_unresolved_encoding;
+        Ok(Self {
+            url,
+            sensitive_path,
+            sensitive_query_pairs,
+            sensitive_authority_scalars,
+            has_unresolved_encoding,
+        })
+    }
+
+    fn uri_reference_exposes_destination(&self, reference: &str) -> bool {
+        // If the accepted destination itself exceeds the bounded decoding
+        // budget, no function-controlled URL-valued header can be proven
+        // credential free. Keep accepting the provider URL, but strip such
+        // response headers fail closed.
+        if self.has_unresolved_encoding {
+            return true;
+        }
+        self.uri_reference_exposes_destination_inner(reference, 0)
+    }
+
+    fn uri_reference_exposes_destination_inner(&self, reference: &str, depth: usize) -> bool {
+        // A signed destination makes an unparseable URI reference unsafe:
+        // Ferrum cannot prove that an encoded credential is absent, so fail
+        // closed by removing the field. Valid benign relative/absolute
+        // references remain eligible below.
+        let decoded_reference = decode_percent_layers(reference);
+        if !decoded_reference.fully_decoded {
+            return true;
+        }
+        let Some(candidate) = self
+            .url
+            .join(reference)
+            .ok()
+            .or_else(|| self.url.join(&decoded_reference.value).ok())
+        else {
+            return true;
+        };
+
+        // Do not forward redirect userinfo supplied by a function. It is both a
+        // credential-bearing URI surface and unnecessary for identifying a
+        // benign redirect destination.
+        if !candidate.username().is_empty() || candidate.password().is_some() {
+            return true;
+        }
+
+        // URL normalization removes an explicit default port (`:443` for
+        // HTTPS and `:80` for HTTP). Inspect the supplied authority before
+        // normalization so a protected query scalar cannot be hidden there.
+        let exposes_explicit_port_scalar = explicit_uri_authority_port(reference)
+            .into_iter()
+            .chain(explicit_uri_authority_port(&decoded_reference.value))
+            .any(|port| self.sensitive_query_scalars().any(|value| value == port));
+        if exposes_explicit_port_scalar {
+            return true;
+        }
+
+        // A function can exfiltrate a DNS-compatible signed query component
+        // through the authority even when the path/query/fragment are benign.
+        // URL parsing lowercases ASCII domains and IDNA-normalizes Unicode, so
+        // compare both original and normalized scalar forms at complete
+        // hostname-label (or IP-segment) boundaries.
+        let exposes_host_scalar = candidate.host_str().is_some_and(|host| {
+            self.sensitive_authority_scalars
+                .iter()
+                .any(|value| authority_contains_scalar_sequence(host, value))
+        });
+        let exposes_port_scalar = candidate.port().is_some_and(|port| {
+            let port = port.to_string();
+            self.sensitive_query_scalars()
+                .any(|value| value == port.as_str())
+        });
+        if exposes_host_scalar || exposes_port_scalar {
+            return true;
+        }
+
+        // A protected query component can itself be a syntactically valid URI
+        // scheme. URL parsing normalizes schemes to ASCII lowercase, so compare
+        // exact components case-insensitively instead of allowing a function to
+        // echo a signed scalar as `secret://attacker.example`.
+        if self
+            .sensitive_query_scalars()
+            .any(|value| value.eq_ignore_ascii_case(candidate.scheme()))
+        {
+            return true;
+        }
+
+        let (candidate_pairs, query_has_unresolved_encoding) = decoded_url_query_pairs(&candidate);
+        if query_has_unresolved_encoding {
+            return true;
+        }
+
+        let candidate_path = decode_percent_layers(candidate.path());
+        if !candidate_path.fully_decoded {
+            return true;
+        }
+        let candidate_path = candidate_path.value;
+        let exposes_signed_path = self
+            .sensitive_path
+            .as_deref()
+            .is_some_and(|path| path_contains_segment_sequence(&candidate_path, path));
+        // A signed path is credential material even if the function copies it
+        // onto another authority. Restricting this comparison to same-origin
+        // references would disclose path-embedded tokens through an attacker-
+        // controlled host. Match the complete configured path at segment
+        // boundaries anywhere in the candidate: adding a prefix or descendant
+        // segment does not stop the signed path from being echoed, while
+        // lookalikes such as `/signed/triggered` remain distinct.
+        if exposes_signed_path {
+            return true;
+        }
+
+        // Query credentials can also be copied into an attacker-controlled
+        // redirect path or path parameter. Match complete URI components so a
+        // value such as `secret/value` is blocked at `/secret/value`,
+        // `/next;leak=secret/value`, and `/next?leak=secret/value`, while
+        // `/secret/value-extra` remains distinct.
+        if self
+            .sensitive_query_scalars()
+            .any(|value| uri_component_contains_sequence(&candidate_path, value))
+        {
+            return true;
+        }
+
+        // Query credentials are unsafe even when copied onto another host,
+        // path, or parameter name. Compare decoded pairs and protected scalar
+        // components exactly so reordering, renaming, key/value swapping, and
+        // ordinary percent-encoding changes cannot evade the check without
+        // introducing substring false positives.
+        if candidate_pairs.iter().any(|candidate| {
+            self.sensitive_query_pairs
+                .iter()
+                .any(|sensitive| candidate == sensitive)
+                || self
+                    .sensitive_query_scalars()
+                    .any(|component| candidate.0 == component || candidate.1 == component)
+                || self.sensitive_path.as_deref().is_some_and(|path| {
+                    let protected_path = path.trim_matches('/');
+                    !protected_path.is_empty()
+                        && (candidate.0 == protected_path || candidate.1 == protected_path)
+                })
+        }) {
+            return true;
+        }
+
+        // URL-bearing fields commonly embed their next destination in an
+        // encoded query value, path segment, or fragment. Inspect those URI
+        // references recursively, but only when they are syntactically
+        // URI-like: treating every scalar as a relative path would remove
+        // benign lookalike values such as
+        // `https://example.test/next?label=signed/trigger-extra` that resemble
+        // but do not match the signed destination. (An exact copy of the signed
+        // path into a query scalar is already blocked above as a renamed
+        // disclosure.) When a structural reference remains at the depth
+        // boundary, fail closed rather than silently treating uninspected
+        // nesting as safe.
+        for (key, value) in &candidate_pairs {
+            if self.nested_reference_exposes_destination(nested_uri_reference(key), depth)
+                || self.nested_reference_exposes_destination(nested_uri_reference(value), depth)
+            {
+                return true;
+            }
+        }
+        let mut nested_path_references = 0;
+        for reference in nested_path_uri_references(&candidate_path) {
+            nested_path_references += 1;
+            if nested_path_references > MAX_NESTED_PATH_URI_REFERENCES
+                || self.nested_reference_exposes_destination(Some(reference), depth)
+            {
+                return true;
+            }
+        }
+        if let Some(fragment) = candidate.fragment() {
+            let decoded_fragment = decode_percent_layers(fragment);
+            if !decoded_fragment.fully_decoded {
+                return true;
+            }
+            // Fragments are client-visible to the destination page even when
+            // they are scalar rather than URI-shaped. Compare their decoded
+            // content directly at URI-component boundaries before the nested
+            // reference check so `#secret/value` and
+            // `#leak=secret/value` cannot expose a signed query value (and the
+            // same applies to a configured signed path).
+            if self.sensitive_path.as_deref().is_some_and(|path| {
+                // Path-edge slashes are structural delimiters, unlike the
+                // slash bytes retained in protected query scalars. Omit
+                // them only for this scalar-fragment path comparison so
+                // both `#signed/trigger` and `#/signed/trigger` remain
+                // governed without weakening query-scalar matching.
+                uri_component_contains_sequence(&decoded_fragment.value, path.trim_matches('/'))
+            }) || self
+                .sensitive_query_scalars()
+                .any(|value| uri_component_contains_sequence(&decoded_fragment.value, value))
+            {
+                return true;
+            }
+            if self.nested_reference_exposes_destination(
+                nested_uri_reference(&decoded_fragment.value),
+                depth,
+            ) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Credential-bearing scalar components from the configured query.
+    ///
+    /// Both non-empty sides are protected. Although many signed URLs carry the
+    /// secret in a value, providers can place credential material in a query
+    /// key even when that key also has a value (for example
+    /// `?SIGNED_TOKEN=1`). Choosing only one side would let a redirect copy the
+    /// other into a renamed key, value, path, or fragment. Slashes are data in
+    /// these decoded scalars and must remain intact for exact comparison.
+    fn sensitive_query_scalars(&self) -> impl Iterator<Item = &str> {
+        self.sensitive_query_pairs
+            .iter()
+            .flat_map(|(key, value)| [key.as_str(), value.as_str()])
+            .filter(|component| !component.is_empty())
+    }
+
+    fn nested_reference_exposes_destination(&self, reference: Option<&str>, depth: usize) -> bool {
+        let Some(reference) = reference else {
+            return false;
+        };
+        depth >= MAX_NESTED_DESTINATION_DEPTH
+            || self.uri_reference_exposes_destination_inner(reference, depth + 1)
+    }
+
+    fn response_header_exposes_destination(
+        &self,
+        kind: UrlValuedResponseHeader,
+        value: &str,
+    ) -> bool {
+        if value.len() > MAX_URL_VALUED_RESPONSE_HEADER_BYTES {
+            return true;
+        }
+        match kind {
+            UrlValuedResponseHeader::Location | UrlValuedResponseHeader::ContentLocation => {
+                self.uri_reference_exposes_destination(value)
+            }
+            UrlValuedResponseHeader::Refresh => match refresh_uri_reference(value) {
+                Ok(Some(reference)) => self.uri_reference_exposes_destination(reference),
+                Ok(None) => false,
+                Err(()) => true,
+            },
+            UrlValuedResponseHeader::Link => self.link_header_exposes_destination(value),
+        }
+    }
+
+    fn link_header_exposes_destination(&self, value: &str) -> bool {
+        let bytes = value.as_bytes();
+        let mut cursor = 0;
+        let mut targets = 0;
+
+        loop {
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if cursor == bytes.len() {
+                return true;
+            }
+            if bytes[cursor] != b'<' {
+                return true;
+            }
+            let target_start = cursor + 1;
+            let Some(relative_end) = value[target_start..].find('>') else {
+                return true;
+            };
+            let target_end = target_start + relative_end;
+            targets += 1;
+            if targets > MAX_LINK_HEADER_TARGETS
+                || self.uri_reference_exposes_destination(&value[target_start..target_end])
+            {
+                return true;
+            }
+
+            cursor = target_end + 1;
+            let mut quoted = false;
+            let mut escaped = false;
+            let mut has_next_target = false;
+            while cursor < bytes.len() {
+                let byte = bytes[cursor];
+                if quoted {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        quoted = false;
+                    }
+                } else if byte == b'"' {
+                    quoted = true;
+                } else if byte == b',' {
+                    cursor += 1;
+                    has_next_target = true;
+                    break;
+                } else if byte == b'<' {
+                    return true;
+                }
+                cursor += 1;
+            }
+            if quoted || escaped {
+                return true;
+            }
+            if cursor == bytes.len() {
+                return has_next_target;
+            }
+        }
+    }
+}
+
+fn nested_uri_reference(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // An encoded absolute URL embedded in a path commonly appears as
+    // `/https://host/...` after decoding. Remove only that transport slash;
+    // ordinary absolute-path references retain their leading slash.
+    if let Some(without_slash) = trimmed.strip_prefix('/')
+        && (has_ascii_case_insensitive_prefix(without_slash, "http://")
+            || has_ascii_case_insensitive_prefix(without_slash, "https://"))
+    {
+        return Some(without_slash);
+    }
+
+    (has_ascii_case_insensitive_prefix(trimmed, "http://")
+        || has_ascii_case_insensitive_prefix(trimmed, "https://")
+        || trimmed.starts_with("//")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with('?')
+        || trimmed.starts_with('#'))
+    .then_some(trimmed)
+}
+
+fn decoded_url_query_pairs(url: &Url) -> (Vec<(String, String)>, bool) {
+    let mut pairs = Vec::new();
+    let mut has_unresolved_encoding = false;
+    for pair in url
+        .query()
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter(|pair| !pair.is_empty())
+    {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        // A URL query is not necessarily form data. Decode percent escapes
+        // without translating a literal '+' to a space so signed tokens that
+        // contain '+' compare consistently with their `%2B` representation.
+        let key = decode_percent_layers(key);
+        let value = decode_percent_layers(value);
+        has_unresolved_encoding |= !key.fully_decoded || !value.fully_decoded;
+        pairs.push((key.value, value.value));
+    }
+    (pairs, has_unresolved_encoding)
+}
+
+fn normalized_authority_scalar_forms(pairs: &[(String, String)]) -> Vec<String> {
+    let mut forms = Vec::new();
+    let mut seen = HashSet::new();
+    for component in pairs
+        .iter()
+        .flat_map(|(key, value)| [key.as_str(), value.as_str()])
+        .filter(|component| !component.is_empty())
+    {
+        for form in [
+            Some(component.to_string()),
+            normalized_authority_scalar(component),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let dedup_key = form.to_ascii_lowercase();
+            if seen.insert(dedup_key) {
+                forms.push(form);
+            }
+        }
+    }
+    forms
+}
+
+fn normalized_authority_scalar(value: &str) -> Option<String> {
+    Some(match Host::parse(value).ok()? {
+        Host::Domain(hostname) => hostname,
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
+}
+
+fn authority_contains_scalar_sequence(candidate: &str, sensitive: &str) -> bool {
+    let candidate = candidate.as_bytes();
+    let sensitive = sensitive.as_bytes();
+    if sensitive.is_empty() || sensitive.len() > candidate.len() {
+        return false;
+    }
+
+    candidate
+        .windows(sensitive.len())
+        .enumerate()
+        .any(|(index, window)| {
+            if !window.eq_ignore_ascii_case(sensitive) {
+                return false;
+            }
+            let end = index + sensitive.len();
+            let starts_at_boundary = sensitive
+                .first()
+                .copied()
+                .is_some_and(is_authority_scalar_boundary)
+                || index == 0
+                || candidate
+                    .get(index - 1)
+                    .copied()
+                    .is_some_and(is_authority_scalar_boundary);
+            let ends_at_boundary = sensitive
+                .last()
+                .copied()
+                .is_some_and(is_authority_scalar_boundary)
+                || end == candidate.len()
+                || candidate
+                    .get(end)
+                    .copied()
+                    .is_some_and(is_authority_scalar_boundary);
+            starts_at_boundary && ends_at_boundary
+        })
+}
+
+fn is_authority_scalar_boundary(byte: u8) -> bool {
+    matches!(byte, b'.' | b':' | b'[' | b']')
+}
+
+fn path_contains_segment_sequence(candidate: &str, sensitive: &str) -> bool {
+    if sensitive.is_empty() {
+        return false;
+    }
+    candidate.match_indices(sensitive).any(|(index, _)| {
+        let end = index + sensitive.len();
+        let starts_at_boundary = sensitive.starts_with('/')
+            || index == 0
+            || candidate.as_bytes().get(index - 1) == Some(&b'/');
+        let ends_at_boundary = sensitive.ends_with('/')
+            || end == candidate.len()
+            || candidate.as_bytes().get(end) == Some(&b'/');
+        starts_at_boundary && ends_at_boundary
+    })
+}
+
+fn uri_component_contains_sequence(candidate: &str, sensitive: &str) -> bool {
+    if sensitive.is_empty() {
+        return false;
+    }
+    candidate.match_indices(sensitive).any(|(index, _)| {
+        let end = index + sensitive.len();
+        let starts_at_boundary = sensitive.starts_with('/')
+            || index == 0
+            || candidate
+                .as_bytes()
+                .get(index - 1)
+                .copied()
+                .is_some_and(is_uri_component_boundary);
+        let ends_at_boundary = sensitive.ends_with('/')
+            || end == candidate.len()
+            || candidate
+                .as_bytes()
+                .get(end)
+                .copied()
+                .is_some_and(is_uri_component_boundary);
+        starts_at_boundary && ends_at_boundary
+    })
+}
+
+fn is_uri_component_boundary(byte: u8) -> bool {
+    !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+fn nested_path_uri_references(value: &str) -> impl Iterator<Item = &str> {
+    value.char_indices().filter_map(move |(index, _)| {
+        let reference = &value[index..];
+        let starts_at_boundary = index == 0
+            || value
+                .as_bytes()
+                .get(index - 1)
+                .copied()
+                .is_some_and(is_uri_component_boundary);
+        (starts_at_boundary
+            && (has_ascii_case_insensitive_prefix(reference, "http://")
+                || has_ascii_case_insensitive_prefix(reference, "https://")))
+        .then_some(reference)
+    })
+}
+
+fn explicit_uri_authority_port(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let authority_and_suffix = if let Some(authority) = value.strip_prefix("//") {
+        authority
+    } else {
+        let scheme_end = value.find(':')?;
+        let scheme = &value[..scheme_end];
+        if !is_valid_uri_scheme(scheme)
+            || !value
+                .get(scheme_end..)
+                .is_some_and(|suffix| suffix.starts_with("://"))
+        {
+            return None;
+        }
+        value.get(scheme_end + "://".len()..)?
+    };
+    let authority_end = authority_and_suffix
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_suffix.len());
+    let authority = &authority_and_suffix[..authority_end];
+    let host_and_port = authority.rsplit('@').next()?;
+    let port = if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        let closing_bracket = bracketed.find(']')? + 1;
+        host_and_port
+            .get(closing_bracket + 1..)?
+            .strip_prefix(':')?
+    } else {
+        host_and_port.rsplit_once(':')?.1
+    };
+    (!port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())).then_some(port)
+}
+
+fn is_valid_uri_scheme(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+fn has_ascii_case_insensitive_prefix(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+const MAX_REDIRECT_PERCENT_DECODE_LAYERS: usize = 8;
+const MAX_NESTED_DESTINATION_DEPTH: usize = 2;
+const MAX_URL_VALUED_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
+const MAX_LINK_HEADER_TARGETS: usize = 32;
+const MAX_NESTED_PATH_URI_REFERENCES: usize = 32;
+
+#[derive(Clone, Copy)]
+enum UrlValuedResponseHeader {
+    Location,
+    ContentLocation,
+    Refresh,
+    Link,
+}
+
+impl UrlValuedResponseHeader {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "location" => Some(Self::Location),
+            "content-location" => Some(Self::ContentLocation),
+            "refresh" => Some(Self::Refresh),
+            "link" => Some(Self::Link),
+            _ => None,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Location => 0,
+            Self::ContentLocation => 1,
+            Self::Refresh => 2,
+            Self::Link => 3,
+        }
+    }
+
+    fn allows_combined_values(self) -> bool {
+        matches!(self, Self::Link)
+    }
+}
+
+fn is_refresh_delay_separator(character: char) -> bool {
+    matches!(character, ';' | ',') || character.is_ascii_whitespace()
+}
+
+fn refresh_uri_reference(value: &str) -> Result<Option<&str>, ()> {
+    let value = value.trim_start_matches(|character: char| character.is_ascii_whitespace());
+    let Some(separator) = value.find(is_refresh_delay_separator) else {
+        return Ok(None);
+    };
+    // The browser Refresh algorithm accepts semicolon, comma, or ASCII
+    // whitespace after the leading delay. Consume a repeated separator run
+    // conservatively so it cannot hide a client-visible destination.
+    let directive = value[separator..]
+        .trim_start_matches(is_refresh_delay_separator)
+        .trim();
+    if directive.is_empty() {
+        return Ok(None);
+    }
+    if !has_ascii_case_insensitive_prefix(directive, "url") {
+        // Refresh consumers accept a bare URI after the delay separator even
+        // without `url=`. Any non-empty scalar is also a valid relative URI
+        // reference, so inspect it as a target; benign extensions still pass
+        // when they do not expose the signed destination.
+        return Ok(Some(directive));
+    }
+    let after_name = &directive["url".len()..];
+    if after_name
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+    {
+        return Ok(Some(directive));
+    }
+    let Some(target) = after_name.trim_start().strip_prefix('=') else {
+        return Err(());
+    };
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(());
+    }
+    if matches!(target.as_bytes()[0], b'\'' | b'"') {
+        let quote = target.as_bytes()[0];
+        if target.len() < 2 || target.as_bytes()[target.len() - 1] != quote {
+            return Err(());
+        }
+        let unquoted = &target[1..target.len() - 1];
+        if unquoted.is_empty() || unquoted.as_bytes().contains(&quote) {
+            return Err(());
+        }
+        Ok(Some(unquoted))
+    } else {
+        Ok(Some(target))
+    }
+}
+
+struct DecodedPercentLayers {
+    value: String,
+    fully_decoded: bool,
+}
+
+fn decode_percent_layers(value: &str) -> DecodedPercentLayers {
+    let mut decoded = value.to_string();
+    for _ in 0..MAX_REDIRECT_PERCENT_DECODE_LAYERS {
+        let Some(next) = strictly_decode_percent_layer(&decoded) else {
+            return DecodedPercentLayers {
+                value: decoded,
+                fully_decoded: false,
+            };
+        };
+        if next == decoded {
+            return DecodedPercentLayers {
+                value: decoded,
+                fully_decoded: true,
+            };
+        }
+        decoded = next;
+    }
+    let Some(next) = strictly_decode_percent_layer(&decoded) else {
+        return DecodedPercentLayers {
+            value: decoded,
+            fully_decoded: false,
+        };
+    };
+    DecodedPercentLayers {
+        fully_decoded: next == decoded,
+        value: decoded,
+    }
+}
+
+fn strictly_decode_percent_layer(value: &str) -> Option<String> {
+    if !has_valid_percent_triplets(value) {
+        return None;
+    }
+    percent_decode_str(value)
+        .decode_utf8()
+        .ok()
+        .map(|decoded| decoded.into_owned())
+}
+
+fn sanitize_function_response_headers(
+    headers: &http::HeaderMap,
+    function_destination: &FunctionDestination,
+) -> HashMap<String, String> {
+    let connection_listed: HashSet<HeaderName> =
+        crate::proxy::headers::parse_connection_listed_headers(headers)
+            .into_iter()
+            .collect();
+    let mut safe: HashMap<String, String> = HashMap::new();
+    let mut destination_header_blocked = [false; 4];
+    for (name, value) in headers {
+        let lower = name.as_str();
+        if connection_listed.contains(name)
+            || crate::proxy::headers::is_backend_response_strip_header(lower)
+            || is_protocol_managed_or_unsafe_response_header(lower)
+        {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        if let Some(kind) = UrlValuedResponseHeader::from_name(lower) {
+            let index = kind.index();
+            if destination_header_blocked[index]
+                || function_destination.response_header_exposes_destination(kind, value)
+            {
+                safe.remove(lower);
+                destination_header_blocked[index] = true;
+                continue;
+            }
+            if safe.contains_key(lower) {
+                // Location, Content-Location, and Refresh are singleton
+                // fields. Folding duplicate lines can synthesize a new URI
+                // scalar that neither original line exposed, so fail closed.
+                // Link is list-valued; preserve it only after validating the
+                // exact combined field that Ferrum will return downstream.
+                let combined_is_unsafe = if kind.allows_combined_values() {
+                    match safe.get_mut(lower) {
+                        Some(existing) => {
+                            existing.push_str(", ");
+                            existing.push_str(value);
+                            function_destination.response_header_exposes_destination(kind, existing)
+                        }
+                        None => true,
+                    }
+                } else {
+                    true
+                };
+                if combined_is_unsafe {
+                    safe.remove(lower);
+                    destination_header_blocked[index] = true;
+                }
+                continue;
+            }
+        }
+        if lower == "set-cookie" {
+            crate::proxy::headers::append_set_cookie_header(&mut safe, value.to_string());
+        } else {
+            safe.entry(lower.to_string())
+                .and_modify(|existing: &mut String| {
+                    existing.push_str(", ");
+                    existing.push_str(value);
+                })
+                .or_insert_with(|| value.to_string());
+        }
+    }
+    safe
+}
+
+fn is_protocol_managed_or_unsafe_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "content-length"
+            | "authorization"
+            | "proxy-authorization"
+            | "authentication-info"
+            | "proxy-authentication-info"
+            | "cookie"
+            | "x-api-key"
+            | "x-functions-key"
+            | "alt-svc"
+            | "server"
+            | "via"
+            | "cf-ray"
+    ) || name.starts_with("x-amz-")
+        || name.starts_with("x-goog-")
+        || name.starts_with("x-functions-")
+        || name.starts_with("x-ms-")
+        || name.starts_with("x-azure-")
+        || name.starts_with("x-cloud-")
+        || name.starts_with("x-envoy-")
 }
 
 fn http_url_hostname(parsed: &Url, field: &str) -> Result<String, String> {
@@ -730,13 +1906,6 @@ fn has_non_empty_authority(url: &str) -> bool {
         .unwrap_or(authority_and_path.len());
 
     authority_end > 0
-}
-
-fn contains_json_ascii(value: &str) -> bool {
-    value
-        .as_bytes()
-        .windows(b"json".len())
-        .any(|window| window.eq_ignore_ascii_case(b"json"))
 }
 
 fn starts_with_grpc_content_type(value: &str) -> bool {
@@ -838,6 +2007,14 @@ impl Plugin for ServerlessFunction {
         self.mode == InvocationMode::PreProxy
     }
 
+    fn egresses_request_body_before_finalization(&self) -> bool {
+        self.forward_body
+    }
+
+    fn requires_prior_request_deduplication(&self) -> bool {
+        self.mode == InvocationMode::Terminate
+    }
+
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
         true
     }
@@ -850,13 +2027,16 @@ impl Plugin for ServerlessFunction {
         self.requires_body
     }
 
-    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+    fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {
         self.requires_body
-            && ctx.method == "POST"
-            && ctx
-                .headers
-                .get("content-type")
-                .is_some_and(|ct| contains_json_ascii(ct))
+    }
+
+    fn needs_request_body_bytes(&self) -> bool {
+        self.requires_body
+    }
+
+    fn needs_request_body_text(&self) -> bool {
+        false
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -892,6 +2072,8 @@ impl Plugin for ServerlessFunction {
                     "serverless_function: terminate mode is not supported for gRPC requests — \
                      the gateway normalizes plugin rejects into trailers-only gRPC errors"
                 );
+                ctx.serverless_pre_invocation_rejection_owners
+                    .extend(ctx.request_deduplication_states.keys().copied());
                 return PluginResult::Reject {
                     status_code: 500,
                     body: r#"{"error":"serverless_function terminate mode is not supported for gRPC"}"#.to_string(),
@@ -900,91 +2082,129 @@ impl Plugin for ServerlessFunction {
             }
         }
 
-        let payload = self.build_invocation_payload(ctx, headers);
+        let payload = match self.build_invocation_payload(ctx, headers) {
+            Ok(payload) => payload,
+            Err(failure) => return self.pre_invocation_failure_result(ctx, failure),
+        };
+
+        if self.mode == InvocationMode::Terminate {
+            // The request_deduplication plugin uses this private provenance to
+            // distinguish an attempted externally executing terminal response
+            // from other synthetic short-circuits that must not be cached.
+            // Set it only after all plugin-local fail-closed inspection passes.
+            ctx.serverless_external_side_effect_owners
+                .extend(ctx.request_deduplication_states.keys().copied());
+        }
 
         let (status, response_headers, body) = match self.invoke(&payload, ctx).await {
             Ok(result) => result,
-            Err(err) => {
-                warn!("serverless_function: {}", err);
-                return match self.on_error {
-                    ErrorAction::Continue => {
-                        ctx.metadata
-                            .insert("serverless_function_error".to_string(), err.clone());
-                        PluginResult::Continue
-                    }
-                    ErrorAction::Reject => PluginResult::Reject {
-                        status_code: self.error_status_code,
-                        body: format!(
-                            r#"{{"error":"serverless function invocation failed","details":"{}"}}"#,
-                            escape_json_string(&err)
-                        ),
-                        headers: HashMap::new(),
-                    },
-                };
+            Err(failure) if failure.proven_pre_wire => {
+                // The outbound request never reached the function, so no external
+                // side effect occurred. Undo the anticipatory terminate-mode
+                // side-effect provenance and release the dedup marker like any
+                // other pre-invocation rejection, so an identical retry can
+                // proceed instead of being blocked/replayed until inflight_ttl.
+                let owners: Vec<u64> = ctx.request_deduplication_states.keys().copied().collect();
+                for owner in owners {
+                    ctx.serverless_external_side_effect_owners.remove(&owner);
+                }
+                return self.pre_invocation_failure_result(ctx, failure);
             }
+            Err(failure) => return self.failure_result(ctx, failure),
         };
+        ctx.metadata
+            .insert(self.metadata_key("status"), status.to_string());
 
         match self.mode {
             InvocationMode::Terminate => {
+                if !(200..=599).contains(&status) {
+                    return self.failure_result(
+                        ctx,
+                        InvocationFailure::new(
+                            "invalid_function_status",
+                            format!("function returned non-final status {status}"),
+                        ),
+                    );
+                }
                 // Return the function's response directly to the client
                 debug!(
                     "serverless_function: terminate mode — returning function response (status {})",
                     status
                 );
-                let mut resp_headers = HashMap::new();
-                // Forward content-type from function response
-                if let Some(ct) = response_headers.get("content-type") {
-                    resp_headers.insert("content-type".to_string(), ct.clone());
-                }
+                // Every valid terminate response is application-owned content,
+                // including redirects and errors. Mark it for the shared
+                // synthetic body lifecycle so configured response transforms
+                // and successful-response guardrails are not limited to the
+                // ordinary synthetic-2xx gate. Replays are already stored after
+                // this lifecycle and deliberately do not set the marker again.
+                ctx.serverless_terminate_response = true;
+                let body = if ctx.method.eq_ignore_ascii_case("HEAD")
+                    || matches!(status, 204 | 205 | 304)
+                {
+                    Bytes::new()
+                } else {
+                    body
+                };
                 PluginResult::RejectBinary {
                     status_code: status,
                     body,
-                    headers: resp_headers,
+                    headers: response_headers,
                 }
             }
             InvocationMode::PreProxy => {
-                // Check for function-level rejection
-                if status >= 400 {
-                    warn!(
-                        "serverless_function: function returned status {} in pre_proxy mode",
-                        status
+                // Only a 2xx function response is an affirmative pre-proxy
+                // decision. Redirects are deliberately not followed by the
+                // shared client and cannot become implicit approval.
+                if !(200..=299).contains(&status) {
+                    return self.failure_result(
+                        ctx,
+                        InvocationFailure::new(
+                            "function_non_success_status",
+                            format!("function returned non-2xx status {status} in pre_proxy mode"),
+                        ),
                     );
-                    return match self.on_error {
-                        ErrorAction::Continue => {
-                            ctx.metadata.insert(
-                                "serverless_function_status".to_string(),
-                                status.to_string(),
-                            );
-                            PluginResult::Continue
-                        }
-                        ErrorAction::Reject => PluginResult::Reject {
-                            status_code: status,
-                            body: String::from_utf8_lossy(&body).into_owned(),
-                            headers: HashMap::new(),
-                        },
-                    };
                 }
 
                 // Parse the response body as JSON to extract headers to inject
                 if let Ok(resp_json) = serde_json::from_slice::<Value>(&body) {
                     // Inject headers from response: { "headers": { "X-Custom": "value" } }
                     if let Some(header_map) = resp_json.get("headers").and_then(|h| h.as_object()) {
+                        let mut candidates = HashMap::new();
                         for (key, val) in header_map {
-                            if let Some(v) = val.as_str() {
-                                headers.insert(key.to_ascii_lowercase(), v.to_string());
+                            let Some(value) = val.as_str() else {
+                                continue;
+                            };
+                            let Ok(name) = HeaderName::from_bytes(key.as_bytes()) else {
+                                continue;
+                            };
+                            if HeaderValue::from_str(value).is_err() {
+                                continue;
                             }
+                            candidates.insert(name.as_str().to_string(), value.to_string());
+                        }
+                        let connection_listed: HashSet<String> =
+                            crate::proxy::headers::parse_connection_listed_from_str_map(
+                                &candidates,
+                            )
+                            .into_iter()
+                            .collect();
+                        for (key, value) in candidates {
+                            if connection_listed.contains(&key)
+                                || crate::proxy::headers::is_backend_request_strip_header(&key)
+                            {
+                                continue;
+                            }
+                            headers.insert(key, value);
                         }
                     }
 
                     // Store metadata from response: { "metadata": { "key": "value" } }
                     if let Some(meta_map) = resp_json.get("metadata").and_then(|m| m.as_object()) {
                         for (key, val) in meta_map {
-                            if let Some(v) = val.as_str() {
-                                let mut metadata_key =
-                                    String::with_capacity("serverless_".len() + key.len());
-                                metadata_key.push_str("serverless_");
-                                metadata_key.push_str(key);
-                                ctx.metadata.insert(metadata_key, v.to_string());
+                            if let Some(value) = val.as_str() {
+                                let suffix = format!("metadata.{}", encode_metadata_segment(key));
+                                ctx.metadata
+                                    .insert(self.metadata_key(&suffix), value.to_string());
                             }
                         }
                     }
