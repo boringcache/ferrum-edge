@@ -79,7 +79,10 @@ async fn try_start_injector(
     command
         .env("FERRUM_MODE", "injector")
         .env("FERRUM_INJECTOR_LISTEN_ADDR", format!("127.0.0.1:{port}"))
-        .env("FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS", header_read_timeout_seconds)
+        .env(
+            "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS",
+            header_read_timeout_seconds,
+        )
         .env("FERRUM_LOG_LEVEL", "warn")
         // Keep the ACME store lookups the TLS-ALPN resolver performs inside
         // the temp dir instead of the ambient default store path.
@@ -103,7 +106,9 @@ async fn try_start_injector(
         command.env("FERRUM_INJECTOR_ALLOW_PLAINTEXT", "true");
     }
 
-    let child = command.spawn().map_err(|e| format!("spawn injector: {e}"))?;
+    let child = command
+        .spawn()
+        .map_err(|e| format!("spawn injector: {e}"))?;
     let mut gateway = InjectorGateway { child, port, tmp };
 
     for _ in 0..100 {
@@ -117,7 +122,9 @@ async fn try_start_injector(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err(format!("injector never accepted a connection on port {port}"))
+    Err(format!(
+        "injector never accepted a connection on port {port}"
+    ))
 }
 
 /// The CA PEM the running TLS injector serves under, as a rustls trust anchor.
@@ -125,7 +132,9 @@ fn root_store_for(gateway: &InjectorGateway) -> rustls::RootCertStore {
     let ca_pem = std::fs::read(gateway.tmp.path().join("ca.crt")).expect("read test CA pem");
     let mut root_store = rustls::RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut Cursor::new(ca_pem)) {
-        root_store.add(cert.expect("parse CA cert")).expect("add CA");
+        root_store
+            .add(cert.expect("parse CA cert"))
+            .expect("add CA");
     }
     root_store
 }
