@@ -60,7 +60,7 @@ fn gzip(data: &[u8]) -> Vec<u8> {
 fn brotli(data: &[u8]) -> Vec<u8> {
     let params = brotli::enc::BrotliEncoderParams::default();
     let mut out = Vec::new();
-    let mut input = &data[..];
+    let mut input = data;
     brotli::BrotliCompress(&mut input, &mut out, &params).expect("brotli must compress");
     out
 }
@@ -455,6 +455,10 @@ async fn unstamped_backend_response_cannot_prove_its_representation_and_is_rejec
 // Unprotected traffic must be completely unaffected.
 // ---------------------------------------------------------------------------
 
+/// One unprotected-traffic case: the backend status, its response headers, and
+/// the exact bytes that must be forwarded untouched.
+type UnprotectedCase = (u16, Vec<(&'static str, &'static str)>, Vec<u8>);
+
 /// The critical non-regression: without a configured body policy, none of the
 /// above rejections may fire. A `206` video range, a gzip asset, and a
 /// zstd-encoded payload all pass through untouched.
@@ -470,7 +474,7 @@ async fn unprotected_responses_are_never_rejected_by_the_gate() {
         .expect("header-only response_transformer config must be valid"),
     )];
 
-    let cases: Vec<(u16, Vec<(&str, &str)>, Vec<u8>)> = vec![
+    let cases: Vec<UnprotectedCase> = vec![
         (
             206,
             vec![
