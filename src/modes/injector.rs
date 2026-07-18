@@ -141,6 +141,10 @@ pub struct InjectorConfig {
     /// permits plaintext HTTP for local development with a loud startup warning.
     pub allow_plaintext: bool,
     pub tls_handshake_timeout_seconds: u64,
+    /// HTTP/1 header read timeout for admission connections, mirroring the
+    /// proxy/admin listeners (`FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`).
+    /// `0` disables the timeout.
+    pub http_header_read_timeout_seconds: u64,
     pub admission_review_max_body_bytes: usize,
 }
 
@@ -237,6 +241,7 @@ impl InjectorConfig {
             tls_key_path,
             allow_plaintext,
             tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+            http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
             admission_review_max_body_bytes,
         })
     }
@@ -748,7 +753,28 @@ fn build_tls_acceptor(
         &[],
     )
     .map_err(|e| anyhow::anyhow!("Invalid injector TLS configuration: {}", e))?;
-    Ok(Some(TlsAcceptor::from(server_config)))
+    // The shared TLS loader advertises `h2` before `http/1.1`, but every
+    // injector connection is served by Hyper's HTTP/1-only builder. Drop `h2`
+    // so an HTTP/2-capable Kubernetes API server can never negotiate it and
+    // then send an HTTP/2 preface to the HTTP/1 parser.
+    //
+    // `acme-tls/1` is deliberately RETAINED. The shared loader installs
+    // `AcmeTlsAlpnResolver` for every listener it builds, so this acceptor can
+    // serve an RFC 8737 validation certificate from a pending order already in
+    // the process-global ACME store — the resolver only does so for a
+    // ClientHello that offers `acme-tls/1` ALONE with matching SNI, which no
+    // Kubernetes API server sends. Dropping the protocol here would silently
+    // break that externally orchestrated TLS-ALPN-01 path while leaving the
+    // resolver in place, so the advertisement and serving path stay in
+    // agreement. An `acme-tls/1` connection carries no HTTP, so handing the
+    // post-handshake socket to the HTTP/1 builder is inert: the validator
+    // closes it, or the header read timeout does.
+    let mut server_config = Arc::unwrap_or_clone(server_config);
+    server_config.alpn_protocols = vec![
+        b"http/1.1".to_vec(),
+        crate::tls::acme::TLS_ALPN01_PROTOCOL.to_vec(),
+    ];
+    Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
 }
 
 async fn serve_injector_connection<S>(
@@ -759,11 +785,26 @@ async fn serve_injector_connection<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(stream);
+    let header_read_timeout_seconds = config.http_header_read_timeout_seconds;
     let svc = service_fn(move |req| {
         let config = Arc::clone(&config);
         async move { handle_injector_request(req, config, remote_addr).await }
     });
-    if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+    // Match the proxy/admin listeners: bound the time a client may take to
+    // send request headers so trickling connections cannot exhaust the
+    // injector's connection budget. 0 is the documented opt-out.
+    let mut builder = http1::Builder::new();
+    if header_read_timeout_seconds > 0 {
+        builder.timer(hyper_util::rt::TokioTimer::new());
+        builder.header_read_timeout(std::time::Duration::from_secs(header_read_timeout_seconds));
+    } else {
+        // Pin the operator-facing `0 = disabled` contract explicitly. Hyper
+        // has its own default timeout, which happens to be inactive without a
+        // timer today; setting `None` prevents a future timer refactor from
+        // silently enabling that default for injector connections.
+        builder.header_read_timeout(None);
+    }
+    if let Err(e) = builder.serve_connection(io, svc).await {
         debug!(remote_addr = %remote_addr, error = %e, "Injector connection error");
     }
 }
@@ -1496,6 +1537,7 @@ mod tests {
             // behavior is covered separately via `from_env_config`.
             allow_plaintext: true,
             tls_handshake_timeout_seconds: 10,
+            http_header_read_timeout_seconds: 10,
             admission_review_max_body_bytes: DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB
                 * MIB_BYTES,
         }
