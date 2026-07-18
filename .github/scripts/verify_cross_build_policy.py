@@ -138,14 +138,47 @@ CROSS_ENVIRONMENT = re.compile(
     r"(?<![A-Za-z0-9_])(?:CROSS_[A-Z0-9_]*|DOCKER_OPTS|QEMU_STRACE|"
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
 )
+# A command word can start a new statement after an operator, at the start of a
+# line, or immediately inside a grouping/function-body delimiter. `{` matters
+# because a one-line function such as `f(){ cross build ...; }` places the
+# executable directly after the brace with no other separator.
+COMMAND_START_CONTEXT = (
+    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|[{(]\s*|"
+    r"\b(?:if|elif|while|until|then|do|else)\s+)"
+    r"(?:!\s*)?"
+)
+# `env` and the ordinary command wrappers accept options whose operand is a
+# separate word (`env -u FOO cross`, `sudo -u builder cross`, `timeout 30
+# cross`). Enumerate the operand-taking forms before the self-contained ones so
+# the operand is consumed with its flag instead of being mistaken for the
+# executable.
+ENV_OPTION = (
+    r"(?:-[uCS]\s+[^\s]+|"
+    r"--(?:unset|chdir|split-string|block-signal|default-signal|ignore-signal)"
+    r"(?:=[^\s]+|\s+[^\s]+)|"
+    r"--?[^\s]+|"
+    r"[A-Za-z_][A-Za-z0-9_]*=[^\s]+)"
+)
+ENV_PREFIX = rf"(?:env(?:\s+{ENV_OPTION})*\s+)"
+WRAPPER_OPTION = (
+    r"(?:-[nupgEC]\s+[^\s]+|"
+    r"--(?:user|group|chdir|niceness|priority|signal|kill-after)"
+    r"(?:=[^\s]+|\s+[^\s]+)|"
+    r"--?[A-Za-z0-9][A-Za-z0-9-]*(?:=[^\s]+)?|"
+    r"[0-9]+(?:\.[0-9]+)?[smhd]?)"
+)
+WRAPPER_PREFIX = (
+    r"(?:(?:command|exec|nohup|sudo|time|timeout|stdbuf|nice|ionice|setsid)"
+    rf"(?:\s+{WRAPPER_OPTION})*\s+)*"
+)
 CROSS_COMMAND_CONTEXT = re.compile(
-    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;|\|)\s*|"
-    r"\b(?:if|elif|while|until|then|do|else|time|command|exec|sudo|nohup)\s+)"
-    r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+    COMMAND_START_CONTEXT
+    + WRAPPER_PREFIX
+    + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
     r"(?:\(\s*)?(?:"
     r"cross|"
-    r"env(?:\s+(?:--?[^\s]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+))*\s+"
-    r"(?:cargo(?:\s+\+[^\s]+)?\s+)?cross|"
+    + ENV_PREFIX
+    + r"(?:cargo(?:\s+\+[^\s]+)?\s+)?cross|"
     r"cargo(?:\s+\+[^\s]+)?\s+cross"
     r")(?=\s+\S)|cargo\s+install"
     r"(?:\s+--[^\s=]+(?:=[^\s]+|\s+(?!cross\b)[^\s]+)?)*\s+cross\b"
@@ -200,14 +233,15 @@ LOCAL_ACTION_CANDIDATE = re.compile(
     r"^\s*(?:-\s*)?(?:uses|'uses'|\"uses\")\s*:\s*['\"]?\./"
 )
 LOCAL_COMMAND_REFERENCE = re.compile(
-    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;|\|)\s*|\$\(\s*|"
-    r"(?:<|>)\(\s*|"
+    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\$\(\s*|"
+    r"(?:<|>)\(\s*|[{(]\s*|"
     r"\b(?:if|elif|while|until|then|do|else)\s+)"
     r"(?:!\s*)?"
     r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
     r"(?:\(\s*)?"
-    r"(?:(?:command|exec|nohup|sudo)(?:\s+--?[^\s]+)*\s+)*"
-    r"(?:env(?:\s+(?:--?[^\s]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+))*\s+)?"
+    + WRAPPER_PREFIX
+    + ENV_PREFIX
+    + r"?"
     r"(?:(?:bash|sh|python|python3|ruby|node)"
     r"(?:\s+--?[^\s]+)*\s*(?:[0-9]+)?<(?![<&])\s*"
     r"(?P<redirected>(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|"
@@ -243,12 +277,13 @@ BLOCK_SCALAR_HEADER = re.compile(
     r"^[|>](?:(?:[1-9][+-]?)|(?:[+-][1-9]?))?(?:\s+#.*)?$"
 )
 HEREDOC_EXECUTABLE = re.compile(
-    r"(?:^\s*|(?:&&|\|\||;|\|)\s*|\$\(\s*|"
+    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\$\(\s*|[{(]\s*|"
     r"\b(?:if|elif|while|until|then|do|else)\s+)"
     r"(?:!\s*)?"
     r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    r"(?:(?:command|exec|nohup|sudo)(?:\s+--?[^\s]+)*\s+)*"
-    r"(?:env(?:\s+(?:--?[^\s]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+))*\s+)?"
+    + WRAPPER_PREFIX
+    + ENV_PREFIX
+    + r"?"
     r"(?P<interpreter>bash|sh|python|python3)\b"
 )
 OPAQUE_INLINE_SHELL = re.compile(
@@ -256,10 +291,18 @@ OPAQUE_INLINE_SHELL = re.compile(
     r"\beval\s+[^\n]*\$\(|"
     r"(?:\bsource|(?<!\S)\.)\s+<\()"
 )
+# One command word may be assembled from several adjacent expansions, with or
+# without literal letters between them (`${x}${y}`, `$x$y`, `${x}o${y}`,
+# `$(printf cr)${y}`). Any such word driving an ARM64 cross build is an opaque
+# executable.
+OPAQUE_EXPANSION = (
+    r"(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|"
+    r"\$\([^()\n]*\)|`[^`\n]*`)"
+)
 OPAQUE_ARM_CROSS_EXECUTION = re.compile(
-    r"(?:^\s*|(?:&&|\|\||;|\|)\s*|\b(?:then|do|else)\s+)"
-    r"(?:\(\s*)?['\"]?\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|"
-    r"[A-Za-z_][A-Za-z0-9_]*)['\"]?\s+"
+    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|[{(]\s*|\b(?:then|do|else)\s+)"
+    r"(?:\(\s*)?['\"]?"
+    rf"(?:[A-Za-z]*{OPAQUE_EXPANSION}['\"]?)+[A-Za-z]*['\"]?\s+"
     r"(?:\+[^\s]+\s+)?(?:build|rustc|run|test|check|clippy|doc|bench)\b"
     r"[^\n]*--target(?:=|\s+)aarch64-unknown-linux-gnu\b"
 )
@@ -271,7 +314,7 @@ NON_PYTHON_PROCESS_DISPATCH = re.compile(
     r"\b(?:os\.execute|io\.popen)\s*\()"
 )
 CD_COMMAND = re.compile(
-    r"(?:^\s*|(?:&&|\|\||;|\|)\s*|\b(?:then|do|else)\s+)"
+    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|[{(]\s*|\b(?:then|do|else)\s+)"
     r"cd(?:\s+--)?\s+"
     r"(?P<quote>['\"]?)(?P<path>[^\s;&|]+)(?P=quote)"
 )
@@ -873,21 +916,47 @@ def has_cross_command_context(candidate: str) -> bool:
     )
 
 
-def opaque_command_completion_variants(line: str) -> tuple[str, ...]:
-    """Expose opaque substitutions that can complete a literal Cross token."""
+CROSS_FRAGMENTS = frozenset(
+    "cross"[start:end]
+    for start in range(len("cross"))
+    for end in range(start + 1, len("cross") + 1)
+)
+
+
+def opaque_word_spans(line: str, spans: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int], ...]:
+    """Merge back-to-back substitutions into the single word the shell builds.
+
+    `${x}${y}` and `$x$y` are one command word once expanded, so evaluating each
+    interpolation in isolation would miss an executable assembled from adjacent
+    expansions. Literal letters between two substitutions belong to the same
+    word and are absorbed into the merged span as well.
+    """
+
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+            continue
+        if merged and re.fullmatch(r"[A-Za-z]*", line[merged[-1][1] : start]):
+            merged[-1][1] = max(merged[-1][1], end)
+            continue
+        merged.append([start, end])
+    return tuple((start, end) for start, end in merged)
+
+
+def opaque_executable_variants(
+    line: str,
+    spans: tuple[tuple[int, int], ...],
+) -> tuple[str, ...]:
+    """Substitute Cross into every opaque word that could hold the executable."""
 
     variants: list[str] = []
-    fragments = {
-        "cross"[start:end]
-        for start in range(len("cross"))
-        for end in range(start + 1, len("cross") + 1)
-    }
-    for start, end in command_substitution_spans(line):
+    for start, end in opaque_word_spans(line, spans):
         prefix_match = re.search(r"[A-Za-z]+$", line[:start])
         suffix_match = re.match(r"[A-Za-z]+", line[end:])
         prefix = prefix_match.group() if prefix_match is not None else ""
         suffix = suffix_match.group() if suffix_match is not None else ""
-        for fragment in fragments:
+        for fragment in CROSS_FRAGMENTS:
             if f"{prefix}{fragment}{suffix}" == "cross":
                 candidate = line[:start] + fragment + line[end:]
                 if has_cross_command_context(candidate):
@@ -899,15 +968,16 @@ def opaque_command_completion_variants(line: str) -> tuple[str, ...]:
     return tuple(variants)
 
 
+def opaque_command_completion_variants(line: str) -> tuple[str, ...]:
+    """Expose opaque substitutions that can complete a literal Cross token."""
+
+    return opaque_executable_variants(line, command_substitution_spans(line))
+
+
 def opaque_github_expression_variants(line: str) -> tuple[str, ...]:
     """Fail closed when a dynamic expression occupies a Cross command slot."""
 
-    variants: list[str] = []
-    fragments = {
-        "cross"[start:end]
-        for start in range(len("cross"))
-        for end in range(start + 1, len("cross") + 1)
-    }
+    dynamic_spans: list[tuple[int, int]] = []
     for start, end in github_expression_spans(line):
         raw = line[start:end]
         if not raw.endswith("}}"):
@@ -920,48 +990,20 @@ def opaque_github_expression_variants(line: str) -> tuple[str, ...]:
         )
         if is_quoted_literal or github_format_literal(inner) is not None:
             continue
-
-        prefix_match = re.search(r"[A-Za-z]+$", line[:start])
-        suffix_match = re.match(r"[A-Za-z]+", line[end:])
-        prefix = prefix_match.group() if prefix_match is not None else ""
-        suffix = suffix_match.group() if suffix_match is not None else ""
-        for fragment in fragments:
-            if f"{prefix}{fragment}{suffix}" == "cross":
-                candidate = line[:start] + fragment + line[end:]
-                if has_cross_command_context(candidate):
-                    variants.append(candidate)
-        if not prefix and not suffix:
-            candidate = line[:start] + "cross" + line[end:]
-            if has_cross_command_context(candidate):
-                variants.append(candidate)
-    return tuple(variants)
+        dynamic_spans.append((start, end))
+    return opaque_executable_variants(line, tuple(dynamic_spans))
 
 
 def opaque_shell_interpolation_variants(line: str) -> tuple[str, ...]:
     """Expose a shell interpolation that can occupy a Cross executable word."""
 
-    variants: list[str] = []
-    fragments = {
-        "cross"[start:end]
-        for start in range(len("cross"))
-        for end in range(start + 1, len("cross") + 1)
-    }
-    for match in SHELL_INTERPOLATION.finditer(line):
-        start, end = match.span()
-        prefix_match = re.search(r"[A-Za-z]+$", line[:start])
-        suffix_match = re.match(r"[A-Za-z]+", line[end:])
-        prefix = prefix_match.group() if prefix_match is not None else ""
-        suffix = suffix_match.group() if suffix_match is not None else ""
-        for fragment in fragments:
-            if f"{prefix}{fragment}{suffix}" == "cross":
-                candidate = line[:start] + fragment + line[end:]
-                if has_cross_command_context(candidate):
-                    variants.append(candidate)
-        if not prefix and not suffix:
-            candidate = line[:start] + "cross" + line[end:]
-            if has_cross_command_context(candidate):
-                variants.append(candidate)
-    return tuple(variants)
+    # Command substitutions participate in the same word as parameter
+    # expansions, so `$(a)${b}` is considered alongside `${a}${b}`.
+    spans = tuple(
+        [match.span() for match in SHELL_INTERPOLATION.finditer(line)]
+        + list(command_substitution_spans(line))
+    )
+    return opaque_executable_variants(line, spans)
 
 
 def decode_ansi_c_body(value: str) -> str:
@@ -1271,6 +1313,23 @@ def unprotected_cross_surfaces(
     return tuple([*top_level_surfaces, *job_surfaces]), []
 
 
+def yaml_command_augmented(contents: str) -> str:
+    """Append the shell text that YAML `run`/`shell` scalars actually produce.
+
+    Raw-text scanning misses a folded (`run: >`) block whose executable and
+    arguments live on different source lines. Appending the resolved command
+    scripts keeps the original text intact while exposing the folded form.
+    """
+
+    try:
+        scripts = workflow_command_scripts(contents)
+    except (RecursionError, ValueError):
+        return contents
+    if not scripts:
+        return contents
+    return "\n".join([contents, *scripts])
+
+
 def generic_workflow_cross_surfaces(
     contents: str,
     source: str,
@@ -1283,7 +1342,7 @@ def generic_workflow_cross_surfaces(
     # a Cross token is exposed, however, parse the job layout conservatively so
     # malformed, duplicate, and alias-shaped jobs fail closed.
     if not contains_cross_surface(
-        contents,
+        yaml_command_augmented(contents),
         include_opaque_shell_executable=include_opaque_shell_executable,
     ):
         return (), []
@@ -1362,7 +1421,7 @@ def generic_action_cross_surfaces(
 ) -> tuple[str, ...]:
     """Represent every Cross-sensitive local-action file by its full digest."""
 
-    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", yaml_command_augmented(contents))
     sensitive = (
         OPAQUE_INLINE_SHELL.search(logical_contents) is not None
         or WRAPPED_LITERAL_CROSS.search(logical_contents) is not None
@@ -1514,6 +1573,28 @@ def shell_command_lines(contents: str) -> tuple[str, ...]:
     return tuple(commands)
 
 
+def folded_block_text(lines: list[str]) -> str:
+    """Join a YAML folded scalar the way the shell finally receives it.
+
+    Blank lines separate paragraphs; every other run of lines collapses to one
+    command line. More-indented lines are folded too, which can only expose an
+    additional command word and never hide one.
+    """
+
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        if line.strip():
+            current.append(line.strip())
+            continue
+        if current:
+            paragraphs.append(" ".join(current))
+            current = []
+    if current:
+        paragraphs.append(" ".join(current))
+    return "\n".join(paragraphs)
+
+
 def workflow_command_scripts(contents: str) -> tuple[str, ...]:
     """Extract literal run and shell scalars from workflows and actions."""
 
@@ -1557,11 +1638,16 @@ def workflow_command_scripts(contents: str) -> tuple[str, ...]:
             len(line) - len(line.lstrip(" ")) for line in block if line.strip()
         ]
         block_indent = min(nonblank_indents, default=field_indent + 2)
-        scripts.append(
-            "\n".join(
-                line[block_indent:] if line.strip() else "" for line in block
-            )
-        )
+        dedented = [line[block_indent:] if line.strip() else "" for line in block]
+        scripts.append("\n".join(dedented))
+        if value.startswith(">"):
+            # A folded scalar joins successive lines with a space before the
+            # shell ever sees them, so `cross` on one line and its `--target`
+            # arguments on the next are a single command. Scan the folded form
+            # as well; the literal join above stays so nothing regresses.
+            folded = folded_block_text(dedented)
+            if folded != "\n".join(dedented):
+                scripts.append(folded)
     return tuple(scripts)
 
 
@@ -1593,6 +1679,58 @@ def executable_heredocs(contents: str) -> tuple[tuple[str, str], ...]:
         ]
         interpreter = interpreters[-1] if interpreters else None
     return tuple(programs)
+
+
+DYNAMIC_DISPATCH_NAMES = frozenset(
+    {
+        "__import__",
+        "compile",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "locals",
+        "vars",
+    }
+)
+
+
+def literal_string(node: ast.expr) -> str | None:
+    """Fold a statically known Python string, including split constructions.
+
+    `'cr' + 'oss'`, an f-string with no substitutions, and `''.join([...])` all
+    denote a constant executable name, so they must resolve rather than being
+    treated as opaque and skipped.
+    """
+
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = literal_string(node.left)
+        right = literal_string(node.right)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts = [literal_string(value) for value in node.values]
+        return None if any(part is None for part in parts) else "".join(parts)
+    if (
+        isinstance(node, ast.FormattedValue)
+        and node.conversion in (-1, ord("s"))
+        and node.format_spec is None
+    ):
+        return literal_string(node.value)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    ):
+        separator = literal_string(node.func.value)
+        elements = [literal_string(element) for element in node.args[0].elts]
+        if separator is None or any(element is None for element in elements):
+            return None
+        return separator.join(elements)
+    return None
 
 
 def python_command_scripts(
@@ -1634,6 +1772,10 @@ def python_command_scripts(
         "subprocess.check_output",
         "subprocess.Popen",
         "subprocess.run",
+        "subprocess.getoutput",
+        "subprocess.getstatusoutput",
+        "os.posix_spawn",
+        "os.posix_spawnp",
     }
     imported_names: dict[str, str] = {}
     for node in ast.walk(tree):
@@ -1647,12 +1789,53 @@ def python_command_scripts(
                     f"{node.module}.{alias.name}"
                 )
 
-    def call_name(node: ast.expr) -> str | None:
+    def static_name(node: ast.expr) -> str | None:
         if isinstance(node, ast.Name):
             return node.id
         if isinstance(node, ast.Attribute):
+            parent = static_name(node.value)
+            return f"{parent}.{node.attr}" if parent is not None else None
+        return None
+
+    def call_name(node: ast.expr) -> str | None:
+        """Resolve a callee, including literal dynamic import/attribute lookup."""
+
+        if isinstance(node, (ast.Name, ast.Attribute)) and not isinstance(
+            getattr(node, "value", None), ast.Call
+        ):
+            return static_name(node)
+        if isinstance(node, ast.Attribute):
             parent = call_name(node.value)
             return f"{parent}.{node.attr}" if parent is not None else None
+        if isinstance(node, ast.Call):
+            inner = static_name(node.func)
+            if inner == "__import__" or (
+                inner is not None and inner.endswith("import_module")
+            ):
+                # `__import__('subprocess').run(...)` executes exactly the same
+                # process API as a direct call, so resolve the literal module
+                # name instead of ignoring the dispatch.
+                return literal_string(node.args[0]) if node.args else None
+            if inner == "getattr" and len(node.args) >= 2:
+                base = call_name(node.args[0])
+                attribute = literal_string(node.args[1])
+                if base is not None and attribute is not None:
+                    return f"{base}.{attribute}"
+            return None
+        return None
+
+    def dynamic_dispatch_root(node: ast.expr) -> str | None:
+        """Name the dynamic primitive that selects an unresolvable callee."""
+
+        if isinstance(node, (ast.Attribute, ast.Subscript)):
+            return dynamic_dispatch_root(node.value)
+        if isinstance(node, ast.Call):
+            inner = static_name(node.func)
+            if inner in DYNAMIC_DISPATCH_NAMES or (
+                inner is not None and inner.endswith("import_module")
+            ):
+                return inner
+            return dynamic_dispatch_root(node.func)
         return None
 
     for node in ast.walk(tree):
@@ -1660,6 +1843,14 @@ def python_command_scripts(
             continue
         raw_name = call_name(node.func)
         if raw_name is None:
+            # A callee chosen through dynamic import or attribute lookup can
+            # reach any process API, so it is an unknown executable surface.
+            primitive = dynamic_dispatch_root(node.func)
+            if primitive is not None:
+                errors.append(
+                    f"{source} must not dispatch calls through dynamic "
+                    f"import or attribute lookup ({primitive})"
+                )
             continue
         name_parts = raw_name.split(".", 1)
         resolved_name = imported_names.get(name_parts[0], name_parts[0])
@@ -1700,17 +1891,45 @@ def python_command_scripts(
                 None,
             )
             command_from_keyword = command is not None
+
+        command_text: str | None = None
+        if command is not None:
+            command_text = literal_string(command)
+            if command_text is None and isinstance(command, (ast.List, ast.Tuple)):
+                elements = [literal_string(element) for element in command.elts]
+                if all(element is not None for element in elements):
+                    command_text = " ".join(elements)
+
+        # `subprocess.run(['build', ...], executable='cross')` runs `cross` even
+        # though the executable never appears in `args`, so the override is the
+        # command word that must be inspected.
+        override: str | None = None
+        override_opaque = False
+        if resolved_name.startswith("subprocess."):
+            executable = next(
+                (
+                    keyword.value
+                    for keyword in node.keywords
+                    if keyword.arg == "executable"
+                ),
+                None,
+            )
+            if executable is not None:
+                override = literal_string(executable)
+                override_opaque = override is None
+        if override is not None:
+            # Keep an argument word even when the positional args are opaque so
+            # the override is still recognized as an executable, not a bare noun.
+            commands.append(f"{override} {command_text or '${ARGS}'}")
+        elif override_opaque and reject_dynamic_commands:
+            errors.append(f"{source} has an opaque process executable override")
+
         if command is None:
-            if reject_dynamic_commands:
+            if reject_dynamic_commands and override is None:
                 errors.append(f"{source} has an opaque process command")
             continue
-        if isinstance(command, ast.Constant) and isinstance(command.value, str):
-            commands.append(command.value)
-        elif isinstance(command, (ast.List, ast.Tuple)) and all(
-            isinstance(element, ast.Constant) and isinstance(element.value, str)
-            for element in command.elts
-        ):
-            commands.append(" ".join(element.value for element in command.elts))
+        if command_text is not None:
+            commands.append(command_text)
         elif command_from_keyword:
             errors.append(
                 f"{source} keyword process commands must be literal strings or "
@@ -1921,6 +2140,11 @@ def validate_automation_collection(
             and (
                 contains_literal_executable_cross(contents)
                 or WRAPPED_LITERAL_CROSS.search(contents)
+                # An executable word assembled from shell expansions is opaque,
+                # so an ARM64 cross build driven by one fails closed here too.
+                or OPAQUE_ARM_CROSS_EXECUTION.search(
+                    re.sub(r"\\\r?\n[ \t]*", "", contents)
+                )
             )
         ):
             errors.append(
@@ -3316,6 +3540,239 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("transitive referenced-script Cross invocation was not rejected")
+
+    python_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "python3 scripts/safe.py",
+    )
+    python_baseline = {"scripts/safe.py": "print('safe')\n"}
+
+    def python_automation_escapes(label: str, body: str) -> None:
+        """Both the PR comparison and current-tree validation must fail closed."""
+
+        proposed = {"scripts/safe.py": body}
+        if not compare_pr_automation_collection(
+            {"ci.yml": python_workflow},
+            {"ci.yml": python_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            python_baseline,
+            proposed,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} was not rejected by PR comparison")
+        if not validate_automation_collection(
+            {"ci.yml": python_workflow},
+            {"setup/action.yml": safe_action},
+            proposed,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} was not rejected by tree validation")
+
+    arm_arguments = "'build', '--target', 'aarch64-unknown-linux-gnu'"
+    python_automation_escapes(
+        "dynamic __import__ process dispatch",
+        f"__import__('subprocess').run(['cr' + 'oss', {arm_arguments}])\n",
+    )
+    python_automation_escapes(
+        "importlib dynamic process dispatch",
+        "import importlib\n"
+        "importlib.import_module('subprocess').run(\n"
+        f"    ['cross', {arm_arguments}]\n"
+        ")\n",
+    )
+    python_automation_escapes(
+        "getattr process dispatch",
+        "import subprocess\n"
+        f"getattr(subprocess, 'run')(['cross', {arm_arguments}])\n",
+    )
+    python_automation_escapes(
+        "f-string assembled Cross executable",
+        "import subprocess\n"
+        f"subprocess.run([f'cr{{\"oss\"}}', {arm_arguments}])\n",
+    )
+    python_automation_escapes(
+        "joined Cross executable",
+        "import subprocess\n"
+        f"subprocess.run([''.join(['cr', 'oss']), {arm_arguments}])\n",
+    )
+    python_automation_escapes(
+        "subprocess executable override",
+        "import subprocess\n"
+        f"subprocess.run([{arm_arguments}], executable='cross')\n",
+    )
+    python_automation_escapes(
+        "opaque dynamic dispatch",
+        "import subprocess\n"
+        "name = 'run'\n"
+        f"getattr(subprocess, name)(['cross', {arm_arguments}])\n",
+    )
+
+    benign_python = {
+        "scripts/safe.py": (
+            "import subprocess\n"
+            "# cross-compilation notes live at cross.example.invalid\n"
+            "subprocess.run(['cargo', 'build', '--locked'])\n"
+            "subprocess.run(['cargo', 'test'], executable='/usr/bin/cargo')\n"
+        )
+    }
+    if compare_pr_automation_collection(
+        {"ci.yml": python_workflow},
+        {"ci.yml": python_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        python_baseline,
+        benign_python,
+        "self-test automation directory",
+    ):
+        failures.append("benign Python automation edit was rejected")
+
+    def shell_automation_escapes(label: str, body: str) -> None:
+        proposed = {"scripts/safe.sh": f"#!/bin/sh\n{body}\n"}
+        if not compare_pr_automation_collection(
+            {"ci.yml": referenced_workflow},
+            {"ci.yml": referenced_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            safe_automation,
+            proposed,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} was not rejected by PR comparison")
+        if not validate_automation_collection(
+            {"ci.yml": referenced_workflow},
+            {"setup/action.yml": safe_action},
+            proposed,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} was not rejected by tree validation")
+
+    arm_target = f"build --target {TARGET}"
+    shell_automation_escapes(
+        "brace-delimited variable concatenation",
+        f"x=cr\ny=oss\n${{x}}${{y}} {arm_target}",
+    )
+    shell_automation_escapes(
+        "bare variable concatenation",
+        f"x=cr\ny=oss\n$x$y {arm_target}",
+    )
+    shell_automation_escapes(
+        "variable concatenation around a literal",
+        f"x=cr\ny=ss\n${{x}}o${{y}} {arm_target}",
+    )
+    shell_automation_escapes(
+        "mixed substitution concatenation",
+        f"y=oss\n$(printf cr)${{y}} {arm_target}",
+    )
+    shell_automation_escapes(
+        "one-line function body",
+        f"f(){{ cross {arm_target}; }}\nf",
+    )
+    shell_automation_escapes(
+        "spaced one-line function body",
+        f"f() {{ cross {arm_target}; }}\nf",
+    )
+    shell_automation_escapes(
+        "env with a separate option operand",
+        f"env -u FOO cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "env with a long option operand",
+        f"env --unset FOO cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "env chdir before Cross",
+        f"env -C /tmp cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "sudo with a separate option operand",
+        f"sudo -u builder cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "timeout wrapper before Cross",
+        f"timeout 30 cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "background separator before Cross",
+        f"echo start & cross {arm_target}",
+    )
+
+    benign_shell = {
+        "scripts/safe.sh": (
+            "#!/bin/sh\n"
+            "# builds are cross-checked against cross.example.invalid\n"
+            "f() { echo safe; }\n"
+            "env -u FOO cargo build --locked\n"
+            "sudo -u builder cargo test\n"
+            "x=cr\ny=ate\n"
+            "echo \"${x}${y}\"\n"
+        )
+    }
+    if compare_pr_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        benign_shell,
+        "self-test automation directory",
+    ):
+        failures.append("benign shell automation edit was rejected")
+
+    folded_action = (
+        "name: Folded\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - run: >\n"
+        "        cross\n"
+        f"        {arm_target}\n"
+        "      shell: bash\n"
+    )
+    if not validate_action_collection(
+        {"folded/action.yml": folded_action},
+        "self-test action directory",
+    ):
+        failures.append("folded local-action Cross invocation was not rejected")
+    if not compare_pr_action_collection(
+        {"folded/action.yml": safe_action},
+        {"folded/action.yml": folded_action},
+        "self-test action directory",
+    ):
+        failures.append("folded local-action Cross edit was not rejected")
+
+    folded_workflow = (
+        "name: Folded workflow\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: >\n"
+        "          cross\n"
+        f"          {arm_target}\n"
+    )
+    if not compare_pr_workflow_collection(
+        {"safe.yml": referenced_workflow},
+        {"safe.yml": folded_workflow},
+        "self-test automation directory",
+    ):
+        failures.append("folded workflow Cross invocation was not rejected")
+
+    benign_folded_action = (
+        "name: Folded\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - run: >\n"
+        "        cargo\n"
+        "        build --locked\n"
+        "      shell: bash\n"
+    )
+    if validate_action_collection(
+        {"folded/action.yml": benign_folded_action},
+        "self-test action directory",
+    ):
+        failures.append("benign folded local action was rejected")
 
     ci_publish_contract = PUBLISH_CONTROL_CONTRACTS["CI workflow"]
     publish_workflow = (
