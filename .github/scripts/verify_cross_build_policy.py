@@ -247,8 +247,8 @@ HEREDOC_EXECUTABLE = re.compile(
     r"(?P<interpreter>bash|sh|python|python3)\b"
 )
 OPAQUE_INLINE_SHELL = re.compile(
-    r"(?:\b(?:bash|sh)\s+-c\s+(?:[^\n]*\$\(|['\"]?`)|"
-    r"\beval\s+(?:[^\n]*\$\(|['\"]?`)|"
+    r"(?:\b(?:bash|sh)\s+-c\s+[^\n]*\$\(|"
+    r"\beval\s+[^\n]*\$\(|"
     r"(?:\bsource|(?<!\S)\.)\s+<\()"
 )
 NON_PYTHON_PROCESS_DISPATCH = re.compile(
@@ -1209,6 +1209,9 @@ def unprotected_cross_surfaces(
         job_digests[name] = hashlib.sha256(block_contents.encode("utf-8")).hexdigest()
 
         logical_contents = re.sub(r"\\\r?\n[ \t]*", "", block_contents)
+        if OPAQUE_INLINE_SHELL.search(logical_contents):
+            sensitive_jobs.add(name)
+            continue
         for logical_line in logical_contents.splitlines():
             for variant in scan_variants(
                 logical_line,
@@ -1223,6 +1226,8 @@ def unprotected_cross_surfaces(
     top_level_surfaces: list[str] = []
     for index, line in enumerate(lines):
         line_surfaces: set[str] = set()
+        if OPAQUE_INLINE_SHELL.search(line):
+            line_surfaces.add("opaque-inline-shell")
         for variant in scan_variants(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
