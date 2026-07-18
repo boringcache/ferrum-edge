@@ -2731,10 +2731,7 @@ fn fault_delta_proxy_id_move_rebuilds_former_and_new_placements() {
     );
     let p1 = make_proxy("p1", "/one", vec!["fault"]);
     let p2 = make_proxy("p2", "/two", vec![]);
-    let old_config = make_config(
-        vec![p1.clone(), p2.clone()],
-        vec![old_fault.clone()],
-    );
+    let old_config = make_config(vec![p1.clone(), p2.clone()], vec![old_fault.clone()]);
     let cache = PluginCache::new(&old_config).expect("initial fault cache");
     assert_eq!(cache.get_plugins("p1")[0].name(), "fault_injection");
     assert!(cache.get_plugins("p2").is_empty());
@@ -2820,8 +2817,7 @@ fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
         vec![group_fault.clone()],
     );
     let to_group = ConfigDelta::compute(&proxy_config, &group_config);
-    let to_group_ids =
-        to_group.proxy_ids_needing_plugin_rebuild(&proxy_config, &group_config);
+    let to_group_ids = to_group.proxy_ids_needing_plugin_rebuild(&proxy_config, &group_config);
     assert_eq!(
         to_group_ids,
         HashSet::from(["p1".to_string(), "p2".to_string(), "p3".to_string()])
