@@ -89,6 +89,7 @@ ferrum-edge validate [OPTIONS]
 
 ### What is validated
 
+0. **External secrets** — before settings are parsed, `validate` resolves the `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` suffixes into their base `FERRUM_*` variables exactly as `run` does. Validation therefore sees the same configuration the gateway would start with, and the same failures apply: a base variable combined with a suffixed source for the same key is a conflict, and an unreadable or unreachable source fails the command. Secret values are never printed.
 1. **Settings** (`ferrum.conf`) — all 300+ environment variables are parsed and validated (ports, paths, TLS configuration, pool sizes, etc.)
 2. **Spec** (resources YAML/JSON, file mode only):
    - YAML/JSON syntax and deserialization
