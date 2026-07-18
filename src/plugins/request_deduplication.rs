@@ -2006,8 +2006,18 @@ impl Plugin for RequestDeduplication {
         {
             return PluginResult::Continue;
         }
-        let retain_inflight_on_storage_skip =
-            ctx.serverless_owned_dedup_publication == Some(self.instance_id);
+        // Retain both in-flight locks (rather than fail open) when configured
+        // capacity is too small even to store an owned terminal response or a
+        // non-replayable external-operation tombstone. Serverless owns its
+        // publication through the typed marker above; `ai_federation` signals
+        // the same intent for its committed provider call through
+        // `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`, so a storage skip there
+        // must keep the marker instead of letting a retry re-run the operation.
+        let retain_inflight_on_storage_skip = ctx.serverless_owned_dedup_publication
+            == Some(self.instance_id)
+            || ctx
+                .metadata
+                .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY);
 
         // Only cache if this instance acquired a completion state in
         // `before_proxy`. Take it before any await so a later hook cannot reuse
@@ -2051,6 +2061,24 @@ impl Plugin for RequestDeduplication {
                 .metadata
                 .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)
             {
+                // A later plugin performed a committed/ambiguous external
+                // operation (e.g. an `ai_federation` provider call) behind this
+                // synthetic short-circuit. Its response has no safe replay, so
+                // the in-flight locks must NOT be released here. Retain
+                // ownership by re-parking the state consumed above so
+                // `on_response_committed` can publish a non-replayable completed
+                // tombstone once every response decision is final. Both the
+                // local and Redis in-flight markers stay held until that
+                // publication (or `inflight_ttl` as the backstop).
+                ctx.request_deduplication_states.insert(
+                    self.instance_id,
+                    RequestDeduplicationRequestState {
+                        key,
+                        fingerprint,
+                        local_inflight_owner_token,
+                        redis_lock_token,
+                    },
+                );
                 return PluginResult::Continue;
             }
             self.remove_matching_local_inflight(&key, &fingerprint, &local_inflight_owner_token);
@@ -2269,13 +2297,52 @@ impl Plugin for RequestDeduplication {
             return;
         }
 
+        // A synthetic response produced after a committed or ambiguous external
+        // operation (an `ai_federation` provider call today) cannot be replayed:
+        // re-running response transforms or re-issuing the side effect under the
+        // same idempotency key is unsafe, while caching the synthetic body would
+        // replay a representation that was never a backend response. Publish a
+        // small non-replayable 409 tombstone instead, so an identical retry is
+        // rejected deterministically for the cache TTL rather than re-executing
+        // the operation once the raw in-flight marker expires.
+        // `on_final_response_body`'s synthetic guard retained ownership for
+        // exactly this. The synthetic marker is cleared around the re-entry so
+        // the publication path runs instead of the retain-and-return synthetic
+        // guard, then restored for any later hook that observes it. If capacity
+        // is too small even for the tombstone, `local_publish_completed` keeps
+        // the in-flight locks (see `retain_inflight_on_storage_skip`) rather than
+        // failing open to an immediate duplicate.
+        if ctx
+            .metadata
+            .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)
+        {
+            let synthetic_marker = ctx
+                .metadata
+                .remove(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+            let headers = HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("cache-control".to_string(), "no-store".to_string()),
+            ]);
+            let body = br#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
+            let _ = self
+                .on_final_response_body(ctx, 409, &headers, body)
+                .await;
+            if let Some(marker) = synthetic_marker {
+                ctx.metadata.insert(
+                    crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+                    marker,
+                );
+            }
+            return;
+        }
+
         // Generic committed-hook release signal used by non-serverless ownership
         // producers (for example `ai_federation`, and the proxy/H3 commit paths):
         // release this instance's exact in-flight token so a duplicate retry can
-        // proceed. An external operation that completed must instead retain the
-        // in-flight lock — the `on_final_response_body` synthetic-short-circuit
-        // guard already kept it — so a same-key retry cannot re-run a
-        // non-replayable side effect. That case takes precedence here.
+        // proceed. An external operation that completed is handled above and
+        // never reaches here, so this path only releases requests that were
+        // provably safe to retry (the `!EXTERNAL_OPERATION_COMPLETED` guard is
+        // retained defensively against any future reordering).
         if ctx
             .metadata
             .contains_key(super::RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY)

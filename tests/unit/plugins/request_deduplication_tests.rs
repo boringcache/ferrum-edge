@@ -488,6 +488,13 @@ async fn committed_replay_skips_second_response_body_transform() {
 // therefore not reachable from this external test crate).
 const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
 
+// Marker set by an ownership producer (e.g. `ai_federation`) on `ctx.metadata`
+// once a billable/side-effecting external operation has a committed or ambiguous
+// outcome behind a synthetic short-circuit (mirrors the `pub(crate)`
+// `crate::plugins::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`, which is not
+// reachable from this external test crate).
+const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str = "ferrum:external_operation_completed";
+
 // A FRESH request that this plugin marked in-flight, then short-circuited by a
 // LATER `before_proxy` plugin (e.g. a 2xx `fault_injection` abort / synthetic AI
 // response), must NOT have its synthetic body stored under the idempotency key.
@@ -547,6 +554,98 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
         "second request with same key must pass through, not replay a synthetic body; got {result:?}"
     );
     assert!(request_identity(&plugin, &ctx2).is_some());
+}
+
+// A FRESH request marked in-flight by this plugin, then short-circuited by a
+// synthetic response AFTER a committed/ambiguous external operation (the
+// `ai_federation` provider-call lifecycle), must not release the in-flight
+// marker on the early final-body pass and must not cache the synthetic body.
+// Instead the observe-only committed hook publishes a non-replayable 409
+// tombstone so an identical retry is rejected deterministically for the cache
+// TTL rather than either re-running the side effect (fresh) or eating a bare
+// "already in progress" in-flight conflict. This isolates the shared dedup
+// lifecycle exercised end-to-end by the `ai_federation` suite, without the
+// federation plugin, so a future dedup refactor cannot silently drop it again.
+#[tokio::test]
+async fn external_operation_completed_publishes_non_replayable_tombstone_at_commit() {
+    let plugin = make_plugin(json!({}));
+
+    // First request acquires the in-flight marker and a dedup key.
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "ext-op-key".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx1, &mut headers1).await,
+        PluginResult::Continue
+    ));
+    assert!(request_identity(&plugin, &ctx1).is_some());
+
+    // The proxy marks the synthetic short-circuit before running the response
+    // body hooks; the external-operation marker is what a committed provider
+    // call sets. The early final-body pass must retain ownership: it neither
+    // stores the synthetic body nor releases the in-flight marker.
+    ctx1.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    ctx1.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut ctx1, 200, &response_headers, b"{\"synthetic\": true}")
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        assert_completed_size_exact(&plugin),
+        0,
+        "synthetic external-operation body must not be stored as a replayable response"
+    );
+
+    // The proxy clears the synthetic marker before the committed hook. The
+    // observe-only committed hook then publishes the non-replayable tombstone.
+    ctx1.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+    plugin
+        .on_response_committed(&mut ctx1, 200, &response_headers, b"{\"synthetic\": true}")
+        .await;
+
+    // A retry with the SAME key must be rejected as a completed non-replayable
+    // operation (409 "cannot be replayed safely"), NOT treated as fresh (which
+    // would re-run the side effect) and NOT returned as a bare in-flight 409.
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "ext-op-key".to_string());
+    match plugin.before_proxy(&mut ctx2, &mut headers2).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 409);
+            assert!(
+                String::from_utf8_lossy(&body).contains("cannot be replayed safely"),
+                "retry after a committed external operation must return the non-replayable tombstone, got {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+        }
+        other => panic!("expected non-replayable completed tombstone, got {other:?}"),
+    }
 }
 
 #[tokio::test]
