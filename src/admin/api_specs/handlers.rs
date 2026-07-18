@@ -3494,8 +3494,13 @@ pub async fn handle_delete_api_spec(
         upstream: existing_upstream,
         plugins: existing_plugins,
     };
-    if let Err(error) =
-        validate_api_spec_restore_inputs(&previous_bundle, &existing, &additional_plugins, true)
+    if let Err(error) = validate_api_spec_restore_inputs(
+        &previous_bundle,
+        &existing,
+        &[],
+        &additional_plugins,
+        true,
+    )
     {
         return Ok(error_response(ApiSpecError::ValidationFailures {
             spec_version: existing.spec_version.clone(),
