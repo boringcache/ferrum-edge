@@ -574,6 +574,233 @@ fn test_jwt_zero_max_ttl_disables_cap() {
     );
 }
 
+// ── `FERRUM_ADMIN_JWT_MAX_TTL` boundaries ─────────────────────────────
+//
+// The enforced contract (see `JwtManager::verify_token`) counts the 60-second
+// clock-skew leeway exactly once: `exp - iat` positive and `<= max_ttl`,
+// `iat <= now + leeway`, `exp - now <= max_ttl + leeway`, and `exp > now`.
+// Effective maximum real acceptance is `max_ttl + leeway`.
+
+fn config_with_max_ttl(max_ttl_seconds: u64) -> JwtConfig {
+    JwtConfig {
+        max_ttl_seconds,
+        ..test_jwt_config()
+    }
+}
+
+/// Sign claims with the shared test key/issuer used by `test_jwt_config()`.
+fn sign_claims(claims: &AdminClaims) -> String {
+    let header = Header::new(Algorithm::HS256);
+    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    encode(&header, claims, &key).unwrap()
+}
+
+/// Claims with explicit `iat`/`exp` offsets (seconds) from the current time
+/// and `nbf` pinned to now, matching the shape a minter would emit.
+fn claims_at(iat_offset: i64, exp_offset: i64) -> AdminClaims {
+    let now = Utc::now().timestamp();
+    AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: now + iat_offset,
+        nbf: now,
+        exp: now + exp_offset,
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({}),
+    }
+}
+
+#[test]
+fn test_jwt_nominal_max_ttl_boundary_accepted() {
+    // exp - iat == max_ttl exactly: the documented nominal maximum.
+    let manager = JwtManager::new(config_with_max_ttl(3600));
+    let token = sign_claims(&claims_at(0, 3600));
+
+    let result = manager.verify_token(&token);
+    assert!(
+        result.is_ok(),
+        "A token whose nominal lifetime equals max_ttl exactly must be accepted: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_jwt_nominal_max_ttl_one_second_over_rejected() {
+    let manager = JwtManager::new(config_with_max_ttl(3600));
+    let token = sign_claims(&claims_at(0, 3601));
+
+    assert!(
+        manager.verify_token(&token).is_err(),
+        "A nominal lifetime one second beyond max_ttl must be rejected"
+    );
+}
+
+#[test]
+fn test_jwt_final_acceptance_window_is_one_skew_allowance() {
+    // Worst legitimate case: an issuer whose clock is a full leeway window
+    // fast mints a full-length token. `exp - now == max_ttl + leeway`, the
+    // documented maximum real acceptance, and it is accepted.
+    let manager = JwtManager::new(config_with_max_ttl(3600));
+    let token = sign_claims(&claims_at(60, 60 + 3600));
+
+    let result = manager.verify_token(&token);
+    assert!(
+        result.is_ok(),
+        "A fast-but-within-skew issuer must still mint full-length tokens: {:?}",
+        result.err()
+    );
+
+    // One second more of future shift breaks the single skew allowance on
+    // both the `iat` and remaining-lifetime bounds.
+    let token = sign_claims(&claims_at(61, 61 + 3600));
+    assert!(
+        manager.verify_token(&token).is_err(),
+        "Shifting beyond one skew window must not extend real acceptance"
+    );
+}
+
+#[test]
+fn test_jwt_expired_within_jsonwebtoken_leeway_rejected_under_cap() {
+    // Anti-double-count: jsonwebtoken alone keeps accepting a token until
+    // `exp + leeway`. With the cap enabled the verifier re-checks expiry at
+    // verifier time with no grace, so the same 60s skew allowance is never
+    // spent twice (which would stretch real acceptance to max_ttl + 120s).
+    let manager = JwtManager::new(config_with_max_ttl(3600));
+    let token = sign_claims(&claims_at(-3610, -10));
+
+    assert!(
+        manager.verify_token(&token).is_err(),
+        "A token past `exp` must be rejected under the cap even inside jsonwebtoken's expiry leeway"
+    );
+}
+
+#[test]
+fn test_jwt_oversized_max_ttl_rejected_not_treated_as_unlimited() {
+    // `u64::MAX` is a typo, not the documented `0` disable sentinel: it is
+    // unrepresentable as an i64-second bound and must fail closed rather
+    // than clamping to an effectively unlimited cap.
+    let manager = JwtManager::new(config_with_max_ttl(u64::MAX));
+    let token = sign_claims(&claims_at(0, 1800));
+
+    assert!(
+        manager.verify_token(&token).is_err(),
+        "An unrepresentable max_ttl must fail closed, not behave as an unlimited cap"
+    );
+}
+
+#[test]
+fn test_jwt_max_ttl_representable_boundary() {
+    // One past the representable bound fails closed; the bound itself is a
+    // valid (if absurd) configuration and still enforces the cap.
+    let over = JwtManager::new(config_with_max_ttl(i64::MAX as u64 + 1));
+    assert!(
+        over.verify_token(&sign_claims(&claims_at(0, 1800))).is_err(),
+        "max_ttl above i64::MAX must be rejected as invalid configuration"
+    );
+
+    let at_bound = JwtManager::new(config_with_max_ttl(i64::MAX as u64));
+    let result = at_bound.verify_token(&sign_claims(&claims_at(0, 1800)));
+    assert!(
+        result.is_ok(),
+        "max_ttl at the representable bound remains a usable configuration: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_jwt_hostile_timestamp_extremes_rejected() {
+    let manager = JwtManager::new(config_with_max_ttl(3600));
+
+    // `iat = i64::MIN` with a sane `exp`: `exp - iat` saturates instead of
+    // overflowing, so the nominal-lifetime check rejects it.
+    let mut claims = claims_at(0, 1800);
+    claims.iat = i64::MIN;
+    assert!(
+        manager.verify_token(&sign_claims(&claims)).is_err(),
+        "iat = i64::MIN must be rejected, not overflow the lifetime computation"
+    );
+
+    // `exp = i64::MAX`: far beyond the cap in both nominal and remaining
+    // lifetime.
+    let mut claims = claims_at(0, 1800);
+    claims.exp = i64::MAX;
+    assert!(
+        manager.verify_token(&sign_claims(&claims)).is_err(),
+        "exp = i64::MAX must be rejected"
+    );
+
+    // Both extremes at once.
+    let mut claims = claims_at(0, 1800);
+    claims.iat = i64::MIN;
+    claims.exp = i64::MAX;
+    assert!(
+        manager.verify_token(&sign_claims(&claims)).is_err(),
+        "iat = i64::MIN with exp = i64::MAX must be rejected"
+    );
+
+    // A negative `exp` is not a valid JWT NumericDate for jsonwebtoken's
+    // expiry validation and is rejected at decode.
+    let mut claims = claims_at(0, 1800);
+    claims.exp = i64::MIN;
+    assert!(
+        manager.verify_token(&sign_claims(&claims)).is_err(),
+        "exp = i64::MIN must be rejected"
+    );
+}
+
+/// `FERRUM_ADMIN_JWT_MAX_TTL` is a security control, so a present-but-invalid
+/// value fails startup instead of silently falling back to the default or to
+/// an effectively unlimited cap. Mutates process env, so it serializes on the
+/// shared lock.
+#[test]
+fn test_create_jwt_manager_rejects_invalid_max_ttl() {
+    use ferrum_edge::admin::jwt_auth::create_jwt_manager_from_env;
+
+    let _guard = crate::unit::env_lock::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // SAFETY: the process-wide env lock is held for the whole test.
+    unsafe {
+        std::env::set_var(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "secret-padding-for-32-characters!!",
+        );
+        std::env::remove_var("FERRUM_ADMIN_JWT_ISSUER");
+        std::env::remove_var("FERRUM_ADMIN_JWT_AUDIENCE");
+    }
+
+    for invalid in ["18446744073709551615", "9223372036854775808", "-1", "abc"] {
+        // SAFETY: see above.
+        unsafe {
+            std::env::set_var("FERRUM_ADMIN_JWT_MAX_TTL", invalid);
+        }
+        assert!(
+            create_jwt_manager_from_env().is_err(),
+            "FERRUM_ADMIN_JWT_MAX_TTL='{invalid}' must be rejected at startup"
+        );
+    }
+
+    // Control cases: the documented disable sentinel and an ordinary value
+    // both construct successfully, so the rejection above is specific.
+    for valid in ["0", "3600", "9223372036854775807"] {
+        // SAFETY: see above.
+        unsafe {
+            std::env::set_var("FERRUM_ADMIN_JWT_MAX_TTL", valid);
+        }
+        assert!(
+            create_jwt_manager_from_env().is_ok(),
+            "FERRUM_ADMIN_JWT_MAX_TTL='{valid}' must be accepted"
+        );
+    }
+
+    // SAFETY: see above.
+    unsafe {
+        std::env::remove_var("FERRUM_ADMIN_JWT_MAX_TTL");
+        std::env::remove_var("FERRUM_ADMIN_JWT_SECRET");
+    }
+}
+
 // ── Optional audience (`aud`) enforcement ─────────────────────────────
 
 fn config_with_audience(audience: Option<&str>) -> JwtConfig {
