@@ -15356,9 +15356,7 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
 ) {
     finalize_grpc_web_error_response_headers_with_policy_source(
         response,
-        InitialResponseHeaderPolicySource::Prefiltered(
-            initial_response_header_policy_plugins,
-        ),
+        InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
         finalized_reject_headers,
     );
 }
@@ -15830,9 +15828,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         response_headers,
         response_body,
         grpc_web_response_content_type,
-        InitialResponseHeaderPolicySource::Prefiltered(
-            initial_response_header_policy_plugins,
-        ),
+        InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
         true,
     )
     .await
