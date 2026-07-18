@@ -2900,8 +2900,13 @@ impl DatabaseStore {
             }
         }
 
-        // If the proxy had an upstream, check if it's now orphaned and delete it
-        if let Some(ref uid) = upstream_id {
+        // Generic proxy deletion owns ordinary orphan cleanup. A spec-owned
+        // proxy can drift to a hand-owned upstream, though, and that resource
+        // must survive deletion of the spec graph. Spec-owned upstreams were
+        // already removed explicitly above.
+        if spec_owner.is_none()
+            && let Some(ref uid) = upstream_id
+        {
             self.cleanup_orphaned_upstream_tx(&mut tx, namespace, uid)
                 .await?;
         }

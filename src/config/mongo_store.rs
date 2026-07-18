@@ -5418,8 +5418,13 @@ mod inner {
                                             .session(&mut *s)
                                             .await?;
                                     }
-                                    // Cascade-delete orphaned upstream.
-                                    if let Some(ref uid) = upstream_id_to_check {
+                                    // Generic proxy deletion owns ordinary
+                                    // orphan cleanup. A spec-owned proxy can
+                                    // drift to a hand-owned upstream, which
+                                    // must survive deletion of the spec graph.
+                                    if spec_owner.is_none()
+                                        && let Some(ref uid) = upstream_id_to_check
+                                    {
                                         let still_referenced = this
                                             .proxies()
                                             .count_documents(mongodb::bson::doc! {
@@ -5643,7 +5648,9 @@ mod inner {
                         ),
                     }
                 }
-                if let Some(ref uid) = upstream_id_to_check {
+                if spec_owner.is_none()
+                    && let Some(ref uid) = upstream_id_to_check
+                {
                     let still_referenced = self
                         .proxies()
                         .count_documents(doc! { "upstream_id": uid })

@@ -1167,8 +1167,11 @@ async fn restore_bundle_rejects_intervening_schema_dependency_removal() {
         .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
         .await
         .expect_err("missing current schema dependency must reject compensation");
+    let error_message = error.to_string();
     assert!(
-        error.to_string().contains("transaction-log schema graph"),
+        error_message.contains(&plugin_id)
+            && error_message.contains("references unknown schema")
+            && error_message.contains("removed-during-delete"),
         "unexpected schema dependency error: {error:#}"
     );
     assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
