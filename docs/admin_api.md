@@ -377,6 +377,8 @@ Ordinary Consumer responses omit the entire `basicauth` credential type; JWT, HM
 
 The OpenAPI document models these wire differences with separate Consumer surface schemas: `ConsumerCreate` is the create/update/batch request shape (write-only credential inputs, including plaintext `basicauth` `password`), `Consumer` is the ordinary redacted response shape (`basicauth` absent; `keyauth.key`, `jwt.secret`, and `hmac_auth.secret` carry the exact `[REDACTED]` placeholder), and `ConsumerBackup`/`ConsumerRestore` are the unredacted backup/restore shapes documented in [docs/admin_backup_restore.md](admin_backup_restore.md). Credential mutation request bodies use `ConsumerCredentialInput`, the union of the per-type input entry schemas.
 
+Consumer `jwt` credential entries support one key form: exactly one `secret` string (32-4096 characters) used for HS256 verification. Fields such as `algorithm`, `public_key`, `jwks`, and `jwks_uri` are rejected rather than ignored. RSA/EC/JWKS verification is configured through the separate `jwks_auth` plugin; it may map verified claims to a Consumer identity but does not read Consumer `jwt` credentials.
+
 ## Plugin Configs
 
 ```bash

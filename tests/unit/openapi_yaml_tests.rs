@@ -480,6 +480,114 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         }
     });
     assert_component_validity(&spec, "ConsumerCreate", &valid_create, true);
+
+    // Consumer JWT credentials have exactly one supported algorithm/key form:
+    // an HS256 shared secret. The input, backup, and restore surfaces all
+    // accept that canonical form, while the ordinary response accepts only
+    // the runtime's exact redaction placeholder.
+    let jwt_input = json!({"secret": jwt_secret});
+    let jwt_redacted = json!({"secret": "[REDACTED]"});
+    let valid_runtime_jwt: Consumer = serde_json::from_value(json!({
+        "username": "alice",
+        "credentials": {"jwt": [jwt_input]}
+    }))
+    .expect("valid JWT Consumer deserializes");
+    assert!(
+        valid_runtime_jwt.validate_fields().is_ok(),
+        "the positive OpenAPI JWT form must pass runtime validation"
+    );
+    for component in ["JwtCredential", "JwtCredentialBackup"] {
+        assert_component_validity(&spec, component, &jwt_input, true);
+        assert_component_validity(&spec, component, &jwt_redacted, false);
+    }
+    assert_component_validity(&spec, "JwtCredentialRedacted", &jwt_redacted, true);
+    assert_component_validity(&spec, "JwtCredentialRedacted", &jwt_input, false);
+    for surface in ["ConsumerCreate", "ConsumerBackup", "ConsumerRestore"] {
+        assert_component_validity(
+            &spec,
+            surface,
+            &json!({"username": "alice", "credentials": {"jwt": [jwt_input]}}),
+            true,
+        );
+    }
+    assert_component_validity(
+        &spec,
+        "Consumer",
+        &json!({"username": "alice", "credentials": {"jwt": [jwt_redacted]}}),
+        true,
+    );
+    for supported_secret in [
+        "🔐".repeat(32),
+        "j".repeat(4096),
+        format!("{}\t\n\r", "j".repeat(32)),
+    ] {
+        let supported = json!({"secret": supported_secret});
+        let supported_runtime_jwt: Consumer = serde_json::from_value(json!({
+            "username": "alice",
+            "credentials": {"jwt": [supported]}
+        }))
+        .expect("supported JWT Consumer deserializes");
+        assert!(supported_runtime_jwt.validate_fields().is_ok());
+        assert_component_validity(&spec, "JwtCredential", &supported, true);
+        assert_component_validity(&spec, "JwtCredentialBackup", &supported, true);
+    }
+
+    // Algorithm selectors and asymmetric/JWKS key material are not Consumer
+    // JWT credential forms. jwt_auth always verifies HS256 with `secret`;
+    // RSA/EC/JWKS verification belongs to the separate jwks_auth plugin.
+    for unsupported in [
+        json!({}),
+        json!({"secret": null}),
+        json!({"secret": 42}),
+        json!({"secret": "short"}),
+        json!({"secret": "🔐".repeat(31)}),
+        json!({"secret": format!("{}{}", "j".repeat(32), '\u{0001}')}),
+        json!({"secret": "j".repeat(4097)}),
+        json!({"secret": "j".repeat(32), "algorithm": "HS256"}),
+        json!({
+            "secret": "j".repeat(32),
+            "algorithm": "RS256",
+            "public_key": "pem"
+        }),
+        json!({"secret": "j".repeat(32), "jwks": {"keys": []}}),
+        json!({
+            "secret": "j".repeat(32),
+            "jwks_uri": "https://issuer.example/jwks.json"
+        }),
+    ] {
+        let invalid_runtime_jwt: Consumer = serde_json::from_value(json!({
+            "username": "alice",
+            "credentials": {"jwt": [unsupported]}
+        }))
+        .expect(
+            "unsupported JWT Consumer still deserializes into the generic credential model",
+        );
+        assert!(
+            invalid_runtime_jwt.validate_fields().is_err(),
+            "an unsupported OpenAPI JWT form must also fail runtime validation: {unsupported}"
+        );
+        for component in [
+            "JwtCredential",
+            "JwtCredentialBackup",
+            "JwtCredentialRedacted",
+        ] {
+            assert_component_validity(&spec, component, &unsupported, false);
+        }
+        for surface in [
+            "ConsumerCreate",
+            "ConsumerBackup",
+            "ConsumerRestore",
+            "Consumer",
+        ] {
+            assert_component_validity(
+                &spec,
+                surface,
+                &json!({"username": "alice", "credentials": {"jwt": [unsupported]}}),
+                false,
+            );
+        }
+    }
+
     for (component, instance) in [
         (
             "ConsumerCreate",

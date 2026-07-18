@@ -6971,6 +6971,28 @@ impl Consumer {
                 {
                     errors.push(format!("{} {}", prefix, error));
                 }
+                if cred_type == "jwt" {
+                    if obj.len() != 1 || !obj.contains_key("secret") {
+                        errors.push(format!(
+                            "{} must contain exactly one field named 'secret'",
+                            prefix
+                        ));
+                    }
+                    match obj.get("secret") {
+                        Some(serde_json::Value::String(secret))
+                            if secret.chars().count() >= MIN_JWT_SECRET_LENGTH => {}
+                        Some(serde_json::Value::String(secret)) => {
+                            errors.push(format!(
+                                "{}.secret must be at least {} characters (got {})",
+                                prefix,
+                                MIN_JWT_SECRET_LENGTH,
+                                secret.chars().count()
+                            ));
+                        }
+                        Some(_) => errors.push(format!("{}.secret must be a string", prefix)),
+                        None => {}
+                    }
+                }
                 if cred_type == "keyauth" {
                     match obj.get("key") {
                         Some(serde_json::Value::String(key)) if !key.trim().is_empty() => {}
@@ -6983,28 +7005,24 @@ impl Consumer {
                 }
                 for (key, val) in *obj {
                     if let Some(s) = val.as_str() {
-                        if s.len() > MAX_CREDENTIAL_VALUE_LENGTH {
+                        let value_length = if cred_type == "jwt" && key == "secret" {
+                            s.chars().count()
+                        } else {
+                            s.len()
+                        };
+                        if value_length > MAX_CREDENTIAL_VALUE_LENGTH {
                             errors.push(format!(
                                 "{}.{} must not exceed {} characters (got {})",
                                 prefix,
                                 key,
                                 MAX_CREDENTIAL_VALUE_LENGTH,
-                                s.len()
+                                value_length
                             ));
                         }
                         if contains_control_chars(s) {
                             errors.push(format!(
                                 "{}.{} must not contain control characters",
                                 prefix, key
-                            ));
-                        }
-                        if cred_type == "jwt" && key == "secret" && s.len() < MIN_JWT_SECRET_LENGTH
-                        {
-                            errors.push(format!(
-                                "{}.secret must be at least {} characters (got {})",
-                                prefix,
-                                MIN_JWT_SECRET_LENGTH,
-                                s.len()
                             ));
                         }
                     }

@@ -6685,7 +6685,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredential"
           minItems: 1
-          description: Multiple JWT secrets for zero-downtime rotation. Secret must be at least 32 characters. Looked up by `username`, `id`, or `custom_id`; all secrets tried.
+          description: Multiple HS256 JWT secrets for zero-downtime rotation. Each entry contains exactly one `secret` string of 32-4096 characters. Looked up by `username`, `id`, or `custom_id`; all secrets tried.
         hmac_auth:
           type: array
           items:
@@ -6729,7 +6729,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredentialRedacted"
           minItems: 1
-          description: JWT entries with each `secret` replaced by the exact `[REDACTED]` placeholder.
+          description: HS256 JWT entries with each `secret` replaced by the exact `[REDACTED]` placeholder.
         hmac_auth:
           type: array
           items:
@@ -6774,7 +6774,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredentialBackup"
           minItems: 1
-          description: Multiple JWT secrets for zero-downtime rotation, unredacted.
+          description: Multiple canonical HS256 JWT secrets for zero-downtime rotation, unredacted.
         hmac_auth:
           type: array
           items:
@@ -6819,7 +6819,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredentialBackup"
           minItems: 1
-          description: Multiple JWT secrets for zero-downtime rotation, unredacted.
+          description: Multiple canonical HS256 JWT secrets for zero-downtime rotation, unredacted.
         hmac_auth:
           type: array
           items:
@@ -6888,18 +6888,27 @@ components:
     JwtCredential:
       type: object
       required: [secret]
+      additionalProperties: false
       properties:
         secret:
           type: string
           minLength: 32
+          maxLength: 4096
+          pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           writeOnly: true
           description: >-
             JWT signing secret used to verify token signatures (HS256) for this
-            consumer. Must be at least 32 characters.
+            consumer. Must be 32-4096 characters and must not contain ASCII
+            control bytes other than horizontal tab, line feed, and carriage
+            return.
       description: >-
-        JWT credential for the `jwt_auth` plugin. Uses HS256 algorithm only.
-        Consumer is looked up by `username`, `id`, or `custom_id` from the JWT
-        claim; then all secrets are tried until one verifies the signature.
+        JWT credential for the `jwt_auth` plugin. The only supported Consumer
+        JWT key form is exactly one HS256 `secret`; algorithm selectors,
+        public keys, and JWKS fields are not Consumer credential fields. Use
+        the separate `jwks_auth` plugin configuration for RSA/EC/JWKS token
+        verification. Consumer is looked up by `username`, `id`, or
+        `custom_id` from the JWT claim; then all secrets are tried until one
+        verifies the signature.
 
     HmacAuthCredential:
       type: object
@@ -6973,6 +6982,7 @@ components:
     JwtCredentialRedacted:
       type: object
       required: [secret]
+      additionalProperties: false
       properties:
         secret:
           type: string
@@ -7017,16 +7027,22 @@ components:
     JwtCredentialBackup:
       type: object
       required: [secret]
+      additionalProperties: false
       properties:
         secret:
           type: string
           minLength: 32
+          maxLength: 4096
+          pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           description: >-
-            Canonical stored JWT secret (at least 32 characters), carried
-            unredacted in backup and restore payloads.
+            Canonical stored HS256 JWT secret (32-4096 characters), carried
+            unredacted in backup and restore payloads. It must not contain
+            ASCII control bytes other than horizontal tab, line feed, and
+            carriage return.
       description: >-
         `jwt` entry in backup/restore payloads: the canonical unredacted
-        stored secret.
+        stored HS256 secret. Public-key and JWKS key forms belong to the
+        separate `jwks_auth` plugin configuration and are rejected here.
 
     HmacAuthCredentialBackup:
       type: object

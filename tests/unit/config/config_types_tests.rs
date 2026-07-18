@@ -2156,6 +2156,58 @@ fn test_validate_fields_accepts_valid_jwt_secret() {
 }
 
 #[test]
+fn test_validate_fields_rejects_unsupported_jwt_credential_shapes() {
+    let valid_secret = "j".repeat(32);
+    let oversized_secret =
+        "j".repeat(ferrum_edge::config::types::MAX_CREDENTIAL_VALUE_LENGTH + 1);
+    let control_secret = format!("{}{}", valid_secret, '\u{0001}');
+    for credential in [
+        serde_json::json!({}),
+        serde_json::json!({"secret": null}),
+        serde_json::json!({"secret": 42}),
+        serde_json::json!({"secret": "🔐".repeat(31)}),
+        serde_json::json!({"secret": oversized_secret}),
+        serde_json::json!({"secret": control_secret}),
+        serde_json::json!({"secret": valid_secret, "algorithm": "HS256"}),
+        serde_json::json!({
+            "secret": valid_secret,
+            "algorithm": "RS256",
+            "public_key": "pem"
+        }),
+        serde_json::json!({"secret": valid_secret, "jwks": {"keys": []}}),
+        serde_json::json!({
+            "secret": valid_secret,
+            "jwks_uri": "https://issuer.example/jwks.json"
+        }),
+    ] {
+        let mut consumer = make_consumer("c1", "alice");
+        consumer
+            .credentials
+            .insert("jwt".into(), serde_json::json!([credential]));
+        assert!(
+            consumer.validate_fields().is_err(),
+            "unsupported JWT credential must fail closed: {:?}",
+            consumer.credentials["jwt"]
+        );
+    }
+}
+
+#[test]
+fn test_validate_fields_accepts_jwt_character_boundaries_and_common_whitespace() {
+    for secret in [
+        "🔐".repeat(32),
+        "j".repeat(ferrum_edge::config::types::MAX_CREDENTIAL_VALUE_LENGTH),
+        format!("{}\t\n\r", "j".repeat(32)),
+    ] {
+        let mut consumer = make_consumer("c1", "alice");
+        consumer
+            .credentials
+            .insert("jwt".into(), serde_json::json!([{"secret": secret}]));
+        assert!(consumer.validate_fields().is_ok());
+    }
+}
+
+#[test]
 fn test_validate_fields_rejects_malformed_or_weak_hmac_secrets() {
     for credential in [
         serde_json::json!({}),
