@@ -1040,6 +1040,7 @@ async fn backend_2xx_carrying_fragment_metadata_is_still_rejected() {
 /// security-header plugins that set `applies_after_proxy_on_reject`.
 struct RejectDecorator;
 
+#[async_trait::async_trait]
 impl Plugin for RejectDecorator {
     fn name(&self) -> &str {
         "test_reject_decorator"
