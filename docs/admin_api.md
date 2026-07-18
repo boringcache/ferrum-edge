@@ -375,6 +375,8 @@ Max credentials per type is controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (def
 
 Ordinary Consumer responses omit the entire `basicauth` credential type; JWT, HMAC, and key credential values use their documented redaction behavior. When `basicauth` is omitted from the request, an existing Basic credential type is preserved; use `DELETE /consumers/{id}/credentials/basicauth` to remove it. The authenticated `/backup` endpoint is the only management response that intentionally returns unredacted Basic password hashes for faithful restoration. During active build-out, restore rejects legacy `basicauth` entries with extra fields: each entry must contain exactly one `password` or `password_hash` field.
 
+The OpenAPI document models these wire differences with separate Consumer surface schemas: `ConsumerCreate` is the create/update/batch request shape (write-only credential inputs, including plaintext `basicauth` `password`), `Consumer` is the ordinary redacted response shape (`basicauth` absent; `keyauth.key`, `jwt.secret`, and `hmac_auth.secret` carry the exact `[REDACTED]` placeholder), and `ConsumerBackup`/`ConsumerRestore` are the unredacted backup/restore shapes documented in [docs/admin_backup_restore.md](admin_backup_restore.md). Credential mutation request bodies use `ConsumerCredentialInput`, the union of the per-type input entry schemas.
+
 ## Plugin Configs
 
 ```bash

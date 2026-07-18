@@ -17,7 +17,7 @@ Returns the entire gateway configuration as a single JSON document. The output f
 
 ### Key Behaviors
 
-- **Unredacted credentials**: Unlike `GET /consumers` (which omits the entire `basicauth` credential type and redacts `hmac_auth.secret`, `jwt.secret`, and `keyauth.key`), the backup endpoint returns raw credential values. This is necessary for faithful restoration.
+- **Unredacted credentials**: Unlike `GET /consumers` (which omits the entire `basicauth` credential type and redacts `hmac_auth.secret`, `jwt.secret`, and `keyauth.key`), the backup endpoint returns raw credential values. This is necessary for faithful restoration. In the OpenAPI document, backup consumer items use the `ConsumerBackup` schema (`basicauth` entries carry the canonical stored `password_hash`; plaintext passwords are never exported) and restore consumer items use `ConsumerRestore` (which additionally accepts a plaintext `password` per entry, hashed on import).
 - **Database-first with cached fallback**: Reads from the database when available. If the database is unreachable, falls back to the in-memory cached config and sets the `X-Data-Source: cached` response header.
 - **Content-Disposition header**: Includes `attachment; filename="ferrum-backup.json"` for browser-friendly downloads.
 - **Resource filtering**: Use `?resources=proxies,consumers` to export only specific resource types. Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`. Omit the parameter to export everything.

@@ -3767,15 +3767,14 @@ paths:
           application/json:
             schema:
               oneOf:
-                - type: object
+                - $ref: "#/components/schemas/ConsumerCredentialInput"
                 - type: array
                   items:
-                    type: object
+                    $ref: "#/components/schemas/ConsumerCredentialInput"
                   minItems: 1
-              description: Credential payload (schema varies by credential type)
+              description: Credential payload (entry shape depends on `{cred_type}`)
               examples:
-                - username: alice
-                  password: s3cret
+                - password: s3cret
                 - key: my-api-key-value
       responses:
         "200":
@@ -3814,8 +3813,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              description: Single credential entry to append (must be a JSON object)
+              $ref: "#/components/schemas/ConsumerCredentialInput"
       responses:
         "200":
           description: Credential appended — returns full consumer object
@@ -6545,7 +6543,13 @@ components:
           description: ID of the PluginConfig to apply to this proxy
 
     # ── Consumer ────────────────────────────────────────────────────
-    Consumer:
+    # The Consumer wire shape is split per surface:
+    #   ConsumerBase    — shared scalar fields (no credentials)
+    #   Consumer        — ordinary redacted management response
+    #   ConsumerCreate  — create/update/batch request (credential input)
+    #   ConsumerBackup  — GET /backup item (canonical unredacted stored values)
+    #   ConsumerRestore — POST /restore item (stored values or plaintext input)
+    ConsumerBase:
       type: object
       required: [username]
       properties:
@@ -6580,54 +6584,6 @@ components:
             Optional external identifier. Must be unique across all consumers when
             set. Empty strings are normalized to null. Must not collide with another
             consumer's username (this would cause incorrect JWKS/JWT authentication).
-        credentials:
-          type: object
-          default: {}
-          description: |
-            Map of credential type to credential payload. Each type maps to an
-            array of credential objects for zero-downtime rotation. Credential
-            arrays must be non-empty and elements must be JSON objects.
-            Credential values that serve as lookup keys must be unique across all
-            consumers and across all entries within arrays. Max entries per type is
-            controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
-            Ordinary Consumer responses omit `basicauth` entirely; authenticated
-            backup responses retain canonical unredacted values for restoration.
-          properties:
-            keyauth:
-              type: array
-              items:
-                $ref: "#/components/schemas/KeyAuthCredential"
-              minItems: 1
-              description: Multiple API key entries for zero-downtime rotation. Each `key` must be globally unique.
-            basicauth:
-              type: array
-              items:
-                $ref: "#/components/schemas/BasicAuthCredential"
-              minItems: 1
-              description: Multiple basic auth entries for zero-downtime rotation. Indexed by consumer `username`; omitted from ordinary Consumer responses.
-            jwt:
-              type: array
-              items:
-                $ref: "#/components/schemas/JwtCredential"
-              minItems: 1
-              description: Multiple JWT secrets for zero-downtime rotation. Secret must be at least 32 characters. Looked up by `username`, `id`, or `custom_id`; all secrets tried.
-            hmac_auth:
-              type: array
-              items:
-                $ref: "#/components/schemas/HmacAuthCredential"
-              minItems: 1
-              description: Multiple HMAC secrets for zero-downtime rotation. Looked up by username within the matched proxy namespace; all secrets tried.
-            mtls_auth:
-              type: array
-              items:
-                $ref: "#/components/schemas/MtlsAuthCredential"
-              minItems: 1
-              description: Multiple mTLS identities for zero-downtime rotation. Each `identity` must be globally unique.
-          additionalProperties:
-            type: array
-            items:
-              type: object
-            minItems: 1
         acl_groups:
           type: array
           items:
@@ -6647,12 +6603,240 @@ components:
           type: string
           format: date-time
 
-    ConsumerCreate:
-      description: Request body for creating or updating a consumer.
+    Consumer:
+      description: >-
+        Ordinary management-plane Consumer representation returned by the
+        Consumer CRUD and credential-mutation endpoints. Credential secrets are
+        redacted per `ConsumerCredentialsRedacted`: `basicauth` is omitted
+        entirely and `keyauth`/`jwt`/`hmac_auth` secret fields carry the exact
+        `[REDACTED]` placeholder.
       allOf:
-        - $ref: "#/components/schemas/Consumer"
-      required:
-        - username
+        - $ref: "#/components/schemas/ConsumerBase"
+        - type: object
+          properties:
+            credentials:
+              $ref: "#/components/schemas/ConsumerCredentialsRedacted"
+
+    ConsumerCreate:
+      description: >-
+        Request body for creating or updating a consumer, and for consumer
+        items in `POST /batch`. Credential values are write-only inputs:
+        plaintext `basicauth` `password` fields are hashed on write and stored
+        secrets are never returned by ordinary Consumer responses.
+      allOf:
+        - $ref: "#/components/schemas/ConsumerBase"
+        - type: object
+          properties:
+            credentials:
+              $ref: "#/components/schemas/ConsumerCredentialsInput"
+
+    ConsumerBackup:
+      description: >-
+        Consumer item in a `GET /backup` export. Credentials carry canonical
+        unredacted stored values (`basicauth` entries carry the stored
+        `password_hash`; plaintext passwords are never exported) suitable for
+        disaster-recovery restoration via `POST /restore`.
+      allOf:
+        - $ref: "#/components/schemas/ConsumerBase"
+        - type: object
+          properties:
+            credentials:
+              $ref: "#/components/schemas/ConsumerCredentialsBackup"
+
+    ConsumerRestore:
+      description: >-
+        Consumer item accepted by `POST /restore`. Credentials are the
+        canonical stored values produced by `GET /backup`; `basicauth` entries
+        may instead supply a plaintext `password`, which is hashed before
+        storage exactly as on create/update.
+      allOf:
+        - $ref: "#/components/schemas/ConsumerBase"
+        - type: object
+          properties:
+            credentials:
+              $ref: "#/components/schemas/ConsumerCredentialsRestore"
+
+    ConsumerCredentialsInput:
+      type: object
+      default: {}
+      description: |
+        Map of credential type to credential payload for consumer create,
+        update, and batch requests. Each type maps to an array of credential
+        objects for zero-downtime rotation. Credential arrays must be non-empty
+        and elements must be JSON objects. Credential values that serve as
+        lookup keys must be unique across all consumers and across all entries
+        within arrays. Max entries per type is controlled by
+        `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
+      properties:
+        keyauth:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeyAuthCredential"
+          minItems: 1
+          description: Multiple API key entries for zero-downtime rotation. Each `key` must be globally unique.
+        basicauth:
+          type: array
+          items:
+            $ref: "#/components/schemas/BasicAuthCredential"
+          minItems: 1
+          description: Multiple basic auth entries for zero-downtime rotation. Indexed by consumer `username`; plaintext `password` is hashed on write and never returned.
+        jwt:
+          type: array
+          items:
+            $ref: "#/components/schemas/JwtCredential"
+          minItems: 1
+          description: Multiple JWT secrets for zero-downtime rotation. Secret must be at least 32 characters. Looked up by `username`, `id`, or `custom_id`; all secrets tried.
+        hmac_auth:
+          type: array
+          items:
+            $ref: "#/components/schemas/HmacAuthCredential"
+          minItems: 1
+          description: Multiple HMAC secrets for zero-downtime rotation. Looked up by username within the matched proxy namespace; all secrets tried.
+        mtls_auth:
+          type: array
+          items:
+            $ref: "#/components/schemas/MtlsAuthCredential"
+          minItems: 1
+          description: Multiple mTLS identities for zero-downtime rotation. Each `identity` must be globally unique.
+      additionalProperties:
+        type: array
+        items:
+          type: object
+        minItems: 1
+
+    ConsumerCredentialsRedacted:
+      type: object
+      default: {}
+      description: |
+        Credential map in ordinary Consumer management responses. Ordinary
+        Consumer responses omit `basicauth` entirely, so neither stored hashes
+        nor pattern-invalid placeholder values cross the management boundary,
+        and replace the `keyauth` `key`, `jwt` `secret`, and `hmac_auth`
+        `secret` fields with the exact `[REDACTED]` placeholder string.
+        `mtls_auth.identity` is a non-secret lookup key and remains visible.
+        `GET /backup` is the only surface that returns canonical unredacted
+        values.
+      properties:
+        keyauth:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeyAuthCredentialRedacted"
+          minItems: 1
+          description: API key entries with each `key` replaced by the exact `[REDACTED]` placeholder.
+        basicauth: false
+        jwt:
+          type: array
+          items:
+            $ref: "#/components/schemas/JwtCredentialRedacted"
+          minItems: 1
+          description: JWT entries with each `secret` replaced by the exact `[REDACTED]` placeholder.
+        hmac_auth:
+          type: array
+          items:
+            $ref: "#/components/schemas/HmacAuthCredentialRedacted"
+          minItems: 1
+          description: HMAC entries with each `secret` replaced by the exact `[REDACTED]` placeholder.
+        mtls_auth:
+          type: array
+          items:
+            $ref: "#/components/schemas/MtlsAuthCredential"
+          minItems: 1
+          description: Multiple mTLS identities for zero-downtime rotation. Each `identity` must be globally unique.
+      additionalProperties:
+        type: array
+        items:
+          type: object
+        minItems: 1
+
+    ConsumerCredentialsBackup:
+      type: object
+      default: {}
+      description: |
+        Credential map in `GET /backup` export items: canonical unredacted
+        stored values suitable for faithful restoration. `basicauth` entries
+        carry the stored `password_hash`; plaintext passwords are never
+        exported.
+      properties:
+        keyauth:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeyAuthCredentialBackup"
+          minItems: 1
+          description: Multiple API key entries for zero-downtime rotation, unredacted.
+        basicauth:
+          type: array
+          items:
+            $ref: "#/components/schemas/BasicAuthCredentialStored"
+          minItems: 1
+          description: Multiple basic auth entries in canonical stored `password_hash` form.
+        jwt:
+          type: array
+          items:
+            $ref: "#/components/schemas/JwtCredentialBackup"
+          minItems: 1
+          description: Multiple JWT secrets for zero-downtime rotation, unredacted.
+        hmac_auth:
+          type: array
+          items:
+            $ref: "#/components/schemas/HmacAuthCredentialBackup"
+          minItems: 1
+          description: Multiple HMAC secrets for zero-downtime rotation, unredacted.
+        mtls_auth:
+          type: array
+          items:
+            $ref: "#/components/schemas/MtlsAuthCredential"
+          minItems: 1
+          description: Multiple mTLS identities for zero-downtime rotation. Each `identity` must be globally unique.
+      additionalProperties:
+        type: array
+        items:
+          type: object
+        minItems: 1
+
+    ConsumerCredentialsRestore:
+      type: object
+      default: {}
+      description: |
+        Credential map accepted by `POST /restore`: the canonical stored
+        values produced by `GET /backup`. `basicauth` entries may supply a
+        plaintext `password` instead of `password_hash`; it is hashed before
+        storage exactly as on create/update.
+      properties:
+        keyauth:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeyAuthCredentialBackup"
+          minItems: 1
+          description: Multiple API key entries for zero-downtime rotation, unredacted.
+        basicauth:
+          type: array
+          items:
+            $ref: "#/components/schemas/BasicAuthCredential"
+          minItems: 1
+          description: Multiple basic auth entries for zero-downtime rotation. Accepts the stored `password_hash` or a plaintext `password` (hashed on import).
+        jwt:
+          type: array
+          items:
+            $ref: "#/components/schemas/JwtCredentialBackup"
+          minItems: 1
+          description: Multiple JWT secrets for zero-downtime rotation, unredacted.
+        hmac_auth:
+          type: array
+          items:
+            $ref: "#/components/schemas/HmacAuthCredentialBackup"
+          minItems: 1
+          description: Multiple HMAC secrets for zero-downtime rotation, unredacted.
+        mtls_auth:
+          type: array
+          items:
+            $ref: "#/components/schemas/MtlsAuthCredential"
+          minItems: 1
+          description: Multiple mTLS identities for zero-downtime rotation. Each `identity` must be globally unique.
+      additionalProperties:
+        type: array
+        items:
+          type: object
+        minItems: 1
 
     # ── Consumer Credential Types ──────────────────────────────────
 
@@ -6765,6 +6949,129 @@ components:
       description: >-
         mTLS auth credential for the `mtls_auth` plugin. Indexed for O(1)
         lookup by certificate identity.
+
+    # ── Consumer Credential Surface Variants ───────────────────────
+    # Redacted variants appear only in ordinary Consumer management responses
+    # and encode the exact placeholder the runtime emits. Backup variants carry
+    # canonical unredacted stored values and appear in `GET /backup` exports
+    # and `POST /restore` payloads.
+
+    KeyAuthCredentialRedacted:
+      type: object
+      required: [key]
+      properties:
+        key:
+          type: string
+          const: "[REDACTED]"
+          description: >-
+            Redaction placeholder. Ordinary Consumer responses never return the
+            stored API key; `GET /backup` returns the canonical value.
+      description: >-
+        `keyauth` entry as returned by ordinary Consumer responses: the stored
+        API key is replaced with the exact `[REDACTED]` placeholder.
+
+    JwtCredentialRedacted:
+      type: object
+      required: [secret]
+      properties:
+        secret:
+          type: string
+          const: "[REDACTED]"
+          description: >-
+            Redaction placeholder. Ordinary Consumer responses never return the
+            stored JWT secret; `GET /backup` returns the canonical value.
+      description: >-
+        `jwt` entry as returned by ordinary Consumer responses: the stored
+        secret is replaced with the exact `[REDACTED]` placeholder.
+
+    HmacAuthCredentialRedacted:
+      type: object
+      required: [secret]
+      additionalProperties: false
+      properties:
+        secret:
+          type: string
+          const: "[REDACTED]"
+          description: >-
+            Redaction placeholder. Ordinary Consumer responses never return the
+            stored HMAC secret; `GET /backup` returns the canonical value.
+      description: >-
+        `hmac_auth` entry as returned by ordinary Consumer responses: the
+        stored secret is replaced with the exact `[REDACTED]` placeholder.
+
+    KeyAuthCredentialBackup:
+      type: object
+      required: [key]
+      properties:
+        key:
+          type: string
+          minLength: 1
+          pattern: "\\S"
+          description: >-
+            Canonical stored API key, carried unredacted in backup and restore
+            payloads.
+      description: >-
+        `keyauth` entry in backup/restore payloads: the canonical unredacted
+        stored API key.
+
+    JwtCredentialBackup:
+      type: object
+      required: [secret]
+      properties:
+        secret:
+          type: string
+          minLength: 32
+          description: >-
+            Canonical stored JWT secret (at least 32 characters), carried
+            unredacted in backup and restore payloads.
+      description: >-
+        `jwt` entry in backup/restore payloads: the canonical unredacted
+        stored secret.
+
+    HmacAuthCredentialBackup:
+      type: object
+      required: [secret]
+      additionalProperties: false
+      properties:
+        secret:
+          type: string
+          minLength: 32
+          description: >-
+            Canonical stored HMAC secret (at least 32 characters), carried
+            unredacted in backup and restore payloads.
+      description: >-
+        `hmac_auth` entry in backup/restore payloads: the canonical unredacted
+        stored secret.
+
+    BasicAuthCredentialStored:
+      type: object
+      additionalProperties: false
+      required: [password_hash]
+      properties:
+        password_hash:
+          type: string
+          maxLength: 76
+          pattern: "^hmac_sha256:[0-9a-f]{64}$"
+          description: >-
+            Canonical stored password hash in `hmac_sha256:<64 lowercase hex>`
+            format. Backup exports never contain plaintext passwords.
+      description: >-
+        `basicauth` entry as stored and exported by `GET /backup`: only the
+        canonical `password_hash`. `POST /restore` additionally accepts a
+        plaintext `password` (see `BasicAuthCredential`), hashed on import.
+
+    ConsumerCredentialInput:
+      description: >-
+        Single credential entry accepted by the credential mutation endpoints.
+        The expected shape is determined by the `{cred_type}` path parameter;
+        plaintext `basicauth` `password` values are hashed on write and never
+        returned.
+      anyOf:
+        - $ref: "#/components/schemas/KeyAuthCredential"
+        - $ref: "#/components/schemas/BasicAuthCredential"
+        - $ref: "#/components/schemas/JwtCredential"
+        - $ref: "#/components/schemas/HmacAuthCredential"
+        - $ref: "#/components/schemas/MtlsAuthCredential"
 
     # ── Plugin Config ───────────────────────────────────────────────
     PluginConfig:
@@ -10240,7 +10547,7 @@ components:
         consumers:
           type: array
           items:
-            $ref: "#/components/schemas/Consumer"
+            $ref: "#/components/schemas/ConsumerBackup"
         plugin_configs:
           type: array
           items:
@@ -10263,7 +10570,7 @@ components:
         consumers:
           type: array
           items:
-            $ref: "#/components/schemas/Consumer"
+            $ref: "#/components/schemas/ConsumerRestore"
         plugin_configs:
           type: array
           items:

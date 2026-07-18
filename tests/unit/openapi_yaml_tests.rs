@@ -223,7 +223,16 @@ fn typed_component_properties_match_serde_field_inventories() {
     }
 
     check!(Proxy, "Proxy");
-    check!(Consumer, "Consumer");
+    // `Consumer` is an allOf composition over `ConsumerBase` plus the
+    // surface-specific credentials map; the serde field inventory is checked
+    // against the flat base schema, and the credentials wiring is covered by
+    // `consumer_credential_surface_schemas_match_runtime_redaction` below.
+    check!(
+        Consumer,
+        "ConsumerBase",
+        rust_only = ["credentials"],
+        schema_only = []
+    );
     check!(PluginConfig, "PluginConfig");
     check!(PluginAssociation, "PluginAssociation");
     check!(Upstream, "Upstream");
@@ -349,11 +358,10 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
     let admin_docs = include_str!("../../docs/admin_api.md");
     assert!(admin_docs.contains(basic_roundtrip_contract));
 
-    let consumer_credentials =
-        &spec["components"]["schemas"]["Consumer"]["properties"]["credentials"];
+    let consumer_credentials = &spec["components"]["schemas"]["ConsumerCredentialsRedacted"];
     let credentials_description = consumer_credentials["description"]
         .as_str()
-        .expect("Consumer credentials description");
+        .expect("ConsumerCredentialsRedacted description");
     assert!(credentials_description.contains("responses omit `basicauth` entirely"));
 
     let password_hash =
@@ -385,6 +393,256 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
     assert_eq!(
         spec["paths"]["/batch"]["post"]["responses"]["500"]["$ref"],
         "#/components/responses/InternalServerError"
+    );
+}
+
+#[test]
+fn consumer_credential_surface_schemas_match_runtime_redaction() {
+    use ferrum_edge::config::types::{Consumer, redact_consumer_credentials};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let password_hash = format!("hmac_sha256:{}", "a".repeat(64));
+    let jwt_secret = "j".repeat(32);
+    let hmac_secret = "h".repeat(32);
+    let stored_consumer = json!({
+        "id": "consumer-1",
+        "username": "alice",
+        "namespace": "ferrum",
+        "custom_id": "ext-123",
+        "credentials": {
+            "keyauth": [{"key": "live-api-key"}],
+            "basicauth": [{"password_hash": password_hash}],
+            "jwt": [{"secret": jwt_secret}],
+            "hmac_auth": [{"secret": hmac_secret}],
+            "mtls_auth": [{"identity": "client.example.com"}]
+        },
+        "acl_groups": ["engineering"],
+        "created_at": "2026-01-02T03:04:05Z",
+        "updated_at": "2026-01-02T03:04:05Z"
+    });
+    let consumer: Consumer =
+        serde_json::from_value(stored_consumer).expect("stored consumer deserializes");
+
+    // The runtime redacted output must validate against the ordinary Consumer
+    // surface and carry the exact placeholders the schema encodes.
+    let redacted = serde_json::to_value(redact_consumer_credentials(&consumer))
+        .expect("redacted consumer serializes");
+    let redacted_credentials = &redacted["credentials"];
+    assert!(redacted_credentials.get("basicauth").is_none());
+    for (cred_type, field) in [
+        ("keyauth", "key"),
+        ("jwt", "secret"),
+        ("hmac_auth", "secret"),
+    ] {
+        assert_eq!(
+            redacted_credentials[cred_type][0][field],
+            json!("[REDACTED]"),
+            "{cred_type} entries must carry the exact redaction placeholder"
+        );
+    }
+    assert_eq!(
+        redacted_credentials["mtls_auth"][0]["identity"],
+        json!("client.example.com"),
+        "non-secret mtls identity stays visible"
+    );
+    assert_component_validity(&spec, "Consumer", &redacted, true);
+
+    // The unredacted stored shape must not validate against the redacted
+    // surface: `basicauth` is forbidden and the placeholders are exact.
+    let stored_value = serde_json::to_value(&consumer).expect("stored consumer serializes");
+    assert_component_validity(&spec, "Consumer", &stored_value, false);
+
+    // The backup surface accepts the canonical stored values; the restore
+    // surface additionally accepts plaintext passwords.
+    assert_component_validity(&spec, "ConsumerBackup", &stored_value, true);
+    assert_component_validity(&spec, "ConsumerRestore", &stored_value, true);
+    let plaintext_basic = json!({
+        "username": "alice",
+        "credentials": {"basicauth": [{"password": "correct horse battery staple"}]}
+    });
+    assert_component_validity(&spec, "ConsumerRestore", &plaintext_basic, true);
+    assert_component_validity(&spec, "ConsumerBackup", &plaintext_basic, false);
+
+    // The request surface accepts canonical credential input and rejects
+    // shapes the runtime validation also rejects (unknown entry fields,
+    // ambiguous basic auth fields, missing secret material) as well as the
+    // redaction placeholders for length-bounded secret types.
+    let valid_create = json!({
+        "username": "alice",
+        "credentials": {
+            "keyauth": [{"key": "live-api-key"}],
+            "basicauth": [{"password": "correct horse battery staple"}],
+            "jwt": [{"secret": jwt_secret}],
+            "hmac_auth": [{"secret": hmac_secret}],
+            "mtls_auth": [{"identity": "client.example.com"}]
+        }
+    });
+    assert_component_validity(&spec, "ConsumerCreate", &valid_create, true);
+    for (component, instance) in [
+        (
+            "ConsumerCreate",
+            json!({"username": "alice", "credentials": {"basicauth": [{"username": "alice"}]}}),
+        ),
+        (
+            "ConsumerCreate",
+            json!({"username": "alice", "credentials": {"basicauth": [{"password": "x", "password_hash": password_hash}]}}),
+        ),
+        (
+            "ConsumerCreate",
+            json!({"username": "alice", "credentials": {"basicauth": [{"password": "s3cret", "username": "alice"}]}}),
+        ),
+        (
+            "ConsumerCreate",
+            json!({"username": "alice", "credentials": {"jwt": [{"secret": "[REDACTED]"}]}}),
+        ),
+        (
+            "ConsumerCreate",
+            json!({"username": "alice", "credentials": {"hmac_auth": [{"secret": "[REDACTED]"}]}}),
+        ),
+        (
+            "ConsumerBackup",
+            json!({"username": "alice", "credentials": {"jwt": [{"secret": "[REDACTED]"}]}}),
+        ),
+        (
+            "ConsumerBackup",
+            json!({"username": "alice", "credentials": {"basicauth": [{"password_hash": "hmac_sha256:deadbeef"}]}}),
+        ),
+        (
+            "ConsumerRestore",
+            json!({"username": "alice", "credentials": {"hmac_auth": [{"secret": "short"}]}}),
+        ),
+    ] {
+        assert_component_validity(&spec, component, &instance, false);
+    }
+
+    // The redacted surface forbids `basicauth` outright.
+    assert_eq!(
+        spec.pointer("/components/schemas/ConsumerCredentialsRedacted/properties/basicauth"),
+        Some(&json!(false))
+    );
+
+    // Response and backup credential schemas never mark fields writeOnly, and
+    // the redacted placeholder constants match the runtime-emitted marker.
+    for component in [
+        "ConsumerCredentialsRedacted",
+        "ConsumerCredentialsBackup",
+        "ConsumerCredentialsRestore",
+        "KeyAuthCredentialRedacted",
+        "JwtCredentialRedacted",
+        "HmacAuthCredentialRedacted",
+        "KeyAuthCredentialBackup",
+        "JwtCredentialBackup",
+        "HmacAuthCredentialBackup",
+        "BasicAuthCredentialStored",
+    ] {
+        let definition = &spec["components"]["schemas"][component];
+        assert!(definition.is_object(), "{component} must exist");
+        assert!(
+            !definition.to_string().contains("writeOnly"),
+            "{component} is a response/backup surface and must not mark fields writeOnly"
+        );
+    }
+    for (component, field) in [
+        ("KeyAuthCredentialRedacted", "key"),
+        ("JwtCredentialRedacted", "secret"),
+        ("HmacAuthCredentialRedacted", "secret"),
+    ] {
+        assert_eq!(
+            spec["components"]["schemas"][component]["properties"][field]["const"],
+            json!("[REDACTED]"),
+            "{component}.{field} must encode the exact runtime placeholder"
+        );
+    }
+
+    // Each Consumer surface composes ConsumerBase with its own credentials map.
+    for (surface, credentials_schema) in [
+        ("Consumer", "ConsumerCredentialsRedacted"),
+        ("ConsumerCreate", "ConsumerCredentialsInput"),
+        ("ConsumerBackup", "ConsumerCredentialsBackup"),
+        ("ConsumerRestore", "ConsumerCredentialsRestore"),
+    ] {
+        let all_of = spec["components"]["schemas"][surface]["allOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{surface} composes its credentials map via allOf"));
+        assert_eq!(
+            all_of[0]["$ref"],
+            json!("#/components/schemas/ConsumerBase"),
+            "{surface} must compose ConsumerBase"
+        );
+        assert_eq!(
+            all_of[1]["properties"]["credentials"]["$ref"],
+            json!(format!("#/components/schemas/{credentials_schema}")),
+            "{surface} must wire {credentials_schema}"
+        );
+    }
+
+    // Every operation references the correct surface schema.
+    let paths = &spec["paths"];
+    assert_eq!(
+        paths["/consumers"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+            ["data"]["items"]["$ref"],
+        json!("#/components/schemas/Consumer")
+    );
+    assert_eq!(
+        paths["/consumers"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/ConsumerCreate")
+    );
+    assert_eq!(
+        paths["/consumers"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/Consumer")
+    );
+    let consumer_id = &paths["/consumers/{id}"];
+    assert_eq!(
+        consumer_id["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/Consumer")
+    );
+    assert_eq!(
+        consumer_id["put"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/ConsumerCreate")
+    );
+    assert_eq!(
+        consumer_id["put"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/Consumer")
+    );
+    let credentials = &paths["/consumers/{consumer_id}/credentials/{cred_type}"];
+    let put_body = &credentials["put"]["requestBody"]["content"]["application/json"]["schema"];
+    assert_eq!(
+        put_body["oneOf"][0]["$ref"],
+        json!("#/components/schemas/ConsumerCredentialInput")
+    );
+    assert_eq!(
+        put_body["oneOf"][1]["items"]["$ref"],
+        json!("#/components/schemas/ConsumerCredentialInput")
+    );
+    assert_eq!(
+        credentials["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/ConsumerCredentialInput")
+    );
+    for operation in ["put", "post"] {
+        assert_eq!(
+            credentials[operation]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            json!("#/components/schemas/Consumer"),
+            "credential {operation} returns the redacted Consumer surface"
+        );
+    }
+    assert_eq!(
+        paths["/consumers/{consumer_id}/credentials/{cred_type}/{index}"]["delete"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/Consumer")
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/BatchCreateRequest/properties/consumers/items/$ref"),
+        Some(&json!("#/components/schemas/ConsumerCreate"))
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/BackupResponse/properties/consumers/items/$ref"),
+        Some(&json!("#/components/schemas/ConsumerBackup"))
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/RestoreRequest/properties/consumers/items/$ref"),
+        Some(&json!("#/components/schemas/ConsumerRestore"))
     );
 }
 
