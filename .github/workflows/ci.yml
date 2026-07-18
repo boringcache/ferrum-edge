@@ -3597,16 +3597,78 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
-      - name: Download all binary artifacts
+      # Download exactly the five trusted build artifacts by name. A wildcard
+      # pattern would also accept any other artifact whose name happened to
+      # start with the same prefix, so an unrelated job could contribute files
+      # to the published `latest` release.
+      - name: Download native binary artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          path: downloaded-artifacts
-          pattern: binary-*
+          name: binary-x86_64-unknown-linux-gnu
+          path: downloaded-artifacts/binary-x86_64-unknown-linux-gnu
+
+      - name: Download protected ARM64 binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: binary-aarch64-unknown-linux-gnu
+          path: downloaded-artifacts/binary-aarch64-unknown-linux-gnu
+
+      - name: Download macOS x86_64 binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: binary-x86_64-apple-darwin
+          path: downloaded-artifacts/binary-x86_64-apple-darwin
+
+      - name: Download macOS aarch64 binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: binary-aarch64-apple-darwin
+          path: downloaded-artifacts/binary-aarch64-apple-darwin
+
+      - name: Download Windows binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: binary-x86_64-pc-windows-msvc
+          path: downloaded-artifacts/binary-x86_64-pc-windows-msvc
 
       - name: Prepare release assets
         run: |
+          set -euo pipefail
           mkdir -p release-assets
-          find downloaded-artifacts -type f -exec cp {} release-assets/ \;
+          # The closed, auditable published asset set. Each entry names the
+          # exact trusted artifact directory and the exact file inside it, so a
+          # colliding or extra upload can neither add nor replace an asset.
+          trusted_assets=(
+            "binary-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64"
+            "binary-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64"
+            "binary-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64"
+            "binary-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64"
+            "binary-x86_64-apple-darwin/ferrum-edge-macos-x86_64"
+            "binary-aarch64-apple-darwin/ferrum-edge-macos-aarch64"
+            "binary-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe"
+          )
+          expected=()
+          for asset in "${trusted_assets[@]}"; do
+            for candidate in "$asset" "$asset.sha256"; do
+              source_path="downloaded-artifacts/${candidate}"
+              if [ ! -f "$source_path" ] || [ -L "$source_path" ]; then
+                echo "::error::missing trusted release asset ${candidate}" >&2
+                exit 1
+              fi
+              cp "$source_path" "release-assets/$(basename "$candidate")"
+              expected+=("$(basename "$candidate")")
+            done
+          done
+          # Publishing must be exactly the trusted set, never whatever the
+          # download happened to produce.
+          published_list="$(cd release-assets && ls -A | LC_ALL=C sort)"
+          expected_list="$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)"
+          if [ "$published_list" != "$expected_list" ]; then
+            echo "::error::published release asset set drifted from the trusted set" >&2
+            printf 'published:\n%s\nexpected:\n%s\n' "$published_list" "$expected_list" >&2
+            exit 1
+          fi
+          (cd release-assets && sha256sum -c ./*.sha256)
           echo "Release assets:"
           ls -la release-assets/
 

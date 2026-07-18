@@ -371,11 +371,21 @@ OPAQUE_ARM_CROSS_EXECUTION = re.compile(
     re.MULTILINE,
 )
 NON_PYTHON_PROCESS_DISPATCH = re.compile(
-    r"(?:(?:\bchild_process|require\(['\"]child_process['\"]\))\s*\.\s*"
+    r"(?:(?:\bchild_process|require\(['\"](?:node:)?child_process['\"]\))\s*\.\s*"
     r"(?:exec|execFile|fork|spawn)(?:Sync)?\s*\(|"
+    # A destructured or renamed binding — `const {execSync} = require(...)`,
+    # `import {spawn as run} from 'node:child_process'` — reaches the same
+    # dispatcher through a name the member-call form never sees. Importing the
+    # module at all is therefore the dispatch surface.
+    r"require\s*\(\s*['\"](?:node:)?child_process['\"]\s*\)|"
+    r"(?:^|[\s;{(])(?:import|export)\b[^\n;]*?['\"](?:node:)?child_process['\"]|"
+    r"\bawait\s+import\s*\(\s*['\"](?:node:)?child_process['\"]\s*\)|"
+    # The bare dispatcher names a destructured binding introduces.
+    r"(?<![A-Za-z0-9_$.])(?:exec|execFile|fork|spawn)(?:Sync)?\s*\(|"
     r"\b(?:Bun\.spawn|Deno\.Command)\s*\(|"
     r"\b(?:Process\.spawn|IO\.popen|Open3\.[A-Za-z_]+|system|exec)\s*\(|"
-    r"\b(?:os\.execute|io\.popen)\s*\()"
+    r"\b(?:os\.execute|io\.popen)\s*\()",
+    re.MULTILINE,
 )
 # A Bash helper that enables `expand_aliases` and binds a short name to Cross
 # runs Cross through a word that never appears as a literal executable. Both
@@ -447,6 +457,13 @@ CROSS_PATH_COMPONENT = re.compile(r"(?<![A-Za-z0-9_.-])cross(?![A-Za-z0-9_.-])")
 MAXIMUM_TRACKED_SHIMS = 64
 MAXIMUM_INLINE_PROGRAM_DEPTH = 4
 _inline_program_depth = 0
+# A lowercase `$cmd` is exactly as executable as `$CMD` once the enclosing
+# shell program assigns it, so the names a program binds are tracked while that
+# program is scanned and consulted when inline interpreter source is read.
+SHELL_PARAMETER_REFERENCE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+SHELL_ASSIGNMENT_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=.*", re.DOTALL)
+WHOLE_SHELL_PARAMETER = re.compile(r"\s*\$[A-Za-z_][A-Za-z0-9_]*\s*")
+_shell_assigned_names: frozenset[str] = frozenset()
 # A remote `uses:` step runs code this repository does not own, so any remote
 # action able to reach Cross is an unreviewable build-execution surface.
 # `actions-rs/cargo` with `use-cross: true` documents that it runs the `cross`
@@ -1298,6 +1315,130 @@ def skip_wrapper_prefixes(tokens: tuple[str, ...], index: int) -> tuple[int, boo
     return index, True
 
 
+ENV_SPLIT_STRING_OPTIONS = ("--split-string", "-S")
+
+
+def expand_env_split_strings(tokens: tuple[str, ...]) -> tuple[str, ...]:
+    """Split `env -S`/`--split-string` operands into the argv they become.
+
+    `env -S 'cross build --target ...'` is one shell word but a full argv by the
+    time the kernel runs it, so discarding the operand as an ordinary option
+    argument hides the executable. Joined (`-Scross build ...`,
+    `--split-string=cross build ...`) and separated spellings all split here.
+    """
+
+    start = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if tool_name(token) == "env"
+        ),
+        None,
+    )
+    if start is None:
+        return tokens
+    expanded = list(tokens[: start + 1])
+    index = start + 1
+    changed = False
+    while index < len(tokens):
+        token = tokens[index]
+        operand: str | None = None
+        consumed = 1
+        for option in ENV_SPLIT_STRING_OPTIONS:
+            if token == option:
+                if index + 1 < len(tokens):
+                    operand = tokens[index + 1]
+                    consumed = 2
+                break
+            if token.startswith(f"{option}="):
+                operand = token[len(option) + 1 :]
+                break
+            if option == "-S" and token.startswith("-S") and len(token) > 2:
+                operand = token[2:]
+                break
+        if operand is None:
+            expanded.append(token)
+            index += 1
+            continue
+        words = shell_tokens(operand)
+        # An untokenizable split string stays one word rather than vanishing.
+        expanded.extend(words if words is not None else (operand,))
+        changed = True
+        index += consumed
+    return tuple(expanded) if changed else tokens
+
+
+COMMAND_OPERAND_WRAPPERS = {
+    "flock": frozenset(
+        {"-w", "-E", "--wait", "--timeout", "--conflict-exit-code"}
+    ),
+    "script": frozenset(
+        {
+            "-B",
+            "-I",
+            "-O",
+            "-T",
+            "-m",
+            "-o",
+            "-t",
+            "--log-in",
+            "--log-io",
+            "--log-out",
+            "--log-timing",
+            "--logging-format",
+            "--output-limit",
+        }
+    ),
+}
+
+
+def command_wrapper_operand(
+    tokens: tuple[str, ...],
+    index: int,
+) -> tuple[int | None, str | None, bool]:
+    """Return the process operand of a `flock`/`script`-style wrapper.
+
+    Both run their operand as a real process, so nested Cross dispatch must be
+    followed: `flock /tmp/lock cross build ...` hands over an argv after the
+    lock operand, and `flock /tmp/lock -c '<script>'` or
+    `script -c '<script>' /dev/null` hands over a shell program.
+    """
+
+    wrapper = tool_name(tokens[index])
+    option_operands = COMMAND_OPERAND_WRAPPERS[wrapper]
+    position = index + 1
+    seen_lock = wrapper != "flock"
+    while position < len(tokens):
+        token = tokens[position]
+        if token == "--":
+            position += 1
+            break
+        if token in {"-c", "--command"}:
+            if position + 1 >= len(tokens):
+                return None, None, True
+            return None, tokens[position + 1], False
+        if token.startswith("--command="):
+            return None, token[len("--command=") :], False
+        if token.startswith("-c") and len(token) > 2:
+            return None, token[2:], False
+        if token in option_operands:
+            position += 2
+            continue
+        if token.startswith("-"):
+            position += 1
+            continue
+        if not seen_lock:
+            # flock's first operand is the lock file, not the command.
+            seen_lock = True
+            position += 1
+            continue
+        break
+    if wrapper == "script" or not seen_lock or position >= len(tokens):
+        # A `script` positional operand is the typescript output file.
+        return None, None, False
+    return position, None, False
+
+
 def executable_index(tokens: tuple[str, ...], start: int = 0) -> tuple[int, bool]:
     """Locate a command word after assignments, redirections, and wrappers."""
 
@@ -1441,33 +1582,85 @@ def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
     return None
 
 
+def interpreter_stdin_language(
+    segment: tuple[str, ...],
+    index: int,
+) -> str | None:
+    """Return the language a non-shell interpreter would read from stdin.
+
+    Python and every other inline-source interpreter execute a program handed
+    to them on stdin, so `python3 <<< '<source>'` is an executable surface in
+    exactly the way `bash <<< '<script>'` is. Only an invocation that supplies
+    no other program qualifies: inline source, a script operand, and `-m`
+    all make stdin ordinary data instead of code.
+    """
+
+    executable = tool_name(segment[index])
+    if PYTHON_INTERPRETER.fullmatch(executable):
+        language = "python"
+    elif executable in INLINE_SOURCE_OPTIONS or executable in (
+        INLINE_SOURCE_SUBCOMMANDS
+    ):
+        language = "foreign"
+    else:
+        return None
+    if executable in INLINE_OPERAND_INTERPRETERS:
+        # An awk-family program is always an operand, never stdin.
+        return None
+    inline = inline_interpreter_programs(segment, index)
+    if inline is not None and (inline[0] or inline[1]):
+        return None
+    for argument in segment[index + 1 :]:
+        if argument == "-":
+            return language
+        if redirection_token(argument):
+            break
+        if argument.startswith("-"):
+            if language == "python" and argument.lstrip("-").startswith("m"):
+                return None
+            continue
+        if SHELL_ASSIGNMENT_TOKEN.fullmatch(argument):
+            continue
+        # A non-option operand names the script to run instead of stdin.
+        return None
+    return language
+
+
 def shell_stdin_program(
     segment: tuple[str, ...],
-) -> tuple[str | None, bool]:
-    """Return literal shell stdin, or whether the stdin program is opaque."""
+) -> tuple[str | None, str | None, bool]:
+    """Return the stdin program's language and source, or its opacity."""
 
     index, executes = executable_index(segment)
     if not executes or index >= len(segment):
-        return None, False
-    if tool_name(segment[index]) not in SHELL_INTERPRETER_NAMES:
-        return None, False
-
-    command_program, option_opaque, reads_stdin = shell_invocation_mode(
-        segment,
-        index,
-    )
-    if command_program is not None or not reads_stdin:
-        return None, False
-    if option_opaque:
-        return None, True
+        return None, None, False
+    if tool_name(segment[index]) in SHELL_INTERPRETER_NAMES:
+        language = "shell"
+        command_program, option_opaque, reads_stdin = shell_invocation_mode(
+            segment,
+            index,
+        )
+        if command_program is not None or not reads_stdin:
+            return None, None, False
+        if option_opaque:
+            return language, None, True
+    else:
+        stdin_language = interpreter_stdin_language(segment, index)
+        if stdin_language is None:
+            return None, None, False
+        language = stdin_language
 
     arguments = segment[index + 1 :]
     for position, token in enumerate(arguments):
         if token == "<<<":
             if position + 1 >= len(arguments):
-                return None, True
+                return language, None, True
             program = arguments[position + 1]
-            return (None, True) if dynamic_shell_word(program) else (program, False)
+            return (
+                (language, None, True)
+                if dynamic_shell_word(program)
+                else (language, program, False)
+            )
         if token == "<" and position + 1 < len(arguments):
             if arguments[position + 1] == "<(" or (
                 position + 2 < len(arguments)
@@ -1486,13 +1679,13 @@ def shell_stdin_program(
                         depth -= 1
                     end += 1
                 if depth:
-                    return None, True
+                    return language, None, True
                 output = literal_producer_output(
                     tuple(arguments[body_start : end - 1])
                 )
-                return (output, output is None)
+                return (language, output, output is None)
 
-    return None, True
+    return language, None, True
 
 
 def split_shell_pipeline(tokens: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
@@ -1585,13 +1778,23 @@ def interpolated_inline_source(value: str) -> bool:
 
     Only the expansions a shell performs make the program unknown. A `$1`
     field reference in an awk program or a `$name` sigil in Perl or PHP source
-    survives single quoting untouched, so requiring a substitution, a braced
-    parameter, or a conventional shell variable name keeps ordinary inline
-    programs readable instead of freezing them.
+    survives single quoting untouched, so an unqualified lowercase sigil alone
+    is not treated as an expansion.
+
+    Shell variables are case-sensitive but equally executable, so the uppercase
+    convention cannot be the whole test. Two further forms are shell-generated
+    whatever the name's case: source that is nothing but one parameter
+    expansion (`python3 -c "$cmd"` carries no readable program at all), and a
+    name the enclosing shell program itself assigns.
     """
 
-    return bool(
-        re.search(r"\$\{|\$\(|`|\$[A-Z][A-Z0-9_]*(?![a-z])", value)
+    if re.search(r"\$\{|\$\(|`|\$[A-Z][A-Z0-9_]*(?![a-z])", value):
+        return True
+    if WHOLE_SHELL_PARAMETER.fullmatch(value):
+        return True
+    return any(
+        name in _shell_assigned_names
+        for name in SHELL_PARAMETER_REFERENCE.findall(value)
     )
 
 
@@ -1629,6 +1832,135 @@ def powershell_inline_program(
             return None, False
         position += 1
     return None, False
+
+
+POWERSHELL_CONTINUATION = re.compile(r"`\r?\n[ \t]*")
+# PowerShell dispatches processes through cmdlets rather than through a bare
+# command word, so the cmdlets that take a process operand are enumerated and
+# their operand is read the way the shell scanner reads an executable word.
+POWERSHELL_PROCESS_CMDLETS = frozenset(
+    {"start-process", "start-job", "start-threadjob", "invoke-command"}
+)
+POWERSHELL_PROCESS_OPERAND_OPTIONS = frozenset(
+    {"-filepath", "-scriptblock", "-command"}
+)
+# Source PowerShell assembles at runtime is unreadable here, exactly as
+# `eval` is in a POSIX shell, so it fails closed instead of being skipped.
+POWERSHELL_OPAQUE_DISPATCH = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:invoke-expression|iex)(?![A-Za-z0-9_-])"
+    r"|\[(?:system\.)?diagnostics\.process\]\s*::\s*start"
+    r"|new-object\s+[^\n]*?diagnostics\.process",
+    re.IGNORECASE,
+)
+# PowerShell needs the `&` or `.` call operator to run a word it computed, so
+# only those forms turn an expansion into an executable. A bare `$path` on its
+# own is a value expression and must stay readable.
+POWERSHELL_CALL_OPERATOR = re.compile(r"(?:^|[\s;({|])[&.]\s+(?P<target>\S+)")
+
+
+def powershell_command_word_has_cross(
+    words: tuple[str, ...],
+) -> tuple[bool, bool]:
+    """Read one PowerShell statement's command word. Returns (cross, opaque)."""
+
+    index = 0
+    while index < len(words) and words[index] in {
+        "(",
+        "{",
+        "!",
+        "if",
+        "elseif",
+        "else",
+        "while",
+        "foreach",
+        "do",
+        "try",
+    }:
+        index += 1
+    if index >= len(words):
+        return False, False
+    if words[index].startswith("$") or "=" in words[index]:
+        # A value expression or assignment dispatches nothing on its own;
+        # PowerShell requires the `&`/`.` call operator to run a computed word.
+        return False, False
+    command = tool_name(words[index]).lower().strip("'\"")
+    if command == "cross":
+        return command_has_argument(words, index), False
+    if command == "cargo":
+        return cargo_cross_command(words, index), False
+    if command not in POWERSHELL_PROCESS_CMDLETS:
+        return False, False
+
+    arguments = words[index + 1 :]
+    position = 0
+    operand: str | None = None
+    while position < len(arguments):
+        argument = arguments[position]
+        if argument.lower() in POWERSHELL_PROCESS_OPERAND_OPTIONS:
+            if position + 1 >= len(arguments):
+                return False, True
+            operand = arguments[position + 1]
+            break
+        if argument.startswith("-"):
+            # Every other cmdlet parameter takes at most one operand.
+            position += 2 if position + 1 < len(arguments) else 1
+            continue
+        operand = argument
+        break
+    if operand is None:
+        return False, True
+    if dynamic_shell_word(operand):
+        return False, True
+    return tool_name(operand).lower().strip("'\"") == "cross", False
+
+
+def powershell_program_has_cross(
+    program: str,
+    source: str,
+    *,
+    include_opaque_shell_executable: bool,
+) -> tuple[bool, list[str]]:
+    """Inspect a PowerShell body for the Cross commands it can dispatch."""
+
+    logical = POWERSHELL_CONTINUATION.sub(" ", program)
+    errors: list[str] = []
+    sensitive = False
+    for raw_line in logical.splitlines():
+        line = strip_shell_comment(raw_line)
+        if not line.strip():
+            continue
+        if POWERSHELL_OPAQUE_DISPATCH.search(line):
+            errors.append(
+                f"{source} uses PowerShell dispatch this scanner cannot read"
+            )
+            continue
+        call = POWERSHELL_CALL_OPERATOR.search(line)
+        if call is not None:
+            target = call.group("target")
+            if dynamic_shell_word(target):
+                errors.append(
+                    f"{source} calls a computed PowerShell executable"
+                )
+                continue
+            if tool_name(target).lower().strip("'\"") == "cross":
+                sensitive = True
+                continue
+        for statement in re.split(r"[;|]|&&|\|\|", line):
+            words = shell_tokens(statement)
+            if words is None:
+                if include_opaque_shell_executable and STANDALONE_CROSS.search(
+                    statement
+                ):
+                    sensitive = True
+                continue
+            has_cross, opaque = powershell_command_word_has_cross(words)
+            if has_cross:
+                sensitive = True
+            elif opaque:
+                errors.append(
+                    f"{source} has an unreadable PowerShell process operand"
+                )
+    return sensitive, errors
 
 
 def inline_interpreter_programs(
@@ -1726,20 +2058,55 @@ def inline_interpreter_programs(
             record(argument[len(joined) + 1 :])
             position += 1
             continue
-        if not argument.startswith("--") and argument.startswith("-") and any(
-            option.startswith("-")
-            and not option.startswith("--")
-            and option[1:] in argument[1:]
+        single_dash = [
+            option
             for option in options
-        ):
-            # A bundled short-option cluster such as `perl -we` still ends with
-            # the inline-source flag, so the next word is program source.
-            if position + 1 >= len(arguments):
-                opaque = True
-                break
-            record(arguments[position + 1])
-            position += 2
+            if option.startswith("-") and not option.startswith("--")
+        ]
+        # A single-dash long option may carry its operand attached
+        # (`erl -evalcode`), exactly as the double-dash form may with `=`.
+        attached_long = next(
+            (
+                argument[len(option) :]
+                for option in sorted(single_dash, key=len, reverse=True)
+                if len(option) > 2
+                and argument.startswith(option)
+                and argument != option
+            ),
+            None,
+        )
+        if attached_long is not None:
+            record(attached_long.removeprefix("="))
+            position += 1
             continue
+        letters = {option[1:] for option in single_dash if len(option) == 2}
+        if letters and argument.startswith("-") and not argument.startswith("--"):
+            cluster = argument[1:]
+            offset = next(
+                (
+                    index
+                    for index, letter in enumerate(cluster)
+                    if letter in letters
+                ),
+                None,
+            )
+            if offset is not None:
+                # A bundled short-option cluster such as `perl -we` ends with
+                # the inline-source flag and takes the next word, but
+                # `perl -e'print "safe"'` attaches its source to the same word.
+                # Treating the attached form as a missing operand would freeze
+                # ordinary inline programs instead of reading them.
+                attached_source = cluster[offset + 1 :]
+                if attached_source:
+                    record(attached_source)
+                    position += 1
+                    continue
+                if position + 1 >= len(arguments):
+                    opaque = True
+                    break
+                record(arguments[position + 1])
+                position += 2
+                continue
         position += 1
     return tuple(programs), opaque
 
@@ -1835,6 +2202,7 @@ def token_command_has_cross(
 ) -> bool:
     if depth > 8:
         return include_opaque_shell_executable
+    tokens = expand_env_split_strings(tokens)
     index, executes = executable_index(tokens)
     if not executes or index >= len(tokens):
         return False
@@ -1864,6 +2232,25 @@ def token_command_has_cross(
             ):
                 return True
         return False
+    if command in COMMAND_OPERAND_WRAPPERS:
+        nested, program, opaque = command_wrapper_operand(tokens, index)
+        if opaque:
+            return include_opaque_shell_executable
+        if program is not None:
+            if dynamic_shell_word(program):
+                return include_opaque_shell_executable
+            return shell_program_has_cross(
+                program,
+                include_opaque_shell_executable=include_opaque_shell_executable,
+                depth=depth + 1,
+            )
+        if nested is not None:
+            return token_command_has_cross(
+                tokens[nested:],
+                include_opaque_shell_executable=include_opaque_shell_executable,
+                depth=depth + 1,
+            )
+        return False
     if command == "eval":
         arguments = tokens[index + 1 :]
         if any(dynamic_shell_word(argument) for argument in arguments):
@@ -1877,12 +2264,17 @@ def token_command_has_cross(
         program, opaque = powershell_inline_program(tokens, index)
         if opaque:
             return include_opaque_shell_executable
-        if program is not None:
-            return shell_program_has_cross(
-                program,
-                include_opaque_shell_executable=include_opaque_shell_executable,
-                depth=depth + 1,
-            )
+        if program is None:
+            return False
+        # A PowerShell `-Command` operand is PowerShell, not POSIX shell.
+        powershell_sensitive, powershell_errors = powershell_program_has_cross(
+            program,
+            "inline PowerShell program",
+            include_opaque_shell_executable=include_opaque_shell_executable,
+        )
+        if powershell_sensitive:
+            return True
+        return bool(powershell_errors) and include_opaque_shell_executable
     if command in SHELL_INTERPRETER_NAMES:
         program, opaque, _ = shell_invocation_mode(tokens, index)
         if opaque:
@@ -1938,6 +2330,56 @@ def shell_program_has_cross(
     if tokens and tokens[0] in {"run:", "shell:"}:
         tokens = tokens[1:]
 
+    global _shell_assigned_names
+    outer_assigned_names = _shell_assigned_names
+    _shell_assigned_names = outer_assigned_names | frozenset(
+        match.group(1)
+        for match in (
+            SHELL_ASSIGNMENT_TOKEN.fullmatch(token) for token in tokens
+        )
+        if match is not None
+    )
+    try:
+        return shell_statements_have_cross(
+            tokens,
+            yaml_shell_field=yaml_shell_field,
+            include_opaque_shell_executable=include_opaque_shell_executable,
+            depth=depth,
+        )
+    finally:
+        _shell_assigned_names = outer_assigned_names
+
+
+def stdin_language_has_cross(
+    language: str | None,
+    program: str,
+    *,
+    include_opaque_shell_executable: bool,
+    depth: int,
+) -> bool:
+    """Read a stdin program with the interpreter that actually executes it."""
+
+    if language == "shell" or language is None:
+        return shell_program_has_cross(
+            program,
+            include_opaque_shell_executable=include_opaque_shell_executable,
+            depth=depth,
+        )
+    return inline_interpreter_has_cross(
+        ((language, program),),
+        include_opaque_shell_executable=include_opaque_shell_executable,
+    )
+
+
+def shell_statements_have_cross(
+    tokens: tuple[str, ...],
+    *,
+    yaml_shell_field: bool,
+    include_opaque_shell_executable: bool,
+    depth: int,
+) -> bool:
+    """Dispatch every statement, pipeline segment, and stdin program."""
+
     statements: list[tuple[str, ...]] = []
     current: list[str] = []
     depth_count = 0
@@ -1967,8 +2409,9 @@ def shell_program_has_cross(
         if yaml_shell_field:
             continue
         for position, segment in enumerate(pipeline):
-            stdin_program, opaque = shell_stdin_program(segment)
-            if stdin_program is not None and shell_program_has_cross(
+            language, stdin_program, opaque = shell_stdin_program(segment)
+            if stdin_program is not None and stdin_language_has_cross(
+                language,
                 stdin_program,
                 include_opaque_shell_executable=include_opaque_shell_executable,
                 depth=depth + 1,
@@ -1977,7 +2420,8 @@ def shell_program_has_cross(
             if opaque and position > 0:
                 producer = literal_producer_output(pipeline[position - 1])
                 if producer is not None:
-                    if shell_program_has_cross(
+                    if stdin_language_has_cross(
+                        language,
                         producer,
                         include_opaque_shell_executable=include_opaque_shell_executable,
                         depth=depth + 1,
@@ -2418,9 +2862,12 @@ def cross_shim_names(contents: str) -> tuple[tuple[str, ...], bool]:
         shims[name] = None
 
     for line in contents.splitlines():
-        if "cross" not in line.lower():
-            # Every binding of the Cross executable names it, so lines without
-            # the token cannot create a shim and need no tokenization.
+        # Every binding of the Cross executable names it, so a line that cannot
+        # produce the token needs no tokenization. Quotes and escapes are
+        # removed first because the shell removes them too: `cr"oss"` and
+        # `cr\oss` are the same executable word as `cross`, and a raw substring
+        # prefilter would let a split source slip past the tokenizer entirely.
+        if "cross" not in re.sub(r"[\\'\"]", "", line).lower():
             continue
         tokens = shell_tokens(strip_shell_comment(line))
         if tokens is None:
@@ -2938,6 +3385,79 @@ def is_dispatcher_manifest(name: str) -> bool:
     return PurePosixPath(name).name in DISPATCHER_MANIFEST_NAMES
 
 
+MAKE_MANIFEST_NAMES = frozenset({"Makefile", "makefile", "GNUmakefile"})
+MAKE_ASSIGNMENT = re.compile(
+    r"^(?:export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)\s*"
+    r"(?P<operator>\+=|\?=|::=|:=|=)(?P<value>.*)$"
+)
+MAKE_VARIABLE_REFERENCE = re.compile(
+    r"\$(?:\((?P<paren>[A-Za-z_][A-Za-z0-9_.-]*)\)|"
+    r"\{(?P<brace>[A-Za-z_][A-Za-z0-9_.-]*)\})"
+)
+# `$(MAKE)` is make's own recursion handle, not a shell command substitution.
+# It expands to the running make executable, so substituting `make` keeps the
+# recipe readable and still routes it through the dispatcher machinery that
+# follows and freezes recursive make. No other undefined variable is assumed
+# safe: an unresolved expansion stays opaque and keeps failing closed.
+MAKE_RECURSION_VARIABLES = frozenset({"MAKE", "MAKE_COMMAND"})
+MAXIMUM_MAKE_VARIABLES = 64
+MAXIMUM_MAKE_EXPANSIONS = 4
+
+
+def make_variable_values(contents: str) -> dict[str, str]:
+    """Collect the variables a makefile assigns, ignoring recipe lines."""
+
+    values: dict[str, str] = {}
+    for line in contents.splitlines():
+        if line.startswith("\t") or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = MAKE_ASSIGNMENT.match(line.strip())
+        if match is None:
+            continue
+        if len(values) >= MAXIMUM_MAKE_VARIABLES:
+            break
+        name = match.group("name")
+        value = match.group("value").strip()
+        if match.group("operator") == "+=" and name in values:
+            values[name] = f"{values[name]} {value}".strip()
+        else:
+            values[name] = value
+    return values
+
+
+def make_expanded_manifest(name: str, contents: str) -> str:
+    """Expand make variables so recipes read as the shell text make emits.
+
+    GNU make expands `$(VAR)` itself; the shell never sees a command
+    substitution there. Treating every `$(...)` as one would freeze ordinary
+    recursive-make recipes, so variables the makefile assigns are substituted
+    with their real values — which also catches `CARGO = cross` followed by
+    `$(CARGO) build ...` — and `$(MAKE)` resolves to the make executable.
+    Anything else, including `$(shell ...)` and other make functions, is left
+    intact for the existing opaque-substitution handling.
+    """
+
+    if PurePosixPath(name).name not in MAKE_MANIFEST_NAMES:
+        return contents
+    values = make_variable_values(contents)
+
+    def substitute(match: re.Match[str]) -> str:
+        variable = match.group("paren") or match.group("brace")
+        if variable in values:
+            return values[variable]
+        if variable in MAKE_RECURSION_VARIABLES:
+            return "make"
+        return match.group()
+
+    expanded = contents
+    for _ in range(MAXIMUM_MAKE_EXPANSIONS):
+        replaced = MAKE_VARIABLE_REFERENCE.sub(substitute, expanded)
+        if replaced == expanded:
+            break
+        expanded = replaced
+    return expanded
+
+
 def dispatcher_manifest_scripts(name: str, contents: str) -> tuple[str, ...]:
     """Return the shell text a repo build-dispatcher manifest can execute."""
 
@@ -2953,7 +3473,15 @@ def dispatcher_manifest_scripts(name: str, contents: str) -> tuple[str, ...]:
         return tuple(value for value in scripts.values() if isinstance(value, str))
     # Make/just/task recipe lines are shell, but carry `@`, `-`, and `+` prefixes
     # that would otherwise sit between the command start and the executable.
-    return (re.sub(r"(?m)^(\s+)[-@+]+", r"\1", contents),)
+    # Make variables are expanded first so a recipe reads as the shell text make
+    # actually emits.
+    return (
+        re.sub(
+            r"(?m)^(\s+)[-@+]+",
+            r"\1",
+            make_expanded_manifest(name, contents),
+        ),
+    )
 
 
 def dispatcher_manifest_cross_surface(name: str, contents: str) -> bool:
@@ -2972,7 +3500,10 @@ def automation_file_cross_surfaces(name: str, contents: str) -> tuple[str, ...]:
 
     surfaces = list(
         generic_action_cross_surfaces(
-            contents,
+            # A makefile's raw text is not shell text; expanding its variables
+            # first keeps `$(MAKE) -C sub all` from reading as an opaque
+            # command substitution in an executable slot.
+            make_expanded_manifest(name, contents),
             name=name,
             include_opaque_shell_executable=True,
         )
@@ -2999,6 +3530,18 @@ def automation_file_cross_surfaces(name: str, contents: str) -> tuple[str, ...]:
         ):
             digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
             surfaces.append(f"literal-python-cross:{digest}")
+    elif language == "powershell":
+        powershell_sensitive, powershell_errors = powershell_program_has_cross(
+            contents,
+            name,
+            include_opaque_shell_executable=True,
+        )
+        if powershell_sensitive:
+            digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+            surfaces.append(f"literal-powershell-cross:{digest}")
+        if powershell_errors:
+            digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+            surfaces.append(f"opaque-powershell-process:{digest}")
     elif language == "unknown":
         digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
         surfaces.append(f"opaque-automation-interpreter:{digest}")
@@ -3451,6 +3994,10 @@ def interpreter_kind(words: tuple[str, ...] | None) -> str | None:
             if index + 1 < len(words) and tool_name(words[index + 1]) == "sh"
             else None
         )
+    if executable.lower() in {"pwsh", "powershell"}:
+        # A PowerShell body is not POSIX shell: its dispatch is cmdlet-shaped,
+        # so reading it as `sh` would miss `Start-Process cross ...` entirely.
+        return "powershell"
     if executable in SHELL_INTERPRETER_NAMES:
         return "shell"
     if PYTHON_INTERPRETER.fullmatch(executable):
@@ -3640,11 +4187,12 @@ def executable_heredocs(
         ]
         if interpreters:
             executable = tool_name(interpreters[-1])
-            interpreter = (
-                "python"
-                if PYTHON_INTERPRETER.fullmatch(executable)
-                else "shell"
-            )
+            if PYTHON_INTERPRETER.fullmatch(executable):
+                interpreter = "python"
+            elif executable.lower() in {"pwsh", "powershell"}:
+                interpreter = "powershell"
+            else:
+                interpreter = "shell"
     errors = (
         [f"{source} has an unterminated executable heredoc {delimiter!r}"]
         if delimiter is not None
@@ -3764,14 +4312,37 @@ def python_command_scripts(
         "subprocess.getstatusoutput",
         "os.posix_spawn",
         "os.posix_spawnp",
+        # asyncio dispatches processes through its own entry points, which
+        # reach exactly the same executables as `subprocess`.
+        "asyncio.create_subprocess_shell",
+        "asyncio.create_subprocess_exec",
+        "asyncio.subprocess.create_subprocess_shell",
+        "asyncio.subprocess.create_subprocess_exec",
     }
+    # `os.execl*`, `os.spawnl*`, and `create_subprocess_exec` spread argv across
+    # their positional arguments, so the executable alone is not the command.
+    variadic_argv_calls = {
+        "asyncio.create_subprocess_exec",
+        "asyncio.subprocess.create_subprocess_exec",
+        "os.execl",
+        "os.execle",
+        "os.execlp",
+        "os.execlpe",
+        "os.spawnl",
+        "os.spawnle",
+        "os.spawnlp",
+        "os.spawnlpe",
+    }
+    process_modules = {"os", "subprocess", "asyncio"}
     imported_names: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name in {"os", "subprocess"}:
+                if alias.name in process_modules or alias.name == "asyncio.subprocess":
                     imported_names[alias.asname or alias.name] = alias.name
-        elif isinstance(node, ast.ImportFrom) and node.module in {"os", "subprocess"}:
+        elif isinstance(node, ast.ImportFrom) and node.module in (
+            process_modules | {"asyncio.subprocess"}
+        ):
             for alias in node.names:
                 imported_names[alias.asname or alias.name] = (
                     f"{node.module}.{alias.name}"
@@ -3834,12 +4405,12 @@ def python_command_scripts(
         for descendant in ast.walk(node):
             if isinstance(descendant, ast.Name) and imported_names.get(
                 descendant.id, descendant.id
-            ) in {"os", "subprocess"}:
+            ) in process_modules:
                 return True
             if isinstance(descendant, ast.Call) and static_name(
                 descendant.func
             ) == "__import__" and descendant.args:
-                if literal_string(descendant.args[0]) in {"os", "subprocess"}:
+                if literal_string(descendant.args[0]) in process_modules:
                     return True
         return False
 
@@ -3864,7 +4435,7 @@ def python_command_scripts(
                 ):
                     opaque_process_aliases.add(target.id)
                 continue
-            if aliased not in process_calls and aliased not in {"os", "subprocess"}:
+            if aliased not in process_calls and aliased not in process_modules:
                 continue
             if imported_names.get(target.id) != aliased:
                 imported_names[target.id] = aliased
@@ -3917,6 +4488,10 @@ def python_command_scripts(
         if command is None:
             if resolved_name.startswith("subprocess."):
                 keyword_names = {"args"}
+            elif resolved_name.endswith("create_subprocess_shell"):
+                keyword_names = {"cmd"}
+            elif resolved_name.endswith("create_subprocess_exec"):
+                keyword_names = {"program"}
             elif resolved_name == "os.system":
                 keyword_names = {"command"}
             elif resolved_name == "os.popen":
@@ -3935,7 +4510,21 @@ def python_command_scripts(
 
         command_text: str | None = None
         command_words: tuple[str, ...] | None = None
-        if command is not None:
+        if command is not None and resolved_name in variadic_argv_calls:
+            # `create_subprocess_exec('cross', 'build', ...)` and
+            # `os.execlp('cross', 'cross', 'build', ...)` spell one argv across
+            # the positional arguments, so the executable word alone would look
+            # like a bare noun rather than a command with operands.
+            spread = [
+                literal_string(argument)
+                for argument in node.args[positional_index:]
+            ]
+            if spread and all(word is not None for word in spread):
+                command_words = tuple(
+                    word for word in spread if word is not None
+                )
+                command_text = " ".join(command_words)
+        if command is not None and command_text is None:
             command_text = literal_string(command)
             if command_text is None and isinstance(command, (ast.List, ast.Tuple)):
                 elements = [literal_string(element) for element in command.elts]
@@ -4044,6 +4633,15 @@ def runtime_program_cross_surface(
             errors.extend(failures)
             if any(contains_literal_executable_cross(command) for command in commands):
                 sensitive = True
+            continue
+        if language == "powershell":
+            powershell_sensitive, powershell_errors = powershell_program_has_cross(
+                program,
+                source,
+                include_opaque_shell_executable=include_opaque_shell_executable,
+            )
+            sensitive = sensitive or powershell_sensitive
+            errors.extend(powershell_errors)
             continue
         errors.append(f"{source} uses an unsupported executable interpreter")
     return sensitive, errors
@@ -4158,6 +4756,8 @@ def automation_command_scripts(
         return [("shell", command) for command in commands], errors
     if language == "shell":
         return [("shell", contents)], []
+    if language == "powershell":
+        return [("powershell", contents)], []
     if language == "unknown" or contents.startswith("#!"):
         return [], [f"{source} has an unsupported executable shebang"]
     return [], [f"{source} is executable automation with no scannable interpreter"]
@@ -4577,6 +5177,18 @@ def validate_automation_collection(
                 f"{source}/{name} contains an unprotected Cross executable in a "
                 "build-dispatcher recipe"
             )
+        elif contents is not None and language == "powershell":
+            powershell_sensitive, powershell_errors = powershell_program_has_cross(
+                contents,
+                f"{source}/{name}",
+                include_opaque_shell_executable=False,
+            )
+            errors.extend(powershell_errors)
+            if powershell_sensitive:
+                errors.append(
+                    f"{source}/{name} contains an unprotected PowerShell Cross "
+                    "dispatch"
+                )
         elif contents is not None and language == "python":
             process_commands, process_failures = python_command_scripts(
                 contents,
@@ -4732,6 +5344,21 @@ def validate_trusted_policy_extraction(contents: str, source: str) -> list[str]:
         'extract_workflows "$trusted_base" "$merge_base_workflows"',
         'extract_actions "$trusted_base" "$merge_base_actions"',
         'extract_automation "$trusted_base" "$merge_base_automation"',
+        # The verifier and every contract it reads must come from the same
+        # pinned trusted tip as the baselines, never from the event checkout.
+        'git show "$trusted_base:.github/scripts/verify_cross_build_policy.py"',
+        'git show "$trusted_base:.github/workflows/cross-build-policy.yml"',
+        'python3 -I "$trusted_verifier"',
+        '--ci-workflow "$merge_base_ci"',
+        '--release-workflow "$merge_base_release"',
+        '--trusted-policy-workflow "$trusted_policy_workflow"',
+        '--workflows-dir "$merge_base_workflows"',
+        '--actions-dir "$merge_base_actions"',
+        '--automation-dir "$merge_base_automation"',
+        # GitHub loads this workflow from the event base, so the extraction
+        # contract itself cannot be re-executed from the live tip and must
+        # instead fail closed once the trusted tip has moved it.
+        'git diff --no-ext-diff --quiet "$BASE_SHA" "$trusted_base" \\',
     )
     for required in required_live_base_inputs:
         if required not in contents:
@@ -4748,6 +5375,14 @@ def validate_trusted_policy_extraction(contents: str, source: str) -> list[str]:
         )
     if re.search(r"git merge-base(?!\s+--is-ancestor\b)", contents):
         errors.append(f"{source} must not use a stale merge-base Cross baseline")
+    if re.search(
+        r"python3[^\n]*\s\.github/scripts/verify_cross_build_policy\.py",
+        contents,
+    ):
+        errors.append(
+            f"{source} must execute the verifier from the pinned live trusted "
+            "base, not from the stale event-base checkout"
+        )
 
     checked_enumerations = re.findall(
         r"if ! git ls-tree -rz --name-only \"\$commit\"[^;]*> \"\$[a-z_]+\"; then",
@@ -6995,6 +7630,279 @@ pre_build = []
         {"justfile": "arm64:\n    cargo build --locked\n"},
         {"justfile": f"arm64:\n    cross {arm_target}\n"},
     )
+    # A make variable holding Cross is the make-native spelling of an aliased
+    # executable, so expanding assignments must catch it rather than relying on
+    # the blunt opaque-substitution rule that also freezes `$(MAKE)`.
+    dispatcher_escapes(
+        "make variable dispatcher",
+        "make arm64",
+        {"Makefile": "CARGO = cargo\narm64:\n\t$(CARGO) build --locked\n"},
+        {"Makefile": f"CARGO = cross\narm64:\n\t$(CARGO) {arm_target}\n"},
+    )
+    dispatcher_escapes(
+        "braced make variable dispatcher",
+        "make arm64",
+        {"Makefile": "CARGO := cargo\narm64:\n\t${CARGO} build --locked\n"},
+        {"Makefile": f"CARGO := cross\narm64:\n\t${{CARGO}} {arm_target}\n"},
+    )
+
+    def benign_dispatcher(label: str, command: str, manifest: dict[str, str]) -> None:
+        """An ordinary recipe must stay editable instead of freezing closed."""
+
+        dispatcher_workflow = referenced_workflow.replace(
+            "bash scripts/safe.sh",
+            command,
+        )
+        tree_errors = validate_automation_collection(
+            {"ci.yml": dispatcher_workflow},
+            {"setup/action.yml": safe_action},
+            manifest,
+            "self-test automation directory",
+        )
+        if tree_errors:
+            failures.append(
+                f"benign {label} was rejected by tree validation: "
+                f"{'; '.join(tree_errors)}"
+            )
+        comparison_errors = compare_pr_automation_collection(
+            {"ci.yml": dispatcher_workflow},
+            {"ci.yml": dispatcher_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            manifest,
+            manifest,
+            "self-test automation directory",
+        )
+        if comparison_errors:
+            failures.append(
+                f"benign {label} was rejected by PR comparison: "
+                f"{'; '.join(comparison_errors)}"
+            )
+
+    # `$(MAKE)` is make's recursion handle, not a shell command substitution.
+    benign_dispatcher(
+        "recursive make recipe",
+        "make arm64",
+        {
+            "Makefile": "arm64:\n\t$(MAKE) -C tests/performance all\n",
+            "tests/performance/Makefile": "all:\n\tcargo build --locked\n",
+        },
+    )
+    benign_dispatcher(
+        "benign make variable recipe",
+        "make arm64",
+        {"Makefile": "CARGO = cargo\narm64:\n\t$(CARGO) build --locked\n"},
+    )
+
+    def opaque_shell_automation_escapes(label: str, body: str) -> None:
+        """An unreadable executable surface must freeze the comparison."""
+
+        proposed = {"scripts/safe.sh": f"#!/bin/sh\n{body}\n"}
+        if not compare_pr_automation_collection(
+            {"ci.yml": referenced_workflow},
+            {"ci.yml": referenced_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            safe_automation,
+            proposed,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} was not rejected by PR comparison")
+
+    # Shell variables are case-sensitive but equally executable, so a lowercase
+    # name the same program assigns generates inline source just as an
+    # uppercase one does.
+    opaque_shell_automation_escapes(
+        "lowercase generated inline python source",
+        'cmd="import subprocess"\npython3 -c "$cmd"',
+    )
+    opaque_shell_automation_escapes(
+        "lowercase generated inline perl source",
+        "cmd='print 1'\nperl -e \"$cmd\"",
+    )
+    opaque_shell_automation_escapes(
+        "whole-parameter inline source",
+        'perl -e "$program"',
+    )
+
+    # A quote-split shim source never contains a raw `cross` token, so the
+    # binding must be tokenized before the prefilter can reject the line.
+    shell_automation_escapes(
+        "quote-split Cross shim source",
+        f'ln -s /home/runner/.cargo/bin/cr"oss" bin/cr\n./bin/cr {arm_target}',
+    )
+    shell_automation_escapes(
+        "escape-split Cross shim source",
+        f"cp /home/runner/.cargo/bin/cr\\oss bin/cx\n./bin/cx {arm_target}",
+    )
+
+    # `env -S` turns its operand into argv rather than discarding it.
+    shell_automation_escapes(
+        "env split-string Cross execution",
+        f"env -S 'cross {arm_target}'",
+    )
+    shell_automation_escapes(
+        "env joined split-string Cross execution",
+        f"env --split-string='cross {arm_target}'",
+    )
+    shell_automation_escapes(
+        "env attached split-string Cross execution",
+        "env -Scross\\ build\\ --target\\ " + TARGET,
+    )
+
+    # `flock` and `script` run their operand as a real process.
+    shell_automation_escapes(
+        "flock command operand",
+        f"flock /tmp/build.lock cross {arm_target}",
+    )
+    shell_automation_escapes(
+        "flock shell command operand",
+        f"flock /tmp/build.lock -c 'cross {arm_target}'",
+    )
+    shell_automation_escapes(
+        "script command operand",
+        f"script -c 'cross {arm_target}' /dev/null",
+    )
+
+    # An interpreter reading its program from stdin executes it exactly as a
+    # shell does.
+    shell_automation_escapes(
+        "python here-string program",
+        "python3 <<< 'import subprocess; subprocess.run([\"cross\", "
+        f"\"build\", \"--target\", \"{TARGET}\"])'",
+    )
+    shell_automation_escapes(
+        "python process-substitution program",
+        "python3 < <(printf 'import os; os.system(\"cross "
+        f"{arm_target}\")')",
+    )
+
+    # An attached short-option operand is ordinary inline source, not a missing
+    # operand, so a benign program must stay readable while a Cross one is
+    # still caught.
+    benign_attached_option = {
+        "scripts/safe.sh": "#!/bin/sh\nperl -e'print \"safe\"'\n"
+    }
+    attached_option_errors = compare_pr_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        benign_attached_option,
+        "self-test automation directory",
+    )
+    if attached_option_errors:
+        failures.append(
+            "benign attached inline-source operand was rejected: "
+            f"{'; '.join(attached_option_errors)}"
+        )
+    shell_automation_escapes(
+        "attached inline-source Cross execution",
+        f"perl -e'system(\"cross {arm_target}\")'",
+    )
+
+    # Node dispatchers bound by destructuring or import are invisible to a
+    # member-call-only reader.
+    node_alias_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "node scripts/safe.js",
+    )
+    node_alias_baseline = {"scripts/safe.js": "console.log('safe');\n"}
+    for alias_label, alias_body in {
+        "destructured child_process alias": (
+            "const {execSync} = require('child_process');\n"
+            f"execSync('cross {arm_target}');\n"
+        ),
+        "imported child_process alias": (
+            "import {spawnSync as run} from 'node:child_process';\n"
+            f"run('cross', ['build', '--target', '{TARGET}']);\n"
+        ),
+    }.items():
+        if not compare_pr_automation_collection(
+            {"ci.yml": node_alias_workflow},
+            {"ci.yml": node_alias_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            node_alias_baseline,
+            {"scripts/safe.js": alias_body},
+            "self-test automation directory",
+        ):
+            failures.append(f"{alias_label} was not rejected")
+
+    # asyncio reaches the same executables as `subprocess`.
+    python_automation_escapes(
+        "asyncio shell process dispatch",
+        "import asyncio\n"
+        f"asyncio.run(asyncio.create_subprocess_shell('cross {arm_target}'))\n",
+    )
+    python_automation_escapes(
+        "asyncio exec process dispatch",
+        "import asyncio\n"
+        "asyncio.run(asyncio.create_subprocess_exec(\n"
+        f"    'cross', {arm_arguments}\n"
+        "))\n",
+    )
+    python_automation_escapes(
+        "aliased asyncio process dispatch",
+        "from asyncio import create_subprocess_exec as run\n"
+        f"run('cross', {arm_arguments})\n",
+    )
+
+    # A `shell: pwsh` body is PowerShell, not POSIX shell.
+    powershell_workflow = (
+        "name: PowerShell\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: windows-latest\n"
+        "    steps:\n"
+        "      - name: Windows step\n"
+        "        shell: pwsh\n"
+        "        run: |\n"
+        "          BODY\n"
+    )
+    for powershell_label, powershell_body in {
+        "PowerShell Start-Process Cross dispatch": (
+            f"Start-Process cross -ArgumentList 'build','--target','{TARGET}'"
+        ),
+        "PowerShell call-operator Cross dispatch": f"& cross {arm_target}",
+        "PowerShell direct Cross dispatch": f"cross {arm_target}",
+        "PowerShell Invoke-Expression dispatch": (
+            "Invoke-Expression $generatedCommand"
+        ),
+        "PowerShell computed call operator": "& $tool build",
+    }.items():
+        surfaces, errors = generic_workflow_cross_surfaces(
+            powershell_workflow.replace("BODY", powershell_body),
+            "self-test powershell workflow",
+            include_opaque_shell_executable=True,
+        )
+        if not surfaces and not errors:
+            failures.append(f"{powershell_label} was not protected")
+    benign_powershell = (
+        '$ErrorActionPreference = "Stop"\n'
+        '          $root = Join-Path $env:RUNNER_TEMP "protoc"\n'
+        '          Invoke-WebRequest -Uri "https://example.invalid/x.zip" '
+        '-OutFile $zip\n'
+        "          Expand-Archive -Path $zip -DestinationPath $root -Force\n"
+        "          if (!(Test-Path $root)) {\n"
+        '            throw "missing $root"\n'
+        "          }\n"
+        "          $root | Out-File -Append -FilePath $env:GITHUB_PATH "
+        "-Encoding utf8"
+    )
+    benign_surfaces, benign_powershell_errors = generic_workflow_cross_surfaces(
+        powershell_workflow.replace("BODY", benign_powershell),
+        "self-test powershell workflow",
+        include_opaque_shell_executable=True,
+    )
+    if benign_surfaces or benign_powershell_errors:
+        failures.append(
+            "benign PowerShell workflow body was rejected: "
+            f"surfaces={benign_surfaces!r}; "
+            f"errors={benign_powershell_errors!r}"
+        )
 
     folded_action = (
         "name: Folded\n"

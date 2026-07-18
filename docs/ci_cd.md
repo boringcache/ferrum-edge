@@ -409,9 +409,19 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   a wrapper script whose body runs Cross, are all detected, and every later
   command-start dispatch through that name — including PATH-prepended,
   `./bin/`-relative, and assignment-prefixed forms — is expanded back to the
-  Cross command word. A dynamic shim name fails closed. Python
+  Cross command word. A dynamic shim name fails closed. Shim sources are
+  tokenized before the Cross token is required, so a quote- or escape-split
+  source (`ln -s ~/.cargo/bin/cr"oss" bin/cr`) still binds the shim. Python
   helpers are analyzed through local process-API aliases (`run =
   subprocess.run`) and shell-wrapper argv (`subprocess.run(['sh', '-c', ...])`).
+  `asyncio.create_subprocess_shell`/`create_subprocess_exec`, including their
+  imported and renamed forms, are tracked alongside `os` and `subprocess`, and
+  the variadic-argv APIs (`create_subprocess_exec`, `os.execl*`, `os.spawnl*`)
+  have their spread arguments joined into the single command they dispatch.
+  In JavaScript, importing `child_process` at all is the dispatch surface, so a
+  destructured or renamed binding (`const {execSync} = require('child_process')`,
+  `import {spawn as run} from 'node:child_process'`) is protected exactly like
+  a `child_process.exec(...)` member call.
   Workflow `run` bodies are dispatched through their effective step, job, or
   workflow-level shell; Python shells and executable Python heredocs therefore
   receive the same AST analysis, while dynamic or unsupported shells fail
@@ -428,6 +438,31 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   Shell-assembled inline source (`perl -e "$PROGRAM"`) and a PowerShell
   `-EncodedCommand` fail closed, while a field reference such as awk's `$1` or
   a Perl `$name` sigil stays readable so ordinary one-liners are not frozen.
+  Because shell variables are case-sensitive but equally executable, source
+  that is nothing but one parameter expansion (`python3 -c "$cmd"`) and source
+  referencing any name — lowercase included — that the enclosing shell program
+  assigns are both treated as generated. An inline-source operand attached to
+  its option letter (`perl -e'print "safe"'`) or to a single-dash long option
+  is parsed as the program it is, rather than being frozen as a missing
+  operand. An interpreter that reads its program from stdin is dispatched the
+  same way as a shell that does, so `python3 <<< '<source>'` and
+  `python3 < <(printf '<source>')` are inspected in the interpreter's own
+  language instead of only in POSIX shell.
+  A `shell: pwsh`/`powershell` body, a PowerShell `-Command` operand, a
+  PowerShell heredoc, and a `SHELL ["pwsh", ...]` Dockerfile selection are
+  parsed as PowerShell rather than as POSIX shell: `Start-Process`,
+  `Start-Job`, `Start-ThreadJob`, and `Invoke-Command` process operands and the
+  `&`/`.` call operators resolve to the executable word, while
+  `Invoke-Expression`/`iex`, a computed call-operator target, a
+  `[Diagnostics.Process]::Start` dispatch, and an unreadable process operand
+  fail closed. A bare `$variable` stays a value expression, because PowerShell
+  requires a call operator to execute a computed word.
+  `env -S`/`--split-string` operands are tokenized into the argv they become
+  rather than discarded as option arguments, in separated, joined
+  (`--split-string=...`), and attached (`-S...`) spellings. `flock` and
+  `script` are followed to their process operands, both the positional argv
+  form after `flock`'s lock operand and the `-c`/`--command` shell-program
+  form.
   A remote (non-`./`) `uses:` step is code this repository does not own, so a
   step whose action reference names Cross, whose inputs include a Cross-enabling
   key (`use-cross`, `cross-version`, and equivalents under case and separator
@@ -449,7 +484,14 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   matching root or `-C`-relocated `Makefile`, `package.json` `scripts`,
   `justfile`, or `Taskfile`, which is then scanned and frozen like any
   referenced script, and a dispatcher whose manifest is not in the scanned set
-  fails closed. Detection stays anchored to command positions, so prose or a
+  fails closed. Make recipes are read as the shell text make emits rather than
+  as raw shell: variables the makefile assigns are substituted with their real
+  values, which catches `CARGO = cross` followed by `$(CARGO) build ...`, and
+  `$(MAKE)`/`$(MAKE_COMMAND)` resolve to the make executable so an ordinary
+  recursive-make recipe is followed as a dispatcher instead of being frozen as
+  an opaque command substitution. Every other `$(...)`, including
+  `$(shell ...)` and other make functions, stays opaque and keeps failing
+  closed. Detection stays anchored to command positions, so prose or a
   comment mentioning `cargo install cross` does not freeze unrelated edits.
   Cross-sensitive jobs, local-action files, and
   reachable scripts are represented by full digests, while unrelated workflow,
@@ -460,6 +502,13 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   the CI publishers' success conditions are protected too. Only those direct
   publication-control fields are frozen, so unrelated implementation changes
   inside the publishing jobs remain permitted.
+- `latest-release` and `create-release` download the five build artifacts by
+  exact name instead of by a `binary-*`/`release-binaries-*` wildcard, so an
+  unrelated job cannot contribute a colliding upload to a published release.
+  Each then copies a closed, auditable list of exact trusted files, asserts
+  that the published set equals that list exactly, and verifies every `.sha256`
+  sidecar before publishing. Native and protected ARM64 publishing are both
+  preserved: the ARM64 artifact is downloaded under its own exact name.
 - The Cross process starts through `env -i` with an explicit minimal host
   environment and fixed compiler variables. This removes `CROSS_CONFIG`, every
   `CROSS_BUILD_*`/`CROSS_TARGET_*` alias, image/Dockerfile/pre-build/runner
@@ -480,7 +529,16 @@ requires the fetched object to equal the immutable head SHA from the triggering
 event, then extracts `Cross.toml`, `Cargo.toml`, `.cargo/config.toml`, the
 complete proposed and live-base workflow and repo-local action directories,
 and the approved automation roots plus the root build-dispatcher manifests as
-hostile data, and runs only the base branch's verifier. Each NUL-delimited
+hostile data. The verifier it executes, and every trusted contract that
+verifier reads — `ci.yml`, `release.yml`, the workflow, local-action, and
+automation baselines, and the trusted policy workflow itself — are all
+extracted from that one pinned live trusted tip, never from the possibly stale
+event-base checkout, so a Cross surface that only the newer live-base verifier
+recognizes is still enforced. GitHub loads the policy workflow file itself from
+the event base and it therefore cannot be re-executed from the live tip; that
+extraction contract is instead authenticated by comparison and fails closed
+when the trusted tip has moved it, which self-heals as soon as the pull
+request's base is updated. Each NUL-delimited
 `git ls-tree` result is materialized and its status checked before consumption;
 regular blobs may use letters, digits, `.`, `_`, `+`, `@`, `~`, spaces, and
 `-`, while dot-dot components, symlinks, gitlinks, and NULs fail closed. A

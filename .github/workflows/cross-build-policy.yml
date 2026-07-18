@@ -77,6 +77,33 @@ jobs:
           fi
           echo "trusted base tip: ${trusted_base} (event base ${BASE_SHA})"
 
+          # GitHub loaded this workflow file from the event base, so the
+          # extraction contract executing right now is the stale copy. It
+          # cannot be re-executed from the live tip, so authenticate it by
+          # comparison and fail closed when the trusted tip has moved it. The
+          # verifier itself is not subject to that limit and is executed from
+          # the live tip below.
+          if ! git diff --no-ext-diff --quiet "$BASE_SHA" "$trusted_base" \
+            -- ".github/workflows/cross-build-policy.yml"; then
+            echo "::error::the trusted extraction contract changed on ${BASE_REF} after this event was created; re-run once the pull request base is updated" >&2
+            exit 1
+          fi
+
+          # Every executed byte and every baseline now comes from one immutable
+          # trusted commit, so a Cross surface that only the newer live-base
+          # verifier recognizes is still enforced.
+          trusted_dir="$RUNNER_TEMP/trusted-policy"
+          mkdir -p "$trusted_dir"
+          verifier_entry="$(git ls-tree "$trusted_base" -- .github/scripts/verify_cross_build_policy.py)"
+          if [[ "$verifier_entry" != "100644 blob "* && "$verifier_entry" != "100755 blob "* ]]; then
+            echo "::error::the live trusted Cross policy verifier must be a regular blob" >&2
+            exit 1
+          fi
+          trusted_verifier="$trusted_dir/verify_cross_build_policy.py"
+          git show "$trusted_base:.github/scripts/verify_cross_build_policy.py" > "$trusted_verifier"
+          trusted_policy_workflow="$trusted_dir/cross-build-policy.yml"
+          git show "$trusted_base:.github/workflows/cross-build-policy.yml" > "$trusted_policy_workflow"
+
           proposed_cross="$RUNNER_TEMP/proposed-Cross.toml"
           proposed_cargo="$RUNNER_TEMP/proposed-Cargo.toml"
           proposed_cargo_tool="$RUNNER_TEMP/proposed-cargo-config.toml"
@@ -246,14 +273,21 @@ jobs:
           extract_automation FETCH_HEAD "$proposed_automation"
           extract_automation "$trusted_base" "$merge_base_automation"
 
-          python3 -I .github/scripts/verify_cross_build_policy.py \
+          # Both the executed verifier and every trusted baseline now come from
+          # the pinned live trusted tip, so a Cross surface that only the newer
+          # verifier recognizes is still enforced against this pull request.
+          python3 -I "$trusted_verifier" \
             --self-test \
             --config "$proposed_cross" \
             --cargo-config "$proposed_cargo" \
             --cargo-tool-config "$proposed_cargo_tool" \
             --cargo-legacy-config "$proposed_cargo_legacy" \
-            --ci-workflow .github/workflows/ci.yml \
-            --release-workflow .github/workflows/release.yml \
+            --ci-workflow "$merge_base_ci" \
+            --release-workflow "$merge_base_release" \
+            --trusted-policy-workflow "$trusted_policy_workflow" \
+            --workflows-dir "$merge_base_workflows" \
+            --actions-dir "$merge_base_actions" \
+            --automation-dir "$merge_base_automation" \
             --merge-base-ci-workflow "$merge_base_ci" \
             --proposed-ci-workflow "$proposed_ci" \
             --merge-base-release-workflow "$merge_base_release" \
