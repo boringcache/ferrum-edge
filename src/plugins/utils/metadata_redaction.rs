@@ -7,10 +7,10 @@
 //! (stdout, http, tcp, kafka, loki, udp, ws, statsd). That has bitten us
 //! before with `transaction_debugger.rs` (which only redacts request HEADERS).
 //!
-//! This module is the single redaction layer. It is wired into the
-//! `metadata` field of both summary structs via `#[serde(serialize_with = ...)]`
-//! so every logger that calls `serde_json::to_string(summary)` gets the same
-//! sanitized output, and there's no way for a new logger to forget to redact.
+//! This module is the single redaction layer. Both summary serializers delegate
+//! their `metadata` field here, so every logger that serializes a summary gets
+//! the same sanitized output and a new logger cannot bypass redaction by
+//! choosing a different sink.
 //!
 //! Matching is case-insensitive against:
 //!   * a built-in default list (`DEFAULT_SENSITIVE_METADATA_KEYS`);
@@ -23,8 +23,8 @@
 //! credential/session/auth context redact. This keeps usage metrics like
 //! `ai_total_tokens` visible while still protecting real token secrets.
 
-use serde::Serializer;
 use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -244,15 +244,30 @@ pub fn serialize_redacted_metadata<S>(
 where
     S: Serializer,
 {
-    let mut map = serializer.serialize_map(Some(metadata.len()))?;
-    for (key, value) in metadata {
-        if is_sensitive_metadata_key(key) {
-            map.serialize_entry(key, REDACTED_PLACEHOLDER)?;
-        } else {
-            map.serialize_entry(key, value)?;
+    RedactedMetadata(metadata).serialize(serializer)
+}
+
+/// Serializable borrowed view used by manual summary serializers and schema
+/// views. Keeping this wrapper here preserves one redaction implementation for
+/// every transaction-log sink.
+pub struct RedactedMetadata<'a>(pub &'a HashMap<String, String>);
+
+impl Serialize for RedactedMetadata<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let metadata = self.0;
+        let mut map = serializer.serialize_map(Some(metadata.len()))?;
+        for (key, value) in metadata {
+            if is_sensitive_metadata_key(key) {
+                map.serialize_entry(key, REDACTED_PLACEHOLDER)?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
         }
+        map.end()
     }
-    map.end()
 }
 
 #[cfg(test)]

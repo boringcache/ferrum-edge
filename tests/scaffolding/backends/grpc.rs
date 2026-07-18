@@ -99,6 +99,10 @@ pub enum GrpcStep {
     /// `grpc-message: <message>` when non-empty). Implicitly closes the
     /// stream.
     RespondStatus { code: u8, message: &'static str },
+    /// Send a deliberately malformed raw `grpc-status` trailer and close the
+    /// stream. This exists for gateway normalization/output tests that cannot
+    /// express invalid wire values through [`Self::RespondStatus`].
+    RespondRawStatus { value: &'static str },
     /// Send response headers + an optional payload, then close the stream
     /// WITHOUT any `grpc-status` trailer. Exercises the gateway's
     /// "missing trailers" INTERNAL fallback.
@@ -303,6 +307,10 @@ fn lower_grpc_step(step: GrpcStep) -> Vec<H2Step> {
             }
             vec![H2Step::RespondTrailers(trailers)]
         }
+        GrpcStep::RespondRawStatus { value } => vec![H2Step::RespondTrailers(vec![(
+            "grpc-status",
+            value.to_string(),
+        )])],
         GrpcStep::OmitTrailers { body } => {
             let headers = H2Step::RespondHeaders(vec![
                 (":status", "200".into()),

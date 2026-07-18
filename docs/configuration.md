@@ -26,7 +26,10 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `node_agent`, `migrate` |
 | `FERRUM_NAMESPACE` | No | `ferrum` | Namespace this gateway loads and manages |
 | `FERRUM_LOG_LEVEL` | No | `warn` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace`. Controls the runtime tracing logs only; per-transaction access logs from the `stdout_logging` plugin are emitted independent of this level |
-| `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel. When full, new events are dropped to avoid backpressure on request threads |
+| `FERRUM_LOG_BUFFER_CAPACITY` | No | `4096` | Per-sink hard record-slot limit (stdout/access logs share one sink; stderr is separate). Actual admission is also constrained by `FERRUM_LOG_BUFFER_BYTES`. Clamped to 1–65,536; admission is lossy and non-blocking when either limit is full |
+| `FERRUM_LOG_BUFFER_BYTES` | No | `33554432` | Per-sink aggregate serialized-payload byte budget. Admission provisionally reserves `FERRUM_LOG_MAX_RECORD_BYTES` before serialization, then queues an exact-sized allocation and shrinks that reservation to the serialized length until write completion. Clamped between `FERRUM_LOG_MAX_RECORD_BYTES` and 1 GiB |
+| `FERRUM_LOG_MAX_RECORD_BYTES` | No | `65536` | Maximum serialized bytes for one runtime/access-log record, including its newline. Clamped to 1 KiB–1 MiB; larger records are dropped and counted |
+| `FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS` | No | `2000` | Maximum time spent draining each process log sink during shutdown. Clamped to 100–30,000 ms; records still outstanding at the deadline are counted as incomplete drain |
 | `FERRUM_LOG_REDACT_METADATA_KEYS` | No | — | Comma-separated additional metadata-key substrings to redact from `TransactionSummary.metadata` and `StreamTransactionSummary.metadata` before log serialization. Built-in sensitive substrings such as `authorization`, `cookie`, `password`, `secret`, and `token` are always redacted. Operators can further reshape per-plugin log output (rename keys, drop fields, reorder, add static / derived fields, flatten metadata, change timestamp format) via per-logging-plugin `schema:` blocks or a shared `transaction_log_schema` plugin — see [docs/log_schema.md](log_schema.md) |
 | `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` | No | `30` | Timeout for each external secret fetch during startup |
 | `FERRUM_GCP_SECRET_MANAGER_ENDPOINT` | No | — | Override the GCP Secret Manager service endpoint (base URL) used by `_GCP` / `gcp://` secret resolution. When set, the client targets this endpoint with anonymous credentials instead of `secretmanager.googleapis.com` with Application Default Credentials. Intended for pointing the real client at a local fake/emulator or an in-cluster proxy in tests and air-gapped setups; leave unset for normal production use. Requires the `secrets-gcp` Cargo feature |
@@ -42,6 +45,16 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_PKCS11_MODULE_PATH` | No | — | Default PKCS#11 module path used by frontend/admin/backend mTLS `pkcs11://` key sources when the URI omits `?module=` and `?module_env=`. Requires the `pkcs11` Cargo feature |
 | `FERRUM_PKCS11_PIN` | No | — | Optional example token user PIN variable for `pkcs11://...?pin_env=FERRUM_PKCS11_PIN`. Ferrum only reads it when a PKCS#11 key source references it, and never logs the value |
 | `FERRUM_CLICKHOUSE_PASSWORD` | No | — | Optional materialized password used by the `api_chargeback_sink` plugin when its `clickhouse.password_ref` is set to `FERRUM_CLICKHOUSE_PASSWORD`. The plugin only accepts `FERRUM_*` password references. Populate this value directly or through existing secret suffixes such as `FERRUM_CLICKHOUSE_PASSWORD_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` |
+
+Process-log admission always needs one maximum-record reservation while a new
+record is serialized. After serialization, diagnostics report the actual bytes
+retained by completed records plus any still-provisional reservation. Raising
+`FERRUM_LOG_BUFFER_CAPACITY` alone has no effect when the byte budget is the
+limiting constraint; size both limits from observed serialized record sizes and
+leave at least `FERRUM_LOG_MAX_RECORD_BYTES` of byte headroom for the next
+producer. If any supplied `FERRUM_LOG_*` numeric value is changed by its clamp,
+Ferrum emits a startup warning naming the variable, supplied value, and applied
+value.
 
 ### Proxy Listener
 

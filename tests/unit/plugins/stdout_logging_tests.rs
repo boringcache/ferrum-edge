@@ -66,18 +66,28 @@ async fn test_stdout_logging_plugin_logging() {
     plugin.log(&summary).await;
 }
 
-#[tokio::test]
-async fn test_stdout_logging_plugin_with_config() {
-    let config = json!({
-        "log_level": "info",
-        "include_metadata": true
-    });
-    let plugin = StdoutLogging::new(&config).unwrap();
-    assert_eq!(plugin.name(), "stdout_logging");
-
-    let mut ctx = create_test_context();
-    let result = plugin.on_request_received(&mut ctx).await;
-    assert!(matches!(result, PluginResult::Continue));
+#[test]
+fn test_stdout_logging_rejects_unknown_outer_and_nested_keys() {
+    for (config, path) in [
+        (
+            json!({"filters": {"errors_only": true}}),
+            "stdout_logging.filters",
+        ),
+        (json!({"log_level": "info"}), "stdout_logging.log_level"),
+        (
+            json!({"filter": {"error_only": true}}),
+            "stdout_logging.filter.error_only",
+        ),
+        (
+            json!({"filter": {"min_latency_msec": 10}}),
+            "stdout_logging.filter.min_latency_msec",
+        ),
+    ] {
+        let error = StdoutLogging::new(&config)
+            .err()
+            .expect("unknown key must fail");
+        assert!(error.contains(path), "expected {path} in {error}");
+    }
 }
 
 #[test]
@@ -99,6 +109,113 @@ fn test_shared_validation_rejects_invalid_stdout_logging_config() {
     let err = validate_plugin_config("stdout_logging", &json!({"filter": "errors"}))
         .expect_err("shared plugin validation must reject a non-object filter");
     assert_eq!(err, "stdout_logging: filter must be an object");
+}
+
+#[test]
+fn test_shared_validation_preserves_null_defaults() {
+    for config in [serde_json::Value::Null, json!({"filter": null})] {
+        validate_plugin_config("stdout_logging", &config)
+            .expect("shared validation must preserve null defaults");
+    }
+}
+
+#[test]
+fn test_shared_validation_rejects_unknown_stdout_logging_keys() {
+    for (config, path) in [
+        (
+            json!({"include_metadata": false}),
+            "stdout_logging.include_metadata",
+        ),
+        (
+            json!({"filter": {"error_only": true}}),
+            "stdout_logging.filter.error_only",
+        ),
+    ] {
+        let error = validate_plugin_config("stdout_logging", &config)
+            .expect_err("shared validation must reject unknown keys");
+        assert!(error.contains(path), "expected {path} in {error}");
+    }
+}
+
+#[test]
+fn test_errors_only_uses_authoritative_terminal_failure_predicate() {
+    let plugin = StdoutLogging::new(&json!({"filter": {"errors_only": true}})).unwrap();
+    let mut summary = create_test_transaction_summary();
+    summary.body_completed = true;
+    assert!(!plugin.should_log_transaction(&summary));
+
+    summary.body_error_class = Some(ferrum_edge::retry::ErrorClass::ConnectionReset);
+    assert!(plugin.should_log_transaction(&summary));
+    summary.body_error_class = None;
+
+    summary.response_streamed = true;
+    summary.body_completed = false;
+    assert!(plugin.should_log_transaction(&summary));
+    summary.response_streamed = false;
+    summary.body_completed = true;
+
+    summary.client_disconnected = true;
+    assert!(plugin.should_log_transaction(&summary));
+    summary.client_disconnected = false;
+
+    summary
+        .metadata
+        .insert("grpc_status".to_string(), "0".to_string());
+    assert!(!plugin.should_log_transaction(&summary));
+    summary
+        .metadata
+        .insert("grpc_status".to_string(), "14".to_string());
+    assert!(plugin.should_log_transaction(&summary));
+
+    summary.metadata.remove("grpc_status");
+    summary
+        .metadata
+        .insert("mirror_error".to_string(), "connection refused".to_string());
+    assert!(plugin.should_log_transaction(&summary));
+}
+
+#[test]
+fn test_terminal_grpc_status_is_stable_across_buffered_streamed_h2_h3_and_rejection_shapes() {
+    let plugin = StdoutLogging::new(&json!({"filter": {"errors_only": true}})).unwrap();
+    for (case, streamed, body_completed, status, rejection, expected_failure) in [
+        ("buffered_h2_ok", false, true, Some("0"), false, false),
+        ("buffered_h2_error", false, true, Some("7"), false, true),
+        ("streamed_h2_ok", true, true, Some("0"), false, false),
+        ("streamed_h2_error", true, true, Some("14"), false, true),
+        ("native_h3_ok", true, true, Some("0"), false, false),
+        ("native_h3_error", true, true, Some("13"), false, true),
+        ("missing_terminal", true, true, None, false, true),
+        ("malformed_terminal", true, true, Some("bad"), false, true),
+        ("gateway_rejection", false, true, Some("16"), true, true),
+    ] {
+        let mut summary = create_test_transaction_summary();
+        summary.response_status_code = 200;
+        summary.response_streamed = streamed;
+        summary.body_completed = body_completed;
+        summary
+            .metadata
+            .insert("request_protocol".to_string(), "grpc".to_string());
+        if let Some(status) = status {
+            summary
+                .metadata
+                .insert("grpc_status".to_string(), status.to_string());
+        }
+        if rejection {
+            summary
+                .metadata
+                .insert("rejection_phase".to_string(), "authorize".to_string());
+        }
+
+        assert_eq!(
+            plugin.should_log_transaction(&summary),
+            expected_failure,
+            "{case}"
+        );
+        let json = serde_json::to_value(&summary).unwrap();
+        let expected_status = status.map_or(2, |value| value.parse::<u32>().unwrap_or(u32::MAX));
+        assert_eq!(json["grpc_status"], expected_status, "{case}");
+        assert_eq!(json["response_status_code"], 200, "{case}");
+    }
 }
 
 #[tokio::test]

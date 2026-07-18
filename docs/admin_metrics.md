@@ -16,8 +16,37 @@ The Ferrum Edge Admin API exposes a comprehensive runtime metrics endpoint that 
 ### Metrics vs Prometheus vs Health
 
 - **`/admin/metrics`** — Rich JSON with connection pools, circuit breakers, health checks, cache stats, load balancer state, consumer index breakdown, rate limiter counters, and database rejected-delta polling state in database mode. Ideal for custom dashboards.
-- **`/metrics`** — Prometheus text format with per-proxy request counters (bounded standard-method/`OTHER` labels and terminal `grpc_status` for gRPC), latency histograms, WebSocket session/duration/traffic families, AI usage families (`ferrum_ai_prompt_tokens_total`, `ferrum_ai_completion_tokens_total`, `ferrum_ai_tokens_total`, and `ferrum_ai_estimated_cost_currency_units_total`), the aggregate built-in rate-limit rejection counter, TLS certificate inventory gauges, bounded database rejected-delta metrics, and admin connection-limiter metrics. AI labels are limited to `proxy_id`, a bounded provider family, and the configured namespace; cost retains sub-micro precision during accumulation, then atomically publishes the rounded aggregate in currency units with exactly six decimal places. Requires one globally scoped `prometheus_metrics` plugin. **Gated by default** — see the auth note above; configure a metrics bearer token or an allowed scrape CIDR for Prometheus/Grafana.
-- **`/live`** / **`/health`** — Liveness and readiness probes for load balancers and orchestrators. Point Kubernetes **liveness** at `/live` (always minimal+unauthenticated) and **readiness** at `/health` (returns `status`+`ready` unauthenticated). Detailed diagnostics — DB connectivity/pool, cached-config counts, and `database_polling.status: "degraded"` (a repeatedly rejected incremental delta while serving last known-good config) — are returned only to authenticated callers.
+- **`/metrics`** — Prometheus text format with per-proxy request counters (bounded standard-method/`OTHER` labels and terminal `grpc_status` for gRPC), process log-sink health/queue/loss/I/O counters, latency histograms, WebSocket session/duration/traffic families, AI usage families (`ferrum_ai_prompt_tokens_total`, `ferrum_ai_completion_tokens_total`, `ferrum_ai_tokens_total`, and `ferrum_ai_estimated_cost_currency_units_total`), the aggregate built-in rate-limit rejection counter, TLS certificate inventory gauges (`ferrum_tls_cert_expiry_seconds`, `ferrum_tls_cert_not_before_seconds`), certificate rotation counters (`ferrum_tls_cert_rotations_total`), TLS source watcher outcomes (`ferrum_tls_source_refresh_total`), source fetch duration histograms (`ferrum_tls_source_fetch_duration_seconds`), source fetch failure counters (`ferrum_tls_source_fetch_failures_total`), bounded database rejected-delta metrics (`ferrum_database_delta_rejections_total`, `ferrum_database_delta_backoff_bucket`, `ferrum_database_delta_forced_full_reloads_total`, `ferrum_database_delta_recoveries_total`), and admin connection-limiter metrics (`ferrum_admin_active_connections`, `ferrum_admin_max_connections`, `ferrum_admin_rejected_connections_total{reason}`). AI labels are limited to `proxy_id`, a bounded provider family, and the configured namespace; cost retains sub-micro precision during accumulation, then atomically publishes the rounded aggregate in currency units with exactly six decimal places. Requires one globally scoped `prometheus_metrics` plugin. **Gated by default** — see the auth note above; configure a metrics bearer token or an allowed scrape CIDR for Prometheus/Grafana.
+- **`/live`** / **`/health`** — Liveness and readiness probes for load balancers and orchestrators. Point Kubernetes **liveness** at `/live` (always minimal+unauthenticated) and **readiness** at `/health` (returns `status`+`ready` unauthenticated). Detailed diagnostics — DB connectivity/pool, cached-config counts, `database_polling.status: "degraded"` (a repeatedly rejected incremental delta while serving last known-good config), and independent stdout/access-log versus stderr sink health/loss/last-failure state — are returned only to authenticated callers.
+
+### Process log-sink policy
+
+Stdout runtime events and `stdout_logging` access records intentionally share
+one bounded sink and therefore one set of counters; stderr diagnostics use a
+separate sink and counter set. `ferrum_log_sink_dropped_records_total` separates
+`saturation`, `record_too_large`, and `closed` reasons, while
+`ferrum_log_sink_io_failures_total` separates `write` and `flush`.
+`ferrum_log_sink_shutdown_timeouts_total` counts bounded drain deadlines and
+`ferrum_log_sink_shutdown_incomplete_records_total` counts records still
+outstanding at those deadlines without claiming they were ultimately dropped.
+Writer failure does not change request handling and is never reported
+recursively to stdout. Ferrum may enqueue one constant stderr notice per
+minute; stderr failure never reports into stderr.
+
+Alert on any increase in a dropped-record, I/O-failure, or shutdown-timeout
+counter, or on `ferrum_log_sink_healthy == 0`. Increase record/byte capacity only after
+checking collector throughput and memory headroom: retained serialized payload
+memory is bounded by `FERRUM_LOG_BUFFER_BYTES` per sink, and larger records
+still obey
+`FERRUM_LOG_MAX_RECORD_BYTES`. `queue_capacity_records` is the hard record-slot
+limit, not a promise that the byte budget can hold that many records. Before
+serialization, each producer provisionally reserves the maximum record size;
+after serialization, `reserved_bytes` shrinks to the actual record length until
+write completion. Raising record capacity is therefore a no-op when the byte
+budget is already limiting; leave at least one maximum-record allocation of byte
+headroom for the next admission. Shutdown waits no longer than
+`FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS` per sink and accounts the remaining
+records when that deadline expires.
 
 ## Endpoint: `GET /admin/metrics`
 
