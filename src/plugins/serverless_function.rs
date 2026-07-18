@@ -1261,10 +1261,13 @@ impl FunctionDestination {
         // encoded query value, path segment, or fragment. Inspect those URI
         // references recursively, but only when they are syntactically
         // URI-like: treating every scalar as a relative path would remove
-        // benign values such as
-        // `https://example.test/next?label=signed/trigger`. When a structural
-        // reference remains at the depth boundary, fail closed rather than
-        // silently treating uninspected nesting as safe.
+        // benign lookalike values such as
+        // `https://example.test/next?label=signed/trigger-extra` that resemble
+        // but do not match the signed destination. (An exact copy of the signed
+        // path into a query scalar is already blocked above as a renamed
+        // disclosure.) When a structural reference remains at the depth
+        // boundary, fail closed rather than silently treating uninspected
+        // nesting as safe.
         for (key, value) in &candidate_pairs {
             if self.nested_reference_exposes_destination(nested_uri_reference(key), depth)
                 || self.nested_reference_exposes_destination(nested_uri_reference(value), depth)

@@ -1578,7 +1578,11 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "benign-same-origin" => format!("{}/safe?other=1", server.uri()),
             "benign-external" => "https://redirect.example/next?other=1".to_string(),
             "benign-external-label" => {
-                "https://redirect.example/next?label=signed/trigger".to_string()
+                // A path-shaped but non-matching query value (lookalike of the
+                // signed path `signed/trigger`) must remain observable. An exact
+                // copy of the signed path is a renamed disclosure and is covered
+                // by `copied-signed-path-query-value`.
+                "https://redirect.example/next?label=signed/trigger-extra".to_string()
             }
             "benign-path-lookalike" => {
                 "https://redirect.example/signed/triggered?other=1".to_string()

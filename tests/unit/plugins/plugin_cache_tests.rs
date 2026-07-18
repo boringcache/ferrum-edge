@@ -2055,6 +2055,10 @@ fn candidate_serverless_composition_uses_pure_capabilities_not_runtime_credentia
                 json!({
                     "provider": "aws_lambda",
                     "mode": "terminate",
+                    // Pin an explicit region so runtime construction reaches the
+                    // malformed-credential check deterministically instead of
+                    // depending on an ambient AWS_REGION / AWS_DEFAULT_REGION.
+                    "aws_region": "us-east-1",
                     "aws_access_key_id": 7
                 }),
                 PluginScope::Proxy,
