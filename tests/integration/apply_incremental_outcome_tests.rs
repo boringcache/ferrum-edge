@@ -26,7 +26,7 @@ use ferrum_edge::config::types::{
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
+use ferrum_edge::plugins::{PluginResult, ProxyProtocol, REQUEST_ID_METADATA_KEY, RequestContext};
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use tempfile::TempDir;
 
@@ -911,6 +911,133 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
             .any(|plugin| plugin.name() == "security_headers"),
         "rejected reload must retain the last-known-good plugin cache"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation() {
+    let state = empty_proxy_state();
+    let mut internal = test_plugin_config("internal-request-id-policy", true);
+    internal.plugin_name = "correlation_id".to_string();
+    internal.priority_override = Some(40);
+    internal.config = serde_json::json!({
+        "header_name": "x-stable-request-id",
+        "echo_downstream": true
+    });
+    let mut external = test_plugin_config("external-request-id-policy", true);
+    external.plugin_name = "correlation_id".to_string();
+    external.priority_override = Some(60);
+    external.config = serde_json::json!({
+        "header_name": "x-external-correlation-id",
+        "echo_downstream": true
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![internal, external],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+
+    let mut invalid = valid.clone();
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "header_name": "x-must-not-publish",
+        "echo_downsteam": false
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
+        panic!("unknown correlation_id field must reject reload");
+    };
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.contains("correlation_id") && error.contains("echo_downsteam") })
+    );
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["header_name"],
+        "x-stable-request-id"
+    );
+    assert_eq!(
+        state.config.load().plugin_configs[1].config["header_name"],
+        "x-external-correlation-id"
+    );
+
+    let mut duplicate = valid.clone();
+    duplicate.plugin_configs[1].config = serde_json::json!({
+        "header_name": " X-Stable-Request-ID ",
+        "echo_downstream": true
+    });
+    duplicate.plugin_configs[1].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(duplicate) else {
+        panic!("duplicate effective correlation header must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("correlation_id") && error.contains("duplicate effective header_name")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["header_name"],
+        "x-stable-request-id"
+    );
+    assert_eq!(
+        state.config.load().plugin_configs[1].config["header_name"],
+        "x-external-correlation-id"
+    );
+
+    let mut priority_tie = valid;
+    priority_tie.plugin_configs[1].priority_override = Some(40);
+    priority_tie.plugin_configs[1].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(priority_tie) else {
+        panic!("equal effective correlation priorities must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("correlation_id") && error.contains("duplicate effective priority 40")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].priority_override,
+        Some(40)
+    );
+    assert_eq!(
+        state.config.load().plugin_configs[1].priority_override,
+        Some(60)
+    );
+
+    let request_view = state.plugin_cache.request_view("p1", ProxyProtocol::Http);
+    let request_plugins = request_view.plugins();
+    let correlations: Vec<_> = request_plugins
+        .iter()
+        .filter(|plugin| plugin.name() == "correlation_id")
+        .collect();
+    assert_eq!(correlations.len(), 2);
+    let mut ctx = RequestContext::new(
+        "198.51.100.44".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers.insert(
+        "x-external-correlation-id".to_string(),
+        "attacker-preserved-id".to_string(),
+    );
+    for correlation in correlations {
+        assert!(matches!(
+            correlation.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+    }
+    let internal_id = ctx
+        .headers
+        .get("x-stable-request-id")
+        .expect("last-known-good internal correlation header");
+    assert!(uuid::Uuid::parse_str(internal_id).is_ok());
+    assert_eq!(ctx.metadata.get(REQUEST_ID_METADATA_KEY), Some(internal_id));
+    assert_eq!(
+        ctx.headers
+            .get("x-external-correlation-id")
+            .map(String::as_str),
+        Some("attacker-preserved-id")
+    );
+    assert!(!ctx.headers.contains_key("x-must-not-publish"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

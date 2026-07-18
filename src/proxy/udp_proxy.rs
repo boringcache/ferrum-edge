@@ -30,9 +30,9 @@ use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
-    Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
-    StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
-    UdpMetadataSink,
+    CorrelationIdState, Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind,
+    StreamConnectionContext, StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection,
+    UdpDatagramVerdict, UdpMetadataSink,
 };
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
@@ -118,6 +118,10 @@ struct UdpSession {
     auth_method: Option<&'static str>,
     /// Plugin metadata from on_stream_connect, carried to on_stream_disconnect.
     metadata: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Immutable authoritative correlation ownership captured after admission.
+    /// Per-datagram hooks mutate only `metadata`; disconnect-summary construction
+    /// re-projects this state after cloning that final writable map.
+    correlation_ids: CorrelationIdState,
     /// Plugins and proxy metadata resolved from the RequestEpoch used to create this session.
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     datagram_plugins: Arc<[Arc<dyn Plugin>]>,
@@ -610,14 +614,26 @@ fn rfc3339_from_epoch_millis(ms: u64) -> String {
         .unwrap_or_default()
 }
 
+/// Restore private correlation ownership after every plugin-writable metadata
+/// merge and immediately before the disconnect summary becomes observable.
+pub(crate) fn finalize_stream_summary_metadata(
+    mut metadata: std::collections::HashMap<String, String>,
+    correlation_ids: &CorrelationIdState,
+) -> std::collections::HashMap<String, String> {
+    correlation_ids.project_correlation_ids(&mut metadata);
+    metadata
+}
+
 fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransactionSummary {
     let created_ms = context.session.created_at.load(Ordering::Relaxed);
-    let metadata = context
+    let writable_metadata = context
         .session
         .metadata
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let metadata =
+        finalize_stream_summary_metadata(writable_metadata, &context.session.correlation_ids);
 
     StreamTransactionSummary {
         namespace: context.namespace.to_string(),
@@ -682,9 +698,13 @@ struct DtlsDisconnectContext<'a> {
     disconnect_direction: Option<crate::plugins::Direction>,
     disconnect_cause: Option<crate::plugins::DisconnectCause>,
     metadata: &'a std::collections::HashMap<String, String>,
+    correlation_ids: &'a CorrelationIdState,
 }
 
 fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransactionSummary {
+    let metadata =
+        finalize_stream_summary_metadata(context.metadata.clone(), context.correlation_ids);
+
     StreamTransactionSummary {
         namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
@@ -706,7 +726,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         timestamp_connected: context.connected_at.to_rfc3339(),
         timestamp_disconnected: context.disconnected_at.to_rfc3339(),
         sni_hostname: None,
-        metadata: context.metadata.clone(),
+        metadata,
     }
 }
 
@@ -2339,47 +2359,38 @@ async fn start_dtls_frontend_listener(
                 let client_ip = udp_session_client_ip(client_addr);
 
                 // Run on_stream_connect plugins (with DTLS client cert if available)
-                let mut stream_ctx = StreamConnectionContext {
-                    client_ip: client_ip.to_string(),
+                let stream_client_ip = client_ip.to_string();
+                let mut stream_ctx = StreamConnectionContext::new(
+                    stream_client_ip.clone(),
                     // PROXY protocol is not supported on UDP/DTLS (TCP-borne only);
                     // direct_client_ip always equals client_ip for UDP sessions.
-                    direct_client_ip: client_ip.to_string(),
-                    canonical_client_ip: Default::default(),
-                    proxy_id: proxy.id.clone(),
-                    proxy_name: proxy_name.clone(),
-                    listen_port: port,
+                    stream_client_ip,
+                    proxy.id.clone(),
+                    proxy_name.clone(),
+                    port,
                     backend_scheme,
                     consumer_index,
-                    identified_consumer: None,
-                    authenticated_identity: None,
-                    auth_method: None,
-                    metadata: None,
-                    tls_client_cert_der: client_conn.tls_client_cert_der.clone(),
-                    tls_client_cert_chain_der: client_conn.tls_client_cert_chain_der.clone(),
-                    sni_hostname: client_conn.sni_hostname.clone(),
-                    mesh_direction: None,
-                    // Node-waypoint per-pod policy scoping is intentionally not
-                    // wired for UDP/DTLS and cannot be without a new capture
-                    // path. Identity is keyed by the per-connection socket
-                    // cookie (`SO_COOKIE`), which node-agent eBPF stamps from
-                    // the source pod via the `connect4`/`connect6` cgroup hooks;
-                    // there are no UDP capture hooks, and a UDP stream proxy
-                    // serves all clients from one shared frontend socket with a
-                    // single cookie, so there is no per-source-pod cookie to
-                    // resolve here. With `per_pod_policy_scoping` on
-                    // (node-waypoint topology), `mesh_authz` stamps
-                    // `mesh_authz.scope_missing` and, because the per-pod scope is
-                    // always absent here, fails closed (rejects the stream, 403)
-                    // when any namespace/selector-scoped policy is configured;
-                    // with only mesh-wide policies it evaluates them normally.
-                    // Per-pod scoped enforcement is unavailable for DTLS streams
-                    // (TCP and HTTP/HBONE have it). See docs/mesh.md.
-                    node_waypoint_policy_scope: None,
-                    // UDP inspects payload per-datagram via on_udp_datagram, not
-                    // via first_bytes (which is a TCP-stream concept).
-                    first_bytes: None,
-                    first_bytes_kind: None,
-                };
+                );
+                stream_ctx.tls_client_cert_der = client_conn.tls_client_cert_der.clone();
+                stream_ctx.tls_client_cert_chain_der =
+                    client_conn.tls_client_cert_chain_der.clone();
+                stream_ctx.sni_hostname = client_conn.sni_hostname.clone();
+                // The constructor intentionally leaves node-waypoint per-pod
+                // policy scope absent: UDP/DTLS cannot wire it without a new
+                // capture path. Identity is keyed by the per-connection socket
+                // cookie (`SO_COOKIE`), which node-agent eBPF stamps from
+                // the source pod via the `connect4`/`connect6` cgroup hooks;
+                // there are no UDP capture hooks, and a UDP stream proxy
+                // serves all clients from one shared frontend socket with a
+                // single cookie, so there is no per-source-pod cookie to
+                // resolve here. With `per_pod_policy_scoping` on
+                // (node-waypoint topology), `mesh_authz` stamps
+                // `mesh_authz.scope_missing` and, because the per-pod scope is
+                // always absent here, fails closed (rejects the stream, 403)
+                // when any namespace/selector-scoped policy is configured;
+                // with only mesh-wide policies it evaluates them normally.
+                // Per-pod scoped enforcement is unavailable for DTLS streams
+                // (TCP and HTTP/HBONE have it). See docs/mesh.md.
                 let mut rejected = false;
                 for plugin in plugins.iter() {
                     if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
@@ -2436,8 +2447,8 @@ async fn start_dtls_frontend_listener(
                     None
                 };
                 let handler_auth_method = stream_ctx.auth_method;
-                let handler_metadata = if handler_has_plugins {
-                    stream_ctx.take_metadata()
+                let (handler_metadata, handler_correlation_ids) = if handler_has_plugins {
+                    stream_ctx.take_metadata_with_correlation_ids()
                 } else {
                     Default::default()
                 };
@@ -2535,6 +2546,7 @@ async fn start_dtls_frontend_listener(
                             disconnect_direction,
                             disconnect_cause,
                             metadata: &merged_metadata,
+                            correlation_ids: &handler_correlation_ids,
                         });
                         crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
 
@@ -3251,44 +3263,32 @@ async fn create_session(
     let client_ip = udp_session_client_ip(client_addr);
 
     // Run on_stream_connect plugins before creating backend connection
-    let mut stream_ctx = StreamConnectionContext {
-        client_ip: client_ip.to_string(),
+    let stream_client_ip = client_ip.to_string();
+    let mut stream_ctx = StreamConnectionContext::new(
+        stream_client_ip.clone(),
         // PROXY protocol is not supported on plain UDP (TCP-borne only);
         // direct_client_ip always equals client_ip for UDP sessions.
-        direct_client_ip: client_ip.to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: proxy_id.to_string(),
-        proxy_name: proxy_name.clone(),
+        stream_client_ip,
+        proxy_id.to_string(),
+        proxy_name.clone(),
         listen_port,
         backend_scheme,
         consumer_index,
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname,
-        mesh_direction: None,
-        // Node-waypoint per-pod policy scoping is intentionally not wired for
-        // plain UDP and cannot be without a new capture path. Identity is keyed
-        // by the per-connection socket cookie (`SO_COOKIE`) that node-agent
-        // eBPF stamps from the source pod via the `connect4`/`connect6` cgroup
-        // hooks; there are no UDP capture hooks, and this UDP proxy demultiplexes
-        // every client off one shared frontend socket with a single cookie, so
-        // there is no per-source-pod cookie to resolve here. With
-        // `per_pod_policy_scoping` on (node-waypoint topology), `mesh_authz`
-        // stamps `mesh_authz.scope_missing` and, because the per-pod scope is
-        // always absent here, fails closed (rejects the stream, 403) when any
-        // namespace/selector-scoped policy is configured; with only mesh-wide
-        // policies it evaluates them normally. Per-pod scoped enforcement is
-        // unavailable for UDP streams (TCP and HTTP/HBONE have it). See docs/mesh.md.
-        node_waypoint_policy_scope: None,
-        // UDP inspects payload per-datagram via on_udp_datagram, not via
-        // first_bytes (which is a TCP-stream concept).
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    );
+    stream_ctx.sni_hostname = sni_hostname;
+    // The constructor intentionally leaves node-waypoint per-pod policy scope
+    // absent: plain UDP cannot wire it without a new capture path. Identity is
+    // keyed by the per-connection socket cookie (`SO_COOKIE`) that node-agent
+    // eBPF stamps from the source pod via the `connect4`/`connect6` cgroup
+    // hooks; there are no UDP capture hooks, and this UDP proxy demultiplexes
+    // every client off one shared frontend socket with a single cookie, so
+    // there is no per-source-pod cookie to resolve here. With
+    // `per_pod_policy_scoping` on (node-waypoint topology), `mesh_authz`
+    // stamps `mesh_authz.scope_missing` and, because the per-pod scope is
+    // always absent here, fails closed (rejects the stream, 403) when any
+    // namespace/selector-scoped policy is configured; with only mesh-wide
+    // policies it evaluates them normally. Per-pod scoped enforcement is
+    // unavailable for UDP streams (TCP and HTTP/HBONE have it). See docs/mesh.md.
     for plugin in plugins.iter() {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
             return Err(
@@ -3499,6 +3499,7 @@ async fn create_session(
     let datagram_client_ip = Arc::clone(&client_ip);
     let datagram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let datagram_proxy_name: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
+    let (metadata, correlation_ids) = stream_ctx.take_metadata_with_correlation_ids();
     let session = Arc::new(UdpSession {
         backend_socket: backend_socket.clone(),
         dtls_conn: dtls_conn.clone(),
@@ -3515,7 +3516,8 @@ async fn create_session(
         sni_hostname: stream_ctx.sni_hostname.clone(),
         consumer_username,
         auth_method,
-        metadata: std::sync::Mutex::new(stream_ctx.take_metadata()),
+        metadata: std::sync::Mutex::new(metadata),
+        correlation_ids,
         local_addr: std::sync::OnceLock::new(),
         plugins: Arc::clone(&plugins),
         datagram_plugins: Arc::clone(&datagram_plugins),
@@ -4385,6 +4387,7 @@ mod tests {
                 "request_id".to_string(),
                 "stream-123".to_string(),
             )])),
+            correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
@@ -4526,6 +4529,7 @@ backend_tls_verify_server_cert: false
         let connected_at = chrono::Utc::now() - chrono::TimeDelta::milliseconds(750);
         let disconnected_at = chrono::Utc::now();
         let metadata = HashMap::from([("request_id".to_string(), "dtls-123".to_string())]);
+        let correlation_ids = Default::default();
 
         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
             namespace: "ferrum",
@@ -4547,6 +4551,7 @@ backend_tls_verify_server_cert: false
             disconnect_direction: None,
             disconnect_cause: Some(crate::plugins::DisconnectCause::RecvError),
             metadata: &metadata,
+            correlation_ids: &correlation_ids,
         });
 
         assert_eq!(summary.proxy_id, "dtls-proxy");
@@ -4565,7 +4570,10 @@ backend_tls_verify_server_cert: false
             Some(crate::retry::ErrorClass::TlsError)
         );
         assert_eq!(
-            summary.metadata.get("request_id").map(String::as_str),
+            summary
+                .metadata
+                .get(crate::plugins::REQUEST_ID_METADATA_KEY)
+                .map(String::as_str),
             Some("dtls-123")
         );
         assert!(summary.duration_ms >= 0.0);
@@ -4629,7 +4637,10 @@ backend_tls_verify_server_cert: false
             Some(crate::retry::ErrorClass::ConnectionReset)
         );
         assert_eq!(
-            summary.metadata.get("request_id").map(String::as_str),
+            summary
+                .metadata
+                .get(crate::plugins::REQUEST_ID_METADATA_KEY)
+                .map(String::as_str),
             Some("stream-123")
         );
         assert!(
@@ -4995,6 +5006,7 @@ backend_tls_verify_server_cert: false
             consumer_username: None,
             auth_method: None,
             metadata: std::sync::Mutex::new(HashMap::new()),
+            correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),

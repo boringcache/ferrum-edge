@@ -6,7 +6,10 @@ use ferrum_edge::{
         jwt_auth::{JwtConfig, JwtManager},
         serve_admin_on_listener,
     },
-    config::db_loader::{DatabaseStore, DbPoolConfig},
+    config::{
+        db_loader::{DatabaseStore, DbPoolConfig},
+        types::{PluginConfig, PluginScope},
+    },
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -355,6 +358,7 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
 
     let secret_key = "super-secret-load-test-key";
     let nested_api_key = "nested-api-key-value";
+    let service_account_json = r#"{"private_key":"federation-private-key"}"#;
     let plugin = json!({
         "id": "audit-plugin-secret",
         "plugin_name": "load_testing",
@@ -365,6 +369,7 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
             "duration_seconds": 1,
             "nested": {
                 "api_key": nested_api_key,
+                "google_service_account_json": service_account_json,
                 "label": "safe-label"
             }
         }
@@ -388,6 +393,10 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
         "[REDACTED]"
     );
     assert_eq!(
+        event["diff"]["after"]["config"]["nested"]["google_service_account_json"],
+        "[REDACTED]"
+    );
+    assert_eq!(
         event["diff"]["after"]["config"]["nested"]["label"],
         "safe-label"
     );
@@ -399,6 +408,10 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
     assert!(
         !serialized.contains(nested_api_key),
         "nested API key leaked: {event:?}"
+    );
+    assert!(
+        !serialized.contains(service_account_json),
+        "service account JSON leaked: {event:?}"
     );
 }
 
@@ -413,6 +426,7 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
 
     let secret_key = "read-secret-load-test-key";
     let nested_api_key = "read-nested-api-key-value";
+    let service_account_json = r#"{"private_key":"federation-private-key"}"#;
     let plugin = json!({
         "id": "read-plugin-secret",
         "plugin_name": "load_testing",
@@ -423,6 +437,7 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
             "duration_seconds": 1,
             "nested": {
                 "api_key": nested_api_key,
+                "google_service_account_json": service_account_json,
                 "label": "safe-label"
             }
         }
@@ -436,6 +451,10 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
     assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
     assert_eq!(viewer_body["config"]["key"], "[REDACTED]");
     assert_eq!(viewer_body["config"]["nested"]["api_key"], "[REDACTED]");
+    assert_eq!(
+        viewer_body["config"]["nested"]["google_service_account_json"],
+        "[REDACTED]"
+    );
     assert!(
         !viewer_body.to_string().contains(secret_key),
         "viewer response leaked plugin secret: {viewer_body:?}"
@@ -443,6 +462,10 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
     assert!(
         !viewer_body.to_string().contains(nested_api_key),
         "viewer response leaked nested plugin secret: {viewer_body:?}"
+    );
+    assert!(
+        !viewer_body.to_string().contains(service_account_json),
+        "viewer response leaked service account JSON: {viewer_body:?}"
     );
 
     let (status, operator_body) =
@@ -458,6 +481,127 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
     let (status, list_body) = get_json(&base, "/plugins/config", &viewer).await;
     assert_eq!(status, 200, "viewer plugin list failed: {list_body:?}");
     assert_eq!(list_body["data"][0]["config"]["key"], "[REDACTED]");
+}
+
+#[tokio::test]
+async fn serverless_config_audit_and_non_admin_reads_redact_url_credentials() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let trigger_secret = "signed-trigger-secret";
+    let function_key = "azure-function-key-secret";
+    let plugin = json!({
+        "id": "serverless-redaction",
+        "plugin_name": "serverless_function",
+        "scope": "global",
+        "config": {
+            "provider": "azure_functions",
+            "function_url": format!(
+                "https://functions.example/private/{trigger_secret}?code={trigger_secret}"
+            ),
+            "azure_function_key": function_key
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "plugin create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=serverless-redaction",
+        &admin,
+        1,
+    )
+    .await;
+    let event = &audit_body["items"].as_array().expect("audit items")[0];
+    assert_eq!(
+        event["diff"]["after"]["config"]["function_url"],
+        "https://functions.example/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(
+        event["diff"]["after"]["config"]["azure_function_key"],
+        "[REDACTED]"
+    );
+
+    let (status, viewer_body) =
+        get_json(&base, "/plugins/config/serverless-redaction", &viewer).await;
+    assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
+    assert_eq!(
+        viewer_body["config"]["function_url"],
+        "https://functions.example/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(viewer_body["config"]["azure_function_key"], "[REDACTED]");
+    let serialized = format!("{event:?}{viewer_body:?}");
+    assert!(!serialized.contains(trigger_secret));
+    assert!(!serialized.contains(function_key));
+}
+
+#[tokio::test]
+async fn malformed_persisted_serverless_url_is_wholly_redacted_from_views_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let store = make_store(&tmp).await;
+    let nested_secret = "nested-signed-trigger-secret";
+    let plugin_id = "malformed-serverless-redaction";
+    store
+        .create_plugin_config(&PluginConfig {
+            id: plugin_id.to_string(),
+            plugin_name: "serverless_function".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "provider": "azure_functions",
+                "function_url": [
+                    null,
+                    {"nested": format!("https://functions.example/run?code={nested_secret}")}
+                ]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist malformed legacy plugin config");
+
+    let state = admin_state(store);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+
+    let (status, viewer_body) =
+        get_json(&base, &format!("/plugins/config/{plugin_id}"), &viewer).await;
+    assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
+    assert_eq!(viewer_body["config"]["function_url"], "[REDACTED]");
+    assert!(!viewer_body.to_string().contains(nested_secret));
+
+    let response = reqwest::Client::new()
+        .delete(format!("{base}/plugins/config/{plugin_id}"))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .expect("delete malformed persisted plugin config");
+    assert_eq!(response.status().as_u16(), 204);
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        &format!("/audit?resource_type=plugin_config&resource_id={plugin_id}"),
+        &admin,
+        1,
+    )
+    .await;
+    let event = &audit_body["items"].as_array().expect("audit items")[0];
+    assert_eq!(
+        event["diff"]["before"]["config"]["function_url"],
+        "[REDACTED]"
+    );
+    assert!(
+        !event["diff"].to_string().contains(nested_secret),
+        "malformed nested function URL leaked into audit: {event:?}"
+    );
 }
 
 #[tokio::test]

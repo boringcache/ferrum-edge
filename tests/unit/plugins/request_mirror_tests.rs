@@ -1,7 +1,7 @@
 use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::{
     HTTP_GRPC_PROTOCOLS, MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult,
-    RequestContext, TransactionSummary, log_with_mirror, priority,
+    RequestContext, TransactionSummary, create_plugin, log_with_mirror, priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -103,6 +103,89 @@ async fn test_mirror_result_logging_is_detached_from_primary_path() {
     assert!(!summaries[0].mirror);
     assert!(summaries[1].mirror);
     assert_eq!(summaries[1].response_status_code, 204);
+}
+
+#[test]
+fn test_mirror_summary_uses_its_own_terminal_outcome() {
+    let mut primary = TransactionSummary {
+        response_status_code: 200,
+        body_completed: true,
+        ..TransactionSummary::default()
+    };
+    primary
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    primary
+        .metadata
+        .insert("grpc_status".to_string(), "14".to_string());
+    primary
+        .metadata
+        .insert("grpc_message".to_string(), "primary failed".to_string());
+    primary
+        .metadata
+        .insert("rejection_phase".to_string(), "primary".to_string());
+
+    let successful_mirror = primary.as_mirror_entry(MirrorResponseMeta {
+        mirror_target_url: "http://mirror.local:8080/api/users".to_string(),
+        mirror_response_status_code: Some(204),
+        mirror_response_size_bytes: Some(0),
+        mirror_latency_ms: 10.0,
+        mirror_error: None,
+    });
+    assert!(successful_mirror.grpc_status().is_none());
+    assert!(!successful_mirror.is_terminal_failure());
+    assert!(!successful_mirror.metadata.contains_key("grpc_message"));
+    assert!(!successful_mirror.metadata.contains_key("rejection_phase"));
+    let successful_json = serde_json::to_value(&successful_mirror).unwrap();
+    assert!(successful_json.get("grpc_status").is_none());
+
+    primary
+        .metadata
+        .insert("grpc_status".to_string(), "0".to_string());
+    primary.metadata.remove("rejection_phase");
+    let failed_mirror = primary.as_mirror_entry(MirrorResponseMeta {
+        mirror_target_url: "http://mirror.local:8080/api/users".to_string(),
+        mirror_response_status_code: None,
+        mirror_response_size_bytes: None,
+        mirror_latency_ms: 10.0,
+        mirror_error: Some("connection refused".to_string()),
+    });
+    assert!(failed_mirror.grpc_status().is_none());
+    assert!(failed_mirror.is_terminal_failure());
+    assert_eq!(
+        failed_mirror
+            .metadata
+            .get("mirror_error")
+            .map(String::as_str),
+        Some("connection refused")
+    );
+}
+
+#[tokio::test]
+async fn expired_grpc_deadline_does_not_suppress_transaction_logging() {
+    let deadline_plugin = create_plugin("grpc_deadline", &json!({ "default_deadline_ms": 1 }))
+        .unwrap()
+        .unwrap();
+    let logger = Arc::new(CapturingMirrorLogger {
+        summaries: Mutex::new(Vec::new()),
+    });
+    let plugins: Vec<Arc<dyn Plugin>> = vec![deadline_plugin, logger.clone()];
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(matches!(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
+        PluginResult::Continue
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    log_with_mirror(&plugins, &TransactionSummary::default(), &ctx).await;
+
+    assert_eq!(
+        logger.summaries.lock().unwrap().len(),
+        1,
+        "client-visible deadline expiry must not suppress the gateway audit record"
+    );
 }
 
 // ---------------------------------------------------------------------------

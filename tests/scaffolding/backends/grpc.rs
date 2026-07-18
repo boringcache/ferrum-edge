@@ -80,6 +80,10 @@ pub enum GrpcStep {
     /// body). A mismatch increments `matcher_mismatches`; the script
     /// continues.
     AcceptRpc(MatchRpc),
+    /// Accept an RPC without draining its request body. Use for client-streaming
+    /// or bidirectional tests whose request direction deliberately remains open
+    /// while the backend starts its response.
+    AcceptStreamingRpc(MatchRpc),
     /// Send response headers for the current RPC. Default
     /// `content-type: application/grpc`. Callers may add/replace via
     /// [`Self::RespondHeadersOverride`].
@@ -95,6 +99,10 @@ pub enum GrpcStep {
     /// `grpc-message: <message>` when non-empty). Implicitly closes the
     /// stream.
     RespondStatus { code: u8, message: &'static str },
+    /// Send a deliberately malformed raw `grpc-status` trailer and close the
+    /// stream. This exists for gateway normalization/output tests that cannot
+    /// express invalid wire values through [`Self::RespondStatus`].
+    RespondRawStatus { value: &'static str },
     /// Send response headers + an optional payload, then close the stream
     /// WITHOUT any `grpc-status` trailer. Exercises the gateway's
     /// "missing trailers" INTERNAL fallback.
@@ -114,6 +122,8 @@ pub enum GrpcStep {
     SendGoaway { error_code: u32 },
     /// Send RST_STREAM on the current stream with `error_code`.
     SendRstStream { error_code: u32 },
+    /// Wait for the gateway to reset the current response stream.
+    ExpectReset(Duration),
 }
 
 /// Fluent builder for [`ScriptedGrpcBackend`].
@@ -219,6 +229,11 @@ impl ScriptedGrpcBackend {
         self.inner.received_stream_count()
     }
 
+    /// Number of gateway RST_STREAM frames observed by `ExpectReset`.
+    pub fn stream_reset_count(&self) -> u32 {
+        self.inner.stream_reset_count()
+    }
+
     /// Count of `AcceptRpc` matchers that returned `false`. See
     /// [`Self::assert_no_matcher_mismatches`].
     pub fn matcher_mismatches(&self) -> u32 {
@@ -264,6 +279,10 @@ fn lower_grpc_step(step: GrpcStep) -> Vec<H2Step> {
                 H2Step::DrainRequestBody,
             ]
         }
+        GrpcStep::AcceptStreamingRpc(matcher) => {
+            let match_headers = MatchHeaders::custom(move |s| (matcher.0)(s));
+            vec![H2Step::ExpectHeaders(match_headers)]
+        }
         GrpcStep::SendInitialHeaders => vec![H2Step::RespondHeaders(vec![
             (":status", "200".into()),
             ("content-type", "application/grpc".into()),
@@ -288,6 +307,10 @@ fn lower_grpc_step(step: GrpcStep) -> Vec<H2Step> {
             }
             vec![H2Step::RespondTrailers(trailers)]
         }
+        GrpcStep::RespondRawStatus { value } => vec![H2Step::RespondTrailers(vec![(
+            "grpc-status",
+            value.to_string(),
+        )])],
         GrpcStep::OmitTrailers { body } => {
             let headers = H2Step::RespondHeaders(vec![
                 (":status", "200".into()),
@@ -327,6 +350,7 @@ fn lower_grpc_step(step: GrpcStep) -> Vec<H2Step> {
         ],
         GrpcStep::SendGoaway { error_code } => vec![H2Step::SendGoawayAndClose { error_code }],
         GrpcStep::SendRstStream { error_code } => vec![H2Step::SendRstStream { error_code }],
+        GrpcStep::ExpectReset(duration) => vec![H2Step::ExpectReset(duration)],
     }
 }
 

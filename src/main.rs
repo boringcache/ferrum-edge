@@ -70,7 +70,6 @@ mod xds;
 use clap::Parser;
 use config::{AdminHttpExposure, EnvConfig, OperatingMode};
 use tracing::{Level, Metadata, debug, error, info, warn};
-use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::filter_fn;
@@ -92,23 +91,21 @@ pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// | `INFO`        | stdout | Normal operational telemetry — this is what log aggregators (Fluentd/Promtail/Vector) ship; belongs with the bulk of structured-JSON output. |
 /// | `DEBUG`/`TRACE` | stdout | Developer-facing verbose output, gated behind `FERRUM_LOG_LEVEL=debug`/`trace`. Staying on stdout keeps them in the same stream as INFO so developers tailing a container see a contiguous timeline. |
 ///
-/// Both sinks are `tracing_appender::non_blocking::NonBlocking`, so the hot
-/// path remains a channel send rather than a blocking I/O write. The
-/// corresponding `WorkerGuard`s are owned by `run_gateway()` so they drop
-/// (and flush buffered events) when it returns — see the ownership
-/// comment on those bindings for the full reasoning.
+/// Both sinks use Ferrum's bounded non-blocking worker, so the hot path remains
+/// an atomic admission plus fixed-queue push rather than blocking I/O. The worker
+/// guards are owned by `run_gateway()` and perform a bounded drain on exit.
 struct SeverityWriter {
-    stdout: NonBlocking,
-    stderr: NonBlocking,
+    stdout: logging::NonBlockingSink,
+    stderr: logging::NonBlockingSink,
 }
 
 impl<'a> MakeWriter<'a> for SeverityWriter {
-    type Writer = NonBlocking;
+    type Writer = logging::non_blocking::RecordWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
         // Called when no metadata is available (e.g., some tracing internals).
         // Default to stdout to match the pre-split behavior.
-        self.stdout.clone()
+        self.stdout.make_writer()
     }
 
     fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
@@ -116,8 +113,8 @@ impl<'a> MakeWriter<'a> for SeverityWriter {
         // See the type-level docstring above for the level → sink table
         // and the rationale for each row.
         match *meta.level() {
-            Level::ERROR | Level::WARN => self.stderr.clone(),
-            Level::INFO | Level::DEBUG | Level::TRACE => self.stdout.clone(),
+            Level::ERROR | Level::WARN => self.stderr.make_writer(),
+            Level::INFO | Level::DEBUG | Level::TRACE => self.stdout.make_writer(),
         }
     }
 }
@@ -229,9 +226,9 @@ fn main() {
     }
 
     // Initialize tracing/logging with non-blocking writers and run the
-    // rest of startup + the gateway in `run_gateway`. Keeping the tracing
-    // `WorkerGuard`s local to that helper (via its return path) ensures they
-    // drop — and thus flush — on EVERY exit path, including errors. A
+    // rest of startup + the gateway in `run_gateway`. Keeping the bounded
+    // worker guards local to that helper ensures every exit path
+    // attempts its configured drain, including errors. A
     // `std::process::exit()` inline inside main would bypass the guards'
     // destructors and silently drop buffered log events, which is exactly
     // what would make a test captor of stderr see nothing after a fatal
@@ -242,29 +239,102 @@ fn main() {
     }
 }
 
-fn init_logging() -> (WorkerGuard, WorkerGuard) {
-    let log_buffer_capacity: usize =
-        config::conf_file::resolve_ferrum_var("FERRUM_LOG_BUFFER_CAPACITY")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(128_000);
+struct LoggingGuards {
+    stdout: Option<logging::WorkerGuard>,
+    stderr: Option<logging::WorkerGuard>,
+}
+
+impl Drop for LoggingGuards {
+    fn drop(&mut self) {
+        // Keep stderr accepting while stdout drains so the stdout worker can
+        // emit at most one rate-limited constant failure notice to the separate
+        // stderr queue. Neither path writes recursively into stdout.
+        if let Some(mut stdout) = self.stdout.take() {
+            let _ = stdout.shutdown();
+        }
+        if let Some(mut stderr) = self.stderr.take() {
+            let _ = stderr.shutdown();
+        }
+    }
+}
+
+struct ResolvedLoggingUsize {
+    name: &'static str,
+    applied: usize,
+    supplied: Option<usize>,
+}
+
+fn resolve_logging_usize(
+    name: &'static str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<ResolvedLoggingUsize, String> {
+    let Some(value) = config::conf_file::resolve_ferrum_var(name) else {
+        return Ok(ResolvedLoggingUsize {
+            name,
+            applied: default,
+            supplied: None,
+        });
+    };
+    let supplied = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {name}: expected an unsigned integer"))?;
+    Ok(ResolvedLoggingUsize {
+        name,
+        applied: supplied.clamp(min, max),
+        supplied: Some(supplied),
+    })
+}
+
+fn init_logging() -> Result<LoggingGuards, String> {
+    let log_buffer_capacity = resolve_logging_usize(
+        "FERRUM_LOG_BUFFER_CAPACITY",
+        logging::LOG_BUFFER_CAPACITY_DEFAULT,
+        logging::LOG_BUFFER_CAPACITY_MIN,
+        logging::LOG_BUFFER_CAPACITY_MAX,
+    )?;
+    let max_record_bytes = resolve_logging_usize(
+        "FERRUM_LOG_MAX_RECORD_BYTES",
+        logging::LOG_MAX_RECORD_BYTES_DEFAULT,
+        logging::LOG_MAX_RECORD_BYTES_MIN,
+        logging::LOG_MAX_RECORD_BYTES_MAX,
+    )?;
+    let log_buffer_bytes = resolve_logging_usize(
+        "FERRUM_LOG_BUFFER_BYTES",
+        logging::LOG_BUFFER_BYTES_DEFAULT,
+        logging::LOG_BUFFER_BYTES_MIN.max(max_record_bytes.applied),
+        logging::LOG_BUFFER_BYTES_MAX,
+    )?;
+    let shutdown_timeout_ms = resolve_logging_usize(
+        "FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS",
+        logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT,
+        logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MIN,
+        logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MAX,
+    )?;
+    let options = logging::NonBlockingOptions {
+        record_capacity: log_buffer_capacity.applied,
+        byte_capacity: log_buffer_bytes.applied,
+        max_record_bytes: max_record_bytes.applied,
+        shutdown_timeout: std::time::Duration::from_millis(shutdown_timeout_ms.applied as u64),
+    };
     let (stdout_writer, stdout_guard) =
-        tracing_appender::non_blocking::NonBlockingBuilder::default()
-            .buffered_lines_limit(log_buffer_capacity)
-            .finish(std::io::stdout());
+        logging::NonBlockingSink::spawn(logging::SinkName::Stdout, std::io::stdout(), options)
+            .map_err(|error| format!("failed to start stdout logging worker: {error}"))?;
     let (stderr_writer, stderr_guard) =
-        tracing_appender::non_blocking::NonBlockingBuilder::default()
-            .buffered_lines_limit(log_buffer_capacity)
-            .finish(std::io::stderr());
+        logging::NonBlockingSink::spawn(logging::SinkName::Stderr, std::io::stderr(), options)
+            .map_err(|error| format!("failed to start stderr logging worker: {error}"))?;
+    stdout_writer.set_failure_fallback(stderr_writer.clone())?;
     // Hand the access-log sink (the `stdout_logging` plugin) a clone of the
     // non-blocking stdout writer so per-transaction JSON lines go through the
     // same backpressure-aware worker thread the tracing layers use, but
     // bypass the `EnvFilter`/`SeverityWriter` stack. That keeps access logs
-    // (a) off the Tokio hot path — a channel send, never a blocking
+    // (a) off the Tokio hot path — a fixed-queue push, never a blocking
     // `stdout().lock()` write — and (b) decoupled from `FERRUM_LOG_LEVEL`, so
     // lowering runtime verbosity never silences them and the plugin's
     // enablement is the only on/off switch. Set before the branches below
     // move `stdout_writer` into the fallback fmt layer.
-    crate::logging::set_access_log_writer(stdout_writer.clone());
+    crate::logging::set_process_log_sinks(stdout_writer.clone(), stderr_writer.clone())?;
     let log_level =
         config::conf_file::resolve_ferrum_var("FERRUM_LOG_LEVEL").unwrap_or_else(|| "warn".into());
     let log_counter_enabled =
@@ -333,7 +403,28 @@ fn init_logging() -> (WorkerGuard, WorkerGuard) {
         }
     }
 
-    (stdout_guard, stderr_guard)
+    for resolved in [
+        &log_buffer_capacity,
+        &log_buffer_bytes,
+        &max_record_bytes,
+        &shutdown_timeout_ms,
+    ] {
+        if let Some(supplied) = resolved.supplied
+            && supplied != resolved.applied
+        {
+            warn!(
+                variable = resolved.name,
+                supplied_value = supplied,
+                applied_value = resolved.applied,
+                "logging configuration value was clamped"
+            );
+        }
+    }
+
+    Ok(LoggingGuards {
+        stdout: Some(stdout_guard),
+        stderr: Some(stderr_guard),
+    })
 }
 
 /// Adapter that turns a `tracing_subscriber::reload::Handle` into the
@@ -372,20 +463,24 @@ where
 /// Runs startup secret resolution, logging init, env-config parsing, and the
 /// gateway runtime. Returns the process exit code.
 ///
-/// All `tracing_appender::non_blocking::WorkerGuard`s are local here, so
-/// any path out of this function (early return on error or fall-through on
-/// success) runs their `Drop` impls and flushes any buffered events before
-/// `main()` calls `std::process::exit()`. This is the invariant that lets
-/// error-level events actually reach stderr instead of being abandoned in
-/// the non-blocking writer's channel at process termination. Normal startup
-/// resolves secrets before those logging threads exist so the temporary
-/// runtime can fully shut down before unsafe env mutation.
+/// The bounded logging guards are local here, so every return path attempts a
+/// lifecycle-owned drain before `main()` can call `std::process::exit()`.
+/// Drain timeout and incomplete-record accounting are explicit rather than
+/// hidden inside a dependency guard. Normal startup resolves secrets before
+/// these worker threads exist so the temporary runtime can fully shut down
+/// before unsafe env mutation.
 fn run_gateway(cli: &cli::Cli) -> i32 {
     // Handle validate subcommand: load config, validate, exit.
     // Runs after crypto + logging init so TLS cert checks and tracing work,
     // but before secret resolution and the multi-threaded runtime.
     if matches!(&cli.command, Some(cli::Command::Validate(_))) {
-        let (_stdout_guard, _stderr_guard) = init_logging();
+        let _logging_guards = match init_logging() {
+            Ok(guards) => guards,
+            Err(error) => {
+                emit_bootstrap_error("logging initialization failed", &[("error", error)]);
+                return 1;
+            }
+        };
         match cli::execute_validate() {
             Ok(()) => return 0,
             Err(e) => {
@@ -434,7 +529,13 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         }
     }
 
-    let (_stdout_guard, _stderr_guard) = init_logging();
+    let _logging_guards = match init_logging() {
+        Ok(guards) => guards,
+        Err(error) => {
+            emit_bootstrap_error("logging initialization failed", &[("error", error)]);
+            return 1;
+        }
+    };
 
     // Raise the soft FD cap to the hard cap before any subsystem opens
     // sockets. The call never asks for privileges we don't have (it caps at
@@ -634,13 +735,9 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             }
             Err(e) => {
                 // `error!` events are routed to stderr by `SeverityWriter`.
-                // The tracing appender's `WorkerGuard`s are held in the
-                // caller (`run_gateway`); returning from this closure +
-                // returning from `run_gateway` drops them in order, which
-                // flushes any buffered events to their respective sinks
-                // before `main` calls `std::process::exit`. Inline
-                // `std::process::exit` would bypass those destructors and
-                // lose the fatal event.
+                // The bounded worker guards are held in `run_gateway`;
+                // returning drains them before `main` may exit. Inline
+                // `std::process::exit` would bypass that accounting.
                 error!("Fatal error: {}", e);
                 1
             }

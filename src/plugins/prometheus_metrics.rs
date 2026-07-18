@@ -15,7 +15,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use super::mesh::prometheus_helpers::{self, MeshRequestKey};
-use super::{Direction, Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
+use super::{
+    AI_COST_SUBMICRO_SCALE, AiCost, Direction, Plugin, StreamTransactionSummary,
+    TransactionSummary, WsDisconnectContext,
+};
 use crate::ebpf::NodeAgentMetrics;
 use crate::retry::ErrorClass;
 
@@ -52,6 +55,28 @@ pub struct CounterKey {
     pub method: &'static str,
     pub status_code: u16,
     pub grpc_status: Option<&'static str>,
+}
+
+/// Bounded AI usage key. Provider is normalized to one of the compiled-in
+/// provider labels; raw model names and arbitrary metadata never become labels.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AiUsageKey {
+    pub proxy_id: Arc<str>,
+    pub provider: &'static str,
+}
+
+fn ai_provider_label(value: &str) -> Option<&'static str> {
+    match value {
+        "openai" | "azure_openai" | "xai" | "deepseek" | "meta_llama" | "hugging_face" => {
+            Some("openai")
+        }
+        "anthropic" => Some("anthropic"),
+        "google" | "google_gemini" | "google_vertex" => Some("google"),
+        "cohere" => Some("cohere"),
+        "mistral" => Some("mistral"),
+        "bedrock" | "aws_bedrock" => Some("bedrock"),
+        _ => None,
+    }
 }
 
 /// Composite key for stream connection counter: (proxy_id, protocol).
@@ -324,10 +349,93 @@ impl TimestampedCounter {
             .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
+    fn saturating_add(&self, value: u64, epoch: Instant) {
+        let _ = self
+            .value
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(value))
+            });
+        self.last_updated
+            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
     fn nanos_since_update(&self, epoch: Instant) -> u64 {
         let now = epoch.elapsed().as_nanos() as u64;
         let last = self.last_updated.load(Ordering::Relaxed);
         now.saturating_sub(last)
+    }
+}
+
+/// Fixed-point cost counter that retains sub-micro remainders without reducing
+/// the supported whole-cost range. Both fields remain bounded atomics on the
+/// logging hot path; fractional carry is applied with a lock-free update.
+pub struct TimestampedCostCounter {
+    pub microunits: CachePadded<AtomicU64>,
+    pub submicrounits: CachePadded<AtomicU64>,
+    published_microunits: CachePadded<AtomicU64>,
+    pub last_updated: CachePadded<AtomicU64>,
+}
+
+impl TimestampedCostCounter {
+    fn new(epoch: Instant) -> Self {
+        Self {
+            microunits: CachePadded::new(AtomicU64::new(0)),
+            submicrounits: CachePadded::new(AtomicU64::new(0)),
+            published_microunits: CachePadded::new(AtomicU64::new(0)),
+            last_updated: CachePadded::new(AtomicU64::new(epoch.elapsed().as_nanos() as u64)),
+        }
+    }
+
+    fn add_microunits(&self, value: u64) {
+        let _ = self
+            .microunits
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(value))
+            });
+    }
+
+    fn add(&self, value: &AiCost, epoch: Instant) {
+        self.add_microunits(
+            value
+                .microunits
+                .saturating_add(value.submicrounits / AI_COST_SUBMICRO_SCALE),
+        );
+        let submicrounits = value.submicrounits % AI_COST_SUBMICRO_SCALE;
+        if submicrounits != 0 {
+            let mut carried = false;
+            let _ =
+                self.submicrounits
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        let sum = current + submicrounits;
+                        carried = sum >= AI_COST_SUBMICRO_SCALE;
+                        Some(sum % AI_COST_SUBMICRO_SCALE)
+                    });
+            if carried {
+                self.add_microunits(1);
+            }
+        }
+        // Whole and fractional updates are deliberately split so the full
+        // supported whole-cost range remains available. Publish only after
+        // both parts have settled, and advance the scrape-facing value with
+        // one monotonic atomic so a concurrent carry gap can only delay an
+        // increase, never expose a counter decrease.
+        let whole = self.microunits.load(Ordering::Relaxed);
+        let remainder = self.submicrounits.load(Ordering::Relaxed);
+        let rounded = whole.saturating_add(u64::from(remainder >= AI_COST_SUBMICRO_SCALE / 2));
+        self.published_microunits
+            .fetch_max(rounded, Ordering::Release);
+        self.last_updated
+            .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn nanos_since_update(&self, epoch: Instant) -> u64 {
+        let now = epoch.elapsed().as_nanos() as u64;
+        let last = self.last_updated.load(Ordering::Relaxed);
+        now.saturating_sub(last)
+    }
+
+    fn rounded_microunits(&self) -> u64 {
+        self.published_microunits.load(Ordering::Acquire)
     }
 }
 
@@ -434,12 +542,30 @@ pub struct MetricsRegistry {
     pub backend_duration_buckets: DashMap<Arc<str>, HistogramBuckets>,
     /// Gateway overhead histogram buckets by proxy_id
     pub gateway_overhead_buckets: DashMap<Arc<str>, HistogramBuckets>,
+    /// Prompt tokens from one selected ai_token_metrics instance per request.
+    pub ai_prompt_tokens_counter: DashMap<AiUsageKey, TimestampedCounter>,
+    /// Completion tokens from one selected ai_token_metrics instance per request.
+    pub ai_completion_tokens_counter: DashMap<AiUsageKey, TimestampedCounter>,
+    /// Total tokens from one selected ai_token_metrics instance per request.
+    pub ai_total_tokens_counter: DashMap<AiUsageKey, TimestampedCounter>,
+    /// Estimated configured-currency cost with a retained sub-micro remainder.
+    pub ai_estimated_cost_counter: DashMap<AiUsageKey, TimestampedCostCounter>,
     /// Mesh request count by Istio/GAMMA RED label set.
     pub mesh_request_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Mesh request duration histogram by the same bounded RED label set.
     pub mesh_request_duration_buckets: DashMap<MeshRequestKey, HistogramBuckets>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
+    /// Current ai_federation circuits in an open/half-open recovery state.
+    ai_federation_circuits_open: AtomicI64,
+    /// ai_federation closed-to-open transitions.
+    ai_federation_circuits_opened: AtomicU64,
+    /// ai_federation half-open-to-closed recoveries.
+    ai_federation_circuits_closed: AtomicU64,
+    /// ai_federation half-open probes admitted.
+    ai_federation_circuit_half_open_probes: AtomicU64,
+    /// Provider attempts skipped because an ai_federation circuit was open.
+    ai_federation_circuit_open_skips: AtomicU64,
     /// Stream connections by (proxy_id, protocol)
     pub stream_connection_counter: DashMap<StreamCounterKey, TimestampedCounter>,
     /// Stream connection duration histogram by proxy_id
@@ -544,9 +670,18 @@ impl MetricsRegistry {
             request_duration_buckets: DashMap::new(),
             backend_duration_buckets: DashMap::new(),
             gateway_overhead_buckets: DashMap::new(),
+            ai_prompt_tokens_counter: DashMap::new(),
+            ai_completion_tokens_counter: DashMap::new(),
+            ai_total_tokens_counter: DashMap::new(),
+            ai_estimated_cost_counter: DashMap::new(),
             mesh_request_counter: DashMap::new(),
             mesh_request_duration_buckets: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
+            ai_federation_circuits_open: AtomicI64::new(0),
+            ai_federation_circuits_opened: AtomicU64::new(0),
+            ai_federation_circuits_closed: AtomicU64::new(0),
+            ai_federation_circuit_half_open_probes: AtomicU64::new(0),
+            ai_federation_circuit_open_skips: AtomicU64::new(0),
             stream_connection_counter: DashMap::new(),
             stream_duration_buckets: DashMap::new(),
             ws_session_counter: DashMap::new(),
@@ -602,6 +737,7 @@ impl MetricsRegistry {
         if let Ok(mut ns_label) = self.namespace_label.write() {
             *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
         }
+        self.render_cache.store(Arc::new(None));
     }
 
     pub fn record_stream(&self, summary: &StreamTransactionSummary) {
@@ -697,6 +833,46 @@ impl MetricsRegistry {
     /// rate-limiter plugin.
     pub fn record_rate_limit_exceeded(&self) {
         self.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_ai_federation_circuit_opened(&self) {
+        self.ai_federation_circuits_open
+            .fetch_add(1, Ordering::Relaxed);
+        self.ai_federation_circuits_opened
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_ai_federation_circuit_closed(&self) {
+        let _ = self.ai_federation_circuits_open.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+        self.ai_federation_circuits_closed
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn release_ai_federation_open_circuit(&self) {
+        let _ = self.ai_federation_circuits_open.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_ai_federation_half_open_probe(&self) {
+        self.ai_federation_circuit_half_open_probes
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_ai_federation_open_skip(&self) {
+        self.ai_federation_circuit_open_skips
+            .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
     }
 
@@ -1001,6 +1177,39 @@ impl MetricsRegistry {
             .or_insert_with(|| HistogramBuckets::new(self.epoch))
             .observe(summary.latency_gateway_overhead_ms, self.epoch);
 
+        if let Some(usage) = summary.ai_usage_export.as_ref()
+            && let Some(provider) = ai_provider_label(usage.provider)
+        {
+            let key = AiUsageKey {
+                proxy_id: Arc::clone(&proxy_id),
+                provider,
+            };
+            if let Some(value) = usage.prompt_tokens {
+                self.ai_prompt_tokens_counter
+                    .entry(key.clone())
+                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                    .saturating_add(value, self.epoch);
+            }
+            if let Some(value) = usage.completion_tokens {
+                self.ai_completion_tokens_counter
+                    .entry(key.clone())
+                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                    .saturating_add(value, self.epoch);
+            }
+            if let Some(value) = usage.total_tokens {
+                self.ai_total_tokens_counter
+                    .entry(key.clone())
+                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                    .saturating_add(value, self.epoch);
+            }
+            if let Some(value) = usage.cost.as_ref() {
+                self.ai_estimated_cost_counter
+                    .entry(key)
+                    .or_insert_with(|| TimestampedCostCounter::new(self.epoch))
+                    .add(value, self.epoch);
+            }
+        }
+
         if let Some(mesh_key) = mesh_key {
             if !prometheus_helpers::mesh_metric_disabled(
                 summary,
@@ -1098,6 +1307,27 @@ impl MetricsRegistry {
 
         self.gateway_overhead_buckets.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        for counters in [
+            &self.ai_prompt_tokens_counter,
+            &self.ai_completion_tokens_counter,
+            &self.ai_total_tokens_counter,
+        ] {
+            counters.retain(|_, value| {
+                let keep = value.nanos_since_update(self.epoch) < ttl_nanos;
+                if !keep {
+                    evicted += 1;
+                }
+                keep
+            });
+        }
+        self.ai_estimated_cost_counter.retain(|_, value| {
+            let keep = value.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
                 evicted += 1;
             }
@@ -1306,6 +1536,10 @@ impl MetricsRegistry {
             + self.request_duration_buckets.len() * 800
             + self.backend_duration_buckets.len() * 800
             + self.gateway_overhead_buckets.len() * 800
+            + self.ai_prompt_tokens_counter.len() * 180
+            + self.ai_completion_tokens_counter.len() * 180
+            + self.ai_total_tokens_counter.len() * 180
+            + self.ai_estimated_cost_counter.len() * 300
             + self.mesh_request_counter.len() * 600
             + self.mesh_request_duration_buckets.len() * 1800
             + self.stream_connection_counter.len() * 200
@@ -1376,6 +1610,47 @@ impl MetricsRegistry {
                 output.push_str(&format!(
                     "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"{}}} {}\n",
                     proxy_id, key.method, key.status_code, ns_label, count
+                ));
+            }
+        }
+
+        render_ai_counter_family(
+            &mut output,
+            "ferrum_ai_prompt_tokens_total",
+            "Prompt tokens reported by AI providers.",
+            &self.ai_prompt_tokens_counter,
+            &ns_label,
+        );
+        render_ai_counter_family(
+            &mut output,
+            "ferrum_ai_completion_tokens_total",
+            "Completion tokens reported by AI providers.",
+            &self.ai_completion_tokens_counter,
+            &ns_label,
+        );
+        render_ai_counter_family(
+            &mut output,
+            "ferrum_ai_tokens_total",
+            "Total tokens reported by AI providers.",
+            &self.ai_total_tokens_counter,
+            &ns_label,
+        );
+        if !self.ai_estimated_cost_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_ai_estimated_cost_currency_units_total Estimated AI cost in the configured currency units, retaining sub-micro precision and rounding the aggregate to six decimals.\n",
+            );
+            output.push_str("# TYPE ferrum_ai_estimated_cost_currency_units_total counter\n");
+            for entry in self.ai_estimated_cost_counter.iter() {
+                let key = entry.key();
+                let value = entry.value().rounded_microunits();
+                let proxy_id = escape_label_value(&key.proxy_id);
+                output.push_str(&format!(
+                    "ferrum_ai_estimated_cost_currency_units_total{{proxy_id=\"{}\",provider=\"{}\"{}}} {}.{:06}\n",
+                    proxy_id,
+                    key.provider,
+                    ns_label,
+                    value / 1_000_000,
+                    value % 1_000_000
                 ));
             }
         }
@@ -1476,6 +1751,45 @@ impl MetricsRegistry {
                 namespace_label_body(&ns_label),
                 self.rate_limit_exceeded.load(Ordering::Relaxed)
             ));
+        }
+
+        output.push_str(
+            "# HELP ferrum_ai_federation_circuits_open Current ai_federation provider circuits in open or half-open recovery state.\n",
+        );
+        output.push_str("# TYPE ferrum_ai_federation_circuits_open gauge\n");
+        render_process_gauge(
+            &mut output,
+            "ferrum_ai_federation_circuits_open",
+            self.ai_federation_circuits_open.load(Ordering::Relaxed),
+            &ns_label,
+        );
+        for (name, help, value) in [
+            (
+                "ferrum_ai_federation_circuits_opened_total",
+                "ai_federation provider circuit closed-to-open transitions.",
+                self.ai_federation_circuits_opened.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_ai_federation_circuits_closed_total",
+                "ai_federation provider circuit half-open recoveries.",
+                self.ai_federation_circuits_closed.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_ai_federation_circuit_half_open_probes_total",
+                "ai_federation provider half-open probes admitted.",
+                self.ai_federation_circuit_half_open_probes
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_ai_federation_circuit_open_skips_total",
+                "ai_federation provider attempts skipped by an open circuit.",
+                self.ai_federation_circuit_open_skips
+                    .load(Ordering::Relaxed),
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            render_process_counter(&mut output, name, value, &ns_label);
         }
 
         // Stream connection counter
@@ -2075,7 +2389,41 @@ impl MetricsRegistry {
     }
 }
 
+fn render_ai_counter_family(
+    output: &mut String,
+    metric_name: &str,
+    help: &str,
+    counters: &DashMap<AiUsageKey, TimestampedCounter>,
+    ns_label: &str,
+) {
+    if counters.is_empty() {
+        return;
+    }
+    output.push_str(&format!("# HELP {metric_name} {help}\n"));
+    output.push_str(&format!("# TYPE {metric_name} counter\n"));
+    for entry in counters.iter() {
+        let key = entry.key();
+        let value = entry.value().value.load(Ordering::Relaxed);
+        let proxy_id = escape_label_value(&key.proxy_id);
+        output.push_str(&format!(
+            "{metric_name}{{proxy_id=\"{}\",provider=\"{}\"{}}} {}\n",
+            proxy_id, key.provider, ns_label, value
+        ));
+    }
+}
+
 fn render_process_counter(output: &mut String, metric_name: &str, value: u64, ns_label: &str) {
+    if ns_label.is_empty() {
+        output.push_str(&format!("{metric_name} {value}\n"));
+    } else {
+        output.push_str(&format!(
+            "{metric_name}{{{}}} {value}\n",
+            namespace_label_body(ns_label)
+        ));
+    }
+}
+
+fn render_process_gauge(output: &mut String, metric_name: &str, value: i64, ns_label: &str) {
     if ns_label.is_empty() {
         output.push_str(&format!("{metric_name} {value}\n"));
     } else {

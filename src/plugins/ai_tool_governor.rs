@@ -672,8 +672,9 @@ impl GovernorEngine {
     /// cannot rewrite the arguments in place — mid-stream SSE deltas, the
     /// request body (no request-body transform), and the post-transform final
     /// response re-check — the safe behavior is to reject rather than forward an
-    /// unredacted secret. Only the buffered response path (which has a
-    /// `transform_response_body` redaction hook) passes `false`.
+    /// unredacted secret. Only a buffered response whose status permits the
+    /// `transform_response_body` redaction hook passes `false`; range/delta
+    /// representations preserve their bytes and therefore pass `true`.
     async fn govern_calls(
         &self,
         corr: &CorrelationMeta,
@@ -1241,12 +1242,17 @@ impl AiToolGovernor {
         model: Option<String>,
         provider: Option<&str>,
     ) -> CorrelationMeta {
+        let request_id = ctx
+            .canonical_correlation_id()
+            .or_else(|| {
+                [super::REQUEST_ID_METADATA_KEY, "correlation_id"]
+                    .into_iter()
+                    .filter_map(|key| ctx.metadata.get(key).map(String::as_str))
+                    .find(|value| !value.is_empty())
+            })
+            .unwrap_or_default();
         CorrelationMeta {
-            request_id: ctx
-                .metadata
-                .get("correlation_id")
-                .cloned()
-                .unwrap_or_default(),
+            request_id: request_id.to_string(),
             consumer: ctx.effective_identity().map(str::to_string),
             proxy: ctx
                 .matched_proxy
@@ -2600,7 +2606,12 @@ impl Plugin for AiToolGovernor {
 
         let batch = self
             .engine
-            .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, false)
+            .govern_calls(
+                &corr,
+                &calls,
+                &ctx.plugin_http_call_ns,
+                !super::response_body_rewrite_allowed(response_status),
+            )
             .await;
         self.write_metadata(ctx, &batch);
 
@@ -2612,6 +2623,16 @@ impl Plugin for AiToolGovernor {
                 batch.deny_reason.as_deref().unwrap_or("blocked")
             );
             return self.reject(&batch);
+        }
+        if ctx.deduplication_replay_response_finalized
+            && self.engine.mode == Mode::Enforce
+            && batch
+                .per_call
+                .iter()
+                .any(|decision| !decision.redact_patterns.is_empty())
+        {
+            ctx.ai_tool_governor_replay_redactions
+                .insert(self.instance_id);
         }
         // Record the governed calls with multiset counts so the final re-check
         // skips them one-for-one. Approval-capable calls use correlation-aware
@@ -2694,6 +2715,11 @@ impl Plugin for AiToolGovernor {
             return Some(rewritten);
         }
         None
+    }
+
+    fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
+        ctx.ai_tool_governor_replay_redactions
+            .contains(&self.instance_id)
     }
 
     /// Re-run the deterministic response policy on the FINAL client-visible body.

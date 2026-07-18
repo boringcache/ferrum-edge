@@ -96,6 +96,11 @@ pub async fn run_response_stream_termination_hooks(
     response_status: u16,
     outcome: &BodyOutcome,
 ) {
+    // These hooks finalize gateway-owned stream state after the client-visible
+    // body has terminated. In particular, a deadline-expired stream still
+    // needs its inspector aggregate, termination hook, and transaction log.
+    // Reusing the client deadline here would make timed-out traffic vanish
+    // from exactly the cleanup/observability path meant to record it.
     crate::plugins::wait_for_response_stream_inspector(ctx).await;
     for plugin in plugins {
         plugin
@@ -400,6 +405,8 @@ mod tests {
             summary.metadata.get("grpc_status").map(String::as_str),
             Some("14")
         );
+        assert_eq!(summary.grpc_status(), Some(14));
+        assert!(summary.is_terminal_failure());
         assert_eq!(summary.response_status_code, 200);
     }
 
@@ -425,6 +432,8 @@ mod tests {
             summary.metadata.get("grpc_status").map(String::as_str),
             Some("2")
         );
+        assert_eq!(summary.grpc_status(), Some(2));
+        assert!(summary.is_terminal_failure());
     }
 
     #[tokio::test]

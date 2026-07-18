@@ -20,6 +20,11 @@ message SubscribeRequest {
   string ferrum_version = 2;
   // Namespace this DP instance loads and proxies
   string namespace = 3;
+  // Effective FERRUM_REAL_IP_HEADER on this DP. An explicitly present empty
+  // string means no authoritative header is configured. CP requires this
+  // field and rejects a mismatch before streaming configuration so plugin
+  // ownership admission uses one enforced cluster-wide value.
+  optional string real_ip_header = 4;
 }
 
 message FullConfigRequest {
@@ -28,6 +33,8 @@ message FullConfigRequest {
   string ferrum_version = 2;
   // Namespace to load config for
   string namespace = 3;
+  // Same required effective-header advertisement as SubscribeRequest.
+  optional string real_ip_header = 4;
 }
 
 message FullConfigResponse {

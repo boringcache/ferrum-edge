@@ -153,6 +153,10 @@ pub enum H2Step {
     SendGoawayAndClose { error_code: u32 },
     /// Send RST_STREAM on the current stream with the given H2 error code.
     SendRstStream { error_code: u32 },
+    /// Wait for the client to reset the current response stream. The step
+    /// fails if no RST_STREAM arrives within `duration` and increments the
+    /// backend's reset counter when one is observed.
+    ExpectReset(Duration),
     /// Pause for `duration` without advancing the connection. Clients that
     /// exceed `backend_write_timeout_ms` while waiting for the next DATA
     /// frame will fire their watchdog here.
@@ -429,6 +433,11 @@ impl ScriptedH2Backend {
         self.state.stream_count.load(Ordering::SeqCst)
     }
 
+    /// Number of client-side RST_STREAM frames observed by `ExpectReset`.
+    pub fn stream_reset_count(&self) -> u32 {
+        self.state.stream_resets.load(Ordering::SeqCst)
+    }
+
     /// Number of `ExpectHeaders` matchers that returned `false`. Tests using
     /// non-trivial matchers should call [`Self::assert_no_matcher_mismatches`].
     pub fn matcher_mismatches(&self) -> u32 {
@@ -493,6 +502,7 @@ struct H2State {
     accepted: AtomicU32,
     handshakes: AtomicU32,
     stream_count: AtomicU32,
+    stream_resets: AtomicU32,
     matcher_mismatches: AtomicU32,
     streams: Mutex<Vec<ReceivedStream>>,
     step_errors: Mutex<Vec<String>>,
@@ -843,6 +853,27 @@ async fn run_script(
                 }
                 if let Some(cs) = current_stream.as_mut() {
                     cs.send.send_reset(reason);
+                }
+            }
+            H2Step::ExpectReset(duration) => {
+                let reset = {
+                    let Some(sender) = current_body_sender.as_mut() else {
+                        return Err("ExpectReset: no response stream is open".into());
+                    };
+                    tokio::time::timeout(duration, std::future::poll_fn(|cx| sender.poll_reset(cx)))
+                        .await
+                };
+                match reset {
+                    Ok(Ok(_reason)) => {
+                        state.stream_resets.fetch_add(1, Ordering::SeqCst);
+                        current_body_sender = None;
+                    }
+                    Ok(Err(error)) => {
+                        return Err(format!("ExpectReset: polling reset failed: {error}"));
+                    }
+                    Err(_) => {
+                        return Err(format!("ExpectReset: no stream reset within {duration:?}"));
+                    }
                 }
             }
             H2Step::Sleep(d) | H2Step::StallWindowFor(d) => {

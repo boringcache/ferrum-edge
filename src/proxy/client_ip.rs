@@ -2,9 +2,10 @@
 //!
 //! When the gateway sits behind load balancers, CDNs, or reverse proxies, the
 //! TCP socket address (`remote_addr`) is the proxy's IP — not the real client's.
-//! This module resolves the true originating client IP by walking the
-//! `X-Forwarded-For` (XFF) chain from right to left, stripping entries that
-//! belong to trusted proxies.
+//! This module resolves the true originating client IP from `X-Forwarded-For`
+//! (XFF) and recognizes the original HTTP or HTTPS scheme from
+//! `X-Forwarded-Proto`, but only when the direct peer belongs to the
+//! trusted-proxy set.
 //!
 //! # Security model
 //!
@@ -62,7 +63,7 @@ impl TrustedProxies {
         }
         if !cidrs.is_empty() {
             tracing::info!(
-                "Configured {} trusted proxy CIDR(s) for X-Forwarded-For resolution",
+                "Configured {} trusted proxy CIDR(s) for forwarded client metadata",
                 cidrs.len()
             );
         }
@@ -82,7 +83,7 @@ impl TrustedProxies {
         Ok(Self { cidrs })
     }
 
-    /// Returns an empty set (no trusted proxies — XFF headers will be ignored).
+    /// Returns an empty set (forwarded client metadata will be ignored).
     #[allow(dead_code)] // Used by tests
     pub fn none() -> Self {
         Self {
@@ -118,6 +119,101 @@ impl TrustedProxies {
             .0
             .permits_all_family()
     }
+}
+
+/// Return the original HTTP-family client-facing scheme reported through a
+/// trusted proxy chain.
+///
+/// A singleton `X-Forwarded-Proto` value is the overwrite-only contract: the
+/// directly connected trusted proxy vouches for that original scheme. A
+/// multi-value list is accepted only when it has the same cardinality as the
+/// `X-Forwarded-For` list. Its scheme is selected at the first untrusted XFF
+/// entry found after walking the validated trusted suffix from right to left,
+/// so safely appended chains preserve the browser-facing value instead of the
+/// nearest hop's value. Malformed or misaligned trusted suffixes return `None`.
+/// Callers must never use this result for an untrusted socket peer because the
+/// headers may then be client-controlled.
+pub fn trusted_forwarded_request_scheme<'a, 'b>(
+    socket_addr: &IpAddr,
+    forwarded_for_values: impl IntoIterator<Item = &'a [u8]>,
+    forwarded_proto_values: impl IntoIterator<Item = &'b [u8]>,
+    trusted_proxies: &TrustedProxies,
+) -> Option<&'static str> {
+    if !trusted_proxies.contains(socket_addr) {
+        return None;
+    }
+
+    // Track the rightmost non-trusted XFF entry without allocating a temporary
+    // vector. Any malformed entry clears the candidate; a later untrusted
+    // entry restores it because that later entry is the boundary reached first
+    // by the canonical right-to-left trust walk.
+    let mut forwarded_for_count = 0usize;
+    let mut client_boundary = None;
+    for value in forwarded_for_values {
+        for entry in value.split(|byte| *byte == b',') {
+            let index = forwarded_for_count;
+            forwarded_for_count += 1;
+            let entry = trim_header_ows(entry);
+            client_boundary = match std::str::from_utf8(entry)
+                .ok()
+                .and_then(|entry| entry.parse::<IpAddr>().ok())
+            {
+                Some(ip) if trusted_proxies.contains(&ip) => client_boundary,
+                Some(_) => Some(index),
+                None => None,
+            };
+        }
+    }
+
+    let mut forwarded_proto_count = 0usize;
+    let mut singleton_proto = None;
+    let mut boundary_proto = None;
+    let mut trusted_proto_suffix_valid = true;
+    for value in forwarded_proto_values {
+        for proto in value.split(|byte| *byte == b',') {
+            let index = forwarded_proto_count;
+            forwarded_proto_count += 1;
+            let proto = recognized_forwarded_proto(trim_header_ows(proto));
+            if index == 0 {
+                singleton_proto = proto;
+            }
+            if client_boundary.is_some_and(|boundary| index >= boundary) && proto.is_none() {
+                trusted_proto_suffix_valid = false;
+            }
+            if client_boundary == Some(index) {
+                boundary_proto = proto;
+            }
+        }
+    }
+
+    if forwarded_proto_count == 1 {
+        return singleton_proto;
+    }
+    if forwarded_proto_count == forwarded_for_count && trusted_proto_suffix_valid {
+        boundary_proto
+    } else {
+        None
+    }
+}
+
+fn recognized_forwarded_proto(value: &[u8]) -> Option<&'static str> {
+    match value {
+        proto if proto.eq_ignore_ascii_case(b"http") => Some("http"),
+        proto if proto.eq_ignore_ascii_case(b"https") => Some("https"),
+        _ => None,
+    }
+}
+
+fn trim_header_ows(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|byte| !matches!(*byte, b' ' | b'\t'))
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !matches!(*byte, b' ' | b'\t'))
+        .map_or(start, |index| index + 1);
+    &value[start..end]
 }
 
 /// Resolve the real client IP from the request context.

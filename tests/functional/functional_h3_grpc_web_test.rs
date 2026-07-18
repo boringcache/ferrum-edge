@@ -426,7 +426,7 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
     let method_policy = request_with_retry(
         &client,
         &format!("https://127.0.0.1:{https_port}/method-policy/pkg.Service/Denied"),
-        grpc_web(Method::POST),
+        grpc_web(Method::POST).header("grpc-timeout", "5S"),
     )
     .await;
     assert_grpc_web_error(&method_policy, "7", "application/grpc-web+proto");
@@ -445,6 +445,7 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
         GetOptions::default()
             .method(Method::POST)
             .header("content-type", "application/grpc")
+            .header("grpc-timeout", "5S")
             .body(Bytes::from(grpc_frame(b"ping"))),
     )
     .await;
@@ -651,6 +652,100 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
+async fn streaming_h3_grpc_web_deadline_cancels_withheld_backend_headers() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled pass-through backend");
+    let backend_port = backend_listener.local_addr().expect("backend addr").port();
+    let backend_ca = TestCa::new("h3-grpc-web-deadline-stall").expect("backend CA");
+    let (backend_cert, backend_key) = backend_ca.valid().expect("backend leaf");
+    let backend = ScriptedTlsBackend::builder(
+        backend_listener,
+        TlsConfig::new(backend_cert, backend_key).with_alpn(vec![b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    // Withhold response headers while continuing to read. The sentinel cannot
+    // occur in this request, so the step exits only when deadline cancellation
+    // closes the backend transport.
+    .step(TcpStep::ReadUntil(
+        b"ferrum-grpc-deadline-backend-never-sends-response".to_vec(),
+    ))
+    .spawn()
+    .expect("spawn stalled pass-through backend");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "h3-grpc-web-deadline-stall",
+            "listen_path": "/deadline-stall",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [{"plugin_config_id": "grpc-deadline-stall"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "grpc-deadline-stall",
+            "plugin_name": "grpc_deadline",
+            "scope": "proxy",
+            "proxy_id": "h3-grpc-web-deadline-stall",
+            "enabled": true,
+            "config": {"max_deadline_ms": 1000},
+        }],
+    });
+    let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
+    let client = Http3Client::insecure().expect("H3 client");
+    let started_at = Instant::now();
+    let response = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/deadline-stall/echo.Echo/Unary"),
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "application/grpc-web+proto")
+            .header("grpc-timeout", "100m")
+            .body(Bytes::from(grpc_frame(b"ping"))),
+    )
+    .await;
+
+    assert_grpc_web_error(&response, "4", "application/grpc-web+proto");
+    assert!(
+        started_at.elapsed() < Duration::from_secs(3),
+        "the absolute RPC deadline must win before the five-second backend read timeout"
+    );
+    let released_connections = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let accepted = backend.accepted_connections();
+            let errors = backend.step_errors().await;
+            if accepted > 0 && errors.len() >= accepted as usize {
+                return (accepted, errors);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let (backend_connections, _release_errors) = match released_connections {
+        Ok(released) => released,
+        Err(_) => panic!(
+            "deadline dispatch did not promptly release every backend connection: {} accepted, \
+             errors: {:?}",
+            backend.accepted_connections(),
+            backend.step_errors().await,
+        ),
+    };
+    assert!(
+        backend_connections >= 1,
+        "the withheld-response-header backend path must be reached"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
 async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
     let backend_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -670,6 +765,16 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         .step(GrpcStep::RespondStatus {
             code: 0,
             message: "",
+        })
+        .step(GrpcStep::AcceptRpc(MatchRpc::custom(|request| {
+            request.method == "POST"
+                && request.path == "/echo.Echo/Unary"
+                && request.header("content-type") == Some("application/grpc")
+        })))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondStatus {
+            code: 7,
+            message: "permission denied",
         })
         .spawn()
         .expect("spawn gRPC backend");
@@ -691,16 +796,25 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         }],
         "consumers": [],
         "upstreams": [],
-        "plugin_configs": [{
-            "id": "grpc-web-success",
-            "plugin_name": "grpc_web",
-            "scope": "proxy",
-            "proxy_id": "h3-grpc-web-success",
-            "enabled": true,
-            "config": {},
-        }],
+        "plugin_configs": [
+            {
+                "id": "grpc-web-success",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-success",
+                "enabled": true,
+                "config": {},
+            },
+            {
+                "id": "grpc-web-errors-only",
+                "plugin_name": "stdout_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": {"filter": {"errors_only": true}},
+            },
+        ],
     });
-    let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
+    let (gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
     let client = Http3Client::insecure().expect("H3 client");
     let response = request_with_retry(
         &client,
@@ -738,13 +852,50 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         "success status must be embedded in the gRPC-Web trailer frame"
     );
 
+    let failure = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/success/echo.Echo/Unary"),
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "application/grpc-web+proto")
+            .body(Bytes::from(grpc_frame(b"ping"))),
+    )
+    .await;
+    assert_grpc_web_error(&failure, "7", "application/grpc-web+proto");
+
+    let logs = gateway
+        .wait_for_log_contains(
+            |logs| {
+                logs.lines().any(|line| {
+                    serde_json::from_str::<Value>(line).is_ok_and(|entry| {
+                        entry["proxy_id"] == "h3-grpc-web-success" && entry["grpc_status"] == 7
+                    })
+                })
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+    let access_logs: Vec<Value> = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["proxy_id"] == "h3-grpc-web-success")
+        .collect();
+    assert_eq!(
+        access_logs.len(),
+        1,
+        "errors_only must exclude translated status 0 and emit translated status 7; logs:\n{logs}"
+    );
+    assert_eq!(access_logs[0]["response_status_code"], 200);
+    assert_eq!(access_logs[0]["grpc_status"], 7);
+
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
     let requests = backend.received_streams().await;
     assert_eq!(
         requests.len(),
-        1,
-        "exactly one native gRPC backend request expected"
+        2,
+        "exactly two native gRPC backend requests expected"
     );
     assert_eq!(requests[0].body, grpc_frame(b"ping"));
+    assert_eq!(requests[1].body, grpc_frame(b"ping"));
 }

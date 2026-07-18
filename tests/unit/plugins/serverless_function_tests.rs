@@ -1,6 +1,7 @@
-use ferrum_edge::plugins::serverless_function::ServerlessFunction;
+use bytes::Bytes;
+use ferrum_edge::plugins::serverless_function::{ServerlessFunction, redact_serverless_url};
 use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, priority};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -128,8 +129,171 @@ fn test_warmup_hostnames_aws_endpoint_ipv6_override() {
 
 #[test]
 fn test_non_object_config_rejects() {
-    let err = expect_err(ServerlessFunction::new(&json!("bad"), default_client()));
-    assert!(err.contains("config must be an object"), "got: {}", err);
+    for config in [Value::Null, json!("bad"), json!([]), json!(42)] {
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(err.contains("config must be an object"), "got: {err}");
+    }
+}
+
+#[test]
+fn test_unknown_fields_are_rejected_deterministically() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forwad_body": true,
+            "z_future_field": false
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("forwad_body, z_future_field"), "got: {err}");
+}
+
+#[test]
+fn test_explicit_null_diagnostics_distinguish_required_and_optional_fields() {
+    for field in [
+        "provider",
+        "function_url",
+        "mode",
+        "aws_region",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_function_name",
+        "aws_session_token",
+        "aws_qualifier",
+        "aws_endpoint_url",
+        "azure_function_key",
+        "gcp_bearer_token",
+        "forward_body",
+        "forward_headers",
+        "forward_query_params",
+        "timeout_ms",
+        "max_response_body_bytes",
+        "on_error",
+        "error_status_code",
+    ] {
+        let mut config = json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func"
+        });
+        config[field] = Value::Null;
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(err.contains(field), "field={field}, got: {err}");
+        assert!(
+            err.contains("must not be null"),
+            "field={field}, got: {err}"
+        );
+        if matches!(field, "provider" | "function_url") {
+            assert!(
+                err.contains("is required"),
+                "required field={field}, got: {err}"
+            );
+            assert!(
+                !err.contains("omit the field"),
+                "required field received optional guidance: field={field}, got: {err}"
+            );
+        } else {
+            assert!(
+                err.contains("omit the field instead"),
+                "optional field={field}, got: {err}"
+            );
+            assert!(
+                !err.contains("is required"),
+                "optional field received required guidance: field={field}, got: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_function_urls_reject_userinfo_without_echoing_credentials() {
+    let secret = "url-password-do-not-echo";
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("https://trigger:{secret}@example.com/api/run")
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("must not contain URL userinfo"));
+    assert!(
+        !err.contains(secret),
+        "credential leaked in config error: {err}"
+    );
+}
+
+#[test]
+fn test_function_urls_reject_fragments_that_clients_do_not_send() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "gcp_cloud_functions",
+            "function_url": "https://example.com/api/run#credential"
+        }),
+        default_client(),
+    ));
+    assert!(
+        err.contains("must not contain a URL fragment"),
+        "got: {err}"
+    );
+    assert!(
+        !err.contains("credential"),
+        "fragment leaked in config error: {err}"
+    );
+}
+
+#[test]
+fn test_function_url_diagnostic_form_redacts_path_and_query_credentials() {
+    let raw = "https://functions.example/private/signed-secret?code=query-secret";
+    let diagnostic = redact_serverless_url(raw);
+    assert_eq!(
+        diagnostic,
+        "https://functions.example/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert!(!diagnostic.contains("signed-secret"));
+    assert!(!diagnostic.contains("query-secret"));
+}
+
+#[test]
+fn test_aws_endpoint_override_rejects_non_origin_components() {
+    for (endpoint, expected_error) in [
+        ("https://example.com/lambda", "must be an HTTP(S) origin"),
+        (
+            "https://example.com?token=secret",
+            "must be an HTTP(S) origin",
+        ),
+        (
+            "https://example.com#fragment",
+            "must not contain a URL fragment",
+        ),
+    ] {
+        let err = expect_err(ServerlessFunction::new(
+            &json!({
+                "provider": "aws_lambda",
+                "aws_region": "us-east-1",
+                "aws_access_key_id": "AKIATEST",
+                "aws_secret_access_key": "secret",
+                "aws_function_name": "fn",
+                "aws_endpoint_url": endpoint
+            }),
+            default_client(),
+        ));
+        assert!(err.contains(expected_error), "got: {err}");
+    }
+}
+
+#[test]
+fn test_final_error_status_boundaries_are_accepted() {
+    for status in [400, 599] {
+        ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": "https://example.com/func",
+                "error_status_code": status
+            }),
+            default_client(),
+        )
+        .unwrap_or_else(|error| panic!("status={status} should be accepted: {error}"));
+    }
 }
 
 #[test]
@@ -423,16 +587,21 @@ fn test_zero_max_response_body_rejects() {
 }
 
 #[test]
-fn test_error_status_code_below_100_rejects() {
-    let err = expect_err(ServerlessFunction::new(
-        &json!({
-            "provider": "azure_functions",
-            "function_url": "https://example.com/func",
-            "error_status_code": 99
-        }),
-        default_client(),
-    ));
-    assert!(err.contains("error_status_code"), "got: {}", err);
+fn test_error_status_code_below_400_rejects() {
+    for status in [100, 199, 399] {
+        let err = expect_err(ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": "https://example.com/func",
+                "error_status_code": status
+            }),
+            default_client(),
+        ));
+        assert!(
+            err.contains("error_status_code"),
+            "status={status}, got: {err}"
+        );
+    }
 }
 
 #[test]
@@ -441,7 +610,7 @@ fn test_error_status_code_above_599_rejects() {
         &json!({
             "provider": "azure_functions",
             "function_url": "https://example.com/func",
-            "error_status_code": 700
+            "error_status_code": 600
         }),
         default_client(),
     ));
@@ -674,22 +843,23 @@ fn test_body_buffering_enabled_with_forward_body() {
 
     assert!(plugin.requires_request_body_before_before_proxy());
 
-    // POST + JSON triggers buffering
+    // Every method and representation is buffered losslessly.
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
     assert!(plugin.should_buffer_request_body(&ctx));
 
-    // GET does not trigger buffering
-    ctx.method = "GET".to_string();
-    assert!(!plugin.should_buffer_request_body(&ctx));
+    assert!(plugin.needs_request_body_bytes());
+    assert!(!plugin.needs_request_body_text());
 
-    // POST + non-JSON does not trigger buffering
+    ctx.method = "GET".to_string();
+    assert!(plugin.should_buffer_request_body(&ctx));
+
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "text/plain".to_string());
-    assert!(!plugin.should_buffer_request_body(&ctx));
+    assert!(plugin.should_buffer_request_body(&ctx));
 }
 
 // ---------------------------------------------------------------------------
@@ -772,7 +942,12 @@ async fn test_before_proxy_error_continue_mode() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     match result {
         PluginResult::Continue => {
-            assert!(ctx.metadata.contains_key("serverless_function_error"));
+            assert_eq!(
+                ctx.metadata
+                    .get("serverless_function.standalone.error_class")
+                    .map(String::as_str),
+                Some("invocation_failed")
+            );
         }
         other => panic!("Expected Continue, got {:?}", other),
     }
@@ -859,6 +1034,1642 @@ async fn test_terminate_mode_returns_function_response_as_reject_binary() {
 }
 
 #[tokio::test]
+async fn test_terminate_rejects_out_of_range_function_status() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(600).set_body_string("non-final"))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "error_status_code": 502
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("invalid_function_status"));
+            assert!(!body.contains("non-final"));
+        }
+        other => panic!("out-of-range function status must fail, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.standalone.status")
+            .map(String::as_str),
+        Some("600")
+    );
+}
+
+#[tokio::test]
+async fn test_pre_proxy_redirect_is_not_approval_and_is_not_followed() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/policy"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/redirect-target", server.uri())),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/redirect-target"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/policy", server.uri()),
+            "mode": "pre_proxy",
+            "on_error": "reject",
+            "error_status_code": 503
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert!(body.contains("function_non_success_status"));
+            assert!(!body.contains("redirect-target"));
+        }
+        other => panic!("redirect must use fail-closed policy, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.standalone.status")
+            .map(String::as_str),
+        Some("302")
+    );
+}
+
+#[tokio::test]
+async fn test_pre_proxy_redirect_continue_records_only_scoped_diagnostics() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(307).insert_header("location", "/moved"))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "gcp_cloud_functions",
+            "function_url": format!("{}/signed/path?token=query-secret", server.uri()),
+            "on_error": "continue"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut HashMap::new()).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.standalone.error_class")
+            .map(String::as_str),
+        Some("function_non_success_status")
+    );
+    assert!(ctx.metadata.iter().all(|(key, value)| {
+        !key.contains("query-secret")
+            && !value.contains("query-secret")
+            && !key.contains("signed/path")
+            && !value.contains("signed/path")
+    }));
+}
+
+#[tokio::test]
+async fn test_pre_proxy_4xx_and_5xx_use_configured_final_error_status() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for (function_status, expected_status) in [(401, "401"), (503, "503")] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(function_status)
+                    .set_body_string("untrusted function error details"),
+            )
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": format!("{}/policy", server.uri()),
+                "error_status_code": 502
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 502);
+                assert!(body.contains("function_non_success_status"));
+                assert!(!body.contains("untrusted function error details"));
+            }
+            other => panic!("status={function_status} must fail closed, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.metadata
+                .get("serverless_function.standalone.status")
+                .map(String::as_str),
+            Some(expected_status)
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_forwards_safe_headers_and_preserves_repeated_cookies() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .set_body_string("redirect")
+                .insert_header("location", "/next")
+                .insert_header("retry-after", "30")
+                .insert_header("etag", "\"version-1\"")
+                .insert_header("connection", "x-function-internal")
+                .insert_header("x-function-internal", "must-strip")
+                .insert_header("x-amz-request-id", "provider-control")
+                .insert_header("x-api-key", "response-secret")
+                .append_header("set-cookie", "a=1; Path=/")
+                .append_header("set-cookie", "b=2; Path=/"),
+        )
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 302);
+            assert_eq!(&body[..], b"redirect");
+            assert_eq!(headers.get("location").map(String::as_str), Some("/next"));
+            assert_eq!(headers.get("retry-after").map(String::as_str), Some("30"));
+            assert_eq!(
+                headers.get("etag").map(String::as_str),
+                Some("\"version-1\"")
+            );
+            assert_eq!(
+                headers.get("set-cookie").map(String::as_str),
+                Some("a=1; Path=/\nb=2; Path=/")
+            );
+            for stripped in [
+                "connection",
+                "content-length",
+                "x-function-internal",
+                "x-amz-request-id",
+                "x-api-key",
+            ] {
+                assert!(
+                    !headers.contains_key(stripped),
+                    "header survived: {stripped}"
+                );
+            }
+        }
+        other => panic!("expected terminal function response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_strips_redirects_that_expose_signed_function_destination() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for case in [
+        "relative-query",
+        "absolute-destination",
+        "scheme-relative",
+        "decoded-path",
+        "copied-path-other-host",
+        "descendant-path-other-host",
+        "prefixed-path-other-host",
+        "nested-double-encoded",
+        "nested-depth-budget",
+        "nested-over-decode-budget",
+        "destination-over-decode-budget",
+        "nested-path-encoded",
+        "nested-path-after-base-directory",
+        "copied-query-other-host",
+        "renamed-query-other-host",
+        "copied-query-path-other-host",
+        "copied-query-path-parameter",
+        "copied-query-encoded-path-delimiter",
+        "copied-signed-path-query-value",
+        "copied-signed-path-query-key",
+        "copied-signed-path-query-value-encoded",
+        "key-only-query-renamed-value",
+        "key-only-query-copied-key",
+        "key-only-query-path",
+        "key-only-query-fragment",
+        "valued-query-key-renamed-value",
+        "valued-query-key-copied-key",
+        "valued-query-key-path",
+        "valued-query-key-fragment",
+        "valued-query-key-slash-boundaries",
+        "valued-query-key-slash-boundaries-path",
+        "query-value-leading-slash-path",
+        "query-value-trailing-slash",
+        "query-value-trailing-slash-path",
+        "query-value-slash-only",
+        "query-value-slash-only-root-path",
+        "query-value-slash-only-nonroot-path",
+        "authority-query-value",
+        "authority-query-key",
+        "authority-query-idna",
+        "authority-query-port",
+        "authority-query-default-https-port",
+        "authority-query-default-network-port",
+        "query-value-scheme",
+        "query-key-scheme",
+        "literal-plus-encoded-candidate",
+        "encoded-plus-literal-candidate",
+        "fragment-query-scalar",
+        "fragment-query-pair-scalar",
+        "fragment-path-scalar",
+        "fragment-double-encoded",
+        "malformed",
+        "userinfo",
+        "benign-relative",
+        "benign-same-origin",
+        "benign-external",
+        "benign-external-label",
+        "benign-path-lookalike",
+        "benign-query-value-lookalike",
+        "benign-query-path-lookalike",
+        "benign-query-path-parameter-lookalike",
+        "benign-signed-path-query-value-lookalike",
+        "benign-key-only-query-lookalike",
+        "benign-leading-slash-scalar-suffix-lookalike",
+        "benign-trailing-slash-scalar-prefix-lookalike",
+        "benign-trailing-slash-scalar-without-slash",
+        "benign-authority-label-lookalike",
+        "benign-authority-substring",
+        "benign-nested-path-after-base-directory",
+        "benign-authority-default-port-lookalike",
+        "benign-scheme-lookalike",
+        "benign-plus-space-distinct",
+        "benign-fragment-lookalike",
+        "benign-fragment-label",
+    ] {
+        let server = MockServer::start().await;
+        let function_url = match case {
+            "destination-over-decode-budget" => {
+                let mut path = "signed/trigger".to_string();
+                for _ in 0..12 {
+                    path = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
+                }
+                format!("{}/{path}?code=secret%2Fvalue", server.uri())
+            }
+            "literal-plus-encoded-candidate" => {
+                format!("{}/signed%2Ftrigger?code=token+part", server.uri())
+            }
+            "encoded-plus-literal-candidate" => {
+                format!("{}/signed%2Ftrigger?code=token%2Bpart", server.uri())
+            }
+            "benign-plus-space-distinct" => {
+                format!("{}/signed%2Ftrigger?code=token%20part", server.uri())
+            }
+            "key-only-query-renamed-value"
+            | "key-only-query-copied-key"
+            | "key-only-query-path"
+            | "key-only-query-fragment"
+            | "benign-key-only-query-lookalike" => {
+                format!("{}/signed%2Ftrigger?SIGNED_TOKEN=", server.uri())
+            }
+            "valued-query-key-renamed-value"
+            | "valued-query-key-copied-key"
+            | "valued-query-key-path"
+            | "valued-query-key-fragment" => {
+                format!("{}/signed%2Ftrigger?SIGNED_TOKEN=1", server.uri())
+            }
+            "valued-query-key-slash-boundaries" | "valued-query-key-slash-boundaries-path" => {
+                format!("{}/signed%2Ftrigger?%2FSIGNED%2F=1", server.uri())
+            }
+            "query-value-leading-slash-path" | "benign-leading-slash-scalar-suffix-lookalike" => {
+                format!("{}/signed%2Ftrigger?code=%2Fsigned", server.uri())
+            }
+            "query-value-trailing-slash"
+            | "query-value-trailing-slash-path"
+            | "benign-trailing-slash-scalar-prefix-lookalike"
+            | "benign-trailing-slash-scalar-without-slash" => {
+                format!("{}/signed%2Ftrigger?code=secret%2F", server.uri())
+            }
+            "query-value-slash-only"
+            | "query-value-slash-only-root-path"
+            | "query-value-slash-only-nonroot-path" => {
+                format!("{}/signed%2Ftrigger?code=%2F", server.uri())
+            }
+            "authority-query-value"
+            | "benign-authority-label-lookalike"
+            | "benign-authority-substring" => {
+                format!("{}/signed%2Ftrigger?code=signedtoken", server.uri())
+            }
+            "authority-query-key" => {
+                format!("{}/signed%2Ftrigger?signedkey=1", server.uri())
+            }
+            "authority-query-idna" => {
+                format!("{}/signed%2Ftrigger?code=b%C3%BCcher", server.uri())
+            }
+            "authority-query-port" => {
+                format!("{}/signed%2Ftrigger?code=18443", server.uri())
+            }
+            "authority-query-default-https-port" | "benign-authority-default-port-lookalike" => {
+                format!("{}/signed%2Ftrigger?code=443", server.uri())
+            }
+            "authority-query-default-network-port" => {
+                format!("{}/signed%2Ftrigger?code=80", server.uri())
+            }
+            "query-value-scheme" | "benign-scheme-lookalike" => {
+                format!("{}/signed%2Ftrigger?code=secret", server.uri())
+            }
+            "query-key-scheme" => {
+                format!("{}/signed%2Ftrigger?secret=1", server.uri())
+            }
+            "nested-path-after-base-directory" | "benign-nested-path-after-base-directory" => {
+                format!("{}/api/signed?code=secret", server.uri())
+            }
+            "copied-signed-path-query-value"
+            | "copied-signed-path-query-key"
+            | "copied-signed-path-query-value-encoded"
+            | "benign-signed-path-query-value-lookalike" => {
+                format!("{}/api/signed-token", server.uri())
+            }
+            _ => format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri()),
+        };
+        let location = match case {
+            "relative-query" => "?code=secret%2Fvalue".to_string(),
+            "absolute-destination" => function_url.clone(),
+            "scheme-relative" => function_url
+                .strip_prefix("http:")
+                .expect("wiremock URI uses HTTP")
+                .to_string(),
+            "decoded-path" => {
+                format!("{}/signed/trigger?unrelated=1", server.uri())
+            }
+            "copied-path-other-host" => {
+                "https://redirect.example/signed/trigger?unrelated=1".to_string()
+            }
+            "descendant-path-other-host" => {
+                "https://redirect.example/signed/trigger/continue?unrelated=1".to_string()
+            }
+            "prefixed-path-other-host" => {
+                "https://redirect.example/collect/signed/trigger?unrelated=1".to_string()
+            }
+            "nested-double-encoded" => {
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();
+                let double_encoded: String =
+                    url::form_urlencoded::byte_serialize(encoded.as_bytes()).collect();
+                format!("https://redirect.example/continue?next={double_encoded}")
+            }
+            "nested-depth-budget" => {
+                let deepest = format!("https://third.example/three?next={function_url}");
+                let middle = format!("https://second.example/two?next={deepest}");
+                format!("https://redirect.example/one?next={middle}")
+            }
+            "nested-over-decode-budget" => {
+                let mut encoded = function_url.clone();
+                for _ in 0..12 {
+                    encoded = url::form_urlencoded::byte_serialize(encoded.as_bytes()).collect();
+                }
+                format!("https://redirect.example/continue?next={encoded}")
+            }
+            "destination-over-decode-budget" => "/next".to_string(),
+            "nested-path-encoded" => {
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();
+                format!("https://redirect.example/{encoded}")
+            }
+            "nested-path-after-base-directory" => {
+                url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect()
+            }
+            "copied-query-other-host" => {
+                "https://redirect.example/next?code=secret%2Fvalue".to_string()
+            }
+            "renamed-query-other-host" => {
+                "https://redirect.example/next?leak=secret%2Fvalue".to_string()
+            }
+            "copied-query-path-other-host" => "https://redirect.example/secret/value".to_string(),
+            "copied-query-path-parameter" => {
+                "https://redirect.example/next;leak=secret/value".to_string()
+            }
+            "copied-query-encoded-path-delimiter" => {
+                "https://redirect.example/next%3Fleak%3Dsecret/value".to_string()
+            }
+            "copied-signed-path-query-value" => {
+                "https://redirect.example/next?leak=api/signed-token".to_string()
+            }
+            "copied-signed-path-query-key" => {
+                "https://redirect.example/next?api/signed-token=other".to_string()
+            }
+            "copied-signed-path-query-value-encoded" => {
+                "https://redirect.example/next?leak=api%252Fsigned-token".to_string()
+            }
+            "key-only-query-renamed-value" => {
+                "https://redirect.example/next?leak=SIGNED_TOKEN".to_string()
+            }
+            "key-only-query-copied-key" => {
+                "https://redirect.example/next?SIGNED_TOKEN=other".to_string()
+            }
+            "key-only-query-path" => "https://redirect.example/next;leak=SIGNED_TOKEN".to_string(),
+            "key-only-query-fragment" => "https://redirect.example/#leak=SIGNED_TOKEN".to_string(),
+            "valued-query-key-renamed-value" => {
+                "https://redirect.example/next?leak=SIGNED_TOKEN".to_string()
+            }
+            "valued-query-key-copied-key" => {
+                "https://redirect.example/next?SIGNED_TOKEN=other".to_string()
+            }
+            "valued-query-key-path" => {
+                "https://redirect.example/next;leak=SIGNED_TOKEN".to_string()
+            }
+            "valued-query-key-fragment" => {
+                "https://redirect.example/#leak=SIGNED_TOKEN".to_string()
+            }
+            "valued-query-key-slash-boundaries" => {
+                "https://redirect.example/next?leak=%2FSIGNED%2F".to_string()
+            }
+            "valued-query-key-slash-boundaries-path" => {
+                "https://redirect.example/prefix/SIGNED/suffix".to_string()
+            }
+            "query-value-leading-slash-path" => {
+                "https://redirect.example/prefix/signed".to_string()
+            }
+            "query-value-trailing-slash" => {
+                "https://redirect.example/next?leak=secret%2F".to_string()
+            }
+            "query-value-trailing-slash-path" => {
+                "https://redirect.example/prefix/secret/suffix".to_string()
+            }
+            "query-value-slash-only" => "https://redirect.example/next?leak=%2F".to_string(),
+            "query-value-slash-only-root-path" => "https://redirect.example/".to_string(),
+            "query-value-slash-only-nonroot-path" => "https://redirect.example/next".to_string(),
+            "authority-query-value" => "https://signedtoken.attacker.example/next".to_string(),
+            "authority-query-key" => "https://signedkey.attacker.example/next".to_string(),
+            "authority-query-idna" => "https://xn--bcher-kva.attacker.example/next".to_string(),
+            "authority-query-port" => "https://attacker.example:18443/next".to_string(),
+            "authority-query-default-https-port" => "https://attacker.example:443/next".to_string(),
+            "authority-query-default-network-port" => "//attacker.example:80/next".to_string(),
+            "query-value-scheme" | "query-key-scheme" => {
+                "SeCrEt://attacker.example/next".to_string()
+            }
+            "literal-plus-encoded-candidate" => {
+                "https://redirect.example/next?leak=token%2Bpart".to_string()
+            }
+            "encoded-plus-literal-candidate" => {
+                "https://redirect.example/next?leak=token+part".to_string()
+            }
+            "fragment-query-scalar" => "https://redirect.example/#secret/value".to_string(),
+            "fragment-query-pair-scalar" => {
+                "https://redirect.example/#leak=secret/value".to_string()
+            }
+            "fragment-path-scalar" => "https://redirect.example/#signed/trigger".to_string(),
+            "fragment-double-encoded" => "https://redirect.example/#secret%252Fvalue".to_string(),
+            "malformed" => "http://[signed%2Ftrigger?code=secret%2Fvalue".to_string(),
+            "userinfo" => "https://user:password@redirect.example/next".to_string(),
+            "benign-relative" => "/next".to_string(),
+            "benign-same-origin" => format!("{}/safe?other=1", server.uri()),
+            "benign-external" => "https://redirect.example/next?other=1".to_string(),
+            "benign-external-label" => {
+                // A path-shaped but non-matching query value (lookalike of the
+                // signed path `signed/trigger`) must remain observable. An exact
+                // copy of the signed path is a renamed disclosure and is covered
+                // by `copied-signed-path-query-value`.
+                "https://redirect.example/next?label=signed/trigger-extra".to_string()
+            }
+            "benign-path-lookalike" => {
+                "https://redirect.example/signed/triggered?other=1".to_string()
+            }
+            "benign-query-value-lookalike" => {
+                "https://redirect.example/next?leak=secret%2Fvalue-extra".to_string()
+            }
+            "benign-query-path-lookalike" => {
+                "https://redirect.example/secret/value-extra".to_string()
+            }
+            "benign-query-path-parameter-lookalike" => {
+                "https://redirect.example/next;leak=secret/value-extra".to_string()
+            }
+            "benign-signed-path-query-value-lookalike" => {
+                "https://redirect.example/next?leak=api/signed-token-extra".to_string()
+            }
+            "benign-key-only-query-lookalike" => {
+                "https://redirect.example/next?leak=SIGNED_TOKEN_EXTRA".to_string()
+            }
+            "benign-leading-slash-scalar-suffix-lookalike" => {
+                "https://redirect.example/prefix/signed_extra".to_string()
+            }
+            "benign-trailing-slash-scalar-prefix-lookalike" => {
+                "https://redirect.example/prefixsecret/suffix".to_string()
+            }
+            "benign-trailing-slash-scalar-without-slash" => {
+                "https://redirect.example/next;leak=secret".to_string()
+            }
+            "benign-authority-label-lookalike" => {
+                "https://signedtoken-extra.attacker.example/next".to_string()
+            }
+            "benign-authority-substring" => {
+                "https://prefixsignedtoken.attacker.example/next".to_string()
+            }
+            "benign-nested-path-after-base-directory" => {
+                let benign = "https://redirect.example/safe?other=1";
+                url::form_urlencoded::byte_serialize(benign.as_bytes()).collect()
+            }
+            "benign-authority-default-port-lookalike" => {
+                "https://attacker.example:8443/next".to_string()
+            }
+            "benign-scheme-lookalike" => "secrets://attacker.example/next".to_string(),
+            "benign-plus-space-distinct" => {
+                "https://redirect.example/next?leak=token+part".to_string()
+            }
+            "benign-fragment-lookalike" => {
+                "https://redirect.example/#secret/value-extra".to_string()
+            }
+            "benign-fragment-label" => "https://redirect.example/#release-notes".to_string(),
+            _ => unreachable!(),
+        };
+        let should_strip = !case.starts_with("benign-");
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .set_body_string("redirect")
+                    .insert_header("location", location.as_str()),
+            )
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": function_url,
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::RejectBinary { headers, .. } => {
+                if should_strip {
+                    assert!(
+                        !headers.contains_key("location"),
+                        "credential-bearing Location survived case {case}: {headers:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        headers.get("location").map(String::as_str),
+                        Some(location.as_str()),
+                        "benign Location changed in case {case}"
+                    );
+                }
+            }
+            other => panic!("expected terminal redirect for case {case}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_strips_unsafe_url_headers_for_root_function_destination() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for case in [
+        "location-userinfo",
+        "content-location-userinfo",
+        "refresh-userinfo",
+        "link-userinfo",
+        "location-malformed",
+        "location-malformed-percent",
+        "location-invalid-percent-utf8",
+        "content-location-malformed-percent",
+        "content-location-invalid-percent-utf8",
+        "refresh-malformed-percent",
+        "refresh-invalid-percent-utf8",
+        "link-malformed-percent",
+        "link-invalid-percent-utf8",
+        "location-percent-budget",
+        "link-malformed",
+        "link-target-budget",
+        "benign-location",
+        "benign-link",
+    ] {
+        let server = MockServer::start().await;
+        let (header, value, should_strip) = match case {
+            "location-userinfo" => (
+                "location",
+                "https://user:password@redirect.example/next".to_string(),
+                true,
+            ),
+            "content-location-userinfo" => (
+                "content-location",
+                "https://user:password@redirect.example/content".to_string(),
+                true,
+            ),
+            "refresh-userinfo" => (
+                "refresh",
+                "0; url=https://user:password@redirect.example/next".to_string(),
+                true,
+            ),
+            "link-userinfo" => (
+                "link",
+                "<https://user:password@redirect.example/next>; rel=\"next\"".to_string(),
+                true,
+            ),
+            "location-malformed" => ("location", "http://[invalid".to_string(), true),
+            "location-malformed-percent" => ("location", "/next%zz".to_string(), true),
+            "location-invalid-percent-utf8" => ("location", "/next%FF".to_string(), true),
+            "content-location-malformed-percent" => {
+                ("content-location", "/content%zz".to_string(), true)
+            }
+            "content-location-invalid-percent-utf8" => {
+                ("content-location", "/content%FF".to_string(), true)
+            }
+            "refresh-malformed-percent" => ("refresh", "0; url=/next%zz".to_string(), true),
+            "refresh-invalid-percent-utf8" => ("refresh", "0; url=/next%FF".to_string(), true),
+            "link-malformed-percent" => ("link", "</next%zz>; rel=\"next\"".to_string(), true),
+            "link-invalid-percent-utf8" => ("link", "</next%FF>; rel=\"next\"".to_string(), true),
+            "location-percent-budget" => {
+                let mut encoded = "https://redirect.example/next".to_string();
+                for _ in 0..12 {
+                    encoded = url::form_urlencoded::byte_serialize(encoded.as_bytes()).collect();
+                }
+                ("location", encoded, true)
+            }
+            "link-malformed" => (
+                "link",
+                "<https://redirect.example/next; rel=\"next\"".to_string(),
+                true,
+            ),
+            "link-target-budget" => (
+                "link",
+                (0..33)
+                    .map(|index| format!("</safe/{index}>; rel=\"item\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                true,
+            ),
+            "benign-location" => (
+                "location",
+                "https://redirect.example/next".to_string(),
+                false,
+            ),
+            "benign-link" => (
+                "link",
+                "<https://redirect.example/next>; rel=\"next\"".to_string(),
+                false,
+            ),
+            _ => unreachable!(),
+        };
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).insert_header(header, value.as_str()))
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": format!("{}/", server.uri()),
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::RejectBinary { headers, .. } => {
+                if should_strip {
+                    assert!(
+                        !headers.contains_key(header),
+                        "unsafe {header} survived root destination case {case}: {headers:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        headers.get(header).map(String::as_str),
+                        Some(value.as_str()),
+                        "benign {header} changed in root destination case {case}"
+                    );
+                }
+            }
+            other => panic!("expected terminal response for case {case}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for case in [
+        "content-location-absolute",
+        "content-location-relative",
+        "content-location-encoded",
+        "refresh-absolute",
+        "refresh-comma-absolute",
+        "refresh-whitespace-url",
+        "refresh-whitespace-bare-absolute",
+        "refresh-repeated-separators",
+        "refresh-relative",
+        "refresh-encoded",
+        "refresh-bare-absolute",
+        "refresh-bare-relative",
+        "refresh-bare-path-segment",
+        "refresh-bare-encoded",
+        "refresh-malformed-target",
+        "link-absolute",
+        "link-relative",
+        "link-multiple-targets",
+        "link-target-budget",
+        "link-malformed",
+        "content-location-query-trailing-slash",
+        "refresh-query-trailing-slash",
+        "link-query-trailing-slash",
+        "benign-content-location",
+        "benign-refresh",
+        "benign-refresh-comma",
+        "benign-refresh-bare-target",
+        "benign-refresh-whitespace-bare-target",
+        "benign-refresh-delay-only",
+        "benign-refresh-separator-only",
+        "benign-refresh-non-url-directive",
+        "benign-link-multiple-targets",
+        "benign-link-label",
+        "benign-link-path-lookalike",
+    ] {
+        let server = MockServer::start().await;
+        let function_url = if case.ends_with("query-trailing-slash") {
+            format!("{}/signed%2Ftrigger?code=secret%2F", server.uri())
+        } else {
+            format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri())
+        };
+        let encoded_function_url: String =
+            url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();
+        let (header, value, should_strip) = match case {
+            "content-location-absolute" => {
+                ("content-location", function_url.clone(), true)
+            }
+            "content-location-relative" => (
+                "content-location",
+                "/signed%2Ftrigger?code=secret%2Fvalue".to_string(),
+                true,
+            ),
+            "content-location-encoded" => {
+                ("content-location", encoded_function_url.clone(), true)
+            }
+            "refresh-absolute" => {
+                ("refresh", format!("0; URL=\"{function_url}\""), true)
+            }
+            "refresh-comma-absolute" => {
+                ("refresh", format!("0, url={function_url}"), true)
+            }
+            "refresh-whitespace-url" => {
+                ("refresh", format!("0 \t url={function_url}"), true)
+            }
+            "refresh-whitespace-bare-absolute" => {
+                ("refresh", format!("0\t{function_url}"), true)
+            }
+            "refresh-repeated-separators" => (
+                "refresh",
+                format!("0 \t, ; \t url={function_url}"),
+                true,
+            ),
+            "refresh-relative" => (
+                "refresh",
+                "0;url=/signed%2Ftrigger?code=secret%2Fvalue".to_string(),
+                true,
+            ),
+            "refresh-encoded" => {
+                ("refresh", format!("0; url={encoded_function_url}"), true)
+            }
+            "refresh-bare-absolute" => {
+                ("refresh", format!("0; {function_url}"), true)
+            }
+            "refresh-bare-relative" => (
+                "refresh",
+                "0; /signed%2Ftrigger?code=secret%2Fvalue".to_string(),
+                true,
+            ),
+            "refresh-bare-path-segment" => {
+                ("refresh", "0; secret/value".to_string(), true)
+            }
+            "refresh-bare-encoded" => {
+                ("refresh", format!("0; {encoded_function_url}"), true)
+            }
+            "refresh-malformed-target" => {
+                ("refresh", format!("0; url=\"{function_url}"), true)
+            }
+            "link-absolute" => {
+                ("link", format!("<{function_url}>; rel=\"next\""), true)
+            }
+            "link-relative" => (
+                "link",
+                "</signed%2Ftrigger?code=secret%2Fvalue>; rel=\"next\"".to_string(),
+                true,
+            ),
+            "link-multiple-targets" => (
+                "link",
+                format!("</safe>; rel=\"prev\", <{function_url}>; rel=\"next\""),
+                true,
+            ),
+            "link-target-budget" => (
+                "link",
+                (0..33)
+                    .map(|index| format!("</safe/{index}>; rel=\"item\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                true,
+            ),
+            "link-malformed" => (
+                "link",
+                format!("</safe>; title=\"unterminated, <{function_url}>; rel=next"),
+                true,
+            ),
+            "content-location-query-trailing-slash" => (
+                "content-location",
+                "https://redirect.example/safe?leak=secret%2F".to_string(),
+                true,
+            ),
+            "refresh-query-trailing-slash" => (
+                "refresh",
+                "0; url=https://redirect.example/safe?leak=secret%2F".to_string(),
+                true,
+            ),
+            "link-query-trailing-slash" => (
+                "link",
+                "<https://redirect.example/safe?leak=secret%2F>; rel=\"next\"".to_string(),
+                true,
+            ),
+            "benign-content-location" => {
+                ("content-location", "/safe?other=1".to_string(), false)
+            }
+            "benign-refresh" => {
+                ("refresh", "5; URL = '/safe?other=1'".to_string(), false)
+            }
+            "benign-refresh-comma" => {
+                ("refresh", "5, url=/safe?other=1".to_string(), false)
+            }
+            "benign-refresh-bare-target" => (
+                "refresh",
+                "5; https://redirect.example/safe?other=1".to_string(),
+                false,
+            ),
+            "benign-refresh-whitespace-bare-target" => (
+                "refresh",
+                "5 https://redirect.example/safe?other=1".to_string(),
+                false,
+            ),
+            "benign-refresh-delay-only" => ("refresh", "5".to_string(), false),
+            "benign-refresh-separator-only" => ("refresh", "5 \t, ;".to_string(), false),
+            "benign-refresh-non-url-directive" => {
+                ("refresh", "not-a-delay; token=value".to_string(), false)
+            }
+            "benign-link-multiple-targets" => (
+                "link",
+                "</safe>; rel=\"prev\", <https://redirect.example/next?other=1>; rel=\"next\"; title=\"a,b\""
+                    .to_string(),
+                false,
+            ),
+            "benign-link-label" => (
+                "link",
+                format!("</safe>; title=\"{function_url}\""),
+                false,
+            ),
+            "benign-link-path-lookalike" => (
+                "link",
+                "<https://redirect.example/signed/triggered?other=1>; rel=\"next\""
+                    .to_string(),
+                false,
+            ),
+            _ => unreachable!(),
+        };
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("function-response")
+                    .insert_header(header, value.as_str()),
+            )
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": function_url,
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::RejectBinary { headers, .. } => {
+                if should_strip {
+                    assert!(
+                        !headers.contains_key(header),
+                        "credential-bearing {header} survived case {case}: {headers:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        headers.get(header).map(String::as_str),
+                        Some(value.as_str()),
+                        "benign {header} changed in case {case}"
+                    );
+                }
+            }
+            other => panic!("expected terminal response for case {case}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_rejects_repeated_singleton_url_headers() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Each line is safe in isolation, but the old `", "` fold synthesized
+    // the protected `alpha, omega` scalar for a downstream URI parser.
+    for (header, first, second) in [
+        ("location", "alpha", "omega"),
+        ("content-location", "alpha", "omega"),
+        ("refresh", "0; alpha", "omega"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header(header, first)
+                    .append_header(header, second),
+            )
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": format!("{}/signed/trigger?code=alpha%2C%20omega", server.uri()),
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::RejectBinary { headers, .. } => assert!(
+                !headers.contains_key(header),
+                "repeated singleton {header} survived: {headers:?}"
+            ),
+            other => panic!("expected terminal response for {header}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_revalidates_combined_link_headers() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for should_strip in [false, true] {
+        let server = MockServer::start().await;
+        let (first, second) = if should_strip {
+            (
+                (0..16)
+                    .map(|index| format!("</first/{index}>; rel=\"item\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                (0..17)
+                    .map(|index| format!("</second/{index}>; rel=\"item\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        } else {
+            (
+                "</safe/one>; rel=\"prev\"".to_string(),
+                "<https://redirect.example/safe/two>; rel=\"next\"".to_string(),
+            )
+        };
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("link", first.as_str())
+                    .append_header("link", second.as_str()),
+            )
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": format!("{}/signed/trigger?code=secret", server.uri()),
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::RejectBinary { headers, .. } => {
+                if should_strip {
+                    assert!(
+                        !headers.contains_key("link"),
+                        "combined Link target budget was not enforced: {headers:?}"
+                    );
+                } else {
+                    let expected = format!("{first}, {second}");
+                    assert_eq!(
+                        headers.get("link").map(String::as_str),
+                        Some(expected.as_str())
+                    );
+                }
+            }
+            other => panic!("expected terminal Link response, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_preserves_head_no_body_semantics() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("function-body")
+                .insert_header("etag", "\"head-version\""),
+        )
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "HEAD".to_string();
+
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert!(body.is_empty());
+            assert_eq!(
+                headers.get("etag").map(String::as_str),
+                Some("\"head-version\"")
+            );
+            assert!(!headers.contains_key("content-length"));
+        }
+        other => panic!("expected HEAD terminal response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_strips_body_from_no_content_statuses() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for status in [204, 205, 304] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_string("forbidden-status-body")
+                    .insert_header("etag", "\"status-version\""),
+            )
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": format!("{}/func", server.uri()),
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+
+        match plugin
+            .before_proxy(&mut create_test_context(), &mut HashMap::new())
+            .await
+        {
+            PluginResult::RejectBinary {
+                status_code,
+                body,
+                headers,
+            } => {
+                assert_eq!(status_code, status);
+                assert!(body.is_empty(), "status {status} retained a body");
+                assert_eq!(
+                    headers.get("etag").map(String::as_str),
+                    Some("\"status-version\"")
+                );
+                assert!(!headers.contains_key("content-length"));
+            }
+            other => panic!("expected terminal status {status}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_forward_body_is_binary_safe_for_non_post_methods() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_body": true,
+            "on_error": "continue"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "PATCH".to_string();
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    );
+    ctx.request_body_bytes = Some(Bytes::from_static(&[0xff, 0x00, 0x41]));
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut HashMap::new()).await,
+        PluginResult::Continue
+    ));
+    let requests = server.received_requests().await.unwrap();
+    let payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(payload["method"], "PATCH");
+    assert_eq!(payload["body"], "/wBB");
+    assert_eq!(payload["body_encoding"], "base64");
+}
+
+#[tokio::test]
+async fn test_forward_body_preserves_exact_bytes_and_active_content_type() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_body": true
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut text_ctx = create_test_context();
+    text_ctx.method = "POST".to_string();
+    text_ctx
+        .headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    let duplicate_key_json = br#"{ "trusted": 1e0, "trusted": 2 }"#;
+    text_ctx.request_body_bytes = Some(Bytes::from_static(duplicate_key_json));
+    let mut transformed_headers = HashMap::new();
+    transformed_headers.insert("content-type".to_string(), "application/json".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut text_ctx, &mut transformed_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut json_ctx = create_test_context();
+    json_ctx.method = "POST".to_string();
+    json_ctx.headers.insert(
+        "content-type".to_string(),
+        "application/problem+json; charset=utf-8".to_string(),
+    );
+    json_ctx.request_body_bytes = Some(Bytes::from_static(br#"{"trusted":true}"#));
+    let mut transformed_headers = HashMap::new();
+    transformed_headers.insert("content-type".to_string(), "text/plain".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut json_ctx, &mut transformed_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let requests = server.received_requests().await.unwrap();
+    let text_payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let json_payload: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(
+        text_payload["body"].as_str(),
+        Some(std::str::from_utf8(duplicate_key_json).unwrap())
+    );
+    assert_eq!(text_payload["body_encoding"], "utf8");
+    assert_eq!(text_payload["body_content_type"], "application/json");
+    assert_eq!(json_payload["body"], r#"{"trusted":true}"#);
+    assert_eq!(json_payload["body_encoding"], "utf8");
+    assert_eq!(json_payload["body_content_type"], "text/plain");
+}
+
+#[tokio::test]
+async fn test_encoded_or_unavailable_body_fails_before_external_egress() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_body": true,
+            "on_error": "continue"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut encoded_ctx = create_test_context();
+    encoded_ctx.request_body_bytes = Some(Bytes::from_static(b"opaque"));
+    let mut active_headers = std::mem::take(&mut encoded_ctx.headers);
+    active_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    match plugin
+        .before_proxy(&mut encoded_ctx, &mut active_headers)
+        .await
+    {
+        PluginResult::Reject { body, .. } => {
+            assert!(body.contains("encoded_request_body_unsupported"));
+        }
+        other => panic!("encoded body must fail closed, got {other:?}"),
+    }
+
+    let mut unavailable_ctx = create_test_context();
+    unavailable_ctx.method = "POST".to_string();
+    match plugin
+        .before_proxy(&mut unavailable_ctx, &mut HashMap::new())
+        .await
+    {
+        PluginResult::Reject { body, .. } => {
+            assert!(body.contains("request_body_unavailable"));
+        }
+        other => panic!("unavailable body must fail closed, got {other:?}"),
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_original_content_encoding_marker_fails_before_external_egress() {
+    // Mirror of `ORIGIN_ENCODED_REQUEST_METADATA_KEY` (pub(crate) in proxy). A
+    // header-only request_transformer that removed/renamed Content-Encoding
+    // before this plugin leaves the transformed header map identity-clean, but
+    // the init-time marker preserves the original non-identity coding.
+    const ORIGIN_ENCODED_REQUEST_METADATA_KEY: &str = "ferrum:origin_encoded_request";
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_body": true,
+            "on_error": "continue"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.request_body_bytes = Some(Bytes::from_static(b"opaque-compressed"));
+    // The live header map carries NO content-encoding (a transformer stripped
+    // it), yet the original request declared one — captured in the marker.
+    ctx.metadata.insert(
+        ORIGIN_ENCODED_REQUEST_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::Reject { body, .. } => {
+            assert!(body.contains("encoded_request_body_unsupported"));
+        }
+        other => panic!("stripped-but-original encoding must fail closed, got {other:?}"),
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_query_transform_marker_fails_before_external_egress() {
+    // Mirror of `QUERY_PARAMS_TRANSFORMED_METADATA_KEY` (pub(crate) in proxy).
+    const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
+
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_query_params": true,
+            "on_error": "continue"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    // A raw query that is otherwise perfectly valid for forwarding — the reject
+    // is driven solely by the request_transformer query-transform marker.
+    ctx.set_raw_query_string("page=1&sort=asc".to_string());
+    ctx.metadata.insert(
+        QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::Reject { body, .. } => {
+            assert!(body.contains("query_params_transformed"));
+        }
+        other => panic!("transformed-query composition must fail closed, got {other:?}"),
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_ambiguous_query_fails_before_external_egress() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_query_params": true,
+            "on_error": "continue"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert!(!plugin.requires_decoded_query_params());
+
+    for (raw_query, expected_code) in [
+        ("role=user&role=admin", "duplicate_query_parameter"),
+        ("name=alice+bob", "ambiguous_query_encoding"),
+        ("name=%FF", "invalid_query_encoding"),
+        ("name=%ZZ", "invalid_query_encoding"),
+    ] {
+        let mut ctx = create_test_context();
+        ctx.set_raw_query_string(raw_query.to_string());
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::Reject { body, .. } => assert!(body.contains(expected_code)),
+            other => panic!("query={raw_query} must fail closed, got {other:?}"),
+        }
+    }
+
+    let mut materialized_only = create_test_context();
+    materialized_only
+        .query_params
+        .insert("role".to_string(), "admin".to_string());
+    match plugin
+        .before_proxy(&mut materialized_only, &mut HashMap::new())
+        .await
+    {
+        PluginResult::Reject { body, .. } => assert!(body.contains("raw_query_unavailable")),
+        other => panic!("materialized-only query must fail closed, got {other:?}"),
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_unambiguous_query_is_decoded_once_for_function_payload() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_query_params": true
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.set_raw_query_string("name=alice%20bob&literal=%2B".to_string());
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut HashMap::new()).await,
+        PluginResult::Continue
+    ));
+    let requests = server.received_requests().await.unwrap();
+    let payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(payload["query_params"]["name"], "alice bob");
+    assert_eq!(payload["query_params"]["literal"], "+");
+}
+
+#[tokio::test]
+async fn test_query_forwarding_omits_only_credentials_marked_for_backend_stripping() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_query_params": true
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.set_raw_query_string(
+        "api_key=first-secret&keep=visible%20value&API_KEY=case-visible&api%5Fkey=second-secret&api_key_suffix=visible-suffix&note=api_key&flag"
+            .to_string(),
+    );
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut HashMap::new()).await,
+        PluginResult::Continue
+    ));
+    let requests = server.received_requests().await.unwrap();
+    let payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let serialized_payload = serde_json::to_string(&payload).unwrap();
+    assert!(!serialized_payload.contains("first-secret"));
+    assert!(!serialized_payload.contains("second-secret"));
+    let params = payload["query_params"].as_object().unwrap();
+    assert_eq!(params.len(), 5);
+    assert_eq!(
+        params.get("keep").and_then(Value::as_str),
+        Some("visible value")
+    );
+    assert_eq!(
+        params.get("API_KEY").and_then(Value::as_str),
+        Some("case-visible")
+    );
+    assert_eq!(
+        params.get("api_key_suffix").and_then(Value::as_str),
+        Some("visible-suffix")
+    );
+    assert_eq!(params.get("note").and_then(Value::as_str), Some("api_key"));
+    assert_eq!(params.get("flag").and_then(Value::as_str), Some(""));
+    assert!(!params.contains_key("api_key"));
+
+    let mut duplicate_ctx = create_test_context();
+    duplicate_ctx.set_raw_query_string(
+        "api_key=hidden&role=user&api%5Fkey=also-hidden&r%6Fle=admin".to_string(),
+    );
+    duplicate_ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+    match plugin
+        .before_proxy(&mut duplicate_ctx, &mut HashMap::new())
+        .await
+    {
+        PluginResult::Reject { body, .. } => {
+            assert!(body.contains("duplicate_query_parameter"));
+        }
+        other => panic!("allowed duplicate names must still fail closed, got {other:?}"),
+    }
+
+    let mut invalid_encoding_ctx = create_test_context();
+    invalid_encoding_ctx.set_raw_query_string("api_key=hidden&visible=%FF".to_string());
+    invalid_encoding_ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+    match plugin
+        .before_proxy(&mut invalid_encoding_ctx, &mut HashMap::new())
+        .await
+    {
+        PluginResult::Reject { body, .. } => {
+            assert!(body.contains("invalid_query_encoding"));
+        }
+        other => panic!("hostile encoding must still fail closed, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_secret_bearing_url_never_reaches_client_or_metadata() {
+    let secret = "reusable-trigger-secret";
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "gcp_cloud_functions",
+            "function_url": format!("http://127.0.0.1:1/private/{secret}?code={secret}"),
+            "on_error": "reject",
+            "timeout_ms": 100
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::Reject { body, .. } => {
+            assert!(!body.contains(secret), "secret leaked to client: {body}");
+            assert!(body.contains("invocation_failed"));
+        }
+        other => panic!("expected opaque invocation error, got {other:?}"),
+    }
+    assert!(
+        ctx.metadata
+            .iter()
+            .all(|(key, value)| !key.contains(secret) && !value.contains(secret))
+    );
+}
+
+#[tokio::test]
 async fn test_pre_proxy_mode_allows_grpc_requests() {
     // pre_proxy mode should NOT reject gRPC — only terminate does
     let plugin = ServerlessFunction::new(
@@ -883,7 +2694,10 @@ async fn test_pre_proxy_mode_allows_grpc_requests() {
     // Should NOT get the gRPC rejection — should proceed to invoke (and fail with continue)
     match result {
         PluginResult::Continue => {
-            assert!(ctx.metadata.contains_key("serverless_function_error"));
+            assert!(
+                ctx.metadata
+                    .contains_key("serverless_function.standalone.error_class")
+            );
         }
         other => panic!("Expected Continue (not gRPC rejection), got {:?}", other),
     }
@@ -930,7 +2744,8 @@ async fn test_aws_lambda_function_error_does_not_leak_response_body_in_reject_de
             status_code, body, ..
         } => {
             assert_eq!(status_code, 502);
-            assert!(body.contains("Lambda function error (Unhandled)"));
+            assert!(body.contains("lambda_function_error"));
+            assert!(!body.contains("Unhandled"));
             assert!(!body.contains("db_password=supersecret"));
             assert!(!body.contains("/var/task/app.py:42"));
         }
@@ -1065,7 +2880,8 @@ async fn test_skips_ai_stream_router_claimed_provider_requests() {
         PluginResult::Continue
     ));
     assert!(
-        !ctx.metadata.contains_key("serverless_function_error"),
+        !ctx.metadata
+            .contains_key("serverless_function.standalone.error_class"),
         "claimed provider traffic must not invoke the external function hook"
     );
 }
@@ -1347,12 +3163,7 @@ async fn test_terminate_mode_rejects_oversized_response_body() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 502);
-            assert!(
-                body.contains("exceeds")
-                    || body.contains("max_response_body_bytes")
-                    || body.contains("invocation"),
-                "expected rejection body to mention the size error, got: {body}"
-            );
+            assert!(body.contains("response_body_too_large"));
         }
         other => panic!("Expected Reject for oversized response, got {:?}", other),
     }
@@ -1392,14 +3203,11 @@ async fn test_pre_proxy_continue_on_oversized_response_body() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     match result {
         PluginResult::Continue => {
-            let err = ctx
+            let error_class = ctx
                 .metadata
-                .get("serverless_function_error")
+                .get("serverless_function.standalone.error_class")
                 .expect("error should be recorded in metadata");
-            assert!(
-                err.contains("exceeds") || err.contains("max_response_body_bytes"),
-                "expected size-limit error in metadata, got: {err}"
-            );
+            assert_eq!(error_class, "response_body_too_large");
         }
         other => panic!("Expected Continue with metadata error, got {:?}", other),
     }

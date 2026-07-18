@@ -30,25 +30,32 @@
 //!   differences (VARCHAR vs TEXT, TINYINT vs INTEGER) do not affect query
 //!   semantics; they are covered by `sql_dialect.rs` unit tests.
 //!
-//! - **MongoDB**: `MongoStore` methods (`submit_api_spec_bundle`,
-//!   `replace_api_spec_bundle`, `delete_api_spec`, `list_api_specs`) are
-//!   byte-for-byte mirrors of their SQL counterparts where possible, diverging
-//!   only for native array membership queries (`has_tag`) and transaction style
-//!   (replica-set vs best-effort).  A future `#[ignore]` test file with a
-//!   `MONGO_URL` env-gated harness would close this gap.  See Round 8 P2
-//!   documenting comment for context on why this is deferred.
+//! - **MongoDB**: `MongoStore` mirrors the SQL API-spec operations where
+//!   possible. Atomic late-delete restore is implemented only with a replica
+//!   set transaction; standalone MongoDB rejects it before writing. A future
+//!   `#[ignore]` test file with a `MONGO_URL` env-gated harness would close the
+//!   live-backend gap. See Round 8 P2 documenting comment for context on why
+//!   this is deferred.
 
 use ferrum_edge::{
     ExtractedBundle, GatewayConfig,
     config::{
-        db_backend::{ApiSpecListFilter, ApiSpecSortBy, SortOrder},
+        BackendAllowIps, BackendEgressPolicy,
+        db_backend::{
+            ApiSpecListFilter, ApiSpecSortBy, SortOrder,
+            tcp_connection_throttle_attachment_conflict,
+        },
         db_loader::{DatabaseStore, DbPoolConfig},
         types::{
             ApiSpec, PluginAssociation, PluginConfig, PluginScope, Proxy, SpecFormat, Upstream,
         },
     },
+    plugins::PluginHttpClient,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tempfile::TempDir;
 
 /// Build a default list filter with just limit/offset (for existing pagination tests).
@@ -70,6 +77,10 @@ static COUNTER: AtomicU64 = AtomicU64::new(1);
 fn uid(prefix: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{n}")
+}
+
+fn restore_validation_http_client() -> PluginHttpClient {
+    PluginHttpClient::default()
 }
 
 /// Pool config with short timeouts for test speed.
@@ -353,6 +364,71 @@ async fn submit_bundle_proxy_only() {
     assert_eq!(fetched.proxy_id, proxy_id);
 }
 
+#[tokio::test]
+async fn submit_bundle_remains_available_with_unrelated_malformed_plugin_association() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let plugin_target_proxy_id = uid("submit-repair-target");
+    let wrong_association_proxy_id = uid("submit-repair-wrong-association");
+    let malformed_plugin_id = uid("submit-repair-plugin");
+
+    store
+        .create_proxy(&make_proxy(&plugin_target_proxy_id, ns))
+        .await
+        .expect("seed plugin target proxy failed");
+    store
+        .create_proxy(&make_proxy(&wrong_association_proxy_id, ns))
+        .await
+        .expect("seed wrongly associated proxy failed");
+    store
+        .create_plugin_config(&make_plugin(
+            &malformed_plugin_id,
+            &plugin_target_proxy_id,
+            ns,
+            None,
+        ))
+        .await
+        .expect("seed proxy-scoped plugin failed");
+    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
+        .bind(&wrong_association_proxy_id)
+        .bind(&malformed_plugin_id)
+        .execute(&store.pool())
+        .await
+        .expect("seed out-of-band malformed association failed");
+
+    let proxy_id = uid("submit-repair-new-proxy");
+    let spec_id = uid("submit-repair-new-spec");
+    let bundle = ExtractedBundle {
+        proxy: make_proxy(&proxy_id, ns),
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        b"valid submission beside malformed plugin state",
+    );
+
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("ordinary API-spec submit must remain available for in-band repair");
+
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_some());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_some());
+    let malformed_association_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?",
+    )
+    .bind(&wrong_association_proxy_id)
+    .bind(&malformed_plugin_id)
+    .fetch_one(&store.pool())
+    .await
+    .expect("count malformed association failed");
+    assert_eq!(malformed_association_count, 1);
+}
+
 // ---------------------------------------------------------------------------
 // submit_api_spec_bundle — rollback on duplicate
 // ---------------------------------------------------------------------------
@@ -409,6 +485,1192 @@ async fn submit_bundle_rollback_on_duplicate_proxy() {
         .expect("get_api_spec failed")
         .expect("spec1 not found after failed second submit");
     assert_eq!(fetched1.id, spec_id_1);
+}
+
+// ---------------------------------------------------------------------------
+// restore_api_spec_bundle — atomic late-delete compensation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn restore_bundle_preserves_complete_owned_and_hand_added_graph() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-proxy");
+    let upstream_id = uid("restore-upstream");
+    let spec_plugin_id = uid("restore-owned-plugin");
+    let additional_plugin_id = uid("restore-hand-plugin");
+    let spec_id = uid("restore-spec");
+    let created_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+        .unwrap()
+        .to_utc();
+    let updated_at = chrono::DateTime::parse_from_rfc3339("2026-02-03T04:05:06Z")
+        .unwrap()
+        .to_utc();
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.upstream_id = Some(upstream_id.clone());
+    proxy.created_at = created_at;
+    proxy.updated_at = updated_at;
+    proxy.plugins = vec![
+        PluginAssociation {
+            plugin_config_id: spec_plugin_id.clone(),
+        },
+        PluginAssociation {
+            plugin_config_id: additional_plugin_id.clone(),
+        },
+    ];
+
+    let mut upstream = make_upstream(&upstream_id, ns);
+    upstream.api_spec_id = Some(spec_id.clone());
+    upstream.created_at = created_at;
+    upstream.updated_at = updated_at;
+
+    let mut spec_plugin = make_plugin(&spec_plugin_id, &proxy_id, ns, Some(&spec_id));
+    spec_plugin.priority_override = Some(7);
+    spec_plugin.created_at = created_at;
+    spec_plugin.updated_at = updated_at;
+    let mut additional_plugin = make_plugin(&additional_plugin_id, &proxy_id, ns, None);
+    additional_plugin.enabled = false;
+    additional_plugin.priority_override = Some(41);
+    additional_plugin.created_at = created_at;
+    additional_plugin.updated_at = updated_at;
+
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: Some(upstream),
+        plugins: vec![spec_plugin],
+    };
+    let mut spec = make_spec(&spec_id, &proxy_id, ns, b"restored API spec");
+    spec.created_at = created_at;
+    spec.updated_at = updated_at;
+
+    store
+        .restore_api_spec_bundle(
+            &bundle,
+            &spec,
+            &[],
+            std::slice::from_ref(&additional_plugin),
+            &restore_validation_http_client(),
+        )
+        .await
+        .expect("atomic API-spec restore failed");
+
+    let restored_proxy = store
+        .get_proxy(ns, &proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("restored proxy missing");
+    assert_eq!(
+        restored_proxy.api_spec_id.as_deref(),
+        Some(spec_id.as_str())
+    );
+    assert_eq!(restored_proxy.created_at, created_at);
+    assert_eq!(restored_proxy.updated_at, updated_at);
+    let association_ids: HashSet<&str> = restored_proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    assert_eq!(
+        association_ids,
+        HashSet::from([spec_plugin_id.as_str(), additional_plugin_id.as_str()])
+    );
+
+    let restored_upstream = store
+        .get_upstream(ns, &upstream_id)
+        .await
+        .expect("get_upstream failed")
+        .expect("restored upstream missing");
+    assert_eq!(
+        restored_upstream.api_spec_id.as_deref(),
+        Some(spec_id.as_str())
+    );
+    assert_eq!(restored_upstream.created_at, created_at);
+    assert_eq!(restored_upstream.updated_at, updated_at);
+
+    let restored_owned = store
+        .get_plugin_config(ns, &spec_plugin_id)
+        .await
+        .expect("get owned plugin failed")
+        .expect("restored owned plugin missing");
+    assert_eq!(
+        restored_owned.api_spec_id.as_deref(),
+        Some(spec_id.as_str())
+    );
+    assert_eq!(restored_owned.scope, PluginScope::Proxy);
+    assert_eq!(restored_owned.proxy_id.as_deref(), Some(proxy_id.as_str()));
+    assert!(restored_owned.enabled);
+    assert_eq!(restored_owned.priority_override, Some(7));
+    assert_eq!(restored_owned.config, bundle.plugins[0].config);
+    assert_eq!(restored_owned.created_at, created_at);
+    assert_eq!(restored_owned.updated_at, updated_at);
+
+    let restored_additional = store
+        .get_plugin_config(ns, &additional_plugin_id)
+        .await
+        .expect("get hand-owned plugin failed")
+        .expect("restored hand-owned plugin missing");
+    assert!(restored_additional.api_spec_id.is_none());
+    assert_eq!(restored_additional.scope, PluginScope::Proxy);
+    assert_eq!(
+        restored_additional.proxy_id.as_deref(),
+        Some(proxy_id.as_str())
+    );
+    assert!(!restored_additional.enabled);
+    assert_eq!(restored_additional.priority_override, Some(41));
+    assert_eq!(restored_additional.config, additional_plugin.config);
+    assert_eq!(restored_additional.created_at, created_at);
+    assert_eq!(restored_additional.updated_at, updated_at);
+
+    let restored_spec = store
+        .get_api_spec(ns, &spec_id)
+        .await
+        .expect("get_api_spec failed")
+        .expect("restored API spec missing");
+    assert_eq!(restored_spec.created_at, created_at);
+    assert_eq!(restored_spec.updated_at, updated_at);
+
+    let changes: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT resource_type, resource_id, operation FROM config_changes \
+         WHERE namespace = ? ORDER BY sequence",
+    )
+    .bind(ns)
+    .fetch_all(&store.pool())
+    .await
+    .expect("load restore config changes failed");
+    assert_eq!(changes.len(), 4);
+    assert_eq!(
+        changes.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([
+            ("upstream".to_string(), upstream_id, "upsert".to_string()),
+            ("proxy".to_string(), proxy_id, "upsert".to_string()),
+            (
+                "plugin_config".to_string(),
+                spec_plugin_id,
+                "upsert".to_string()
+            ),
+            (
+                "plugin_config".to_string(),
+                additional_plugin_id,
+                "upsert".to_string()
+            ),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn restore_bundle_preserves_unattached_proxy_config_during_late_delete_compensation() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-unattached-proxy");
+    let spec_id = uid("restore-unattached-spec");
+    let plugin_id = uid("restore-unattached-plugin");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    assert!(proxy.plugins.is_empty());
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"unattached plugin compensation");
+    let mut unattached = make_plugin(&plugin_id, &proxy_id, ns, None);
+    unattached.enabled = false;
+    unattached.priority_override = Some(19);
+
+    store
+        .restore_api_spec_bundle(
+            &bundle,
+            &spec,
+            &[],
+            std::slice::from_ref(&unattached),
+            &restore_validation_http_client(),
+        )
+        .await
+        .expect("late-delete compensation must restore an unattached proxy config");
+
+    let restored_proxy = store
+        .get_proxy(ns, &proxy_id)
+        .await
+        .expect("get restored proxy failed")
+        .expect("restored proxy missing");
+    assert!(
+        restored_proxy.plugins.is_empty(),
+        "compensation must not invent a reverse proxy association"
+    );
+    let restored_plugin = store
+        .get_plugin_config(ns, &plugin_id)
+        .await
+        .expect("get restored unattached plugin failed")
+        .expect("unattached proxy config was not restored");
+    assert_eq!(restored_plugin.scope, PluginScope::Proxy);
+    assert_eq!(restored_plugin.proxy_id.as_deref(), Some(proxy_id.as_str()));
+    assert!(restored_plugin.api_spec_id.is_none());
+    assert!(!restored_plugin.enabled);
+    assert_eq!(restored_plugin.priority_override, Some(19));
+    assert_eq!(restored_plugin.config, unattached.config);
+}
+
+#[tokio::test]
+async fn restore_bundle_uses_configured_plugin_validation_egress_policy() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-egress-proxy");
+    let spec_id = uid("restore-egress-spec");
+    let plugin_id = uid("restore-egress-plugin");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: plugin_id.clone(),
+    }];
+    let mut plugin = make_plugin(&plugin_id, &proxy_id, ns, Some(&spec_id));
+    plugin.plugin_name = "http_logging".to_string();
+    plugin.config = serde_json::json!({
+        "endpoint_url": "http://169.254.169.254/ingest"
+    });
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![plugin],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        b"configured recovery validation client",
+    );
+    let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true)
+        .expect("production backend egress policy");
+    let validation_http_client = PluginHttpClient::default_with_backend_allow_ips(policy);
+
+    let error = store
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &validation_http_client)
+        .await
+        .expect_err("configured backend egress policy must reject recovery plugin");
+    assert!(
+        error.to_string().contains("backend egress policy"),
+        "recovery validation must return the configured-client rejection: {error:#}"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_plugin_config(ns, &plugin_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+    let change_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM config_changes WHERE namespace = ? AND resource_id IN (?, ?)",
+    )
+    .bind(ns)
+    .bind(&proxy_id)
+    .bind(&plugin_id)
+    .fetch_one(&store.pool())
+    .await
+    .expect("count rejected recovery changes failed");
+    assert_eq!(change_count, 0, "rejected recovery must roll back changes");
+}
+
+#[tokio::test]
+async fn restore_bundle_ignores_unrelated_malformed_plugin_association() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let plugin_target_proxy_id = uid("restore-repair-target");
+    let wrong_association_proxy_id = uid("restore-repair-wrong-association");
+    let malformed_plugin_id = uid("restore-repair-plugin");
+
+    store
+        .create_proxy(&make_proxy(&plugin_target_proxy_id, ns))
+        .await
+        .expect("seed plugin target proxy failed");
+    store
+        .create_proxy(&make_proxy(&wrong_association_proxy_id, ns))
+        .await
+        .expect("seed wrongly associated proxy failed");
+    store
+        .create_plugin_config(&make_plugin(
+            &malformed_plugin_id,
+            &plugin_target_proxy_id,
+            ns,
+            None,
+        ))
+        .await
+        .expect("seed proxy-scoped plugin failed");
+    sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
+        .bind(&wrong_association_proxy_id)
+        .bind(&malformed_plugin_id)
+        .execute(&store.pool())
+        .await
+        .expect("seed out-of-band malformed association failed");
+
+    let restored_proxy_id = uid("restore-repair-recovered-proxy");
+    let spec_id = uid("restore-repair-spec");
+    let mut restored_proxy = make_proxy(&restored_proxy_id, ns);
+    restored_proxy.api_spec_id = Some(spec_id.clone());
+    let bundle = ExtractedBundle {
+        proxy: restored_proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &restored_proxy_id,
+        ns,
+        b"valid recovery beside malformed plugin state",
+    );
+
+    store
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
+        .await
+        .expect("unrelated repairable association must not block compensation");
+
+    assert!(
+        store
+            .get_proxy(ns, &restored_proxy_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_some());
+    let malformed_association_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?",
+    )
+    .bind(&wrong_association_proxy_id)
+    .bind(&malformed_plugin_id)
+    .fetch_one(&store.pool())
+    .await
+    .expect("count malformed association failed");
+    assert_eq!(
+        malformed_association_count, 1,
+        "compensation must not mask or rewrite unrelated repairable state"
+    );
+}
+
+#[test]
+fn mongo_restore_validation_uses_the_recovered_proxy_graph_projection() {
+    let source = include_str!("../../src/config/mongo_store.rs");
+    let validation_start = source
+        .find("async fn validate_api_spec_restore_candidate_in_session")
+        .expect("Mongo restore validation helper");
+    let validation_end = source[validation_start..]
+        .find("// -----------------------------------------------------------------------")
+        .map(|offset| validation_start + offset)
+        .expect("end of Mongo restore validation helper");
+    let validation = &source[validation_start..validation_end];
+
+    assert!(validation.contains("api_spec_recovered_proxy_graph"));
+    assert!(validation.contains("restored_proxy_id"));
+    assert!(validation.contains("recovered_graph.validate_plugin_references()"));
+    assert!(validation.contains("load_full_upstreams_opt_session"));
+    assert!(validation.contains("recovered_graph.validate_upstream_references()"));
+    assert!(validation.contains("validate_api_spec_recovered_plugin_graph("));
+    assert!(validation.contains("validation_http_client: &crate::plugins::PluginHttpClient"));
+    assert!(validation.contains("validation_http_client"));
+    assert!(!validation.contains("PluginHttpClient::default()"));
+    assert!(
+        validation.contains("validate_tcp_connection_throttle_attachments(&candidate)"),
+        "namespace-wide guarded composition validation must remain in force"
+    );
+}
+
+#[test]
+fn recovery_graph_validation_uses_the_configured_admin_http_client() {
+    let shared = include_str!("../../src/config/db_backend.rs");
+    let validation_start = shared
+        .find("pub(crate) async fn validate_api_spec_recovered_plugin_graph(")
+        .expect("shared recovery graph validator");
+    let validation_end = shared[validation_start..]
+        .find("/// Validate the immutable identity")
+        .map(|offset| validation_start + offset)
+        .expect("end of shared recovery graph validator");
+    let validation = &shared[validation_start..validation_end];
+    assert!(validation.contains("http_client: &PluginHttpClient"));
+    assert!(validation.contains("let http_client = http_client.clone();"));
+    assert!(!validation.contains("PluginHttpClient::default"));
+
+    let sql = include_str!("../../src/config/db_loader.rs");
+    assert!(sql.contains("validation_http_client: &crate::plugins::PluginHttpClient"));
+    assert!(sql.contains("&recovered_graph,\n            validation_http_client,"));
+
+    let handlers = include_str!("../../src/admin/api_specs/handlers.rs");
+    assert!(handlers.contains("plugin_validation_http_client(state)"));
+    assert!(handlers.contains("&validation_http_client,"));
+}
+
+#[tokio::test]
+async fn restore_bundle_rolls_back_resources_associations_spec_and_changes_on_late_failure() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = "restore-failure-proxy";
+    let upstream_id = "restore-failure-upstream";
+    let additional_upstream_id = "restore-failure-hand-upstream";
+    let spec_plugin_id = "restore-failure-owned-plugin";
+    let additional_plugin_id = "restore-failure-hand-plugin";
+    let spec_id = "restore-failure-spec";
+
+    sqlx::query(
+        "CREATE TRIGGER fail_api_spec_restore_change BEFORE INSERT ON config_changes \
+         WHEN NEW.resource_id = 'restore-failure-hand-plugin' \
+         BEGIN SELECT RAISE(ABORT, 'injected late API-spec restore failure'); END",
+    )
+    .execute(&store.pool())
+    .await
+    .expect("install API-spec restore fault trigger failed");
+
+    let mut proxy = make_proxy(proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.to_string());
+    proxy.upstream_id = Some(additional_upstream_id.to_string());
+    proxy.plugins = vec![
+        PluginAssociation {
+            plugin_config_id: spec_plugin_id.to_string(),
+        },
+        PluginAssociation {
+            plugin_config_id: additional_plugin_id.to_string(),
+        },
+    ];
+    let mut upstream = make_upstream(upstream_id, ns);
+    upstream.api_spec_id = Some(spec_id.to_string());
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: Some(upstream),
+        plugins: vec![make_plugin(spec_plugin_id, proxy_id, ns, Some(spec_id))],
+    };
+    let spec = make_spec(spec_id, proxy_id, ns, b"fault-injected restore");
+    let additional_upstream = make_upstream(additional_upstream_id, ns);
+    let additional = make_plugin(additional_plugin_id, proxy_id, ns, None);
+
+    let error = store
+        .restore_api_spec_bundle(
+            &bundle,
+            &spec,
+            &[additional_upstream],
+            &[additional],
+            &restore_validation_http_client(),
+        )
+        .await
+        .expect_err("fault-injected restore must fail");
+    assert!(
+        format!("{error:#}").contains("injected late API-spec restore failure"),
+        "restore must reach the injected late failure after inserting the hand-owned upstream: {error:#}"
+    );
+
+    assert!(store.get_proxy(ns, proxy_id).await.unwrap().is_none());
+    assert!(store.get_upstream(ns, upstream_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_upstream(ns, additional_upstream_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "hand-owned upstream must roll back with the API-spec restore"
+    );
+    assert!(
+        store
+            .get_plugin_config(ns, spec_plugin_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_plugin_config(ns, additional_plugin_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get_api_spec(ns, spec_id).await.unwrap().is_none());
+
+    let association_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proxy_plugins WHERE proxy_id = ?")
+            .bind(proxy_id)
+            .fetch_one(&store.pool())
+            .await
+            .expect("count proxy associations failed");
+    assert_eq!(association_count, 0);
+    let change_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM config_changes WHERE namespace = ?")
+            .bind(ns)
+            .fetch_one(&store.pool())
+            .await
+            .expect("count config changes failed");
+    assert_eq!(change_count, 0);
+}
+
+#[tokio::test]
+async fn restore_bundle_preserves_preexisting_shared_additional_upstream() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let shared_upstream_id = uid("restore-shared-hand-upstream");
+    let keeper_proxy_id = uid("restore-shared-keeper");
+    let restored_proxy_id = uid("restore-shared-proxy");
+    let spec_id = uid("restore-shared-spec");
+
+    let mut current_upstream = make_upstream(&shared_upstream_id, ns);
+    current_upstream.name = Some("current shared upstream".to_string());
+    store
+        .create_upstream(&current_upstream)
+        .await
+        .expect("create shared upstream");
+    let mut keeper_proxy = make_proxy(&keeper_proxy_id, ns);
+    keeper_proxy.upstream_id = Some(shared_upstream_id.clone());
+    store
+        .create_proxy(&keeper_proxy)
+        .await
+        .expect("create proxy retaining shared upstream");
+
+    let mut restored_proxy = make_proxy(&restored_proxy_id, ns);
+    restored_proxy.api_spec_id = Some(spec_id.clone());
+    restored_proxy.upstream_id = Some(shared_upstream_id.clone());
+    let bundle = ExtractedBundle {
+        proxy: restored_proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &restored_proxy_id,
+        ns,
+        b"restore while shared hand upstream remains live",
+    );
+    let mut pre_delete_upstream = current_upstream.clone();
+    pre_delete_upstream.name = Some("stale pre-delete snapshot".to_string());
+
+    store
+        .restore_api_spec_bundle(
+            &bundle,
+            &spec,
+            &[pre_delete_upstream],
+            &[],
+            &restore_validation_http_client(),
+        )
+        .await
+        .expect("restore must reuse the hand upstream retained by another proxy");
+
+    assert!(
+        store
+            .get_proxy(ns, &restored_proxy_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_some());
+    let preserved_upstream = store
+        .get_upstream(ns, &shared_upstream_id)
+        .await
+        .unwrap()
+        .expect("shared upstream must remain present");
+    assert_eq!(
+        preserved_upstream.name.as_deref(),
+        Some("current shared upstream")
+    );
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_recreated_additional_upstream_identity() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let upstream_id = uid("restore-recreated-hand-upstream");
+    let proxy_id = uid("restore-recreated-proxy");
+    let spec_id = uid("restore-recreated-spec");
+
+    let recreated_upstream = make_upstream(&upstream_id, ns);
+    store
+        .create_upstream(&recreated_upstream)
+        .await
+        .expect("create intervening replacement upstream");
+    let mut pre_delete_upstream = recreated_upstream.clone();
+    pre_delete_upstream.created_at = recreated_upstream.created_at - chrono::Duration::seconds(1);
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.upstream_id = Some(upstream_id.clone());
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        b"reject upstream recreated after orphan cascade",
+    );
+
+    let error = store
+        .restore_api_spec_bundle(
+            &bundle,
+            &spec,
+            &[pre_delete_upstream],
+            &[],
+            &restore_validation_http_client(),
+        )
+        .await
+        .expect_err("replacement upstream identity must reject compensation");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match its pre-delete identity"),
+        "unexpected replacement-upstream error: {error:#}"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_upstream(ns, &upstream_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_intervening_schema_dependency_removal() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-schema-proxy");
+    let plugin_id = uid("restore-schema-logger");
+    let spec_id = uid("restore-schema-spec");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: plugin_id.clone(),
+    }];
+    let mut plugin = make_plugin(&plugin_id, &proxy_id, ns, Some(&spec_id));
+    plugin.plugin_name = "stdout_logging".to_string();
+    plugin.config = serde_json::json!({"schema_ref": "removed-during-delete"});
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![plugin],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        b"restore after schema dependency removal",
+    );
+
+    let error = store
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
+        .await
+        .expect_err("missing current schema dependency must reject compensation");
+    let error_message = error.to_string();
+    assert!(
+        error_message.contains(&plugin_id)
+            && error_message.contains("references unknown schema")
+            && error_message.contains("removed-during-delete"),
+        "unexpected schema dependency error: {error:#}"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_plugin_config(ns, &plugin_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+}
+
+#[test]
+fn mongo_restore_keeps_additional_upstreams_inside_the_transaction() {
+    let source = include_str!("../../src/config/mongo_store.rs");
+    let restore_start = source
+        .find("async fn restore_api_spec_bundle(")
+        .expect("Mongo restore implementation");
+    let restore_end = source[restore_start..]
+        .find("async fn replace_api_spec_bundle(")
+        .map(|offset| restore_start + offset)
+        .expect("end of Mongo restore implementation");
+    let restore = &source[restore_start..restore_end];
+
+    assert!(restore.contains("prepare_api_spec_restore_docs("));
+    assert!(restore.contains("prepared_docs.additional_upstreams"));
+    assert!(restore.contains("validate_api_spec_retained_upstream_identity("));
+    assert!(restore.contains("validation_http_client: &crate::plugins::PluginHttpClient"));
+    assert!(restore.contains("validate_api_spec_restore_candidate_in_session("));
+    assert!(restore.contains("validation_http_client,"));
+    assert!(!restore.contains("PluginHttpClient::default()"));
+    assert!(restore.contains("record_config_change_in_session("));
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_invalid_additional_upstream_ownership_before_writing() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    for (suffix, additional_id_matches_bundle, owner, expected_error) in [
+        ("overlap", true, None, "overlapping upstream id"),
+        (
+            "foreign",
+            false,
+            Some("different-api-spec"),
+            "owned by a different API spec",
+        ),
+    ] {
+        let proxy_id = format!("restore-upstream-input-{suffix}-proxy");
+        let spec_id = format!("restore-upstream-input-{suffix}-spec");
+        let upstream_id = format!("restore-upstream-input-{suffix}-owned");
+        let additional_id = if additional_id_matches_bundle {
+            upstream_id.clone()
+        } else {
+            format!("restore-upstream-input-{suffix}-additional")
+        };
+        let mut proxy = make_proxy(&proxy_id, ns);
+        proxy.api_spec_id = Some(spec_id.clone());
+        proxy.upstream_id = Some(upstream_id.clone());
+        let mut upstream = make_upstream(&upstream_id, ns);
+        upstream.api_spec_id = Some(spec_id.clone());
+        let bundle = ExtractedBundle {
+            proxy,
+            upstream: Some(upstream),
+            plugins: vec![],
+        };
+        let spec = make_spec(&spec_id, &proxy_id, ns, b"invalid additional upstream");
+        let mut additional = make_upstream(&additional_id, ns);
+        additional.api_spec_id = owner.map(str::to_string);
+
+        let error = store
+            .restore_api_spec_bundle(
+                &bundle,
+                &spec,
+                &[additional],
+                &[],
+                &restore_validation_http_client(),
+            )
+            .await
+            .expect_err("invalid additional upstream must fail before persistence");
+        assert!(
+            error.to_string().contains(expected_error),
+            "unexpected additional-upstream validation error: {error:#}"
+        );
+        assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+        assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+        assert!(
+            store
+                .get_upstream(ns, &upstream_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_upstream(ns, &additional_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_overlapping_ids_and_foreign_ownership_before_writing() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    for (suffix, additional_owner, expected_error) in [
+        ("overlap", None, "overlapping plugin id"),
+        (
+            "foreign",
+            Some("different-api-spec"),
+            "owned by an API spec",
+        ),
+    ] {
+        let proxy_id = format!("restore-input-{suffix}-proxy");
+        let plugin_id = format!("restore-input-{suffix}-plugin");
+        let additional_id = if suffix == "overlap" {
+            plugin_id.clone()
+        } else {
+            format!("restore-input-{suffix}-additional")
+        };
+        let spec_id = format!("restore-input-{suffix}-spec");
+        let mut proxy = make_proxy(&proxy_id, ns);
+        proxy.api_spec_id = Some(spec_id.clone());
+        proxy.plugins = vec![PluginAssociation {
+            plugin_config_id: plugin_id.clone(),
+        }];
+        if plugin_id != additional_id {
+            proxy.plugins.push(PluginAssociation {
+                plugin_config_id: additional_id.clone(),
+            });
+        }
+        let bundle = ExtractedBundle {
+            proxy,
+            upstream: None,
+            plugins: vec![make_plugin(&plugin_id, &proxy_id, ns, Some(&spec_id))],
+        };
+        let spec = make_spec(&spec_id, &proxy_id, ns, b"invalid restore input");
+        let additional = make_plugin(&additional_id, &proxy_id, ns, additional_owner);
+
+        let error = store
+            .restore_api_spec_bundle(
+                &bundle,
+                &spec,
+                &[],
+                &[additional],
+                &restore_validation_http_client(),
+            )
+            .await
+            .expect_err("invalid restore input must fail");
+        assert!(
+            error.to_string().contains(expected_error),
+            "unexpected restore validation error: {error:#}"
+        );
+        assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+        assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_wrong_preexisting_plugin_instance_and_rolls_back() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-wrong-instance-proxy");
+    let external_plugin_id = uid("restore-wrong-instance-plugin");
+    let spec_id = uid("restore-wrong-instance-spec");
+
+    let mut global = make_plugin(&external_plugin_id, &proxy_id, ns, None);
+    global.scope = PluginScope::Global;
+    global.proxy_id = None;
+    store
+        .create_plugin_config(&global)
+        .await
+        .expect("seed global plugin failed");
+    let baseline_changes: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM config_changes WHERE namespace = ?")
+            .bind(ns)
+            .fetch_one(&store.pool())
+            .await
+            .expect("count baseline changes failed");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: external_plugin_id.clone(),
+    }];
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"wrong plugin instance restore");
+    let error = store
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
+        .await
+        .expect_err("global plugin association must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid proxy/plugin associations"),
+        "unexpected wrong-instance error: {error:#}"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_plugin_config(ns, &external_plugin_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "pre-existing plugin must survive the rolled-back restore"
+    );
+    let final_changes: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM config_changes WHERE namespace = ?")
+            .bind(ns)
+            .fetch_one(&store.pool())
+            .await
+            .expect("count final changes failed");
+    assert_eq!(final_changes, baseline_changes);
+}
+
+#[tokio::test]
+async fn restore_bundle_preserves_preexisting_proxy_when_later_insert_conflicts() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-existing-proxy");
+    let upstream_id = uid("restore-conflict-upstream");
+    let spec_id = uid("restore-conflict-spec");
+    let existing = make_proxy(&proxy_id, ns);
+    store
+        .create_proxy(&existing)
+        .await
+        .expect("seed existing proxy failed");
+
+    let mut restore_proxy = existing.clone();
+    restore_proxy.api_spec_id = Some(spec_id.clone());
+    let mut restore_upstream = make_upstream(&upstream_id, ns);
+    restore_upstream.api_spec_id = Some(spec_id.clone());
+    let bundle = ExtractedBundle {
+        proxy: restore_proxy,
+        upstream: Some(restore_upstream),
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"pre-existing proxy conflict");
+    assert!(
+        store
+            .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
+            .await
+            .is_err()
+    );
+
+    let preserved = store
+        .get_proxy(ns, &proxy_id)
+        .await
+        .unwrap()
+        .expect("pre-existing proxy was lost");
+    assert_eq!(preserved.id, existing.id);
+    assert!(
+        store
+            .get_upstream(ns, &upstream_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_intervening_route_conflict_and_rolls_back() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let existing_proxy_id = uid("restore-route-existing");
+    let restored_proxy_id = uid("restore-route-candidate");
+    let restored_upstream_id = uid("restore-route-upstream");
+    let spec_id = uid("restore-route-spec");
+
+    let existing = make_proxy(&existing_proxy_id, ns);
+    store
+        .create_proxy(&existing)
+        .await
+        .expect("seed intervening route failed");
+
+    let mut restored_proxy = make_proxy(&restored_proxy_id, ns);
+    restored_proxy.api_spec_id = Some(spec_id.clone());
+    restored_proxy.listen_path = existing.listen_path.clone();
+    let mut restored_upstream = make_upstream(&restored_upstream_id, ns);
+    restored_upstream.api_spec_id = Some(spec_id.clone());
+    let bundle = ExtractedBundle {
+        proxy: restored_proxy,
+        upstream: Some(restored_upstream),
+        plugins: vec![],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &restored_proxy_id,
+        ns,
+        b"intervening route conflict",
+    );
+
+    let error = store
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
+        .await
+        .expect_err("overlapping intervening route must reject compensation");
+    assert!(
+        error.to_string().contains("overlapping hosts"),
+        "unexpected route-conflict error: {error:#}"
+    );
+    assert!(
+        store
+            .get_proxy(ns, &existing_proxy_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "intervening proxy must survive rejected compensation"
+    );
+    assert!(
+        store
+            .get_proxy(ns, &restored_proxy_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_upstream(ns, &restored_upstream_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "upstream inserted before route admission must roll back"
+    );
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_missing_hand_owned_upstream_reference() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-missing-upstream-proxy");
+    let missing_upstream_id = uid("restore-missing-upstream");
+    let spec_id = uid("restore-missing-upstream-spec");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.upstream_id = Some(missing_upstream_id);
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"missing hand-owned upstream");
+
+    assert!(
+        store
+            .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
+            .await
+            .is_err(),
+        "compensation must reject a proxy whose hand-owned upstream disappeared"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_intervening_hand_owned_upstream_subset_change() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-subset-proxy");
+    let upstream_id = uid("restore-subset-upstream");
+    let spec_id = uid("restore-subset-spec");
+
+    let mut upstream: Upstream = serde_json::from_value(serde_json::json!({
+        "id": upstream_id,
+        "namespace": ns,
+        "targets": [{
+            "host": "target.internal",
+            "port": 443,
+            "tags": {"version": "blue"}
+        }],
+        "subsets": [{"name": "blue", "labels": {"version": "blue"}}]
+    }))
+    .expect("subset upstream deserialization failed");
+    store
+        .create_upstream(&upstream)
+        .await
+        .expect("seed hand-owned upstream failed");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.upstream_id = Some(upstream_id.clone());
+    proxy.upstream_subset = Some("blue".to_string());
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"restored subset snapshot");
+
+    upstream.subsets = None;
+    assert!(
+        store
+            .update_upstream(&upstream)
+            .await
+            .expect("intervening upstream update failed")
+    );
+
+    let error = store
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
+        .await
+        .expect_err("removed upstream subset must reject compensation");
+    assert!(
+        error.to_string().contains("upstream_subset 'blue'"),
+        "unexpected subset validation error: {error:#}"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_upstream(ns, &upstream_id)
+            .await
+            .unwrap()
+            .is_some_and(|current| current.subsets.is_none()),
+        "rejected compensation must preserve the intervening upstream"
+    );
+}
+
+#[tokio::test]
+async fn restore_bundle_rejects_intervening_hand_owned_mesh_retry_change() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let proxy_id = uid("restore-mesh-retry-proxy");
+    let upstream_id = uid("restore-mesh-retry-upstream");
+    let spec_id = uid("restore-mesh-retry-spec");
+
+    let mut upstream = make_upstream(&upstream_id, ns);
+    store
+        .create_upstream(&upstream)
+        .await
+        .expect("seed hand-owned upstream failed");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.api_spec_id = Some(spec_id.clone());
+    proxy.upstream_id = Some(upstream_id.clone());
+    proxy.retry = Some(
+        serde_json::from_value(serde_json::json!({"max_retries": 1}))
+            .expect("retry deserialization failed"),
+    );
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"restored mesh retry snapshot");
+
+    upstream.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+    assert!(
+        store
+            .update_upstream(&upstream)
+            .await
+            .expect("intervening mesh upstream update failed")
+    );
+
+    let error = store
+        .restore_api_spec_bundle(&bundle, &spec, &[], &[], &restore_validation_http_client())
+        .await
+        .expect_err("new mesh transport/retry conflict must reject compensation");
+    let message = error.to_string();
+    assert!(
+        message.contains("enables retry") && message.contains("mesh.hbone"),
+        "unexpected mesh retry validation error: {error:#}"
+    );
+    assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_upstream(ns, &upstream_id)
+            .await
+            .unwrap()
+            .is_some_and(|current| {
+                current.targets[0]
+                    .tags
+                    .get("mesh.hbone")
+                    .map(String::as_str)
+                    == Some("true")
+            }),
+        "rejected compensation must preserve the intervening mesh upstream"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,6 +2370,64 @@ async fn delete_api_spec_returns_false_for_missing_spec() {
         !deleted,
         "delete_api_spec must return false for missing spec"
     );
+}
+
+#[tokio::test]
+async fn delete_api_spec_rejects_removing_last_global_tcp_throttle_target() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let spec_id = uid("spec-tcp-delete-guard");
+    let tcp_proxy_id = uid("tcp-proxy");
+    let http_proxy_id = uid("http-proxy");
+    let tcp_proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": tcp_proxy_id,
+        "namespace": ns,
+        "backend_scheme": "tcp",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9000,
+        "listen_port": 19101
+    }))
+    .unwrap();
+    let bundle = ExtractedBundle {
+        proxy: tcp_proxy.clone(),
+        upstream: None,
+        plugins: Vec::new(),
+    };
+    let spec = make_spec(&spec_id, &tcp_proxy_id, ns, b"tcp spec");
+    store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
+    store
+        .create_proxy(&make_proxy(&http_proxy_id, ns))
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    store
+        .create_plugin_config(&PluginConfig {
+            id: uid("global-tcp-throttle"),
+            namespace: ns.to_string(),
+            plugin_name: "tcp_connection_throttle".to_string(),
+            config: serde_json::json!({"max_connections_per_key": 10}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("the mixed global graph has a supported TCP target");
+
+    let error = store
+        .delete_api_spec(ns, &spec_id)
+        .await
+        .expect_err("the API-spec cascade must not remove the final TCP target");
+    assert!(
+        tcp_connection_throttle_attachment_conflict(&error).is_some(),
+        "unexpected API-spec delete rejection: {error:#}"
+    );
+    assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_some());
+    assert!(store.get_proxy(ns, &tcp_proxy_id).await.unwrap().is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -3133,7 +4453,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
     proxy_v1.plugins = vec![PluginAssociation {
         plugin_config_id: plugin_id.clone(),
     }];
-    let plugin_v1 = make_plugin(&plugin_id, &proxy_id, ns, Some(&spec_id));
+    let plugin_v1 = make_plugin(&plugin_id, &proxy_id, ns, None);
     let bundle_v1 = ExtractedBundle {
         proxy: proxy_v1,
         upstream: None,

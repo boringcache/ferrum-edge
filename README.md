@@ -225,7 +225,7 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 |---|---|---|---|
 | `FERRUM_MODE` | **Yes** | — | `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `node_agent`, `migrate` |
 | `FERRUM_LOG_LEVEL` | No | `warn` | `error`, `warn`, `info`, `debug`, `trace` |
-| `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel |
+| `FERRUM_LOG_BUFFER_CAPACITY` | No | `4096` | Per-sink hard record limit; aggregate bytes are separately bounded by `FERRUM_LOG_BUFFER_BYTES` |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy port (`0` = disabled) |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy port |
 | `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept loops via SO_REUSEPORT (0 = CPU cores; Unix only, non-Unix falls back to one loop) |
@@ -237,7 +237,7 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 
 For the full list of 300+ environment variables, see [docs/configuration.md](docs/configuration.md).
 
-Operational note: all logging flows through a **non-blocking writer** (channel → dedicated background thread → stdout), so log calls never block request-processing threads. Keep application logs on `stdout`/`stderr` by default. In containers, let the container runtime or platform collect and rotate the stream. On VMs, prefer running Ferrum Edge under `systemd` or another supervisor and let `journald`, `rsyslog`, `logrotate`, or a host log agent handle retention and rotation. Only add application-level file logging if you have a specific requirement for local log files. Under extreme throughput, tune `FERRUM_LOG_BUFFER_CAPACITY` to reduce log loss (the default 128,000 line buffer is lossy — new events are dropped when full to avoid backpressure).
+Operational note: all logging flows through bounded **non-blocking writers** (fixed record and byte admission → dedicated background threads → stdout/stderr), so log calls never block request-processing threads. Keep application logs on `stdout`/`stderr` by default. In containers, let the container runtime or platform collect and rotate the stream. On VMs, prefer running Ferrum Edge under `systemd` or another supervisor and let `journald`, `rsyslog`, `logrotate`, or a host log agent handle retention and rotation. Only add application-level file logging if you have a specific requirement for local log files. Under extreme throughput, size `FERRUM_LOG_BUFFER_CAPACITY` and `FERRUM_LOG_BUFFER_BYTES` together; increasing the record limit alone cannot increase admission when the byte budget is already full. New events are dropped and counted when either bound is reached so collector backpressure cannot stall the gateway.
 
 ### File Mode Config Format
 
@@ -339,7 +339,7 @@ Plugins for AI and agent gateway use cases — transcript audit, cost visibility
 - **`ai_tool_governor`** — Deterministic allow/deny/redact/approval policy for AI tool/function calls by name, arguments, JSON Schema, regex, risk, and identity; screens request tool definitions, buffered and streaming response tool calls (held until cleared, then released or cut), and optional MCP/A2A methods, with an optional approval webhook
 - **`ai_transcript_audit`** — Controlled AI payload capture for compliance: redacted request/response excerpts, canonical hashes, model/provider, token/guardrail/tool/cache metadata, sampling, and async batched HTTP export; never blocks the hot path unless configured fail-closed
 - **`ai_stream_router`** — Streaming counterpart to `ai_federation`: claims `"stream": true` OpenAI Chat Completions, route-overrides to the matched provider, and normalizes provider-native SSE (e.g. Anthropic) to OpenAI `chat.completion.chunk` SSE without buffering
-- **`ai_federation`** — Universal AI gateway routing non-streaming Chat Completions requests to 11+ providers with model-based routing and priority fallback; matched `"stream": true` requests return `501`
+- **`ai_federation`** — HTTP-only AI gateway routing final transformed, non-streaming Chat Completions JSON to supported providers with bounded responses, replay-safe fallback, strict endpoint policy, and provider-native tool/content normalization; matched `"stream": true` requests return `501`
 - **`mcp_gateway`** — MCP / Agent Tool Gateway for HTTP JSON-RPC MCP traffic: transparent proxying, aggregate discovery, namespaced tool/resource/prompt routing, session mediation, tool argument validation, and `mcp.*` metadata for downstream Ferrum plugins
 - **`a2a_gateway`** — Transparent Agent-to-Agent gateway for HTTP/HTTPS JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs traffic: method detection, lightweight method policy, HTTP Agent Card URL rewriting, streaming-safe pass-through, and `a2a.*` metadata
 

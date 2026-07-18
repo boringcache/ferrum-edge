@@ -1,9 +1,13 @@
 //! Tests for ws_frame_logging plugin
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use ferrum_edge::plugins::correlation_id::CorrelationId;
 use ferrum_edge::plugins::ws_frame_logging::WsFrameLogging;
-use ferrum_edge::plugins::{Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
+use ferrum_edge::plugins::{
+    Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection, WsDisconnectContext,
+};
 use serde_json::json;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{Event, Subscriber};
@@ -13,6 +17,8 @@ use tracing_subscriber::registry::LookupSpan;
 #[derive(Clone, Debug, Default)]
 struct CapturedWsLog {
     preview: Option<String>,
+    event: Option<String>,
+    correlation_id: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -56,6 +62,8 @@ where
         event.record(&mut visitor);
         self.events.lock().unwrap().push(CapturedWsLog {
             preview: visitor.preview,
+            event: visitor.event,
+            correlation_id: visitor.correlation_id,
         });
     }
 }
@@ -63,18 +71,28 @@ where
 #[derive(Default)]
 struct WsLogVisitor {
     preview: Option<String>,
+    event: Option<String>,
+    correlation_id: Option<String>,
 }
 
 impl tracing::field::Visit for WsLogVisitor {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "preview" {
             self.preview = Some(value.to_string());
+        } else if field.name() == "event" {
+            self.event = Some(value.to_string());
+        } else if field.name() == "correlation_id" {
+            self.correlation_id = Some(value.to_string());
         }
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "preview" {
             self.preview = Some(format!("{value:?}").trim_matches('"').to_string());
+        } else if field.name() == "event" {
+            self.event = Some(format!("{value:?}").trim_matches('"').to_string());
+        } else if field.name() == "correlation_id" {
+            self.correlation_id = Some(format!("{value:?}").trim_matches('"').to_string());
         }
     }
 }
@@ -90,6 +108,28 @@ fn preview_plugin(preview_bytes: u64) -> WsFrameLogging {
 fn install_ws_log_capture(capture: &WsLogCapture) -> tracing::subscriber::DefaultGuard {
     let subscriber = tracing_subscriber::registry().with(capture.layer());
     tracing::subscriber::set_default(subscriber)
+}
+
+fn disconnect_context(metadata: HashMap<String, String>) -> WsDisconnectContext {
+    WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "ws-proxy".to_string(),
+        proxy_name: Some("websocket".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        backend_target: "ws://127.0.0.1:9001/socket".to_string(),
+        listen_port: 8000,
+        duration_ms: 1.0,
+        frames_client_to_backend: 1,
+        frames_backend_to_client: 1,
+        bytes_client_to_backend: 4,
+        bytes_backend_to_client: 4,
+        direction: None,
+        io_side: None,
+        error_class: None,
+        consumer_username: None,
+        auth_method: None,
+        metadata,
+    }
 }
 
 async fn log_frame(plugin: &WsFrameLogging, connection_id: u64, message: &Message) {
@@ -207,6 +247,94 @@ fn test_supported_protocols_websocket_only() {
 fn test_requires_ws_frame_hooks() {
     let plugin = WsFrameLogging::new(&json!({})).unwrap();
     assert!(plugin.requires_ws_frame_hooks());
+}
+
+#[tokio::test]
+async fn correlation_id_composition_reaches_generated_and_preserved_disconnect_logs() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let correlation = CorrelationId::new(&json!({})).expect("valid correlation config");
+    let external_correlation = CorrelationId::new(&json!({
+        "header_name": "x-external-correlation-id"
+    }))
+    .expect("valid external correlation config");
+    let logger = WsFrameLogging::new(&json!({})).expect("valid WebSocket logger config");
+
+    for inbound in [None, Some("ws-preserved-id")] {
+        let mut request_ctx = super::plugin_utils::create_test_context();
+        if let Some(inbound) = inbound {
+            request_ctx
+                .headers
+                .insert("x-request-id".to_string(), inbound.to_string());
+        }
+        request_ctx.headers.insert(
+            "x-external-correlation-id".to_string(),
+            "attacker-controlled-alias".to_string(),
+        );
+        correlation.on_request_received(&mut request_ctx).await;
+        external_correlation
+            .on_request_received(&mut request_ctx)
+            .await;
+        let expected = request_ctx
+            .metadata
+            .get(ferrum_edge::plugins::REQUEST_ID_METADATA_KEY)
+            .expect("canonical request ID")
+            .clone();
+        assert_ne!(expected, "attacker-controlled-alias");
+
+        logger
+            .on_ws_disconnect(&disconnect_context(request_ctx.metadata.clone()))
+            .await;
+
+        let event = capture
+            .events()
+            .into_iter()
+            .rev()
+            .find(|event| event.event.as_deref() == Some("disconnect"))
+            .expect("disconnect log event");
+        assert_eq!(event.correlation_id.as_deref(), Some(expected.as_str()));
+        if inbound.is_none() {
+            assert!(uuid::Uuid::parse_str(&expected).is_ok());
+        }
+    }
+}
+
+#[tokio::test]
+async fn disconnect_log_falls_back_to_legacy_custom_correlation_metadata() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let logger = WsFrameLogging::new(&json!({})).expect("valid WebSocket logger config");
+
+    logger
+        .on_ws_disconnect(&disconnect_context(HashMap::from([(
+            "correlation_id".to_string(),
+            "legacy-custom-id".to_string(),
+        )])))
+        .await;
+
+    let event = capture
+        .events()
+        .into_iter()
+        .find(|event| event.event.as_deref() == Some("disconnect"))
+        .expect("disconnect log event");
+    assert_eq!(event.correlation_id.as_deref(), Some("legacy-custom-id"));
+
+    logger
+        .on_ws_disconnect(&disconnect_context(HashMap::from([
+            ("request_id".to_string(), "canonical-request-id".to_string()),
+            ("correlation_id".to_string(), "legacy-custom-id".to_string()),
+        ])))
+        .await;
+    let event = capture
+        .events()
+        .into_iter()
+        .rev()
+        .find(|event| event.event.as_deref() == Some("disconnect"))
+        .expect("disconnect log event");
+    assert_eq!(
+        event.correlation_id.as_deref(),
+        Some("canonical-request-id")
+    );
 }
 
 // === on_ws_frame always returns None (never transforms) ===

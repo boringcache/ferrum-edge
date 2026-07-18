@@ -3,7 +3,7 @@
 use ferrum_edge::custom_plugins::{create_custom_plugin, custom_plugin_names};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
-    RequestContext, plugin_failure_policy, validate_plugin_config,
+    RequestContext, TCP_ONLY_PROTOCOLS, plugin_failure_policy, validate_plugin_config,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -55,10 +55,16 @@ async fn valid_config_exercises_request_and_response_hooks() {
 
     let plugin = create_example_plugin(&json!({
         "header_value": "edge-a",
-        "request_body_prefix": "custom:"
+        "request_body_prefix": "custom:",
+        "correlation_header_name": " X-Custom-Correlation-ID "
     }))
     .expect("valid example config");
     assert_eq!(plugin.name(), "example_plugin");
+    assert_eq!(
+        plugin.correlation_id_header_name(),
+        Some(" X-Custom-Correlation-ID "),
+        "the example retains configured whitespace and casing at the capability boundary so core validation must trim and compare claims case-insensitively",
+    );
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(plugin.modifies_request_headers());
     assert!(plugin.modifies_request_body());
@@ -83,6 +89,13 @@ async fn valid_config_exercises_request_and_response_hooks() {
         Some("edge-a")
     );
     assert_eq!(
+        request_headers
+            .get("x-custom-correlation-id")
+            .map(String::as_str),
+        Some("edge-a"),
+        "runtime writes use the validated normalized lowercase header",
+    );
+    assert_eq!(
         plugin
             .transform_request_body(b"payload", None, &request_headers)
             .await,
@@ -99,6 +112,13 @@ async fn valid_config_exercises_request_and_response_hooks() {
     assert_eq!(
         response_headers.get("x-custom-gateway").map(String::as_str),
         Some("edge-a")
+    );
+    assert_eq!(
+        response_headers
+            .get("x-custom-correlation-id")
+            .map(String::as_str),
+        Some("edge-a"),
+        "runtime writes use the validated normalized lowercase header",
     );
 }
 
@@ -147,6 +167,39 @@ fn constructor_rejects_non_object_wrong_type_unknown_and_invalid_header_configs(
         let error = rejected_config(config);
         assert!(error.contains("request_body_prefix"), "got: {error}");
     }
+
+    for config in [
+        json!({"correlation_header_name": null}),
+        json!({"correlation_header_name": 7}),
+        json!({"correlation_header_name": ""}),
+        json!({"correlation_header_name": "bad header"}),
+    ] {
+        let error = rejected_config(config);
+        assert!(error.contains("correlation_header_name"), "got: {error}");
+    }
+
+    for config in [
+        json!({"protocol": null}),
+        json!({"protocol": 7}),
+        json!({"protocol": "udp"}),
+    ] {
+        let error = rejected_config(config);
+        assert!(error.contains("protocol"), "got: {error}");
+    }
+}
+
+#[test]
+fn protocol_declaration_can_select_tcp_only() {
+    if !example_plugin_registered() {
+        return;
+    }
+
+    let plugin = create_example_plugin(&json!({
+        "protocol": "tcp",
+        "correlation_header_name": "x-stream-correlation-id"
+    }))
+    .expect("valid TCP-only example config");
+    assert_eq!(plugin.supported_protocols(), TCP_ONLY_PROTOCOLS);
 }
 
 #[test]

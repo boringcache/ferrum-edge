@@ -31,7 +31,7 @@ tests/
 │   │   ├── hmac_auth_tests.rs          # HMAC auth plugin (24 tests)
 │   │   ├── ip_restriction_tests.rs     # IP restriction plugin (32 tests)
 │   │   ├── bot_detection_tests.rs      # Bot detection plugin (39 tests)
-│   │   ├── correlation_id_tests.rs     # Correlation ID plugin (23 tests)
+│   │   ├── correlation_id_tests.rs     # Correlation ID plugin (39 tests)
 │   │   ├── stdout_logging_tests.rs     # Stdout logging plugin
 │   │   └── transaction_debugger_tests.rs
 │   ├── config/                         # Configuration parsing tests

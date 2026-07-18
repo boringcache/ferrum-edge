@@ -63,7 +63,12 @@ const HEADER_GRPC_WEB_MODE: &str = "x-grpc-web-mode";
 const APPLICATION_GRPC_WEB: &str = "application/grpc-web";
 const APPLICATION_GRPC_WEB_TEXT: &str = "application/grpc-web-text";
 const BASE_EXPOSE_HEADERS: [&str; 3] = ["grpc-status", "grpc-message", "grpc-status-details-bin"];
-const BASE_EXPOSE_HEADERS_VALUE: &str = "grpc-status, grpc-message, grpc-status-details-bin";
+/// The gRPC-Web expose list every generated error representation must carry, so
+/// a browser can read the terminal metadata out of the body trailer frame.
+/// Authoritative in `finalize_grpc_web_error_response_headers`, which seeds the
+/// merge from this constant rather than from whatever ended up in the header map.
+pub(crate) const BASE_EXPOSE_HEADERS_VALUE: &str =
+    "grpc-status, grpc-message, grpc-status-details-bin";
 
 /// gRPC frame flag: data frame.
 pub(crate) const GRPC_FRAME_DATA: u8 = 0x00;
@@ -355,20 +360,43 @@ pub(crate) fn client_uses_grpc_web(ctx: &RequestContext) -> bool {
     ctx.metadata.contains_key(META_GRPC_WEB_ORIGINAL_CT)
 }
 
+pub(crate) fn retained_response_content_type(ctx: &RequestContext) -> Option<&'static str> {
+    ctx.metadata
+        .get(META_GRPC_WEB_ORIGINAL_CT)
+        .map(|content_type| response_content_type(content_type))
+}
+
 pub struct GrpcWebErrorResponse {
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    terminal_headers: HashMap<String, String>,
 }
 
 /// Rebuild a synthesized error's body trailer frame after finalized rejection
-/// metadata has been merged into its temporary header map.
+/// metadata has been merged into its temporary header map. Preserve the
+/// originally selected status/message when decorators contribute no terminal
+/// fields, while letting case-insensitive finalized fields replace them.
 pub(crate) fn rebuild_error_body_from_headers(response: &mut GrpcWebErrorResponse) {
     let response_ct = response
         .headers
         .get("content-type")
         .map(String::as_str)
         .unwrap_or(APPLICATION_GRPC_WEB);
-    let mut body = build_trailer_frame(&response.headers);
+    let mut trailer_headers = response.terminal_headers.clone();
+    for (name, value) in &response.headers {
+        if is_valid_trailer_header(name).is_none() {
+            continue;
+        }
+        if let Some(existing) = trailer_headers
+            .keys()
+            .find(|existing| existing.eq_ignore_ascii_case(name))
+            .cloned()
+        {
+            trailer_headers.remove(&existing);
+        }
+        trailer_headers.insert(name.clone(), value.clone());
+    }
+    let mut body = build_trailer_frame(&trailer_headers);
     if is_grpc_web_text(response_ct) {
         body = BASE64.encode(&body).into_bytes();
     }
@@ -383,21 +411,31 @@ pub fn error_response_for_content_type(
     message: &str,
 ) -> GrpcWebErrorResponse {
     let response_ct = response_content_type(response_ct);
-    let mut headers = HashMap::with_capacity(5);
+    let mut headers = HashMap::with_capacity(3);
     headers.insert("content-type".to_string(), response_ct.to_string());
     headers.insert("x-grpc-web".to_string(), "1".to_string());
     headers.insert(
         "access-control-expose-headers".to_string(),
         BASE_EXPOSE_HEADERS_VALUE.to_string(),
     );
-    headers.insert("grpc-status".to_string(), status.to_string());
-    headers.insert("grpc-message".to_string(), message.to_string());
 
-    let mut body = build_trailer_frame(&headers);
+    // gRPC-Web carries terminal metadata in its body trailer frame, never as
+    // native response headers. Keep a separate trailer map so an early gateway
+    // refusal has the same client-visible shape as a transformed backend
+    // response.
+    let trailer_headers = HashMap::from([
+        ("grpc-status".to_string(), status.to_string()),
+        ("grpc-message".to_string(), message.to_string()),
+    ]);
+    let mut body = build_trailer_frame(&trailer_headers);
     if is_grpc_web_text(response_ct) {
         body = BASE64.encode(&body).into_bytes();
     }
-    GrpcWebErrorResponse { headers, body }
+    GrpcWebErrorResponse {
+        headers,
+        body,
+        terminal_headers: trailer_headers,
+    }
 }
 
 /// Build the client-visible gRPC-Web error shape for a recognized request that
@@ -579,6 +617,27 @@ impl Plugin for GrpcWebPlugin {
         ctx.metadata.contains_key(META_GRPC_WEB_MODE)
     }
 
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        _content_type: Option<&str>,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && super::response_body_rewrite_allowed(response_status)
+    }
+
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && !super::response_body_rewrite_allowed(response_status)
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Always strip the internal mode marker from inbound headers so a client
         // cannot spoof it. The plugin re-injects it in `before_proxy` only when
@@ -749,9 +808,16 @@ impl Plugin for GrpcWebPlugin {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // The shared lifecycle cannot embed trailers or base64-rewrite a
+        // preserved 206/226 representation. Leave its native headers coherent
+        // with the untouched bytes instead of falsely labelling it gRPC-Web.
+        if !super::response_body_rewrite_allowed(response_status) {
+            return PluginResult::Continue;
+        }
+
         let original_ct = match ctx.metadata.get(META_GRPC_WEB_ORIGINAL_CT) {
             Some(ct) => ct.clone(),
             None => return PluginResult::Continue,
@@ -788,6 +854,39 @@ impl Plugin for GrpcWebPlugin {
             None => self.expose_headers_value.clone(),
         };
         response_headers.insert("access-control-expose-headers".to_string(), combined);
+
+        // The expose list is the ONE field here whose gateway contribution a
+        // deadline rebuild could lose. `content-type` and `x-grpc-web` are
+        // regenerated by the gRPC-Web error builder itself, but the expose list
+        // is only merged from what provenance retained
+        // (`merge_grpc_web_expose_headers`), so a backend that pre-populated the
+        // identical combined list would make this insert invisible to net-diff
+        // mutation tracking and the DEADLINE_EXCEEDED response would carry only
+        // the base list — browsers could not read the operator-configured
+        // trailer headers.
+        //
+        // Whole-field ownership is the wrong instrument: the live value may also
+        // carry backend-only tokens this plugin merely preserved, and claiming
+        // the field would cross them onto the synthesized response. Declaring
+        // the configured elements as authored retires exactly one backend
+        // baseline occurrence each, so the ordinary occurrence partition credits
+        // the gateway's configured list and nothing else.
+        //
+        // Gated on provenance being tracked so the common path never builds the
+        // borrowed element slice. Applies to every gRPC-Web surface — binary and
+        // text, H1/H2/H3 — because all of them run this one `after_proxy`.
+        if ctx.has_buffered_deadline_response_header_provenance() {
+            let authored = self
+                .expose_headers
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            ctx.record_deadline_authored_response_header_elements(
+                "access-control-expose-headers",
+                &authored,
+                response_headers,
+            );
+        }
 
         debug!(
             plugin = "grpc_web",

@@ -1,8 +1,10 @@
 use chrono::Utc;
 use ferrum_edge::config::db_backend::FullConfigLoadPurpose;
 use ferrum_edge::config::types::{
-    Consumer, anchor_regex_pattern, hosts_overlap, redact_consumer_credentials, validate_host_entry,
+    Consumer, GatewayConfig, PluginConfig, PluginScope, anchor_regex_pattern, hosts_overlap,
+    redact_consumer_credentials, validate_host_entry,
 };
+use serde_json::json;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -510,11 +512,11 @@ fn test_redact_consumer_entry_without_target_field_unchanged() {
 }
 
 #[test]
-fn cp_full_and_incremental_rejection_share_hmac_composition_validation() {
+fn cp_full_and_incremental_rejection_share_plugin_security_composition_validation() {
     let shared = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(
-        shared.contains("validate_hmac_request_transform_candidate("),
-        "the shared rejecting contract must include HMAC composition"
+        shared.contains("validate_plugin_security_composition_candidate("),
+        "the shared rejecting contract must include plugin security composition"
     );
 
     let control_plane = include_str!("../../../src/modes/control_plane.rs");
@@ -608,4 +610,44 @@ fn runtime_mmdb_validation_runs_off_async_workers() {
     assert!(file_loader.contains("reload_config_from_file_off_thread"));
     assert!(file_mode.contains("load_config_from_file_off_thread("));
     assert!(file_mode.contains("reload_config_from_file_off_thread("));
+}
+
+#[test]
+fn runtime_plugin_composition_validation_scopes_global_correlation_by_namespace() {
+    let global_correlation = |id: &str, namespace: &str| PluginConfig {
+        id: id.to_string(),
+        plugin_name: "correlation_id".to_string(),
+        namespace: namespace.to_string(),
+        config: json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let config = GatewayConfig {
+        plugin_configs: vec![
+            global_correlation("tenant-a-correlation", "tenant-a"),
+            global_correlation("tenant-b-correlation", "tenant-b"),
+        ],
+        ..GatewayConfig::default()
+    };
+
+    let errors =
+        ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config);
+    assert!(
+        errors.is_empty(),
+        "global correlation owners in independent namespace slices must not conflict: {errors:?}"
+    );
+}
+
+#[test]
+fn runtime_config_rejection_includes_tcp_throttle_attachment_validation() {
+    let shared = include_str!("../../../src/config/validation_pipeline.rs");
+    assert!(
+        shared.contains("validate_tcp_connection_throttle_attachments(config)"),
+        "database and CP snapshots must reject unsupported TCP-throttle attachments"
+    );
 }

@@ -897,6 +897,16 @@ impl Plugin for WorkloadMetrics {
         true
     }
 
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        // When `workload_metrics` is the mesh tracing plugin its `after_proxy`
+        // echoes the gateway-authored `traceparent` from `ctx.metadata`, exactly
+        // like `otel_tracing`. If the backend already echoed that identical
+        // value, mutation tracking sees no change, so declare ownership so a
+        // buffered gRPC deadline rebuild preserves the gateway trace context.
+        name.eq_ignore_ascii_case(TRACEPARENT_HEADER)
+            && ctx.metadata.contains_key(TRACEPARENT_HEADER)
+    }
+
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let stamped_direction = ctx.mesh_direction;
         let peer_identity = ctx
@@ -1825,27 +1835,18 @@ mod tests {
         authenticated_identity: Option<&str>,
         proxy_name: &str,
     ) -> StreamConnectionContext {
-        StreamConnectionContext {
-            client_ip: "10.0.0.2".to_string(),
-            direct_client_ip: "10.0.0.2".to_string(),
-            canonical_client_ip: Default::default(),
-            proxy_id: "mesh-stream".to_string(),
-            proxy_name: Some(proxy_name.to_string()),
-            listen_port: 5432,
-            backend_scheme: crate::config::types::BackendScheme::Tcp,
-            consumer_index: Arc::new(crate::consumer_index::ConsumerIndex::new(&[])),
-            identified_consumer: None,
-            authenticated_identity: authenticated_identity.map(str::to_owned),
-            auth_method: None,
-            metadata: None,
-            tls_client_cert_der: None,
-            tls_client_cert_chain_der: None,
-            sni_hostname: None,
-            mesh_direction: Some(direction),
-            node_waypoint_policy_scope: None,
-            first_bytes: None,
-            first_bytes_kind: None,
-        }
+        let mut ctx = StreamConnectionContext::new(
+            "10.0.0.2".to_string(),
+            "10.0.0.2".to_string(),
+            "mesh-stream".to_string(),
+            Some(proxy_name.to_string()),
+            5432,
+            crate::config::types::BackendScheme::Tcp,
+            Arc::new(crate::consumer_index::ConsumerIndex::new(&[])),
+        );
+        ctx.authenticated_identity = authenticated_identity.map(str::to_owned);
+        ctx.mesh_direction = Some(direction);
+        ctx
     }
 
     #[test]

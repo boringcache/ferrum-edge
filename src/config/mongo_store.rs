@@ -44,9 +44,9 @@ mod inner {
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
         DeleteAllResourcesError, DeleteMode, FullConfigLoadPurpose, IncrementalResult,
-        MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict, NamespaceResourceCounts,
-        NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
-        SnapshotDataIntegrityError, SortOrder,
+        MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend,
+        NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+        SnapshotDataIntegrityError, SortOrder, TcpConnectionThrottleAttachmentConflict,
     };
     use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
     use crate::config::types::{
@@ -103,6 +103,7 @@ mod inner {
         MONGO_MIGRATION_LEASE_DURATION.as_millis() as i64;
     const MONGO_MIGRATION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
     const MONGO_MIGRATION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+    const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
     const MONGO_ADMISSION_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
     const HMAC_SECRET_HASHES_FIELD: &str = "_ferrum_hmac_secret_hashes";
     // Dedicated migration-lease pool size. Lease upkeep only issues tiny
@@ -891,8 +892,9 @@ mod inner {
                     "MongoDB connected without a replica set (FERRUM_MONGO_REPLICA_SET is unset). \
                      Multi-document writes (proxy delete/update, api_spec submit/replace) will \
                      fall back to compensating rollback instead of transactions, leaving a small \
-                     window where partial failure may require operator reconciliation. Configure \
-                     FERRUM_MONGO_REPLICA_SET to enable transactions."
+                     window where partial failure may require operator reconciliation. Atomic \
+                     late API-spec delete compensation is unavailable and fails before writing. \
+                     Configure FERRUM_MONGO_REPLICA_SET to enable transactions."
                 );
             }
 
@@ -1355,7 +1357,7 @@ mod inner {
             Ok(())
         }
 
-        /// Aggregation-pipeline update that takes or holds the migration lease
+        /// Aggregation-pipeline update that takes or holds a renewable lease.
         /// using MongoDB SERVER time (`$$NOW`). Clock skew on the connecting
         /// client can never enter the expiry comparison: the server both
         /// evaluates whether the existing lease is expired and stamps the new
@@ -1363,6 +1365,53 @@ mod inner {
         /// The lease is (re)claimed only when it is missing, server-expired, or
         /// already owned by us; otherwise every field is left untouched so an
         /// active owner is never stomped.
+        fn server_time_lease_acquire_pipeline(owner: &str, duration_millis: i64) -> Vec<Document> {
+            vec![
+                doc! {
+                    "$set": {
+                        "_ferrum_same_owner": { "$eq": [ "$owner", owner ] },
+                        "_ferrum_claimable": {
+                            "$or": [
+                                { "$eq": [ { "$type": "$expires_at" }, "missing" ] },
+                                { "$lte": [ "$expires_at", "$$NOW" ] },
+                                { "$eq": [ "$owner", owner ] },
+                            ],
+                        },
+                    },
+                },
+                doc! {
+                    "$set": {
+                        "owner": { "$cond": [ "$_ferrum_claimable", owner, "$owner" ] },
+                        "expires_at": {
+                            "$cond": [
+                                "$_ferrum_claimable",
+                                { "$add": [ "$$NOW", duration_millis ] },
+                                "$expires_at",
+                            ],
+                        },
+                        "generation": {
+                            "$cond": [
+                                "$_ferrum_claimable",
+                                {
+                                    "$cond": [
+                                        "$_ferrum_same_owner",
+                                        { "$ifNull": [ "$generation", 1_i64 ] },
+                                        { "$add": [ { "$ifNull": [ "$generation", 0_i64 ] }, 1_i64 ] },
+                                    ],
+                                },
+                                "$generation",
+                            ],
+                        },
+                        "updated_at": {
+                            "$cond": [ "$_ferrum_claimable", "$$NOW", "$updated_at" ],
+                        },
+                        "created_at": { "$ifNull": [ "$created_at", "$$NOW" ] },
+                    },
+                },
+                doc! { "$unset": [ "_ferrum_claimable", "_ferrum_same_owner" ] },
+            ]
+        }
+
         fn migration_lease_acquire_pipeline(owner: &str) -> Vec<Document> {
             vec![
                 doc! {
@@ -1396,16 +1445,26 @@ mod inner {
             ]
         }
 
-        /// Aggregation-pipeline update that renews the lease with a fresh
+        /// Aggregation-pipeline update that renews a lease with a fresh
         /// server-time (`$$NOW`) expiry. The owner match stays in the query
         /// filter so a renewal that no longer owns the lock matches nothing.
-        fn migration_lease_renew_pipeline() -> Vec<Document> {
+        fn server_time_lease_renew_pipeline(duration_millis: i64) -> Vec<Document> {
             vec![doc! {
                 "$set": {
-                    "expires_at": { "$add": [ "$$NOW", MONGO_MIGRATION_LEASE_DURATION_MILLIS ] },
+                    "expires_at": { "$add": [ "$$NOW", duration_millis ] },
                     "updated_at": "$$NOW",
                 },
             }]
+        }
+
+        async fn lease_server_time(&self) -> Result<BsonDateTime, anyhow::Error> {
+            let response = self.lease_db().run_command(doc! { "hello": 1 }).await?;
+            response
+                .get_datetime("localTime")
+                .cloned()
+                .map_err(|error| {
+                    anyhow::anyhow!("MongoDB hello response omitted localTime: {error}")
+                })
         }
 
         /// The migration-lease duration in milliseconds (exposed for tests that
@@ -1639,7 +1698,19 @@ mod inner {
         where
             F: Fn(&mut GatewayConfig),
         {
-            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, false)
+            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, false, false)
+                .await
+        }
+
+        async fn validate_plugin_graph_admission_candidate<F>(
+            &self,
+            namespace: &str,
+            mutate: F,
+        ) -> Result<(), anyhow::Error>
+        where
+            F: Fn(&mut GatewayConfig),
+        {
+            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, false, true)
                 .await
         }
 
@@ -1651,7 +1722,19 @@ mod inner {
         where
             F: Fn(&mut GatewayConfig),
         {
-            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, true)
+            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, true, false)
+                .await
+        }
+
+        async fn validate_plugin_graph_repair_delete_candidate<F>(
+            &self,
+            namespace: &str,
+            mutate: F,
+        ) -> Result<(), anyhow::Error>
+        where
+            F: Fn(&mut GatewayConfig),
+        {
+            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, true, true)
                 .await
         }
 
@@ -1660,6 +1743,7 @@ mod inner {
             namespace: &str,
             mutate: F,
             allow_existing_conflicts: bool,
+            validate_plugin_graph: bool,
         ) -> Result<(), anyhow::Error>
         where
             F: Fn(&mut GatewayConfig),
@@ -1670,6 +1754,14 @@ mod inner {
             let mut policy_candidate = self.load_mtls_dns_policy_candidate(namespace).await?;
             mutate(&mut policy_candidate);
             policy_candidate.normalize_fields();
+            if validate_plugin_graph {
+                crate::plugin_cache::validate_tcp_connection_throttle_attachments(
+                    &policy_candidate,
+                )
+                .map_err(|errors| {
+                    anyhow::Error::new(TcpConnectionThrottleAttachmentConflict::new(errors))
+                })?;
+            }
             if !policy_candidate.has_effective_mtls_dns_identity_policy() {
                 return Ok(());
             }
@@ -2026,7 +2118,9 @@ mod inner {
                                 renew_collection
                                     .update_one(
                                         renew_filter,
-                                        MongoStore::migration_lease_renew_pipeline(),
+                                        MongoStore::server_time_lease_renew_pipeline(
+                                            MONGO_MIGRATION_LEASE_DURATION_MILLIS,
+                                        ),
                                     )
                                     .await
                             }
@@ -2114,6 +2208,18 @@ mod inner {
             }
         }
 
+        /// Snapshot of the dedicated lease `Database` handle. Lease acquisition,
+        /// renewal, release, and supporting server-time reads must not queue
+        /// behind ordinary datastore traffic.
+        fn lease_db(&self) -> MongoDatabaseHandle {
+            let connection = self.connection();
+            let db = connection.lease_client.database(connection.db.name());
+            MongoDatabaseHandle {
+                db,
+                _connection: connection,
+            }
+        }
+
         fn collection(&self, name: &str) -> MongoCollectionHandle {
             let connection = self.connection();
             MongoCollectionHandle {
@@ -2152,6 +2258,14 @@ mod inner {
 
         fn config_change_counters(&self) -> MongoCollectionHandle {
             self.collection("config_change_counters")
+        }
+
+        fn config_admission_locks(&self) -> MongoCollectionHandle {
+            let lease_db = self.lease_db();
+            MongoCollectionHandle {
+                collection: lease_db.collection("config_admission_locks"),
+                _connection: lease_db._connection,
+            }
         }
 
         /// Merged consumer identity keyspace (id ∪ username ∪ custom_id per
@@ -3905,6 +4019,7 @@ mod inner {
     #[derive(Clone)]
     struct PreparedApiSpecBundleDocs {
         upstream: Option<(String, Document)>,
+        additional_upstreams: Vec<(String, Document)>,
         plugins: Vec<(String, Document)>,
         proxy: (String, Document),
         spec: Document,
@@ -3937,15 +4052,244 @@ mod inner {
 
         Ok(PreparedApiSpecBundleDocs {
             upstream,
+            additional_upstreams: Vec::new(),
             plugins,
             proxy: (bundle.proxy.id.clone(), proxy_doc),
             spec: spec_doc,
         })
     }
 
+    fn prepare_api_spec_restore_docs(
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &ApiSpec,
+        additional_upstreams: &[Upstream],
+        additional_plugins: &[PluginConfig],
+    ) -> Result<PreparedApiSpecBundleDocs, anyhow::Error> {
+        let mut prepared = prepare_api_spec_bundle_docs(bundle, spec)?;
+        prepared
+            .additional_upstreams
+            .reserve(additional_upstreams.len());
+        for upstream in additional_upstreams {
+            prepared
+                .additional_upstreams
+                .push((upstream.id.clone(), upstream_to_doc(upstream)?));
+        }
+        prepared.plugins.reserve(additional_plugins.len());
+        for plugin in additional_plugins {
+            prepared
+                .plugins
+                .push((plugin.id.clone(), plugin_config_to_doc(plugin)?));
+        }
+        Ok(prepared)
+    }
+
+    async fn validate_api_spec_restore_candidate_in_session(
+        store: &MongoStore,
+        connection: &MongoConnectionBundle,
+        session: &mut ClientSession,
+        namespace: &str,
+        restored_proxy_id: &str,
+        validation_http_client: &crate::plugins::PluginHttpClient,
+    ) -> Result<(), anyhow::Error> {
+        let proxies = store
+            .load_full_proxies_opt_session(namespace, Some((connection, &mut *session)), true)
+            .await?;
+        let plugin_configs = store
+            .load_full_plugin_configs_opt_session(
+                namespace,
+                Some((connection, &mut *session)),
+                true,
+            )
+            .await?;
+        let upstreams = store
+            .load_full_upstreams_opt_session(namespace, Some((connection, &mut *session)), true)
+            .await?;
+        let mut candidate = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            plugin_configs,
+            upstreams,
+            loaded_at: Utc::now(),
+            ..Default::default()
+        };
+        candidate.normalize_fields();
+        let recovered_graph = crate::config::db_backend::api_spec_recovered_proxy_graph(
+            candidate.clone(),
+            restored_proxy_id,
+        )?;
+        if let Err(errors) = recovered_graph.validate_plugin_references() {
+            anyhow::bail!(
+                "restore_api_spec_bundle produced invalid proxy/plugin associations: {}",
+                errors.join("; ")
+            );
+        }
+        if let Err(errors) = recovered_graph.validate_upstream_references() {
+            anyhow::bail!(
+                "restore_api_spec_bundle produced invalid proxy/upstream references: {}",
+                errors.join("; ")
+            );
+        }
+        crate::config::db_backend::validate_api_spec_recovered_plugin_graph(
+            &recovered_graph,
+            validation_http_client,
+        )
+        .await?;
+        crate::plugin_cache::validate_tcp_connection_throttle_attachments(&candidate).map_err(
+            |errors| anyhow::Error::new(TcpConnectionThrottleAttachmentConflict::new(errors)),
+        )?;
+        if !candidate.has_effective_mtls_dns_identity_policy() {
+            return Ok(());
+        }
+        candidate.consumers = store
+            .load_full_consumers_opt_session(namespace, Some((connection, &mut *session)), true)
+            .await?;
+        candidate
+            .validate_unique_mtls_dns_identities()
+            .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
+    }
+
     // -----------------------------------------------------------------------
     // DatabaseBackend trait implementation
     // -----------------------------------------------------------------------
+
+    #[async_trait]
+    impl NamespaceConfigAdmissionLeaseBackend for MongoStore {
+        async fn try_acquire_namespace_config_admission_lease(
+            &self,
+            namespace: &str,
+            owner: &str,
+        ) -> Result<Option<u64>, anyhow::Error> {
+            let collection = self.config_admission_locks();
+            let result = collection
+                .find_one_and_update(
+                    doc! { "_id": namespace },
+                    Self::server_time_lease_acquire_pipeline(
+                        owner,
+                        CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+                    ),
+                )
+                .upsert(true)
+                .return_document(ReturnDocument::After)
+                .await;
+            let result = match result {
+                Err(error) if is_pipeline_update_unsupported(&error) => {
+                    let now = self.lease_server_time().await?;
+                    let expires_at = BsonDateTime::from_millis(
+                        now.timestamp_millis() + CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+                    );
+                    let retained = collection
+                        .find_one_and_update(
+                            doc! { "_id": namespace, "owner": owner },
+                            doc! {
+                                "$set": {
+                                    "expires_at": expires_at,
+                                    "updated_at": now,
+                                },
+                            },
+                        )
+                        .return_document(ReturnDocument::After)
+                        .await?;
+                    if retained.is_some() {
+                        Ok(retained)
+                    } else {
+                        collection
+                            .find_one_and_update(
+                                doc! {
+                                    "_id": namespace,
+                                    "$or": [
+                                        { "expires_at": { "$exists": false } },
+                                        { "expires_at": { "$lte": now } },
+                                        { "owner": owner },
+                                    ],
+                                },
+                                doc! {
+                                    "$set": {
+                                        "owner": owner,
+                                        "expires_at": expires_at,
+                                        "updated_at": now,
+                                    },
+                                    "$inc": { "generation": 1_i64 },
+                                    "$setOnInsert": { "created_at": now },
+                                },
+                            )
+                            .upsert(true)
+                            .return_document(ReturnDocument::After)
+                            .await
+                    }
+                }
+                result => result,
+            };
+            match result {
+                Ok(Some(document)) if document.get_str("owner").ok() == Some(owner) => {
+                    let generation = document.get_i64("generation").map_err(anyhow::Error::new)?;
+                    Ok(Some(u64::try_from(generation).map_err(|_| {
+                        anyhow::anyhow!("namespace config admission generation is negative")
+                    })?))
+                }
+                Ok(Some(_)) | Ok(None) => Ok(None),
+                Err(error) if is_duplicate_key(&error) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        }
+
+        async fn renew_namespace_config_admission_lease(
+            &self,
+            namespace: &str,
+            owner: &str,
+        ) -> Result<bool, anyhow::Error> {
+            let collection = self.config_admission_locks();
+            let result = collection
+                .update_one(
+                    doc! {
+                        "_id": namespace,
+                        "owner": owner,
+                        "$expr": { "$gt": [ "$expires_at", "$$NOW" ] },
+                    },
+                    Self::server_time_lease_renew_pipeline(CONFIG_ADMISSION_LEASE_DURATION_MILLIS),
+                )
+                .await;
+            let result = match result {
+                Err(error) if is_pipeline_update_unsupported(&error) => {
+                    let now = self.lease_server_time().await?;
+                    let expires_at = BsonDateTime::from_millis(
+                        now.timestamp_millis() + CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+                    );
+                    collection
+                        .update_one(
+                            doc! {
+                                "_id": namespace,
+                                "owner": owner,
+                                "expires_at": { "$gt": now },
+                            },
+                            doc! {
+                                "$set": {
+                                    "expires_at": expires_at,
+                                    "updated_at": now,
+                                },
+                            },
+                        )
+                        .await
+                }
+                result => result,
+            }?;
+            Ok(result.matched_count == 1)
+        }
+
+        async fn release_namespace_config_admission_lease(
+            &self,
+            namespace: &str,
+            owner: &str,
+        ) -> Result<bool, anyhow::Error> {
+            let result = self
+                .config_admission_locks()
+                .update_one(
+                    doc! { "_id": namespace, "owner": owner },
+                    doc! { "$set": { "expires_at": BsonDateTime::from_millis(0) } },
+                )
+                .await?;
+            Ok(result.matched_count == 1)
+        }
+    }
 
     #[async_trait]
     impl DatabaseBackend for MongoStore {
@@ -4540,7 +4884,7 @@ mod inner {
             let mut mtls_lease = self
                 .acquire_mtls_dns_admission_lease(&proxy.namespace)
                 .await?;
-            self.validate_mtls_dns_candidate(&proxy.namespace, |candidate| {
+            self.validate_plugin_graph_admission_candidate(&proxy.namespace, |candidate| {
                 candidate.proxies.push(proxy.clone());
             })
             .await?;
@@ -4692,7 +5036,7 @@ mod inner {
             let mut mtls_lease = self
                 .acquire_mtls_dns_admission_lease(&proxy.namespace)
                 .await?;
-            self.validate_mtls_dns_candidate(&proxy.namespace, |candidate| {
+            self.validate_plugin_graph_admission_candidate(&proxy.namespace, |candidate| {
                 if let Some(existing) = candidate
                     .proxies
                     .iter_mut()
@@ -4959,7 +5303,7 @@ mod inner {
         async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
-            self.validate_mtls_dns_repair_delete_candidate(namespace, |candidate| {
+            self.validate_plugin_graph_repair_delete_candidate(namespace, |candidate| {
                 candidate.proxies.retain(|proxy| proxy.id != id);
                 candidate
                     .plugin_configs
@@ -5094,8 +5438,13 @@ mod inner {
                                             .session(&mut *s)
                                             .await?;
                                     }
-                                    // Cascade-delete orphaned upstream.
-                                    if let Some(ref uid) = upstream_id_to_check {
+                                    // Generic proxy deletion owns ordinary
+                                    // orphan cleanup. A spec-owned proxy can
+                                    // drift to a hand-owned upstream, which
+                                    // must survive deletion of the spec graph.
+                                    if spec_owner.is_none()
+                                        && let Some(ref uid) = upstream_id_to_check
+                                    {
                                         let still_referenced = this
                                             .proxies()
                                             .count_documents(mongodb::bson::doc! {
@@ -5319,7 +5668,9 @@ mod inner {
                         ),
                     }
                 }
-                if let Some(ref uid) = upstream_id_to_check {
+                if spec_owner.is_none()
+                    && let Some(ref uid) = upstream_id_to_check
+                {
                     let still_referenced = self
                         .proxies()
                         .count_documents(doc! { "upstream_id": uid })
@@ -5945,7 +6296,7 @@ mod inner {
         async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(&pc.namespace).await?;
-            self.validate_mtls_dns_candidate(&pc.namespace, |candidate| {
+            self.validate_plugin_graph_admission_candidate(&pc.namespace, |candidate| {
                 if let Some(existing) = candidate
                     .plugin_configs
                     .iter_mut()
@@ -6048,7 +6399,7 @@ mod inner {
         async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(&pc.namespace).await?;
-            self.validate_mtls_dns_candidate(&pc.namespace, |candidate| {
+            self.validate_plugin_graph_admission_candidate(&pc.namespace, |candidate| {
                 if let Some(existing) = candidate
                     .plugin_configs
                     .iter_mut()
@@ -6206,7 +6557,7 @@ mod inner {
         ) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
-            self.validate_mtls_dns_repair_delete_candidate(namespace, |candidate| {
+            self.validate_plugin_graph_repair_delete_candidate(namespace, |candidate| {
                 candidate.plugin_configs.retain(|plugin| plugin.id != id);
                 for proxy in &mut candidate.proxies {
                     proxy
@@ -7190,7 +7541,7 @@ mod inner {
                     .map(|proxy| proxy.namespace.as_str())
                     .collect();
                 for namespace in namespaces {
-                    self.validate_mtls_dns_candidate(namespace, |candidate| {
+                    self.validate_plugin_graph_admission_candidate(namespace, |candidate| {
                         candidate.proxies.extend(
                             proxies
                                 .iter()
@@ -7508,7 +7859,7 @@ mod inner {
                     .map(|config| config.namespace.as_str())
                     .collect();
                 for namespace in namespaces {
-                    self.validate_mtls_dns_candidate(namespace, |candidate| {
+                    self.validate_plugin_graph_admission_candidate(namespace, |candidate| {
                         candidate.plugin_configs.extend(
                             configs
                                 .iter()
@@ -8653,6 +9004,13 @@ mod inner {
             bundle: &crate::admin::api_specs::ExtractedBundle,
             spec: &ApiSpec,
         ) -> Result<(), anyhow::Error> {
+            crate::config::db_backend::validate_api_spec_restore_inputs(
+                bundle,
+                spec,
+                &[],
+                &[],
+                false,
+            )?;
             // Pre-flight size check: BSON document limit is 16 MiB.
             // Measure the actual serialized BSON size rather than estimating
             // with a hardcoded overhead constant.
@@ -8688,7 +9046,7 @@ mod inner {
                 )
                 .collect();
             for namespace in namespaces {
-                self.validate_mtls_dns_candidate(namespace, |candidate| {
+                self.validate_plugin_graph_admission_candidate(namespace, |candidate| {
                     if bundle.proxy.namespace == namespace {
                         candidate.proxies.push(bundle.proxy.clone());
                     }
@@ -8890,6 +9248,225 @@ mod inner {
             Ok(())
         }
 
+        async fn restore_api_spec_bundle(
+            &self,
+            bundle: &crate::admin::api_specs::ExtractedBundle,
+            spec: &ApiSpec,
+            additional_upstreams: &[Upstream],
+            additional_plugins: &[PluginConfig],
+            validation_http_client: &crate::plugins::PluginHttpClient,
+        ) -> Result<(), anyhow::Error> {
+            crate::config::db_backend::validate_api_spec_restore_inputs(
+                bundle,
+                spec,
+                additional_upstreams,
+                additional_plugins,
+                true,
+            )?;
+            if !self.replica_set_configured() {
+                anyhow::bail!(
+                    "atomic API-spec restore requires MongoDB replica-set transactions; configure FERRUM_MONGO_REPLICA_SET"
+                );
+            }
+
+            let spec_doc = api_spec_to_doc(spec)?;
+            let bson_bytes = mongodb::bson::to_vec(&spec_doc)?;
+            if bson_bytes.len() > 15 * 1024 * 1024 {
+                anyhow::bail!(
+                    "MongoDB document limit exceeded: serialized spec is {} bytes \
+                     (limit ~15 MiB); use a SQL backend for large specs",
+                    bson_bytes.len()
+                );
+            }
+
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases(std::iter::once(spec.namespace.as_str()))
+                .await?;
+            self.validate_plugin_graph_admission_candidate(&spec.namespace, |candidate| {
+                candidate.proxies.push(bundle.proxy.clone());
+                candidate
+                    .plugin_configs
+                    .extend(bundle.plugins.iter().cloned());
+                candidate
+                    .plugin_configs
+                    .extend(additional_plugins.iter().cloned());
+            })
+            .await?;
+
+            Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                let prepared_docs = prepare_api_spec_restore_docs(
+                    bundle,
+                    spec,
+                    additional_upstreams,
+                    additional_plugins,
+                )?;
+                let guard_params = ProxyWriteGuardParams::from_proxy(&bundle.proxy);
+                let mut upsert_changes: Vec<(String, &'static str, String)> = Vec::new();
+                if let Some(upstream) = &bundle.upstream {
+                    upsert_changes.push((
+                        upstream.namespace.clone(),
+                        "upstream",
+                        upstream.id.clone(),
+                    ));
+                }
+                upsert_changes.push((
+                    bundle.proxy.namespace.clone(),
+                    "proxy",
+                    bundle.proxy.id.clone(),
+                ));
+                for plugin in bundle.plugins.iter().chain(additional_plugins) {
+                    upsert_changes.push((
+                        plugin.namespace.clone(),
+                        "plugin_config",
+                        plugin.id.clone(),
+                    ));
+                }
+
+                session
+                    .start_transaction()
+                    .and_run(
+                        (
+                            self,
+                            connection,
+                            prepared_docs,
+                            guard_params,
+                            upsert_changes,
+                            spec.namespace.clone(),
+                            bundle.proxy.id.clone(),
+                            validation_http_client,
+                        ),
+                        |s,
+                         (
+                            this,
+                            connection,
+                            prepared_docs,
+                            guard_params,
+                            upsert_changes,
+                            namespace,
+                            restored_proxy_id,
+                            validation_http_client,
+                        )| {
+                            Box::pin(async move {
+                                if let Some((_, doc)) = &prepared_docs.upstream {
+                                    this.upstreams()
+                                        .insert_one(doc.clone())
+                                        .session(&mut *s)
+                                        .await?;
+                                }
+                                for (upstream_id, doc) in &prepared_docs.additional_upstreams {
+                                    let upstream_namespace = doc
+                                        .get_str("namespace")
+                                        .map_err(|error| {
+                                            mongodb::error::Error::custom(format!(
+                                                "additional restore upstream {} is missing namespace: {}",
+                                                upstream_id, error
+                                            ))
+                                        })?;
+                                    let existing = this
+                                        .upstreams()
+                                        .find_one(mongodb::bson::doc! {
+                                            "_id": upstream_id.as_str(),
+                                            "namespace": upstream_namespace,
+                                        })
+                                        .session(&mut *s)
+                                        .await?;
+                                    if let Some(existing) = existing {
+                                        let existing = doc_to_upstream(existing).map_err(|error| {
+                                            mongodb::error::Error::custom(error.to_string())
+                                        })?;
+                                        let expected = doc_to_upstream(doc.clone()).map_err(
+                                            |error| {
+                                                mongodb::error::Error::custom(error.to_string())
+                                            },
+                                        )?;
+                                        crate::config::db_backend::validate_api_spec_retained_upstream_identity(
+                                            &expected,
+                                            &existing,
+                                        )
+                                        .map_err(|error| {
+                                            mongodb::error::Error::custom(error.to_string())
+                                        })?;
+                                        continue;
+                                    }
+                                    this.upstreams()
+                                        .insert_one(doc.clone())
+                                        .session(&mut *s)
+                                        .await?;
+                                    upsert_changes.push((
+                                        upstream_namespace.to_string(),
+                                        "upstream",
+                                        upstream_id.clone(),
+                                    ));
+                                }
+                                // Compensation may follow an intervening
+                                // writer. Reapply the same in-session route
+                                // uniqueness and upstream-reference guards as
+                                // normal proxy creation before publishing the
+                                // restored proxy.
+                                this.ensure_proxy_admission_guards_in_session(
+                                    &mut *s,
+                                    guard_params,
+                                    None,
+                                )
+                                .await?;
+                                this.proxies()
+                                    .insert_one(prepared_docs.proxy.1.clone())
+                                    .session(&mut *s)
+                                    .await?;
+                                for (_, doc) in &prepared_docs.plugins {
+                                    this.plugin_configs()
+                                        .insert_one(doc.clone())
+                                        .session(&mut *s)
+                                        .await?;
+                                }
+                                this.api_specs()
+                                    .insert_one(prepared_docs.spec.clone())
+                                    .session(&mut *s)
+                                    .await?;
+
+                                validate_api_spec_restore_candidate_in_session(
+                                    this,
+                                    connection.as_ref(),
+                                    &mut *s,
+                                    namespace.as_str(),
+                                    restored_proxy_id.as_str(),
+                                    validation_http_client,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    mongodb::error::Error::custom(error.to_string())
+                                })?;
+
+                                for (namespace, resource_type, resource_id) in upsert_changes.iter()
+                                {
+                                    this.record_config_change_in_session(
+                                        &mut *s,
+                                        namespace.as_str(),
+                                        resource_type,
+                                        resource_id.as_str(),
+                                        "upsert",
+                                    )
+                                    .await?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("restore_api_spec_bundle transaction failed")?;
+
+                self.compact_config_changes_best_effort(&spec.namespace)
+                    .await;
+                Ok(())
+            })
+            .await?;
+            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Ok(())
+        }
+
         async fn replace_api_spec_bundle(
             &self,
             bundle: &crate::admin::api_specs::ExtractedBundle,
@@ -9076,7 +9653,7 @@ mod inner {
                 )
                 .collect();
             for namespace in namespaces {
-                self.validate_mtls_dns_candidate(namespace, |candidate| {
+                self.validate_plugin_graph_admission_candidate(namespace, |candidate| {
                     candidate.plugin_configs.retain(|plugin| {
                         !old_spec_plugin_ids.contains(&plugin.id)
                             && !previous_declared_assoc_ids.contains(&plugin.id)
@@ -9746,7 +10323,7 @@ mod inner {
                 .as_ref()
                 .and_then(|d| d.get_str("proxy_id").ok())
                 .map(str::to_string);
-            self.validate_mtls_dns_repair_delete_candidate(namespace, |candidate| {
+            self.validate_plugin_graph_repair_delete_candidate(namespace, |candidate| {
                 if let Some(proxy_id) = proxy_id.as_deref() {
                     candidate.proxies.retain(|proxy| proxy.id != proxy_id);
                     candidate

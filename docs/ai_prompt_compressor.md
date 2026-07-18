@@ -69,9 +69,10 @@ preserved: whitespace is compacted, equivalent escape spellings can normalize,
 duplicate object names collapse according to `serde_json`'s last-value behavior,
 and original numeric spelling/object-member byte order are outside the contract.
 Marker-only bounded fallbacks instead remove configured markers directly from
-admitted JSON string literals and preserve every unrelated source byte. Requests
-with neither a successful rewrite nor marker cleanup retain their original
-bytes.
+admitted JSON string **values**. Object member names are never sanitized and
+remain byte-for-byte unchanged, including their original escape spelling.
+Every other source byte is preserved as well. Requests with neither a successful
+rewrite nor value cleanup retain their original bytes.
 
 ## Configuration
 
@@ -106,10 +107,11 @@ correctness path: up to 32 sanitation jobs parse and classify concurrently.
 Saturation fails closed before cloning the buffered body instead of retaining a
 waiter queue. If statistical compression is saturated, any work counter is
 exceeded, or JSON reserialization would exceed the hard output bound, the
-plugin removes markers directly from the admitted JSON string literals while
-preserving all other source bytes (including whitespace, duplicate names,
-member order, escapes, and number spelling). Escaped marker spellings such as
-`\u003ckeep\u003e` are recognized too. The gateway applies a 1,048,576-byte
+plugin removes markers directly from admitted JSON string values while never
+changing object member names. This value-only pass preserves all other source
+bytes (including whitespace, duplicate names, member order, escapes, and number
+spelling). Escaped marker spellings such as `\u003ckeep\u003e` are recognized in
+values too. The gateway applies a 1,048,576-byte
 plugin-local buffer limit to these candidate requests even when its global body
 limit is unlimited; a larger candidate is rejected with `413`, while sanitation
 worker unavailability is rejected with `503`. The context-free compatibility
@@ -188,10 +190,10 @@ routing rewrites the backend path, so staged reuse, recomputation, and the
 65,536-byte threshold cannot change eligibility. The path snapshot is one
 private typed value per request, shared by all compressor instances rather than
 stored in public metadata. Opt-in gzip/brotli decompression therefore compresses
-and measures the resulting plaintext on the standard path. Compressed client
-uploads cannot be compressed for direct `ai_federation` dispatch because
-federation returns before request-body transforms run; use the standard
-backend-dispatch path for that combination.
+and measures the resulting plaintext on the standard path. `ai_federation`
+consumes the authoritative final request body after decompression and the
+context-aware transform, so provider dispatch uses that same compressed
+representation for plaintext and opt-in compressed uploads.
 
 The final context-aware body hook is the fail-closed backstop for decoded
 representations. For example, if request decompression produces more than the
@@ -256,13 +258,16 @@ transforms cannot write request metadata and therefore emit no counters.
   keys and values. Wrap such payloads in a fenced code block or a
   `preserve_tag` span.
 - **`preserve_tag` markers never reach the provider for an admitted request
-  family.** Markers are stripped from balanced, repeated, adjacent, nested,
-  malformed, and JSON-escaped sequences, even when content is below
+  family when they occur in string values.** Markers are stripped from balanced,
+  repeated, adjacent, nested, malformed, and JSON-escaped value sequences, even
+  when content is below
   `min_content_tokens`, compression yields no reduction, work/output limits are
-  exceeded, or statistical admission is saturated. Invalid JSON and
-  unsupported/ambiguous shapes are not admitted and retain their original
-  bytes. An admitted decoded body above the immutable sanitation ceiling fails
-  closed instead of reaching the provider.
+  exceeded, or statistical admission is saturated. Object member names are a
+  schema boundary: their bytes are always left exactly as received, even when a
+  name contains literal or escaped preserve markers. Invalid JSON and
+  unsupported/ambiguous shapes are not admitted and retain their original bytes.
+  An admitted decoded body above the immutable sanitation ceiling fails closed
+  instead of reaching the provider.
 
 ## Testing
 

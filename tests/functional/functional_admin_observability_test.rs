@@ -249,6 +249,50 @@ async fn test_metrics_gated_and_live_minimal() {
         "expected Prometheus metrics output, got: {}",
         &text[..text.len().min(200)]
     );
+    for family in [
+        "ferrum_log_sink_healthy",
+        "ferrum_log_sink_accepted_records_total",
+        "ferrum_log_sink_dropped_records_total",
+        "ferrum_log_sink_io_failures_total",
+        "ferrum_log_sink_shutdown_timeouts_total",
+        "ferrum_log_sink_shutdown_incomplete_records_total",
+    ] {
+        assert!(text.contains(family), "missing {family}: {text}");
+    }
+    for sink in ["stdout", "stderr"] {
+        assert!(
+            text.contains(&format!("ferrum_log_sink_healthy{{sink=\"{sink}\"}}")),
+            "missing distinct {sink} sink metrics: {text}"
+        );
+    }
+
+    // /health keeps sink internals in the authenticated detail tier.
+    let unauth_health: serde_json::Value = client
+        .get(format!("{}/health", harness.admin_base_url))
+        .send()
+        .await
+        .expect("GET /health (unauth) failed")
+        .json()
+        .await
+        .expect("health JSON");
+    assert!(unauth_health.get("logging").is_none(), "{unauth_health}");
+    let auth_health: serde_json::Value = client
+        .get(format!("{}/health", harness.admin_base_url))
+        .header("Authorization", harness.auth_header())
+        .send()
+        .await
+        .expect("GET /health (auth) failed")
+        .json()
+        .await
+        .expect("health JSON");
+    assert!(
+        auth_health["logging"]["stdout"].is_object(),
+        "{auth_health}"
+    );
+    assert!(
+        auth_health["logging"]["stderr"].is_object(),
+        "{auth_health}"
+    );
 
     // /live is always unauthenticated and minimal.
     let resp = client
@@ -574,6 +618,8 @@ async fn test_runtime_metrics_endpoint_requires_jwt_and_returns_system_json() {
         "system sampler did not populate RSS within 2s: {last_body}"
     );
     assert!(last_body["http"]["status_codes"]["totals"].is_object());
+    assert!(last_body["logs"]["sinks"]["stdout"].is_object());
+    assert!(last_body["logs"]["sinks"]["stderr"].is_object());
     assert_eq!(last_body["overload"]["level"].as_str(), Some("normal"));
 }
 

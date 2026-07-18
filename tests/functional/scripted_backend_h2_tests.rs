@@ -19,6 +19,8 @@
 //! `H2Step::SendGoawayAndClose`, `H2Step::SendRstStream`, and
 //! `H2Step::DropConnection` are exercised through the corresponding
 //! `GrpcStep::{SendGoaway,SendRstStream,CloseAfterHeaders}` lowering.
+//! `GrpcStep::{AcceptStreamingRpc,ExpectReset}` cover the live bidi deadline
+//! cancellation path.
 //! `H2Step::SendGoaway` (the non-closing graceful form) is intentionally
 //! reserved for in-flight graceful-drain coverage: the round-2 matrix needs
 //! a terminal connection fault, so it uses `SendGoawayAndClose` instead.
@@ -83,7 +85,7 @@ fn has_backend_error_signal(logs: &str) -> bool {
 
 /// Poll the captured output until a backend-error signal appears, then
 /// return the full snapshot. Polling is necessary because the
-/// `stdout_logging` access-log routes through `tracing-appender`'s
+/// `stdout_logging` access-log routes through Ferrum's bounded
 /// non-blocking writer, which lags the response by tens of ms; a bare
 /// `captured_combined()` snapshot races the flush.
 ///
@@ -157,6 +159,10 @@ async fn wait_for_h2_tls_supported(harness: &GatewayHarness, timeout: Duration) 
 /// when `backend_scheme: http`). Callers can merge additional overrides
 /// into the proxy definition via `overrides`.
 fn grpc_file_config(port: u16, overrides: Value) -> String {
+    grpc_file_config_with_log_config(port, overrides, json!({}))
+}
+
+fn grpc_file_config_with_log_config(port: u16, overrides: Value, log_config: Value) -> String {
     let mut proxy = json!({
         "id": "grpc-scripted",
         "listen_path": "/grpc",
@@ -188,12 +194,61 @@ fn grpc_file_config(port: u16, overrides: Value) -> String {
         "plugin_configs": [{
             "id": "access-log",
             "plugin_name": "stdout_logging",
-            "config": {},
+            "config": log_config,
             "scope": "global",
             "enabled": true,
         }],
     });
     serde_yaml::to_string(&config).expect("serialize yaml")
+}
+
+/// gRPC scripted-backend config with one proxy-scoped `grpc_deadline`
+/// policy. Kept separate from `grpc_file_config` so the broad scripted H2
+/// suite retains its existing stdout-only plugin chain.
+fn grpc_deadline_file_config(port: u16, deadline_config: Value) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "grpc-deadline-scripted",
+            "listen_path": "/grpc",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "plugins": [{ "plugin_config_id": "grpc-deadline" }],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "grpc-deadline",
+            "plugin_name": "grpc_deadline",
+            "config": deadline_config,
+            "scope": "proxy",
+            "proxy_id": "grpc-deadline-scripted",
+            "enabled": true,
+        }],
+    });
+    serde_yaml::to_string(&config).expect("serialize grpc_deadline yaml")
+}
+
+/// Add a one-failure circuit breaker to the deadline fixture. A follow-up
+/// healthy RPC then proves client-owned deadline expiry was recorded as neutral
+/// rather than poisoning backend health.
+fn grpc_deadline_cb_file_config(port: u16, deadline_config: Value) -> String {
+    let mut config: Value = serde_yaml::from_str(&grpc_deadline_file_config(port, deadline_config))
+        .expect("parse grpc_deadline yaml");
+    config["proxies"][0]["circuit_breaker"] = json!({
+        "failure_threshold": 1,
+        "success_threshold": 1,
+        "timeout_seconds": 30,
+        "failure_status_codes": [500, 502, 503, 504],
+        "half_open_max_requests": 1,
+        "trip_on_connection_errors": true,
+    });
+    serde_yaml::to_string(&config).expect("serialize grpc_deadline circuit-breaker yaml")
 }
 
 /// Spawn a gateway harness with the Phase-2 test defaults.
@@ -759,6 +814,255 @@ async fn grpc_stall_after_headers_is_bounded_by_backend_read_timeout() {
     assert_eq!(backend.received_stream_count(), 1);
 }
 
+// #2498 / #2497 — an end-to-end grpc_deadline expiry after the backend's
+// initial HEADERS must terminate a no-DATA H2 stream with an explicit
+// DEADLINE_EXCEEDED trailers frame. A body error or missing grpc-status is not
+// protocol-equivalent: real gRPC clients otherwise surface UNKNOWN/INTERNAL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_deadline_expiry_after_headers_emits_deadline_exceeded_trailers() {
+    let cases = [
+        (
+            "plugin-default",
+            json!({
+                "default_deadline_ms": 1000,
+                "subtract_gateway_processing": true,
+            }),
+            None,
+        ),
+        (
+            "client-timeout",
+            json!({
+                "max_deadline_ms": 2000,
+                "subtract_gateway_processing": true,
+            }),
+            Some("1000m".to_string()),
+        ),
+    ];
+
+    for (case, deadline_config, client_timeout) in cases {
+        let reservation = reserve_port().await.expect("reserve port");
+        let backend_port = reservation.port;
+        let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+            .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+            .step(GrpcStep::StallAfterHeaders(Duration::from_secs(30)))
+            .spawn()
+            .expect("spawn backend");
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(grpc_deadline_file_config(backend_port, deadline_config))
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("spawn gateway");
+        let gw_port = harness
+            .proxy_base_url()
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .expect("gateway port");
+        let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+        let headers = client_timeout
+            .as_ref()
+            .map(|timeout| [("grpc-timeout", timeout.clone())]);
+        let extra_headers: &[(&str, String)] =
+            headers.as_ref().map_or(&[], |headers| headers.as_slice());
+        let response = tokio::time::timeout(
+            Duration::from_secs(4),
+            client.unary_with_headers("/grpc/ferrum.Echo/Ping", Bytes::new(), extra_headers),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: RPC exceeded its deadline envelope"))
+        .unwrap_or_else(|error| panic!("{case}: timeout response failed: {error}"));
+
+        assert_eq!(response.http_status, 200, "{case}: gRPC wire status");
+        assert!(
+            response.stream_error.is_none(),
+            "{case}: expiry must be trailers, not a body error: {response:?}"
+        );
+        assert_eq!(
+            response
+                .trailers
+                .as_ref()
+                .and_then(|trailers| trailers.get("grpc-status"))
+                .and_then(|value| value.to_str().ok()),
+            Some("4"),
+            "{case}: missing DEADLINE_EXCEEDED trailer: {response:?}"
+        );
+        assert_eq!(
+            response.effective_grpc_status(),
+            4,
+            "{case}: semantic status"
+        );
+        assert_eq!(
+            backend.received_stream_count(),
+            1,
+            "{case}: backend attempts"
+        );
+    }
+}
+
+// #2498 / #2497 — exercise the real H2 body path after response DATA has
+// already reached the client. Once DATA is committed the gateway cannot safely
+// append a trailers-only replacement, so expiry must abort downstream, drop the
+// upstream body (RST_STREAM), and remain neutral to backend health. Cover both
+// a closed unary request direction (server-stream shape) and an open request
+// direction (bidi shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_deadline_after_partial_data_resets_stream_and_preserves_backend_health() {
+    let cases = [
+        ("server-stream", "/ferrum.Echo/ServerStream", false),
+        ("bidi", "/ferrum.Echo/Bidi", true),
+    ];
+
+    for (case, method, bidi) in cases {
+        let reservation = reserve_port().await.expect("reserve port");
+        let backend_port = reservation.port;
+        let partial_message = Bytes::from_static(b"partial");
+        let builder = ScriptedGrpcBackend::builder_plain(reservation.into_listener());
+        let builder = if bidi {
+            builder.step(GrpcStep::AcceptStreamingRpc(MatchRpc::method(method)))
+        } else {
+            builder.step(GrpcStep::AcceptRpc(MatchRpc::method(method)))
+        };
+        let backend = builder
+            .step(GrpcStep::SendInitialHeaders)
+            .step(GrpcStep::RespondMessage(partial_message.clone()))
+            .step(GrpcStep::ExpectReset(Duration::from_secs(4)))
+            .step(GrpcStep::AcceptRpc(MatchRpc::method("/ferrum.Echo/Health")))
+            .step(GrpcStep::SendInitialHeaders)
+            .step(GrpcStep::RespondMessage(Bytes::from_static(b"healthy")))
+            .step(GrpcStep::RespondStatus {
+                code: 0,
+                message: "",
+            })
+            .spawn()
+            .expect("spawn backend");
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(grpc_deadline_cb_file_config(
+                backend_port,
+                json!({
+                    "default_deadline_ms": 1000,
+                    "subtract_gateway_processing": true,
+                }),
+            ))
+            // Select the production zero-buffering H2 body branch so the
+            // backend's first DATA frame is committed before expiry.
+            .env("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0")
+            .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("spawn gateway");
+        let gw_port = harness
+            .proxy_base_url()
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .expect("gateway port");
+        let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+
+        let response = tokio::time::timeout(Duration::from_secs(4), async {
+            if bidi {
+                client
+                    .bidi_with_headers(
+                        &format!("/grpc{method}"),
+                        Bytes::from_static(b"request remains open"),
+                        &[],
+                    )
+                    .await
+            } else {
+                client.unary(&format!("/grpc{method}"), Bytes::new()).await
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{case}: partial-DATA RPC exceeded deadline envelope"))
+        .unwrap_or_else(|error| panic!("{case}: response failed: {error}"));
+
+        assert_eq!(response.http_status, 200, "{case}: initial gRPC status");
+        assert_eq!(
+            response.messages,
+            vec![partial_message],
+            "{case}: partial message must be delivered before expiry"
+        );
+        assert!(
+            response.stream_error.is_some(),
+            "{case}: post-DATA expiry must abort instead of ending cleanly: {response:?}"
+        );
+        assert!(
+            response.trailers.is_none(),
+            "{case}: terminal grpc-status cannot be appended after DATA: {response:?}"
+        );
+        let reset_deadline = Instant::now() + Duration::from_secs(1);
+        while backend.stream_reset_count() == 0 && Instant::now() < reset_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            backend.stream_reset_count(),
+            1,
+            "{case}: dropping the expired upstream body must reset its H2 stream"
+        );
+
+        let health = client
+            .unary("/grpc/ferrum.Echo/Health", Bytes::new())
+            .await
+            .unwrap_or_else(|error| panic!("{case}: health RPC failed: {error}"));
+        assert_eq!(health.grpc_status(), Some(0), "{case}: health RPC");
+        assert_eq!(
+            backend.received_stream_count(),
+            2,
+            "{case}: client deadline must not trip the one-failure circuit breaker"
+        );
+        backend.assert_no_matcher_mismatches().await;
+        backend.assert_no_step_errors().await;
+    }
+}
+
+// #2608 — the constructor's HTTP-style internal rejection is normalized to
+// native gRPC wire semantics before it reaches an H2 client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_deadline_missing_required_timeout_is_http_200_trailers_only() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .spawn()
+        .expect("spawn backend");
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(grpc_deadline_file_config(
+            backend_port,
+            json!({"reject_no_deadline": true}),
+        ))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .expect("gateway port");
+    let response = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"))
+        .unary("/grpc/ferrum.Echo/Ping", Bytes::new())
+        .await
+        .expect("missing-deadline response");
+
+    assert_eq!(response.http_status, 200);
+    assert!(
+        response
+            .headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|status| status != "0"),
+        "missing deadline must be a non-OK trailers-only header: {response:?}"
+    );
+    assert!(response.raw_body_frames.is_empty());
+    assert!(response.trailers.is_none());
+    assert_eq!(backend.received_stream_count(), 0);
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test 3 — gRPC backend omits trailers → client sees a well-formed
 //          non-OK status, not a hang.
@@ -786,7 +1090,11 @@ async fn grpc_trailers_missing_produces_non_ok_status() {
         .spawn()
         .expect("spawn backend");
 
-    let yaml = grpc_file_config(backend_port, Value::Null);
+    let yaml = grpc_file_config_with_log_config(
+        backend_port,
+        Value::Null,
+        json!({"filter": {"errors_only": true}}),
+    );
     let harness = spawn_grpc_harness(yaml).await;
 
     let gw_port = harness
@@ -850,6 +1158,28 @@ async fn grpc_trailers_missing_produces_non_ok_status() {
         response.grpc_status(),
         response.headers,
         response.trailers
+    );
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| {
+                logs.lines().any(|line| {
+                    serde_json::from_str::<Value>(line).is_ok_and(|entry| {
+                        entry["proxy_id"] == "grpc-scripted" && entry["grpc_status"] == 2
+                    })
+                })
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        logs.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|entry| {
+                entry["proxy_id"] == "grpc-scripted"
+                    && entry["response_status_code"] == 200
+                    && entry["grpc_status"] == 2
+            })
+        }),
+        "missing trailers must emit UNKNOWN(2) through errors_only; logs:\n{logs}"
     );
 }
 
@@ -918,6 +1248,118 @@ async fn grpc_deadline_exceeded_propagates_as_deadline_exceeded_not_unavailable(
         "grpc-message was not preserved; trailers={:?}",
         response.trailers
     );
+}
+
+async fn assert_errors_only_grpc_output(overrides: Value, case: &str) {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"ok")))
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondStatus {
+            code: 4,
+            message: "deadline exceeded",
+        })
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondRawStatus { value: "malformed" })
+        .spawn()
+        .expect("spawn backend");
+    let yaml = grpc_file_config_with_log_config(
+        backend_port,
+        overrides,
+        json!({"filter": {"errors_only": true}}),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .pool_warmup_enabled(false)
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gateway_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gateway_port}"));
+
+    let success = client
+        .unary("/grpc/ferrum.Echo/Success", Bytes::new())
+        .await
+        .expect("successful RPC");
+    assert_eq!(success.grpc_status(), Some(0), "{case}: {success:?}");
+    let failure = client
+        .unary("/grpc/ferrum.Echo/Failure", Bytes::new())
+        .await
+        .expect("failed-status RPC response");
+    assert_eq!(failure.grpc_status(), Some(4), "{case}: {failure:?}");
+    let malformed = client
+        .unary("/grpc/ferrum.Echo/Malformed", Bytes::new())
+        .await
+        .expect("malformed-status RPC response");
+    assert_eq!(malformed.grpc_status(), None, "{case}: {malformed:?}");
+
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| {
+                let mut statuses: Vec<u64> = logs
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .filter(|entry| entry["proxy_id"] == "grpc-scripted")
+                    .filter_map(|entry| entry["grpc_status"].as_u64())
+                    .collect();
+                statuses.sort_unstable();
+                statuses.as_slice() == [4, u32::MAX as u64]
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+    let access_logs: Vec<Value> = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["proxy_id"] == "grpc-scripted")
+        .collect();
+    assert_eq!(
+        access_logs.len(),
+        2,
+        "{case}: status-0 success must be excluded and status-4/malformed failures emitted; logs:\n{logs}"
+    );
+    assert!(
+        access_logs
+            .iter()
+            .all(|entry| entry["response_status_code"] == 200),
+        "{case}: {access_logs:?}"
+    );
+    let mut statuses: Vec<u64> = access_logs
+        .iter()
+        .filter_map(|entry| entry["grpc_status"].as_u64())
+        .collect();
+    statuses.sort_unstable();
+    assert_eq!(statuses.as_slice(), &[4, u32::MAX as u64], "{case}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn stdout_errors_only_covers_streamed_and_buffered_h2_grpc_status() {
+    assert_errors_only_grpc_output(Value::Null, "streamed_h2").await;
+    assert_errors_only_grpc_output(
+        json!({
+            "retry": {
+                "max_retries": 1,
+                "retry_on_connect_failure": true,
+            }
+        }),
+        "buffered_h2",
+    )
+    .await;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1090,7 +1532,7 @@ async fn h2_window_stall_triggers_backend_read_timeout_on_grpc() {
             || logs.contains("read timeout")
     };
     // Poll the captured logs: the gateway emits the timeout line through
-    // tracing-appender's non-blocking writer, which lags the client-visible
+    // non-blocking process-log worker, which lags the client-visible
     // response, so a single snapshot races the flush.
     let logs = harness
         .wait_for_log_contains(&has_timeout_signal, Duration::from_secs(5))

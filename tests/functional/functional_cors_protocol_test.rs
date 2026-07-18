@@ -1,21 +1,111 @@
 //! CORS request/response parity across H1, H2, and H3 frontends.
 
-use crate::common::{EchoServer, TestGateway, spawn_http_echo};
+use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::ports::reserve_port;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
 const ORIGIN: &str = "https://app.example";
 const CANONICAL_ORIGIN: &str = "https://xn--bcher-kva.example";
+const BACKEND_ACCESS_CONTROL_HEADERS: [&str; 7] = [
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-expose-headers",
+    "access-control-max-age",
+    "access-control-allow-private-network",
+];
+const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 struct CapturedResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
+}
+
+struct PermissiveCorsBackend {
+    port: u16,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PermissiveCorsBackend {
+    async fn spawn() -> std::io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let handle = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, _)) => {
+                        tokio::spawn(async move {
+                            let mut request = Vec::with_capacity(4096);
+                            let mut chunk = [0u8; 4096];
+                            let mut request_head_complete = false;
+                            while request.len() < MAX_REQUEST_HEAD_BYTES {
+                                let remaining = MAX_REQUEST_HEAD_BYTES - request.len();
+                                let read_len = remaining.min(chunk.len());
+                                let size = match stream.read(&mut chunk[..read_len]).await {
+                                    Ok(0) => {
+                                        request_head_complete = true;
+                                        break;
+                                    }
+                                    Ok(size) => size,
+                                    Err(_) => return,
+                                };
+                                request.extend_from_slice(&chunk[..size]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    request_head_complete = true;
+                                    break;
+                                }
+                            }
+                            if !request_head_complete {
+                                return;
+                            }
+
+                            let request = String::from_utf8_lossy(&request);
+                            let path = request
+                                .lines()
+                                .next()
+                                .and_then(|line| line.split_whitespace().nth(1))
+                                .unwrap_or("/")
+                                .replace('"', "\\\"");
+                            let body = format!(r#"{{"echo":"{path}"}}"#);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE\r\nAccess-Control-Allow-Headers: Authorization, X-Admin\r\nAccess-Control-Expose-Headers: X-Secret\r\nAccess-Control-Max-Age: 99999\r\nAccess-Control-Allow-Private-Network: true\r\nX-Backend: permissive\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            let _ = stream.shutdown().await;
+                        });
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        });
+        Ok(Self {
+            port,
+            handle: Some(handle),
+        })
+    }
+
+    fn abort(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for PermissiveCorsBackend {
+    fn drop(&mut self) {
+        self.abort();
+    }
 }
 
 #[ignore]
@@ -40,6 +130,11 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
         assert_eq!(
             header(response, "access-control-expose-headers"),
             "X-Response"
+        );
+        assert!(
+            !response
+                .headers
+                .contains_key("access-control-allow-private-network")
         );
         assert_vary(response, "Origin");
         assert_vary(response, "Access-Control-Request-Method");
@@ -203,7 +298,7 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
     ] {
         assert_eq!(response.status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&response.body).contains("istio-forward"));
-        assert!(!response.headers.contains_key("access-control-allow-origin"));
+        assert_no_access_control_headers(&response);
     }
 
     for response in [
@@ -237,7 +332,41 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
     ] {
         assert_eq!(response.status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&response.body).contains("istio-forward"));
-        assert!(!response.headers.contains_key("access-control-allow-origin"));
+        assert_no_access_control_headers(&response);
+    }
+
+    for response in [
+        send_h1_path(
+            &harness,
+            "/no-cors",
+            Method::GET,
+            None,
+            None,
+            "https://other.example",
+        )
+        .await,
+        send_h2_path(
+            &harness,
+            "/no-cors",
+            Method::GET,
+            None,
+            None,
+            "https://other.example",
+        )
+        .await,
+        send_h3_path(
+            &harness,
+            "/no-cors",
+            Method::GET,
+            None,
+            None,
+            "https://other.example",
+        )
+        .await,
+    ] {
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&response.body).contains("no-cors"));
+        assert_backend_access_control_headers_preserved(&response);
     }
 
     for response in [
@@ -271,7 +400,7 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
     ] {
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.body.is_empty());
-        assert!(!response.headers.contains_key("access-control-allow-origin"));
+        assert_no_access_control_headers(&response);
     }
 
     for response in [
@@ -394,13 +523,15 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
 
 struct CorsProtocolHarness {
     gateway: TestGateway,
-    echo: EchoServer,
+    echo: PermissiveCorsBackend,
     https_port: u16,
 }
 
 impl CorsProtocolHarness {
     async fn spawn() -> Self {
-        let mut echo = spawn_http_echo().await.expect("spawn CORS backend");
+        let mut echo = PermissiveCorsBackend::spawn()
+            .await
+            .expect("spawn CORS backend");
         let config = cors_config(echo.port);
         let mut last_error = String::new();
         for _ in 0..5 {
@@ -483,6 +614,7 @@ fn cors_config(backend_port: u16) -> String {
         ),
         cors_proxy("istio-star", "/istio-star", backend_port, &["istio-star"]),
         cors_proxy("canonical", "/canonical", backend_port, &["canonical"]),
+        cors_proxy("no-cors", "/no-cors", backend_port, &[]),
     ];
     let config = serde_json::json!({
         "version": "1",
@@ -814,4 +946,23 @@ fn assert_vary(response: &CapturedResponse, expected: &str) {
             .any(|value| value.trim().eq_ignore_ascii_case(expected)),
         "missing Vary token {expected}: {response:?}"
     );
+}
+
+fn assert_no_access_control_headers(response: &CapturedResponse) {
+    assert!(
+        response
+            .headers
+            .keys()
+            .all(|name| !name.as_str().starts_with("access-control-")),
+        "backend Access-Control-* headers must be removed: {response:?}"
+    );
+}
+
+fn assert_backend_access_control_headers_preserved(response: &CapturedResponse) {
+    for name in BACKEND_ACCESS_CONTROL_HEADERS {
+        assert!(
+            response.headers.contains_key(name),
+            "ordinary upstream header {name} must be preserved: {response:?}"
+        );
+    }
 }

@@ -486,7 +486,7 @@ async fn test_near_expiry_cert_warns_but_starts() {
         }
 
         // Give the log writer a moment to flush the warning through the async
-        // tracing-appender buffer.
+        // bounded process-log worker.
         sleep(Duration::from_millis(500)).await;
         let output = capture.snapshot().join("\n");
         let lower = output.to_lowercase();

@@ -63,6 +63,34 @@ fn build_config_with_stdout_logging(backend_port: u16) -> String {
     )
 }
 
+fn build_serverless_redirect_config(backend_port: u16, function_port: u16) -> String {
+    format!(
+        "version: \"1\"\nproxies:\n\
+         \x20 - id: \"h3-serverless-policy\"\n\
+         \x20   listen_path: \"/\"\n\
+         \x20   backend_scheme: http\n\
+         \x20   backend_host: \"127.0.0.1\"\n\
+         \x20   backend_port: {backend_port}\n\
+         \x20   strip_listen_path: false\n\
+         \x20   plugins:\n\
+         \x20     - plugin_config_id: \"h3-serverless\"\n\
+         consumers: []\n\
+         plugin_configs:\n\
+         \x20 - id: \"h3-serverless\"\n\
+         \x20   plugin_name: \"serverless_function\"\n\
+         \x20   scope: \"proxy\"\n\
+         \x20   proxy_id: \"h3-serverless-policy\"\n\
+         \x20   enabled: true\n\
+         \x20   config:\n\
+         \x20     provider: \"azure_functions\"\n\
+         \x20     function_url: \"http://127.0.0.1:{function_port}/policy\"\n\
+         \x20     mode: \"pre_proxy\"\n\
+         \x20     forward_query_params: true\n\
+         \x20     on_error: \"reject\"\n\
+         \x20     error_status_code: 403\n",
+    )
+}
+
 async fn wait_for_access_log_bytes_sent(gateway: &TestGateway, expected: u64) -> Option<Value> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -107,6 +135,27 @@ async fn start_body_count_backend(listener: TcpListener) {
                     .status(200)
                     .header(hyper::header::CONTENT_TYPE, "application/json")
                     .body(Full::new(Bytes::from(response_body)))
+                    .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+                Ok::<_, Infallible>(response)
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+    }
+}
+
+async fn start_redirect_function(listener: TcpListener) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(async move {
+            let service = service_fn(|_req: HyperRequest<Incoming>| async move {
+                let response = Response::builder()
+                    .status(302)
+                    .header(http::header::LOCATION, "/moved")
+                    .body(Full::new(Bytes::new()))
                     .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
                 Ok::<_, Infallible>(response)
             });
@@ -265,6 +314,51 @@ async fn functional_h3_request_body_zero_limit_forwards_large_post() {
 
     gateway.shutdown();
     backend_task.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_h3_serverless_redirect_is_not_pre_proxy_approval() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_task = tokio::spawn(start_body_count_backend(backend_listener));
+    let function_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let function_port = function_listener.local_addr().unwrap().port();
+    let function_task = tokio::spawn(start_redirect_function(function_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let https_port = https_reservation.local_addr().unwrap().port();
+    drop(https_reservation);
+
+    let mut gateway = TestGateway::builder()
+        .mode_file(build_serverless_redirect_config(
+            backend_port,
+            function_port,
+        ))
+        .log_level("warn")
+        .capture_output()
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start gateway");
+
+    let url = format!("https://localhost:{https_port}/protected?name=alice%20bob");
+    let (status, body) = h3_post_bytes(&url, Bytes::new())
+        .await
+        .unwrap_or_else(|error| {
+            let logs = gateway.read_combined_captured_output().unwrap_or_default();
+            panic!("H3 serverless request failed: {error}; logs={logs}")
+        });
+    assert_eq!(status.as_u16(), 403);
+    assert!(String::from_utf8_lossy(&body).contains("function_non_success_status"));
+
+    gateway.shutdown();
+    backend_task.abort();
+    function_task.abort();
 }
 
 /// Coverage scope (read before assuming this guards the native H3 byte

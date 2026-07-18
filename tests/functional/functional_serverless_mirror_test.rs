@@ -8,13 +8,17 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_serverless_mirror
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::Request;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
 // ============================================================================
@@ -47,23 +51,63 @@ async fn start_backend_server(port: u16) {
 }
 
 /// Start a mock serverless function endpoint that returns a custom response.
-async fn start_function_server(port: u16) {
+async fn start_function_server(port: u16, invocations: Arc<AtomicUsize>) {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind function server");
 
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
+            let invocations = Arc::clone(&invocations);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
-                let _n = stream.read(&mut buf).await.unwrap_or(0);
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                invocations.fetch_add(1, Ordering::SeqCst);
 
-                let body = r#"{"source":"serverless-function","message":"hello from function"}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let is_governed_partial_response =
+                    request.contains(r#""path":"/fn/range-governed""#);
+                let is_governed_delta_response = request.contains(r#""path":"/fn/delta-governed""#);
+                let is_partial_response = request.contains(r#""path":"/fn/range""#);
+                let is_delta_response = request.contains(r#""path":"/fn/delta""#);
+                let response = if is_governed_partial_response {
+                    let body =
+                        r#"{"choices":[{"message":{"content":"contact secret@example.com"}}]}"#;
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Type: application/json\r\nContent-Range: bytes 0-66/100\r\nAccept-Ranges: bytes\r\nETag: \"partial-sensitive-v1\"\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if is_governed_delta_response {
+                    let body = r#"{"choices":[{"message":{"tool_calls":[{"type":"function","function":{"name":"filesystem.write","arguments":"{\"token\":\"sk-SECRET123\"}"}}]}}]}"#;
+                    format!(
+                        "HTTP/1.1 226 IM Used\r\nContent-Length: {}\r\nContent-Type: application/json\r\nIM: diffe\r\nDelta-Base: \"delta-sensitive-v1\"\r\nETag: \"delta-sensitive-v2\"\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if is_partial_response {
+                    let body = r#"{"source":"serverless-function","message":"partial"}"#;
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Type: application/json\r\nContent-Range: bytes 0-51/100\r\nAccept-Ranges: bytes\r\nETag: \"partial-v1\"\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if is_delta_response {
+                    let body = r#"{"source":"serverless-function","message":"delta"}"#;
+                    format!(
+                        "HTTP/1.1 226 IM Used\r\nContent-Length: {}\r\nContent-Type: application/json\r\nIM: diffe\r\nDelta-Base: \"delta-v1\"\r\nETag: \"delta-v2\"\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    let body =
+                        r#"{"source":"serverless-function","message":"hello from function"}"#;
+                    format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nContent-Type: application/json\r\nRetry-After: 30\r\nWWW-Authenticate: Bearer realm=function\r\nTraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nX-RateLimit-Remaining: 0\r\nETag: \"function-v1\"\r\nLast-Modified: Wed, 01 Jan 2025 00:00:00 GMT\r\nDigest: sha-256=stale\r\nContent-Digest: sha-256=:stale:\r\nRepr-Digest: sha-256=:stale:\r\nContent-MD5: stale-md5\r\nContent-Range: bytes 0-63/64\r\nAccept-Ranges: bytes\r\nSignature-Input: sig1=(\"content-digest\")\r\nSignature: sig1=:stale:\r\nContent-Disposition: attachment; filename=decision.json\r\nSet-Cookie: first=1; Path=/\r\nSet-Cookie: second=2; Path=/\r\nConnection: close, x-function-internal\r\nX-Function-Internal: strip-me\r\nX-Amz-Request-Id: provider-control\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
             });
@@ -211,11 +255,22 @@ proxies:
     backend_port: {backend_port}
     strip_listen_path: true
     plugins:
+      - plugin_config_id: "dedup-1"
       - plugin_config_id: "serverless-1"
+      - plugin_config_id: "response-transformer-1"
+      - plugin_config_id: "tool-governor-1"
+      - plugin_config_id: "response-guard-1"
 
 consumers: []
 
 plugin_configs:
+  - id: "dedup-1"
+    proxy_id: "serverless-proxy"
+    plugin_name: "request_deduplication"
+    scope: "proxy"
+    enabled: true
+    config:
+      applicable_methods: ["GET", "HEAD"]
   - id: "serverless-1"
     proxy_id: "serverless-proxy"
     plugin_name: "serverless_function"
@@ -226,6 +281,37 @@ plugin_configs:
       mode: "terminate"
       function_url: "http://127.0.0.1:{function_port}/function"
       timeout_ms: 5000
+  - id: "response-transformer-1"
+    proxy_id: "serverless-proxy"
+    plugin_name: "response_transformer"
+    scope: "proxy"
+    enabled: true
+    config:
+      rules:
+        - operation: "update"
+          target: "body"
+          key: "source"
+          value: "gateway-rewritten"
+  - id: "tool-governor-1"
+    proxy_id: "serverless-proxy"
+    plugin_name: "ai_tool_governor"
+    scope: "proxy"
+    enabled: true
+    config:
+      tools:
+        filesystem.write:
+          action: "redact_args"
+          blocked_arg_patterns:
+            - name: "secret"
+              regex: "sk-[A-Za-z0-9]+"
+  - id: "response-guard-1"
+    proxy_id: "serverless-proxy"
+    plugin_name: "ai_response_guard"
+    scope: "proxy"
+    enabled: true
+    config:
+      pii_patterns: ["email"]
+      action: "redact"
 
 upstreams: []
 "#
@@ -237,7 +323,11 @@ upstreams: []
 
     // Start both backend and function servers
     let _backend = tokio::spawn(start_backend_server(backend_port));
-    let _function = tokio::spawn(start_function_server(function_port));
+    let function_invocations = Arc::new(AtomicUsize::new(0));
+    let _function = tokio::spawn(start_function_server(
+        function_port,
+        Arc::clone(&function_invocations),
+    ));
     sleep(Duration::from_millis(300)).await;
 
     // Start gateway with retry
@@ -248,21 +338,58 @@ upstreams: []
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("http://127.0.0.1:{}/fn/test", proxy_port))
+        .header("idempotency-key", "h1-terminal-key")
         .send()
         .await
         .expect("Request failed");
 
     assert_eq!(
         resp.status().as_u16(),
-        200,
-        "Expected 200 from serverless function, got {}",
+        429,
+        "Expected 429 from serverless function, got {}",
         resp.status()
     );
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("30")
+    );
+    for invalidated in [
+        "etag",
+        "last-modified",
+        "digest",
+        "content-digest",
+        "repr-digest",
+        "content-md5",
+        "content-range",
+        "accept-ranges",
+        "signature-input",
+        "signature",
+    ] {
+        assert!(
+            !resp.headers().contains_key(invalidated),
+            "rewritten response retained stale {invalidated}"
+        );
+    }
+    assert_eq!(
+        resp.headers()
+            .get("content-disposition")
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=decision.json")
+    );
+    assert_eq!(resp.headers().get_all("set-cookie").iter().count(), 2);
+    assert!(resp.headers().contains_key("www-authenticate"));
+    assert!(resp.headers().contains_key("traceparent"));
+    assert!(resp.headers().contains_key("x-ratelimit-remaining"));
+    assert!(!resp.headers().contains_key("connection"));
+    assert!(!resp.headers().contains_key("x-function-internal"));
+    assert!(!resp.headers().contains_key("x-amz-request-id"));
 
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("serverless-function"),
-        "Response should come from the serverless function, not the backend. Got: {}",
+        body.contains("gateway-rewritten"),
+        "Response should be the transformed serverless body. Got: {}",
         body
     );
     assert!(
@@ -270,6 +397,213 @@ upstreams: []
         "Response should NOT come from the backend. Got: {}",
         body
     );
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 1);
+
+    let replay = client
+        .get(format!("http://127.0.0.1:{}/fn/test", proxy_port))
+        .header("idempotency-key", "h1-terminal-key")
+        .send()
+        .await
+        .expect("H1 replay request failed");
+    assert_eq!(replay.status().as_u16(), 429);
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    for sanitized in [
+        "retry-after",
+        "www-authenticate",
+        "traceparent",
+        "x-ratelimit-remaining",
+    ] {
+        assert!(
+            !replay.headers().contains_key(sanitized),
+            "dedup replay retained per-request {sanitized}"
+        );
+    }
+    assert_eq!(replay.headers().get_all("set-cookie").iter().count(), 0);
+    assert!(replay.text().await.unwrap().contains("gateway-rewritten"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 1);
+
+    // Exercise the same terminate contract over an H2 frontend connection.
+    let stream = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect H2 frontend");
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .expect("H2 handshake");
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://example.com/fn/h2")
+        .header("host", "example.com")
+        .header("idempotency-key", "h2-terminal-key")
+        .body(Full::new(Bytes::new()))
+        .expect("build H2 request");
+    let response = sender.send_request(request).await.expect("H2 request");
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("30")
+    );
+    assert!(!response.headers().contains_key("etag"));
+    assert!(!response.headers().contains_key("content-digest"));
+    assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+    assert!(!response.headers().contains_key("x-function-internal"));
+    let h2_body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect H2 response")
+        .to_bytes();
+    assert!(String::from_utf8_lossy(&h2_body).contains("gateway-rewritten"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 2);
+
+    let replay_request = Request::builder()
+        .method("GET")
+        .uri("http://example.com/fn/h2")
+        .header("host", "example.com")
+        .header("idempotency-key", "h2-terminal-key")
+        .body(Full::new(Bytes::new()))
+        .expect("build H2 replay request");
+    let replay_response = sender
+        .send_request(replay_request)
+        .await
+        .expect("H2 replay request");
+    assert_eq!(replay_response.status().as_u16(), 429);
+    assert_eq!(
+        replay_response
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    let replay_body = replay_response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect H2 replay response")
+        .to_bytes();
+    assert!(String::from_utf8_lossy(&replay_body).contains("gateway-rewritten"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 2);
+    connection_task.abort();
+
+    let head = client
+        .head(format!("http://127.0.0.1:{}/fn/head", proxy_port))
+        .header("idempotency-key", "head-terminal-key")
+        .send()
+        .await
+        .expect("HEAD request failed");
+    assert_eq!(head.status().as_u16(), 429);
+    assert!(head.bytes().await.unwrap().is_empty());
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 3);
+
+    let head_replay = client
+        .head(format!("http://127.0.0.1:{}/fn/head", proxy_port))
+        .header("idempotency-key", "head-terminal-key")
+        .send()
+        .await
+        .expect("HEAD replay request failed");
+    assert_eq!(head_replay.status().as_u16(), 429);
+    assert_eq!(
+        head_replay
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert!(head_replay.bytes().await.unwrap().is_empty());
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 3);
+
+    let partial = client
+        .get(format!("http://127.0.0.1:{}/fn/range", proxy_port))
+        .send()
+        .await
+        .expect("partial response request failed");
+    assert_eq!(partial.status().as_u16(), 206);
+    assert_eq!(
+        partial
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 0-51/100")
+    );
+    assert_eq!(
+        partial
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok()),
+        Some("\"partial-v1\"")
+    );
+    let partial_body = partial.text().await.unwrap();
+    assert!(partial_body.contains("serverless-function"));
+    assert!(!partial_body.contains("gateway-rewritten"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 4);
+
+    let delta = client
+        .get(format!("http://127.0.0.1:{}/fn/delta", proxy_port))
+        .send()
+        .await
+        .expect("delta response request failed");
+    assert_eq!(delta.status().as_u16(), 226);
+    assert_eq!(
+        delta
+            .headers()
+            .get("im")
+            .and_then(|value| value.to_str().ok()),
+        Some("diffe")
+    );
+    assert_eq!(
+        delta
+            .headers()
+            .get("delta-base")
+            .and_then(|value| value.to_str().ok()),
+        Some("\"delta-v1\"")
+    );
+    assert_eq!(
+        delta
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok()),
+        Some("\"delta-v2\"")
+    );
+    let delta_body = delta.text().await.unwrap();
+    assert!(delta_body.contains("serverless-function"));
+    assert!(!delta_body.contains("gateway-rewritten"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 5);
+
+    let governed_partial = client
+        .get(format!("http://127.0.0.1:{}/fn/range-governed", proxy_port))
+        .send()
+        .await
+        .expect("governed partial response request failed");
+    assert_eq!(governed_partial.status().as_u16(), 502);
+    assert!(!governed_partial.headers().contains_key("content-range"));
+    assert!(!governed_partial.headers().contains_key("etag"));
+    let governed_partial_body = governed_partial.text().await.unwrap();
+    assert!(!governed_partial_body.contains("secret@example.com"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 6);
+
+    let governed_delta = client
+        .get(format!("http://127.0.0.1:{}/fn/delta-governed", proxy_port))
+        .send()
+        .await
+        .expect("governed delta response request failed");
+    assert_eq!(governed_delta.status().as_u16(), 502);
+    assert!(!governed_delta.headers().contains_key("im"));
+    assert!(!governed_delta.headers().contains_key("delta-base"));
+    let governed_delta_body = governed_delta.text().await.unwrap();
+    assert!(!governed_delta_body.contains("sk-SECRET123"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 7);
 
     let _ = gw.kill();
     let _ = gw.wait();

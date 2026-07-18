@@ -657,14 +657,33 @@ fn test_response_buffering_skips_range_responses() {
     let plugin = make_plugin(json!({}));
     let ctx = make_ctx(Some("gzip"));
 
-    // 206 Partial Content (even without an explicit Content-Range header).
+    // Preserved 206/226 representations (even without range/delta headers).
     let no_range = HashMap::new();
-    assert!(!plugin.should_buffer_response_body_for_content_type(
-        &ctx,
-        Some("text/html"),
-        206,
-        &no_range
-    ));
+    for status in [206, 226] {
+        assert!(!plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/html"),
+            status,
+            &no_range
+        ));
+        assert!(
+            plugin
+                .should_release_response_body_before_content_type_rewrite(&ctx, status, &no_range)
+        );
+    }
+
+    for status in [204, 205, 304] {
+        assert!(!plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/html"),
+            status,
+            &no_range
+        ));
+        assert!(
+            plugin
+                .should_release_response_body_before_content_type_rewrite(&ctx, status, &no_range)
+        );
+    }
 
     // A Content-Range header on a non-206 status also opts out.
     let mut range_headers = HashMap::new();
@@ -740,26 +759,43 @@ fn test_response_buffering_still_requires_accept_encoding() {
 }
 
 #[tokio::test]
-async fn test_skips_partial_content_responses() {
+async fn test_skips_preserved_representation_responses() {
     let plugin = make_plugin(json!({}));
-    let mut ctx = make_ctx(Some("gzip"));
-    let mut headers = HashMap::new();
-    plugin.before_proxy(&mut ctx, &mut headers).await;
+    for status in [206, 226] {
+        let mut ctx = make_ctx(Some("gzip"));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    let mut resp_headers = HashMap::new();
-    resp_headers.insert("content-type".to_string(), "text/html".to_string());
-    resp_headers.insert("content-length".to_string(), "100".to_string());
-    resp_headers.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/html".to_string());
+        resp_headers.insert("content-length".to_string(), "100".to_string());
+        if status == 206 {
+            resp_headers.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
+        } else {
+            resp_headers.insert("im".to_string(), "vcdiff".to_string());
+            resp_headers.insert("delta-base".to_string(), "\"version-1\"".to_string());
+        }
 
-    plugin.after_proxy(&mut ctx, 206, &mut resp_headers).await;
+        plugin
+            .after_proxy(&mut ctx, status, &mut resp_headers)
+            .await;
 
-    assert!(!ctx.metadata.contains_key("compression:algorithm"));
-    assert!(!resp_headers.contains_key("content-encoding"));
-    assert_eq!(resp_headers.get("content-length").unwrap(), "100");
-    assert_eq!(
-        resp_headers.get("content-range").unwrap(),
-        "bytes 0-99/5000"
-    );
+        assert!(!ctx.metadata.contains_key("compression:algorithm"));
+        assert!(!resp_headers.contains_key("content-encoding"));
+        assert_eq!(resp_headers.get("content-length").unwrap(), "100");
+        if status == 206 {
+            assert_eq!(
+                resp_headers.get("content-range").unwrap(),
+                "bytes 0-99/5000"
+            );
+        } else {
+            assert_eq!(resp_headers.get("im").map(String::as_str), Some("vcdiff"));
+            assert_eq!(
+                resp_headers.get("delta-base").map(String::as_str),
+                Some("\"version-1\"")
+            );
+        }
+    }
 }
 
 #[tokio::test]
