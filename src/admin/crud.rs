@@ -3986,8 +3986,9 @@ impl AdminResource for Proxy {
                 }
                 Some(current) => {
                     return Err(api_spec_restore_snapshot_validation(format!(
-                        "API spec '{}' cannot snapshot current upstream '{}': it is owned by API spec '{}'",
+                        "API spec '{}' cannot snapshot proxy '{}' current upstream '{}': it is owned by API spec '{}'",
                         spec.id,
+                        previous.id,
                         current.id,
                         current.api_spec_id.as_deref().unwrap_or("<unknown>")
                     )));

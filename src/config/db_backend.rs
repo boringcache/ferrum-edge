@@ -84,6 +84,20 @@ pub(crate) async fn validate_api_spec_recovered_plugin_graph(
     let candidate = candidate.clone();
     let http_client = http_client.clone();
     tokio::task::spawn_blocking(move || {
+        for plugin in &candidate.plugin_configs {
+            crate::plugins::validate_plugin_config_with_http_client(
+                &plugin.plugin_name,
+                &plugin.config,
+                http_client.clone(),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "API-spec restore plugin '{}' validation failed: {}",
+                    plugin.id,
+                    error
+                )
+            })?;
+        }
         crate::plugin_cache::validate_plugin_composition_candidate(&candidate, &http_client)
             .map_err(anyhow::Error::msg)?;
         crate::plugins::transaction_log_schema::validate_config_graph(
