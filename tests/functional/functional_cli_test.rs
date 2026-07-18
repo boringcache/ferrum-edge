@@ -298,22 +298,39 @@ async fn functional_cli_validate_with_settings() {
 
 // ── validate: external secret suffixes ──────────────────────────────────────
 
-/// Database-mode validate needs an admin JWT secret and a DB URL; sqlite
-/// in-memory keeps the check hermetic.
+/// Database-mode validate requires *both* `FERRUM_DB_TYPE` and `FERRUM_DB_URL`
+/// (`EnvConfig::validate`), so both are supplied explicitly; sqlite in-memory
+/// keeps the check hermetic and reachable without a live database.
 ///
 /// `current_dir()` is the temp dir so the repo's own `./ferrum.conf` is never
 /// picked up by the smart-path search, which means the binary must be spawned
-/// through `binary_abs_path()`. An inherited `FERRUM_ADMIN_JWT_SECRET` would
-/// turn the `_FILE` cases into source conflicts, so the base key and the
-/// config-path vars are cleared explicitly; callers that want them set them
+/// through `binary_abs_path()`. Clearing `FERRUM_CONF_PATH` is *not* enough:
+/// `resolve_settings_path()` only skips discovery when the variable is set, so
+/// an unset value still falls through to the `/etc/ferrum/ferrum.conf`
+/// candidate on machines that have one. The variable is therefore pinned to an
+/// empty settings file inside the temp dir, which suppresses discovery
+/// entirely.
+///
+/// An inherited `FERRUM_ADMIN_JWT_SECRET`, or any inherited suffixed source for
+/// it, would turn the `_FILE` cases into source conflicts, so the base key and
+/// every provider suffix are cleared explicitly; callers that want one set it
 /// back afterwards.
 fn validate_database_mode_command(temp_dir: &TempDir) -> Command {
+    let conf_path = temp_dir.path().join("hermetic-ferrum.conf");
+    std::fs::write(&conf_path, "").unwrap();
+
     let mut cmd = Command::new(binary_abs_path());
     cmd.args(["validate"])
         .env("FERRUM_MODE", "database")
+        .env("FERRUM_DB_TYPE", "sqlite")
         .env("FERRUM_DB_URL", "sqlite::memory:")
+        .env("FERRUM_CONF_PATH", &conf_path)
         .env_remove("FERRUM_ADMIN_JWT_SECRET")
-        .env_remove("FERRUM_CONF_PATH")
+        .env_remove("FERRUM_ADMIN_JWT_SECRET_FILE")
+        .env_remove("FERRUM_ADMIN_JWT_SECRET_VAULT")
+        .env_remove("FERRUM_ADMIN_JWT_SECRET_AWS")
+        .env_remove("FERRUM_ADMIN_JWT_SECRET_AZURE")
+        .env_remove("FERRUM_ADMIN_JWT_SECRET_GCP")
         .env_remove("FERRUM_FILE_CONFIG_PATH")
         .current_dir(temp_dir.path());
     cmd
@@ -343,6 +360,11 @@ async fn functional_cli_validate_resolves_file_secret_suffix() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Non-vacuous: `FERRUM_ADMIN_JWT_SECRET` is `required_for(["database","cp"])`
+    // with `min_len(MIN_JWT_SECRET_LENGTH)`, and the helper clears the base key
+    // and pins an empty settings file, so the only way parsing can reach
+    // "Validation passed." is if the `_FILE` source was actually materialized
+    // into the base variable.
     assert!(stdout.contains("Validation passed."));
     // The resolved value must never be echoed on either stream.
     let stderr = String::from_utf8_lossy(&output.stderr);
