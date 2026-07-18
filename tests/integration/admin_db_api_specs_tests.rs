@@ -975,8 +975,7 @@ async fn restore_bundle_rejects_recreated_additional_upstream_identity() {
         .await
         .expect("create intervening replacement upstream");
     let mut pre_delete_upstream = recreated_upstream.clone();
-    pre_delete_upstream.created_at =
-        recreated_upstream.created_at - chrono::Duration::seconds(1);
+    pre_delete_upstream.created_at = recreated_upstream.created_at - chrono::Duration::seconds(1);
 
     let mut proxy = make_proxy(&proxy_id, ns);
     proxy.api_spec_id = Some(spec_id.clone());
@@ -1005,7 +1004,13 @@ async fn restore_bundle_rejects_recreated_additional_upstream_identity() {
     );
     assert!(store.get_proxy(ns, &proxy_id).await.unwrap().is_none());
     assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_none());
-    assert!(store.get_upstream(ns, &upstream_id).await.unwrap().is_some());
+    assert!(
+        store
+            .get_upstream(ns, &upstream_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
