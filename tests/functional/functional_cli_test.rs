@@ -1104,7 +1104,10 @@ async fn functional_cli_validate_prefers_secret_spec_path_over_discovered_resour
     std::fs::write(&spec_pointer, spec_path.to_str().unwrap()).unwrap();
 
     let mut cmd = hermetic_validate_command(&temp_dir, &[]);
-    cmd.env("FERRUM_FILE_CONFIG_PATH_FILE", spec_pointer.to_str().unwrap());
+    cmd.env(
+        "FERRUM_FILE_CONFIG_PATH_FILE",
+        spec_pointer.to_str().unwrap(),
+    );
 
     let output = cmd
         .stdout(Stdio::piped())

@@ -268,10 +268,7 @@ fn test_resolve_all_env_secrets_rejects_nul_in_resolved_value() {
     file.flush().unwrap();
 
     with_env_vars_async(
-        &[(
-            "FERRUM_TEST_SECRET_NUL_FILE",
-            file.path().to_str().unwrap(),
-        )],
+        &[("FERRUM_TEST_SECRET_NUL_FILE", file.path().to_str().unwrap())],
         || async {
             let err = match resolve_all_env_secrets().await {
                 Ok(_) => panic!("expected a NUL-containing resolved value to fail"),
