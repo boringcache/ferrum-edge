@@ -1545,9 +1545,7 @@ pub mod _test_support {
         tag: &str,
     ) -> Option<(Vec<u8>, usize, usize)> {
         let tags = (format!("<{tag}>"), format!("</{tag}>"));
-        crate::plugins::ai_prompt_compressor::preserve_marker_sanitizer_work_for_test(
-            body, &tags,
-        )
+        crate::plugins::ai_prompt_compressor::preserve_marker_sanitizer_work_for_test(body, &tags)
     }
 
     // ── plugins/ai_semantic_cache staging fields ─────────────────────────────

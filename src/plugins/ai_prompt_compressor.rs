@@ -1121,8 +1121,8 @@ where
         }
 
         let marker_end = match_json_string_ascii(body, cursor, open.as_bytes(), work);
-        let marker_end = marker_end
-            .or_else(|| match_json_string_ascii(body, cursor, close.as_bytes(), work));
+        let marker_end =
+            marker_end.or_else(|| match_json_string_ascii(body, cursor, close.as_bytes(), work));
         if let Some(end) = marker_end {
             cursor = end;
             changed = true;
@@ -1137,11 +1137,7 @@ where
     (changed && !in_string).then_some(output)
 }
 
-fn json_string_end<W: FnMut(usize)>(
-    body: &str,
-    mut cursor: usize,
-    work: &mut W,
-) -> Option<usize> {
+fn json_string_end<W: FnMut(usize)>(body: &str, mut cursor: usize, work: &mut W) -> Option<usize> {
     // Each call advances monotonically to one string boundary using the UTF-8
     // validation performed once at scanner entry, and the caller then advances
     // past that string. Value contents are scanned once more for marker matches
