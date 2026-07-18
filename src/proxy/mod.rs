@@ -15526,6 +15526,10 @@ pub(crate) fn buffered_response_representation_origin(
 /// `oidc_relying_party` rotated session cookie, `response_transformer` route
 /// overrides) a second time and silently drop it. Every backend path passes
 /// `true`, matching [`apply_plugin_rejection_response`].
+// Same nine request/response context parameters as the single caller
+// (`admit_buffered_response_body_transforms`); bundling them into a struct
+// here would only move the same borrows across one call boundary.
+#[allow(clippy::too_many_arguments)]
 async fn replace_buffered_response_with_representation_error(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
