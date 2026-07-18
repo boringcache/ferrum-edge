@@ -2652,13 +2652,9 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
                 filter.limit = if parsed == 0 {
                     DEFAULT_LIMIT
                 } else {
-                    u32::try_from(parsed.min(u64::from(MAX_LIMIT)))
-                        .map_err(|_| {
-                            invalid_pagination(
-                                "limit",
-                                crate::admin::PaginationValueError::Overflow,
-                            )
-                        })?
+                    u32::try_from(parsed.min(u64::from(MAX_LIMIT))).map_err(|_| {
+                        invalid_pagination("limit", crate::admin::PaginationValueError::Overflow)
+                    })?
                 };
             }
             "offset" => {

@@ -719,9 +719,8 @@ fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<F
         for (key, val) in url::form_urlencoded::parse(query.as_bytes()) {
             match key.as_ref() {
                 "offset" => {
-                    let parsed = parse_unsigned_pagination_value(&val).map_err(|error| {
-                        invalid_pagination_response("offset", error.reason())
-                    })?;
+                    let parsed = parse_unsigned_pagination_value(&val)
+                        .map_err(|error| invalid_pagination_response("offset", error.reason()))?;
                     if parsed > i64::MAX as u64 {
                         return Err(invalid_pagination_response(
                             "offset",
@@ -733,9 +732,8 @@ fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<F
                     })?;
                 }
                 "limit" => {
-                    let parsed = parse_unsigned_pagination_value(&val).map_err(|error| {
-                        invalid_pagination_response("limit", error.reason())
-                    })?;
+                    let parsed = parse_unsigned_pagination_value(&val)
+                        .map_err(|error| invalid_pagination_response("limit", error.reason()))?;
                     // `0` keeps the documented "server default" meaning; values
                     // above the maximum are capped, both per openapi.yaml.
                     let parsed = if parsed == 0 {
