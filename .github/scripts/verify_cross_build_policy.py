@@ -118,9 +118,10 @@ CROSS_ENVIRONMENT = re.compile(
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
 )
 CROSS_COMMAND_CONTEXT = re.compile(
-    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;|\||\()\s*|"
+    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;|\|)\s*|"
     r"\b(?:if|elif|while|until|then|do|else|time|command|exec|sudo|nohup)\s+)"
-    r"cross(?=\s+\S)|cargo\s+install(?:\s+--[^\s]+)*\s+cross\b"
+    r"(?:\(\s*)?cross(?=\s+\S)|"
+    r"cargo\s+install(?:\s+--[^\s]+)*\s+cross\b"
 )
 SHELL_INTERPOLATION = re.compile(
     r"\$\{[^{}\n]*\}|`[^`\n]*`|"
@@ -1883,6 +1884,20 @@ pre_build = []
         failures.append(
             "merge-base comparison allowed a shell-variable Cross executable"
         )
+    changed_parenthesized_shell_cross = benign_workflow.replace(
+        "echo unrelated-edit",
+        "|\n          cmd=$(printf '\\143\\162\\157\\163\\163')\n"
+        '          ( "$cmd" rustc --target aarch64-unknown-linux-gnu )',
+    )
+    if not compare_pr_workflow_job(
+        workflow,
+        changed_parenthesized_shell_cross,
+        "current workflow",
+        "protected-arm",
+    ):
+        failures.append(
+            "merge-base comparison allowed a parenthesized variable Cross executable"
+        )
     if not compare_pr_workflow_job(
         merge_base_without_job,
         workflow,
@@ -1906,6 +1921,16 @@ pre_build = []
         "self-test workflow directory",
     ):
         failures.append("safe additional workflow was rejected")
+    benign_embedded_substitutions = safe_extra_workflow.replace(
+        "echo safe",
+        'echo "packaging $(grep -c x files) files '
+        '($(grep -c y files) profraw)"',
+    )
+    if validate_workflow_collection(
+        {"coverage.yml": benign_embedded_substitutions},
+        "self-test workflow directory",
+    ):
+        failures.append("benign embedded command substitutions were rejected")
     if compare_pr_workflow_collection(
         {"coverage.yml": safe_extra_workflow},
         {
