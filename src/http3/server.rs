@@ -899,7 +899,7 @@ async fn handle_h3_connection(
     // to avoid per-request String allocation from SocketAddr::ip().to_string().
     // Updated in-place when QUIC connection migration is detected.
     let mut cached_addr = quinn_conn.remote_address();
-    let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_string());
+    let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_canonical().to_string());
 
     loop {
         match h3_conn.accept().await {
@@ -914,7 +914,7 @@ async fn handle_h3_connection(
                         cached_addr, current_addr
                     );
                     cached_addr = current_addr;
-                    socket_ip = Arc::from(current_addr.ip().to_string());
+                    socket_ip = Arc::from(current_addr.ip().to_canonical().to_string());
                 }
 
                 let state = Arc::clone(&state);
@@ -2752,27 +2752,34 @@ async fn handle_h3_request(
             initial_needs_ctx_headers_for_body_hooks,
         )
     };
-    // Reserved consumer-identity headers are gateway-asserted. Strip any
+    // Reserved gateway assertions — consumer identity AND the private GeoIP
+    // lookup result — are never sourced from mutable plugin headers. Strip any
     // client- OR plugin-supplied value UNCONDITIONALLY before backend dispatch,
-    // then inject the authenticated value when a principal resolved. `materialize_headers`
+    // then inject the authenticated principal and the authoritative country
+    // only after a successful lookup/allow decision. `materialize_headers`
     // only removed the RAW client header BEFORE plugins ran, so an unauthenticated
-    // route where a `before_proxy` transformer adds `x-consumer-*` would otherwise
-    // forward that plugin value to the backend — the exact spoofing path. The strip
-    // is case-insensitive (the gateway injects mixed-case keys; the H3 wire and
-    // plugins use lowercase). To preserve the zero-alloc hot path, only
-    // materialize/scrub when a principal must be injected OR a reserved header is
-    // actually present in the effective source.
-    let source_has_reserved_identity = owned_proxy_headers
+    // route where a `before_proxy` transformer adds `x-consumer-*` or
+    // `x-geo-country` would otherwise forward that plugin value to the backend —
+    // the exact spoofing path. The strip is case-insensitive (the gateway
+    // injects mixed-case keys; the H3 wire and plugins use lowercase). To
+    // preserve the zero-alloc hot path, only materialize/scrub when an
+    // assertion must be injected OR a reserved header is actually present in
+    // the effective source.
+    let source_has_reserved_assertion = owned_proxy_headers
         .as_ref()
         .unwrap_or(&ctx.headers)
         .keys()
         .any(|k| {
             k.eq_ignore_ascii_case("x-consumer-username")
                 || k.eq_ignore_ascii_case("x-consumer-custom-id")
+                || k.eq_ignore_ascii_case("x-geo-country")
         });
-    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
+    if ctx.backend_consumer_username().is_some()
+        || ctx.backend_geo_country().is_some()
+        || source_has_reserved_assertion
+    {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        crate::proxy::refresh_backend_consumer_identity_headers(&ctx, headers);
+        crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
     // Resolve proxy_headers into an owned HashMap to avoid borrowing
     // ctx.headers while ctx is passed as &mut to proxy functions downstream.
@@ -3002,9 +3009,9 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.path = backend_ctx_path;
         if matches!(deferred_result, PluginResult::Continue) {
-            // Re-establish gateway-authenticated identity and egress baggage
+            // Re-establish gateway assertions and egress baggage
             // policy before a deferred function's headers reach a backend.
-            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers);
             crate::modes::mesh::hbone::strip_egress_baggage_in_map(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,
@@ -3030,7 +3037,7 @@ async fn handle_h3_request(
             ctx.path = backend_ctx_path;
         }
         if matches!(deferred_result, PluginResult::Continue) {
-            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers);
             crate::modes::mesh::hbone::strip_egress_baggage_in_map(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,

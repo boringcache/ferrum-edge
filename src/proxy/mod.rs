@@ -4593,6 +4593,21 @@ fn spawn_backend_svid_rotation_task(
 }
 
 impl ProxyState {
+    /// Apply a full snapshot on Tokio's blocking pool. DP snapshots cannot
+    /// carry a CP-side node-local MMDB handoff, so their plugin-cache build may
+    /// synchronously hash, verify, and scan the configured database.
+    pub async fn update_config_off_thread(&self, new_config: GatewayConfig) -> ConfigApplyOutcome {
+        let proxy_state = self.clone();
+        match tokio::task::spawn_blocking(move || proxy_state.update_config(new_config)).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let message = format!("configuration update worker failed: {error}");
+                error!("Config reload rejected: {}", message);
+                ConfigApplyOutcome::rejected_one(message)
+            }
+        }
+    }
+
     /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
     ///
     /// If the gateway already has a file-loaded SVID, rebuild the SVID bundle
@@ -7298,6 +7313,7 @@ impl ProxyState {
         new_config: &GatewayConfig,
         staged_config: Arc<GatewayConfig>,
         delta: &crate::config_delta::ConfigDelta,
+        country_mmdb_load_mode: crate::plugin_cache::CountryMmdbLoadMode,
     ) -> Result<StagedIncrementalRequestEpoch, String> {
         let proxy_ids_to_rebuild =
             plugin_rebuild_targets_for_incremental_stage(&current.config, new_config, delta);
@@ -7318,6 +7334,7 @@ impl ProxyState {
             &proxy_ids_to_rebuild,
             &delta.removed_proxy_ids,
             rebuild_globals,
+            country_mmdb_load_mode,
         )?;
         let consumer_inner = if consumer_changed {
             ConsumerIndex::build_inner(&new_config.consumers)
@@ -7601,22 +7618,30 @@ impl ProxyState {
             |current| {
                 let delta = ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
-                    // No proxy / upstream / consumer / plugin delta. The mesh
-                    // block (`config.mesh`) is NOT diffed by `ConfigDelta`
-                    // (it carries no `id`/`updated_at`), and mesh endpoints
-                    // (`mesh.workloads`/`mesh.services`) are resolved at REQUEST
-                    // time from the live request-epoch's `config.mesh` (e.g. the
-                    // inbound HBONE relay destination guard, and the mesh
-                    // service discoverer) — NOT from any materialized
-                    // `Upstream.targets`. So a mesh-only change (a federation
-                    // bundle refresh, or a cross-cluster remote-cluster
-                    // scale-up/down merged in by
-                    // `merge_remote_endpoints_into_mesh`) leaves the delta empty
-                    // yet genuinely changes routable state. Republish the epoch
-                    // with the fresh config so the request path observes the new
-                    // `config.mesh`; the plugin/consumer/LB caches are unaffected
-                    // by a mesh-only change and reused as-is, and the route table
-                    // is reused UNLESS the mesh route inputs changed (see below).
+                    // ConfigDelta does not represent node-local plugin-file
+                    // contents or the mesh block. Claim an accepted MMDB
+                    // validation handoff before deciding this generation is a
+                    // no-op: a same-path file replacement must atomically
+                    // publish fresh geo readers even though every serialized
+                    // config field and timestamp is unchanged.
+                    let country_mmdb_plugin_cache =
+                        self.plugin_cache.build_country_mmdb_reload_inner(
+                            &current.plugin_cache,
+                            &new_config,
+                            matches!(
+                                self.env_config.mode,
+                                crate::config::env_config::OperatingMode::DataPlane
+                            ),
+                        )?;
+                    let mesh_changed = current.config.mesh != new_config.mesh;
+                    if !mesh_changed && country_mmdb_plugin_cache.is_none() {
+                        return Ok(None);
+                    }
+
+                    // Mesh endpoints (`mesh.workloads`/`mesh.services`) are
+                    // resolved at REQUEST time from the request epoch's live
+                    // `config.mesh`, not materialized `Upstream.targets`. A
+                    // mesh-only change therefore also needs an epoch publish.
                     //
                     // Without this, the `Ok(None)` no-delta path below updates
                     // only `ProxyState.config` (the ArcSwap the request path
@@ -7624,39 +7649,45 @@ impl ProxyState {
                     // stale — so a remote scale-up / trust-bundle overlay never
                     // reaches the live proxy until an unrelated proxy/upstream
                     // delta forces a republish (codex F7.2 round-5, finding 3).
-                    if current.config.mesh == new_config.mesh {
-                        return Ok(None);
-                    }
-                    // The mesh block changed. The pre-computed plugin/consumer/LB
-                    // caches are unaffected by a mesh-only change and are reused,
-                    // but the route table snapshot materializes mesh-derived maps
+                    // When the mesh block changed, the route table snapshot
+                    // must also refresh because it materializes mesh-derived maps
                     // (raw-TCP inbound port map from the `#[serde(skip)]`
                     // `mesh.local_inbound_tcp_routes`, VIP egress tables, sibling
-                    // port groups), and the route table is a pure function of
-                    // `config.mesh`, so a mesh change rebuilds it here. Without this,
+                    // port groups). Without this,
                     // a mesh slice update that retargets/adds/removes a local
                     // stream-family port would leave the inbound accept loop relaying
                     // to a stale loopback backend (or falling through to Hyper for a
-                    // newly added port). `mesh_route_table_inputs_changed` is the same
-                    // whole-mesh signal the incremental path ORs into `route_changed`;
-                    // having already established the mesh differs, the rebuild is
-                    // unconditional here.
-                    route_changed.set(true);
+                    // newly added port). An MMDB-only publish reuses that table.
+                    route_changed.set(mesh_changed);
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
-                        route_table: RouterCache::build_route_table_snapshot(&new_config),
-                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        route_table: if mesh_changed {
+                            RouterCache::build_route_table_snapshot(&new_config)
+                        } else {
+                            Arc::clone(&current.route_table)
+                        },
+                        plugin_cache: country_mmdb_plugin_cache
+                            .unwrap_or_else(|| Arc::clone(&current.plugin_cache)),
                         consumer_index: Arc::clone(&current.consumer_index),
                         load_balancer: Arc::clone(&current.load_balancer),
-                        route_changed: true,
+                        route_changed: mesh_changed,
                         lb_changed: false,
                     }));
                 }
+                let country_mmdb_load_mode = if matches!(
+                    self.env_config.mode,
+                    crate::config::env_config::OperatingMode::DataPlane
+                ) {
+                    crate::plugin_cache::CountryMmdbLoadMode::NodeLocalRefresh
+                } else {
+                    crate::plugin_cache::CountryMmdbLoadMode::Standard
+                };
                 let staged = self.stage_incremental_request_epoch(
                     current,
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
+                    country_mmdb_load_mode,
                 )?;
                 route_changed.set(staged.request_epoch.route_changed);
                 proxy_plugin_rebuild_count.set(staged.proxy_plugin_rebuild_count);
@@ -7686,16 +7717,13 @@ impl ProxyState {
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
-        // Mesh-only republish (no proxy/upstream/consumer/plugin delta — only
-        // `config.mesh` changed): the pre-computed caches were reused unchanged,
-        // so there is nothing to prune, warm, reconcile, or restart. The fresh
-        // epoch (and the mirrored `ProxyState.config`) already carry the new
-        // `config.mesh` for the request path. `mirror_request_epoch_wrappers`
-        // published the new config above. Return without running the
-        // delta-keyed maintenance below (it would all be a no-op anyway, and
-        // `applied_delta` is `None` here).
+        // Out-of-band republish (mesh-only and/or accepted MMDB-only reload):
+        // there is no resource delta to drive pruning, DNS warmup, listener
+        // reconciliation, or health-check restarts. The request epoch already
+        // carries the new mesh config and/or geo plugin snapshot, and
+        // `mirror_request_epoch_wrappers` published its wrapper views above.
         let Some(delta) = applied_delta else {
-            debug!("Config update: mesh-only change republished (caches reused)");
+            debug!("Config update: out-of-band mesh/MMDB generation republished");
             return ConfigApplyOutcome::Applied;
         };
         let proxy_plugin_rebuild_count = proxy_plugin_rebuild_count.get();
@@ -8062,6 +8090,35 @@ impl ProxyState {
             return ConfigApplyOutcome::rejected(errors);
         }
 
+        // Incremental database and CP/DP deltas stage plugin caches directly
+        // on this async call path. Expand the prospective rebuild scope using
+        // the same adaptive-concurrency route-definition logic as cache
+        // staging, preload every MMDB that exact scope reconstructs on the
+        // blocking pool, then require the cache stage to claim the handoff
+        // without synchronous file work.
+        let prospective_delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+        let prospective_proxy_rebuilds =
+            prospective_delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
+        if self.plugin_cache.country_mmdb_preload_required(
+            &new_config,
+            &prospective_proxy_rebuilds,
+            prospective_delta.global_plugin_configs_changed,
+        ) {
+            new_config = match crate::config::validation_pipeline::validate_plugin_file_dependencies_off_thread(
+                new_config,
+                crate::config::validation_pipeline::ValidationAction::Warn,
+            )
+            .await
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    let message = format!("incremental plugin file validation failed: {error}");
+                    error!("Incremental config rejected: {}", message);
+                    return ConfigApplyOutcome::rejected_one(message);
+                }
+            };
+        }
+
         let mut applied_delta = None;
         // See `update_config` rustdoc nearby for why this is a `Cell` and not
         // a plain `let mut bool`.
@@ -8071,13 +8128,34 @@ impl ProxyState {
             |current| {
                 let delta = crate::config_delta::ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
-                    return Ok(None);
+                    // A concurrent writer can make the prospective delta above
+                    // disappear after its off-thread MMDB generation was
+                    // accepted. Claim and publish that handoff rather than
+                    // leaving it unowned or retaining stale geo readers.
+                    let Some(plugin_cache) = self.plugin_cache.build_country_mmdb_reload_inner(
+                        &current.plugin_cache,
+                        &new_config,
+                        false,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(StagedRequestEpoch {
+                        config: Arc::clone(&staged_config),
+                        route_table: Arc::clone(&current.route_table),
+                        plugin_cache,
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: false,
+                        lb_changed: false,
+                    }));
                 }
                 let staged = self.stage_incremental_request_epoch(
                     current,
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
+                    crate::plugin_cache::CountryMmdbLoadMode::PreloadedOnly,
                 )?;
                 route_changed.set(staged.request_epoch.route_changed);
                 applied_delta = Some(delta);
@@ -8097,7 +8175,10 @@ impl ProxyState {
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
-        let delta = applied_delta.expect("delta captured when publish_result is Some");
+        let Some(delta) = applied_delta else {
+            debug!("Incremental config: accepted MMDB-only generation republished");
+            return ConfigApplyOutcome::Applied;
+        };
 
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -8737,11 +8818,14 @@ async fn handle_websocket_request_authenticated(
             custom_id.to_string(),
         );
     }
+    if let Some(country) = ctx.backend_geo_country() {
+        push_forwardable_header_override(&mut client_headers, "x-geo-country", country.to_string());
+    }
 
     // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`.
     // The WebSocket handshake gets the same sanitized `proxy_headers` as the
     // HTTP/gRPC dispatch paths. Keep applying the vector helper here because
-    // this function may append identity headers before backend dial.
+    // this function may append gateway assertions before backend dial.
     hbone_proxy::strip_egress_baggage_in_vec(
         &mut client_headers,
         &state.mesh_egress_strip_baggage_keys,
@@ -9890,6 +9974,7 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             | "sec-websocket-extensions"
             | "x-consumer-username"
             | "x-consumer-custom-id"
+            | "x-geo-country"
     )
 }
 
@@ -9902,16 +9987,17 @@ fn push_forwardable_header_override(
     headers.push((name.to_string(), value));
 }
 
-fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, String>) {
+fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, String>) {
     headers.retain(|name, _| {
         !name.eq_ignore_ascii_case("x-consumer-username")
             && !name.eq_ignore_ascii_case("x-consumer-custom-id")
+            && !name.eq_ignore_ascii_case("x-geo-country")
     });
 }
 
-/// Remove plugin-controlled consumer identity headers and restore only the
-/// gateway-authenticated values for backend dispatch.
-pub(crate) fn refresh_backend_consumer_identity_headers(
+/// Remove plugin-controlled gateway assertion headers and restore only the
+/// authenticated principal and private GeoIP lookup result for dispatch.
+pub(crate) fn refresh_backend_gateway_assertion_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
@@ -9919,33 +10005,39 @@ pub(crate) fn refresh_backend_consumer_identity_headers(
     let principal_custom_id = principal_username
         .as_ref()
         .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
-    let source_has_reserved_identity = principal_username.is_none()
+    let geo_country = ctx.backend_geo_country().map(str::to_string);
+    let source_has_reserved_assertion = principal_username.is_none()
+        && geo_country.is_none()
         && headers.keys().any(|name| {
             name.eq_ignore_ascii_case("x-consumer-username")
                 || name.eq_ignore_ascii_case("x-consumer-custom-id")
+                || name.eq_ignore_ascii_case("x-geo-country")
         });
-    if principal_username.is_none() && !source_has_reserved_identity {
+    if principal_username.is_none() && geo_country.is_none() && !source_has_reserved_assertion {
         return;
     }
 
-    sanitize_reserved_consumer_identity_headers(headers);
+    sanitize_reserved_gateway_assertion_headers(headers);
     if let Some(username) = principal_username {
         headers.insert("x-consumer-username".to_string(), username);
         if let Some(custom_id) = principal_custom_id {
             headers.insert("x-consumer-custom-id".to_string(), custom_id);
         }
     }
+    if let Some(country) = geo_country {
+        headers.insert("x-geo-country".to_string(), country);
+    }
 }
 
-fn refresh_effective_backend_consumer_identity_headers(
+fn refresh_effective_backend_gateway_assertion_headers(
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
 ) {
     if let Some(headers) = owned_proxy_headers.as_mut() {
-        refresh_backend_consumer_identity_headers(ctx, headers);
+        refresh_backend_gateway_assertion_headers(ctx, headers);
     } else {
         let mut headers = std::mem::take(&mut ctx.headers);
-        refresh_backend_consumer_identity_headers(ctx, &mut headers);
+        refresh_backend_gateway_assertion_headers(ctx, &mut headers);
         ctx.headers = headers;
     }
 }
@@ -18457,18 +18549,21 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
-    // Strip plugin-controlled identity headers and inject only the gateway's
-    // authenticated values. The common no-header/no-principal path avoids
-    // materializing an owned header map.
-    let source_has_reserved_identity = owned_proxy_headers.as_ref().is_some_and(|headers| {
-        headers.keys().any(|name| {
-            name.eq_ignore_ascii_case("x-consumer-username")
-                || name.eq_ignore_ascii_case("x-consumer-custom-id")
-        })
+    // Strip plugin-controlled gateway assertions and inject only the
+    // authenticated principal and private GeoIP result. The common
+    // no-assertion path avoids materializing an owned header map.
+    let effective_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    let source_has_reserved_assertion = effective_headers.keys().any(|name| {
+        name.eq_ignore_ascii_case("x-consumer-username")
+            || name.eq_ignore_ascii_case("x-consumer-custom-id")
+            || name.eq_ignore_ascii_case("x-geo-country")
     });
-    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
+    if ctx.backend_consumer_username().is_some()
+        || ctx.backend_geo_country().is_some()
+        || source_has_reserved_assertion
+    {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        refresh_backend_consumer_identity_headers(&ctx, headers);
+        refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
     // Egress baggage strip — operator-configured key prefixes are removed
     // from the outbound `baggage` header. Default empty list is a no-op.
@@ -18621,9 +18716,9 @@ async fn handle_proxy_request_inner(
         ctx.path = backend_ctx_path;
         if matches!(deferred_result, PluginResult::Continue) {
             // A deferred routing function can return arbitrary headers.
-            // Restore gateway-owned identity and reapply the egress baggage
+            // Restore gateway-owned assertions and reapply the egress baggage
             // policy before those headers can reach any backend transport.
-            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            refresh_effective_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
                 &ctx.headers,
@@ -18671,7 +18766,7 @@ async fn handle_proxy_request_inner(
             ctx.path = backend_ctx_path;
         }
         if matches!(deferred_result, PluginResult::Continue) {
-            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            refresh_effective_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
                 &ctx.headers,
@@ -35639,7 +35734,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_identity_headers_override_client_supplied_values() {
+    fn websocket_gateway_assertions_override_mutable_values() {
         let mut headers = vec![
             ("x-consumer-username".to_string(), "spoofed".to_string()),
             (
@@ -35650,6 +35745,7 @@ mod tests {
                 "x-consumer-custom-id".to_string(),
                 "spoofed-custom".to_string(),
             ),
+            ("X-Geo-Country".to_string(), "ATTACKER".to_string()),
             ("x-request-id".to_string(), "req-1".to_string()),
         ];
 
@@ -35663,6 +35759,7 @@ mod tests {
             "x-consumer-custom-id",
             "trusted-custom".to_string(),
         );
+        push_forwardable_header_override(&mut headers, "x-geo-country", "SE".to_string());
 
         let usernames: Vec<&str> = headers
             .iter()
@@ -35678,9 +35775,17 @@ mod tests {
                     .then_some(value.as_str())
             })
             .collect();
+        let countries: Vec<&str> = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("x-geo-country")
+                    .then_some(value.as_str())
+            })
+            .collect();
 
         assert_eq!(usernames, vec!["trusted-user"]);
         assert_eq!(custom_ids, vec!["trusted-custom"]);
+        assert_eq!(countries, vec!["SE"]);
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
         }));

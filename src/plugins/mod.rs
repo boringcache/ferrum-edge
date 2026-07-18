@@ -1139,6 +1139,8 @@ pub enum UdpDatagramDirection {
 /// relaying the response to the client).
 #[allow(dead_code)]
 pub struct UdpDatagramContext<'a> {
+    /// Canonical client IP identity. IPv4-mapped IPv6 is normalized once when
+    /// the UDP/DTLS session is created so per-datagram hooks only clone this Arc.
     pub client_ip: Arc<str>,
     pub proxy_id: Arc<str>,
     pub proxy_name: Option<Arc<str>>,
@@ -1562,6 +1564,10 @@ pub struct RequestContext {
     /// Human-readable identity for the `X-Consumer-Username` header sent to the
     /// backend. Falls back to `authenticated_identity` when not set separately.
     pub authenticated_identity_header: Option<String>,
+    /// Authoritative GeoIP country assertion staged by `geo_restriction` for
+    /// backend dispatch. Kept outside the mutable plugin header map and public
+    /// metadata so later request hooks cannot replace or log a forged value.
+    backend_geo_country: Option<[u8; 2]>,
     /// Authentication mechanism that succeeded (e.g., `"jwt_auth"`, `"key_auth"`).
     /// `&'static str` because every `AuthMechanism::mechanism_name()` returns a
     /// compiled-in literal — zero allocation on the hot path.
@@ -2056,6 +2062,7 @@ impl RequestContext {
             identified_consumer: None,
             authenticated_identity: None,
             authenticated_identity_header: None,
+            backend_geo_country: None,
             auth_method: None,
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
@@ -2626,6 +2633,7 @@ impl RequestContext {
             identified_consumer: self.identified_consumer.clone(),
             authenticated_identity: self.authenticated_identity.clone(),
             authenticated_identity_header: self.authenticated_identity_header.clone(),
+            backend_geo_country: self.backend_geo_country,
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
@@ -3169,8 +3177,10 @@ impl RequestContext {
                     // clients. Identity headers are injected after
                     // authentication; path-param headers are injected after
                     // route matching from regex captures.
-                    if matches!(key, "x-consumer-username" | "x-consumer-custom-id")
-                        || key.starts_with("x-path-param-")
+                    if matches!(
+                        key,
+                        "x-consumer-username" | "x-consumer-custom-id" | "x-geo-country"
+                    ) || key.starts_with("x-path-param-")
                     {
                         continue;
                     }
@@ -3321,6 +3331,21 @@ impl RequestContext {
             return None;
         }
         Some(custom_id)
+    }
+
+    /// Return the GeoIP country value to assert at the backend boundary.
+    ///
+    /// `geo_restriction` records this packed value privately when header
+    /// injection is enabled. Backend dispatch strips every mutable
+    /// `x-geo-country` value and restores only this lookup result.
+    pub fn backend_geo_country(&self) -> Option<&str> {
+        self.backend_geo_country
+            .as_ref()
+            .and_then(|country| std::str::from_utf8(country).ok())
+    }
+
+    pub(crate) fn set_backend_geo_country(&mut self, country: [u8; 2]) {
+        self.backend_geo_country = Some(country);
     }
 
     /// Whether a plugin opted this request out of gateway consumer-identity
@@ -4988,6 +5013,15 @@ pub trait Plugin: Send + Sync {
     /// Returns the plugin name.
     fn name(&self) -> &str;
 
+    /// Returns the immutable country-MMDB snapshot retained by this plugin.
+    ///
+    /// Plugin-cache generation construction uses this cold-path hook to enforce
+    /// the aggregate live-snapshot budget across both rebuilt and retained geo
+    /// instances. Ordinary plugins retain the allocation-free default.
+    fn country_mmdb_snapshot(&self) -> Option<&crate::config::types::CountryMmdbSnapshot> {
+        None
+    }
+
     /// Return the non-empty correlation header owned by this instance, or
     /// `None` when it owns no correlation header. Plugin-cache admission trims
     /// and ASCII-case-folds claims before rejecting empty, deployment-owned
@@ -6535,6 +6569,9 @@ pub(crate) fn validate_plugin_config_with_http_client(
     config: &Value,
     http_client: PluginHttpClient,
 ) -> Result<(), String> {
+    if name == "geo_restriction" {
+        return geo_restriction::GeoRestriction::validate_config(config);
+    }
     if name == "oidc_relying_party" {
         screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
         return oidc_relying_party::OidcRelyingParty::validate_config(config, http_client);
