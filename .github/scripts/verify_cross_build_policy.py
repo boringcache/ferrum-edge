@@ -96,6 +96,67 @@ WORKFLOW_CONTRACTS = (
     ),
 )
 
+DOCKER_ARTIFACT_MATRIX = (
+    "    strategy:\n"
+    "      fail-fast: false\n"
+    "      matrix:\n"
+    "        include:\n"
+    "          - platform: linux/amd64\n"
+    "            binary_target: x86_64-unknown-linux-gnu\n"
+    "            binary_asset: ferrum-edge-linux-x86_64\n"
+    "            cni_asset: ferrum-cni-linux-x86_64\n"
+    "            arch_dir: amd64\n"
+    "          - platform: linux/arm64\n"
+    "            binary_target: aarch64-unknown-linux-gnu\n"
+    "            binary_asset: ferrum-edge-linux-aarch64\n"
+    "            cni_asset: ferrum-cni-linux-aarch64\n"
+    "            arch_dir: arm64\n"
+)
+DOCKER_CONTEXT_STEP = (
+    "      - name: Prepare Docker context\n"
+    "        run: |\n"
+    "          mkdir -p docker-context/bin/${{ matrix.arch_dir }}\n"
+    "          cp downloaded-artifacts/${{ matrix.binary_asset }} "
+    "docker-context/bin/${{ matrix.arch_dir }}/ferrum-edge\n"
+    "          cp downloaded-artifacts/${{ matrix.cni_asset }} "
+    "docker-context/bin/${{ matrix.arch_dir }}/ferrum-cni\n"
+    "          cp Dockerfile.release docker-context/Dockerfile\n"
+)
+# The Docker jobs never name the protected ARM64 artifact literally. They
+# select it through matrix values that the download step and the context step
+# interpolate, so freezing the job's `needs`/`if` alone would still let a pull
+# request point the `linux/arm64` row at the x86_64 artifact and publish an
+# ARM64 image containing the wrong binary. The matrix row and both consuming
+# steps are therefore frozen as one artifact-selection contract.
+PUBLISH_ARTIFACT_STEP_CONTRACTS = {
+    "CI workflow": {
+        "docker": {
+            "Download Linux binary": (
+                "      - name: Download Linux binary\n"
+                "        uses: actions/download-artifact"
+                "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+                "        with:\n"
+                "          name: binary-${{ matrix.binary_target }}\n"
+                "          path: downloaded-artifacts\n"
+            ),
+            "Prepare Docker context": DOCKER_CONTEXT_STEP,
+        },
+    },
+    "release workflow": {
+        "docker": {
+            "Download Linux binary": (
+                "      - name: Download Linux binary\n"
+                "        uses: actions/download-artifact"
+                "@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
+                "        with:\n"
+                "          name: release-binaries-${{ matrix.binary_target }}\n"
+                "          path: downloaded-artifacts\n"
+            ),
+            "Prepare Docker context": DOCKER_CONTEXT_STEP,
+        },
+    },
+}
+
 # Only the publication-control fields that consume the protected ARM64
 # artifacts are frozen. The rest of each publishing job remains editable.
 PUBLISH_CONTROL_CONTRACTS = {
@@ -117,6 +178,7 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "needs.build-arm64-cross.result == 'success' && "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
             ),
+            "strategy": DOCKER_ARTIFACT_MATRIX,
         },
     },
     "release workflow": {
@@ -131,6 +193,7 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "    needs: [build-release-binaries, "
                 "build-release-arm64-cross]\n"
             ),
+            "strategy": DOCKER_ARTIFACT_MATRIX,
         },
     },
 }
@@ -262,6 +325,13 @@ GENERATED_COMMAND_PATHS = frozenset(
         "conformance",
     }
 )
+# Directory prefixes whose contents are produced by a build rather than
+# committed. None of them is ignored by git, so a pull request can commit a
+# script under any of them. They therefore confer NO exemption on their own:
+# only the exact build outputs enumerated in `GENERATED_COMMAND_PATHS` may run
+# from outside the scanned automation roots. The tuple is retained so the
+# self-test can assert that no prefix is silently promoted back into an
+# open namespace.
 GENERATED_SCRIPT_PREFIXES = (
     "target/",
     "results/",
@@ -490,6 +560,20 @@ CROSS_CAPABLE_ACTION_INPUTS = frozenset(
 ARTIFACT_TRANSFER_ACTION = re.compile(
     r"^actions/(?:up|down)load-artifact@[0-9a-f]{40}$"
 )
+ARTIFACT_INPUT_KEYS = frozenset({"name", "path", "pattern"})
+# `with:` only introduces the input mapping, so it does not itself widen the
+# closed artifact carve-out to a flow mapping's other keys.
+ARTIFACT_CONTAINER_KEYS = frozenset({"with"})
+WORKFLOW_EXPRESSION = re.compile(r"\$\{\{(?P<body>[^{}]*)\}\}")
+# Only these expression scopes hold values a workflow author writes, so only
+# these can smuggle the protected target into a remote-action input.
+RESOLVABLE_EXPRESSION_SCOPES = (
+    "matrix.",
+    "env.",
+    "inputs.",
+    "github.event.inputs.",
+)
+TARGET_ARGUMENT_FLAG = re.compile(r"--target(?:\s|=|$)")
 REMOTE_ACTION_FIELD = re.compile(
     r"^(?P<lead> *)(?P<dash>-\s+)?(?:uses|'uses'|\"uses\")\s*:\s*(?P<value>.*)$"
 )
@@ -845,6 +929,48 @@ def extract_job_field_block(
     return "".join(lines[start:end]).rstrip() + "\n", []
 
 
+def extract_job_step_block(
+    contents: str,
+    source: str,
+    job_name: str,
+    step_name: str,
+    *,
+    required: bool,
+) -> tuple[str | None, list[str]]:
+    """Return the exact text of one named step inside a job's `steps:` list."""
+
+    steps_block, failures = extract_job_field_block(
+        contents,
+        source,
+        job_name,
+        "steps",
+        required=required,
+    )
+    if failures or steps_block is None:
+        return None, failures
+
+    lines = steps_block.splitlines(keepends=True)
+    step_starts = [
+        index for index, line in enumerate(lines) if re.match(r"^      - ", line)
+    ]
+    matches = [
+        index
+        for index in step_starts
+        if lines[index].rstrip("\r\n") == f"      - name: {step_name}"
+    ]
+    if not matches and not required:
+        return None, []
+    if len(matches) != 1:
+        return None, [
+            f"{source} job {job_name!r} must contain step {step_name!r} "
+            "exactly once"
+        ]
+
+    start = matches[0]
+    end = next((index for index in step_starts if index > start), len(lines))
+    return "".join(lines[start:end]).rstrip() + "\n", []
+
+
 def validate_publish_control_contract(contents: str, source: str) -> list[str]:
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
     errors: list[str] = []
@@ -862,6 +988,21 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
                 errors.append(
                     f"{source} job {job_name!r} field {field_name!r} differs "
                     "from the trusted ARM64 publication dependency contract"
+                )
+    for job_name, steps in PUBLISH_ARTIFACT_STEP_CONTRACTS.get(source, {}).items():
+        for step_name, expected in steps.items():
+            actual, failures = extract_job_step_block(
+                contents,
+                source,
+                job_name,
+                step_name,
+                required=True,
+            )
+            errors.extend(failures)
+            if not failures and actual != expected:
+                errors.append(
+                    f"{source} job {job_name!r} step {step_name!r} differs from "
+                    "the trusted ARM64 publication artifact-selection contract"
                 )
     return errors
 
@@ -896,6 +1037,30 @@ def compare_pr_publish_control_contract(
                     errors.append(
                         f"{source} job {job_name!r} ARM64 publication field "
                         f"{field_name!r} cannot be changed by a pull request"
+                    )
+    for job_name, steps in PUBLISH_ARTIFACT_STEP_CONTRACTS.get(source, {}).items():
+        for step_name in steps:
+            baseline, baseline_failures = extract_job_step_block(
+                merge_base_contents,
+                f"merge-base {source}",
+                job_name,
+                step_name,
+                required=False,
+            )
+            proposed, proposed_failures = extract_job_step_block(
+                proposed_contents,
+                f"proposed {source}",
+                job_name,
+                step_name,
+                required=False,
+            )
+            errors.extend(baseline_failures)
+            errors.extend(proposed_failures)
+            if not baseline_failures and not proposed_failures:
+                if baseline != proposed:
+                    errors.append(
+                        f"{source} job {job_name!r} ARM64 artifact-selection step "
+                        f"{step_name!r} cannot be changed by a pull request"
                     )
     return errors
 
@@ -3004,6 +3169,252 @@ def contains_cross_surface(
     )
 
 
+def step_block_bounds(
+    lines: list[str],
+    index: int,
+    key_column: int,
+    *,
+    has_dash: bool,
+) -> tuple[int, int]:
+    """Return the half-open line range of the step mapping that holds `index`.
+
+    A YAML step is one mapping, so its keys may appear in any order and `uses:`
+    is not necessarily the first of them. Scanning forward from the reference
+    alone would miss `with:` inputs written above it, so the whole mapping is
+    located instead. When the reference itself carries the sequence dash it is
+    already the first line of the step and no backward walk is needed.
+    """
+
+    start = index
+    if not has_dash:
+        for offset in range(index - 1, -1, -1):
+            previous = lines[offset]
+            if not previous.strip():
+                continue
+            indent = len(previous) - len(previous.lstrip(" "))
+            stripped = previous.lstrip(" ")
+            if indent == key_column - 2 and stripped.startswith("- "):
+                # The sequence entry that opens this step.
+                start = offset
+                break
+            if indent < key_column:
+                break
+            if indent == key_column and stripped.startswith("- "):
+                break
+            start = offset
+
+    end = len(lines)
+    for offset in range(index + 1, len(lines)):
+        following = lines[offset]
+        if not following.strip():
+            continue
+        indent = len(following) - len(following.lstrip(" "))
+        stripped = following.lstrip(" ")
+        if indent < key_column or (
+            indent == key_column and stripped.startswith("- ")
+        ):
+            end = offset
+            break
+    return start, end
+
+
+def step_input_keys(text: str) -> list[str]:
+    """Return every mapping key on a step line, quoted or not.
+
+    `'use-cross': true` and `"use-cross": true` are the same YAML key as the
+    unquoted spelling, so an action input cannot be hidden behind quoting.
+    """
+
+    return re.findall(r"['\"]?([A-Za-z0-9_.+-]+)['\"]?\s*:", text)
+
+
+def artifact_only_input_line(keys: list[str]) -> bool:
+    """Return whether a line declares only closed artifact name/path inputs.
+
+    Block (`name: ...`) and flow (`with: {name: ...}`) mappings are the same
+    YAML, so the documented carve-out accepts both. A line that also carries
+    any other key is not covered.
+    """
+
+    if not keys:
+        return False
+    contents = [
+        key.lower() for key in keys if key.lower() not in ARTIFACT_CONTAINER_KEYS
+    ]
+    return bool(contents) and all(key in ARTIFACT_INPUT_KEYS for key in contents)
+
+
+def literal_value_definitions(
+    lines: list[str],
+    start: int,
+    end: int,
+) -> dict[str, set[str]]:
+    """Collect the literal value set each mapping key can take in a range."""
+
+    definitions: dict[str, set[str]] = {}
+    pending: tuple[str, int] | None = None
+    for offset in range(start, end):
+        line = lines[offset]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        text = re.sub(r"\s+#.*$", "", line)
+        indent = len(text) - len(text.lstrip(" "))
+        stripped = text.strip()
+        if (
+            pending is not None
+            and stripped.startswith("- ")
+            and indent > pending[1]
+            and ":" not in stripped[2:]
+        ):
+            item = stripped[2:].strip().strip("'\"")
+            if item:
+                definitions.setdefault(pending[0], set()).add(item)
+            continue
+        entry = re.match(
+            r"^\s*(?:-\s+)?['\"]?([A-Za-z0-9_.+-]+)['\"]?\s*:\s*(.*)$",
+            text,
+        )
+        if entry is None:
+            pending = None
+            continue
+        name, raw = entry.group(1), entry.group(2).strip()
+        if raw in {"", "|", ">", "|-", ">-", "|+", ">+"}:
+            pending = (name, indent)
+            continue
+        pending = None
+        if raw.startswith("[") and raw.endswith("]"):
+            for item in raw[1:-1].split(","):
+                cleaned = item.strip().strip("'\"")
+                if cleaned:
+                    definitions.setdefault(name, set()).add(cleaned)
+            continue
+        definitions.setdefault(name, set()).add(raw.strip("'\""))
+    return definitions
+
+
+def workflow_scope_definitions(
+    lines: list[str],
+    index: int,
+) -> dict[str, set[str]]:
+    """Return the literal values a step's expressions can resolve to.
+
+    Matrix and environment names are resolved in the enclosing job first so an
+    unrelated job's identically named key cannot widen or narrow the result,
+    with the workflow-level mapping merged in as a fallback.
+    """
+
+    jobs_index = next(
+        (
+            offset
+            for offset, line in enumerate(lines)
+            if decode_simple_yaml_key(line) == (0, "jobs")
+        ),
+        None,
+    )
+    start, end = 0, len(lines)
+    if jobs_index is not None and index > jobs_index:
+        job_starts = [
+            offset
+            for offset in range(jobs_index + 1, len(lines))
+            if (decoded := decode_simple_yaml_key(lines[offset])) is not None
+            and decoded[0] == 2
+        ]
+        enclosing = [offset for offset in job_starts if offset <= index]
+        if enclosing:
+            start = enclosing[-1]
+            after = [offset for offset in job_starts if offset > index]
+            end = min(
+                after[0] if after else len(lines),
+                next(
+                    (
+                        offset
+                        for offset in range(start + 1, len(lines))
+                        if (decoded := decode_simple_yaml_key(lines[offset]))
+                        is not None
+                        and decoded[0] == 0
+                    ),
+                    len(lines),
+                ),
+            )
+    definitions = literal_value_definitions(lines, start, end)
+    if start != 0:
+        outer = literal_value_definitions(
+            lines,
+            0,
+            jobs_index if jobs_index is not None else len(lines),
+        )
+        for name, values in outer.items():
+            definitions.setdefault(name, set()).update(values)
+    return definitions
+
+
+def expression_candidates(
+    body: str,
+    definitions: dict[str, set[str]],
+) -> set[str] | None:
+    """Resolve one `${{ }}` body to its literal values, or None if unknown.
+
+    Only the namespaces a workflow author populates can carry a build target.
+    `secrets.*`, `runner.*`, `github.*`, `steps.*`, and `needs.*` are not
+    workflow-authored value sets, so they resolve to nothing rather than
+    failing closed on every ordinary credential input.
+    """
+
+    body = body.strip()
+    lowered = body.lower()
+    if not any(lowered.startswith(name) for name in RESOLVABLE_EXPRESSION_SCOPES):
+        return set()
+    name = body.split(".")[-1].strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        return None
+    values = definitions.get(name)
+    if values is None:
+        return None
+    if any("${{" in value for value in values):
+        # The definition is itself an unresolved expression.
+        return None
+    return values
+
+
+def expression_reaches_target(
+    text: str,
+    definitions: dict[str, set[str]],
+) -> bool:
+    """Return whether a workflow expression can deliver the protected target.
+
+    `args: build --target ${{ matrix.target }}` hands the action the ARM64
+    target without any physical line containing it, so the expression is
+    resolved against the matrix rather than compared as literal text.
+    """
+
+    expressions = list(WORKFLOW_EXPRESSION.finditer(text))
+    if not expressions:
+        return False
+    unresolved = False
+    for expression in expressions:
+        candidates = expression_candidates(expression.group("body"), definitions)
+        if candidates is None:
+            unresolved = True
+            continue
+        for candidate in candidates:
+            expanded = WORKFLOW_EXPRESSION.sub(
+                "",
+                text[: expression.start()] + candidate + text[expression.end() :],
+            )
+            if (
+                TARGET in expanded
+                or EXPECTED_IMAGE in expanded
+                or STANDALONE_CROSS.search(candidate)
+            ):
+                return True
+    # A reference this workflow never defines cannot be shown to be free of the
+    # protected target, so an input that already declares itself a build-target
+    # argument fails closed rather than being read as benign.
+    return unresolved and bool(
+        TARGET_ARGUMENT_FLAG.search(WORKFLOW_EXPRESSION.sub("", text))
+    )
+
+
 def remote_action_surface_lines(
     contents: str,
     source: str = "",
@@ -3017,6 +3428,10 @@ def remote_action_surface_lines(
     argument reaches the same place through any other action. Such a step is
     therefore a build-execution surface, and a dynamic reference that cannot be
     resolved at all fails closed.
+
+    The whole step mapping is scanned, in any key order, with quoted keys,
+    flow mappings, folded double-quoted scalars, and matrix-derived target
+    expressions all read the way the Actions runner reads them.
     """
 
     surfaces: dict[int, str] = {}
@@ -3047,51 +3462,69 @@ def remote_action_surface_lines(
         artifact_transfer = bool(ARTIFACT_TRANSFER_ACTION.match(value))
 
         key_column = len(match.group("lead")) + len(match.group("dash") or "")
-        for offset in range(index + 1, len(lines)):
+        start, end = step_block_bounds(
+            lines,
+            index,
+            key_column,
+            has_dash=bool(match.group("dash")),
+        )
+        scanned: list[str] = []
+        for offset in range(start, end):
+            if offset == index:
+                # The reference itself was already classified above.
+                continue
             following = lines[offset]
             if not following.strip():
                 continue
-            indent = len(following) - len(following.lstrip(" "))
             stripped = following.lstrip(" ")
-            if indent < key_column or (
-                indent == key_column and stripped.startswith("- ")
-            ):
-                break
             if stripped.startswith("#"):
-                continue
-            if reason is not None:
                 continue
             text = re.sub(r"\s+#.*$", "", following)
             # Every key on the line is considered, so a flow mapping such as
             # `with: {use-cross: true}` is read like a block mapping.
+            keys = step_input_keys(text)
             cross_input = next(
                 (
                     key
-                    for key in re.findall(r"([A-Za-z0-9_.+-]+)\s*:", text)
+                    for key in keys
                     if re.sub(r"[^a-z0-9]", "", key.lower())
                     in CROSS_CAPABLE_ACTION_INPUTS
                 ),
                 None,
             )
             if cross_input is not None:
-                reason = f"input:{cross_input}"
+                if reason is None:
+                    reason = f"input:{cross_input}"
                 continue
-            if artifact_transfer and re.match(
-                r"(?:- )?(?:name|path|pattern)\s*:", stripped
-            ):
+            if artifact_transfer and artifact_only_input_line(keys):
                 # An artifact name or path is not an execution argument. These
                 # two SHA-pinned first-party actions only move files between
                 # jobs, so naming the protected target in an artifact name
                 # cannot start a build. Everything else about them, including a
                 # `cross` executable token and every Cross-enabling input key,
                 # is still a surface.
-                if EXPECTED_IMAGE in text or STANDALONE_CROSS.search(text):
+                if reason is None and (
+                    EXPECTED_IMAGE in text or STANDALONE_CROSS.search(text)
+                ):
                     reason = "input-value"
                 continue
-            if TARGET in text or EXPECTED_IMAGE in text or (
-                STANDALONE_CROSS.search(text)
-            ):
-                reason = "input-value"
+            scanned.append(text)
+        if reason is None and scanned:
+            # A double-quoted YAML scalar continued with a trailing backslash
+            # is delivered to the action as one string with the newline and the
+            # following indentation removed, so the protected target can span
+            # source lines that each look benign on their own.
+            folded = re.sub(r"\\\r?\n[ \t]*", "", "\n".join(scanned))
+            definitions = workflow_scope_definitions(lines, index)
+            for text in (*scanned, *folded.splitlines()):
+                if TARGET in text or EXPECTED_IMAGE in text or (
+                    STANDALONE_CROSS.search(text)
+                ):
+                    reason = "input-value"
+                    break
+                if expression_reaches_target(text, definitions):
+                    reason = "input-expression"
+                    break
         if reason is not None:
             surfaces[index] = f"remote-action:{value}:{reason}"
     return surfaces, errors
@@ -4796,6 +5229,12 @@ def local_automation_references(
 
     Returns the literal script references, the build-dispatcher manifest
     candidate groups (`"Makefile|makefile|GNUmakefile"`), and any failures.
+
+    Only the exact build outputs in `GENERATED_COMMAND_PATHS` are exempt from
+    the scanned automation roots. A generated-looking directory prefix confers
+    no exemption of its own: `tmp/`, `results/`, and the rest are ordinary
+    committable paths, so a pull request could otherwise add `tmp/run.sh` with
+    a Cross invocation and have it neither scanned nor reported.
     """
 
     references: set[str] = set()
@@ -4978,8 +5417,6 @@ def local_automation_references(
                         PurePosixPath(effective_directory) / command_path
                     ).as_posix()
                 if command_path in GENERATED_COMMAND_PATHS:
-                    continue
-                if command_path.startswith(GENERATED_SCRIPT_PREFIXES):
                     continue
                 if command_path.startswith(APPROVED_AUTOMATION_ROOTS):
                     references.add(command_path)
@@ -6923,6 +7360,63 @@ pre_build = []
     ):
         failures.append("unreachable variable-prefixed generated paths remain allowed")
 
+    # A generated-looking directory prefix is not an exemption. None of these
+    # prefixes is ignored by git, so a pull request can commit `tmp/run.sh`
+    # with a Cross invocation; it must be reported as outside the scanned
+    # automation roots rather than skipped unscanned.
+    def generated_prefix_workflow(command_path: str) -> str:
+        return (
+            "name: Generated prefix\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  build:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            f"      - run: bash {command_path}\n"
+        )
+
+    for prefix in GENERATED_SCRIPT_PREFIXES:
+        smuggled = f"{prefix}run.sh"
+        if smuggled in GENERATED_COMMAND_PATHS:
+            failures.append(f"{smuggled} must not be an exact generated command")
+            continue
+        if not any(
+            "outside the scanned automation roots" in error
+            for error in validate_automation_collection(
+                {"ci.yml": generated_prefix_workflow(smuggled)},
+                {},
+                {},
+                "self-test generated prefix",
+            )
+        ):
+            failures.append(
+                f"a committed script under {prefix!r} escaped the automation roots"
+            )
+
+    # The exact build outputs stay exempt, and an approved-root script is still
+    # scanned rather than reported.
+    for exempt_path in GENERATED_COMMAND_PATHS:
+        if "/" not in exempt_path:
+            continue
+        if validate_automation_collection(
+            {"ci.yml": generated_prefix_workflow(exempt_path)},
+            {},
+            {},
+            "self-test generated prefix",
+        ):
+            failures.append(f"exact generated build output {exempt_path!r} was rejected")
+
+    if not any(
+        "references missing automation" in error
+        for error in validate_automation_collection(
+            {"ci.yml": generated_prefix_workflow("scripts/absent.sh")},
+            {},
+            {},
+            "self-test generated prefix",
+        )
+    ):
+        failures.append("an approved-root command was not followed into automation")
+
     quoted_run_workflow = referenced_workflow.replace(
         "run: bash scripts/safe.sh",
         'run: "bash scripts/safe.sh"',
@@ -7910,6 +8404,162 @@ pre_build = []
         if not artifact_surface(carve_uses, carve_key, carve_value):
             failures.append(f"{carve_label} was not protected")
 
+    # A YAML step is one mapping, so the reference, its inputs, and the matrix
+    # that feeds them must be read the way the Actions runner reads them: in any
+    # key order, through quoted and flow spellings, across folded scalars, and
+    # with expressions resolved rather than compared as literal text.
+    def step_surface(step_body: str, extra: str = "") -> dict[int, str]:
+        surfaces, _ = remote_action_surface_lines(
+            "name: Steps\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  build:\n"
+            "    runs-on: ubuntu-latest\n"
+            + extra
+            + "    steps:\n"
+            + step_body,
+            "self-test step workflow",
+        )
+        return surfaces
+
+    remote_action = "actions-rs/cargo@" + ("c" * 40)
+    other_action = "some/other-action@" + ("d" * 40)
+    literal_matrix = (
+        "    strategy:\n"
+        "      matrix:\n"
+        f"        target: [{TARGET}]\n"
+    )
+    benign_matrix = (
+        "    strategy:\n"
+        "      matrix:\n"
+        "        target: [x86_64-unknown-linux-gnu]\n"
+    )
+    dynamic_matrix = "    strategy:\n      matrix: ${{ fromJSON(needs.plan.outputs.m) }}\n"
+
+    hidden_surfaces = {
+        "inputs declared above the reference": (
+            "      - with:\n"
+            "          use-cross: true\n"
+            f"        uses: {remote_action}\n",
+            "",
+        ),
+        "named step with inputs above the reference": (
+            "      - name: Build\n"
+            "        with:\n"
+            f"          args: build --target {TARGET}\n"
+            f"        uses: {other_action}\n",
+            "",
+        ),
+        "single-quoted input key": (
+            f"      - uses: {remote_action}\n"
+            "        with:\n"
+            "          'use-cross': true\n",
+            "",
+        ),
+        "double-quoted input key": (
+            f"      - uses: {remote_action}\n"
+            "        with:\n"
+            '          "use-cross": true\n',
+            "",
+        ),
+        "flow-mapping quoted input key": (
+            f"      - uses: {remote_action}\n"
+            "        with: {'use-cross': true}\n",
+            "",
+        ),
+        "folded double-quoted target": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            '          args: "build --target aarch64-\\\n'
+            '            unknown-linux-gnu"\n',
+            "",
+        ),
+        "matrix-derived target argument": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          args: build --target ${{ matrix.target }}\n",
+            literal_matrix,
+        ),
+        "unresolvable matrix target argument": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          args: build --target ${{ matrix.target }}\n",
+            dynamic_matrix,
+        ),
+        "matrix-derived artifact name on a non-artifact action": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          name: binary-${{ matrix.target }}\n",
+            literal_matrix,
+        ),
+    }
+    for label, (body, extra) in hidden_surfaces.items():
+        if not step_surface(body, extra):
+            failures.append(f"{label} was not protected")
+
+    benign_steps = {
+        "flow-mapping artifact name": (
+            f"      - uses: {artifact_action}\n"
+            "        with: {name: binary-" + TARGET + "}\n",
+            "",
+        ),
+        "flow-mapping artifact name and path": (
+            f"      - uses: {artifact_action}\n"
+            "        with: {name: binary-"
+            + TARGET
+            + ", path: downloaded/binary-"
+            + TARGET
+            + "}\n",
+            "",
+        ),
+        "matrix-derived artifact name on a pinned artifact action": (
+            f"      - uses: {artifact_action}\n"
+            "        with:\n"
+            "          name: binary-${{ matrix.target }}\n",
+            literal_matrix,
+        ),
+        "matrix target that never selects ARM64": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          args: build --target ${{ matrix.target }}\n",
+            benign_matrix,
+        ),
+        "unresolvable matrix without a target argument": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          targets: ${{ matrix.target }}\n",
+            dynamic_matrix,
+        ),
+        "credential inputs": (
+            f"      - uses: {other_action}\n"
+            "        with:\n"
+            "          password: ${{ secrets.GITHUB_TOKEN }}\n"
+            "          username: ${{ github.actor }}\n",
+            "",
+        ),
+    }
+    for label, (body, extra) in benign_steps.items():
+        if step_surface(body, extra):
+            failures.append(f"{label} was rejected")
+
+    # A flow mapping that also carries a non-artifact key is not covered by the
+    # closed artifact carve-out.
+    if not step_surface(
+        f"      - uses: {artifact_action}\n"
+        "        with: {name: binary-" + TARGET + ", args: --target " + TARGET + "}\n"
+    ):
+        failures.append("flow-mapping artifact carve-out leaked a build argument")
+
+    # The step above a remote action belongs to that step, not to this one.
+    if step_surface(
+        "      - name: Unrelated\n"
+        f"        run: echo {TARGET}\n"
+        f"      - uses: {other_action}\n"
+        "        with:\n"
+        "          context: .\n"
+    ):
+        failures.append("a preceding step's contents leaked into the next step")
+
     # A `shell: pwsh` body is PowerShell, not POSIX shell.
     powershell_workflow = (
         "name: PowerShell\n"
@@ -8461,6 +9111,7 @@ pre_build = []
         failures.append("opaque shell stdin program edit was not rejected")
 
     ci_publish_contract = PUBLISH_CONTROL_CONTRACTS["CI workflow"]
+    ci_publish_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["CI workflow"]["docker"]
     publish_workflow = (
         "name: Publish fixture\n"
         "on: [push]\n"
@@ -8475,11 +9126,77 @@ pre_build = []
         + ci_publish_contract["docker"]["needs"]
         + ci_publish_contract["docker"]["if"]
         + "    runs-on: ubuntu-latest\n"
+        + ci_publish_contract["docker"]["strategy"]
         + "    steps:\n"
+        + ci_publish_steps["Download Linux binary"]
+        + "\n"
+        + ci_publish_steps["Prepare Docker context"]
+        + "\n"
         + "      - run: echo docker\n"
     )
     if validate_publish_control_contract(publish_workflow, "CI workflow"):
         failures.append("valid ARM64 publication dependency controls were rejected")
+
+    # The Docker jobs never name the ARM64 artifact literally, so repointing the
+    # `linux/arm64` matrix row or rewriting either consuming step would publish
+    # an ARM64 image built from the x86_64 binary.
+    artifact_selection_edits = {
+        "arm64 matrix row repointed at the x86_64 artifact": (
+            "            binary_target: aarch64-unknown-linux-gnu\n"
+            "            binary_asset: ferrum-edge-linux-aarch64\n",
+            "            binary_target: x86_64-unknown-linux-gnu\n"
+            "            binary_asset: ferrum-edge-linux-x86_64\n",
+        ),
+        "arm64 platform row bound to the x86_64 target": (
+            "          - platform: linux/arm64\n"
+            "            binary_target: aarch64-unknown-linux-gnu\n",
+            "          - platform: linux/arm64\n"
+            "            binary_target: x86_64-unknown-linux-gnu\n",
+        ),
+        "download step renamed to a fixed artifact": (
+            "          name: binary-${{ matrix.binary_target }}\n",
+            "          name: binary-x86_64-unknown-linux-gnu\n",
+        ),
+        "context step copies a fixed asset": (
+            "cp downloaded-artifacts/${{ matrix.binary_asset }} ",
+            "cp downloaded-artifacts/ferrum-edge-linux-x86_64 ",
+        ),
+    }
+    for label, (original, replacement) in artifact_selection_edits.items():
+        tampered = publish_workflow.replace(original, replacement, 1)
+        if tampered == publish_workflow:
+            failures.append(f"{label} fixture did not change the workflow")
+            continue
+        if not validate_publish_control_contract(tampered, "CI workflow"):
+            failures.append(f"{label} was not rejected")
+        if not compare_pr_publish_control_contract(
+            publish_workflow,
+            tampered,
+            "CI workflow",
+        ):
+            failures.append(f"{label} was allowed by the merge-base comparison")
+
+    duplicate_publish_step = publish_workflow.replace(
+        ci_publish_steps["Prepare Docker context"],
+        ci_publish_steps["Prepare Docker context"]
+        + "\n"
+        + ci_publish_steps["Prepare Docker context"],
+        1,
+    )
+    if not validate_publish_control_contract(duplicate_publish_step, "CI workflow"):
+        failures.append("duplicate artifact-selection step was not rejected")
+
+    release_publish_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["release workflow"][
+        "docker"
+    ]
+    if (
+        release_publish_steps["Download Linux binary"]
+        == ci_publish_steps["Download Linux binary"]
+    ):
+        failures.append(
+            "release and CI artifact-selection contracts must name distinct "
+            "artifacts"
+        )
 
     benign_publish_edit = publish_workflow.replace("echo latest", "echo updated")
     if compare_pr_publish_control_contract(

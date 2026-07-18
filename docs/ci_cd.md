@@ -469,12 +469,30 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   normalization, in block or flow mappings), or whose input values carry the
   protected ARM64 target, the pinned Cross image, or the `cross` executable is a
   build-execution surface; a dynamic `uses:` reference fails closed. Benign
-  pinned actions with unrelated inputs stay editable. One narrow exception
+  pinned actions with unrelated inputs stay editable. The step is read as the
+  single YAML mapping it is, so key order does not matter: a `with:` block
+  written **above** the `uses:` line is scanned exactly like one written below
+  it. Input keys are matched in their quoted spellings (`'use-cross'`,
+  `"use-cross"`) as well as unquoted, and a double-quoted scalar continued with
+  a trailing backslash is folded the way the runner folds it, so a target split
+  across two source lines is still detected. Input values are resolved rather
+  than compared as literal text: an expression such as
+  `args: build --target ${{ matrix.target }}` is expanded against the enclosing
+  job's matrix, `env`, and `inputs` definitions, and any expansion reaching the
+  protected target is a surface. A reference in one of those author-populated
+  scopes that the workflow never defines cannot be shown to be target-free, so
+  it fails closed whenever the same input already declares a `--target`
+  argument. `secrets.*`, `github.*`, `runner.*`, `steps.*`, and `needs.*` are
+  not author-populated value sets and resolve to nothing, so ordinary
+  credential and context inputs stay editable. One narrow exception
   exists so release downloads can be isolated to exact artifact names, which
   necessarily name the protected target: for `actions/upload-artifact` and
   `actions/download-artifact` **pinned to a full commit SHA**, the target
   string in an artifact `name`/`path`/`pattern` input is not a surface, because
-  those two actions only move files between jobs and cannot start a build. The
+  those two actions only move files between jobs and cannot start a build. That
+  carve-out accepts the block and flow spellings of the same YAML
+  (`with: {name: ...}`) equally, and applies only when every key on the line is
+  one of those closed artifact inputs. The
   Cross image, a `cross` executable token, every Cross-enabling input key, any
   other input key, an unpinned reference, and any other action are all still
   surfaces; self-test fixtures assert each of those boundaries.
@@ -485,8 +503,14 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   real `FROM` instruction, so ordinary Python beginning with `from` remains
   Python. Baseline and proposed automation diagnostics are aggregated before
   surface comparison, ensuring a malformed baseline cannot suppress proposed
-  findings. Generated-artifact exemptions are limited to literal repository
-  paths; variable-prefixed pseudo-paths are not allowlisted.
+  findings. Generated-artifact exemptions are limited to an exact allowlist of
+  literal build outputs; variable-prefixed pseudo-paths are not allowlisted,
+  and a generated-looking *directory prefix* confers no exemption of its own.
+  None of `target/`, `results/`, `coverage-report/`, `benchmark-results/`,
+  `comparison-results/`, or `tmp/` is ignored by git, so a pull request can
+  commit a script under any of them; such a script is ordinary repository code
+  and is reported as outside the scanned automation roots unless it is one of
+  the exact allowlisted build outputs.
   Repo-controlled build dispatchers are followed rather than trusted: a step
   running `make`, `npm`/`pnpm`/`yarn`, `just`, or `task` resolves to the
   matching root or `-C`-relocated `Makefile`, `package.json` `scripts`,
@@ -510,6 +534,16 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   the CI publishers' success conditions are protected too. Only those direct
   publication-control fields are frozen, so unrelated implementation changes
   inside the publishing jobs remain permitted.
+- The Docker jobs never name the ARM64 artifact literally; they select it
+  through matrix values. Their `strategy` block and the two steps that consume
+  it — `Download Linux binary` (`name: binary-${{ matrix.binary_target }}` /
+  `release-binaries-${{ matrix.binary_target }}`) and `Prepare Docker context`
+  (which copies `${{ matrix.binary_asset }}` and `${{ matrix.cni_asset }}` into
+  `${{ matrix.arch_dir }}`) — are therefore frozen as one artifact-selection
+  contract in both workflows. Without it a pull request could repoint the
+  `linux/arm64` row at the x86_64 artifact and publish an ARM64 image
+  containing the wrong binary while the protected ARM64 build still succeeded.
+  The rest of each Docker job stays editable.
 - `latest-release` and `create-release` download the five build artifacts by
   exact name instead of by a `binary-*`/`release-binaries-*` wildcard, so an
   unrelated job cannot contribute a colliding upload to a published release.
