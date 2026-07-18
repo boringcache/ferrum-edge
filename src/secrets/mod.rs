@@ -445,12 +445,13 @@ fn redaction_plan() -> Option<&'static RedactionPlan> {
 /// 7. the JSON-escaped body of each of the above, because the tracing fmt
 ///    layer escapes the record before [`redact_log_record`] sees it.
 ///
-/// Bounded at `(2 + MAX_LIST_SEGMENTS + MAX_REFERENCE_FORMS + MAX_SCALAR_FORMS)
-/// * 3 * 2` forms per value — a fixed ceiling, not a function of message size —
-/// so no configuration can turn candidate discovery into an amplification
-/// vector. Each derivation below is a single deterministic rewrite of the value
-/// itself, never a rewrite of another derived form, so the expansion stays
-/// additive rather than combinatorial.
+/// Bounded at
+/// `(2 + MAX_LIST_SEGMENTS + MAX_REFERENCE_FORMS + MAX_SCALAR_FORMS) * 3 * 2`
+/// forms per value — a fixed ceiling, not a function of message size — so no
+/// configuration can turn candidate discovery into an amplification vector.
+/// Each derivation below is a single deterministic rewrite of the value itself,
+/// never a rewrite of another derived form, so the expansion stays additive
+/// rather than combinatorial.
 ///
 /// **Residual, deliberate:** a value with more than `MAX_LIST_SEGMENTS`
 /// comma-separated segments contributes no per-segment candidates. Such a value
