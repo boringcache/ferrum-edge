@@ -399,7 +399,17 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   and `<(...)`/`>(...)` substitutions, single-line `case` arms, wrapper
   end-of-options markers (`sudo -- cross`), absolute or home-relative tool
   paths (`/usr/bin/cargo cross`, `~/.cargo/bin/cross`), and Bash aliases bound
-  to Cross under `expand_aliases` all resolve to the Cross command word. Python
+  to Cross under `expand_aliases` all resolve to the Cross command word. Because
+  an unquoted expansion is word-split before dispatch, each expansion is also
+  read as a word separator, so `cross${IFS}build` and
+  `cargo${IFS}+stable${IFS}cross build` resolve exactly like literal
+  whitespace at the executable, toolchain-selector, and subcommand boundaries.
+  Binding Cross to another executable name is itself a Cross surface: linking,
+  copying, moving, or installing the Cross binary under a new name, and writing
+  a wrapper script whose body runs Cross, are all detected, and every later
+  command-start dispatch through that name — including PATH-prepended,
+  `./bin/`-relative, and assignment-prefixed forms — is expanded back to the
+  Cross command word. A dynamic shim name fails closed. Python
   helpers are analyzed through local process-API aliases (`run =
   subprocess.run`) and shell-wrapper argv (`subprocess.run(['sh', '-c', ...])`).
   Workflow `run` bodies are dispatched through their effective step, job, or
@@ -407,6 +417,24 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   receive the same AST analysis, while dynamic or unsupported shells fail
   closed. Shell, Python, Perl, PHP, R, JavaScript/TypeScript, PowerShell, awk,
   and BusyBox script launchers are recognized when resolving repository paths.
+  Inline interpreter source is dispatched the same way: a `run:` step that
+  hands a program to Python (`-c`), PowerShell (`-Command`, any unambiguous
+  prefix), Node, Deno, Bun, Perl, Ruby, PHP, Lua, R, Julia, Elixir, Groovy,
+  Scala, osascript, awk, or Tcl has that program inspected rather than skipped,
+  so `perl -e 'system("cross build ...")'` and `node -e ...` are rejected.
+  Python inline source gets the same AST analysis as a Python shell; other
+  languages have their string literals read as command text and any other
+  process dispatch inside inline source treated as an unresolvable executable.
+  Shell-assembled inline source (`perl -e "$PROGRAM"`) and a PowerShell
+  `-EncodedCommand` fail closed, while a field reference such as awk's `$1` or
+  a Perl `$name` sigil stays readable so ordinary one-liners are not frozen.
+  A remote (non-`./`) `uses:` step is code this repository does not own, so a
+  step whose action reference names Cross, whose inputs include a Cross-enabling
+  key (`use-cross`, `cross-version`, and equivalents under case and separator
+  normalization, in block or flow mappings), or whose input values carry the
+  protected ARM64 target, the pinned Cross image, or the `cross` executable is a
+  build-execution surface; a dynamic `uses:` reference fails closed. Benign
+  pinned actions with unrelated inputs stay editable.
   Heredoc parsing is quote-aware and rejects unterminated bodies. Repository
   working-directory state changes only after each `cd` execution point and is
   rejected when conditional or loop control flow makes it ambiguous. Dockerfile
@@ -440,21 +468,31 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   inherited `CARGO_*` passthrough values before Cross reads configuration.
 
 The trusted `pull_request_target` job checks out only the base SHA with
-read-only contents permission. It fetches the PR head without checking it out,
+read-only contents permission, and verifies that the checkout is exactly the
+triggering base SHA because it is the only code the job executes. Because
+`main` can advance after the event is created, the job then fetches the live
+base branch tip into a fixed local ref, requires it to descend from the
+triggering base SHA, and pins it to one immutable commit SHA that every
+baseline extraction and comparison reads; a live tip that does not descend from
+the triggering base is a rewritten or confused ref and fails closed. It fetches
+the PR head without checking it out,
 requires the fetched object to equal the immutable head SHA from the triggering
 event, then extracts `Cross.toml`, `Cargo.toml`, `.cargo/config.toml`, the
-complete proposed and current-base workflow and repo-local action directories,
+complete proposed and live-base workflow and repo-local action directories,
 and the approved automation roots plus the root build-dispatcher manifests as
 hostile data, and runs only the base branch's verifier. Each NUL-delimited
 `git ls-tree` result is materialized and its status checked before consumption;
 regular blobs may use letters, digits, `.`, `_`, `+`, `@`, `~`, spaces, and
 `-`, while dot-dot components, symlinks, gitlinks, and NULs fail closed. A
 proposed legacy `.cargo/config` is surfaced and rejected. Proposed executable
-and configuration surfaces are compared with current base `HEAD`, preventing a
-stale branch from restoring a surface removed from main. The verifier and
-trusted workflow themselves are compared with `HEAD...FETCH_HEAD`, preserving
-merge-base behavior only for the question of whether the PR authored a
-protected-file modification, mode change, rename, or deletion. On pull
+and configuration surfaces are compared with the live trusted base tip,
+preventing both a stale branch and a stale event base from restoring a surface
+removed from main. The verifier and trusted workflow themselves are compared
+with `<live base>...<PR head>`, preserving merge-base behavior only for the
+question of whether the PR authored a protected-file modification, mode change,
+rename, or deletion. The verifier enforces this shape on the trusted workflow
+itself, rejecting a baseline read from the stale event-base checkout as well as
+an unfetched, unpinned, or unauthenticated live base. On pull
 requests, the ordinary `CI Plan` executes the base branch's
 trusted verifier when it exists and never imports or runs the proposed script.
 For this one bootstrap PR, where no base verifier or base-loaded trusted

@@ -389,6 +389,83 @@ SHELL_ALIAS_DEFINITION = re.compile(
     re.MULTILINE,
 )
 MAXIMUM_TRACKED_ALIASES = 64
+# `cross${IFS}build` and `cargo${IFS}+stable${IFS}cross` reach exactly the same
+# executable and subcommand words as literal whitespace, because the shell
+# splits the expanded word before it dispatches the command. Every expansion is
+# therefore also evaluated as if it expanded to a word separator, which covers
+# `$IFS`, `${IFS}`, `${IFS:0:1}`, a command substitution, and any other
+# expansion placed at an executable or Cross-subcommand boundary.
+WORD_SPLIT_EXPANSION = re.compile(
+    r"\$\{[^{}\n]*\}|\$\([^()\n]*\)|`[^`\n]*`|"
+    r"\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]"
+)
+MAXIMUM_WORD_SPLIT_EXPANSIONS = 16
+# An inline program handed to a non-shell interpreter dispatches commands the
+# shell scanner never sees, such as `perl -e 'system("cross build ...")'` or
+# `node -e ...`. Each interpreter is mapped to the options whose operand is
+# program source. Python source is parsed by the existing AST reader; every
+# other language's inline source is treated as opaque command text.
+PYTHON_INLINE_SOURCE_OPTIONS = ("-c",)
+INLINE_SOURCE_OPTIONS = {
+    "awk": (),
+    "bun": ("-e", "--eval"),
+    "elixir": ("-e", "--eval"),
+    "erl": ("-eval",),
+    "gawk": (),
+    "groovy": ("-e",),
+    "julia": ("-e", "--eval"),
+    "lua": ("-e",),
+    "luajit": ("-e",),
+    "mawk": (),
+    "node": ("-e", "--eval", "-p", "--print"),
+    "nodejs": ("-e", "--eval", "-p", "--print"),
+    "osascript": ("-e",),
+    "perl": ("-e", "-E"),
+    "php": ("-r",),
+    "R": ("-e",),
+    "Rscript": ("-e",),
+    "ruby": ("-e",),
+    "scala": ("-e",),
+    "tclsh": (),
+}
+# `deno eval '<source>'` takes the program as a subcommand operand rather than
+# as the operand of an option.
+INLINE_SOURCE_SUBCOMMANDS = {"deno": ("eval",)}
+# awk-family and Tcl interpreters take the program as their first non-option
+# operand unless a `-f` script file supplies it instead.
+INLINE_OPERAND_INTERPRETERS = frozenset({"awk", "gawk", "mawk", "tclsh"})
+FOREIGN_STRING_LITERAL = re.compile(
+    r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|`((?:[^`\\]|\\.)*)`"
+)
+# Linking, copying, or moving the Cross binary under another name produces an
+# executable that dispatches Cross without the literal token ever occupying an
+# executable slot (`ln -s ~/.cargo/bin/cross bin/cr && cr build ...`). `cross`
+# must be the final path component so `docs/cross.md` and `cross-notes.txt`
+# remain ordinary data.
+CROSS_ALIAS_COMMANDS = frozenset({"cp", "install", "link", "ln", "mv", "rsync"})
+CROSS_PATH_COMPONENT = re.compile(r"(?<![A-Za-z0-9_.-])cross(?![A-Za-z0-9_.-])")
+MAXIMUM_TRACKED_SHIMS = 64
+MAXIMUM_INLINE_PROGRAM_DEPTH = 4
+_inline_program_depth = 0
+# A remote `uses:` step runs code this repository does not own, so any remote
+# action able to reach Cross is an unreviewable build-execution surface.
+# `actions-rs/cargo` with `use-cross: true` documents that it runs the `cross`
+# executable in place of `cargo`.
+CROSS_CAPABLE_ACTION_INPUTS = frozenset(
+    {
+        "cross",
+        "crossargs",
+        "crossbuild",
+        "crossimage",
+        "crosstool",
+        "crossversion",
+        "usecross",
+        "usecrossbuild",
+    }
+)
+REMOTE_ACTION_FIELD = re.compile(
+    r"^(?P<lead> *)(?P<dash>-\s+)?(?:uses|'uses'|\"uses\")\s*:\s*(?P<value>.*)$"
+)
 # A repo-controlled dispatcher runs recipes from a manifest the workflow never
 # names, so `run: make arm64` can reach Cross with no Cross token in the
 # workflow. Each dispatcher is mapped to the manifests it can execute; the
@@ -1051,6 +1128,38 @@ def dynamic_shell_word(value: str) -> bool:
     )
 
 
+def word_splitting_variants(value: str) -> tuple[str, ...]:
+    """Expose the words a shell builds when an expansion splits a command word.
+
+    An unquoted expansion is subject to word splitting, so `cross${IFS}build`
+    dispatches `cross` with a `build` operand even though the source contains
+    no whitespace between them. Each expansion is therefore also read as a word
+    separator, one at a time and then all together, which covers a split at the
+    executable boundary, at the Cargo toolchain selector, and at the Cross
+    subcommand boundary alike.
+    """
+
+    if "cross" not in value and "cargo" not in value:
+        # Word splitting only matters here when it can assemble a Cross
+        # executable or subcommand out of literal text that is already present.
+        return ()
+    spans = [match.span() for match in WORD_SPLIT_EXPANSION.finditer(value)]
+    if not spans or len(spans) > MAXIMUM_WORD_SPLIT_EXPANSIONS:
+        return ()
+    variants = [value[:start] + " " + value[end:] for start, end in spans]
+    if len(spans) > 1:
+        parts: list[str] = []
+        cursor = 0
+        for start, end in spans:
+            parts.extend((value[cursor:start], " "))
+            cursor = end
+        parts.append(value[cursor:])
+        variants.append("".join(parts))
+    return tuple(
+        dict.fromkeys(variant for variant in variants if variant != value)
+    )
+
+
 def redirection_token(value: str) -> bool:
     return bool(value) and ("<" in value or ">" in value) and not set(value) - set(
         "<>&"
@@ -1471,6 +1580,253 @@ def shell_invocation_mode(
     return None, False, True
 
 
+def interpolated_inline_source(value: str) -> bool:
+    """Return whether inline program source is assembled by the shell.
+
+    Only the expansions a shell performs make the program unknown. A `$1`
+    field reference in an awk program or a `$name` sigil in Perl or PHP source
+    survives single quoting untouched, so requiring a substitution, a braced
+    parameter, or a conventional shell variable name keeps ordinary inline
+    programs readable instead of freezing them.
+    """
+
+    return bool(
+        re.search(r"\$\{|\$\(|`|\$[A-Z][A-Z0-9_]*(?![a-z])", value)
+    )
+
+
+def powershell_inline_program(
+    tokens: tuple[str, ...],
+    index: int,
+) -> tuple[str | None, bool]:
+    """Return a literal PowerShell inline program, or whether it is opaque.
+
+    PowerShell accepts any unambiguous prefix of an option name, so `-c`,
+    `-Comm`, and `-Command` all introduce inline source. An encoded command
+    carries base64 source this scanner cannot read and therefore fails closed.
+    """
+
+    arguments = tokens[index + 1 :]
+    position = 0
+    while position < len(arguments):
+        argument = arguments[position]
+        if not argument.startswith(("-", "/")):
+            break
+        option = argument.lstrip("-/").split(":", maxsplit=1)[0].lower()
+        if option and "encodedcommand".startswith(option):
+            return None, True
+        if option and "command".startswith(option):
+            if position + 1 >= len(arguments):
+                return None, True
+            program = arguments[position + 1]
+            return (
+                (None, True)
+                if interpolated_inline_source(program)
+                else (program, False)
+            )
+        if option and "file".startswith(option):
+            # A `-File` operand is a repository script resolved elsewhere.
+            return None, False
+        position += 1
+    return None, False
+
+
+def inline_interpreter_programs(
+    tokens: tuple[str, ...],
+    index: int,
+) -> tuple[tuple[tuple[str, str], ...], bool] | None:
+    """Return the inline programs an interpreter executes, plus its opacity.
+
+    Returns `None` when the command word is not a known inline-source
+    interpreter, so ordinary commands keep their current handling. Otherwise
+    every resolved `(language, source)` pair is returned together with a flag
+    that is set when an inline-source operand is missing, dynamic, or in a form
+    this scanner cannot resolve, which must fail closed.
+    """
+
+    executable = tool_name(tokens[index])
+    if PYTHON_INTERPRETER.fullmatch(executable):
+        options: tuple[str, ...] = PYTHON_INLINE_SOURCE_OPTIONS
+        language = "python"
+    elif executable in INLINE_SOURCE_OPTIONS or executable in (
+        INLINE_SOURCE_SUBCOMMANDS
+    ):
+        options = INLINE_SOURCE_OPTIONS.get(executable, ())
+        language = "foreign"
+    else:
+        return None
+
+    arguments = list(tokens[index + 1 :])
+    for terminator in ("|", "||", "&&", ";", ";;", "&", ")", "}"):
+        if terminator in arguments:
+            arguments = arguments[: arguments.index(terminator)]
+
+    programs: list[tuple[str, str]] = []
+    opaque = False
+
+    def record(source: str, *, may_be_generated: bool = True) -> None:
+        nonlocal opaque
+        if may_be_generated and interpolated_inline_source(source):
+            # A shell-generated inline program is an unknown executable surface.
+            opaque = True
+        else:
+            programs.append((language, source))
+
+    subcommands = INLINE_SOURCE_SUBCOMMANDS.get(executable, ())
+    position = 0
+    if subcommands:
+        while position < len(arguments) and arguments[position].startswith("-"):
+            position += 1
+        if position < len(arguments) and arguments[position] in subcommands:
+            position += 1
+            while position < len(arguments) and arguments[position].startswith("-"):
+                position += 1
+            if position >= len(arguments):
+                return (), True
+            record(arguments[position])
+            return tuple(programs), opaque
+
+    if executable in INLINE_OPERAND_INTERPRETERS:
+        if any(argument in {"-f", "--file", "--source"} for argument in arguments):
+            # A `-f` script file is a repository path resolved elsewhere.
+            return (), False
+        operand = next(
+            (
+                argument
+                for argument in arguments
+                if not argument.startswith("-")
+                and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argument, re.DOTALL)
+            ),
+            None,
+        )
+        if operand is not None:
+            # `$1` and `$NF` in an awk program are field references the shell
+            # never expands, so an operand program is always read literally.
+            record(operand, may_be_generated=False)
+        return tuple(programs), opaque
+
+    while position < len(arguments):
+        argument = arguments[position]
+        if argument in options:
+            if position + 1 >= len(arguments):
+                opaque = True
+                break
+            record(arguments[position + 1])
+            position += 2
+            continue
+        joined = next(
+            (
+                option
+                for option in options
+                if option.startswith("--") and argument.startswith(f"{option}=")
+            ),
+            None,
+        )
+        if joined is not None:
+            record(argument[len(joined) + 1 :])
+            position += 1
+            continue
+        if not argument.startswith("--") and argument.startswith("-") and any(
+            option.startswith("-")
+            and not option.startswith("--")
+            and option[1:] in argument[1:]
+            for option in options
+        ):
+            # A bundled short-option cluster such as `perl -we` still ends with
+            # the inline-source flag, so the next word is program source.
+            if position + 1 >= len(arguments):
+                opaque = True
+                break
+            record(arguments[position + 1])
+            position += 2
+            continue
+        position += 1
+    return tuple(programs), opaque
+
+
+def foreign_inline_program_has_cross(
+    source: str,
+    *,
+    include_opaque_shell_executable: bool,
+) -> bool:
+    """Inspect an inline non-Python program for the Cross commands it can run.
+
+    The program's own language is not parsed. Instead every string literal it
+    contains is read as command text, which resolves the ordinary
+    `system("cross build ...")` shape, and any other process dispatch inside an
+    inline program is treated as an unresolvable executable surface.
+    """
+
+    candidates = [source]
+    for match in FOREIGN_STRING_LITERAL.finditer(source):
+        literal = next(group for group in match.groups() if group is not None)
+        candidates.append(literal)
+        unescaped = re.sub(r"\\(.)", r"\1", literal)
+        if unescaped != literal:
+            candidates.append(unescaped)
+    for candidate in candidates:
+        if literal_command_text_has_cross(candidate) or (
+            WRAPPED_LITERAL_CROSS.search(candidate)
+        ):
+            return True
+    return include_opaque_shell_executable and bool(
+        NON_PYTHON_PROCESS_DISPATCH.search(source)
+    )
+
+
+def inline_interpreter_has_cross(
+    programs: tuple[tuple[str, str], ...],
+    *,
+    include_opaque_shell_executable: bool,
+) -> bool:
+    """Route each inline program through the reader that matches its language."""
+
+    global _inline_program_depth
+
+    if not programs:
+        return False
+    if _inline_program_depth >= MAXIMUM_INLINE_PROGRAM_DEPTH:
+        # Inline programs may nest interpreters without bound, so a program
+        # nested past this depth is an unresolvable executable surface.
+        return include_opaque_shell_executable
+    _inline_program_depth += 1
+    try:
+        for language, source in programs:
+            if language == "python":
+                commands, failures = python_command_scripts(
+                    source,
+                    "inline python program",
+                    reject_dynamic_commands=True,
+                )
+                if any(
+                    literal_command_text_has_cross(command) for command in commands
+                ):
+                    return True
+                # Inline Python one-liners that shell scripts already use to
+                # reshape JSON dispatch no processes at all, so an unresolvable
+                # command only fails closed once the program itself mentions
+                # Cross or the protected ARM64 target.
+                if (
+                    failures
+                    and include_opaque_shell_executable
+                    and (
+                        STANDALONE_CROSS.search(source)
+                        or TARGET in source
+                        or CROSS_ENVIRONMENT.search(source)
+                    )
+                ):
+                    return True
+                continue
+            if foreign_inline_program_has_cross(
+                source,
+                include_opaque_shell_executable=include_opaque_shell_executable,
+            ):
+                return True
+    finally:
+        _inline_program_depth -= 1
+    return False
+
+
 def token_command_has_cross(
     tokens: tuple[str, ...],
     *,
@@ -1517,6 +1873,16 @@ def token_command_has_cross(
             include_opaque_shell_executable=include_opaque_shell_executable,
             depth=depth + 1,
         )
+    if command.lower() in {"powershell", "pwsh"}:
+        program, opaque = powershell_inline_program(tokens, index)
+        if opaque:
+            return include_opaque_shell_executable
+        if program is not None:
+            return shell_program_has_cross(
+                program,
+                include_opaque_shell_executable=include_opaque_shell_executable,
+                depth=depth + 1,
+            )
     if command in SHELL_INTERPRETER_NAMES:
         program, opaque, _ = shell_invocation_mode(tokens, index)
         if opaque:
@@ -1529,6 +1895,16 @@ def token_command_has_cross(
                 include_opaque_shell_executable=include_opaque_shell_executable,
                 depth=depth + 1,
             )
+        return False
+    inline = inline_interpreter_programs(tokens, index)
+    if inline is not None:
+        programs, opaque = inline
+        if opaque:
+            return include_opaque_shell_executable
+        return inline_interpreter_has_cross(
+            programs,
+            include_opaque_shell_executable=include_opaque_shell_executable,
+        )
     return False
 
 
@@ -1537,8 +1913,21 @@ def shell_program_has_cross(
     *,
     include_opaque_shell_executable: bool = False,
     depth: int = 0,
+    expand_word_splits: bool = True,
 ) -> bool:
     """Inspect literal shell command positions and nested stdin programs."""
+
+    if expand_word_splits:
+        # An expansion inside a command word splits into several words before
+        # dispatch, so `cross${IFS}build` is read as `cross build` here too.
+        for split_variant in word_splitting_variants(value):
+            if shell_program_has_cross(
+                split_variant,
+                include_opaque_shell_executable=include_opaque_shell_executable,
+                depth=depth,
+                expand_word_splits=False,
+            ):
+                return True
 
     tokens = shell_tokens(value)
     if tokens is None:
@@ -1871,6 +2260,7 @@ def scan_variants(
     if include_opaque_shell_executable:
         variants.extend(opaque_shell_interpolation_variants(line))
     variants.extend(ansi_c_quoted_variants(line))
+    variants.extend(word_splitting_variants(line))
     collapsed = re.sub(r"[\\'\"]", "", line)
     if collapsed != line:
         variants.append(collapsed)
@@ -1946,10 +2336,189 @@ def shell_alias_variants(contents: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(variants))
 
 
-def logical_scan_lines(contents: str) -> tuple[str, ...]:
-    """Return every command line to scan, including Bash alias expansions."""
+def literal_command_text_has_cross(
+    text: str,
+    *,
+    executable_only: bool = False,
+) -> bool:
+    """Scan literal command text without re-entering alias/shim expansion.
 
-    return (*contents.splitlines(), *shell_alias_variants(contents))
+    Alias and shim expansion is derived from command text, so the readers that
+    are themselves used to derive it must scan through this narrower entry
+    point instead of `contains_literal_executable_cross`. With
+    `executable_only`, a Cross environment token alone is not enough: binding a
+    new name to Cross requires the Cross executable itself.
+    """
+
+    logical_text = re.sub(r"\\\r?\n[ \t]*", "", text)
+    return any(
+        has_cross_command_context(variant)
+        or (not executable_only and CROSS_ENVIRONMENT.search(variant))
+        for line in logical_text.splitlines()
+        for variant in scan_variants(line)
+    )
+
+
+def shell_statement_segments(tokens: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    """Split a token stream into the individual commands a shell dispatches."""
+
+    statements: list[tuple[str, ...]] = []
+    current: list[str] = []
+    depth = 0
+    for token in tokens:
+        if token == "(":
+            depth += 1
+        elif token == ")" and depth:
+            depth -= 1
+        if token in {";", ";;", "&&", "||", "&"} and depth == 0:
+            if current:
+                statements.append(tuple(current))
+            current = []
+        else:
+            current.append(token)
+    if current:
+        statements.append(tuple(current))
+    return tuple(
+        segment
+        for statement in statements
+        for segment in split_shell_pipeline(statement)
+    )
+
+
+def cross_shim_names(contents: str) -> tuple[tuple[str, ...], bool]:
+    """Return executable names bound to Cross, and whether a binding is opaque.
+
+    Linking, copying, or moving the Cross binary to another name, or writing a
+    wrapper script whose body runs Cross, produces an executable that
+    dispatches Cross through a word that is never literally `cross`. Both forms
+    are collected here so the later dispatch is recognized as well.
+    """
+
+    shims: dict[str, None] = {}
+    opaque = False
+
+    def register(destination: str) -> None:
+        nonlocal opaque
+        if dynamic_shell_word(destination):
+            # A generated shim name still binds Cross to a new executable.
+            opaque = True
+            return
+        if destination.endswith("/"):
+            # A trailing slash keeps the source name, so no alias is created.
+            return
+        name = tool_name(destination)
+        if not name or name == "cross" or name in {"bin", "sbin", "usr", "local"}:
+            return
+        if not re.fullmatch(r"[A-Za-z0-9_.+-]+", name):
+            opaque = True
+            return
+        if len(shims) >= MAXIMUM_TRACKED_SHIMS:
+            opaque = True
+            return
+        shims[name] = None
+
+    for line in contents.splitlines():
+        if "cross" not in line.lower():
+            # Every binding of the Cross executable names it, so lines without
+            # the token cannot create a shim and need no tokenization.
+            continue
+        tokens = shell_tokens(strip_shell_comment(line))
+        if tokens is None:
+            continue
+        # An inline YAML `- run:` scalar puts the list marker and the key in
+        # front of the command, exactly as the lexical scanners already allow.
+        while tokens and tokens[0] in {"-", "run:", "shell:"}:
+            tokens = tokens[1:]
+        for segment in shell_statement_segments(tokens):
+            index, executes = executable_index(segment)
+            if not executes or index >= len(segment):
+                continue
+            arguments = segment[index + 1 :]
+
+            if tool_name(segment[index]) in CROSS_ALIAS_COMMANDS:
+                operands = [
+                    token
+                    for token in arguments
+                    if not token.startswith("-") and not redirection_token(token)
+                ]
+                # The final operand is the destination; every earlier operand
+                # is a source, which keeps `install -m 0755 <cross> bin/cx`
+                # and multi-source copies on the same footing as `ln src dst`.
+                if len(operands) >= 2 and any(
+                    CROSS_PATH_COMPONENT.search(operand)
+                    for operand in operands[:-1]
+                ):
+                    register(operands[-1])
+
+            # `printf '#!/bin/sh\nexec cross "$@"\n' > bin/cr` writes a wrapper
+            # whose body is command text even though the redirection target is
+            # only ever created, never executed, on this line.
+            target: str | None = None
+            for position, token in enumerate(segment):
+                if (
+                    redirection_token(token)
+                    and ">" in token
+                    and position + 1 < len(segment)
+                ):
+                    target = segment[position + 1]
+            if target is None:
+                continue
+            body = " ".join(
+                decode_ansi_c_body(token)
+                for position, token in enumerate(segment)
+                if not redirection_token(token)
+                and (position == 0 or not redirection_token(segment[position - 1]))
+            )
+            if any(
+                literal_command_text_has_cross(body_line, executable_only=True)
+                for body_line in body.split("\n")
+            ):
+                register(target)
+
+    return tuple(shims), opaque
+
+
+def cross_shim_variants(contents: str) -> tuple[str, ...]:
+    """Expose Cross shim creation and every later dispatch through the shim."""
+
+    shims, opaque = cross_shim_names(contents)
+    if not shims and not opaque:
+        return ()
+    # Binding Cross to another executable name is itself a Cross surface, so a
+    # dynamic or oversized binding still fails closed with no resolvable name.
+    variants: list[str] = [f"cross build --target {TARGET}"]
+    for name in shims:
+        dispatch = re.compile(
+            COMMAND_START_CONTEXT
+            + WRAPPER_PREFIX
+            # `PATH="$PWD/bin:$PATH" cr build ...` prepends the shim directory
+            # in the same command, so the assignment layer must be consumed
+            # before the shim name like any other executable word.
+            + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+            + TOOL_PATH_PREFIX
+            + re.escape(name)
+            + r"(?![A-Za-z0-9_-])"
+        )
+        for line in contents.splitlines():
+            # Replacing only the trailing shim name preserves the command-start
+            # context and any `./bin/` or PATH-qualified prefix before it.
+            expanded = dispatch.sub(
+                lambda use, shim=name: use.group()[: -len(shim)] + "cross",
+                line,
+            )
+            if expanded != line:
+                variants.append(expanded)
+    return tuple(dict.fromkeys(variants))
+
+
+def logical_scan_lines(contents: str) -> tuple[str, ...]:
+    """Return every command line to scan, including alias and shim expansions."""
+
+    return (
+        *contents.splitlines(),
+        *shell_alias_variants(contents),
+        *cross_shim_variants(contents),
+    )
 
 
 def contains_cross_surface(
@@ -1976,6 +2545,86 @@ def contains_cross_surface(
             include_opaque_shell_executable=include_opaque_shell_executable,
         )
     )
+
+
+def remote_action_surface_lines(
+    contents: str,
+    source: str = "",
+) -> tuple[dict[int, str], list[str]]:
+    """Map every line that starts a Cross-capable remote-action step.
+
+    A remote `uses:` step runs code this repository does not own, so its
+    reference and its declared inputs are the only visible evidence of what it
+    executes. `actions-rs/cargo` with `use-cross: true` runs the Cross
+    executable in place of Cargo, and a Cross-capable input or an ARM64 target
+    argument reaches the same place through any other action. Such a step is
+    therefore a build-execution surface, and a dynamic reference that cannot be
+    resolved at all fails closed.
+    """
+
+    surfaces: dict[int, str] = {}
+    errors: list[str] = []
+    lines = contents.splitlines()
+    for index, line in enumerate(lines):
+        match = REMOTE_ACTION_FIELD.match(line)
+        if match is None:
+            continue
+        value = re.sub(r"\s+#.*$", "", match.group("value")).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1].strip()
+        if not value or value.startswith("./"):
+            # Local actions are extracted and scanned as files of their own.
+            continue
+        if "${{" in value or dynamic_shell_word(value):
+            surfaces[index] = f"remote-action-dynamic:{index + 1}"
+            errors.append(
+                f"{source}:{index + 1} remote action references must be literal"
+                if source
+                else f"line {index + 1} remote action references must be literal"
+            )
+            continue
+
+        reason: str | None = None
+        if "cross" in re.split(r"[^A-Za-z0-9]+", value.lower()):
+            reason = "reference"
+
+        key_column = len(match.group("lead")) + len(match.group("dash") or "")
+        for offset in range(index + 1, len(lines)):
+            following = lines[offset]
+            if not following.strip():
+                continue
+            indent = len(following) - len(following.lstrip(" "))
+            stripped = following.lstrip(" ")
+            if indent < key_column or (
+                indent == key_column and stripped.startswith("- ")
+            ):
+                break
+            if stripped.startswith("#"):
+                continue
+            if reason is not None:
+                continue
+            text = re.sub(r"\s+#.*$", "", following)
+            # Every key on the line is considered, so a flow mapping such as
+            # `with: {use-cross: true}` is read like a block mapping.
+            cross_input = next(
+                (
+                    key
+                    for key in re.findall(r"([A-Za-z0-9_.+-]+)\s*:", text)
+                    if re.sub(r"[^a-z0-9]", "", key.lower())
+                    in CROSS_CAPABLE_ACTION_INPUTS
+                ),
+                None,
+            )
+            if cross_input is not None:
+                reason = f"input:{cross_input}"
+                continue
+            if TARGET in text or EXPECTED_IMAGE in text or (
+                STANDALONE_CROSS.search(text)
+            ):
+                reason = "input-value"
+        if reason is not None:
+            surfaces[index] = f"remote-action:{value}:{reason}"
+    return surfaces, errors
 
 
 def unprotected_cross_surfaces(
@@ -2065,9 +2714,18 @@ def unprotected_cross_surfaces(
             if name in sensitive_jobs:
                 break
 
+    # A remote action is opaque code, so a Cross-capable one is attributed to
+    # the job that runs it exactly like a literal Cross command would be.
+    remote_surfaces, remote_errors = remote_action_surface_lines(
+        "".join(lines),
+        source,
+    )
+
     top_level_surfaces: list[str] = []
     for index, line in enumerate(lines):
         line_surfaces: set[str] = set()
+        if index in remote_surfaces:
+            line_surfaces.add(remote_surfaces[index])
         if OPAQUE_INLINE_SHELL.search(line) or OPAQUE_ARM_CROSS_EXECUTION.search(
             line
         ):
@@ -2097,7 +2755,7 @@ def unprotected_cross_surfaces(
         for _, name in job_starts
         if name in sensitive_jobs
     ]
-    return tuple([*top_level_surfaces, *job_surfaces]), []
+    return tuple([*top_level_surfaces, *job_surfaces]), remote_errors
 
 
 def yaml_command_augmented(contents: str) -> str:
@@ -2131,12 +2789,13 @@ def generic_workflow_cross_surfaces(
         source,
         include_opaque_shell_executable=include_opaque_shell_executable,
     )
-    errors = [*interpreter_errors, *runtime_errors]
+    remote_surfaces, remote_errors = remote_action_surface_lines(contents, source)
+    errors = [*interpreter_errors, *runtime_errors, *remote_errors]
 
     # Avoid imposing a YAML layout contract on unrelated workflows. As soon as
     # a Cross token is exposed, however, parse the job layout conservatively so
     # malformed, duplicate, and alias-shaped jobs fail closed.
-    if not runtime_sensitive and not contains_cross_surface(
+    if not runtime_sensitive and not remote_surfaces and not contains_cross_surface(
         yaml_command_augmented(contents),
         include_opaque_shell_executable=include_opaque_shell_executable,
     ):
@@ -2150,7 +2809,9 @@ def generic_workflow_cross_surfaces(
     )
     if runtime_sensitive and not surfaces:
         surfaces = (f"runtime:{hashlib.sha256(contents.encode()).hexdigest()}",)
-    return surfaces, [*errors, *surface_errors]
+    if remote_surfaces and not surfaces:
+        surfaces = tuple(sorted(remote_surfaces.values()))
+    return surfaces, list(dict.fromkeys([*errors, *surface_errors]))
 
 
 def validate_workflow_collection(
@@ -2226,9 +2887,18 @@ def generic_action_cross_surfaces(
         contents,
         include_opaque_shell_executable=include_opaque_shell_executable,
     )
+    # A composite action can also delegate to a remote action that reaches
+    # Cross, so the same remote-action policy applies to action files. Only
+    # YAML carries `uses:` steps, so other automation is left untouched.
+    if name.lower().endswith((".yml", ".yaml")):
+        remote_surfaces, remote_errors = remote_action_surface_lines(contents, name)
+    else:
+        remote_surfaces, remote_errors = {}, []
     sensitive = (
         runtime_sensitive
         or bool(runtime_errors)
+        or bool(remote_surfaces)
+        or bool(remote_errors)
         or OPAQUE_INLINE_SHELL.search(logical_contents) is not None
         or WRAPPED_LITERAL_CROSS.search(logical_contents) is not None
         or any(
@@ -4043,23 +4713,40 @@ def validate_ci_planner_isolation(contents: str, source: str) -> list[str]:
 
 
 def validate_trusted_policy_extraction(contents: str, source: str) -> list[str]:
-    """Keep hostile-tree extraction fail-closed and based on current main."""
+    """Keep hostile-tree extraction fail-closed and on the live trusted base.
+
+    `pull_request_target` checks out the event's base SHA, which goes stale as
+    soon as `main` advances. The guard must therefore fetch the live base
+    branch tip, authenticate it against the triggering base, pin it to one
+    immutable SHA, and read every baseline from that SHA instead of from the
+    event checkout.
+    """
 
     errors: list[str] = []
-    required_current_base_inputs = (
-        'git show "HEAD:.github/workflows/ci.yml"',
-        'git show "HEAD:.github/workflows/release.yml"',
-        'extract_workflows HEAD "$merge_base_workflows"',
-        'extract_actions HEAD "$merge_base_actions"',
-        'extract_automation HEAD "$merge_base_automation"',
+    required_live_base_inputs = (
+        '"+refs/heads/${BASE_REF}:refs/remotes/trusted-base"',
+        'trusted_base="$(git rev-parse "refs/remotes/trusted-base^{commit}")"',
+        'git merge-base --is-ancestor "$BASE_SHA" "$trusted_base"',
+        'git show "$trusted_base:.github/workflows/ci.yml"',
+        'git show "$trusted_base:.github/workflows/release.yml"',
+        'extract_workflows "$trusted_base" "$merge_base_workflows"',
+        'extract_actions "$trusted_base" "$merge_base_actions"',
+        'extract_automation "$trusted_base" "$merge_base_automation"',
     )
-    for required in required_current_base_inputs:
+    for required in required_live_base_inputs:
         if required not in contents:
             errors.append(
-                f"{source} must compare proposed Cross surfaces with current base "
-                f"HEAD ({required!r} is missing)"
+                f"{source} must authenticate and compare against the live trusted "
+                f"base tip ({required!r} is missing)"
             )
-    if "git merge-base" in contents:
+    if re.search(r'git show "HEAD:', contents) or re.search(
+        r"\bextract_(?:workflows|actions|automation) HEAD\b", contents
+    ):
+        errors.append(
+            f"{source} must not read a Cross baseline from the stale event-base "
+            "checkout"
+        )
+    if re.search(r"git merge-base(?!\s+--is-ancestor\b)", contents):
         errors.append(f"{source} must not use a stale merge-base Cross baseline")
 
     checked_enumerations = re.findall(
@@ -4934,6 +5621,308 @@ pre_build = []
         "self-test workflow directory",
     ):
         failures.append("new workflow Cross invocation was not rejected")
+
+    # An inline program handed to a non-shell interpreter dispatches Cross
+    # without any Cross word ever appearing in a shell command position.
+    inline_interpreter_bypasses = {
+        "perl inline program": (
+            "perl -e 'system(\"cross build --target "
+            "aarch64-unknown-linux-gnu\")'"
+        ),
+        "perl bundled inline flag": (
+            "perl -we 'system(\"cross build --target "
+            "aarch64-unknown-linux-gnu\")'"
+        ),
+        "node inline program": (
+            "node -e 'require(\"child_process\").execSync(\"cross build "
+            "--target aarch64-unknown-linux-gnu\")'"
+        ),
+        "node long inline flag": (
+            "node --eval 'require(\"child_process\").execSync(\"cross build "
+            "--target aarch64-unknown-linux-gnu\")'"
+        ),
+        "ruby inline program": (
+            "ruby -e 'system(\"cross build --target "
+            "aarch64-unknown-linux-gnu\")'"
+        ),
+        "php inline program": (
+            "php -r 'exec(\"cross build --target aarch64-unknown-linux-gnu\");'"
+        ),
+        "deno inline subcommand": (
+            "deno eval 'Deno.run({cmd: \"cross build --target "
+            "aarch64-unknown-linux-gnu\"})'"
+        ),
+        "awk inline operand": (
+            "awk 'BEGIN { system(\"cross build --target "
+            "aarch64-unknown-linux-gnu\") }' /dev/null"
+        ),
+        "lua inline program": (
+            "lua -e 'os.execute(\"cross build --target "
+            "aarch64-unknown-linux-gnu\")'"
+        ),
+        "python inline program": (
+            "python3 -c 'import subprocess; subprocess.run([\"cross\", "
+            '"build", "--target", "aarch64-unknown-linux-gnu"])\''
+        ),
+        "powershell inline command": (
+            "pwsh -Command 'cross build --target aarch64-unknown-linux-gnu'"
+        ),
+    }
+    for label, command in inline_interpreter_bypasses.items():
+        proposed = safe_extra_workflow.replace("echo safe", command)
+        if not validate_workflow_collection(
+            {"attacker.yml": proposed},
+            "self-test workflow directory",
+        ):
+            failures.append(f"{label} was not rejected")
+        if not compare_pr_workflow_collection(
+            {"coverage.yml": safe_extra_workflow},
+            {"coverage.yml": proposed},
+            "self-test workflow directory",
+        ):
+            failures.append(f"merge-base comparison allowed {label}")
+
+    inline_interpreter_fail_closed = {
+        "generated perl program": 'perl -e "$PROGRAM"',
+        "generated node program": "node -e \"${BUILD_SCRIPT}\"",
+        "encoded powershell command": "pwsh -EncodedCommand YnVpbGQ=",
+        "opaque node process dispatch": (
+            "node -e 'require(\"child_process\").execSync(process.env.CMD)'"
+        ),
+        "opaque deno process dispatch": (
+            "deno eval 'new Deno.Command(cmd, {args: argv})'"
+        ),
+    }
+    for label, command in inline_interpreter_fail_closed.items():
+        proposed = safe_extra_workflow.replace("echo safe", command)
+        if not compare_pr_workflow_collection(
+            {"coverage.yml": safe_extra_workflow},
+            {"coverage.yml": proposed},
+            "self-test workflow directory",
+        ):
+            failures.append(f"{label} was not rejected")
+
+    benign_inline_interpreters = {
+        "benign node inline program": "node -e 'console.log(1)'",
+        "benign perl inline program": "perl -e 'print 1'",
+        "benign python inline program": (
+            "python3 -c 'import json; print(json.dumps({}))'"
+        ),
+        "benign awk program": "awk '{ print $1 }' report.txt",
+    }
+    for label, command in benign_inline_interpreters.items():
+        proposed = safe_extra_workflow.replace("echo safe", command)
+        if validate_workflow_collection(
+            {"coverage.yml": proposed},
+            "self-test workflow directory",
+        ):
+            failures.append(f"{label} was rejected")
+        if compare_pr_workflow_collection(
+            {"coverage.yml": proposed},
+            {"coverage.yml": proposed.replace("name: Coverage", "name: Coverage 2")},
+            "self-test workflow directory",
+        ):
+            failures.append(f"{label} blocked a benign edit")
+
+    # An unquoted expansion splits into several words before dispatch, so
+    # `cross${IFS}build` runs Cross with no literal source whitespace.
+    word_splitting_bypasses = {
+        "IFS-split subcommand": (
+            "cross${IFS}build --target aarch64-unknown-linux-gnu"
+        ),
+        "bare IFS-split subcommand": (
+            "cross$IFS build --target aarch64-unknown-linux-gnu"
+        ),
+        "IFS-split cargo subcommand": (
+            "cargo${IFS}cross build --target aarch64-unknown-linux-gnu"
+        ),
+        "IFS-split toolchain selector": (
+            "cargo${IFS}+stable${IFS}cross build --target "
+            "aarch64-unknown-linux-gnu"
+        ),
+        "IFS-split cargo install": (
+            "cargo${IFS}install${IFS}cross"
+        ),
+        "substring IFS-split subcommand": (
+            "cross${IFS:0:1}build --target aarch64-unknown-linux-gnu"
+        ),
+        "command-substitution word split": (
+            "cross$(printf ' ')build --target aarch64-unknown-linux-gnu"
+        ),
+    }
+    for label, command in word_splitting_bypasses.items():
+        proposed = safe_extra_workflow.replace("echo safe", command)
+        if not validate_workflow_collection(
+            {"attacker.yml": proposed},
+            "self-test workflow directory",
+        ):
+            failures.append(f"{label} was not rejected")
+        if not compare_pr_workflow_collection(
+            {"coverage.yml": safe_extra_workflow},
+            {"coverage.yml": proposed},
+            "self-test workflow directory",
+        ):
+            failures.append(f"merge-base comparison allowed {label}")
+
+    benign_expansion_workflow = safe_extra_workflow.replace(
+        "echo safe",
+        'echo "cargo${SUFFIX} finished for ${MATRIX} targets"',
+    )
+    if validate_workflow_collection(
+        {"coverage.yml": benign_expansion_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append("benign expansion inside prose was rejected")
+
+    # Linking, copying, or wrapping the Cross binary under another name runs
+    # Cross through a word that is never literally `cross`.
+    shim_bypasses = {
+        "symlinked shim": (
+            "ln -s /home/runner/.cargo/bin/cross bin/cr && "
+            'PATH="$PWD/bin:$PATH" cr build --target aarch64-unknown-linux-gnu'
+        ),
+        "copied shim": (
+            "cp /home/runner/.cargo/bin/cross bin/builder && "
+            "./bin/builder build --target aarch64-unknown-linux-gnu"
+        ),
+        "moved shim": (
+            "mv ~/.cargo/bin/cross /usr/local/bin/xb && "
+            "xb build --target aarch64-unknown-linux-gnu"
+        ),
+        "installed shim": (
+            "install -m 0755 ~/.cargo/bin/cross bin/cx && "
+            "bin/cx build --target aarch64-unknown-linux-gnu"
+        ),
+        "hardlinked shim": (
+            "ln ~/.cargo/bin/cross bin/cr2 && "
+            "bin/cr2 build --target aarch64-unknown-linux-gnu"
+        ),
+        "resolved shim source": (
+            'ln -s "$(command -v cross)" bin/cr3 && '
+            "bin/cr3 build --target aarch64-unknown-linux-gnu"
+        ),
+        "wrapper script shim": (
+            "printf '#!/bin/sh\\nexec cross \"$@\"\\n' > bin/cw && "
+            "chmod +x bin/cw && "
+            "./bin/cw build --target aarch64-unknown-linux-gnu"
+        ),
+        "dynamic shim name": (
+            'ln -s ~/.cargo/bin/cross "$RUNNER_TEMP/$NAME"'
+        ),
+    }
+    for label, command in shim_bypasses.items():
+        proposed = safe_extra_workflow.replace("echo safe", command)
+        if not validate_workflow_collection(
+            {"attacker.yml": proposed},
+            "self-test workflow directory",
+        ):
+            failures.append(f"{label} was not rejected")
+        if not compare_pr_workflow_collection(
+            {"coverage.yml": safe_extra_workflow},
+            {"coverage.yml": proposed},
+            "self-test workflow directory",
+        ):
+            failures.append(f"merge-base comparison allowed {label}")
+
+    benign_shim_lookalikes = {
+        "cross-named documentation": "cp docs/cross.md site/cross.md",
+        "cross-prefixed artifact": "mv cross-report.json results/report.json",
+        "same-name install": "cp bin/cross bin/cross",
+    }
+    for label, command in benign_shim_lookalikes.items():
+        proposed = safe_extra_workflow.replace("echo safe", command)
+        if validate_workflow_collection(
+            {"coverage.yml": proposed},
+            "self-test workflow directory",
+        ):
+            failures.append(f"{label} was rejected")
+
+    # A remote action is code this repository does not own, so a Cross-capable
+    # one restores unprotected ARM64 Cross execution with no Cross command.
+    remote_action_step = (
+        "      - uses: actions-rs/cargo@844f36862e911db73fe0815f00a4a2602c279505\n"
+        "        with:\n"
+        "          command: build\n"
+        "          use-cross: true\n"
+        "          args: --release --target aarch64-unknown-linux-gnu\n"
+    )
+    remote_action_workflow = safe_extra_workflow.replace(
+        "      - run: echo safe\n",
+        remote_action_step,
+    )
+    remote_action_bypasses = {
+        "cross-capable action input": remote_action_workflow,
+        "cross-named remote action": safe_extra_workflow.replace(
+            "      - run: echo safe\n",
+            "      - uses: houseabsolute/actions-rust-cross"
+            "@9c74a0a6b7b6a8b7d0d1a7b9c0d1e2f3a4b5c6d7\n"
+            "        with:\n"
+            "          command: build\n",
+        ),
+        "cross-target action argument": safe_extra_workflow.replace(
+            "      - run: echo safe\n",
+            "      - uses: example/build-action"
+            "@0f1e2d3c4b5a69788796a5b4c3d2e1f001122334\n"
+            "        with:\n"
+            "          args: --target aarch64-unknown-linux-gnu\n",
+        ),
+        "dynamic remote action reference": safe_extra_workflow.replace(
+            "      - run: echo safe\n",
+            "      - uses: ${{ matrix.action }}\n",
+        ),
+    }
+    for label, proposed in remote_action_bypasses.items():
+        if not validate_workflow_collection(
+            {"attacker.yml": proposed},
+            "self-test workflow directory",
+        ):
+            failures.append(f"{label} was not rejected")
+        if not compare_pr_workflow_collection(
+            {"coverage.yml": safe_extra_workflow},
+            {"coverage.yml": proposed},
+            "self-test workflow directory",
+        ):
+            failures.append(f"merge-base comparison allowed {label}")
+
+    benign_remote_action_workflow = safe_extra_workflow.replace(
+        "      - run: echo safe\n",
+        "      - uses: actions/checkout"
+        "@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+        "        with:\n"
+        "          persist-credentials: false\n"
+        "      - uses: actions/upload-artifact"
+        "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\n"
+        "        with:\n"
+        "          name: report\n"
+        "          path: results/\n",
+    )
+    if validate_workflow_collection(
+        {"coverage.yml": benign_remote_action_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append("benign pinned remote actions were rejected")
+    if compare_pr_workflow_collection(
+        {"coverage.yml": safe_extra_workflow},
+        {"coverage.yml": benign_remote_action_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append("adding benign pinned remote actions was rejected")
+
+    remote_action_composite = (
+        "name: Remote delegating action\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - uses: actions-rs/cargo@844f36862e911db73fe0815f00a4a2602c279505\n"
+        "      with:\n"
+        "        command: build\n"
+        "        use-cross: true\n"
+    )
+    if not validate_action_collection(
+        {"setup/action.yml": remote_action_composite},
+        "self-test local-action directory",
+    ):
+        failures.append("composite delegation to a Cross-capable action was allowed")
 
     malformed_cross_workflow = (
         added_cross_workflow
@@ -6524,11 +7513,15 @@ pre_build = []
         failures.append("duplicate publication needs field was not rejected")
 
     trusted_extraction_fixture = (
-        'git show "HEAD:.github/workflows/ci.yml"\n'
-        'git show "HEAD:.github/workflows/release.yml"\n'
-        'extract_workflows HEAD "$merge_base_workflows"\n'
-        'extract_actions HEAD "$merge_base_actions"\n'
-        'extract_automation HEAD "$merge_base_automation"\n'
+        'git fetch --no-tags origin '
+        '"+refs/heads/${BASE_REF}:refs/remotes/trusted-base"\n'
+        'trusted_base="$(git rev-parse "refs/remotes/trusted-base^{commit}")"\n'
+        'git merge-base --is-ancestor "$BASE_SHA" "$trusted_base"\n'
+        'git show "$trusted_base:.github/workflows/ci.yml"\n'
+        'git show "$trusted_base:.github/workflows/release.yml"\n'
+        'extract_workflows "$trusted_base" "$merge_base_workflows"\n'
+        'extract_actions "$trusted_base" "$merge_base_actions"\n'
+        'extract_automation "$trusted_base" "$merge_base_automation"\n'
         'if ! git ls-tree -rz --name-only "$commit" -- workflows > "$listing"; then\n'
         "  return 1\n"
         "fi\n"
@@ -6546,9 +7539,9 @@ pre_build = []
         trusted_extraction_fixture,
         "self-test trusted policy",
     ):
-        failures.append("valid checked current-base extraction was rejected")
+        failures.append("valid checked live-base extraction was rejected")
     stale_extraction_fixture = trusted_extraction_fixture.replace(
-        'extract_workflows HEAD "$merge_base_workflows"',
+        'extract_workflows "$trusted_base" "$merge_base_workflows"',
         'extract_workflows "$merge_base" "$merge_base_workflows"',
     )
     if not validate_trusted_policy_extraction(
@@ -6556,6 +7549,35 @@ pre_build = []
         "self-test trusted policy",
     ):
         failures.append("stale merge-base extraction was not rejected")
+    for label, stale_baseline in {
+        "stale event-base workflow extraction": (
+            'extract_workflows "$trusted_base" "$merge_base_workflows"',
+            'extract_workflows HEAD "$merge_base_workflows"',
+        ),
+        "stale event-base CI baseline": (
+            'git show "$trusted_base:.github/workflows/ci.yml"',
+            'git show "HEAD:.github/workflows/ci.yml"',
+        ),
+        "unfetched live base": (
+            'git fetch --no-tags origin '
+            '"+refs/heads/${BASE_REF}:refs/remotes/trusted-base"\n',
+            "",
+        ),
+        "unauthenticated live base": (
+            'git merge-base --is-ancestor "$BASE_SHA" "$trusted_base"\n',
+            "",
+        ),
+        "unpinned live base": (
+            'trusted_base="$(git rev-parse "refs/remotes/trusted-base^{commit}")"\n',
+            "",
+        ),
+    }.items():
+        original, replacement = stale_baseline
+        if not validate_trusted_policy_extraction(
+            trusted_extraction_fixture.replace(original, replacement),
+            "self-test trusted policy",
+        ):
+            failures.append(f"{label} was not rejected")
     process_substitution_fixture = trusted_extraction_fixture.replace(
         'if ! git ls-tree -rz --name-only "$commit" -- workflows > "$listing"; then',
         'done < <(git ls-tree -rz --name-only "$commit" -- workflows)',

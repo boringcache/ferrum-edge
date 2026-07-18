@@ -31,6 +31,8 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
 
@@ -38,6 +40,42 @@ jobs:
             echo "::error::invalid triggering PR head SHA" >&2
             exit 1
           fi
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::invalid triggering base SHA" >&2
+            exit 1
+          fi
+          # The checkout is the only code this job executes, so it must be the
+          # trusted base commit the event was created from.
+          checked_out="$(git rev-parse HEAD)"
+          if [ "$checked_out" != "$BASE_SHA" ]; then
+            echo "::error::checkout ${checked_out} is not the triggering base ${BASE_SHA}" >&2
+            exit 1
+          fi
+
+          # `main` can advance after the event is created. Comparing against the
+          # event's base SHA would then measure the PR against a stale policy
+          # surface, so fetch the live base branch tip from the trusted
+          # repository, authenticate it against the triggering base, and pin it
+          # to an immutable SHA that every later extraction reads.
+          if [[ ! "$BASE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$BASE_REF" == *".."* ]] \
+            || [[ "$BASE_REF" == -* ]] || [[ "$BASE_REF" == */ ]]; then
+            echo "::error::invalid triggering base ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin \
+            "+refs/heads/${BASE_REF}:refs/remotes/trusted-base"
+          trusted_base="$(git rev-parse "refs/remotes/trusted-base^{commit}")"
+          if [[ ! "$trusted_base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::live trusted base did not resolve to a commit" >&2
+            exit 1
+          fi
+          # A live tip that does not descend from the triggering base is a
+          # rewritten or confused ref rather than an advance of trusted `main`.
+          if ! git merge-base --is-ancestor "$BASE_SHA" "$trusted_base"; then
+            echo "::error::live base ${trusted_base} does not descend from ${BASE_SHA}" >&2
+            exit 1
+          fi
+          echo "trusted base tip: ${trusted_base} (event base ${BASE_SHA})"
 
           proposed_cross="$RUNNER_TEMP/proposed-Cross.toml"
           proposed_cargo="$RUNNER_TEMP/proposed-Cargo.toml"
@@ -63,14 +101,16 @@ jobs:
           # These files define and invoke the trusted policy. Once this
           # bootstrap workflow is on main, changes to either require an
           # explicit branch-protection bypass rather than an ordinary PR. Use
-          # the merge base so unrelated changes made later on main do not make
-          # an otherwise untouched PR appear to modify these files.
+          # the merge base with the live trusted tip so unrelated changes made
+          # later on main do not make an otherwise untouched PR appear to
+          # modify these files.
           protected_paths=(
             ".github/scripts/verify_cross_build_policy.py"
             ".github/workflows/cross-build-policy.yml"
           )
           for protected_path in "${protected_paths[@]}"; do
-            if ! git diff --no-ext-diff --quiet HEAD...FETCH_HEAD -- "$protected_path"; then
+            if ! git diff --no-ext-diff --quiet \
+              "$trusted_base...$PR_HEAD_SHA" -- "$protected_path"; then
               echo "::error file=${protected_path}::trusted cross-build policy files cannot be changed by a pull request" >&2
               exit 1
             fi
@@ -89,11 +129,11 @@ jobs:
           fi
           git show "FETCH_HEAD:.github/workflows/ci.yml" > "$proposed_ci"
           git show "FETCH_HEAD:.github/workflows/release.yml" > "$proposed_release"
-          # Compare executable/configuration surfaces to the current trusted
-          # base tip. A stale head therefore cannot restore a Cross surface
-          # removed from current main.
-          git show "HEAD:.github/workflows/ci.yml" > "$merge_base_ci"
-          git show "HEAD:.github/workflows/release.yml" > "$merge_base_release"
+          # Compare executable/configuration surfaces to the live trusted base
+          # tip rather than the event's base SHA. A stale event base therefore
+          # cannot restore a Cross surface that current main removed.
+          git show "$trusted_base:.github/workflows/ci.yml" > "$merge_base_ci"
+          git show "$trusted_base:.github/workflows/release.yml" > "$merge_base_release"
 
           extract_workflows() {
             local commit="$1"
@@ -124,7 +164,7 @@ jobs:
           }
 
           extract_workflows FETCH_HEAD "$proposed_workflows"
-          extract_workflows HEAD "$merge_base_workflows"
+          extract_workflows "$trusted_base" "$merge_base_workflows"
 
           extract_actions() {
             local commit="$1"
@@ -158,7 +198,7 @@ jobs:
           }
 
           extract_actions FETCH_HEAD "$proposed_actions"
-          extract_actions HEAD "$merge_base_actions"
+          extract_actions "$trusted_base" "$merge_base_actions"
 
           extract_automation() {
             local commit="$1"
@@ -204,7 +244,7 @@ jobs:
           }
 
           extract_automation FETCH_HEAD "$proposed_automation"
-          extract_automation HEAD "$merge_base_automation"
+          extract_automation "$trusted_base" "$merge_base_automation"
 
           python3 -I .github/scripts/verify_cross_build_policy.py \
             --self-test \
