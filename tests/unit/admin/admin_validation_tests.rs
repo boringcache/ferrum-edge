@@ -288,9 +288,15 @@ fn api_spec_delete_snapshots_current_hand_upstream_for_atomic_restore() {
     assert!(delete.contains("existing_proxy.upstream_id.as_deref()"));
     assert!(delete.contains("db.get_upstream(namespace, upstream_id)"));
     assert!(delete.contains("upstream.api_spec_id.is_none()"));
-    assert!(delete.contains("&additional_upstreams,"));
-    assert!(delete.contains("compensate_late_api_spec_delete("));
-    assert!(delete.matches("additional_upstreams").count() >= 4);
+    let validation = delete
+        .find("validate_api_spec_restore_inputs(")
+        .expect("API-spec DELETE must validate its restore snapshot");
+    let compensation = delete
+        .find("compensate_late_api_spec_delete(")
+        .expect("API-spec DELETE must compensate a late persistence failure");
+    assert!(validation < compensation);
+    assert!(delete[validation..compensation].contains("&additional_upstreams,"));
+    assert!(delete[compensation..].contains("additional_upstreams,"));
 }
 
 #[test]
