@@ -9,7 +9,9 @@
 //! Resources present in the new config but not the old are additions;
 //! resources in the old but not the new are removals; resources in both
 //! with a different `updated_at` are modifications (uses `!=` to catch
-//! both forward progress and backward clock skew).
+//! both forward progress and backward clock skew). Proxy/plugin association
+//! membership is compared directly because junction-table changes can arrive
+//! without advancing the owning proxy's timestamp.
 
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -54,6 +56,9 @@ pub struct ConfigDelta {
     pub added_plugin_configs: Vec<PluginConfig>,
     pub removed_plugin_config_ids: Vec<String>,
     pub modified_plugin_configs: Vec<PluginConfig>,
+    /// Existing proxies whose plugin association membership changed even
+    /// though the proxy resource timestamp may not have advanced.
+    pub plugin_association_changed_proxy_ids: Vec<String>,
     /// True when a global plugin was added, removed, modified, or changed away
     /// from global scope. Known proxy plugin lists contain merged global
     /// instances, so they must all be rebuilt when this is true.
@@ -75,6 +80,8 @@ impl ConfigDelta {
         let added_plugin_configs = diff_added(&old.plugin_configs, &new.plugin_configs);
         let removed_plugin_config_ids = diff_removed_ids(&old.plugin_configs, &new.plugin_configs);
         let modified_plugin_configs = diff_modified(&old.plugin_configs, &new.plugin_configs);
+        let plugin_association_changed_proxy_ids =
+            diff_plugin_association_changes(&old.proxies, &new.proxies);
         let old_global_plugin_ids: HashSet<&str> = old
             .plugin_configs
             .iter()
@@ -103,6 +110,7 @@ impl ConfigDelta {
             added_plugin_configs,
             removed_plugin_config_ids,
             modified_plugin_configs,
+            plugin_association_changed_proxy_ids,
             global_plugin_configs_changed,
 
             added_upstreams: diff_added(&old.upstreams, &new.upstreams),
@@ -122,6 +130,7 @@ impl ConfigDelta {
             && self.added_plugin_configs.is_empty()
             && self.removed_plugin_config_ids.is_empty()
             && self.modified_plugin_configs.is_empty()
+            && self.plugin_association_changed_proxy_ids.is_empty()
             && !self.global_plugin_configs_changed
             && self.added_upstreams.is_empty()
             && self.removed_upstream_ids.is_empty()
@@ -132,8 +141,13 @@ impl ConfigDelta {
     ///
     /// A proxy needs plugin rebuild if:
     /// - The proxy itself was added or modified (plugin associations may have changed)
+    /// - Its plugin association membership changed without a proxy timestamp change
     /// - Any of its referenced plugin_configs were added, removed, or modified
-    pub fn proxy_ids_needing_plugin_rebuild(&self, new_config: &GatewayConfig) -> HashSet<String> {
+    pub fn proxy_ids_needing_plugin_rebuild(
+        &self,
+        old_config: &GatewayConfig,
+        new_config: &GatewayConfig,
+    ) -> HashSet<String> {
         let mut ids = HashSet::new();
 
         // Added/modified proxies always need plugin rebuild
@@ -143,6 +157,7 @@ impl ConfigDelta {
         for p in &self.modified_proxies {
             ids.insert(p.id.clone());
         }
+        ids.extend(self.plugin_association_changed_proxy_ids.iter().cloned());
 
         // If any plugin config changed, find all proxies that reference it
         if !self.added_plugin_configs.is_empty()
@@ -157,25 +172,46 @@ impl ConfigDelta {
                 .chain(self.modified_plugin_configs.iter().map(|pc| pc.id.as_str()))
                 .collect();
 
-            // Also include any plugin configs with proxy_id scope that changed
-            let changed_proxy_scoped: HashSet<&str> = self
+            // Include both the previous and replacement direct placements.
+            // A modified PluginConfig contains only its new proxy_id, while a
+            // cache entry can still be live on the former proxy.
+            let old_changed_proxy_scoped: HashSet<&str> = old_config
+                .plugin_configs
+                .iter()
+                .filter(|pc| changed_pc_ids.contains(pc.id.as_str()))
+                .filter_map(|pc| pc.proxy_id.as_deref())
+                .collect();
+            let new_changed_proxy_scoped: HashSet<&str> = self
                 .added_plugin_configs
                 .iter()
                 .chain(self.modified_plugin_configs.iter())
                 .filter_map(|pc| pc.proxy_id.as_deref())
                 .collect();
+            let old_proxies_by_id: HashMap<&str, &Proxy> = old_config
+                .proxies
+                .iter()
+                .map(|proxy| (proxy.id.as_str(), proxy))
+                .collect();
 
             for proxy in &new_config.proxies {
-                // Check if this proxy references any changed plugin config
-                if proxy
+                // Check both association generations. Scope/group moves can
+                // remove the old association without advancing the proxy's
+                // timestamp, but the old cached chain still needs rebuilding.
+                let references_changed_plugin = proxy
                     .plugins
                     .iter()
                     .any(|assoc| changed_pc_ids.contains(assoc.plugin_config_id.as_str()))
+                    || old_proxies_by_id
+                        .get(proxy.id.as_str())
+                        .is_some_and(|old_proxy| {
+                            old_proxy.plugins.iter().any(|assoc| {
+                                changed_pc_ids.contains(assoc.plugin_config_id.as_str())
+                            })
+                        });
+                if references_changed_plugin
+                    || old_changed_proxy_scoped.contains(proxy.id.as_str())
+                    || new_changed_proxy_scoped.contains(proxy.id.as_str())
                 {
-                    ids.insert(proxy.id.clone());
-                }
-                // Check if a proxy-scoped plugin config targets this proxy
-                if changed_proxy_scoped.contains(proxy.id.as_str()) {
                     ids.insert(proxy.id.clone());
                 }
             }
@@ -328,6 +364,45 @@ fn diff_modified<T: HasIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
         })
         .cloned()
         .collect()
+}
+
+/// Existing proxies whose plugin association membership differs between the
+/// accepted and candidate snapshots.
+///
+/// SQL stores these links in a junction table, so an association-only update or
+/// cascade need not advance `Proxy.updated_at`. Association order is not part of
+/// placement identity; plugin execution order comes from effective priorities.
+fn diff_plugin_association_changes(old: &[Proxy], new: &[Proxy]) -> Vec<String> {
+    let old_by_id: HashMap<&str, &Proxy> =
+        old.iter().map(|proxy| (proxy.id.as_str(), proxy)).collect();
+
+    new.iter()
+        .filter(|proxy| {
+            old_by_id
+                .get(proxy.id.as_str())
+                .is_some_and(|old_proxy| !same_plugin_associations(old_proxy, proxy))
+        })
+        .map(|proxy| proxy.id.clone())
+        .collect()
+}
+
+fn same_plugin_associations(left: &Proxy, right: &Proxy) -> bool {
+    if left.plugins.len() != right.plugins.len() {
+        return false;
+    }
+    let mut left_ids: Vec<&str> = left
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    let mut right_ids: Vec<&str> = right
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    left_ids.sort_unstable();
+    right_ids.sort_unstable();
+    left_ids == right_ids
 }
 
 type ConsumerKey<'a> = (&'a str, &'a str);
@@ -589,7 +664,7 @@ mod tests {
         );
 
         let delta = ConfigDelta::compute(&old, &new);
-        let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+        let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
 
         assert!(ids.contains("p1"));
         assert!(ids.contains("p3"));
@@ -613,7 +688,7 @@ mod tests {
         let new = config(old.proxies.clone(), vec![]);
 
         let delta = ConfigDelta::compute(&old, &new);
-        let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+        let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
 
         assert_eq!(ids.len(), 2);
         assert!(ids.contains("p1"));
