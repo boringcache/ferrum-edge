@@ -181,6 +181,10 @@ GENERATED_SCRIPT_PREFIXES = (
     "comparison-results/",
     "tmp/",
 )
+IGNORED_AUTOMATION_SUFFIXES = frozenset(
+    {".gif", ".jpeg", ".jpg", ".pdf", ".png", ".pyc", ".webp"}
+)
+IGNORED_AUTOMATION_DIRECTORIES = frozenset({"__pycache__"})
 LOCAL_ACTION_REFERENCE = re.compile(
     r"\buses\s*:\s*(?P<quote>['\"]?)(?P<path>\./[A-Za-z0-9._/-]+)"
     r"(?P=quote)(?=\s*(?:#|$))"
@@ -2628,6 +2632,9 @@ def load_workflow_directory(
 def load_action_directory(
     path: Path,
     label: str,
+    *,
+    ignored_suffixes: frozenset[str] = frozenset(),
+    ignored_directories: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, str], list[str]]:
     """Load every repo-local action file without following filesystem aliases."""
 
@@ -2649,8 +2656,11 @@ def load_action_directory(
             if entry.is_symlink():
                 errors.append(f"{label}/{relative} must not be a symlink")
             elif entry.is_dir():
-                directories.append(entry)
+                if entry.name not in ignored_directories:
+                    directories.append(entry)
             elif entry.is_file():
+                if entry.suffix.lower() in ignored_suffixes:
+                    continue
                 contents, failures = load_workflow(entry, f"{label}/{relative}")
                 errors.extend(failures)
                 if not failures:
@@ -2673,7 +2683,12 @@ def load_automation_directory(
     errors: list[str] = []
     for root_name in APPROVED_AUTOMATION_ROOTS:
         root = path / root_name.rstrip("/")
-        loaded, failures = load_action_directory(root, f"{label}/{root_name}")
+        loaded, failures = load_action_directory(
+            root,
+            f"{label}/{root_name}",
+            ignored_suffixes=IGNORED_AUTOMATION_SUFFIXES,
+            ignored_directories=IGNORED_AUTOMATION_DIRECTORIES,
+        )
         errors.extend(failures)
         for name, contents in loaded.items():
             automation[f"{root_name}{name}"] = contents
