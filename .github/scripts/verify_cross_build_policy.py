@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import re
@@ -186,8 +187,12 @@ IGNORED_AUTOMATION_SUFFIXES = frozenset(
 )
 IGNORED_AUTOMATION_DIRECTORIES = frozenset({"__pycache__"})
 LOCAL_ACTION_REFERENCE = re.compile(
-    r"\buses\s*:\s*(?P<quote>['\"]?)(?P<path>\./[A-Za-z0-9._/-]+)"
-    r"(?P=quote)(?=\s*(?:#|$))"
+    r"^\s*(?:-\s*)?(?:uses|'uses'|\"uses\")\s*:\s*"
+    r"(?P<quote>['\"]?)(?P<path>\./[A-Za-z0-9._/-]+)"
+    r"(?P=quote)\s*(?:#.*)?$"
+)
+LOCAL_ACTION_CANDIDATE = re.compile(
+    r"^\s*(?:-\s*)?(?:uses|'uses'|\"uses\")\s*:\s*['\"]?\./"
 )
 LOCAL_COMMAND_REFERENCE = re.compile(
     r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;|\|)\s*|\$\(\s*|"
@@ -197,14 +202,24 @@ LOCAL_COMMAND_REFERENCE = re.compile(
     r"(?:env(?:\s+(?:--?[^\s]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+))*\s+)?"
     r"(?:(?:bash|sh|python|python3|ruby|node|source|\.)"
     r"(?:\s+--?[^\s]+)*\s+"
-    r"(?P<interpreted>[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+)|"
+    r"(?P<interpreted>(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|"
+    r"\{[A-Za-z_][A-Za-z0-9_]*\})/)?"
+    r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+)|"
     r"(?P<direct>\./[A-Za-z0-9._/-]+)|"
-    r"(?P<bare>[A-Za-z0-9_-]+/[A-Za-z0-9._/-]+))"
+    r"(?P<bare>[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+\.(?:sh|py|rb)))"
 )
-LOCAL_SCRIPT_LITERAL = re.compile(
-    r"(?<![A-Za-z0-9._/-])"
-    r"(?P<path>(?:\./)?[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+"
-    r"\.(?:sh|py|rb))"
+YAML_RUN_FIELD = re.compile(
+    r"^(?P<indent> *)(?:-\s*)?(?:run|'run'|\"run\")\s*:\s*(?P<value>.*)$"
+)
+YAML_DYNAMIC_RUN_FIELD = re.compile(
+    r"^\s*(?:-\s*)?(?:run|'run'|\"run\")\s*:\s*[*!&]"
+)
+YAML_DYNAMIC_USES_FIELD = re.compile(
+    r"^\s*(?:-\s*)?(?:uses|'uses'|\"uses\")\s*:\s*[*!&]"
+)
+HEREDOC_START = re.compile(
+    r"<<-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?P=quote)"
 )
 
 
@@ -1328,6 +1343,12 @@ def compare_pr_action_collection(
 
 
 def normalize_repository_path(raw: str) -> str | None:
+    variable_prefix = re.match(
+        r"^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})/",
+        raw,
+    )
+    if variable_prefix is not None:
+        raw = raw[variable_prefix.end() :]
     value = raw[2:] if raw.startswith("./") else raw
     candidate = PurePosixPath(value)
     if (
@@ -1339,17 +1360,199 @@ def normalize_repository_path(raw: str) -> str | None:
     return candidate.as_posix()
 
 
+def shell_command_lines(contents: str) -> tuple[str, ...]:
+    """Return shell command lines while excluding literal here-document data."""
+
+    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    commands: list[str] = []
+    heredoc_delimiter: str | None = None
+    for line in logical_contents.splitlines():
+        if heredoc_delimiter is not None:
+            if line.strip() == heredoc_delimiter:
+                heredoc_delimiter = None
+            continue
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        commands.append(line)
+        heredoc = HEREDOC_START.search(line)
+        if heredoc is not None:
+            heredoc_delimiter = heredoc.group("delimiter")
+    return tuple(commands)
+
+
+def workflow_run_scripts(contents: str) -> tuple[str, ...]:
+    """Extract literal run scalars without treating embedded program data as YAML."""
+
+    lines = contents.splitlines()
+    scripts: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = YAML_RUN_FIELD.match(lines[index])
+        if match is None:
+            index += 1
+            continue
+        value = match.group("value").strip()
+        if value not in {"|", "|-", "|+", ">", ">-", ">+"}:
+            if len(value) >= 2 and value[0] == value[-1] == "'":
+                value = value[1:-1].replace("''", "'")
+            elif len(value) >= 2 and value[0] == value[-1] == '"':
+                try:
+                    decoded = json.loads(value)
+                except json.JSONDecodeError:
+                    decoded = value
+                if isinstance(decoded, str):
+                    value = decoded
+            scripts.append(value)
+            index += 1
+            continue
+
+        field_indent = len(match.group("indent"))
+        block: list[str] = []
+        index += 1
+        while index < len(lines):
+            line = lines[index]
+            if line.strip():
+                indentation = len(line) - len(line.lstrip(" "))
+                if indentation <= field_indent:
+                    break
+                block.append(line)
+            else:
+                block.append("")
+            index += 1
+        nonblank_indents = [
+            len(line) - len(line.lstrip(" ")) for line in block if line.strip()
+        ]
+        block_indent = min(nonblank_indents, default=field_indent + 2)
+        scripts.append(
+            "\n".join(
+                line[block_indent:] if line.strip() else "" for line in block
+            )
+        )
+    return tuple(scripts)
+
+
+def python_command_scripts(contents: str, source: str) -> tuple[list[str], list[str]]:
+    """Extract literal commands passed to standard Python process APIs."""
+
+    try:
+        tree = ast.parse(contents)
+    except SyntaxError as error:
+        return [], [f"{source} cannot be parsed as Python: {error}"]
+
+    commands: list[str] = []
+    process_calls = {
+        "os.execl",
+        "os.execle",
+        "os.execlp",
+        "os.execlpe",
+        "os.execv",
+        "os.execve",
+        "os.execvp",
+        "os.execvpe",
+        "os.popen",
+        "os.spawnl",
+        "os.spawnle",
+        "os.spawnlp",
+        "os.spawnlpe",
+        "os.spawnv",
+        "os.spawnve",
+        "os.spawnvp",
+        "os.spawnvpe",
+        "os.system",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.Popen",
+        "subprocess.run",
+    }
+    imported_names: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in {"os", "subprocess"}:
+                    imported_names[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module in {"os", "subprocess"}:
+            for alias in node.names:
+                imported_names[alias.asname or alias.name] = (
+                    f"{node.module}.{alias.name}"
+                )
+
+    def call_name(node: ast.expr) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = call_name(node.value)
+            return f"{parent}.{node.attr}" if parent is not None else None
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        raw_name = call_name(node.func)
+        if raw_name is None:
+            continue
+        name_parts = raw_name.split(".", 1)
+        resolved_name = imported_names.get(name_parts[0], name_parts[0])
+        if len(name_parts) == 2:
+            resolved_name = f"{resolved_name}.{name_parts[1]}"
+        if resolved_name not in process_calls:
+            continue
+        if not node.args:
+            continue
+        command = node.args[0]
+        if isinstance(command, ast.Constant) and isinstance(command.value, str):
+            commands.append(command.value)
+        elif isinstance(command, (ast.List, ast.Tuple)) and all(
+            isinstance(element, ast.Constant) and isinstance(element.value, str)
+            for element in command.elts
+        ):
+            commands.append(" ".join(element.value for element in command.elts))
+    return commands, []
+
+
+def automation_command_scripts(
+    contents: str,
+    source: str,
+    *,
+    workflow_source: bool,
+) -> tuple[list[str], list[str]]:
+    if workflow_source:
+        return list(workflow_run_scripts(contents)), []
+    if source.endswith(".py"):
+        return python_command_scripts(contents, source)
+    if (
+        source.endswith((".sh", ".bash"))
+        or contents.startswith("#!/bin/sh")
+        or contents.startswith("#!/usr/bin/env bash")
+    ):
+        return [contents], []
+    return [], []
+
+
 def local_automation_references(
     contents: str,
     source: str,
+    *,
+    workflow_source: bool,
 ) -> tuple[set[str], list[str]]:
     """Collect canonical repo scripts and reject unscanned local actions/commands."""
 
     references: set[str] = set()
     errors: list[str] = []
-    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
-    for line_number, line in enumerate(logical_contents.splitlines(), start=1):
-        if re.search(r"\buses\s*:\s*['\"]?\./", line):
+    if workflow_source:
+        for line_number, line in enumerate(contents.splitlines(), start=1):
+            if YAML_DYNAMIC_RUN_FIELD.search(line):
+                errors.append(
+                    f"{source}:{line_number} run commands must not use YAML "
+                    "tags, anchors, or aliases"
+                )
+            if YAML_DYNAMIC_USES_FIELD.search(line):
+                errors.append(
+                    f"{source}:{line_number} action references must not use YAML "
+                    "tags, anchors, or aliases"
+                )
+            if not LOCAL_ACTION_CANDIDATE.search(line):
+                continue
             match = LOCAL_ACTION_REFERENCE.search(line)
             if match is None:
                 errors.append(
@@ -1357,51 +1560,50 @@ def local_automation_references(
                 )
             else:
                 action_path = normalize_repository_path(match.group("path"))
-                if action_path is None or not action_path.startswith(".github/actions/"):
+                if action_path is None or not action_path.startswith(
+                    ".github/actions/"
+                ):
                     errors.append(
                         f"{source}:{line_number} local actions must be under "
                         ".github/actions"
                     )
 
-        for match in LOCAL_SCRIPT_LITERAL.finditer(line):
-            script_path = normalize_repository_path(match.group("path"))
-            if script_path is None:
-                errors.append(
-                    f"{source}:{line_number} has a non-canonical script path"
+    command_scripts, command_failures = automation_command_scripts(
+        contents,
+        source,
+        workflow_source=workflow_source,
+    )
+    errors.extend(command_failures)
+    for command_script in command_scripts:
+        for line_number, line in enumerate(
+            shell_command_lines(command_script),
+            start=1,
+        ):
+            for match in LOCAL_COMMAND_REFERENCE.finditer(line):
+                raw_command_path = (
+                    match.group("interpreted")
+                    or match.group("direct")
+                    or match.group("bare")
                 )
-            elif script_path.startswith(GENERATED_SCRIPT_PREFIXES):
-                continue
-            elif script_path.startswith(APPROVED_AUTOMATION_ROOTS):
-                references.add(script_path)
-            else:
-                errors.append(
-                    f"{source}:{line_number} script {script_path!r} is outside "
-                    "the scanned automation roots"
-                )
-
-        for match in LOCAL_COMMAND_REFERENCE.finditer(line):
-            raw_command_path = (
-                match.group("interpreted")
-                or match.group("direct")
-                or match.group("bare")
-            )
-            if raw_command_path.endswith("/"):
-                continue
-            command_path = normalize_repository_path(raw_command_path)
-            if command_path is None:
-                errors.append(
-                    f"{source}:{line_number} has a non-canonical repository command"
-                )
-                continue
-            if command_path in GENERATED_COMMAND_PATHS:
-                continue
-            if command_path.startswith(APPROVED_AUTOMATION_ROOTS):
-                references.add(command_path)
-            else:
-                errors.append(
-                    f"{source}:{line_number} repository command {command_path!r} is "
-                    "outside the scanned automation roots"
-                )
+                if raw_command_path.endswith("/"):
+                    continue
+                command_path = normalize_repository_path(raw_command_path)
+                if command_path is None:
+                    errors.append(
+                        f"{source}:{line_number} has a non-canonical repository command"
+                    )
+                    continue
+                if command_path in GENERATED_COMMAND_PATHS:
+                    continue
+                if command_path.startswith(GENERATED_SCRIPT_PREFIXES):
+                    continue
+                if command_path.startswith(APPROVED_AUTOMATION_ROOTS):
+                    references.add(command_path)
+                else:
+                    errors.append(
+                        f"{source}:{line_number} repository command {command_path!r} "
+                        "is outside the scanned automation roots"
+                    )
     return references, errors
 
 
@@ -1416,7 +1618,11 @@ def reachable_automation_references(
     errors: list[str] = []
     pending: list[str] = []
     for name, contents in sorted(sources.items()):
-        references, failures = local_automation_references(contents, f"{label}/{name}")
+        references, failures = local_automation_references(
+            contents,
+            f"{label}/{name}",
+            workflow_source=True,
+        )
         errors.extend(failures)
         pending.extend(sorted(references))
 
@@ -1432,6 +1638,7 @@ def reachable_automation_references(
         references, failures = local_automation_references(
             contents,
             f"{label}/{name}",
+            workflow_source=False,
         )
         errors.extend(failures)
         pending.extend(sorted(references - reachable))
@@ -2452,6 +2659,30 @@ pre_build = []
     ):
         failures.append("safe referenced automation was rejected")
 
+    quoted_run_workflow = referenced_workflow.replace(
+        "run: bash scripts/safe.sh",
+        'run: "bash scripts/safe.sh"',
+    )
+    if validate_automation_collection(
+        {"ci.yml": quoted_run_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("quoted safe automation command was rejected")
+
+    aliased_run_workflow = referenced_workflow.replace(
+        "run: bash scripts/safe.sh",
+        "run: *external_command",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": aliased_run_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("YAML-aliased automation command was not rejected")
+
     external_action_workflow = referenced_workflow.replace(
         "./.github/actions/setup",
         "./ci/cross-action",
@@ -2475,6 +2706,53 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("repository script outside scanned roots was not rejected")
+
+    benign_heredoc_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "python3 - <<'PY'\n"
+        "          print('| GCP/Azure | src/plugins/mod.rs | n/a |')\n"
+        "          print('attacker.sh is fixture data, not a command')\n"
+        "          PY",
+    )
+    if validate_automation_collection(
+        {"ci.yml": benign_heredoc_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append("benign inline-program data was treated as an executable path")
+
+    benign_python_automation = {
+        "scripts/safe.py": (
+            "FIXTURES = ('./ci/arm64.sh', 'scripts/missing.sh')\n"
+            "print(FIXTURES)\n"
+        )
+    }
+    python_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "python3 scripts/safe.py",
+    )
+    if validate_automation_collection(
+        {"ci.yml": python_workflow},
+        {"setup/action.yml": safe_action},
+        benign_python_automation,
+        "self-test automation directory",
+    ):
+        failures.append("benign Python fixture strings were treated as commands")
+
+    external_python_automation = {
+        "scripts/safe.py": (
+            "from subprocess import run as execute\n"
+            "execute(['python3', 'ci/arm64.py'], check=True)\n"
+        )
+    }
+    if not validate_automation_collection(
+        {"ci.yml": python_workflow},
+        {"setup/action.yml": safe_action},
+        external_python_automation,
+        "self-test automation directory",
+    ):
+        failures.append("Python process API escaped the scanned automation roots")
 
     benign_automation_edit = {"scripts/safe.sh": "#!/bin/sh\necho still-safe\n"}
     if compare_pr_automation_collection(
