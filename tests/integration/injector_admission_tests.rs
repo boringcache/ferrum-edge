@@ -58,6 +58,7 @@ fn injector_config(capture_mode: CaptureMode) -> InjectorConfig {
         tls_key_path: None,
         allow_plaintext: true,
         tls_handshake_timeout_seconds: 10,
+        http_header_read_timeout_seconds: 10,
         admission_review_max_body_bytes: 4 * 1024 * 1024,
     }
 }
