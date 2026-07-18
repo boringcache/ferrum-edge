@@ -1213,10 +1213,8 @@ async fn native_grpc_representation_rejection_strips_backend_headers() {
 async fn grpc_representation_rejection_preserves_decorators_with_or_without_deadline() {
     for deadline_active in [false, true] {
         for grpc_web_content_type in [None, Some("application/grpc-web+proto")] {
-            let plugins: Vec<Arc<dyn Plugin>> = vec![
-                Arc::new(ClaimEverythingPolicy),
-                Arc::new(RejectDecorator),
-            ];
+            let plugins: Vec<Arc<dyn Plugin>> =
+                vec![Arc::new(ClaimEverythingPolicy), Arc::new(RejectDecorator)];
             let mut ctx = make_ctx();
             if deadline_active {
                 set_grpc_deadline_budget_for_test(&mut ctx, Some(10_000));
@@ -1300,10 +1298,7 @@ fn grpc_body_rewrite_discards_application_trailers_but_preserves_terminal_status
         trailers,
         HashMap::from([("grpc-status".to_string(), "0".to_string())])
     );
-    assert_eq!(
-        headers.get("grpc-status").map(String::as_str),
-        Some("0")
-    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("0"));
     assert_eq!(
         headers.get("x-shadowed").map(String::as_str),
         Some("initial")
@@ -1339,10 +1334,7 @@ fn h3_bridge_replacement_preserves_synthesized_terminal_status() {
         trailers.is_empty(),
         "Trailers-Only status must not be duplicated"
     );
-    assert_eq!(
-        headers.get("grpc-status").map(String::as_str),
-        Some("13")
-    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("13"));
     assert_eq!(
         headers.get("grpc-message").map(String::as_str),
         Some("response representation could not be inspected")

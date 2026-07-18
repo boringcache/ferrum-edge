@@ -15775,26 +15775,25 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     // `Content-Encoding` after a decode cannot be resurrected by a later rebuild,
     // which replays gateway output only.
     ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
-    let (rewrite_allowed, representation_rewritten) =
-        match admit_buffered_response_body_transforms(
-            plugins,
-            ctx,
-            origin,
-            response_status,
-            response_headers,
-            response_body,
-            grpc_web_response_content_type,
-            initial_response_header_policy_plugins,
-            true,
-        )
-        .await
-        {
-            BufferedTransformAdmission::Proceed {
-                rewrite_allowed,
-                representation_rewritten,
-            } => (rewrite_allowed, representation_rewritten),
-            BufferedTransformAdmission::Rejected => return (true, false),
-        };
+    let (rewrite_allowed, representation_rewritten) = match admit_buffered_response_body_transforms(
+        plugins,
+        ctx,
+        origin,
+        response_status,
+        response_headers,
+        response_body,
+        grpc_web_response_content_type,
+        initial_response_header_policy_plugins,
+        true,
+    )
+    .await
+    {
+        BufferedTransformAdmission::Proceed {
+            rewrite_allowed,
+            representation_rewritten,
+        } => (rewrite_allowed, representation_rewritten),
+        BufferedTransformAdmission::Rejected => return (true, false),
+    };
     if !rewrite_allowed {
         return (false, false);
     }
