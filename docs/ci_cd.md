@@ -420,7 +420,16 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   `run: $CMD`, and `run: $(plan)` all fail closed even though no literal
   `build --target` text is left on the line; an expression that is an argument
   to a named command, or that is only data, does not occupy a command word and
-  stays editable.
+  stays editable. Substituting a whole command needs a slot that dispatches
+  one. An explicit executable slot on the line — `run:`, a statement separator,
+  `$(`, a conditional keyword — always counts; a bare line start counts only
+  where a shell evaluates the line, because a raw line scan also reads a
+  workflow's non-`run` block scalars and a script's heredoc bodies. An
+  expression standing alone inside a `prompt: |` block or a `cat <<EOF`
+  configuration body is data the runner never dispatches, while the same
+  expression alone on its own line inside a `run: |` block is a command and
+  still fails closed. An executable heredoc is unaffected either way: it is
+  extracted and rescanned as its own program.
   Binding Cross to another executable name is itself a Cross surface: linking,
   copying, moving, or installing the Cross binary under a new name, and writing
   a wrapper script whose body runs Cross, are all detected, and every later

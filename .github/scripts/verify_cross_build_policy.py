@@ -428,11 +428,18 @@ CASE_ARM_CONTEXT = r"(?:\bin|;;)\s+\(?\s*[^\s;&|()]+(?:\s*\|\s*[^\s;&|()]+)*\)\s
 # context, whereas a bare `(` also appears literally inside quoted prose.
 # `$(`, a backtick, and `<(`/`>(` are unambiguous executable slots, so an
 # assignment such as `out=$(cross build ...)` is one.
-COMMAND_START_CONTEXT = (
-    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|"
+# Every context except a bare line start names the executable slot explicitly,
+# so a scanner can rely on one without knowing whether the line is a command at
+# all. A bare line start only means "command word" once the line is known to be
+# shell the runner evaluates, which `shell_evaluated_lines` decides.
+EXPLICIT_COMMAND_START_CONTEXT = (
+    r"(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|"
     r"\$\(\s*|`\s*|[<>]\(\s*|"
     rf"{CASE_ARM_CONTEXT}|{SHELL_C_CONTEXT}|"
-    r"\b(?:if|elif|while|until|then|do|else)\s+)"
+    r"\b(?:if|elif|while|until|then|do|else)\s+"
+)
+COMMAND_START_CONTEXT = (
+    rf"(?:^\s*|{EXPLICIT_COMMAND_START_CONTEXT})"
     r"(?:!\s*)?"
 )
 # `env` and the ordinary command wrappers accept options whose operand is a
@@ -484,6 +491,15 @@ CROSS_COMMAND_CONTEXT = re.compile(
     + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
     r"(?:\(\s*)?"
     + CROSS_EXECUTABLE
+)
+# The same command slot, matched against the text that precedes a word instead
+# of against the word itself. Whatever ends here occupies an executable slot.
+EXPLICIT_COMMAND_WORD_PREFIX = re.compile(
+    rf"(?:{EXPLICIT_COMMAND_START_CONTEXT})"
+    r"(?:!\s*)?"
+    + WRAPPER_PREFIX
+    + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+    r"(?:\(\s*)?$"
 )
 WRAPPED_LITERAL_CROSS = re.compile(
     r"(?:\b(?:bash|sh)\s+-c\s+['\"][^'\"]*\bcross\s+|"
@@ -2880,14 +2896,28 @@ def shell_argv_dispatch_analysis(tokens: tuple[str, ...]) -> frozenset[str]:
     while index < len(tokens):
         name: str | None = None
         body_start = 0
-        if (
-            index + 3 < len(tokens)
-            and tokens[index] not in {"{", "}", "(", ")"}
+        # The lexer returns a run of punctuation as one token, so the empty
+        # parameter list of `run() { ...; }` arrives as a single `()` rather
+        # than as `(` followed by `)`. Both spellings are accepted so the
+        # ordinary function form is recognized alongside the `function`
+        # keyword form below.
+        parenthesis_width = 0
+        if index + 1 < len(tokens) and tokens[index + 1] == "()":
+            parenthesis_width = 1
+        elif (
+            index + 2 < len(tokens)
             and tokens[index + 1] == "("
             and tokens[index + 2] == ")"
-            and tokens[index + 3] == "{"
         ):
-            name, body_start = tokens[index], index + 4
+            parenthesis_width = 2
+        if (
+            parenthesis_width
+            and tokens[index] not in {"{", "}", "(", ")", "()"}
+            and index + parenthesis_width + 1 < len(tokens)
+            and tokens[index + parenthesis_width + 1] == "{"
+        ):
+            name = tokens[index]
+            body_start = index + parenthesis_width + 2
         elif (
             tokens[index] == "function"
             and index + 2 < len(tokens)
@@ -3278,9 +3308,32 @@ def opaque_word_spans(line: str, spans: tuple[tuple[int, int], ...]) -> tuple[tu
     return tuple((start, end) for start, end in merged)
 
 
+def opaque_word_starts_command(
+    line: str,
+    start: int,
+    *,
+    standalone_command: bool,
+) -> bool:
+    """Return whether an opaque word occupies a slot a shell dispatches.
+
+    Substituting a whole command is only sound where a whole command would run.
+    An explicit executable slot — `run:`, a statement separator, `$(`, a
+    conditional keyword — says so on the line itself. A bare line start says so
+    only when the line is shell the runner evaluates rather than block-scalar
+    prose or heredoc data.
+    """
+
+    prefix = line[:start]
+    if EXPLICIT_COMMAND_WORD_PREFIX.search(prefix):
+        return True
+    return standalone_command and not prefix.strip()
+
+
 def opaque_executable_variants(
     line: str,
     spans: tuple[tuple[int, int], ...],
+    *,
+    standalone_command: bool = True,
 ) -> tuple[str, ...]:
     """Substitute Cross into every opaque word that could hold the executable."""
 
@@ -3307,19 +3360,41 @@ def opaque_executable_variants(
             # leave nothing for the argument check to find. The same applies to
             # `run: $CMD`, to `run: $(plan)`, and to a composite action's
             # `run: ${{ inputs.cmd }}`.
-            whole_command = line[:start] + WHOLE_CROSS_COMMAND + line[end:]
-            if has_cross_command_context(whole_command):
-                variants.append(whole_command)
+            #
+            # The word has to stand in a slot a shell dispatches for that to be
+            # true. A workflow's prose block scalar and a script's heredoc body
+            # are scanned as raw lines too, and an expansion standing alone
+            # there is data the runner never executes.
+            if opaque_word_starts_command(
+                line,
+                start,
+                standalone_command=standalone_command,
+            ):
+                whole_command = line[:start] + WHOLE_CROSS_COMMAND + line[end:]
+                if has_cross_command_context(whole_command):
+                    variants.append(whole_command)
     return tuple(variants)
 
 
-def opaque_command_completion_variants(line: str) -> tuple[str, ...]:
+def opaque_command_completion_variants(
+    line: str,
+    *,
+    standalone_command: bool = True,
+) -> tuple[str, ...]:
     """Expose opaque substitutions that can complete a literal Cross token."""
 
-    return opaque_executable_variants(line, command_substitution_spans(line))
+    return opaque_executable_variants(
+        line,
+        command_substitution_spans(line),
+        standalone_command=standalone_command,
+    )
 
 
-def opaque_github_expression_variants(line: str) -> tuple[str, ...]:
+def opaque_github_expression_variants(
+    line: str,
+    *,
+    standalone_command: bool = True,
+) -> tuple[str, ...]:
     """Fail closed when a dynamic expression occupies a Cross command slot."""
 
     dynamic_spans: list[tuple[int, int]] = []
@@ -3336,10 +3411,18 @@ def opaque_github_expression_variants(line: str) -> tuple[str, ...]:
         if is_quoted_literal or github_format_literal(inner) is not None:
             continue
         dynamic_spans.append((start, end))
-    return opaque_executable_variants(line, tuple(dynamic_spans))
+    return opaque_executable_variants(
+        line,
+        tuple(dynamic_spans),
+        standalone_command=standalone_command,
+    )
 
 
-def opaque_shell_interpolation_variants(line: str) -> tuple[str, ...]:
+def opaque_shell_interpolation_variants(
+    line: str,
+    *,
+    standalone_command: bool = True,
+) -> tuple[str, ...]:
     """Expose a shell interpolation that can occupy a Cross executable word."""
 
     # Command substitutions participate in the same word as parameter
@@ -3348,7 +3431,11 @@ def opaque_shell_interpolation_variants(line: str) -> tuple[str, ...]:
         [match.span() for match in SHELL_INTERPOLATION.finditer(line)]
         + list(command_substitution_spans(line))
     )
-    return opaque_executable_variants(line, spans)
+    return opaque_executable_variants(
+        line,
+        spans,
+        standalone_command=standalone_command,
+    )
 
 
 def decode_ansi_c_body(value: str) -> str:
@@ -3478,14 +3565,30 @@ def scan_variants(
     line: str,
     *,
     include_opaque_shell_executable: bool = False,
+    standalone_command: bool = True,
 ) -> tuple[str, ...]:
     """Expose ordinary YAML/shell quoting variants to the lexical boundary."""
 
     variants = [line]
-    variants.extend(opaque_command_completion_variants(line))
-    variants.extend(opaque_github_expression_variants(line))
+    variants.extend(
+        opaque_command_completion_variants(
+            line,
+            standalone_command=standalone_command,
+        )
+    )
+    variants.extend(
+        opaque_github_expression_variants(
+            line,
+            standalone_command=standalone_command,
+        )
+    )
     if include_opaque_shell_executable:
-        variants.extend(opaque_shell_interpolation_variants(line))
+        variants.extend(
+            opaque_shell_interpolation_variants(
+                line,
+                standalone_command=standalone_command,
+            )
+        )
     variants.extend(ansi_c_quoted_variants(line))
     variants.extend(word_splitting_variants(line))
     collapsed = re.sub(r"[\\'\"]", "", line)
@@ -3578,11 +3681,12 @@ def literal_command_text_has_cross(
     """
 
     logical_text = re.sub(r"\\\r?\n[ \t]*", "", text)
+    evaluated = shell_evaluated_lines(logical_text)
     return any(
         has_cross_command_context(variant)
         or (not executable_only and CROSS_ENVIRONMENT.search(variant))
-        for line in logical_text.splitlines()
-        for variant in scan_variants(line)
+        for index, line in enumerate(logical_text.splitlines())
+        for variant in scan_variants(line, standalone_command=index in evaluated)
     )
 
 
@@ -3741,13 +3845,80 @@ def cross_shim_variants(contents: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(variants))
 
 
-def logical_scan_lines(contents: str) -> tuple[str, ...]:
-    """Return every command line to scan, including alias and shim expansions."""
+YAML_BLOCK_SCALAR_FIELD = re.compile(
+    r"^(?P<indent> *)(?:-\s+)?(?P<key>[^\s:#][^:#]*?)\s*:\s*(?P<value>[|>].*)$"
+)
 
+
+def shell_evaluated_lines(contents: str) -> frozenset[int]:
+    """Return the lines a shell evaluates as commands rather than as data.
+
+    Raw-line scanning cannot tell a command from the text that surrounds it, so
+    a workflow's prose block scalar and a script's heredoc body are read line by
+    line exactly like a `run:` body is. That is harmless while every check needs
+    literal Cross text on the line, and wrong once a bare line start lets an
+    opaque word stand for a whole command: `${{ github.event.comment.body }}`
+    inside a `prompt: |` block and `$federated_block` inside a generated-YAML
+    heredoc are data the runner never dispatches.
+
+    Only that bare-line-start allowance is withdrawn. An explicit executable
+    slot on the line still counts everywhere, and an executable heredoc is
+    unaffected because it is extracted and rescanned as its own program, where
+    its lines are command lines again.
+    """
+
+    lines = contents.splitlines()
+    evaluated = set(range(len(lines)))
+
+    index = 0
+    while index < len(lines):
+        match = YAML_BLOCK_SCALAR_FIELD.match(lines[index])
+        if match is None or BLOCK_SCALAR_HEADER.fullmatch(
+            match.group("value").strip()
+        ) is None:
+            index += 1
+            continue
+        body_is_shell = match.group("key").strip("'\"") in {"run", "shell"}
+        indent = len(match.group("indent"))
+        cursor = index + 1
+        while cursor < len(lines):
+            body = lines[cursor]
+            if body.strip() and len(body) - len(body.lstrip(" ")) <= indent:
+                break
+            if not body_is_shell:
+                evaluated.discard(cursor)
+            cursor += 1
+        index = cursor
+
+    delimiters: list[str] = []
+    for cursor, line in enumerate(lines):
+        if delimiters:
+            if line.strip() == delimiters[0]:
+                delimiters.pop(0)
+            else:
+                evaluated.discard(cursor)
+            continue
+        delimiters.extend(
+            delimiter for _, delimiter in quote_aware_heredoc_starts(line)
+        )
+    return frozenset(evaluated)
+
+
+def logical_scan_lines(contents: str) -> tuple[tuple[str, bool], ...]:
+    """Return every command line to scan with whether a shell evaluates it.
+
+    Alias and shim expansions are synthesized command text rather than source
+    lines, so they are always read as commands.
+    """
+
+    evaluated = shell_evaluated_lines(contents)
     return (
-        *contents.splitlines(),
-        *shell_alias_variants(contents),
-        *cross_shim_variants(contents),
+        *(
+            (line, index in evaluated)
+            for index, line in enumerate(contents.splitlines())
+        ),
+        *((line, True) for line in shell_alias_variants(contents)),
+        *((line, True) for line in cross_shim_variants(contents)),
     )
 
 
@@ -3770,12 +3941,51 @@ def contains_cross_surface(
                 include_opaque_shell_executable=include_opaque_shell_executable,
             )
             or CROSS_ENVIRONMENT.search(variant)
-            for line in logical_scan_lines(logical_contents)
+            for line, standalone_command in logical_scan_lines(logical_contents)
             for variant in scan_variants(
                 line,
                 include_opaque_shell_executable=include_opaque_shell_executable,
+                standalone_command=standalone_command,
             )
         )
+
+
+def cross_surface_line_report(
+    contents: str,
+    *,
+    include_opaque_shell_executable: bool = False,
+) -> str:
+    """Name the first line a Cross scan matched, for the rejection message.
+
+    A digest-level rejection tells an author that a file holds a Cross surface
+    without saying where, which is most of the work of acting on it. The scan is
+    replayed only when a file has already been rejected.
+    """
+
+    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    # Alias and shim expansions follow the source lines and are synthesized
+    # rather than located, so they are reported without a line number.
+    source_line_count = len(logical_contents.splitlines())
+    for number, (line, standalone_command) in enumerate(
+        logical_scan_lines(logical_contents),
+        start=1,
+    ):
+        for variant in scan_variants(
+            line,
+            include_opaque_shell_executable=include_opaque_shell_executable,
+            standalone_command=standalone_command,
+        ):
+            if has_cross_command_context(
+                variant,
+                include_opaque_shell_executable=include_opaque_shell_executable,
+            ) or CROSS_ENVIRONMENT.search(variant):
+                where = (
+                    f"line {number}"
+                    if number <= source_line_count
+                    else "expanded command text"
+                )
+                return f" ({where}: {line.strip()[:160]!r})"
+    return ""
 
 
 def step_block_bounds(
@@ -4411,6 +4621,7 @@ def unprotected_cross_surfaces(
         outside = contents[:block_start] + contents[block_start + len(block) :]
 
     lines = outside.splitlines(keepends=True)
+    evaluated_lines = shell_evaluated_lines(outside)
     jobs_index = next(
         index
         for index, line in enumerate(lines)
@@ -4458,10 +4669,13 @@ def unprotected_cross_surfaces(
             sensitive_jobs.add(name)
             continue
         with shell_argv_dispatch_scope(logical_contents):
-            for logical_line in logical_scan_lines(logical_contents):
+            for logical_line, standalone_command in logical_scan_lines(
+                logical_contents
+            ):
                 for variant in scan_variants(
                     logical_line,
                     include_opaque_shell_executable=include_opaque_shell_executable,
+                    standalone_command=standalone_command,
                 ):
                     if has_cross_command_context(
                         variant,
@@ -4493,6 +4707,7 @@ def unprotected_cross_surfaces(
         for variant in scan_variants(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
+            standalone_command=index in evaluated_lines,
         ):
             normalized = re.sub(r"\s+", " ", variant).strip()
             if has_cross_command_context(
@@ -4592,7 +4807,7 @@ def validate_workflow_collection(
         if surfaces:
             errors.append(
                 f"{source}/{name} contains an unprotected Cross executable or "
-                "configuration input"
+                "configuration input" + cross_surface_line_report(contents)
             )
     return errors
 
@@ -4668,10 +4883,13 @@ def generic_action_cross_surfaces(
                     include_opaque_shell_executable=include_opaque_shell_executable,
                 )
                 or CROSS_ENVIRONMENT.search(variant)
-                for line in logical_scan_lines(logical_contents)
+                for line, standalone_command in logical_scan_lines(
+                    logical_contents
+                )
                 for variant in scan_variants(
                     line,
                     include_opaque_shell_executable=include_opaque_shell_executable,
+                    standalone_command=standalone_command,
                 )
             )
         )
@@ -4688,10 +4906,11 @@ def contains_literal_executable_cross(contents: str) -> bool:
     with shell_argv_dispatch_scope(logical_contents):
         return any(
             has_cross_command_context(variant) or CROSS_ENVIRONMENT.search(variant)
-            for line in logical_scan_lines(logical_contents)
+            for line, standalone_command in logical_scan_lines(logical_contents)
             for variant in scan_variants(
                 line,
                 include_opaque_shell_executable=False,
+                standalone_command=standalone_command,
             )
         )
 
@@ -6486,6 +6705,7 @@ def validate_automation_collection(
             errors.append(
                 f"{source}/{name} contains an unprotected Cross executable or "
                 "generated inline shell surface"
+                + cross_surface_line_report(contents)
             )
         elif (
             contents is not None
@@ -6777,9 +6997,12 @@ def validate_workflow_contract(
     )
     errors.extend(surface_failures)
     if surfaces:
+        # Name the surfaces themselves: a bare rejection leaves the author to
+        # rediscover which line the scan matched.
+        listed = ", ".join(surface[:160] for surface in surfaces[:3])
         errors.append(
             f"{source} contains Cross executable or configuration input outside "
-            f"protected job {job_name!r}"
+            f"protected job {job_name!r} ({listed})"
         )
     errors.extend(validate_publish_control_contract(contents, source))
     if source == "CI workflow":
@@ -8902,6 +9125,90 @@ pre_build = []
         )
         if surfaces or errors:
             failures.append(f"{label} was rejected")
+
+    # A whole-command expression standing alone on its own line inside a `run:`
+    # block is still a command, so withdrawing the bare-line-start allowance
+    # from prose and heredoc data must not withdraw it here.
+    run_block_workflow = (
+        "name: Expression\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          BODY\n"
+    )
+    for label, body in whole_command_bodies.items():
+        surfaces, errors = generic_workflow_cross_surfaces(
+            run_block_workflow.replace("BODY", body),
+            "self-test run block workflow",
+            include_opaque_shell_executable=True,
+        )
+        if not surfaces and not errors:
+            failures.append(f"{label} in a run block was not protected")
+
+    # The same text inside a block scalar the runner never executes is prose,
+    # not a command word, and must leave the file editable.
+    prose_block_workflow = (
+        "name: Prose\n"
+        "on: [issue_comment]\n"
+        "jobs:\n"
+        "  review:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo reviewing\n"
+        "        env:\n"
+        "          PROMPT: |\n"
+        "            Review this comment:\n"
+        "            BODY\n"
+    )
+    for label, body in whole_command_bodies.items():
+        surfaces, errors = generic_workflow_cross_surfaces(
+            prose_block_workflow.replace("BODY", body),
+            "self-test prose workflow",
+            include_opaque_shell_executable=True,
+        )
+        if surfaces or errors:
+            failures.append(f"{label} in a prose block scalar was rejected")
+
+    # A heredoc body is data the shell hands to the reader, so an expansion
+    # standing alone there is not a command word either. The `cat` form is the
+    # generated-configuration shape real automation uses.
+    heredoc_data_scripts = {
+        "expansion alone in a heredoc body": (
+            'cat <<EOF > config.yaml\nkey: value\n$block\nEOF\n'
+        ),
+        "substitution alone in a heredoc body": (
+            'cat <<EOF > config.yaml\nkey: value\n$(render_block)\nEOF\n'
+        ),
+    }
+    for label, body in heredoc_data_scripts.items():
+        proposed_heredoc = {"scripts/safe.sh": f"#!/bin/sh\n{body}"}
+        if compare_pr_automation_collection(
+            {"ci.yml": referenced_workflow},
+            {"ci.yml": referenced_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            safe_automation,
+            proposed_heredoc,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} was rejected by PR comparison")
+        if validate_automation_collection(
+            {"ci.yml": referenced_workflow},
+            {"setup/action.yml": safe_action},
+            proposed_heredoc,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} was rejected by tree validation")
+
+    # An expansion standing alone in ordinary script text is still a command,
+    # so the heredoc allowance must not reach past the terminator.
+    shell_automation_escapes(
+        "substitution alone after a heredoc terminator",
+        "cat <<EOF > config.yaml\nkey: value\nEOF\n$(plan)",
+    )
     shell_automation_escapes(
         "env with a separate option operand",
         f"env -u FOO cross {arm_target}",
@@ -10092,10 +10399,11 @@ pre_build = []
             logical_benign = re.sub(r"\\\r?\n[ \t]*", "", benign_contents)
             matching_variants = [
                 variant
-                for line in logical_scan_lines(logical_benign)
+                for line, standalone_command in logical_scan_lines(logical_benign)
                 for variant in scan_variants(
                     line,
                     include_opaque_shell_executable=True,
+                    standalone_command=standalone_command,
                 )
                 if has_cross_command_context(
                     variant,
