@@ -1044,6 +1044,9 @@ fn strip_markers_from_json_strings(body: &[u8], tags: &(String, String)) -> Opti
     )
 }
 
+// External tests reach this through the lib target's `_test_support` shim;
+// the bin target recompiles this plugin module without that caller.
+#[allow(dead_code)]
 pub(crate) fn preserve_marker_sanitizer_work_for_test(
     body: &[u8],
     tags: &(String, String),
