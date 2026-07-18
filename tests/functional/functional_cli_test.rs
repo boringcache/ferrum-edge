@@ -300,14 +300,21 @@ async fn functional_cli_validate_with_settings() {
 
 /// Database-mode validate needs an admin JWT secret and a DB URL; sqlite
 /// in-memory keeps the check hermetic.
+///
+/// `current_dir()` is the temp dir so the repo's own `./ferrum.conf` is never
+/// picked up by the smart-path search, which means the binary must be spawned
+/// through `binary_abs_path()`. An inherited `FERRUM_ADMIN_JWT_SECRET` would
+/// turn the `_FILE` cases into source conflicts, so the base key and the
+/// config-path vars are cleared explicitly; callers that want them set them
+/// back afterwards.
 fn validate_database_mode_command(temp_dir: &TempDir) -> Command {
-    let mut cmd = Command::new(binary_path());
+    let mut cmd = Command::new(binary_abs_path());
     cmd.args(["validate"])
         .env("FERRUM_MODE", "database")
         .env("FERRUM_DB_URL", "sqlite::memory:")
-        // Database mode requires a file-backed DB URL directory to exist;
-        // sqlite::memory: has no such requirement, but keep HOME/TMPDIR
-        // inherited and isolate nothing else.
+        .env_remove("FERRUM_ADMIN_JWT_SECRET")
+        .env_remove("FERRUM_CONF_PATH")
+        .env_remove("FERRUM_FILE_CONFIG_PATH")
         .current_dir(temp_dir.path());
     cmd
 }
@@ -337,6 +344,13 @@ async fn functional_cli_validate_resolves_file_secret_suffix() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Validation passed."));
+    // The resolved value must never be echoed on either stream.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("validate-file-secret-with-well-over-32-bytes")
+            && !stderr.contains("validate-file-secret-with-well-over-32-bytes"),
+        "secret values must never be logged: stdout={stdout}, stderr={stderr}"
+    );
 }
 
 #[ignore]
@@ -368,6 +382,19 @@ async fn functional_cli_validate_rejects_secret_source_conflict() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // Assert the reason, so an unrelated validation failure cannot make this
+    // test pass vacuously.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Multiple secret sources configured for FERRUM_ADMIN_JWT_SECRET"),
+        "expected a secret source conflict error, got: {stderr}"
+    );
+    // The resolved value must never reach the error output.
+    assert!(
+        !stderr.contains("direct-secret-value-with-well-over-32-bytes")
+            && !stderr.contains("validate-file-secret-with-well-over-32-bytes"),
+        "secret values must never be logged: {stderr}"
+    );
 }
 
 #[ignore]
@@ -390,6 +417,13 @@ async fn functional_cli_validate_fails_on_secret_resolution_error() {
         "validate must fail when a suffixed secret source cannot be read: stdout={}, stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    // Assert the reason, so an unrelated validation failure cannot make this
+    // test pass vacuously.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to read FERRUM_ADMIN_JWT_SECRET_FILE"),
+        "expected a secret read failure error, got: {stderr}"
     );
 }
 
