@@ -1080,13 +1080,8 @@ async fn buffered_deadline_strips_gateway_authored_cache_and_representation_head
             ("vary".to_string(), "Accept-Encoding, Origin".to_string()),
         ]);
         assert!(
-            !run_after_proxy_hooks_for_test(
-                &after_proxy_plugins,
-                &mut ctx,
-                200,
-                &mut headers,
-            )
-            .await,
+            !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers,)
+                .await,
             "response transformer must not reject the backend response"
         );
         for (name, value) in stale_headers {
