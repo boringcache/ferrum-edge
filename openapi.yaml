@@ -19317,8 +19317,8 @@ components:
             properties:
               resource_type:
                 type: string
-                enum: [proxy, upstream, plugin, plugin_composition, plugin_graph, restore_snapshot]
-                description: Kind of resource, aggregate plugin composition, or pre-delete restore snapshot that failed
+                enum: [proxy, upstream, upstream_graph, plugin, plugin_composition, plugin_graph, restore_snapshot]
+                description: Kind of resource, upstream/plugin graph, or pre-delete restore snapshot that failed
               id:
                 type: string
                 description: ID of the resource (from the extension object)
