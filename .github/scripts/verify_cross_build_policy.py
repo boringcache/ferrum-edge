@@ -1324,6 +1324,15 @@ def shell_stdin_program(
     if tool_name(segment[index]) not in SHELL_INTERPRETER_NAMES:
         return None, False
 
+    command_program, option_opaque, reads_stdin = shell_invocation_mode(
+        segment,
+        index,
+    )
+    if command_program is not None or not reads_stdin:
+        return None, False
+    if option_opaque:
+        return None, True
+
     arguments = segment[index + 1 :]
     for position, token in enumerate(arguments):
         if token == "<<<":
@@ -1355,17 +1364,6 @@ def shell_stdin_program(
                 )
                 return (output, output is None)
 
-    option_index = 0
-    while option_index < len(arguments) and arguments[option_index].startswith("-"):
-        option = arguments[option_index]
-        if "c" in option.lstrip("-"):
-            return None, False
-        option_index += 1
-    if option_index < len(arguments) and not redirection_token(
-        arguments[option_index]
-    ):
-        # A literal script operand, rather than stdin, supplies this shell's code.
-        return None, False
     return None, True
 
 
@@ -1385,6 +1383,73 @@ def split_shell_pipeline(tokens: tuple[str, ...]) -> tuple[tuple[str, ...], ...]
             current.append(token)
     segments.append(tuple(current))
     return tuple(segment for segment in segments if segment)
+
+
+def shell_invocation_mode(
+    tokens: tuple[str, ...],
+    index: int,
+) -> tuple[str | None, bool, bool]:
+    """Return a shell `-c` program, option opacity, and stdin-code mode."""
+
+    option_operands = {"-O", "-o", "--init-file", "--rcfile"}
+    position = index + 1
+    force_stdin = False
+    while position < len(tokens):
+        option = tokens[position]
+        if option.isdigit() and position + 1 < len(tokens) and redirection_token(
+            tokens[position + 1]
+        ):
+            position += 1
+            option = tokens[position]
+        if redirection_token(option):
+            if position + 1 >= len(tokens):
+                return None, True, False
+            if "<" in option and (
+                tokens[position + 1] == "<("
+                or (
+                    position + 2 < len(tokens)
+                    and tokens[position + 1] == "<"
+                    and tokens[position + 2] == "("
+                )
+            ):
+                body_start = position + (
+                    2 if tokens[position + 1] == "<(" else 3
+                )
+                depth = 1
+                position = body_start
+                while position < len(tokens) and depth:
+                    if tokens[position] == "(":
+                        depth += 1
+                    elif tokens[position] == ")":
+                        depth -= 1
+                    position += 1
+                if depth:
+                    return None, True, False
+                continue
+            position += 2
+            continue
+        if option == "--":
+            position += 1
+            return None, False, force_stdin or position >= len(tokens)
+        if option == "-":
+            return None, False, True
+        if not option.startswith("-"):
+            # The first non-option is a script operand. Its later arguments
+            # cannot turn an option-looking word such as `--locked` into `-c`.
+            return None, False, force_stdin
+        if option in option_operands:
+            if position + 1 >= len(tokens):
+                return None, True, False
+            position += 2
+            continue
+        if not option.startswith("--") and "c" in option[1:]:
+            if position + 1 >= len(tokens):
+                return None, True, False
+            return tokens[position + 1], False, False
+        if not option.startswith("--") and "s" in option[1:]:
+            force_stdin = True
+        position += 1
+    return None, False, True
 
 
 def token_command_has_cross(
@@ -1434,18 +1499,17 @@ def token_command_has_cross(
             depth=depth + 1,
         )
     if command in SHELL_INTERPRETER_NAMES:
-        for position, option in enumerate(tokens[index + 1 :], start=index + 1):
-            if option.startswith("-") and "c" in option.lstrip("-"):
-                if position + 1 >= len(tokens):
-                    return include_opaque_shell_executable
-                program = tokens[position + 1]
-                if dynamic_shell_word(program):
-                    return include_opaque_shell_executable
-                return shell_program_has_cross(
-                    program,
-                    include_opaque_shell_executable=include_opaque_shell_executable,
-                    depth=depth + 1,
-                )
+        program, opaque, _ = shell_invocation_mode(tokens, index)
+        if opaque:
+            return include_opaque_shell_executable
+        if program is not None:
+            if dynamic_shell_word(program):
+                return include_opaque_shell_executable
+            return shell_program_has_cross(
+                program,
+                include_opaque_shell_executable=include_opaque_shell_executable,
+                depth=depth + 1,
+            )
     return False
 
 
@@ -5505,6 +5569,10 @@ pre_build = []
         f"printf 'cross {arm_target}' | bash",
     )
     shell_automation_escapes(
+        "literal pipeline shell stdin after shell options",
+        f"printf 'cross {arm_target}' | bash --norc",
+    )
+    shell_automation_escapes(
         "literal here-string shell stdin",
         f"bash <<< 'cross {arm_target}'",
     )
@@ -5520,6 +5588,9 @@ pre_build = []
         "xargs command": "printf x | xargs -n 1 echo",
         "find exec command": "find . -exec echo safe ';'",
         "literal pipeline shell input": "printf 'cargo build --locked' | bash",
+        "literal pipeline shell input after shell options": (
+            "printf 'cargo build --locked' | bash --norc"
+        ),
         "literal here-string shell input": "bash <<< 'cargo test --locked'",
         "literal process-substitution shell input": (
             "bash < <(printf 'cargo check --locked')"
