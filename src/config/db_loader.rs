@@ -1148,6 +1148,53 @@ impl DatabaseStore {
             .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
     }
 
+    /// Validate the exact proxy/plugin graph produced by an API-spec restore.
+    /// This is intentionally stricter than the shared admission validator:
+    /// compensation must never attach a restored proxy to a pre-existing
+    /// global, cross-proxy, cross-namespace, or otherwise wrong plugin row.
+    async fn validate_api_spec_restore_candidate_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        restored_proxy_id: &str,
+        validation_http_client: &crate::plugins::PluginHttpClient,
+    ) -> Result<(), anyhow::Error> {
+        let mut candidate = self
+            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .await?;
+        candidate.upstreams = self
+            .load_upstreams_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .await?;
+        candidate.normalize_fields();
+        let recovered_graph = crate::config::db_backend::api_spec_recovered_proxy_graph(
+            candidate.clone(),
+            restored_proxy_id,
+        )?;
+        Self::reject_invalid_gateway_plugin_references(
+            "restore_api_spec_bundle",
+            &recovered_graph,
+        )?;
+        Self::reject_invalid_gateway_upstream_references(
+            "restore_api_spec_bundle",
+            &recovered_graph,
+        )?;
+        crate::config::db_backend::validate_api_spec_recovered_plugin_graph(
+            &recovered_graph,
+            validation_http_client,
+        )
+        .await?;
+        Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
+        let Some(candidate) = self
+            .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+            .await?
+        else {
+            return Ok(());
+        };
+        candidate
+            .validate_unique_mtls_dns_identities()
+            .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
+    }
+
     async fn mtls_dns_identity_conflicts_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -1901,6 +1948,25 @@ impl DatabaseStore {
             // same typed marker used by the rest of the runtime validation
             // contract so database-mode polling keeps admin writes available
             // for in-band repair (issue #2158).
+            return Err(ConfigValidationRejection {
+                backend: "Database",
+                errors,
+            }
+            .into_anyhow()
+            .context(context));
+        }
+        Ok(())
+    }
+
+    fn reject_invalid_gateway_upstream_references(
+        operation: &str,
+        config: &GatewayConfig,
+    ) -> Result<(), anyhow::Error> {
+        if let Err(errors) = config.validate_upstream_references() {
+            let context = format!(
+                "operation={operation} resource=upstreams: invalid proxy/upstream references: {}",
+                errors.join("; ")
+            );
             return Err(ConfigValidationRejection {
                 backend: "Database",
                 errors,
@@ -2834,8 +2900,13 @@ impl DatabaseStore {
             }
         }
 
-        // If the proxy had an upstream, check if it's now orphaned and delete it
-        if let Some(ref uid) = upstream_id {
+        // Generic proxy deletion owns ordinary orphan cleanup. A spec-owned
+        // proxy can drift to a hand-owned upstream, though, and that resource
+        // must survive deletion of the spec graph. Spec-owned upstreams were
+        // already removed explicitly above.
+        if spec_owner.is_none()
+            && let Some(ref uid) = upstream_id
+        {
             self.cleanup_orphaned_upstream_tx(&mut tx, namespace, uid)
                 .await?;
         }
@@ -6380,14 +6451,87 @@ impl DatabaseStore {
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
+        self.restore_api_spec_bundle_inner(bundle, spec, &[], &[], None, false)
+            .await
+    }
+
+    pub async fn restore_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+        additional_upstreams: &[crate::config::types::Upstream],
+        additional_plugins: &[crate::config::types::PluginConfig],
+        validation_http_client: &crate::plugins::PluginHttpClient,
+    ) -> Result<(), anyhow::Error> {
+        self.restore_api_spec_bundle_inner(
+            bundle,
+            spec,
+            additional_upstreams,
+            additional_plugins,
+            Some(validation_http_client),
+            true,
+        )
+        .await
+    }
+
+    async fn restore_api_spec_bundle_inner(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+        additional_upstreams: &[crate::config::types::Upstream],
+        additional_plugins: &[crate::config::types::PluginConfig],
+        validation_http_client: Option<&crate::plugins::PluginHttpClient>,
+        compensation_restore: bool,
+    ) -> Result<(), anyhow::Error> {
         use crate::config::types::{AuthMode, ResponseBodyMode};
+
+        crate::config::db_backend::validate_api_spec_restore_inputs(
+            bundle,
+            spec,
+            additional_upstreams,
+            additional_plugins,
+            compensation_restore,
+        )?;
 
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace)
             .await?;
 
-        // 1. INSERT upstream (if present), tagged with api_spec_id.
-        if let Some(u) = &bundle.upstream {
+        // 1. INSERT upstream (if present), tagged with api_spec_id. Additional
+        // hand-owned upstreams may still exist when another proxy or mesh
+        // dispatch kept them live through the delete. Preserve those current
+        // rows instead of turning compensation into a duplicate-key failure.
+        let mut inserted_additional_upstream_ids = HashSet::new();
+        for (u, api_spec_id, allow_existing) in bundle
+            .upstream
+            .iter()
+            .map(|upstream| (upstream, Some(spec.id.as_str()), false))
+            .chain(
+                additional_upstreams
+                    .iter()
+                    .map(|upstream| (upstream, upstream.api_spec_id.as_deref(), true)),
+            )
+        {
+            if allow_existing {
+                let existing_sql = if self.db_type == "sqlite" {
+                    self.q("SELECT * FROM upstreams WHERE id = ? AND namespace = ?")
+                } else {
+                    self.q("SELECT * FROM upstreams WHERE id = ? AND namespace = ? FOR UPDATE")
+                };
+                let existing: Option<AnyRow> = sqlx::query(&existing_sql)
+                    .bind(&u.id)
+                    .bind(&u.namespace)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                if let Some(existing) = existing {
+                    let existing = row_to_upstream(&existing)?;
+                    crate::config::db_backend::validate_api_spec_retained_upstream_identity(
+                        u, &existing,
+                    )?;
+                    continue;
+                }
+                inserted_additional_upstream_ids.insert(u.id.clone());
+            }
             let targets_json = serde_json::to_string(&u.targets)?;
             let algo_json = serde_json::to_string(&u.algorithm)?;
             let algo_str = algo_json.trim_matches('"');
@@ -6432,7 +6576,7 @@ impl DatabaseStore {
             .bind(&u.backend_tls_server_ca_cert_path)
             .bind(&u.backend_tls_sni)
             .bind(&backend_tls_san_allow_list_json)
-            .bind(&spec.id)
+            .bind(api_spec_id)
             .bind(u.created_at.to_rfc3339())
             .bind(u.updated_at.to_rfc3339())
             .execute(&mut *tx)
@@ -6570,7 +6714,12 @@ impl DatabaseStore {
         }
 
         // 3. INSERT plugin_configs, tagged with api_spec_id.
-        for pc in &bundle.plugins {
+        for (pc, api_spec_id) in bundle
+            .plugins
+            .iter()
+            .map(|plugin| (plugin, Some(spec.id.as_str())))
+            .chain(additional_plugins.iter().map(|plugin| (plugin, None)))
+        {
             let config_json = serde_json::to_string(&pc.config)?;
             let scope_str = match pc.scope {
                 crate::config::types::PluginScope::Proxy => "proxy",
@@ -6589,7 +6738,7 @@ impl DatabaseStore {
             .bind(&pc.proxy_id)
             .bind(if pc.enabled { 1i32 } else { 0 })
             .bind(pc.priority_override.map(|v| v as i32))
-            .bind(&spec.id)
+            .bind(api_spec_id)
             .bind(pc.created_at.to_rfc3339())
             .bind(pc.updated_at.to_rfc3339())
             .execute(&mut *tx)
@@ -6613,9 +6762,35 @@ impl DatabaseStore {
 
         // 4. INSERT api_specs row.
         self.insert_api_spec_tx(&mut tx, spec).await?;
-        self.validate_namespace_admission_tx(&mut tx, &spec.namespace)
+        if compensation_restore {
+            let validation_http_client = validation_http_client.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "restore_api_spec_bundle requires the configured plugin validation client"
+                )
+            })?;
+            self.validate_api_spec_restore_candidate_tx(
+                &mut tx,
+                &spec.namespace,
+                &bundle.proxy.id,
+                validation_http_client,
+            )
             .await?;
-        if let Some(u) = &bundle.upstream {
+        } else {
+            // Preserve the normal submission contract: ordinary API-spec
+            // writes run the same guarded admission checks as the other
+            // resource writers, but must remain available to repair an
+            // unrelated invalid-but-present plugin graph. Compensation is
+            // stricter because it must prove that the graph being restored
+            // cannot publish the recovered proxy with the wrong plugin
+            // instance or association.
+            self.validate_namespace_admission_tx(&mut tx, &spec.namespace)
+                .await?;
+        }
+        for u in bundle.upstream.iter().chain(
+            additional_upstreams
+                .iter()
+                .filter(|upstream| inserted_additional_upstream_ids.contains(&upstream.id)),
+        ) {
             self.record_config_change_tx(&mut tx, &u.namespace, "upstream", &u.id, "upsert")
                 .await?;
         }
@@ -6627,7 +6802,7 @@ impl DatabaseStore {
             "upsert",
         )
         .await?;
-        for pc in &bundle.plugins {
+        for pc in bundle.plugins.iter().chain(additional_plugins) {
             self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
                 .await?;
         }
@@ -8462,6 +8637,25 @@ impl DatabaseBackend for DatabaseStore {
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
         DatabaseStore::submit_api_spec_bundle(self, bundle, spec).await
+    }
+
+    async fn restore_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+        additional_upstreams: &[crate::config::types::Upstream],
+        additional_plugins: &[crate::config::types::PluginConfig],
+        validation_http_client: &crate::plugins::PluginHttpClient,
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::restore_api_spec_bundle(
+            self,
+            bundle,
+            spec,
+            additional_upstreams,
+            additional_plugins,
+            validation_http_client,
+        )
+        .await
     }
 
     async fn replace_api_spec_bundle(

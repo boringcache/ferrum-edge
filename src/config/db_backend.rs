@@ -4,11 +4,345 @@
 //! polling are defined here. Each backend (sqlx, MongoDB) provides its own
 //! implementation. The trait is object-safe so it can be used as `Arc<dyn DatabaseBackend>`.
 
-use crate::config::types::{ApiSpec, Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
+use crate::config::types::{
+    ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
+};
+use crate::plugins::PluginHttpClient;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use percent_encoding::percent_decode_str;
 use std::collections::HashSet;
+
+/// Validate that a plugin row can be restored as an explicit association on
+/// `proxy_id`. Global plugins are inherited rather than associated, while a
+/// proxy-scoped plugin may only be attached to its own target proxy.
+pub(crate) fn validate_api_spec_proxy_plugin_association(
+    plugin: &PluginConfig,
+    proxy_id: &str,
+) -> Result<(), anyhow::Error> {
+    match plugin.scope {
+        PluginScope::Global => anyhow::bail!(
+            "API-spec restore associated plugin '{}' is global and cannot be associated explicitly with proxy '{}'",
+            plugin.id,
+            proxy_id
+        ),
+        PluginScope::Proxy if plugin.proxy_id.as_deref() != Some(proxy_id) => anyhow::bail!(
+            "API-spec restore associated plugin '{}' targets proxy '{}', not restored proxy '{}'",
+            plugin.id,
+            plugin.proxy_id.as_deref().unwrap_or("<none>"),
+            proxy_id
+        ),
+        PluginScope::ProxyGroup if plugin.proxy_id.is_some() => anyhow::bail!(
+            "API-spec restore associated proxy-group plugin '{}' unexpectedly carries proxy_id '{}'",
+            plugin.id,
+            plugin.proxy_id.as_deref().unwrap_or("<none>")
+        ),
+        PluginScope::Proxy | PluginScope::ProxyGroup => Ok(()),
+    }
+}
+
+/// Project a namespace transaction candidate down to the recovered proxy graph.
+///
+/// Restore must fail closed for the proxy it is publishing, including attached
+/// shared proxy-group rows, effective global rows, and unattached proxy-scoped
+/// rows that the cascade removed. Unrelated malformed associations remain
+/// available for in-band repair and must not make otherwise-valid compensation
+/// impossible.
+pub(crate) fn api_spec_recovered_proxy_graph(
+    mut candidate: GatewayConfig,
+    proxy_id: &str,
+) -> Result<GatewayConfig, anyhow::Error> {
+    let restored_proxy = candidate
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == proxy_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("API-spec restore proxy '{}' is missing", proxy_id))?;
+    let associated_plugin_ids: HashSet<&str> = restored_proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    candidate.plugin_configs.retain(|plugin| {
+        plugin.scope == PluginScope::Global
+            || associated_plugin_ids.contains(plugin.id.as_str())
+            || plugin.proxy_id.as_deref() == Some(proxy_id)
+    });
+    candidate.proxies.clear();
+    candidate.proxies.push(restored_proxy);
+    Ok(candidate)
+}
+
+/// Re-run the plugin composition and named-schema contracts against the exact
+/// recovered proxy graph. Compensation can follow an intervening writer, so
+/// the pre-delete admission result is no longer authoritative when the restore
+/// transaction commits.
+pub(crate) async fn validate_api_spec_recovered_plugin_graph(
+    candidate: &GatewayConfig,
+    http_client: &PluginHttpClient,
+) -> Result<(), anyhow::Error> {
+    let candidate = candidate.clone();
+    let http_client = http_client.clone();
+    tokio::task::spawn_blocking(move || {
+        for plugin in &candidate.plugin_configs {
+            crate::plugins::validate_plugin_config_with_http_client(
+                &plugin.plugin_name,
+                &plugin.config,
+                http_client.clone(),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "API-spec restore plugin '{}' validation failed: {}",
+                    plugin.id,
+                    error
+                )
+            })?;
+        }
+        crate::plugin_cache::validate_plugin_composition_candidate(&candidate, &http_client)
+            .map_err(anyhow::Error::msg)?;
+        crate::plugins::transaction_log_schema::validate_config_graph(
+            &candidate,
+            &http_client,
+            true,
+        )
+        .map_err(|errors| {
+            anyhow::anyhow!(
+                "API-spec restore produced an invalid transaction-log schema graph: {}",
+                errors.join("; ")
+            )
+        })
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("API-spec restore graph validation task failed: {error}"))?
+}
+
+/// Validate the immutable identity and ownership boundaries of an API-spec
+/// bundle before a backend starts an atomic restore.
+///
+/// A restore deliberately avoids upserts. These checks make that contract
+/// explicit: normal submissions must be unstamped, compensation resources must
+/// be stamped with this spec, and compensating upstreams and plugins preserve
+/// their exact ownership. Backends may reuse an additional hand-owned upstream
+/// only after validating its stable pre-delete identity.
+pub(crate) fn validate_api_spec_restore_inputs(
+    bundle: &crate::admin::api_specs::ExtractedBundle,
+    spec: &ApiSpec,
+    additional_upstreams: &[Upstream],
+    additional_plugins: &[PluginConfig],
+    compensation_restore: bool,
+) -> Result<(), anyhow::Error> {
+    if bundle.proxy.id != spec.proxy_id {
+        anyhow::bail!(
+            "API-spec restore proxy id '{}' does not match spec proxy_id '{}'",
+            bundle.proxy.id,
+            spec.proxy_id
+        );
+    }
+    if bundle.proxy.namespace != spec.namespace {
+        anyhow::bail!(
+            "API-spec restore proxy namespace '{}' does not match spec namespace '{}'",
+            bundle.proxy.namespace,
+            spec.namespace
+        );
+    }
+    match (bundle.proxy.api_spec_id.as_deref(), compensation_restore) {
+        (Some(owner), true) if owner != spec.id => anyhow::bail!(
+            "API-spec restore proxy '{}' is owned by a different API spec",
+            bundle.proxy.id
+        ),
+        (None, true) => anyhow::bail!(
+            "API-spec restore proxy '{}' is not owned by API spec '{}'",
+            bundle.proxy.id,
+            spec.id
+        ),
+        (Some(_), false) => anyhow::bail!(
+            "API-spec submission proxy '{}' carries server-managed API-spec ownership",
+            bundle.proxy.id
+        ),
+        (Some(_), true) | (None, false) => {}
+    }
+
+    if let Some(upstream) = &bundle.upstream {
+        if upstream.namespace != spec.namespace {
+            anyhow::bail!(
+                "API-spec restore upstream '{}' belongs to namespace '{}', not '{}'",
+                upstream.id,
+                upstream.namespace,
+                spec.namespace
+            );
+        }
+        match (upstream.api_spec_id.as_deref(), compensation_restore) {
+            (Some(owner), true) if owner != spec.id => anyhow::bail!(
+                "API-spec restore upstream '{}' is owned by a different API spec",
+                upstream.id
+            ),
+            (None, true) => anyhow::bail!(
+                "API-spec restore upstream '{}' is not owned by API spec '{}'",
+                upstream.id,
+                spec.id
+            ),
+            (Some(_), false) => anyhow::bail!(
+                "API-spec submission upstream '{}' carries server-managed API-spec ownership",
+                upstream.id
+            ),
+            (Some(_), true) | (None, false) => {}
+        }
+    }
+
+    let mut inserted_upstream_ids = HashSet::with_capacity(
+        bundle
+            .upstream
+            .iter()
+            .count()
+            .saturating_add(additional_upstreams.len()),
+    );
+    if let Some(upstream) = &bundle.upstream {
+        inserted_upstream_ids.insert(upstream.id.as_str());
+    }
+    for upstream in additional_upstreams {
+        if upstream.namespace != spec.namespace {
+            anyhow::bail!(
+                "API-spec restore additional upstream '{}' belongs to namespace '{}', not '{}'",
+                upstream.id,
+                upstream.namespace,
+                spec.namespace
+            );
+        }
+        if upstream
+            .api_spec_id
+            .as_deref()
+            .is_some_and(|owner| owner != spec.id.as_str())
+        {
+            anyhow::bail!(
+                "API-spec restore additional upstream '{}' is owned by a different API spec",
+                upstream.id
+            );
+        }
+        if !inserted_upstream_ids.insert(upstream.id.as_str()) {
+            anyhow::bail!(
+                "API-spec restore contains overlapping upstream id '{}'",
+                upstream.id
+            );
+        }
+    }
+
+    let mut association_ids = HashSet::with_capacity(bundle.proxy.plugins.len());
+    for association in &bundle.proxy.plugins {
+        if !association_ids.insert(association.plugin_config_id.as_str()) {
+            anyhow::bail!(
+                "API-spec restore proxy '{}' contains duplicate association to plugin '{}'",
+                bundle.proxy.id,
+                association.plugin_config_id
+            );
+        }
+    }
+
+    let mut inserted_plugin_ids = HashSet::with_capacity(
+        bundle
+            .plugins
+            .len()
+            .saturating_add(additional_plugins.len()),
+    );
+    for plugin in &bundle.plugins {
+        if plugin.namespace != spec.namespace {
+            anyhow::bail!(
+                "API-spec restore plugin '{}' belongs to namespace '{}', not '{}'",
+                plugin.id,
+                plugin.namespace,
+                spec.namespace
+            );
+        }
+        match (plugin.api_spec_id.as_deref(), compensation_restore) {
+            (Some(owner), true) if owner != spec.id => anyhow::bail!(
+                "API-spec restore plugin '{}' is owned by a different API spec",
+                plugin.id
+            ),
+            (None, true) => anyhow::bail!(
+                "API-spec restore plugin '{}' is not owned by API spec '{}'",
+                plugin.id,
+                spec.id
+            ),
+            (Some(_), false) => anyhow::bail!(
+                "API-spec submission plugin '{}' carries server-managed API-spec ownership",
+                plugin.id
+            ),
+            (Some(_), true) | (None, false) => {}
+        }
+        if compensation_restore && plugin.scope == PluginScope::Global && plugin.proxy_id.is_some()
+        {
+            anyhow::bail!(
+                "API-spec restore global plugin '{}' unexpectedly carries proxy_id '{}'",
+                plugin.id,
+                plugin.proxy_id.as_deref().unwrap_or("<none>")
+            );
+        }
+        let is_proxy_scoped_to_bundle = plugin.scope == PluginScope::Proxy
+            && plugin.proxy_id.as_deref() == Some(bundle.proxy.id.as_str());
+        let is_unassociated_compensation_global = compensation_restore
+            && plugin.scope == PluginScope::Global
+            && plugin.proxy_id.is_none()
+            && !association_ids.contains(plugin.id.as_str());
+        if !is_proxy_scoped_to_bundle && !is_unassociated_compensation_global {
+            anyhow::bail!(
+                "API-spec restore plugin '{}' is not proxy-scoped to proxy '{}'",
+                plugin.id,
+                bundle.proxy.id
+            );
+        }
+        if !inserted_plugin_ids.insert(plugin.id.as_str()) {
+            anyhow::bail!(
+                "API-spec restore contains duplicate plugin id '{}'",
+                plugin.id
+            );
+        }
+    }
+
+    for plugin in additional_plugins {
+        if plugin.namespace != spec.namespace {
+            anyhow::bail!(
+                "API-spec restore additional plugin '{}' belongs to namespace '{}', not '{}'",
+                plugin.id,
+                plugin.namespace,
+                spec.namespace
+            );
+        }
+        if plugin.api_spec_id.is_some() {
+            anyhow::bail!(
+                "API-spec restore additional plugin '{}' is owned by an API spec",
+                plugin.id
+            );
+        }
+        validate_api_spec_proxy_plugin_association(plugin, &bundle.proxy.id)?;
+        if !inserted_plugin_ids.insert(plugin.id.as_str()) {
+            anyhow::bail!(
+                "API-spec restore contains overlapping plugin id '{}'",
+                plugin.id
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Prove that an additional hand-owned upstream still present during
+/// compensation is the row captured before deletion, rather than a replacement
+/// created by an intervening writer after an orphan cascade removed it.
+pub(crate) fn validate_api_spec_retained_upstream_identity(
+    expected: &Upstream,
+    existing: &Upstream,
+) -> Result<(), anyhow::Error> {
+    if existing.id != expected.id
+        || existing.namespace != expected.namespace
+        || existing.api_spec_id != expected.api_spec_id
+        || existing.created_at != expected.created_at
+    {
+        anyhow::bail!(
+            "API-spec restore additional upstream '{}' does not match its pre-delete identity",
+            expected.id
+        );
+    }
+    Ok(())
+}
 
 /// User-facing proxy route conflict message shared by preflight and persistence checks.
 pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
@@ -1012,6 +1346,26 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         &self,
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &ApiSpec,
+    ) -> Result<(), anyhow::Error>;
+
+    /// Atomically restore a deleted API spec together with upstreams and
+    /// non-spec-owned plugins affected by the proxy delete cascade. A
+    /// hand-owned additional upstream that remained live through the delete
+    /// is preserved rather than inserted again.
+    ///
+    /// SQL backends and replica-set MongoDB implement this transactionally for
+    /// database and control-plane modes. A backend/topology without a
+    /// multi-document transaction must return an error before its first write;
+    /// data-plane and file modes have no writable database path. Recovery-time
+    /// plugin construction must use `validation_http_client`, which is the same
+    /// configured egress-policy and real-IP client used by admin admission.
+    async fn restore_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &ApiSpec,
+        additional_upstreams: &[Upstream],
+        additional_plugins: &[PluginConfig],
+        validation_http_client: &PluginHttpClient,
     ) -> Result<(), anyhow::Error>;
 
     /// Atomically replace an existing api spec identified by `spec.id`.
