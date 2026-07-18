@@ -10,8 +10,12 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use ferrum_edge::admin::{CachedDbHealthResult, cached_db_health_connected};
 
-const TTL: Duration = Duration::from_millis(250);
-const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Deliberately generous relative to the work each test performs: the
+/// assertions below count probes, never elapsed time, so a wide freshness
+/// window only removes the chance that runner preemption between two bursts
+/// expires an entry the test expects to still be fresh.
+const TTL: Duration = Duration::from_secs(2);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
 type HealthCache = ArcSwap<Option<CachedDbHealthResult>>;
 
