@@ -7258,11 +7258,11 @@ pub(crate) fn inject_sticky_cookie_with_deadline_provenance(
     ) {
         return false;
     }
-    // Gated so the owned-name allocation only happens on deadline-bound
-    // responses, matching the gating rationale used elsewhere in this path.
-    if ctx.has_buffered_deadline_response_header_provenance() {
-        ctx.record_deadline_owned_response_headers(&["set-cookie".to_string()], response_headers);
-    }
+    // Borrowed static name: allocation-free, and `record_deadline_owned_…`
+    // returns immediately when no deadline provenance is being tracked, so
+    // ordinary sticky traffic pays nothing here (same shape as the H1/H2
+    // buffered sites in `src/proxy/mod.rs`).
+    ctx.record_deadline_owned_response_headers(&["set-cookie"], response_headers);
     true
 }
 

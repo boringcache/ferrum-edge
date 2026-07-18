@@ -1451,7 +1451,7 @@ pub mod _test_support {
     /// the sticky-cookie-then-deadline path without a full proxy request.
     pub fn record_deadline_owned_response_headers_for_test(
         ctx: &mut crate::plugins::RequestContext,
-        owned_header_names: &[String],
+        owned_header_names: &[&str],
         response_headers: &HashMap<String, String>,
     ) {
         ctx.record_deadline_owned_response_headers(owned_header_names, response_headers);

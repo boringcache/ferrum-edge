@@ -385,6 +385,18 @@ struct BufferedDeadlineResponseHeaderProvenance {
     backend_headers: HashMap<String, String>,
 }
 
+/// Case-insensitive membership test for a borrowed owned-header-name slice.
+/// Written as a loop rather than an iterator chain so no temporary is built on
+/// the deadline-provenance path.
+fn header_name_is_declared(declared: &[&str], name: &str) -> bool {
+    for candidate in declared {
+        if candidate.eq_ignore_ascii_case(name) {
+            return true;
+        }
+    }
+    false
+}
+
 impl BufferedDeadlineResponseHeaderProvenance {
     fn backend_response(headers: &HashMap<String, String>) -> Self {
         let observed_headers = Self::canonical_snapshot(headers);
@@ -547,14 +559,19 @@ impl BufferedDeadlineResponseHeaderProvenance {
         canonical
     }
 
+    /// `is_owned` is consulted per canonical (lowercase) field name and reports
+    /// whether the completed hook authoritatively wrote that field. It is a
+    /// predicate rather than a name slice so callers can answer from data they
+    /// already hold — no owned-name `Vec`/`String` is materialized on the hot
+    /// path (see [`RequestContext::record_deadline_owned_response_headers`]).
     fn record_gateway_mutations(
         &mut self,
-        plugin_owned_headers: &[String],
+        is_owned: impl Fn(&str) -> bool,
         headers: &HashMap<String, String>,
     ) {
         let current = Self::canonical_snapshot(headers);
         for (name, value) in &current {
-            let owned = plugin_owned_headers.iter().any(|declared| declared == name);
+            let owned = is_owned(name.as_str());
             let changed = self.observed_headers.get(name) != Some(value) || owned;
             if !changed {
                 continue;
@@ -574,9 +591,11 @@ impl BufferedDeadlineResponseHeaderProvenance {
                     // owned value that carries no line beyond the backend
                     // baseline cannot have come from the appending sites
                     // (sticky-affinity injection) — it came from a
-                    // `response_transformer` `update` to `set-cookie`, or a
-                    // `rename` whose destination is `set-cookie`, both of which
-                    // write an operator-configured value over the field. That
+                    // `response_transformer` `update` to `set-cookie`, a
+                    // `rename` whose destination is `set-cookie`, or an `add`
+                    // that re-inserted `set-cookie` after a `remove` cleared
+                    // it, all of which put an operator-configured value into
+                    // the field with no backend line left underneath. That
                     // value is gateway-authored even when the backend happened
                     // to send a byte-identical cookie, so surplus filtering here
                     // was destroying an operator-owned cookie on the deadline
@@ -594,12 +613,18 @@ impl BufferedDeadlineResponseHeaderProvenance {
                 }
             } else if owned {
                 // Ownership of an ordinary header is only ever declared for
-                // unconditional replacements (`update` rules and fired `rename`
-                // destinations), so the whole configured value is gateway
-                // output. Retire this field's backend baseline for the same
-                // reason as the `set-cookie` branch above — the backend value
-                // was overwritten, and leaving a stale baseline would make a
-                // later append partition against data no longer in the response.
+                // WHOLE-VALUE gateway writes: unconditional replacements
+                // (`update` rules and fired `rename` destinations) and `add`
+                // rules that actually INSERTED into an absent slot (the
+                // add-after-remove sequence, where the final map can be
+                // byte-identical to the backend's). An `add` that appended onto
+                // an existing value is deliberately NOT declared owned — it
+                // stays on the append-partition branch below. So the whole
+                // configured value is gateway output. Retire this field's
+                // backend baseline for the same reason as the `set-cookie`
+                // branch above — the backend value was overwritten, and leaving
+                // a stale baseline would make a later append partition against
+                // data no longer in the response.
                 self.gateway_headers.insert(name.clone(), value.clone());
                 self.backend_headers.remove(name);
             } else {
@@ -2307,7 +2332,7 @@ impl RequestContext {
         response_headers: &HashMap<String, String>,
     ) {
         if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
-            Arc::make_mut(state).record_gateway_mutations(&[], response_headers);
+            Arc::make_mut(state).record_gateway_mutations(|_| false, response_headers);
         }
     }
 
@@ -2325,14 +2350,22 @@ impl RequestContext {
             .map(|name| name.to_ascii_lowercase())
             .collect::<Vec<_>>();
         if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
-            Arc::make_mut(state).record_gateway_mutations(&plugin_owned_headers, response_headers);
+            Arc::make_mut(state).record_gateway_mutations(
+                |name| plugin_owned_headers.iter().any(|d| d.as_str() == name),
+                response_headers,
+            );
         }
     }
 
     /// Whether backend/gateway deadline-response provenance is being tracked for
-    /// this request. Trusted response hooks consult this to skip the
-    /// [`Self::record_deadline_owned_response_headers`] bookkeeping (and its
-    /// allocation) on the common path that has no absolute RPC deadline.
+    /// this request. Trusted response hooks whose owned-name set must be
+    /// COMPUTED (e.g. `response_transformer` accumulating fired `update` /
+    /// `rename` / `add` keys) consult this first so that work is skipped
+    /// entirely on the common path with no absolute RPC deadline. Hooks that
+    /// own a fixed name can call
+    /// [`Self::record_deadline_owned_response_headers`] with a borrowed static
+    /// slice unconditionally — it allocates nothing and returns immediately
+    /// when provenance is absent.
     pub(crate) fn has_buffered_deadline_response_header_provenance(&self) -> bool {
         self.buffered_deadline_response_header_provenance.is_some()
     }
@@ -2343,21 +2376,24 @@ impl RequestContext {
     /// tracking alone drops such a write, so a backend that pre-populates the
     /// identical key/value could otherwise suppress the gateway decoration on a
     /// terminal deadline rebuild. Declaring the keys owned keeps them in
-    /// `gateway_headers`. Names are lowercased to match the canonical snapshot.
+    /// `gateway_headers`.
+    ///
+    /// Names are matched case-insensitively against the canonical (lowercase)
+    /// snapshot rather than being lowercased into a fresh `Vec<String>`, so
+    /// callers can pass borrowed static names (`&["set-cookie"]`) and the
+    /// always-on proxy sites — sticky-affinity cookie injection in particular —
+    /// pay no per-request allocation for provenance bookkeeping, whether or not
+    /// a deadline is being tracked.
     pub(crate) fn record_deadline_owned_response_headers(
         &mut self,
-        owned_header_names: &[String],
+        owned_header_names: &[&str],
         response_headers: &HashMap<String, String>,
     ) {
-        if self.buffered_deadline_response_header_provenance.is_none() {
-            return;
-        }
-        let owned = owned_header_names
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect::<Vec<_>>();
         if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
-            Arc::make_mut(state).record_gateway_mutations(&owned, response_headers);
+            Arc::make_mut(state).record_gateway_mutations(
+                |name| header_name_is_declared(owned_header_names, name),
+                response_headers,
+            );
         }
     }
 

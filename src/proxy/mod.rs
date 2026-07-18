@@ -21641,7 +21641,7 @@ async fn handle_proxy_request_inner(
                         // would not stay pinned. Line-granular recording keeps
                         // any co-present backend cookie out of gateway output.
                         ctx.record_deadline_owned_response_headers(
-                            &["set-cookie".to_string()],
+                            &["set-cookie"],
                             &response_headers,
                         );
                     }
@@ -23203,10 +23203,7 @@ async fn handle_proxy_request_inner(
             // before the committed-hook phase can exhaust the RPC deadline and
             // rebuild the response from gateway-owned output only. Line-granular
             // recording keeps any co-present backend cookie out of gateway output.
-            ctx.record_deadline_owned_response_headers(
-                &["set-cookie".to_string()],
-                &response_headers,
-            );
+            ctx.record_deadline_owned_response_headers(&["set-cookie"], &response_headers);
         }
     }
 

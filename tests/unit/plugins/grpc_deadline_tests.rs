@@ -1264,11 +1264,7 @@ async fn deadline_replacement_preserves_injected_sticky_cookie_and_strips_backen
             existing.push_str("ferrum_affinity=target-a; Path=/");
         })
         .or_insert_with(|| "ferrum_affinity=target-a; Path=/".to_string());
-    record_deadline_owned_response_headers_for_test(
-        &mut ctx,
-        &["set-cookie".to_string()],
-        &headers,
-    );
+    record_deadline_owned_response_headers_for_test(&mut ctx, &["set-cookie"], &headers);
 
     // A committed-response hook then exhausts the RPC deadline.
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
@@ -3853,5 +3849,284 @@ async fn deadline_rebuild_keeps_a_whole_owned_update_list_sharing_a_backend_elem
         headers.get("x-route-list").map(String::as_str),
         Some("shared,route"),
         "a route-override `update` is an owned replacement too"
+    );
+}
+
+/// Codex finding (#2707 discussion r3608060899): a `remove`-then-`add` rule
+/// sequence on the same key leaves the final header map BYTE-IDENTICAL to what
+/// the backend sent. `record_gateway_mutations` compares the post-hook map
+/// against the observed baseline, so the net diff is empty and the reintroduced
+/// header was never credited as gateway-authored — a later committed hook that
+/// exhausts the RPC deadline then rebuilt the DEADLINE_EXCEEDED response
+/// without it.
+///
+/// A static `add` only ever fires into an ABSENT slot, so the value it inserts
+/// is wholly gateway-authored and must be declared owned.
+#[tokio::test]
+async fn deadline_rebuild_keeps_a_static_add_that_reinstated_a_removed_header() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+
+    const SHARED: &str = "gateway-authored";
+
+    let transformer = create_plugin(
+        "response_transformer",
+        &json!({
+            "rules": [
+                {
+                    "operation": "remove",
+                    "target": "header",
+                    "key": "x-policy-note",
+                },
+                {
+                    "operation": "add",
+                    "target": "header",
+                    "key": "x-policy-note",
+                    "value": SHARED,
+                },
+            ]
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let after_proxy_plugins = vec![transformer];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    // The backend pre-populated exactly the value the `add` reinstates, so the
+    // post-hook map is indistinguishable from the backend's by value diff alone.
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("x-policy-note".to_string(), SHARED.to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "the response_transformer must not reject the buffered response"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("x-policy-note").map(String::as_str),
+        Some(SHARED),
+        "an `add` that inserted after a `remove` is a whole-value gateway write \
+         and must survive the deadline rebuild even though the final map \
+         matches what the backend sent"
+    );
+}
+
+/// Route-override parity for
+/// [`deadline_rebuild_keeps_a_static_add_that_reinstated_a_removed_header`].
+/// `apply_route_header_transforms` documents that "an `add` after a `remove`
+/// reinstates the header", so the same empty-net-diff hole existed on the
+/// route-override rule set reached through `route_override_response_transform`.
+#[tokio::test]
+async fn deadline_rebuild_keeps_a_route_override_add_that_reinstated_a_removed_header() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+    use ferrum_edge::plugins::utils::route_header_transform::{
+        RawRouteHeaderTransformRule, parse_route_header_transforms,
+    };
+
+    const SHARED: &str = "route-authored";
+
+    let transformer = create_plugin(
+        "response_transformer",
+        &json!({"rules": [], "apply_route_overrides": true}),
+    )
+    .unwrap()
+    .unwrap();
+    let after_proxy_plugins = vec![transformer];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let route_rules = parse_route_header_transforms(
+        &[
+            RawRouteHeaderTransformRule {
+                operation: "remove".to_string(),
+                target: "header".to_string(),
+                key: "x-route-note".to_string(),
+                value: None,
+            },
+            RawRouteHeaderTransformRule {
+                operation: "add".to_string(),
+                target: "header".to_string(),
+                key: "x-route-note".to_string(),
+                value: Some(SHARED.to_string()),
+            },
+        ],
+        "route_override",
+    )
+    .unwrap();
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+    ctx.route_override_response_transform = Some(Arc::new(route_rules));
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("x-route-note".to_string(), SHARED.to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "the response_transformer must not reject the buffered response"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("x-route-note").map(String::as_str),
+        Some(SHARED),
+        "a route-override `add` that inserted after a `remove` must be credited \
+         as gateway-authored on the deadline rebuild"
+    );
+}
+
+/// Codex finding (#2707 discussion r3608060902): `after_proxy` telemetry
+/// decorators that unconditionally `insert` a gateway-computed value are
+/// invisible to net-diff mutation tracking when the backend echoes the same
+/// bytes. `response_caching` writes `x-cache-status`, whose `MISS` value is
+/// trivially guessable, so a backend could suppress the gateway's cache
+/// telemetry on a deadline rebuild.
+///
+/// `response_caching` is `HTTP_ONLY_PROTOCOLS`, so in production it reaches a
+/// deadline-bound response through the gRPC-Web dispatch path (gRPC-Web keys
+/// `ProxyProtocol::Http`, per
+/// [`h3_grpc_web_requests_keep_the_http_protocol_key`]). The harness invokes
+/// the hook chain directly, so the native-gRPC context is used here; what is
+/// under test is the provenance bookkeeping, which is protocol-independent.
+#[tokio::test]
+async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
+    use ferrum_edge::_test_support::{
+        run_after_proxy_hooks_for_test, run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+
+    let caching = create_plugin("response_caching", &json!({"add_cache_status_header": true}))
+        .unwrap()
+        .unwrap();
+    let after_proxy_plugins = vec![caching];
+    let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
+
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    // The backend pre-populated the exact value the plugin is about to write.
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("x-cache-status".to_string(), "MISS".to_string()),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
+        "response_caching must not reject the buffered response"
+    );
+
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &committed,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS"),
+        "the gateway's cache-status telemetry is declared owned, so a backend \
+         echoing the identical value cannot suppress it on the deadline rebuild"
+    );
+}
+
+/// Ownership declarations for the exact-value telemetry decorators are gated on
+/// the same conditions as their writes, so nothing is claimed that was not
+/// actually written. Direct trait-level coverage keeps the two in step for the
+/// plugins whose end-to-end deadline path is exercised above only for
+/// `response_caching`.
+#[test]
+fn exact_value_telemetry_decorators_declare_only_what_they_write() {
+    let ctx = create_test_context();
+
+    let caching = create_plugin("response_caching", &json!({"add_cache_status_header": true}))
+        .unwrap()
+        .unwrap();
+    assert!(caching.owns_deadline_response_header(&ctx, "x-cache-status"));
+    assert!(caching.owns_deadline_response_header(&ctx, "X-Cache-Status"));
+    assert!(!caching.owns_deadline_response_header(&ctx, "x-other"));
+
+    let caching_off = create_plugin("response_caching", &json!({"add_cache_status_header": false}))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !caching_off.owns_deadline_response_header(&ctx, "x-cache-status"),
+        "ownership must not be claimed when the header is not configured to be written"
+    );
+
+    let limiter = create_plugin(
+        "ai_rate_limiter",
+        &json!({"token_limit": 1000, "window_seconds": 60, "expose_headers": true}),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        !limiter.owns_deadline_response_header(&ctx, "x-ai-ratelimit-limit"),
+        "without the metadata this request produced no header to own"
+    );
+    let mut ctx_with_metadata = create_test_context();
+    ctx_with_metadata
+        .metadata
+        .insert("ai_ratelimit_limit".to_string(), "1000".to_string());
+    assert!(limiter.owns_deadline_response_header(&ctx_with_metadata, "x-ai-ratelimit-limit"));
+    assert!(
+        !limiter.owns_deadline_response_header(&ctx_with_metadata, "x-ai-ratelimit-remaining"),
+        "only the metadata keys actually populated are owned"
+    );
+
+    let limiter_hidden = create_plugin(
+        "ai_rate_limiter",
+        &json!({"token_limit": 1000, "window_seconds": 60, "expose_headers": false}),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        !limiter_hidden.owns_deadline_response_header(&ctx_with_metadata, "x-ai-ratelimit-limit"),
+        "expose_headers=false writes nothing, so it owns nothing"
     );
 }
