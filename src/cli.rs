@@ -316,6 +316,59 @@ pub fn execute_validate() -> Result<(), String> {
     Ok(())
 }
 
+const HEALTH_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const HEALTH_RESPONSE_HEAD_MAX_BYTES: usize = 16 * 1024;
+const HEALTH_MAX_INFORMATIONAL_RESPONSES: usize = 8;
+
+struct HealthResponse {
+    status_code: u16,
+    status_line: String,
+}
+
+/// A TCP stream that reapplies the remaining absolute deadline before every
+/// socket operation. This also covers reads rustls performs internally while
+/// assembling a TLS record or completing the handshake.
+struct DeadlineTcpStream {
+    stream: std::net::TcpStream,
+    deadline: std::time::Instant,
+}
+
+impl DeadlineTcpStream {
+    fn new(stream: std::net::TcpStream, deadline: std::time::Instant) -> Self {
+        Self { stream, deadline }
+    }
+
+    fn remaining(&self) -> std::io::Result<std::time::Duration> {
+        self.deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "health response deadline elapsed",
+                )
+            })
+    }
+}
+
+impl std::io::Read for DeadlineTcpStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        std::io::Read::read(&mut self.stream, buffer)
+    }
+}
+
+impl std::io::Write for DeadlineTcpStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        std::io::Write::write(&mut self.stream, buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.stream)
+    }
+}
+
 /// Check gateway health by connecting to the admin API.
 ///
 /// By default this probes readiness via `GET /health` (503 until the gateway is
@@ -330,7 +383,7 @@ pub fn execute_validate() -> Result<(), String> {
 /// HTTPS. This is needed when `FERRUM_ADMIN_HTTP_PORT=0` disables plaintext.
 pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
     use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
+    use std::time::Instant;
 
     // Auto-detect TLS when admin HTTP port is explicitly disabled (port=0) and
     // the user didn't pass --port to override.
@@ -362,82 +415,239 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
         .map_err(|e| format!("Cannot resolve {}: {}", addr_str, e))?
         .next()
         .ok_or_else(|| format!("No addresses found for {}", addr_str))?;
-    let stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
+    let stream = TcpStream::connect_timeout(&sock_addr, HEALTH_RESPONSE_TIMEOUT)
         .map_err(|e| format!("Cannot connect to {}: {}", addr_str, e))?;
-
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| format!("Failed to set read timeout: {}", e))?;
 
     let host_header = format_host_port(&args.host, port);
     let path = if args.live { "/live" } else { "/health" };
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+    let response_deadline = Instant::now() + HEALTH_RESPONSE_TIMEOUT;
+    let stream = DeadlineTcpStream::new(stream, response_deadline);
 
     let response = if use_tls {
-        health_request_tls(stream, &request, &args.host, args.tls_no_verify)?
+        health_request_tls(
+            stream,
+            &request,
+            &args.host,
+            args.tls_no_verify,
+            response_deadline,
+        )?
     } else {
-        health_request_plain(stream, &request)?
+        health_request_plain(stream, &request, response_deadline)?
     };
 
-    let status_code = parse_response_status_code(&response)
-        .map_err(|e| format!("Unhealthy: invalid response: {}", e))?;
-    if status_code == 200 {
+    if response.status_code == 200 {
         Ok(())
     } else {
-        let status_line = response.lines().next().unwrap_or("(empty response)");
-        Err(format!("Unhealthy: {}", status_line))
+        Err(format!("Unhealthy: {:?}", response.status_line))
     }
 }
 
-/// Parse the HTTP status line (first line) of a raw response and return the
-/// numeric status code.
+/// Read complete HTTP response-head sections until the final response arrives.
 ///
-/// Only the status line determines health; header and body content (which may
-/// contain strings like "200 OK") must not influence the result. Malformed or
-/// missing status lines are rejected.
-fn parse_response_status_code(response: &str) -> Result<u16, String> {
-    let status_line = response
-        .lines()
-        .next()
-        .filter(|line| !line.trim().is_empty())
-        .ok_or_else(|| "missing HTTP status line".to_string())?;
+/// The total bytes and number of informational responses are deliberately
+/// small and bounded because this is a one-shot health probe. The underlying
+/// deadline stream reapplies the remaining overall deadline to every socket
+/// operation, so a peer cannot keep the probe alive by trickling bytes.
+fn read_health_response_head<R>(
+    reader: &mut R,
+    deadline: std::time::Instant,
+    transport: &str,
+) -> Result<HealthResponse, String>
+where
+    R: std::io::Read,
+{
+    use std::io::ErrorKind;
 
-    let mut parts = status_line.splitn(3, ' ');
-    let version = parts.next().unwrap_or("");
-    if !version.starts_with("HTTP/") {
-        return Err(format!("malformed HTTP status line: {:?}", status_line));
+    let mut buffered = Vec::with_capacity(1024);
+    let mut informational_responses = 0usize;
+    let mut total_bytes_read = 0usize;
+
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Timed out reading {transport} response head after {} seconds",
+                HEALTH_RESPONSE_TIMEOUT.as_secs()
+            ));
+        }
+
+        while let Some(section_end) = buffered
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+        {
+            let section_len = section_end + 4;
+            let response = parse_response_head_section(&buffered[..section_len])?;
+            drop(buffered.drain(..section_len));
+
+            if (100..200).contains(&response.status_code) && response.status_code != 101 {
+                informational_responses += 1;
+                if informational_responses > HEALTH_MAX_INFORMATIONAL_RESPONSES {
+                    return Err(format!(
+                        "HTTP response exceeded the limit of {} informational sections",
+                        HEALTH_MAX_INFORMATIONAL_RESPONSES
+                    ));
+                }
+                continue;
+            }
+
+            return Ok(response);
+        }
+
+        if total_bytes_read >= HEALTH_RESPONSE_HEAD_MAX_BYTES {
+            return Err(format!(
+                "HTTP response heads exceeded the {}-byte limit",
+                HEALTH_RESPONSE_HEAD_MAX_BYTES
+            ));
+        }
+
+        let mut chunk = [0u8; 1024];
+        let read_limit = chunk
+            .len()
+            .min(HEALTH_RESPONSE_HEAD_MAX_BYTES - total_bytes_read);
+        match reader.read(&mut chunk[..read_limit]) {
+            Ok(0) => {
+                return Err(
+                    "Unexpected EOF before a complete final HTTP response head".to_string(),
+                );
+            }
+            Ok(read) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "Timed out reading {transport} response head after {} seconds",
+                        HEALTH_RESPONSE_TIMEOUT.as_secs()
+                    ));
+                }
+                buffered.extend_from_slice(&chunk[..read]);
+                total_bytes_read += read;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "Timed out reading {transport} response head after {} seconds",
+                        HEALTH_RESPONSE_TIMEOUT.as_secs()
+                    ));
+                }
+            }
+            Err(e) => return Err(format!("Failed to read {transport} response head: {e}")),
+        }
     }
-    let code_str = parts
+}
+
+/// Parse and validate one complete HTTP response-head section.
+fn parse_response_head_section(section: &[u8]) -> Result<HealthResponse, String> {
+    let head = section
+        .strip_suffix(b"\r\n\r\n")
+        .ok_or_else(|| "HTTP response head is not terminated by CRLF CRLF".to_string())?;
+    let head = std::str::from_utf8(head)
+        .map_err(|e| format!("HTTP response head is not valid UTF-8: {e}"))?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines
         .next()
-        .filter(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit()))
-        .ok_or_else(|| format!("malformed HTTP status line: {:?}", status_line))?;
-    code_str
-        .parse::<u16>()
-        .map_err(|e| format!("invalid HTTP status code {:?}: {}", code_str, e))
+        .filter(|line| !line.is_empty())
+        .ok_or_else(|| "missing HTTP status line".to_string())?;
+    let status_code = parse_response_status_line(status_line)?;
+
+    for header in lines {
+        validate_response_header_line(header)?;
+    }
+
+    Ok(HealthResponse {
+        status_code,
+        status_line: status_line.to_string(),
+    })
+}
+
+fn parse_response_status_line(status_line: &str) -> Result<u16, String> {
+    let malformed = || format!("malformed HTTP status line: {status_line:?}");
+    if status_line.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(malformed());
+    }
+
+    let (version, remainder) = status_line.split_once(' ').ok_or_else(|| malformed())?;
+    let version = version.as_bytes();
+    if version.len() != 8
+        || &version[..5] != b"HTTP/"
+        || !version[5].is_ascii_digit()
+        || version[6] != b'.'
+        || !version[7].is_ascii_digit()
+    {
+        return Err(malformed());
+    }
+
+    let code = remainder.as_bytes();
+    if code.len() < 3
+        || !code[..3].iter().all(|byte| byte.is_ascii_digit())
+        || (code.len() > 3 && code[3] != b' ')
+    {
+        return Err(malformed());
+    }
+
+    // Exactly three ASCII digits are in 000..=999, so this conversion is
+    // infallible and always fits in u16.
+    Ok(u16::from(code[0] - b'0') * 100
+        + u16::from(code[1] - b'0') * 10
+        + u16::from(code[2] - b'0'))
+}
+
+fn validate_response_header_line(header: &str) -> Result<(), String> {
+    let malformed = || format!("malformed HTTP response header: {header:?}");
+    if header.is_empty() || header.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(malformed());
+    }
+
+    let (name, _value) = header.split_once(':').ok_or_else(|| malformed())?;
+    if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+        return Err(malformed());
+    }
+    Ok(())
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 /// Send health request over plaintext TCP.
-fn health_request_plain(mut stream: std::net::TcpStream, request: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
+fn health_request_plain(
+    mut stream: DeadlineTcpStream,
+    request: &str,
+    deadline: std::time::Instant,
+) -> Result<HealthResponse, String> {
+    use std::io::Write;
+
     stream
         .write_all(request.as_bytes())
         .map_err(|e| format!("Failed to send request: {}", e))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| format!("Failed to read response: {}", e))?;
-    Ok(response)
+    read_health_response_head(&mut stream, deadline, "plaintext")
 }
 
 /// Send health request over TLS (rustls).
 fn health_request_tls(
-    stream: std::net::TcpStream,
+    stream: DeadlineTcpStream,
     request: &str,
     host: &str,
     no_verify: bool,
-) -> Result<String, String> {
-    use std::io::{Read, Write};
+    deadline: std::time::Instant,
+) -> Result<HealthResponse, String> {
+    use std::io::Write;
     use std::sync::Arc;
 
     // `execute_health` is an early-exit subcommand that returns from `main()`
@@ -474,11 +684,7 @@ fn health_request_tls(
     tls_stream
         .write_all(request.as_bytes())
         .map_err(|e| format!("Failed to send TLS request: {}", e))?;
-    let mut response = String::new();
-    tls_stream
-        .read_to_string(&mut response)
-        .map_err(|e| format!("Failed to read TLS response: {}", e))?;
-    Ok(response)
+    read_health_response_head(&mut tls_stream, deadline, "TLS")
 }
 
 /// Certificate verifier that accepts any certificate (testing / self-signed).

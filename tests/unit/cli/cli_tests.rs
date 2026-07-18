@@ -504,14 +504,16 @@ fn test_execute_reload_no_pid_when_no_process_running() {
 
 // ── execute_health path selection ───────────────────────────────────────────
 
-/// Spawn a one-shot HTTP server on loopback that replies with `response`,
-/// run `execute_health`, and return the CLI result plus the captured request
-/// line.
-fn run_health_against_response(
+/// Spawn a one-shot plaintext server on loopback, run `execute_health`, and
+/// return the CLI result plus the captured request line.
+fn run_health_against_plain_server<F>(
     live: bool,
-    response: &'static [u8],
-) -> (Result<(), String>, String) {
-    use std::io::{Read, Write};
+    serve: F,
+) -> (Result<(), String>, String)
+where
+    F: FnOnce(&mut std::net::TcpStream) + Send + 'static,
+{
+    use std::io::Read;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
@@ -523,7 +525,7 @@ fn run_health_against_response(
         let mut buf = [0u8; 1024];
         let n = stream.read(&mut buf).unwrap();
         let request = String::from_utf8_lossy(&buf[..n]).into_owned();
-        stream.write_all(response).unwrap();
+        serve(&mut stream);
         request.lines().next().unwrap_or("").to_string()
     });
 
@@ -537,6 +539,78 @@ fn run_health_against_response(
     let result = execute_health(&args);
     let request_line = server.join().unwrap();
     (result, request_line)
+}
+
+/// Spawn a one-shot plaintext server that replies with `response`.
+fn run_health_against_response(
+    live: bool,
+    response: &[u8],
+) -> (Result<(), String>, String) {
+    use std::io::Write;
+
+    let response = response.to_vec();
+    run_health_against_plain_server(live, move |stream| {
+        stream.write_all(&response).unwrap();
+    })
+}
+
+/// Spawn a one-shot TLS server that replies with `response` and run the health
+/// command with certificate verification disabled.
+fn run_health_against_tls_response(response: &[u8]) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+    use std::sync::Arc;
+
+    let key_pair =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate TLS key");
+    let params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("certificate params");
+    let certificate = params.self_signed(&key_pair).expect("self-sign certificate");
+
+    let certificate_pem = certificate.pem();
+    let mut certificate_reader = certificate_pem.as_bytes();
+    let certificate_chain: Vec<_> = rustls_pemfile::certs(&mut certificate_reader)
+        .collect::<Result<_, _>>()
+        .expect("parse certificate");
+    let key_pem = key_pair.serialize_pem();
+    let mut key_reader = key_pem.as_bytes();
+    let private_key = rustls_pemfile::private_key(&mut key_reader)
+        .expect("parse private key")
+        .expect("private key present");
+    let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("default protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(certificate_chain, private_key)
+    .expect("configure TLS server certificate");
+
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .expect("loopback should be available for CLI health TLS tests");
+    let port = listener.local_addr().unwrap().port();
+    let response = response.to_vec();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let connection =
+            rustls::ServerConnection::new(Arc::new(server_config)).expect("TLS server connection");
+        let mut tls_stream = rustls::StreamOwned::new(connection, stream);
+        let mut request = [0u8; 1024];
+        let read = tls_stream.read(&mut request).expect("read TLS request");
+        assert!(read > 0, "TLS health request must not be empty");
+        tls_stream.write_all(&response).expect("write TLS response");
+        tls_stream.flush().expect("flush TLS response");
+    });
+
+    let result = execute_health(&HealthArgs {
+        port: Some(port),
+        host: "127.0.0.1".to_string(),
+        tls: true,
+        tls_no_verify: true,
+        live: false,
+    });
+    server.join().unwrap();
+    result
 }
 
 /// Spawn a one-shot HTTP server on loopback that captures the request line,
@@ -573,6 +647,15 @@ fn test_execute_health_http10_200_succeeds() {
     let (result, _) =
         run_health_against_response(false, b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
     assert!(result.is_ok(), "HTTP/1.0 200 must be healthy: {result:?}");
+}
+
+#[test]
+fn test_execute_health_http11_200_without_reason_phrase_succeeds() {
+    let (result, _) = run_health_against_response(false, b"HTTP/1.1 200\r\n\r\n");
+    assert!(
+        result.is_ok(),
+        "HTTP/1.1 200 without a reason phrase must be healthy: {result:?}"
+    );
 }
 
 #[test]
@@ -623,4 +706,181 @@ fn test_execute_health_rejects_malformed_status_line() {
 fn test_execute_health_rejects_empty_response() {
     let (result, _) = run_health_against_response(false, b"");
     assert!(result.is_err(), "an empty response must be unhealthy");
+}
+
+#[test]
+fn test_execute_health_consumes_multiple_informational_responses() {
+    let (result, _) = run_health_against_response(
+        false,
+        b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\n\
+          HTTP/1.1 100 Continue\r\n\r\n\
+          HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(
+        result.is_ok(),
+        "a final 200 after complete informational responses must be healthy: {result:?}"
+    );
+}
+
+#[test]
+fn test_execute_health_uses_final_non200_after_informational_response() {
+    let (result, _) = run_health_against_response(
+        false,
+        b"HTTP/1.1 103 Early Hints\r\n\r\n\
+          HTTP/1.1 503 Service Unavailable\r\nContent-Length: 6\r\n\r\n200 OK",
+    );
+    let error = result.expect_err("the final 503 must be unhealthy");
+    assert!(error.contains("503 Service Unavailable"), "{error}");
+}
+
+#[test]
+fn test_execute_health_treats_101_as_final_unhealthy_response() {
+    let (result, _) = run_health_against_response(
+        false,
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n\
+          HTTP/1.1 200 OK\r\n\r\n",
+    );
+    let error = result.expect_err("101 must not be skipped in search of a later 200");
+    assert!(error.contains("101 Switching Protocols"), "{error}");
+}
+
+#[test]
+fn test_execute_health_bounds_informational_response_sections() {
+    let mut response = b"HTTP/1.1 103 Early Hints\r\n\r\n".repeat(9);
+    response.extend_from_slice(b"HTTP/1.1 200 OK\r\n\r\n");
+    let (result, _) = run_health_against_response(false, &response);
+    let error = result.expect_err("too many informational responses must be rejected");
+    assert!(error.contains("8 informational sections"), "{error}");
+}
+
+#[test]
+fn test_execute_health_rejects_invalid_http_versions() {
+    for status_line in ["HTTP/", "HTTP/garbage", "HTTP/1.1junk"] {
+        let response = format!("{status_line} 200 OK\r\n\r\n");
+        let (result, _) = run_health_against_response(false, response.as_bytes());
+        assert!(result.is_err(), "{status_line:?} must be rejected");
+    }
+}
+
+#[test]
+fn test_execute_health_rejects_missing_or_malformed_status_codes() {
+    for status_line in [
+        "HTTP/1.1",
+        "HTTP/1.1 OK",
+        "HTTP/1.1 20",
+        "HTTP/1.1 2000",
+    ] {
+        let response = format!("{status_line}\r\n\r\n");
+        let (result, _) = run_health_against_response(false, response.as_bytes());
+        assert!(result.is_err(), "{status_line:?} must be rejected");
+    }
+}
+
+#[test]
+fn test_execute_health_requires_crlf_terminated_status_and_head() {
+    for response in [
+        b"HTTP/1.1 200".as_slice(),
+        b"HTTP/1.1 200\r\n".as_slice(),
+        b"HTTP/1.1 200\n\n".as_slice(),
+    ] {
+        let (result, _) = run_health_against_response(false, response);
+        assert!(result.is_err(), "incomplete or LF-only framing must fail");
+    }
+}
+
+#[test]
+fn test_execute_health_rejects_leading_empty_status_line() {
+    for response in [
+        b"\r\nHTTP/1.1 200 OK\r\n\r\n".as_slice(),
+        b"\r\n\r\nHTTP/1.1 200 OK\r\n\r\n".as_slice(),
+    ] {
+        let (result, _) = run_health_against_response(false, response);
+        assert!(result.is_err(), "a leading empty status line must fail");
+    }
+}
+
+#[test]
+fn test_execute_health_rejects_malformed_header_syntax() {
+    for response in [
+        b"HTTP/1.1 200 OK\r\nMissing-Colon\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\nBad Header: value\r\n\r\n".as_slice(),
+    ] {
+        let (result, _) = run_health_against_response(false, response);
+        assert!(result.is_err(), "malformed header syntax must fail");
+    }
+}
+
+#[test]
+fn test_execute_health_rejects_invalid_utf8_response_head() {
+    let (result, _) = run_health_against_response(
+        false,
+        b"HTTP/1.1 200 OK\r\nX-Invalid: \xff\r\n\r\n",
+    );
+    let error = result.expect_err("invalid UTF-8 in a response head must fail");
+    assert!(error.contains("not valid UTF-8"), "{error}");
+}
+
+#[test]
+fn test_execute_health_escapes_untrusted_status_text() {
+    let (result, _) = run_health_against_response(
+        false,
+        b"HTTP/1.1 503 unsafe\x1b[31mreason\r\n\r\n",
+    );
+    let error = result.expect_err("status controls must fail closed");
+    assert!(!error.contains('\x1b'), "raw escape reached error text: {error:?}");
+    assert!(error.contains("\\u{1b}"), "escape was not rendered safely: {error}");
+}
+
+#[test]
+fn test_execute_health_escapes_non200_reason_text() {
+    let response = "HTTP/1.1 503 unsafe\u{85}reason\r\n\r\n";
+    let (result, _) = run_health_against_response(false, response.as_bytes());
+    let error = result.expect_err("503 must be unhealthy");
+    assert!(!error.contains('\u{85}'), "raw control reached error text: {error:?}");
+    assert!(error.contains("\\u{85}"), "reason was not rendered safely: {error}");
+}
+
+#[test]
+fn test_execute_health_bounds_total_response_head_bytes() {
+    let response = format!(
+        "HTTP/1.1 103 Early Hints\r\nX-Fill: {}\r\n\r\nHTTP/1.1 200 OK\r\n\r\n",
+        "a".repeat(17 * 1024)
+    );
+    let (result, _) = run_health_against_response(false, response.as_bytes());
+    let error = result.expect_err("oversized response heads must fail");
+    assert!(error.contains("16384-byte limit"), "{error}");
+}
+
+#[test]
+fn test_execute_health_enforces_one_overall_response_deadline() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let (result, _) = run_health_against_plain_server(false, |stream| {
+        for _ in 0..40 {
+            if stream.write_all(b"H").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    });
+    let elapsed = started.elapsed();
+    let error = result.expect_err("a trickling peer must hit the overall deadline");
+    assert!(error.contains("Timed out reading plaintext"), "{error}");
+    assert!(
+        elapsed < Duration::from_secs(7),
+        "per-read timeout was reset by trickled bytes: {elapsed:?}"
+    );
+}
+
+#[test]
+fn test_execute_health_tls_uses_shared_interim_response_parser() {
+    let result = run_health_against_tls_response(
+        b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200\r\n\r\n",
+    );
+    assert!(
+        result.is_ok(),
+        "TLS must accept the same bounded interim/final framing: {result:?}"
+    );
 }
