@@ -138,6 +138,8 @@ async fn test_translated_error_response_binary_uses_grpc_web_trailer_frame() {
         response.headers.get("x-grpc-web").map(String::as_str),
         Some("1")
     );
+    assert!(!response.headers.contains_key("grpc-status"));
+    assert!(!response.headers.contains_key("grpc-message"));
     assert_eq!(
         response
             .headers
@@ -170,6 +172,8 @@ async fn test_translated_error_response_text_base64_encodes_trailer_frame() {
         response.headers.get("x-grpc-web").map(String::as_str),
         Some("1")
     );
+    assert!(!response.headers.contains_key("grpc-status"));
+    assert!(!response.headers.contains_key("grpc-message"));
     let decoded = BASE64.decode(&response.body).unwrap();
     let payload = grpc_web_trailer_payload(&decoded);
     assert!(payload.contains("grpc-status: 14\r\n"));
@@ -195,6 +199,8 @@ fn test_error_response_for_content_type_text_base64_encodes_trailer_frame() {
         response.headers.get("x-grpc-web").map(String::as_str),
         Some("1")
     );
+    assert!(!response.headers.contains_key("grpc-status"));
+    assert!(!response.headers.contains_key("grpc-message"));
     let decoded = BASE64.decode(&response.body).unwrap();
     let payload = grpc_web_trailer_payload(&decoded);
     assert!(payload.contains("grpc-status: 14\r\n"));

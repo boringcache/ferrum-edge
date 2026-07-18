@@ -774,6 +774,9 @@ Deletes the spec and cascades:
 - Spec-owned **proxy** is deleted → FK cascade removes its plugins (including any added manually after import).
 - Spec-owned **upstream** is deleted if present. Upstreams without `api_spec_id` survive.
 - Calling `DELETE /proxies/{id}` directly also removes the spec row via the `ON DELETE CASCADE` FK constraint.
+- If the cascade would leave an invalid aggregate plugin graph, the API returns
+  422 with validation failures and no resources are deleted. Direct proxy or
+  plugin-config deletion reports the equivalent precondition failure as 400.
 
 ### Cascade and ownership summary
 

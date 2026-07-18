@@ -1,6 +1,4 @@
-use ferrum_edge::plugins::{
-    BackendPathPolicyPhase, GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, create_plugin, priority,
-};
+use ferrum_edge::plugins::{GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, create_plugin, priority};
 use serde_json::json;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
@@ -19,9 +17,7 @@ async fn enforce_effective_path(
     ctx: &mut ferrum_edge::plugins::RequestContext,
 ) -> PluginResult {
     let path = ctx.path.clone();
-    plugin
-        .on_backend_path_resolved(ctx, &path, BackendPathPolicyPhase::Enforce)
-        .await
+    plugin.on_backend_path_resolved(ctx, &path).await
 }
 
 // ── Plugin creation ──
@@ -160,11 +156,7 @@ async fn test_backend_effective_rewrite_refreshes_metadata_before_enforcement() 
     );
 
     let result = plugin
-        .on_backend_path_resolved(
-            &mut ctx,
-            "/admin.Service/Delete",
-            BackendPathPolicyPhase::Enforce,
-        )
+        .on_backend_path_resolved(&mut ctx, "/admin.Service/Delete")
         .await;
     assert_reject(result, Some(403));
     assert_eq!(
@@ -193,7 +185,7 @@ async fn test_stripped_prefix_is_enforced_as_backend_effective_method() {
     assert!(!ctx.metadata.contains_key("grpc_full_method"));
 
     let result = plugin
-        .on_backend_path_resolved(&mut ctx, "/pkg.Svc/Denied", BackendPathPolicyPhase::Enforce)
+        .on_backend_path_resolved(&mut ctx, "/pkg.Svc/Denied")
         .await;
     assert_reject(result, Some(403));
     assert_eq!(
@@ -214,11 +206,7 @@ async fn test_invalid_backend_effective_rewrite_clears_provisional_metadata() {
     assert!(ctx.metadata.contains_key("grpc_full_method"));
 
     let result = plugin
-        .on_backend_path_resolved(
-            &mut ctx,
-            "/invalid/extra/segment",
-            BackendPathPolicyPhase::Enforce,
-        )
+        .on_backend_path_resolved(&mut ctx, "/invalid/extra/segment")
         .await;
     assert_reject(result, Some(403));
     assert!(!ctx.metadata.contains_key("grpc_service"));
@@ -356,31 +344,6 @@ async fn test_method_rate_limiting_exceeded() {
     let _ = plugin.on_request_received(&mut ctx).await;
     let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_reject(result, Some(429));
-}
-
-#[tokio::test]
-async fn test_backend_path_preview_does_not_charge_method_rate_limit() {
-    let config = json!({
-        "method_rate_limits": {
-            "/pkg.Svc/Create": { "max_requests": 1, "window_seconds": 60 }
-        }
-    });
-    let plugin = create_plugin("grpc_method_router", &config)
-        .unwrap()
-        .unwrap();
-    let mut ctx = create_grpc_context("/pkg.Svc/Create");
-
-    for _ in 0..2 {
-        let result = plugin
-            .on_backend_path_resolved(&mut ctx, "/pkg.Svc/Create", BackendPathPolicyPhase::Preview)
-            .await;
-        assert_continue(result);
-    }
-
-    let first_enforcement = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
-    assert_continue(first_enforcement);
-    let second_enforcement = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
-    assert_reject(second_enforcement, Some(429));
 }
 
 #[tokio::test]

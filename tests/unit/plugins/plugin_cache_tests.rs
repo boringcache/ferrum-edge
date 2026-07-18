@@ -1,18 +1,24 @@
 //! Tests for PluginCache — pre-resolved plugin instances per proxy
 
 use chrono::Utc;
+use ferrum_edge::_test_support::{
+    plugin_cache_with_real_ip_header_for_test,
+    validate_correlation_id_composition_with_real_ip_header_for_test,
+    validate_plugin_composition_candidate_with_real_ip_header_for_test,
+};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
     PluginScope, Proxy,
 };
 use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, ProxyProtocol, RequestContext, apply_initial_response_header_policies,
+    Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
+    apply_initial_response_header_policies,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 struct LegacyAuthorizePlugin;
@@ -25,6 +31,21 @@ impl Plugin for LegacyAuthorizePlugin {
 
     async fn authorize(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue
+    }
+}
+
+struct RawCorrelationClaimPlugin {
+    claim: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Plugin for RawCorrelationClaimPlugin {
+    fn name(&self) -> &str {
+        "raw_correlation_claim"
+    }
+
+    fn correlation_id_header_name(&self) -> Option<&str> {
+        Some(self.claim)
     }
 }
 
@@ -141,6 +162,52 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
+}
+
+fn make_tcp_proxy(id: &str, plugin_ids: Vec<&str>) -> Proxy {
+    let mut proxy = make_proxy(id, "/", plugin_ids);
+    proxy.listen_path = None;
+    proxy.listen_port = Some(15432);
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+    proxy
+}
+
+fn make_udp_proxy(id: &str, plugin_ids: Vec<&str>, scheme: BackendScheme) -> Proxy {
+    let mut proxy = make_proxy(id, "/", plugin_ids);
+    proxy.listen_path = None;
+    proxy.listen_port = Some(15353);
+    proxy.backend_scheme = Some(scheme);
+    proxy.dispatch_kind = DispatchKind::from(scheme);
+    proxy
+}
+
+fn make_tcp_stream_context(ip: &str) -> StreamConnectionContext {
+    StreamConnectionContext::new(
+        ip.to_string(),
+        ip.to_string(),
+        "p1".to_string(),
+        Some("Proxy p1".to_string()),
+        15432,
+        BackendScheme::Tcp,
+        Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    )
+}
+
+async fn run_tcp_connect_chain(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut StreamConnectionContext,
+) -> bool {
+    for plugin in plugins {
+        if matches!(
+            plugin.on_stream_connect(ctx).await,
+            PluginResult::Reject { .. }
+        ) {
+            ctx.release_admission_permits();
+            return false;
+        }
+    }
+    true
 }
 
 fn make_plugin_config(
@@ -965,9 +1032,8 @@ fn mesh_route_dispatch_ignores_non_http_interleaving_when_finalizing() {
     );
     second_route.priority_override = Some(3040);
     let config = make_config(
-        vec![make_proxy(
+        vec![make_tcp_proxy(
             "p1",
-            "/api",
             vec!["first-route", "tcp-throttle", "second-route"],
         )],
         vec![first_route, tcp_only, second_route],
@@ -1581,22 +1647,21 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
 
 #[tokio::test]
 async fn test_request_view_precomputes_response_committed_hook_capability() {
-    let config = make_config(
-        vec![make_proxy("p1", "/api", vec!["audit"])],
-        vec![make_plugin_config_with_json(
-            "audit",
-            "ai_transcript_audit",
-            json!({
-                "capture": { "request": true, "response": true },
-                "sink": {
-                    "type": "http",
-                    "endpoint_url": "https://audit.example.com/ingest"
-                }
-            }),
-            PluginScope::Proxy,
-            Some("p1"),
-        )],
+    let mut audit = make_plugin_config_with_json(
+        "audit",
+        "ai_transcript_audit",
+        json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest"
+            }
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
     );
+    audit.priority_override = Some(125);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
     let cache = PluginCache::new(&config).unwrap();
     let view = cache.request_view("p1", ProxyProtocol::Http);
 
@@ -1604,11 +1669,45 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
         view.capabilities()
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
     );
+    assert_eq!(view.response_committed_plugins().len(), 1);
+    assert_eq!(
+        view.response_committed_plugins()[0].name(),
+        "ai_transcript_audit"
+    );
+    assert_eq!(view.response_committed_plugins()[0].priority(), 125);
     assert!(
         !cache
             .request_view("missing", ProxyProtocol::Http)
             .capabilities()
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+    );
+}
+
+#[test]
+fn test_request_view_precomputes_grpc_deadline_policy_plugins() {
+    let mut deadline = make_plugin_config_with_json(
+        "deadline",
+        "grpc_deadline",
+        json!({"default_deadline_ms": 1000}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    deadline.priority_override = Some(120);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["deadline"])],
+        vec![deadline],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let grpc_view = cache.request_view("p1", ProxyProtocol::Grpc);
+    assert_eq!(grpc_view.grpc_deadline_plugins().len(), 1);
+    assert_eq!(grpc_view.grpc_deadline_plugins()[0].name(), "grpc_deadline");
+    assert_eq!(grpc_view.grpc_deadline_plugins()[0].priority(), 120);
+    assert!(
+        cache
+            .request_view("p1", ProxyProtocol::Http)
+            .grpc_deadline_plugins()
+            .is_empty()
     );
 }
 
@@ -1926,7 +2025,7 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
     assert!(candidate.contains("crate::custom_plugins::custom_plugin_names()"));
     assert!(candidate.contains("is_security_composition_candidate_plugin("));
     assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
-    assert!(candidate.contains("validate_plugin_security_composition(&global_plugins)"));
+    assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
     assert!(
         !candidate.contains("forward_body"),
         "candidate validation must not be gated on a built-in serverless config field"
@@ -3012,6 +3111,135 @@ fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
 
 // ---- Protocol-filtered plugin lookup tests ----
 
+#[test]
+fn transaction_log_schema_only_cache_preserves_no_plugin_fast_path_for_all_protocols() {
+    use ferrum_edge::plugins::utils::log_schema::registry;
+
+    let _guard = registry::lock_for_tests();
+    registry::reset_for_tests();
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![
+            make_plugin_config_with_json(
+                "schemas-a",
+                "transaction_log_schema",
+                json!({"schemas": {"audit-a": {"summary_type": "both"}}}),
+                PluginScope::Global,
+                None,
+            ),
+            make_plugin_config_with_json(
+                "schemas-b",
+                "transaction_log_schema",
+                json!({"schemas": {"audit-b": {"summary_type": "both"}}}),
+                PluginScope::Global,
+                None,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("schema-only cache must build");
+
+    assert!(cache.get_plugins("p1").is_empty());
+    assert!(cache.get_plugins("unknown").is_empty());
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+        ProxyProtocol::Tcp,
+        ProxyProtocol::Udp,
+    ] {
+        let first_view = cache.request_view("p1", protocol);
+        let second_view = cache.request_view("p1", protocol);
+        let first_plugins = first_view.plugins();
+        let second_plugins = second_view.plugins();
+        assert!(
+            first_plugins.is_empty(),
+            "config-only schema instances leaked into the {protocol:?} runtime list"
+        );
+        assert!(
+            Arc::ptr_eq(&first_plugins, &second_plugins),
+            "{protocol:?} request views must reuse the precomputed plugin list instead of allocating per request"
+        );
+
+        let first_auth = first_view.auth_plugins();
+        let second_auth = second_view.auth_plugins();
+        let first_authorize = first_view.authorize_plugins();
+        let second_authorize = second_view.authorize_plugins();
+        let first_backend_admission = first_view.backend_admission_plugins();
+        let second_backend_admission = second_view.backend_admission_plugins();
+        let first_redactions = first_view.request_headers_to_redact();
+        let second_redactions = second_view.request_headers_to_redact();
+        let first_initial_response = first_view.initial_response_header_policy_plugins();
+        let second_initial_response = second_view.initial_response_header_policy_plugins();
+        let first_initial_names = first_view.initial_response_header_policy_names();
+        let second_initial_names = second_view.initial_response_header_policy_names();
+        assert!(Arc::ptr_eq(&first_auth, &second_auth));
+        assert!(Arc::ptr_eq(&first_authorize, &second_authorize));
+        assert!(Arc::ptr_eq(
+            &first_backend_admission,
+            &second_backend_admission
+        ));
+        assert!(Arc::ptr_eq(&first_redactions, &second_redactions));
+        assert!(Arc::ptr_eq(
+            &first_initial_response,
+            &second_initial_response
+        ));
+        assert!(Arc::ptr_eq(&first_initial_names, &second_initial_names));
+        assert!(!first_view.requires_response_body_buffering());
+        assert!(!first_view.requires_request_body_buffering());
+        assert!(!first_view.requires_ws_frame_hooks());
+    }
+    assert!(registry::lookup_named("audit-a").is_some());
+    assert!(registry::lookup_named("audit-b").is_some());
+}
+
+#[test]
+fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries() {
+    use ferrum_edge::plugins::utils::log_schema::registry;
+
+    let _guard = registry::lock_for_tests();
+    registry::reset_for_tests();
+    let old_schema = make_plugin_config_with_json(
+        "schemas",
+        "transaction_log_schema",
+        json!({"schemas": {"before": {}}}),
+        PluginScope::Global,
+        None,
+    );
+    let old_config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![old_schema.clone()],
+    );
+    let cache = PluginCache::new(&old_config).expect("initial schema cache");
+
+    let mut new_schema = old_schema;
+    new_schema.config = json!({"schemas": {"after": {}}});
+    new_schema.updated_at += chrono::Duration::seconds(1);
+    let new_config = make_config(vec![make_proxy("p1", "/api", vec![])], vec![new_schema]);
+    let delta = ConfigDelta::compute(&old_config, &new_config);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+    cache
+        .apply_delta(
+            &new_config,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect("schema delta reload");
+
+    assert!(registry::lookup_named("before").is_none());
+    assert!(registry::lookup_named("after").is_some());
+    assert!(cache.get_plugins("p1").is_empty());
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+        ProxyProtocol::Tcp,
+        ProxyProtocol::Udp,
+    ] {
+        assert!(cache.get_plugins_for_protocol("p1", protocol).is_empty());
+    }
+}
+
 fn make_plugin_config_with_json(
     id: &str,
     plugin_name: &str,
@@ -3256,13 +3484,10 @@ async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
     use ferrum_edge::plugins::available_plugins;
     use ferrum_edge::plugins::create_plugin;
 
-    // Every non-WS-frame built-in plugin must return false for requires_ws_frame_hooks().
-    // This is the zero-overhead guarantee — only explicit WS frame plugins opt in.
-    const WS_FRAME_PLUGINS: &[&str] = &[
-        "ws_message_size_limiting",
-        "ws_frame_logging",
-        "ws_rate_limiting",
-    ];
+    // Every non-message-hook built-in plugin must return false for
+    // requires_ws_frame_hooks(). Parser-only policies use the independent
+    // requires_websocket_framing() aggregate.
+    const WS_FRAME_PLUGINS: &[&str] = &["ws_frame_logging", "ws_rate_limiting"];
 
     for name in available_plugins() {
         if WS_FRAME_PLUGINS.contains(&name) {
@@ -3460,23 +3685,37 @@ fn test_ws_frame_direction_debug_and_equality() {
 }
 
 #[test]
-fn test_plugin_cache_requires_ws_frame_hooks_true_with_ws_size_plugin() {
-    // When a WS frame plugin is assigned to a proxy, requires_ws_frame_hooks must be TRUE.
-    let config = make_config(
-        vec![make_proxy("p1", "/ws", vec!["ws1"])],
-        vec![make_plugin_config(
-            "ws1",
-            "ws_message_size_limiting",
-            PluginScope::Proxy,
-            Some("p1"),
-            true,
-        )],
+fn test_priority_override_preserves_ws_parser_policy_and_framing() {
+    // A parser-policy-only plugin must select the framed relay even though it
+    // does not opt into the post-reassembly message hook. Priority overrides
+    // must not hide either capability behind their wrapper.
+    let mut limiter = make_plugin_config(
+        "ws1",
+        "ws_message_size_limiting",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
     );
+    limiter.priority_override = Some(101);
+    let config = make_config(vec![make_proxy("p1", "/ws", vec!["ws1"])], vec![limiter]);
     let cache = PluginCache::new(&config).unwrap();
     assert!(
         cache.requires_ws_frame_hooks("p1"),
-        "requires_ws_frame_hooks must be TRUE when ws_message_size_limiting is attached"
+        "parser size policy must select the framed relay"
     );
+    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let limiter = ws_plugins
+        .iter()
+        .find(|plugin| plugin.name() == "ws_message_size_limiting")
+        .expect("wrapped limiter remains in WebSocket chain");
+    assert_eq!(limiter.priority(), 101);
+    assert!(!limiter.requires_ws_frame_hooks());
+    assert!(limiter.requires_websocket_framing());
+    let limits = limiter
+        .websocket_size_limits()
+        .expect("priority wrapper delegates parser policy");
+    assert_eq!(limits.max_frame_bytes, 65_536);
+    assert_eq!(limits.max_message_bytes, 262_144);
 }
 
 #[test]
@@ -3657,6 +3896,90 @@ fn test_multiple_same_type_proxy_plugins_both_present() {
     assert_eq!(plugins[1].name(), "stdout_logging");
 }
 
+#[tokio::test]
+async fn correlation_id_priority_overrides_select_canonical_without_collapsing_instances() {
+    for internal_priority in [40, 60] {
+        let external_priority = if internal_priority == 40 { 60 } else { 40 };
+        let mut internal = make_plugin_config_with_priority(
+            "internal-correlation",
+            "correlation_id",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(internal_priority),
+        );
+        internal.config = json!({"header_name": "x-internal-request-id"});
+        let mut external = make_plugin_config_with_priority(
+            "external-correlation",
+            "correlation_id",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(external_priority),
+        );
+        external.config = json!({"header_name": "x-external-request-id"});
+        let config = make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                vec!["external-correlation", "internal-correlation"],
+            )],
+            vec![external, internal],
+        );
+        let cache = PluginCache::new(&config).expect("multi-instance correlation cache");
+        let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(
+            plugins[0].priority(),
+            internal_priority.min(external_priority)
+        );
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.headers.insert(
+            "x-external-request-id".to_string(),
+            "priority-preserved-id".to_string(),
+        );
+        assert!(matches!(
+            run_request_received_chain(&plugins, &mut ctx).await,
+            PluginResult::Continue
+        ));
+
+        let internal_id = ctx.headers.get("x-internal-request-id").unwrap();
+        assert!(uuid::Uuid::parse_str(internal_id).is_ok());
+        assert_ne!(internal_id, "priority-preserved-id");
+        let expected_canonical = if internal_priority < external_priority {
+            internal_id.as_str()
+        } else {
+            "priority-preserved-id"
+        };
+        assert_eq!(
+            ctx.metadata
+                .get(ferrum_edge::plugins::REQUEST_ID_METADATA_KEY)
+                .map(String::as_str),
+            Some(expected_canonical)
+        );
+
+        let mut handshake_headers = HashMap::new();
+        for plugin in plugins.iter() {
+            plugin.apply_websocket_handshake_response_headers(&ctx, 101, &mut handshake_headers);
+        }
+        assert_eq!(
+            handshake_headers.get("x-internal-request-id"),
+            Some(internal_id)
+        );
+        assert_eq!(
+            handshake_headers
+                .get("x-external-request-id")
+                .map(String::as_str),
+            Some("priority-preserved-id")
+        );
+    }
+}
+
 #[test]
 fn test_proxy_scoped_plugin_removes_only_global_of_same_name() {
     // A global stdout_logging and two proxy-scoped stdout_logging instances.
@@ -3771,8 +4094,33 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
+#[tokio::test]
+async fn test_priority_override_delegates_deadline_rejection_replacement_capability() {
+    let mut audit = make_plugin_config_with_json(
+        "audit",
+        "ai_transcript_audit",
+        json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest"
+            }
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    audit.priority_override = Some(100);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 100);
+    assert!(plugins[0].may_replace_rejection_response());
+}
+
 #[test]
-fn test_priority_override_delegates_rejection_replacement_capability() {
+fn test_priority_override_delegates_spec_rejection_replacement_capability() {
     let mut plugin_config = make_plugin_config_with_json(
         "ps1",
         "spec_expose",
@@ -3794,6 +4142,7 @@ fn test_priority_override_delegates_rejection_replacement_capability() {
     assert_eq!(plugins[0].priority(), 211);
     assert!(plugins[0].applies_after_proxy_on_reject());
     assert!(plugins[0].may_replace_rejection_response());
+    assert!(!plugins[0].warn_on_rejection_response_replacement());
 }
 
 #[test]
@@ -4447,7 +4796,7 @@ fn test_multiple_proxies_with_different_plugins() {
 fn test_tcp_only_plugin_excluded_from_http() {
     // tcp_connection_throttle supports TCP_ONLY_PROTOCOLS
     let config = make_config(
-        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_tcp_proxy("p1", vec!["ps1"])],
         vec![make_plugin_config(
             "ps1",
             "tcp_connection_throttle",
@@ -4584,7 +4933,7 @@ fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
     // tcp_connection_throttle = TCP_ONLY, udp_rate_limiting = UDP_ONLY,
     // cors = HTTP_ONLY, stdout_logging = ALL_PROTOCOLS
     let config = make_config(
-        vec![make_proxy("p1", "/svc", vec!["ps1", "ps2", "ps3", "ps4"])],
+        vec![make_tcp_proxy("p1", vec!["ps1", "ps2", "ps3", "ps4"])],
         vec![
             make_plugin_config(
                 "ps1",
@@ -4638,6 +4987,383 @@ fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
     assert!(!udp_names.contains(&"cors"));
     assert!(!udp_names.contains(&"tcp_connection_throttle"));
     assert_eq!(udp_names.len(), 2);
+}
+
+#[test]
+fn test_tcp_connection_throttle_rejects_udp_and_dtls_attachments() {
+    for scheme in [BackendScheme::Udp, BackendScheme::Dtls] {
+        let config = make_config(
+            vec![make_udp_proxy("p1", vec!["throttle"], scheme)],
+            vec![make_plugin_config_with_json(
+                "throttle",
+                "tcp_connection_throttle",
+                json!({"max_connections_per_key": 1}),
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        );
+        let error = PluginCache::new(&config)
+            .err()
+            .expect("UDP/DTLS attachment must fail visibly");
+        assert!(error.contains("unsupported UDP/DTLS"), "{error}");
+        assert!(error.contains("udp_rate_limiting"), "{error}");
+    }
+
+    let global_only_udp = make_config(
+        vec![make_udp_proxy("p1", vec![], BackendScheme::Udp)],
+        vec![make_plugin_config_with_json(
+            "global-throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let error = PluginCache::new(&global_only_udp)
+        .err()
+        .expect("a global throttle with only UDP coverage must fail visibly");
+    assert!(error.contains("has no TCP/TCP+TLS proxy"), "{error}");
+
+    let http_attachment = make_config(
+        vec![make_proxy("p1", "/api", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let error = PluginCache::new(&http_attachment)
+        .err()
+        .expect("HTTP-family attachment must fail visibly");
+    assert!(error.contains("HTTP-family"), "{error}");
+}
+
+#[test]
+fn test_tcp_connection_throttle_accepts_tcp_and_tcp_tls_attachments() {
+    for scheme in [BackendScheme::Tcp, BackendScheme::Tcps] {
+        let mut proxy = make_tcp_proxy("p1", vec!["throttle"]);
+        proxy.backend_scheme = Some(scheme);
+        proxy.dispatch_kind = DispatchKind::from(scheme);
+        let config = make_config(
+            vec![proxy],
+            vec![make_plugin_config_with_json(
+                "throttle",
+                "tcp_connection_throttle",
+                json!({"max_connections_per_key": 1}),
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        );
+        let cache = PluginCache::new(&config)
+            .unwrap_or_else(|error| panic!("{scheme} attachment was rejected: {error}"));
+        let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name(), "tcp_connection_throttle");
+    }
+}
+
+#[test]
+fn test_tcp_connection_throttle_global_mixed_protocol_scope_protects_only_tcp() {
+    let config = make_config(
+        vec![
+            make_tcp_proxy("tcp", vec![]),
+            make_udp_proxy("udp", vec![], BackendScheme::Udp),
+        ],
+        vec![make_plugin_config_with_json(
+            "global-throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("mixed global scope has TCP coverage");
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("tcp", ProxyProtocol::Tcp)
+            .len(),
+        1
+    );
+    assert!(
+        cache
+            .get_plugins_for_protocol("udp", ProxyProtocol::Udp)
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_tcp_connection_throttle_proxy_group_rejects_mixed_protocol_attachment() {
+    let config = make_config(
+        vec![
+            make_tcp_proxy("tcp", vec!["group-throttle"]),
+            make_udp_proxy("udp", vec!["group-throttle"], BackendScheme::Dtls),
+        ],
+        vec![make_plugin_config_with_json(
+            "group-throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1}),
+            PluginScope::ProxyGroup,
+            None,
+        )],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("mixed-protocol proxy-group attachment must fail closed");
+    assert!(error.contains("udp (dtls)"), "{error}");
+    assert!(error.contains("only TCP/TCP+TLS is supported"), "{error}");
+}
+
+#[test]
+fn test_tcp_connection_throttle_global_validation_is_namespace_scoped() {
+    let mut tenant_a_http = make_proxy("shared-id", "/tenant-a", vec![]);
+    tenant_a_http.namespace = "tenant-a".to_string();
+    let mut tenant_b_tcp = make_tcp_proxy("shared-id", vec![]);
+    tenant_b_tcp.namespace = "tenant-b".to_string();
+    let mut tenant_a_throttle = make_plugin_config_with_json(
+        "global-throttle",
+        "tcp_connection_throttle",
+        json!({"max_connections_per_key": 1}),
+        PluginScope::Global,
+        None,
+    );
+    tenant_a_throttle.namespace = "tenant-a".to_string();
+
+    let config = make_config(vec![tenant_a_http, tenant_b_tcp], vec![tenant_a_throttle]);
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("another namespace's TCP proxy must not satisfy global coverage");
+    assert!(error.contains("has no TCP/TCP+TLS proxy"), "{error}");
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances() {
+    let mut wide = make_plugin_config_with_json(
+        "wide",
+        "tcp_connection_throttle",
+        json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    wide.priority_override = Some(1000);
+    let mut strict = make_plugin_config_with_json(
+        "strict",
+        "tcp_connection_throttle",
+        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    strict.priority_override = Some(2000);
+    let config = make_config(
+        vec![make_tcp_proxy("p1", vec!["wide", "strict"])],
+        vec![wide, strict],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    assert_eq!(plugins.len(), 2);
+    assert_eq!(plugins[0].priority(), 1000);
+    assert_eq!(plugins[1].priority(), 2000);
+
+    let mut first = make_tcp_stream_context("10.0.0.1");
+    assert!(run_tcp_connect_chain(&plugins, &mut first).await);
+    assert_eq!(first.admission_permits.len(), 2);
+
+    let mut rejected = make_tcp_stream_context("10.0.0.1");
+    assert!(!run_tcp_connect_chain(&plugins, &mut rejected).await);
+    assert!(rejected.admission_permits.is_empty());
+    assert_eq!(cache.total_rate_limiter_keys(), 2);
+
+    first.release_admission_permits();
+    assert_eq!(cache.total_rate_limiter_keys(), 0);
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_full_reload_preserves_live_admissions() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut old_connection = make_tcp_stream_context("10.0.0.2");
+    assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
+
+    let mut replacement = initial.clone();
+    replacement.plugin_configs[0].priority_override = Some(1800);
+    replacement.plugin_configs[0].updated_at = Utc::now();
+    cache.rebuild(&replacement).unwrap();
+    let new_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut blocked = make_tcp_stream_context("10.0.0.2");
+    assert!(!run_tcp_connect_chain(&new_plugins, &mut blocked).await);
+
+    old_connection.release_admission_permits();
+    let mut admitted = make_tcp_stream_context("10.0.0.2");
+    assert!(run_tcp_connect_chain(&new_plugins, &mut admitted).await);
+    admitted.release_admission_permits();
+    assert_eq!(cache.total_rate_limiter_keys(), 0);
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_state() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut old_connection = make_tcp_stream_context("10.0.0.3");
+    assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
+
+    let mut replacement = initial.clone();
+    replacement.plugin_configs[0].config =
+        json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0});
+    replacement.plugin_configs[0].updated_at = Utc::now();
+    cache
+        .apply_delta(&replacement, &HashSet::from(["p1".to_string()]), &[], false)
+        .unwrap();
+    let new_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut second = make_tcp_stream_context("10.0.0.3");
+    assert!(run_tcp_connect_chain(&new_plugins, &mut second).await);
+    let mut third = make_tcp_stream_context("10.0.0.3");
+    assert!(!run_tcp_connect_chain(&new_plugins, &mut third).await);
+
+    old_connection.release_admission_permits();
+    second.release_admission_permits();
+    assert_eq!(cache.total_rate_limiter_keys(), 0);
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_decreased_limit_waits_for_old_permits_to_drain() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut first = make_tcp_stream_context("10.0.0.5");
+    let mut second = make_tcp_stream_context("10.0.0.5");
+    assert!(run_tcp_connect_chain(&old_plugins, &mut first).await);
+    assert!(run_tcp_connect_chain(&old_plugins, &mut second).await);
+
+    let mut replacement = initial.clone();
+    replacement.plugin_configs[0].config =
+        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0});
+    cache.rebuild(&replacement).unwrap();
+    let new_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut blocked = make_tcp_stream_context("10.0.0.5");
+    assert!(!run_tcp_connect_chain(&new_plugins, &mut blocked).await);
+    first.release_admission_permits();
+    assert!(!run_tcp_connect_chain(&new_plugins, &mut blocked).await);
+    second.release_admission_permits();
+    assert!(run_tcp_connect_chain(&new_plugins, &mut blocked).await);
+    blocked.release_admission_permits();
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_scope_move_keeps_same_proxy_accounting() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut old_connection = make_tcp_stream_context("10.0.0.6");
+    assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
+
+    let mut moved = initial.clone();
+    moved.plugin_configs[0].scope = PluginScope::ProxyGroup;
+    moved.plugin_configs[0].proxy_id = None;
+    cache.rebuild(&moved).unwrap();
+    let moved_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut blocked = make_tcp_stream_context("10.0.0.6");
+    assert!(!run_tcp_connect_chain(&moved_plugins, &mut blocked).await);
+    old_connection.release_admission_permits();
+    assert!(run_tcp_connect_chain(&moved_plugins, &mut blocked).await);
+    blocked.release_admission_permits();
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_rejected_reload_keeps_old_generation() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut existing = make_tcp_stream_context("10.0.0.7");
+    assert!(run_tcp_connect_chain(&plugins, &mut existing).await);
+
+    let mut invalid = initial.clone();
+    invalid.plugin_configs[0].config = json!({"max_connections_per_key": 0});
+    assert!(cache.rebuild(&invalid).is_err());
+    let still_current = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut blocked = make_tcp_stream_context("10.0.0.7");
+    assert!(!run_tcp_connect_chain(&still_current, &mut blocked).await);
+    existing.release_admission_permits();
+    assert!(run_tcp_connect_chain(&still_current, &mut blocked).await);
+    blocked.release_admission_permits();
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_removed_policy_is_generation_isolated() {
+    let initial = make_config(
+        vec![make_tcp_proxy("p1", vec!["throttle"])],
+        vec![make_plugin_config_with_json(
+            "throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&initial).unwrap();
+    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut old_connection = make_tcp_stream_context("10.0.0.4");
+    assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
+
+    let removed = make_config(vec![make_tcp_proxy("p1", vec![])], vec![]);
+    cache.rebuild(&removed).unwrap();
+    cache.rebuild(&initial).unwrap();
+    let recreated_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let mut recreated = make_tcp_stream_context("10.0.0.4");
+    assert!(run_tcp_connect_chain(&recreated_plugins, &mut recreated).await);
+
+    old_connection.release_admission_permits();
+    let mut still_blocked = make_tcp_stream_context("10.0.0.4");
+    assert!(!run_tcp_connect_chain(&recreated_plugins, &mut still_blocked).await);
+    recreated.release_admission_permits();
+    assert_eq!(cache.total_rate_limiter_keys(), 0);
 }
 
 // ---- Body buffering flag tests ----
@@ -4804,6 +5530,322 @@ fn test_hmac_auth_allows_header_only_request_transformer() {
 }
 
 #[test]
+fn test_duplicate_effective_correlation_headers_are_rejected() {
+    let first = make_plugin_config_with_json(
+        "corr-first",
+        "correlation_id",
+        json!({}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let mut second = make_plugin_config_with_json(
+        "corr-second",
+        "correlation_id",
+        json!({"header_name": " X-Request-ID "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second.priority_override = Some(75);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr-first", "corr-second"])],
+        vec![first, second],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("duplicate normalized correlation headers must fail closed");
+    assert!(error.contains("duplicate effective header_name \"x-request-id\""));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
+fn test_real_ip_header_collision_is_rejected_by_candidate_and_runtime_cache() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr"])],
+        vec![make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": " CF-Connecting-IP "}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    let candidate_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &config,
+        Some("cf-connecting-ip"),
+    )
+    .expect_err("candidate admission must reject the real-IP header collision");
+    assert!(candidate_error.contains("FERRUM_REAL_IP_HEADER"));
+
+    let cache_error = plugin_cache_with_real_ip_header_for_test(&config, Some("cf-connecting-ip"))
+        .err()
+        .expect("runtime cache construction must reject the real-IP header collision");
+    assert!(cache_error.contains("FERRUM_REAL_IP_HEADER"));
+}
+
+#[test]
+fn test_real_ip_header_non_collision_is_accepted_by_candidate_and_runtime_cache() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr"])],
+        vec![make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": "X-Request-ID"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &config,
+        Some("cloudfront-viewer-address"),
+    )
+    .expect("distinct candidate headers must be accepted");
+    plugin_cache_with_real_ip_header_for_test(&config, Some("cloudfront-viewer-address"))
+        .expect("distinct runtime headers must be accepted");
+}
+
+#[test]
+fn test_equal_effective_correlation_priorities_are_rejected() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["corr-internal", "corr-external"],
+        )],
+        vec![
+            make_plugin_config_with_json(
+                "corr-internal",
+                "correlation_id",
+                json!({"header_name": "x-internal-request-id"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "corr-external",
+                "correlation_id",
+                json!({"header_name": "x-external-request-id"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("equal correlation priorities must fail closed");
+    assert!(error.contains("duplicate effective priority 50"));
+    assert!(error.contains("priority_override"));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
+fn test_same_correlation_header_on_disjoint_proxy_chains_is_allowed() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/one", vec!["corr-one"]),
+            make_proxy("p2", "/two", vec!["corr-two"]),
+        ],
+        vec![
+            make_plugin_config(
+                "corr-one",
+                "correlation_id",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "corr-two",
+                "correlation_id",
+                PluginScope::Proxy,
+                Some("p2"),
+                true,
+            ),
+        ],
+    );
+
+    assert!(PluginCache::new(&config).is_ok());
+}
+
+#[test]
+fn test_custom_only_duplicate_effective_correlation_headers_are_rejected() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    // The example plugin retains configured whitespace and casing at the
+    // capability boundary, modeling a third-party implementation that did not
+    // pre-normalize its correlation_id_header_name() result. Core validation
+    // must still trim and compare these two claims case-insensitively.
+    let first = make_plugin_config_with_json(
+        "custom-corr-first",
+        "example_plugin",
+        json!({"correlation_header_name": "x-custom-correlation-id"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let mut second = make_plugin_config_with_json(
+        "custom-corr-second",
+        "example_plugin",
+        json!({"correlation_header_name": " X-Custom-Correlation-ID "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second.priority_override = Some(5001);
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["custom-corr-first", "custom-corr-second"],
+        )],
+        vec![first, second],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("mixed-whitespace/case correlation claims must fail closed");
+    assert!(error.contains("duplicate effective header_name \"x-custom-correlation-id\""));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
+fn test_empty_third_party_correlation_capability_claims_fail_closed_clearly() {
+    for claim in ["", " \t "] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin { claim })];
+        let error =
+            ferrum_edge::_test_support::validate_correlation_id_composition_for_test(&plugins)
+                .expect_err("one empty normalized capability claim must fail closed");
+
+        assert!(
+            error.contains("plugin \"raw_correlation_claim\" returned an empty correlation_id_header_name capability claim"),
+            "unexpected empty-claim error for {claim:?}: {error}"
+        );
+        assert!(error.contains("return None"), "got: {error}");
+        assert!(
+            !error.contains("duplicate effective header_name"),
+            "got: {error}"
+        );
+    }
+}
+
+#[test]
+fn test_third_party_correlation_capability_cannot_claim_real_ip_header() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin {
+        claim: " CF-Connecting-IP ",
+    })];
+    let error = validate_correlation_id_composition_with_real_ip_header_for_test(
+        &plugins,
+        Some("cf-connecting-ip"),
+    )
+    .expect_err("third-party real-IP header collision must fail closed");
+    assert!(error.contains("FERRUM_REAL_IP_HEADER"), "got: {error}");
+    assert!(error.contains("cf-connecting-ip"), "got: {error}");
+}
+
+#[test]
+fn test_third_party_correlation_capability_cannot_claim_reserved_header() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin {
+        claim: " AuThOrIzAtIoN ",
+    })];
+    let error = ferrum_edge::_test_support::validate_correlation_id_composition_for_test(&plugins)
+        .expect_err("third-party reserved header ownership must fail closed");
+
+    assert!(
+        error.contains("effective header_name \"authorization\""),
+        "got: {error}"
+    );
+    assert!(
+        error.contains("plugin \"raw_correlation_claim\""),
+        "got: {error}"
+    );
+    assert!(error.contains("protocol Http"), "got: {error}");
+    assert!(
+        error.contains("reserved protocol-managed or security-sensitive header ownership"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn test_shipped_custom_correlation_plugin_cannot_claim_reserved_header() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let custom_owner = make_plugin_config_with_json(
+        "custom-corr-reserved",
+        "example_plugin",
+        json!({"correlation_header_name": " AuThOrIzAtIoN "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["custom-corr-reserved"])],
+        vec![custom_owner],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("shipped custom plugin must not claim reserved correlation headers");
+    assert!(
+        error.contains("effective header_name \"authorization\""),
+        "got: {error}"
+    );
+    assert!(error.contains("plugin \"example_plugin\""), "got: {error}");
+    assert!(error.contains("protocol Http"), "got: {error}");
+    assert!(error.contains("proxy_id=p1"), "got: {error}");
+    assert!(error.contains("reserved"), "got: {error}");
+}
+
+#[test]
+fn test_custom_correlation_owners_on_disjoint_protocols_are_allowed() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let http_owner = make_plugin_config_with_json(
+        "custom-corr-http",
+        "example_plugin",
+        json!({"correlation_header_name": "x-custom-correlation-id"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let tcp_owner = make_plugin_config_with_json(
+        "custom-corr-tcp",
+        "example_plugin",
+        json!({
+            "correlation_header_name": " X-Custom-Correlation-ID ",
+            "protocol": "tcp"
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["custom-corr-http", "custom-corr-tcp"],
+        )],
+        vec![http_owner, tcp_owner],
+    );
+
+    let cache = PluginCache::new(&config)
+        .expect("disjoint protocol owners cannot contend for correlation ownership");
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("p1", ProxyProtocol::Http)
+            .len(),
+        1
+    );
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("p1", ProxyProtocol::Tcp)
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn test_modifies_request_headers_flag_false_when_no_plugin_modifies() {
     // stdout_logging does not modify request headers
     let config = make_config(
@@ -4956,6 +5998,38 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
         caps.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT),
         "WAF plugin must set NEEDS_FINAL_REQUEST_BODY_CONTEXT so the proxy \
          passes a mutable RequestContext into on_final_request_body hooks"
+    );
+}
+
+#[test]
+fn test_ai_federation_sets_terminal_final_body_dispatch_capability() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "ai_federation",
+        json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "api_key": "sk-test-key",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    // Exercise the priority wrapper too: it must forward the terminal dispatch
+    // contract or the proxy would run federation inside backend accounting.
+    plugin_config.priority_override = Some(2099);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        caps.has(PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH),
+        "AI federation must finalize and dispatch before backend-only preflights and accounting"
     );
 }
 
@@ -5224,6 +6298,129 @@ fn test_default_priority_used_when_no_override() {
     // cors (100) should come before key_auth (1200)
     assert_eq!(plugins[0].name(), "cors");
     assert_eq!(plugins[1].name(), "key_auth");
+}
+
+#[test]
+fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_policies() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["dedup", "grpc-web", "method-router", "deadline"],
+        )],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "method-router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "deadline",
+                "grpc_deadline",
+                json!({"default_deadline_ms": 1000}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("plugin cache");
+    let view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+
+    assert!(
+        view.plugins
+            .iter()
+            .any(|name| name == "request_deduplication")
+    );
+    assert!(view.plugins.iter().any(|name| name == "grpc_web"));
+    assert_eq!(
+        view.plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_method_router")
+            .count(),
+        1
+    );
+    assert_eq!(
+        view.plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_deadline")
+            .count(),
+        1
+    );
+    assert_eq!(view.grpc_deadline_plugins, vec!["grpc_deadline"]);
+    assert_eq!(view.backend_path_plugins, vec!["grpc_method_router"]);
+
+    let merged_names = cache
+        .get_plugins("p1")
+        .iter()
+        .filter(|plugin| {
+            plugin.supported_protocols().contains(&ProxyProtocol::Http)
+                || (["grpc_method_router", "grpc_deadline"].contains(&plugin.name())
+                    && plugin.supported_protocols().contains(&ProxyProtocol::Grpc))
+        })
+        .map(|plugin| plugin.name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        view.plugins, merged_names,
+        "the precomputed composed view must preserve merged priority/config order"
+    );
+
+    let reloaded = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["grpc-web", "method-router", "deadline"],
+        )],
+        vec![
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "method-router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "deadline",
+                "grpc_deadline",
+                json!({"default_deadline_ms": 1000}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    cache
+        .apply_delta(
+            &reloaded,
+            &std::collections::HashSet::from(["p1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("gRPC-Web composed view delta rebuild");
+    let reloaded_view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+    assert!(
+        !reloaded_view
+            .plugins
+            .iter()
+            .any(|name| name == "request_deduplication")
+    );
+    assert_eq!(
+        reloaded_view
+            .plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_deadline")
+            .count(),
+        1
+    );
 }
 
 #[test]

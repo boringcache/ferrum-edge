@@ -14,6 +14,7 @@ pub mod cache_headers;
 pub mod cert_hash;
 pub mod claim_header_fanout;
 pub mod claim_resolver;
+pub mod content_encoding;
 pub mod dpop;
 pub mod fault_roll;
 pub mod http_client;

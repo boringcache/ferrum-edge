@@ -6,7 +6,10 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_ai_plugins
 
+use crate::common::TestGateway;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,6 +37,33 @@ async fn start_echo_server_on(listener: TcpListener) {
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    }
+}
+
+async fn start_counted_json_server_on(
+    listener: TcpListener,
+    status: u16,
+    body: &'static str,
+    counted_request_prefix: &'static [u8],
+    hits: Arc<AtomicUsize>,
+) {
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let hits = Arc::clone(&hits);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16384];
+                let bytes_read = stream.read(&mut buf).await.unwrap_or(0);
+                if buf[..bytes_read].starts_with(counted_request_prefix) {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
@@ -118,6 +148,206 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         }
     }
     panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
+}
+
+// ============================================================================
+// ai_federation request-path isolation
+// ============================================================================
+
+#[ignore]
+#[tokio::test]
+async fn test_ai_federation_terminal_dispatch_is_backend_accounting_neutral() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let backend_task = tokio::spawn(start_counted_json_server_on(
+        backend_listener,
+        200,
+        r#"{"backend":true}"#,
+        b"POST /chat ",
+        Arc::clone(&backend_hits),
+    ));
+
+    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_port = provider_listener.local_addr().unwrap().port();
+    let provider_hits = Arc::new(AtomicUsize::new(0));
+    let provider_task = tokio::spawn(start_counted_json_server_on(
+        provider_listener,
+        503,
+        r#"{"error":"provider unavailable"}"#,
+        b"POST /v1/chat/completions ",
+        Arc::clone(&provider_hits),
+    ));
+
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "federation-isolation"
+    listen_path: "/federation-isolation"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    pool_enable_http2: false
+    upstream_id: "federation-isolation-upstream"
+    circuit_breaker:
+      failure_threshold: 1
+      success_threshold: 1
+      timeout_seconds: 60
+      failure_status_codes: [503]
+      half_open_max_requests: 1
+      trip_on_connection_errors: true
+    plugins:
+      - plugin_config_id: "federation-content-type-transformer"
+      - plugin_config_id: "federation-isolation-plugin"
+
+consumers: []
+upstreams:
+  - id: "federation-isolation-upstream"
+    algorithm: round_robin
+    targets:
+      - host: "127.0.0.1"
+        port: {backend_port}
+        weight: 1
+    health_checks:
+      passive:
+        unhealthy_status_codes: [503]
+        unhealthy_threshold: 1
+        unhealthy_window_seconds: 60
+        healthy_after_seconds: 0
+
+plugin_configs:
+  - id: "federation-content-type-transformer"
+    proxy_id: "federation-isolation"
+    plugin_name: "request_transformer"
+    scope: "proxy"
+    enabled: true
+    config:
+      rules:
+        - operation: "update"
+          target: "header"
+          key: "content-type"
+          value: "application/json"
+  - id: "federation-isolation-plugin"
+    proxy_id: "federation-isolation"
+    plugin_name: "ai_federation"
+    scope: "proxy"
+    enabled: true
+    config:
+      fallback_enabled: false
+      fail_on_no_matching_provider: false
+      providers:
+        - name: "mock-provider"
+          provider_type: "openai"
+          api_key: "test-key"
+          model_patterns: ["gpt-*"]
+          base_url: "http://127.0.0.1:{provider_port}/v1/chat/completions"
+          allow_plaintext: true
+  - id: "federation-isolation-metrics"
+    plugin_name: "prometheus_metrics"
+    scope: "global"
+    enabled: true
+    config:
+      render_cache_ttl_seconds: 0
+"#
+    );
+
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("start federation isolation gateway");
+    let client = reqwest::Client::new();
+
+    let provider_response = client
+        .post(gateway.proxy_url("/federation-isolation/chat"))
+        .header("content-type", "text/plain")
+        .body(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .expect("serialize federated request"),
+        )
+        .send()
+        .await
+        .expect("send federated request");
+    assert_eq!(provider_response.status().as_u16(), 503);
+    assert_eq!(provider_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        backend_hits.load(Ordering::Relaxed),
+        0,
+        "terminal federation dispatch must not send the application request to backend transport"
+    );
+
+    let runtime_metrics: serde_json::Value = client
+        .get(gateway.admin_url("/admin/metrics"))
+        .header("Authorization", gateway.auth_header())
+        .send()
+        .await
+        .expect("read runtime metrics after provider response")
+        .json()
+        .await
+        .expect("parse runtime metrics after provider response");
+    if let Some(breaker) = runtime_metrics["circuit_breakers"]
+        .as_array()
+        .and_then(|breakers| {
+            breakers
+                .iter()
+                .find(|breaker| breaker["proxy_id"] == "federation-isolation")
+        })
+    {
+        assert_eq!(breaker["state"], "closed");
+        assert_eq!(breaker["failure_count"].as_u64().unwrap_or(0), 0);
+    }
+    assert!(
+        runtime_metrics["health_check"]["unhealthy_targets"]
+            .as_array()
+            .expect("runtime unhealthy target list")
+            .iter()
+            .all(|target| target["proxy_id"] != "federation-isolation"),
+        "provider failures must not poison backend passive health: {runtime_metrics}"
+    );
+
+    let metrics = client
+        .get(gateway.admin_url("/metrics"))
+        .header("Authorization", gateway.auth_header())
+        .send()
+        .await
+        .expect("scrape metrics after synthetic provider response")
+        .text()
+        .await
+        .expect("read metrics body");
+    assert!(
+        !metrics.contains("ferrum_backend_duration_ms_count{proxy_id=\"federation-isolation\""),
+        "provider latency must not be recorded as backend latency: {metrics}"
+    );
+
+    let passthrough_response = client
+        .post(gateway.proxy_url("/federation-isolation/chat"))
+        .header("content-type", "text/plain")
+        .body(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "local-only",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .expect("serialize unmatched pass-through request"),
+        )
+        .send()
+        .await
+        .expect("send unmatched pass-through request");
+    assert_eq!(
+        passthrough_response.status().as_u16(),
+        200,
+        "the provider 503 must not open or penalize the backend circuit"
+    );
+    assert_eq!(backend_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(provider_hits.load(Ordering::Relaxed), 1);
+
+    backend_task.abort();
+    provider_task.abort();
 }
 
 // ============================================================================

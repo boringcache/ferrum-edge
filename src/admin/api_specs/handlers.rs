@@ -14,6 +14,8 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -27,8 +29,9 @@ use crate::admin::{AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, SortOrder,
     is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
+    tcp_connection_throttle_attachment_conflict,
 };
-use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
+use crate::config::types::{ApiSpec, PluginAssociation, PluginScope, Upstream};
 use crate::util::body_limit::is_length_limit_error;
 
 // ---------------------------------------------------------------------------
@@ -62,6 +65,8 @@ enum ApiSpecError {
     MongoDocTooLarge,
     /// FK or business-logic violation (422)
     Unprocessable(String),
+    /// Authoritative plugin-composition validation failure (422)
+    PluginComposition(Vec<String>),
     /// No DB configured (503)
     NoDatabase,
     /// Namespace admission is currently fenced (503)
@@ -77,6 +82,12 @@ struct ValidationFailure {
     errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiSpecLateWriteRecovery {
+    Retained,
+    NotRetained,
+}
+
 // ---------------------------------------------------------------------------
 // Helper: map anyhow::Error from DB calls to ApiSpecError
 // ---------------------------------------------------------------------------
@@ -87,6 +98,9 @@ fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
     }
     if is_mtls_dns_identity_conflict(&e) {
         return ApiSpecError::Conflict(e.to_string());
+    }
+    if let Some(conflict) = tcp_connection_throttle_attachment_conflict(&e) {
+        return ApiSpecError::PluginComposition(conflict.errors().to_vec());
     }
     if e.chain().any(|cause| {
         cause
@@ -120,6 +134,375 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
     } else {
         ApiSpecError::Internal(msg.to_string())
     }
+}
+
+async fn run_api_spec_persistence_while_held<T, F, C>(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    guard: crate::admin::crud::NamespaceConfigAdmissionGuard,
+    future: F,
+    compensation: C,
+    compensate_after_intervening_write: bool,
+) -> Result<T, ApiSpecError>
+where
+    F: Future<Output = Result<T, anyhow::Error>>,
+    C: Future<Output = Result<ApiSpecLateWriteRecovery, anyhow::Error>>,
+{
+    match guard.run_to_completion_while_held(future).await {
+        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(result)) => {
+            result.map_err(classify_db_error)
+        }
+        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
+            tracing::warn!(
+                %error,
+                "API-spec persistence completed after namespace config admission was lost"
+            );
+            match result {
+                Ok(result) => {
+                    let lost_generation = guard.generation();
+                    drop(guard);
+                    let recovery_guard = crate::admin::crud::lock_namespace_config_admission(
+                        db, namespace,
+                    )
+                    .await
+                    .map_err(|recovery_error| {
+                        tracing::error!(
+                            %recovery_error,
+                            "Failed to reacquire API-spec namespace admission after a late write"
+                        );
+                        ApiSpecError::AdmissionUnavailable(recovery_error.to_string())
+                    })?;
+                    if recovery_guard.immediately_succeeds_generation(lost_generation) {
+                        return Ok(result);
+                    }
+                    if !compensate_after_intervening_write {
+                        return Err(ApiSpecError::AdmissionUnavailable(error.to_string()));
+                    }
+                    match recovery_guard
+                        .run_to_completion_while_held(compensation)
+                        .await
+                    {
+                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Ok(
+                            ApiSpecLateWriteRecovery::Retained,
+                        ))) => return Ok(result),
+                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Ok(
+                            ApiSpecLateWriteRecovery::NotRetained,
+                        ))) => {}
+                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
+                            result: Ok(_),
+                            error: recovery_error,
+                        }) => {
+                            tracing::error!(
+                                %recovery_error,
+                                "API-spec late-write compensation lost namespace admission"
+                            );
+                        }
+                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Err(
+                            recovery_error,
+                        )))
+                        | Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
+                            result: Err(recovery_error),
+                            ..
+                        })
+                        | Err(recovery_error) => {
+                            tracing::error!(
+                                %recovery_error,
+                                "API-spec late-write compensation failed"
+                            );
+                        }
+                    }
+                    Err(ApiSpecError::AdmissionUnavailable(error.to_string()))
+                }
+                Err(error) => Err(classify_db_error(error)),
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "API-spec persistence could not start with namespace config admission held"
+            );
+            Err(ApiSpecError::AdmissionUnavailable(error.to_string()))
+        }
+    }
+}
+
+async fn stored_api_spec_bundle_matches(
+    db: &dyn DatabaseBackend,
+    bundle: &ExtractedBundle,
+    spec: &ApiSpec,
+) -> Result<bool, anyhow::Error> {
+    let Some(current_spec) = db.get_api_spec(&spec.namespace, &spec.id).await? else {
+        return Ok(false);
+    };
+    if current_spec.updated_at != spec.updated_at || current_spec.content_hash != spec.content_hash
+    {
+        return Ok(false);
+    }
+    let Some(current_proxy) = db
+        .get_proxy_for_write(&spec.namespace, &bundle.proxy.id)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if current_proxy.updated_at != bundle.proxy.updated_at {
+        return Ok(false);
+    }
+    if let Some(upstream) = bundle.upstream.as_ref() {
+        let Some(current) = db.get_upstream(&spec.namespace, &upstream.id).await? else {
+            return Ok(false);
+        };
+        if current.updated_at != upstream.updated_at {
+            return Ok(false);
+        }
+    }
+    for plugin in &bundle.plugins {
+        let Some(current) = db.get_plugin_config(&spec.namespace, &plugin.id).await? else {
+            return Ok(false);
+        };
+        if current.updated_at != plugin.updated_at {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn compensate_late_api_spec_create(
+    db: Arc<dyn DatabaseBackend>,
+    bundle: ExtractedBundle,
+    spec: ApiSpec,
+    state: &AdminState,
+) -> Result<ApiSpecLateWriteRecovery, anyhow::Error> {
+    if crate::admin::crud::current_transaction_log_schema_graph_is_valid(
+        db.as_ref(),
+        state,
+        &spec.namespace,
+    )
+    .await?
+    {
+        return if stored_api_spec_bundle_matches(db.as_ref(), &bundle, &spec).await? {
+            Ok(ApiSpecLateWriteRecovery::Retained)
+        } else {
+            Ok(ApiSpecLateWriteRecovery::NotRetained)
+        };
+    }
+    match crate::admin::crud::validate_transaction_log_schema_api_spec_deletion_candidate(
+        db.as_ref(),
+        state,
+        &spec.namespace,
+        &spec,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crate::admin::crud::AfterValidateError::BadRequest(errors))
+        | Err(crate::admin::crud::AfterValidateError::Conflict(errors)) => anyhow::bail!(
+            "late API-spec create compensation would leave an invalid transaction-log schema graph: {}",
+            errors.join("; ")
+        ),
+        Err(crate::admin::crud::AfterValidateError::Db(error)) => return Err(error),
+        Err(crate::admin::crud::AfterValidateError::Response(_)) => {
+            anyhow::bail!("late API-spec create compensation validation returned an HTTP response")
+        }
+    }
+    if !late_api_spec_create_compensation_safe(db.as_ref(), &bundle, &spec).await? {
+        anyhow::bail!(
+            "late API-spec create compensation found intervening resources attached to its proxy"
+        );
+    }
+    if !db.delete_api_spec(&spec.namespace, &spec.id).await? {
+        anyhow::bail!("late API-spec create compensation found no matching API spec");
+    }
+    Ok(ApiSpecLateWriteRecovery::NotRetained)
+}
+
+async fn late_api_spec_create_compensation_safe(
+    db: &dyn DatabaseBackend,
+    bundle: &ExtractedBundle,
+    spec: &ApiSpec,
+) -> Result<bool, anyhow::Error> {
+    if !stored_api_spec_bundle_matches(db, bundle, spec).await? {
+        return Ok(false);
+    }
+    let Some(current_proxy) = db
+        .get_proxy_for_write(&spec.namespace, &bundle.proxy.id)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let expected_associations = bundle
+        .proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect::<HashSet<_>>();
+    if current_proxy.plugins.len() != expected_associations.len()
+        || current_proxy.plugins.iter().any(|association| {
+            !expected_associations.contains(association.plugin_config_id.as_str())
+        })
+    {
+        return Ok(false);
+    }
+
+    let expected_plugin_ids = bundle
+        .plugins
+        .iter()
+        .map(|plugin| plugin.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_plugin_configs_paginated(&spec.namespace, PAGE_SIZE, offset)
+            .await?;
+        let items_len = page.items.len() as i64;
+        if page.items.iter().any(|plugin| {
+            plugin.proxy_id.as_deref() == Some(bundle.proxy.id.as_str())
+                && !expected_plugin_ids.contains(plugin.id.as_str())
+        }) {
+            return Ok(false);
+        }
+        if items_len == 0 || offset + items_len >= page.total {
+            return Ok(true);
+        }
+        offset += items_len;
+    }
+}
+
+async fn compensate_late_api_spec_replace(
+    db: Arc<dyn DatabaseBackend>,
+    written_bundle: ExtractedBundle,
+    written_spec: ApiSpec,
+    previous_bundle: ExtractedBundle,
+    previous_spec: ApiSpec,
+    state: &AdminState,
+) -> Result<ApiSpecLateWriteRecovery, anyhow::Error> {
+    if crate::admin::crud::current_transaction_log_schema_graph_is_valid(
+        db.as_ref(),
+        state,
+        &written_spec.namespace,
+    )
+    .await?
+    {
+        return if stored_api_spec_bundle_matches(db.as_ref(), &written_bundle, &written_spec)
+            .await?
+        {
+            Ok(ApiSpecLateWriteRecovery::Retained)
+        } else {
+            Ok(ApiSpecLateWriteRecovery::NotRetained)
+        };
+    }
+    match crate::admin::crud::validate_transaction_log_schema_api_spec_replacement_candidate(
+        db.as_ref(),
+        state,
+        &written_spec.namespace,
+        &written_spec,
+        &previous_bundle.plugins,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crate::admin::crud::AfterValidateError::BadRequest(errors))
+        | Err(crate::admin::crud::AfterValidateError::Conflict(errors)) => anyhow::bail!(
+            "late API-spec replacement compensation could not produce a valid transaction-log schema graph: {}",
+            errors.join("; ")
+        ),
+        Err(crate::admin::crud::AfterValidateError::Db(error)) => return Err(error),
+        Err(crate::admin::crud::AfterValidateError::Response(_)) => anyhow::bail!(
+            "late API-spec replacement compensation validation returned an HTTP response"
+        ),
+    }
+    if !stored_api_spec_bundle_matches(db.as_ref(), &written_bundle, &written_spec).await? {
+        anyhow::bail!("late API-spec replacement no longer matches the written bundle");
+    }
+    db.replace_api_spec_bundle(&previous_bundle, &previous_spec)
+        .await?;
+    Ok(ApiSpecLateWriteRecovery::NotRetained)
+}
+
+async fn compensate_late_api_spec_delete(
+    db: Arc<dyn DatabaseBackend>,
+    previous_bundle: ExtractedBundle,
+    previous_spec: ApiSpec,
+    additional_plugins: Vec<crate::config::types::PluginConfig>,
+    state: &AdminState,
+) -> Result<ApiSpecLateWriteRecovery, anyhow::Error> {
+    if crate::admin::crud::current_transaction_log_schema_graph_is_valid(
+        db.as_ref(),
+        state,
+        &previous_spec.namespace,
+    )
+    .await?
+    {
+        let remains_deleted = db
+            .get_api_spec(&previous_spec.namespace, &previous_spec.id)
+            .await?
+            .is_none()
+            && db
+                .get_proxy_for_write(&previous_spec.namespace, &previous_spec.proxy_id)
+                .await?
+                .is_none();
+        return Ok(if remains_deleted {
+            ApiSpecLateWriteRecovery::Retained
+        } else {
+            ApiSpecLateWriteRecovery::NotRetained
+        });
+    }
+    if db
+        .get_api_spec(&previous_spec.namespace, &previous_spec.id)
+        .await?
+        .is_some()
+        || db
+            .get_proxy_for_write(&previous_spec.namespace, &previous_spec.proxy_id)
+            .await?
+            .is_some()
+    {
+        return Ok(ApiSpecLateWriteRecovery::NotRetained);
+    }
+    let mut restored_plugins = previous_bundle.plugins.clone();
+    restored_plugins.extend(additional_plugins.iter().cloned());
+    match crate::admin::crud::validate_transaction_log_schema_candidates(
+        db.as_ref(),
+        state,
+        &previous_spec.namespace,
+        &restored_plugins,
+        None,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crate::admin::crud::AfterValidateError::BadRequest(errors))
+        | Err(crate::admin::crud::AfterValidateError::Conflict(errors)) => anyhow::bail!(
+            "late API-spec delete compensation could not restore a valid transaction-log schema graph: {}",
+            errors.join("; ")
+        ),
+        Err(crate::admin::crud::AfterValidateError::Db(error)) => return Err(error),
+        Err(crate::admin::crud::AfterValidateError::Response(_)) => {
+            anyhow::bail!("late API-spec delete compensation validation returned an HTTP response")
+        }
+    }
+    let additional_plugin_ids = additional_plugins
+        .iter()
+        .map(|plugin| plugin.id.clone())
+        .collect::<HashSet<_>>();
+    let mut base_bundle = previous_bundle.clone();
+    base_bundle.proxy.plugins.retain(|association| {
+        !additional_plugin_ids.contains(association.plugin_config_id.as_str())
+    });
+    db.submit_api_spec_bundle(&base_bundle, &previous_spec)
+        .await?;
+    for plugin in additional_plugins {
+        if db
+            .get_plugin_config(&previous_spec.namespace, &plugin.id)
+            .await?
+            .is_none()
+        {
+            db.create_plugin_config(&plugin).await?;
+        }
+    }
+    if !additional_plugin_ids.is_empty() && !db.update_proxy(&previous_bundle.proxy).await? {
+        anyhow::bail!("late API-spec delete compensation could not restore proxy associations");
+    }
+    Ok(ApiSpecLateWriteRecovery::NotRetained)
 }
 
 fn is_row_missing_error_message(lower: &str) -> bool {
@@ -199,6 +582,16 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
                 }),
             )
         }
+        ApiSpecError::PluginComposition(errors) => json_resp(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &json!({
+                "error": "Spec validation failed",
+                "failures": [{
+                    "resource_type": "plugin_composition",
+                    "errors": errors,
+                }]
+            }),
+        ),
         ApiSpecError::NoDatabase => json_resp(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "No database configured"}),
@@ -1325,14 +1718,27 @@ async fn validate_bundle(
                 "Unknown plugin name '{}'. Available plugins: {:?}",
                 plugin.plugin_name, known_plugins
             ));
-        } else if plugin.enabled
-            && let Err(e) = crate::plugins::validate_plugin_config_with_policy(
-                &plugin.plugin_name,
-                &plugin.config,
-                &state.backend_allow_ips,
-            )
-        {
-            plugin_errors.push(e);
+        } else if plugin.enabled {
+            let validation =
+                if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin) {
+                    // Full construction must run only after the prospective
+                    // namespace's schema definitions have been staged below.
+                    // Keep policy-only admission active in this preliminary pass.
+                    crate::plugins::validate_plugin_config_policy_only(
+                        &plugin.plugin_name,
+                        &plugin.config,
+                        &state.backend_allow_ips,
+                    )
+                } else {
+                    crate::plugins::validate_plugin_config_with_policy(
+                        &plugin.plugin_name,
+                        &plugin.config,
+                        &state.backend_allow_ips,
+                    )
+                };
+            if let Err(error) = validation {
+                plugin_errors.push(error);
+            }
         }
 
         if !plugin_errors.is_empty() {
@@ -1732,7 +2138,7 @@ async fn validate_bundle(
 
     if failures.is_empty() {
         let validation_result = if let Some(put_ctx) = put_ctx.as_ref() {
-            crate::admin::crud::validate_plugin_security_composition_api_spec_replacement_candidate(
+            crate::admin::crud::validate_plugin_graph_api_spec_replacement_candidate(
                 db,
                 state,
                 namespace,
@@ -1742,7 +2148,7 @@ async fn validate_bundle(
             )
             .await
         } else {
-            crate::admin::crud::validate_plugin_security_composition_candidates(
+            crate::admin::crud::validate_plugin_graph_candidates(
                 db,
                 state,
                 namespace,
@@ -1769,7 +2175,56 @@ async fn validate_bundle(
             }
             Err(crate::admin::crud::AfterValidateError::Response(_)) => {
                 return Err(ApiSpecError::Internal(
-                    "plugin security composition candidate validation returned an unexpected response"
+                    "Plugin-graph candidate validation returned an unexpected response".to_string(),
+                ));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        let validation_result = if let Some(put_ctx) = put_ctx.as_ref() {
+            crate::admin::crud::validate_transaction_log_schema_api_spec_replacement_candidate(
+                db,
+                state,
+                namespace,
+                put_ctx.spec,
+                &bundle.plugins,
+            )
+            .await
+        } else if bundle
+            .plugins
+            .iter()
+            .any(crate::plugins::transaction_log_schema::is_enabled_config_graph_participant)
+        {
+            crate::admin::crud::validate_transaction_log_schema_candidates(
+                db,
+                state,
+                namespace,
+                &bundle.plugins,
+                None,
+            )
+            .await
+        } else {
+            Ok(())
+        };
+        match validation_result {
+            Ok(()) => {}
+            Err(
+                crate::admin::crud::AfterValidateError::BadRequest(errors)
+                | crate::admin::crud::AfterValidateError::Conflict(errors),
+            ) => {
+                failures.push(ValidationFailure {
+                    resource_type: "plugin_graph",
+                    id: bundle.proxy.id.clone(),
+                    errors,
+                });
+            }
+            Err(crate::admin::crud::AfterValidateError::Db(error)) => {
+                return Err(classify_db_error(error));
+            }
+            Err(crate::admin::crud::AfterValidateError::Response(_)) => {
+                return Err(ApiSpecError::Internal(
+                    "Transaction-log schema candidate validation returned an unexpected response"
                         .to_string(),
                 ));
             }
@@ -2344,6 +2799,20 @@ pub async fn handle_post_api_spec(
     // Assign IDs for POST: mint UUIDs for every empty ID, re-link references.
     assign_ids_for_post(&mut bundle);
 
+    // Keep the authoritative namespace snapshot used by plugin-graph admission
+    // stable through bundle persistence. This is shared with direct CRUD,
+    // batch, restore, and API-spec PUT/DELETE mutations.
+    let _namespace_config_admission_guard =
+        match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+                return Ok(error_response(ApiSpecError::AdmissionUnavailable(
+                    error.to_string(),
+                )));
+            }
+        };
+
     // Validate: field checks + DB cross-checks (listen_path uniqueness, etc.)
     let ValidatedBundle { bundle, metadata } = match validate_bundle(
         bundle,
@@ -2374,9 +2843,62 @@ pub async fn handle_post_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
-    match db.submit_api_spec_bundle(&bundle, &spec).await {
-        Ok(()) => {}
-        Err(e) => return Ok(error_response(classify_db_error(e))),
+    let settlement_db = db.clone();
+    let persistence_db = db.clone();
+    let compensation_db = db.clone();
+    let settlement_namespace = namespace.to_string();
+    let persistence_bundle = bundle.clone();
+    let persistence_spec = spec.clone();
+    let compensation_bundle = bundle.clone();
+    let compensation_spec = spec.clone();
+    let settlement_state = state.clone();
+    let audit_db = db.clone();
+    let audit_enabled = state.admin_audit_enabled;
+    let audit_actor = actor.clone();
+    let audit_spec = spec.clone();
+    let persistence = tokio::spawn(async move {
+        let result = run_api_spec_persistence_while_held(
+            settlement_db,
+            &settlement_namespace,
+            _namespace_config_admission_guard,
+            persistence_db.submit_api_spec_bundle(&persistence_bundle, &persistence_spec),
+            compensate_late_api_spec_create(
+                compensation_db,
+                compensation_bundle,
+                compensation_spec,
+                &settlement_state,
+            ),
+            true,
+        )
+        .await;
+        if result.is_ok() {
+            let event = audit::AuditEvent::new(
+                &audit_actor,
+                "create",
+                "api_spec",
+                &audit_spec.id,
+                &audit_spec.namespace,
+                audit::create_diff(json!({
+                    "id": audit_spec.id,
+                    "proxy_id": audit_spec.proxy_id,
+                    "content_hash": audit_spec.content_hash,
+                    "spec_version": audit_spec.spec_version,
+                })),
+            );
+            if let Err(error) = audit::record(audit_enabled, audit_db, event) {
+                log_audit_enqueue_failure(&error);
+            }
+        }
+        result
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(ApiSpecError::Internal(format!(
+            "API-spec create persistence task failed: {error}"
+        )))
+    });
+    if let Err(error) = persistence {
+        return Ok(error_response(error));
     }
 
     let resp_body = json!({
@@ -2385,18 +2907,6 @@ pub async fn handle_post_api_spec(
         "content_hash": spec.content_hash,
         "spec_version": spec.spec_version,
     });
-
-    let event = audit::AuditEvent::new(
-        actor,
-        "create",
-        "api_spec",
-        &spec_id,
-        namespace,
-        audit::create_diff(resp_body.clone()),
-    );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-        log_audit_enqueue_failure(&error);
-    }
 
     // Build the body + standard headers via the shared `json_resp` helper, then
     // inject the `Location` header. This keeps body-serialisation and header
@@ -2428,12 +2938,14 @@ pub async fn handle_put_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
-    // Check spec exists and belongs to this namespace
-    let existing_spec = match db.get_api_spec(namespace, id).await {
-        Ok(Some(s)) => s,
+    // Preserve the endpoint's early not-found behavior before collecting a
+    // potentially large body. The spec is re-read under the namespace
+    // admission guard below before any prospective validation uses it.
+    match db.get_api_spec(namespace, id).await {
+        Ok(Some(_)) => {}
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
         Err(e) => return Ok(error_response(classify_db_error(e))),
-    };
+    }
 
     let declared_format = parse_content_type(req.headers());
     let max_mib = state.admin_spec_max_body_size_mib;
@@ -2449,11 +2961,37 @@ pub async fn handle_put_api_spec(
         Err(e) => return Ok(error_response(ApiSpecError::Extract(e))),
     };
 
+    // Serialize every graph-relevant read below through replacement
+    // persistence. Re-read the spec after acquiring the guard so a concurrent
+    // API-spec delete cannot leave validation based on a stale owner row.
+    let _namespace_config_admission_guard =
+        match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+                return Ok(error_response(ApiSpecError::AdmissionUnavailable(
+                    error.to_string(),
+                )));
+            }
+        };
+    let existing_spec = match db.get_api_spec(namespace, id).await {
+        Ok(Some(spec)) => spec,
+        Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
+        Err(e) => return Ok(error_response(classify_db_error(e))),
+    };
+
     let existing_spec_upstream =
         match load_single_spec_owned_upstream(db, namespace, &existing_spec.id).await {
             Ok(upstream) => upstream,
             Err(e) => return Ok(error_response(e)),
         };
+    let existing_spec_plugins = match db
+        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
+        .await
+    {
+        Ok(plugins) => plugins,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
 
     // Assign IDs for PUT: reuse existing stored IDs for empty-id resources so
     // re-submitting the same ID-less spec is idempotent (Fix 1). This must
@@ -2501,6 +3039,19 @@ pub async fn handle_put_api_spec(
         Ok(p) => p,
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
+    let previous_bundle = match existing_proxy_row.as_ref() {
+        Some(proxy) => ExtractedBundle {
+            proxy: proxy.clone(),
+            upstream: existing_spec_upstream.clone(),
+            plugins: existing_spec_plugins,
+        },
+        None => {
+            return Ok(error_response(ApiSpecError::Internal(format!(
+                "API spec '{}' references missing proxy '{}'",
+                existing_spec.id, existing_spec.proxy_id
+            ))));
+        }
+    };
     let existing_upstream_id: Option<&str> = existing_spec_upstream.as_ref().map(|u| u.id.as_str());
 
     let ValidatedBundle { bundle, metadata } = match validate_bundle(
@@ -2538,9 +3089,74 @@ pub async fn handle_put_api_spec(
     // Preserve original created_at
     spec.created_at = existing_spec.created_at;
 
-    match db.replace_api_spec_bundle(&bundle, &spec).await {
-        Ok(()) => {}
-        Err(e) => return Ok(error_response(classify_db_error(e))),
+    let settlement_db = db.clone();
+    let persistence_db = db.clone();
+    let compensation_db = db.clone();
+    let settlement_namespace = namespace.to_string();
+    let persistence_bundle = bundle.clone();
+    let persistence_spec = spec.clone();
+    let compensation_bundle = bundle.clone();
+    let compensation_spec = spec.clone();
+    let compensation_previous_spec = existing_spec.clone();
+    let settlement_state = state.clone();
+    let audit_db = db.clone();
+    let audit_enabled = state.admin_audit_enabled;
+    let audit_actor = actor.clone();
+    let audit_spec = spec.clone();
+    let audit_previous_spec = existing_spec.clone();
+    let persistence = tokio::spawn(async move {
+        let result = run_api_spec_persistence_while_held(
+            settlement_db,
+            &settlement_namespace,
+            _namespace_config_admission_guard,
+            persistence_db.replace_api_spec_bundle(&persistence_bundle, &persistence_spec),
+            compensate_late_api_spec_replace(
+                compensation_db,
+                compensation_bundle,
+                compensation_spec,
+                previous_bundle,
+                compensation_previous_spec,
+                &settlement_state,
+            ),
+            true,
+        )
+        .await;
+        if result.is_ok() {
+            let event = audit::AuditEvent::new(
+                &audit_actor,
+                "update",
+                "api_spec",
+                &audit_spec.id,
+                &audit_spec.namespace,
+                audit::update_diff(
+                    json!({
+                        "id": audit_previous_spec.id,
+                        "proxy_id": audit_previous_spec.proxy_id,
+                        "content_hash": audit_previous_spec.content_hash,
+                        "spec_version": audit_previous_spec.spec_version,
+                    }),
+                    json!({
+                        "id": audit_spec.id,
+                        "proxy_id": audit_spec.proxy_id,
+                        "content_hash": audit_spec.content_hash,
+                        "spec_version": audit_spec.spec_version,
+                    }),
+                ),
+            );
+            if let Err(error) = audit::record(audit_enabled, audit_db, event) {
+                log_audit_enqueue_failure(&error);
+            }
+        }
+        result
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(ApiSpecError::Internal(format!(
+            "API-spec replace persistence task failed: {error}"
+        )))
+    });
+    if let Err(error) = persistence {
+        return Ok(error_response(error));
     }
 
     let resp_body = json!({
@@ -2549,24 +3165,6 @@ pub async fn handle_put_api_spec(
         "content_hash": spec.content_hash,
         "spec_version": spec.spec_version,
     });
-
-    let before = json!({
-        "id": existing_spec.id,
-        "proxy_id": existing_spec.proxy_id,
-        "content_hash": existing_spec.content_hash,
-        "spec_version": existing_spec.spec_version,
-    });
-    let event = audit::AuditEvent::new(
-        actor,
-        "update",
-        "api_spec",
-        id,
-        namespace,
-        audit::update_diff(before, resp_body.clone()),
-    );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-        log_audit_enqueue_failure(&error);
-    }
 
     Ok(json_resp(StatusCode::OK, &resp_body))
 }
@@ -2712,38 +3310,202 @@ pub async fn handle_delete_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
+    let _namespace_config_admission_guard =
+        match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+                return Ok(error_response(ApiSpecError::AdmissionUnavailable(
+                    error.to_string(),
+                )));
+            }
+        };
+
     let existing = match db.get_api_spec(namespace, id).await {
         Ok(Some(spec)) => spec,
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
+    let existing_proxy = match db.get_proxy_for_write(namespace, &existing.proxy_id).await {
+        Ok(Some(proxy)) => proxy,
+        Ok(None) => {
+            return Ok(error_response(ApiSpecError::Internal(format!(
+                "API spec '{}' references missing proxy '{}'",
+                existing.id, existing.proxy_id
+            ))));
+        }
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    let existing_upstream = match load_single_spec_owned_upstream(db, namespace, id).await {
+        Ok(upstream) => upstream,
+        Err(error) => return Ok(error_response(error)),
+    };
+    let existing_plugins = match db.list_spec_owned_plugin_configs(namespace, id).await {
+        Ok(plugins) => plugins,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    let deletion_snapshot = match db.load_namespace_snapshot(namespace).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    let owned_plugin_ids: HashSet<&str> = existing_plugins
+        .iter()
+        .map(|plugin| plugin.id.as_str())
+        .collect();
+    let proxy_plugin_ids: HashSet<&str> = existing_proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    let other_proxy_plugin_ids: HashSet<&str> = deletion_snapshot
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.id != existing.proxy_id)
+        .flat_map(|proxy| proxy.plugins.iter())
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    let additional_plugins = deletion_snapshot
+        .plugin_configs
+        .iter()
+        .filter(|plugin| !owned_plugin_ids.contains(plugin.id.as_str()))
+        .filter(|plugin| {
+            plugin.proxy_id.as_deref() == Some(existing.proxy_id.as_str())
+                || (plugin.scope == PluginScope::ProxyGroup
+                    && proxy_plugin_ids.contains(plugin.id.as_str())
+                    && !other_proxy_plugin_ids.contains(plugin.id.as_str()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let previous_bundle = ExtractedBundle {
+        proxy: existing_proxy,
+        upstream: existing_upstream,
+        plugins: existing_plugins,
+    };
 
-    match db.delete_api_spec(namespace, id).await {
-        Ok(true) => {
+    match crate::admin::crud::validate_plugin_graph_proxy_deletion_candidate(
+        db.as_ref(),
+        state,
+        namespace,
+        &existing.proxy_id,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(
+            crate::admin::crud::AfterValidateError::BadRequest(errors)
+            | crate::admin::crud::AfterValidateError::Conflict(errors),
+        ) => {
+            return Ok(error_response(ApiSpecError::ValidationFailures {
+                spec_version: existing.spec_version.clone(),
+                failures: vec![ValidationFailure {
+                    resource_type: "plugin_composition",
+                    id: existing.proxy_id.clone(),
+                    errors,
+                }],
+            }));
+        }
+        Err(crate::admin::crud::AfterValidateError::Db(error)) => {
+            return Ok(error_response(classify_db_error(error)));
+        }
+        Err(crate::admin::crud::AfterValidateError::Response(response)) => {
+            return Ok(*response);
+        }
+    }
+
+    match crate::admin::crud::validate_transaction_log_schema_api_spec_deletion_candidate(
+        db.as_ref(),
+        state,
+        namespace,
+        &existing,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(
+            crate::admin::crud::AfterValidateError::BadRequest(errors)
+            | crate::admin::crud::AfterValidateError::Conflict(errors),
+        ) => {
+            return Ok(error_response(ApiSpecError::ValidationFailures {
+                spec_version: existing.spec_version.clone(),
+                failures: vec![ValidationFailure {
+                    resource_type: "plugin_graph",
+                    id: existing.proxy_id.clone(),
+                    errors,
+                }],
+            }));
+        }
+        Err(crate::admin::crud::AfterValidateError::Db(error)) => {
+            return Ok(error_response(classify_db_error(error)));
+        }
+        Err(crate::admin::crud::AfterValidateError::Response(response)) => {
+            return Ok(*response);
+        }
+    }
+
+    let settlement_db = db.clone();
+    let persistence_db = db.clone();
+    let compensation_db = db.clone();
+    let settlement_namespace = namespace.to_string();
+    let persistence_id = id.to_string();
+    let compensation_spec = existing.clone();
+    let settlement_state = state.clone();
+    let audit_db = db.clone();
+    let audit_enabled = state.admin_audit_enabled;
+    let audit_actor = actor.clone();
+    let audit_spec = existing.clone();
+    let persistence = match tokio::spawn(async move {
+        let result = run_api_spec_persistence_while_held(
+            settlement_db,
+            &settlement_namespace,
+            _namespace_config_admission_guard,
+            persistence_db.delete_api_spec(&settlement_namespace, &persistence_id),
+            compensate_late_api_spec_delete(
+                compensation_db,
+                previous_bundle,
+                compensation_spec,
+                additional_plugins,
+                &settlement_state,
+            ),
+            true,
+        )
+        .await;
+        if matches!(&result, Ok(true)) {
             let event = audit::AuditEvent::new(
-                actor,
+                &audit_actor,
                 "delete",
                 "api_spec",
-                id,
-                namespace,
+                &audit_spec.id,
+                &audit_spec.namespace,
                 audit::delete_diff(json!({
-                    "id": existing.id,
-                    "proxy_id": existing.proxy_id,
-                    "content_hash": existing.content_hash,
-                    "spec_version": existing.spec_version,
+                    "id": audit_spec.id,
+                    "proxy_id": audit_spec.proxy_id,
+                    "content_hash": audit_spec.content_hash,
+                    "spec_version": audit_spec.spec_version,
                 })),
             );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            if let Err(error) = audit::record(audit_enabled, audit_db, event) {
                 log_audit_enqueue_failure(&error);
             }
-            Ok(Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .header("Cache-Control", "no-store")
-                .body(Full::new(Bytes::new()))
-                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))))
         }
-        Ok(false) => Ok(error_response(ApiSpecError::NotFound)),
-        Err(e) => Ok(error_response(classify_db_error(e))),
+        result
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(ApiSpecError::Internal(format!(
+            "API-spec delete persistence task failed: {error}"
+        )))
+    }) {
+        Ok(result) => result,
+        Err(error) => return Ok(error_response(error)),
+    };
+    if persistence {
+        Ok(Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("Cache-Control", "no-store")
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))))
+    } else {
+        Ok(error_response(ApiSpecError::NotFound))
     }
 }
 

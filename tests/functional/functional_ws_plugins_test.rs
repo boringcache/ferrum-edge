@@ -14,8 +14,11 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
 
 // ============================================================================
 // Helpers
@@ -28,17 +31,24 @@ async fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// Start a WebSocket echo server on the given port.
+async fn bind_ws_backend_listener() -> (u16, TcpListener) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind WS backend");
+    let port = listener
+        .local_addr()
+        .expect("WS backend local address")
+        .port();
+    (port, listener)
+}
+
+/// Start a WebSocket echo server on an already-bound listener.
 // The `Message::Ping(data)` arm consumes `data` (a `Bytes`) when forwarding
 // to `Message::Pong(data)`. Collapsing into a match guard is rejected by the
 // borrow checker (E0507) because variables bound in patterns cannot be moved
 // from inside a pattern guard.
 #[allow(clippy::collapsible_match)]
-async fn start_ws_echo_server(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .expect("Failed to bind WS echo server");
-
+async fn start_ws_echo_server(listener: TcpListener) {
     loop {
         if let Ok((stream, _addr)) = listener.accept().await {
             tokio::spawn(async move {
@@ -74,6 +84,63 @@ async fn start_ws_echo_server(port: u16) {
                 }
             });
         }
+    }
+}
+
+async fn start_ws_echo_server_recording_close(
+    listener: TcpListener,
+    close_tx: mpsc::UnboundedSender<(CloseCode, String)>,
+) {
+    loop {
+        let Ok((stream, _addr)) = listener.accept().await else {
+            continue;
+        };
+        let close_tx = close_tx.clone();
+        tokio::spawn(async move {
+            let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sink, mut source) = ws_stream.split();
+            while let Some(Ok(msg)) = source.next().await {
+                let outgoing = match msg {
+                    Message::Text(text) if text == "__backend_oversized_frame__" => {
+                        if sink
+                            .send(Message::Frame(Frame::message(
+                                vec![8u8; 10],
+                                OpCode::Data(Data::Binary),
+                                false,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        Some(Message::Frame(Frame::message(
+                            vec![9u8; 60],
+                            OpCode::Data(Data::Continue),
+                            true,
+                        )))
+                    }
+                    Message::Text(text) => Some(Message::Text(format!("Echo: {text}").into())),
+                    Message::Binary(data) => Some(Message::Text(
+                        format!("Echo binary: {} bytes", data.len()).into(),
+                    )),
+                    Message::Ping(data) => Some(Message::Pong(data)),
+                    Message::Close(Some(close)) => {
+                        let _ = close_tx.send((close.code, close.reason.to_string()));
+                        let _ = sink.send(Message::Close(Some(close))).await;
+                        break;
+                    }
+                    Message::Close(None) => break,
+                    _ => None,
+                };
+                if let Some(outgoing) = outgoing
+                    && sink.send(outgoing).await.is_err()
+                {
+                    break;
+                }
+            }
+        });
     }
 }
 
@@ -262,10 +329,13 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn test_ws_message_size_limiting_e2e() {
-    let backend_port = free_port().await;
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
 
-    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let (backend_close_tx, mut backend_close_rx) = mpsc::unbounded_channel();
+    let echo_handle = tokio::spawn(start_ws_echo_server_recording_close(
+        backend_listener,
+        backend_close_tx,
+    ));
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -278,7 +348,9 @@ async fn test_ws_message_size_limiting_e2e() {
     proxy_id: "ws-echo-proxy"
     enabled: true
     config:
-      max_frame_bytes: 50"#,
+      max_frame_bytes: 50
+      max_message_bytes: 200
+      close_reason: "payload exceeds gateway limit""#,
         r#"      - plugin_config_id: "ws-size-limit""#,
     );
 
@@ -295,43 +367,274 @@ async fn test_ws_message_size_limiting_e2e() {
     let reply = ws.next().await.unwrap().unwrap();
     assert_eq!(reply, Message::Text("Echo: hello".into()));
 
-    // Large message (> 50 bytes) should trigger close
-    let large_msg = "x".repeat(60);
-    ws.send(Message::Text(large_msg.into())).await.unwrap();
+    // A cumulative 80-byte binary message split into two valid 40-byte frames
+    // must pass. Interleaved control traffic must not reset reassembly state.
+    ws.send(Message::Frame(Frame::message(
+        vec![1u8; 40],
+        OpCode::Data(Data::Binary),
+        false,
+    )))
+    .await
+    .expect("send first binary fragment");
+    ws.send(Message::Ping(vec![7, 8, 9].into()))
+        .await
+        .expect("send interleaved ping");
+    ws.send(Message::Frame(Frame::message(
+        vec![2u8; 40],
+        OpCode::Data(Data::Continue),
+        true,
+    )))
+    .await
+    .expect("send final continuation");
+    let fragmented_reply = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) if text == "Echo binary: 80 bytes" => {
+                    break text.to_string();
+                }
+                Some(Ok(Message::Pong(_))) => continue,
+                other => panic!("unexpected fragmented-message reply: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("fragmented message reply timed out");
+    assert_eq!(fragmented_reply, "Echo binary: 80 bytes");
+
+    // An oversized continuation must be rejected as its own frame before the
+    // partial message can be extended or forwarded.
+    ws.send(Message::Frame(Frame::message(
+        vec![3u8; 10],
+        OpCode::Data(Data::Binary),
+        false,
+    )))
+    .await
+    .expect("send partial message before oversized continuation");
+    ws.send(Message::Frame(Frame::message(
+        vec![4u8; 51],
+        OpCode::Data(Data::Continue),
+        true,
+    )))
+    .await
+    .expect("send oversized continuation header/payload");
 
     // Should receive a close frame with code 1009
-    let reply = ws.next().await;
-    match reply {
-        Some(Ok(Message::Close(Some(cf)))) => {
-            assert_eq!(
-                cf.code,
-                tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Size,
-                "Expected close code 1009 (Size), got {:?}",
-                cf.code
-            );
-            println!("Got expected close code 1009: {}", cf.reason);
+    let client_close = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(close @ Message::Close(_))) => break close,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                other => panic!("unexpected reply before policy close: {other:?}"),
+            }
         }
-        Some(Ok(Message::Close(None))) => {
-            // Some implementations may not include the close frame details
-            println!("Got close frame without details (acceptable)");
-        }
-        None => {
-            // Connection was closed
-            println!("Connection closed (acceptable)");
-        }
-        other => {
-            // The gateway may close the connection before the client sees the close frame
-            println!(
-                "Got unexpected reply (connection may have been closed): {:?}",
-                other
-            );
-        }
-    }
+    })
+    .await
+    .expect("client close timed out");
+    let Message::Close(Some(client_close)) = client_close else {
+        panic!("offending client did not receive detailed close");
+    };
+    assert_eq!(client_close.code, CloseCode::Size);
+    assert_eq!(
+        client_close.reason.as_str(),
+        "payload exceeds gateway limit"
+    );
+
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_close_rx.recv())
+            .await
+            .expect("backend close timed out")
+            .expect("backend close channel ended");
+    assert_eq!(backend_code, CloseCode::Size);
+    assert_eq!(backend_reason, "payload exceeds gateway limit");
 
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_ws_message_size_limiting_e2e PASSED");
+}
+
+/// Backend-originated violations use the same strictest-instance parser limit
+/// and deliver the configured 1009 details to both peers.
+#[ignore]
+#[tokio::test]
+async fn test_ws_message_size_limiting_backend_direction_and_instances_e2e() {
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let (backend_close_tx, mut backend_close_rx) = mpsc::unbounded_channel();
+    let echo_handle = tokio::spawn(start_ws_echo_server_recording_close(
+        backend_listener,
+        backend_close_tx,
+    ));
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config_with_plugins(
+        &config_path,
+        backend_port,
+        r#"  - id: "ws-size-loose"
+    plugin_name: "ws_message_size_limiting"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      max_frame_bytes: 100
+      close_reason: "loose limit"
+  - id: "ws-size-strict"
+    plugin_name: "ws_message_size_limiting"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      max_frame_bytes: 50
+      max_message_bytes: 200
+      close_reason: "strict proxy limit""#,
+        r#"      - plugin_config_id: "ws-size-loose"
+      - plugin_config_id: "ws-size-strict""#,
+    );
+
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    let url = format!("ws://127.0.0.1:{gateway_port}/ws-echo");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect WebSocket");
+
+    ws.send(Message::Text("__backend_oversized_frame__".into()))
+        .await
+        .expect("request oversized backend frame");
+
+    let client_close = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("client close timed out")
+        .expect("client stream ended before close")
+        .expect("client close read failed");
+    let Message::Close(Some(client_close)) = client_close else {
+        panic!("client did not receive backend-policy close");
+    };
+    assert_eq!(client_close.code, CloseCode::Size);
+    assert_eq!(client_close.reason.as_str(), "strict proxy limit");
+
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_close_rx.recv())
+            .await
+            .expect("offending backend close timed out")
+            .expect("backend close channel ended");
+    assert_eq!(backend_code, CloseCode::Size);
+    assert_eq!(backend_reason, "strict proxy limit");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// Continuation accumulation is bounded independently from the per-frame cap.
+#[ignore]
+#[tokio::test]
+async fn test_ws_message_size_limiting_reassembly_bound_e2e() {
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let (backend_close_tx, mut backend_close_rx) = mpsc::unbounded_channel();
+    let echo_handle = tokio::spawn(start_ws_echo_server_recording_close(
+        backend_listener,
+        backend_close_tx,
+    ));
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config_with_plugins(
+        &config_path,
+        backend_port,
+        r#"  - id: "ws-frame-limit"
+    plugin_name: "ws_message_size_limiting"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      max_frame_bytes: 50
+      max_message_bytes: 100
+      close_reason: "frame limit"
+  - id: "ws-message-limit"
+    plugin_name: "ws_message_size_limiting"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      max_frame_bytes: 50
+      max_message_bytes: 50
+      close_reason: "reassembly limit""#,
+        r#"      - plugin_config_id: "ws-frame-limit"
+      - plugin_config_id: "ws-message-limit""#,
+    );
+
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    let url = format!("ws://127.0.0.1:{gateway_port}/ws-echo");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect WebSocket");
+
+    // Equal numeric ceilings must still retain the parser check that fired.
+    // A single oversized wire frame uses the frame policy and its reason.
+    ws.send(Message::Frame(Frame::message(
+        vec![4u8; 51],
+        OpCode::Data(Data::Binary),
+        true,
+    )))
+    .await
+    .expect("send oversized single frame");
+    let close = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("frame-policy client close timed out")
+        .expect("client stream ended before frame-policy close")
+        .expect("frame-policy client close read failed");
+    let Message::Close(Some(close)) = close else {
+        panic!("client did not receive frame-policy close");
+    };
+    assert_eq!(close.code, CloseCode::Size);
+    assert_eq!(close.reason.as_str(), "frame limit");
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_close_rx.recv())
+            .await
+            .expect("frame-policy backend close timed out")
+            .expect("frame-policy backend close channel ended");
+    assert_eq!(backend_code, CloseCode::Size);
+    assert_eq!(backend_reason, "frame limit");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("reconnect WebSocket for reassembly policy");
+
+    for (opcode, final_fragment) in [
+        (OpCode::Data(Data::Binary), false),
+        (OpCode::Data(Data::Continue), true),
+    ] {
+        ws.send(Message::Frame(Frame::message(
+            vec![5u8; 30],
+            opcode,
+            final_fragment,
+        )))
+        .await
+        .expect("send bounded continuation fragment");
+    }
+
+    let close = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("client close timed out")
+        .expect("client stream ended before close")
+        .expect("client close read failed");
+    let Message::Close(Some(close)) = close else {
+        panic!("client did not receive reassembly close");
+    };
+    assert_eq!(close.code, CloseCode::Size);
+    assert_eq!(close.reason.as_str(), "reassembly limit");
+
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_close_rx.recv())
+            .await
+            .expect("backend close timed out")
+            .expect("backend close channel ended");
+    assert_eq!(backend_code, CloseCode::Size);
+    assert_eq!(backend_reason, "reassembly limit");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
 }
 
 // ============================================================================
@@ -342,10 +645,9 @@ async fn test_ws_message_size_limiting_e2e() {
 #[ignore]
 #[tokio::test]
 async fn test_ws_frame_logging_e2e() {
-    let backend_port = free_port().await;
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
 
-    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -403,10 +705,9 @@ async fn test_ws_frame_logging_e2e() {
 #[ignore]
 #[tokio::test]
 async fn test_ws_rate_limiting_e2e() {
-    let backend_port = free_port().await;
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
 
-    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");
@@ -510,10 +811,9 @@ async fn test_ws_rate_limiting_e2e() {
 #[ignore]
 #[tokio::test]
 async fn test_ws_combined_plugins_e2e() {
-    let backend_port = free_port().await;
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
 
-    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
 
     let temp_dir = TempDir::new().unwrap();
     let config_path = temp_dir.path().join("config.yaml");

@@ -2,75 +2,199 @@
 //!
 //! Tracks active TCP connections per proxy and observed identity:
 //! - authenticated consumer identity when a prior stream auth plugin set one
-//! - otherwise the client IP address
+//! - otherwise the canonical client IP address
 //!
-//! This keeps plaintext TCP proxies IP-scoped while allowing TCP+TLS proxies
-//! to throttle by the Consumer established by `mtls_auth`.
+//! Accounting is process-local. Each admitted connection owns an opaque permit
+//! for the exact map entry it incremented; dropping that permit releases the
+//! count exactly once without consulting transaction metadata.
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
-use super::{Plugin, PluginResult, StreamConnectionContext, StreamTransactionSummary};
+use super::{Plugin, PluginResult, StreamAdmissionPermit, StreamConnectionContext};
 
-const METADATA_KEY: &str = "tcp_connection_throttle.key";
+const MAX_CLEANUP_INTERVAL_SECONDS: u64 = 86_400;
+
+struct ConnectionCounter {
+    active: AtomicU64,
+}
+
+struct CleanupTask {
+    interval_seconds: u64,
+    handle: Option<JoinHandle<()>>,
+}
+
+/// Stable accounting state shared by compatible plugin-cache generations.
+pub(crate) struct TcpConnectionThrottleState {
+    active_counts: DashMap<String, Arc<ConnectionCounter>>,
+    cleanup_task: Mutex<CleanupTask>,
+}
+
+impl TcpConnectionThrottleState {
+    fn new(pool_shard_amount: usize) -> Arc<Self> {
+        let shard_amount = crate::util::sharding::pool_shard_amount(pool_shard_amount).max(2);
+        Arc::new(Self {
+            active_counts: DashMap::with_shard_amount(shard_amount),
+            cleanup_task: Mutex::new(CleanupTask {
+                interval_seconds: 0,
+                handle: None,
+            }),
+        })
+    }
+
+    fn admit(
+        &self,
+        key: String,
+        max_connections_per_key: u64,
+    ) -> Option<(String, Arc<ConnectionCounter>)> {
+        match self.active_counts.entry(key) {
+            Entry::Occupied(entry) => {
+                let counter = Arc::clone(entry.get());
+                let active = counter.active.load(Ordering::Relaxed);
+                if active >= max_connections_per_key {
+                    return None;
+                }
+                // The DashMap entry guard serializes admission and release for
+                // this key, so the increment cannot land on a detached entry.
+                counter.active.store(active + 1, Ordering::Relaxed);
+                Some((entry.key().clone(), counter))
+            }
+            Entry::Vacant(entry) => {
+                let counter = Arc::new(ConnectionCounter {
+                    active: AtomicU64::new(1),
+                });
+                let key = entry.key().clone();
+                entry.insert(Arc::clone(&counter));
+                Some((key, counter))
+            }
+        }
+    }
+
+    fn release(&self, key: String, counter: Arc<ConnectionCounter>) {
+        let Entry::Occupied(entry) = self.active_counts.entry(key) else {
+            return;
+        };
+        if !Arc::ptr_eq(entry.get(), &counter) {
+            return;
+        }
+
+        let active = counter.active.load(Ordering::Relaxed);
+        if active == 0 {
+            tracing::warn!(
+                plugin = "tcp_connection_throttle",
+                "ignored an already-released TCP connection admission permit"
+            );
+            return;
+        }
+        if active == 1 {
+            // Removal happens while the same shard entry is exclusively held.
+            // A concurrent admission therefore observes either this entry
+            // before removal or a fresh entry after removal, never both.
+            entry.remove();
+        } else {
+            counter.active.store(active - 1, Ordering::Relaxed);
+        }
+    }
+
+    fn sweep_residual_zero_entries(&self) {
+        self.active_counts
+            .retain(|_, counter| counter.active.load(Ordering::Relaxed) > 0);
+    }
+
+    pub(crate) fn set_cleanup_interval(self: &Arc<Self>, interval_seconds: u64) {
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let mut task = self
+            .cleanup_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if task.interval_seconds == interval_seconds
+            && (interval_seconds == 0 || task.handle.is_some() || runtime.is_none())
+        {
+            return;
+        }
+        if let Some(handle) = task.handle.take() {
+            handle.abort();
+        }
+        task.interval_seconds = interval_seconds;
+        let Some(runtime) = runtime.filter(|_| interval_seconds > 0) else {
+            return;
+        };
+
+        let state: Weak<Self> = Arc::downgrade(self);
+        task.handle = Some(runtime.spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(interval_seconds));
+            timer.tick().await;
+            loop {
+                timer.tick().await;
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                state.sweep_residual_zero_entries();
+            }
+        }));
+    }
+}
+
+impl Drop for TcpConnectionThrottleState {
+    fn drop(&mut self) {
+        let task = self
+            .cleanup_task
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(handle) = task.handle.take() {
+            handle.abort();
+        }
+    }
+}
 
 pub struct TcpConnectionThrottle {
     max_connections_per_key: u64,
-    active_counts: Arc<DashMap<String, Arc<AtomicU64>>>,
-    cleanup_task: Option<JoinHandle<()>>,
+    cleanup_interval_seconds: u64,
+    state: Arc<TcpConnectionThrottleState>,
 }
 
 impl TcpConnectionThrottle {
-    pub fn new(config: &Value) -> Result<Self, String> {
-        let object = config.as_object().ok_or_else(|| {
-            format!("tcp_connection_throttle: config must be an object, got: {config}")
-        })?;
-        let max_connections_per_key = parse_required_u64(object, "max_connections_per_key")?;
-
-        if max_connections_per_key == 0 {
-            return Err(
-                "tcp_connection_throttle: 'max_connections_per_key' must be greater than 0"
-                    .to_string(),
-            );
-        }
-
-        let cleanup_interval_seconds =
-            parse_optional_u64(object, "cleanup_interval_seconds")?.unwrap_or(60);
-
-        let active_counts = Arc::new(DashMap::new());
-
-        // Spawn background sweep to remove stale zero-count entries.
-        // Normally entries are cleaned in decrement_key(), but this catches
-        // edge cases where connections are dropped without on_stream_disconnect.
-        // Guard with Handle::try_current() so new() works in non-tokio test contexts.
-        let cleanup_task = if cleanup_interval_seconds > 0
-            && tokio::runtime::Handle::try_current().is_ok()
-        {
-            let counts = active_counts.clone();
-            Some(tokio::spawn(async move {
-                let mut timer =
-                    tokio::time::interval(Duration::from_secs(cleanup_interval_seconds));
-                loop {
-                    timer.tick().await;
-                    counts
-                        .retain(|_, count: &mut Arc<AtomicU64>| count.load(Ordering::Relaxed) > 0);
-                }
-            }))
-        } else {
-            None
-        };
-
+    pub(crate) fn new_with_pool_shard_amount(
+        config: &Value,
+        pool_shard_amount: usize,
+    ) -> Result<Self, String> {
+        let (max_connections_per_key, cleanup_interval_seconds) = parse_config(config)?;
+        let state = TcpConnectionThrottleState::new(pool_shard_amount);
+        state.set_cleanup_interval(cleanup_interval_seconds);
         Ok(Self {
             max_connections_per_key,
-            active_counts,
-            cleanup_task,
+            cleanup_interval_seconds,
+            state,
         })
+    }
+
+    pub(crate) fn with_shared_state(
+        config: &Value,
+        state: Arc<TcpConnectionThrottleState>,
+    ) -> Result<Self, String> {
+        let (max_connections_per_key, cleanup_interval_seconds) = parse_config(config)?;
+        Ok(Self {
+            max_connections_per_key,
+            cleanup_interval_seconds,
+            state,
+        })
+    }
+
+    pub(crate) fn shared_state(&self) -> Arc<TcpConnectionThrottleState> {
+        Arc::clone(&self.state)
+    }
+
+    pub(crate) fn cleanup_interval_seconds(&self) -> u64 {
+        self.cleanup_interval_seconds
     }
 
     fn throttle_key(&self, ctx: &StreamConnectionContext) -> String {
@@ -86,53 +210,71 @@ impl TcpConnectionThrottle {
                 key
             }
             None => {
+                let canonical_ip = canonical_client_ip(&ctx.client_ip);
                 let mut key = String::with_capacity(
-                    "proxy::ip:".len() + ctx.proxy_id.len() + ctx.client_ip.len(),
+                    "proxy::ip:".len() + ctx.proxy_id.len() + canonical_ip.len(),
                 );
                 key.push_str("proxy:");
                 key.push_str(&ctx.proxy_id);
                 key.push_str(":ip:");
-                key.push_str(&ctx.client_ip);
+                key.push_str(&canonical_ip);
                 key
-            }
-        }
-    }
-
-    fn decrement_key(&self, key: &str) {
-        let Some(counter) = self
-            .active_counts
-            .get(key)
-            .map(|entry| Arc::clone(entry.value()))
-        else {
-            return;
-        };
-
-        loop {
-            let current = counter.load(Ordering::Relaxed);
-            if current == 0 {
-                return;
-            }
-
-            if counter
-                .compare_exchange(current, current - 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                if current == 1 {
-                    self.active_counts.remove_if(key, |_, value| {
-                        Arc::ptr_eq(value, &counter) && value.load(Ordering::Relaxed) == 0
-                    });
-                }
-                return;
             }
         }
     }
 }
 
-impl Drop for TcpConnectionThrottle {
-    fn drop(&mut self) {
-        if let Some(handle) = self.cleanup_task.take() {
-            handle.abort();
-        }
+fn canonical_client_ip(client_ip: &str) -> Cow<'_, str> {
+    if let Ok(IpAddr::V6(ip)) = client_ip.parse::<IpAddr>()
+        && let Some(mapped) = ip.to_ipv4_mapped()
+    {
+        Cow::Owned(mapped.to_string())
+    } else {
+        // Gateway-produced client IP strings are already canonical. Borrow the
+        // common case so the throttle allocates only its final map key.
+        Cow::Borrowed(client_ip)
+    }
+}
+
+fn parse_config(config: &Value) -> Result<(u64, u64), String> {
+    let object = config.as_object().ok_or_else(|| {
+        format!("tcp_connection_throttle: config must be an object, got: {config}")
+    })?;
+    let max_connections_per_key = parse_required_u64(object, "max_connections_per_key")?;
+    if max_connections_per_key == 0 {
+        return Err(
+            "tcp_connection_throttle: 'max_connections_per_key' must be greater than 0".to_string(),
+        );
+    }
+    let cleanup_interval_seconds =
+        parse_optional_u64(object, "cleanup_interval_seconds")?.unwrap_or(60);
+    if cleanup_interval_seconds > MAX_CLEANUP_INTERVAL_SECONDS {
+        return Err(format!(
+            "tcp_connection_throttle: 'cleanup_interval_seconds' must be at most {MAX_CLEANUP_INTERVAL_SECONDS}"
+        ));
+    }
+    reject_unknown_fields(object)?;
+    Ok((max_connections_per_key, cleanup_interval_seconds))
+}
+
+fn reject_unknown_fields(object: &serde_json::Map<String, Value>) -> Result<(), String> {
+    let unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|field| {
+            !matches!(
+                *field,
+                "max_connections_per_key" | "cleanup_interval_seconds"
+            )
+        })
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "tcp_connection_throttle: unknown config field(s): {}",
+            unknown.join(", ")
+        ))
     }
 }
 
@@ -171,37 +313,42 @@ impl Plugin for TcpConnectionThrottle {
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
-        Some(self.active_counts.len())
+        Some(self.state.active_counts.len())
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
-        let key = self.throttle_key(ctx);
-        let counter = self
-            .active_counts
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .clone();
-
-        let previous = counter.fetch_add(1, Ordering::Relaxed);
-        if previous >= self.max_connections_per_key {
-            counter.fetch_sub(1, Ordering::Relaxed);
-            self.active_counts.remove_if(&key, |_, value| {
-                Arc::ptr_eq(value, &counter) && value.load(Ordering::Relaxed) == 0
-            });
+        let Some((key, counter)) = self
+            .state
+            .admit(self.throttle_key(ctx), self.max_connections_per_key)
+        else {
             return PluginResult::Reject {
                 status_code: 429,
                 body: r#"{"error":"TCP connection limit exceeded"}"#.into(),
                 headers: HashMap::new(),
             };
-        }
+        };
 
-        ctx.insert_metadata(METADATA_KEY.to_string(), key);
+        let state = Arc::clone(&self.state);
+        ctx.add_admission_permit(StreamAdmissionPermit::new(move || {
+            state.release(key, counter);
+        }));
         PluginResult::Continue
     }
+}
 
-    async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        if let Some(key) = summary.metadata.get(METADATA_KEY) {
-            self.decrement_key(key);
+#[cfg(test)]
+mod tests {
+    use super::TcpConnectionThrottleState;
+    use dashmap::Map;
+
+    #[test]
+    fn state_normalizes_pool_shard_amount_for_the_actual_counter_map() {
+        for override_value in [0, 1, 3] {
+            let state = TcpConnectionThrottleState::new(override_value);
+            assert_eq!(
+                state.active_counts._shard_count(),
+                crate::util::sharding::pool_shard_amount(override_value).max(2)
+            );
         }
     }
 }

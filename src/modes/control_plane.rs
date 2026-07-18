@@ -837,6 +837,7 @@ pub async fn run(
         .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
         .scope(cp_scope.clone())
         .require_ns_claim(env_config.cp_require_namespace_claim)
+        .real_ip_header(env_config.real_ip_header.clone())
         .build();
     let broadcasts = grpc_server.broadcasts();
     let (mesh_grpc_server, mesh_update_tx) =

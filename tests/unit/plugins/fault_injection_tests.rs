@@ -1063,27 +1063,15 @@ async fn test_stream_connect_abort_100_percent() {
     }))
     .unwrap();
 
-    let mut ctx = StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "test-proxy".to_string(),
-        proxy_name: None,
-        listen_port: 9000,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ConsumerIndex::new(&[])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    let mut ctx = StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "test-proxy".to_string(),
+        None,
+        9000,
+        BackendScheme::Tcp,
+        Arc::new(ConsumerIndex::new(&[])),
+    );
 
     let result = plugin.on_stream_connect(&mut ctx).await;
 
@@ -1114,27 +1102,15 @@ async fn test_stream_connect_delay_100_percent() {
     }))
     .unwrap();
 
-    let mut ctx = StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "test-proxy".to_string(),
-        proxy_name: None,
-        listen_port: 9000,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ConsumerIndex::new(&[])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    let mut ctx = StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "test-proxy".to_string(),
+        None,
+        9000,
+        BackendScheme::Tcp,
+        Arc::new(ConsumerIndex::new(&[])),
+    );
 
     let start = std::time::Instant::now();
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -1163,27 +1139,15 @@ async fn test_later_stream_fault_instance_is_not_suppressed_by_earlier_delay() {
         "abort": { "status_code": 503, "percentage": 100.0 }
     }))
     .unwrap();
-    let mut ctx = StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "test-proxy".to_string(),
-        proxy_name: None,
-        listen_port: 9000,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ConsumerIndex::new(&[])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    let mut ctx = StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "test-proxy".to_string(),
+        None,
+        9000,
+        BackendScheme::Tcp,
+        Arc::new(ConsumerIndex::new(&[])),
+    );
 
     assert!(matches!(
         delay.on_stream_connect(&mut ctx).await,

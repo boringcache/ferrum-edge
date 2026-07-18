@@ -358,6 +358,39 @@ fn grpc_error_policy_preserves_gateway_terminal_and_transport_authority() {
 }
 
 #[test]
+fn grpc_web_reject_finalizer_preserves_synthesized_status_without_terminal_overrides() {
+    for (response_content_type, is_text) in [
+        ("application/grpc-web+proto", false),
+        ("application/grpc-web-text+proto", true),
+    ] {
+        let mut response = ferrum_edge::plugins::grpc_web::error_response_for_content_type(
+            response_content_type,
+            14,
+            "backend unavailable",
+        );
+        let finalized_headers = HashMap::from([(
+            "access-control-allow-origin".to_string(),
+            "https://app.example".to_string(),
+        )]);
+
+        ferrum_edge::_test_support::finalize_grpc_web_error_response_headers(
+            &mut response,
+            &[],
+            Some(&finalized_headers),
+        );
+
+        let wire_body = if is_text {
+            BASE64.decode(&response.body).expect("decode text response")
+        } else {
+            response.body
+        };
+        let trailer = String::from_utf8_lossy(&wire_body[5..]);
+        assert!(trailer.contains("grpc-status: 14\r\n"));
+        assert!(trailer.contains("grpc-message: backend unavailable\r\n"));
+    }
+}
+
+#[test]
 fn grpc_web_reject_finalizer_moves_rich_status_details_into_body_trailer() {
     for (response_content_type, is_text) in [
         ("application/grpc-web+proto", false),
@@ -547,6 +580,7 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
         &proxy_headers,
         false,
         0,
+        None,
     )
     .await;
     assert!(
@@ -1987,52 +2021,31 @@ fn grpc_mesh_fall_through_mesh_mtls_requires_streamable_request_body() {
 // frame.
 
 #[test]
-fn grpc_streaming_response_deadline_client_budget_is_absolute_and_disables_per_frame() {
-    use std::time::Duration;
-    let before = tokio::time::Instant::now();
-    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(
-        Some(5_000),
-        Duration::from_millis(1_000),
-        30_000,
-    );
+fn grpc_streaming_response_deadline_reuses_typed_absolute_and_disables_per_frame() {
+    let absolute = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+    let (per_frame_ms, deadline) =
+        grpc_proxy::grpc_streaming_response_deadline(Some(absolute), 30_000);
     assert_eq!(
         per_frame_ms, 0,
         "a client deadline replaces the per-frame idle regime"
     );
-    let deadline = deadline.expect("a sane client budget must arm a deadline");
-    let remaining = deadline.saturating_duration_since(before);
-    // 5s budget minus 1s already elapsed => ~4s remaining. Small slack for
-    // the helper's own `Instant::now()` anchor being taken after `before`.
-    assert!(
-        remaining <= Duration::from_millis(4_100),
-        "deadline must subtract the elapsed request time: {remaining:?}"
-    );
-    assert!(
-        remaining >= Duration::from_millis(3_500),
-        "deadline must preserve the remaining client budget: {remaining:?}"
-    );
+    assert_eq!(deadline, Some(absolute));
 }
 
 #[test]
-fn grpc_streaming_response_deadline_exhausted_budget_is_immediate_not_negative() {
-    use std::time::Duration;
-    // Elapsed time exceeding the budget saturates to zero remaining — the
-    // deadline is "now" (fires on first poll), never a panic or underflow.
-    let before = tokio::time::Instant::now();
+fn grpc_streaming_response_deadline_preserves_already_elapsed_instant() {
+    let expired = tokio::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .expect("one minute before now is representable");
     let (per_frame_ms, deadline) =
-        grpc_proxy::grpc_streaming_response_deadline(Some(100), Duration::from_secs(60), 30_000);
+        grpc_proxy::grpc_streaming_response_deadline(Some(expired), 30_000);
     assert_eq!(per_frame_ms, 0);
-    let deadline = deadline.expect("an exhausted budget still arms a deadline");
-    assert!(
-        deadline.saturating_duration_since(before) <= Duration::from_millis(50),
-        "an exhausted budget must produce an already-due deadline"
-    );
+    assert_eq!(deadline, Some(expired));
 }
 
 #[test]
 fn grpc_streaming_response_deadline_no_client_budget_falls_back_per_frame() {
-    let (per_frame_ms, deadline) =
-        grpc_proxy::grpc_streaming_response_deadline(None, std::time::Duration::ZERO, 30_000);
+    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(None, 30_000);
     assert_eq!(
         per_frame_ms, 30_000,
         "without a client deadline the operator read timeout applies per frame"
@@ -2040,32 +2053,18 @@ fn grpc_streaming_response_deadline_no_client_budget_falls_back_per_frame() {
     assert!(deadline.is_none());
     // 0 + None (no client deadline, no operator fallback) = unbounded, for
     // long-lived server/bidi streams that legitimately idle.
-    let (per_frame_ms, deadline) =
-        grpc_proxy::grpc_streaming_response_deadline(None, std::time::Duration::ZERO, 0);
+    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(None, 0);
     assert_eq!(per_frame_ms, 0);
     assert!(deadline.is_none());
 }
 
 #[test]
-fn grpc_streaming_response_deadline_pathological_budget_is_unbounded_not_panic() {
-    // A multi-year client grpc-timeout must NEVER panic the proxy path
-    // (`checked_add`, not `+`). Whether the platform's `Instant` range
-    // absorbs ~584M years is platform-dependent: `None` = degraded to
-    // unbounded; `Some` must be so far in the future it is functionally
-    // unbounded.
-    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(
-        Some(u64::MAX),
-        std::time::Duration::ZERO,
-        30_000,
-    );
-    assert_eq!(per_frame_ms, 0);
-    if let Some(deadline) = deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(
-            remaining > std::time::Duration::from_secs(365 * 24 * 60 * 60),
-            "a non-overflowing pathological budget must still be functionally unbounded: {remaining:?}"
-        );
-    }
+fn grpc_streaming_response_deadline_does_not_rearm_between_consumers() {
+    let absolute = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (_, direct) = grpc_proxy::grpc_streaming_response_deadline(Some(absolute), 10_000);
+    let (_, mesh) = grpc_proxy::grpc_streaming_response_deadline(Some(absolute), 20_000);
+    assert_eq!(direct, mesh);
+    assert_eq!(direct, Some(absolute));
 }
 
 // ── Mesh gRPC limit ordering (codex r2 finding 4) ───────────────────────────

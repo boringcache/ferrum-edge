@@ -2035,11 +2035,24 @@ impl Plugin for RequestDeduplication {
         // (mirroring `response_caching`'s served-from-cache guard) but still
         // RELEASE the in-flight locks so the marker transitions to a clean state
         // instead of dangling until `inflight_ttl`, which keeps duplicate
-        // detection accurate once the synthetic short-circuit returns.
+        // detection accurate once the synthetic short-circuit returns. The
+        // exception is a synthetic short-circuit whose own execution already
+        // performed an external side effect (for example an `ai_federation`
+        // provider call, which marks `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`):
+        // that operation has no replayable response, so a same-key retry must
+        // not immediately re-execute it. Retain both in-flight locks until
+        // `inflight_ttl` in that case, mirroring the terminate-mode serverless
+        // side-effect owner handling above.
         if ctx
             .metadata
             .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
         {
+            if ctx
+                .metadata
+                .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)
+            {
+                return PluginResult::Continue;
+            }
             self.remove_matching_local_inflight(&key, &fingerprint, &local_inflight_owner_token);
             if let Some(token) = redis_lock_token.as_deref() {
                 self.redis_release_inflight(&key, &fingerprint, token).await;
@@ -2230,31 +2243,58 @@ impl Plugin for RequestDeduplication {
             return;
         }
 
-        if !ctx
+        if ctx
             .serverless_external_side_effect_owners
             .remove(&self.instance_id)
         {
+            // Consume only this instance's provenance before reusing the ordinary
+            // publication path. Other instances retain their ownership and publish
+            // into their own caches when their committed hooks run.
+            let synthetic_marker = ctx
+                .metadata
+                .remove(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+            let previous_publication_owner = ctx
+                .serverless_owned_dedup_publication
+                .replace(self.instance_id);
+            let _ = self
+                .on_final_response_body(ctx, response_status, response_headers, body)
+                .await;
+            ctx.serverless_owned_dedup_publication = previous_publication_owner;
+            if let Some(marker) = synthetic_marker {
+                ctx.metadata.insert(
+                    crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+                    marker,
+                );
+            }
             return;
         }
 
-        // Consume only this instance's provenance before reusing the ordinary
-        // publication path. Other instances retain their ownership and publish
-        // into their own caches when their committed hooks run.
-        let synthetic_marker = ctx
+        // Generic committed-hook release signal used by non-serverless ownership
+        // producers (for example `ai_federation`, and the proxy/H3 commit paths):
+        // release this instance's exact in-flight token so a duplicate retry can
+        // proceed. An external operation that completed must instead retain the
+        // in-flight lock — the `on_final_response_body` synthetic-short-circuit
+        // guard already kept it — so a same-key retry cannot re-run a
+        // non-replayable side effect. That case takes precedence here.
+        if ctx
             .metadata
-            .remove(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
-        let previous_publication_owner = ctx
-            .serverless_owned_dedup_publication
-            .replace(self.instance_id);
-        let _ = self
-            .on_final_response_body(ctx, response_status, response_headers, body)
-            .await;
-        ctx.serverless_owned_dedup_publication = previous_publication_owner;
-        if let Some(marker) = synthetic_marker {
-            ctx.metadata.insert(
-                crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
-                marker,
+            .contains_key(super::RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY)
+            && !ctx
+                .metadata
+                .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)
+        {
+            let Some(state) = ctx.request_deduplication_states.remove(&self.instance_id) else {
+                return;
+            };
+            self.remove_matching_local_inflight(
+                &state.key,
+                &state.fingerprint,
+                &state.local_inflight_owner_token,
             );
+            if let Some(token) = state.redis_lock_token.as_deref() {
+                self.redis_release_inflight(&state.key, &state.fingerprint, token)
+                    .await;
+            }
         }
     }
 
