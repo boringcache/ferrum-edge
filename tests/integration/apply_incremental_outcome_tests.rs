@@ -768,10 +768,7 @@ async fn incremental_geo_refresh_preserves_out_of_scope_policy_snapshot() {
         .iter()
         .find(|plugin| plugin.name() == "geo_restriction")
         .unwrap();
-    assert!(std::sync::Arc::ptr_eq(
-        &unaffected_before,
-        unaffected_after
-    ));
+    assert!(std::sync::Arc::ptr_eq(&unaffected_before, unaffected_after));
     let mut request = RequestContext::new(
         "89.160.20.112".to_string(),
         "GET".to_string(),

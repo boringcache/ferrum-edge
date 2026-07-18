@@ -3719,17 +3719,18 @@ impl PluginCache {
             .collect();
         let mut forced_country_mmdb_instances = CountryMmdbPluginInstanceMap::new();
         if force_country_mmdb_refresh {
-            for (id, plugin_config) in active_country_mmdb_configs
-                .iter()
-                .filter(|(_, plugin_config)| {
-                    !restrict_country_mmdb_refresh_to_rebuild_scope
-                        || country_mmdb_plugin_is_in_rebuild_scope(
-                            config,
-                            plugin_config,
-                            &proxy_ids_to_rebuild,
-                            rebuild_globals,
-                        )
-                })
+            for (id, plugin_config) in
+                active_country_mmdb_configs
+                    .iter()
+                    .filter(|(_, plugin_config)| {
+                        !restrict_country_mmdb_refresh_to_rebuild_scope
+                            || country_mmdb_plugin_is_in_rebuild_scope(
+                                config,
+                                plugin_config,
+                                &proxy_ids_to_rebuild,
+                                rebuild_globals,
+                            )
+                    })
             {
                 match try_create_plugin(
                     plugin_config,
@@ -3979,9 +3980,8 @@ impl PluginCache {
                     return None;
                 }
                 if pc.plugin_name == "geo_restriction"
-                    && forced_country_mmdb_instances.is_some_and(|forced| {
-                        forced.contains_key(&country_mmdb_plugin_id(pc))
-                    })
+                    && forced_country_mmdb_instances
+                        .is_some_and(|forced| forced.contains_key(&country_mmdb_plugin_id(pc)))
                 {
                     return None;
                 }
