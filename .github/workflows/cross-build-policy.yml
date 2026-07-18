@@ -45,6 +45,8 @@ jobs:
           proposed_release="$RUNNER_TEMP/proposed-release.yml"
           merge_base_ci="$RUNNER_TEMP/merge-base-ci.yml"
           merge_base_release="$RUNNER_TEMP/merge-base-release.yml"
+          proposed_workflows="$RUNNER_TEMP/proposed-workflows"
+          merge_base_workflows="$RUNNER_TEMP/merge-base-workflows"
           git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
           fetched_head="$(git rev-parse FETCH_HEAD)"
           if [ "$fetched_head" != "$PR_HEAD_SHA" ]; then
@@ -76,6 +78,32 @@ jobs:
           git show "${merge_base}:.github/workflows/ci.yml" > "$merge_base_ci"
           git show "${merge_base}:.github/workflows/release.yml" > "$merge_base_release"
 
+          extract_workflows() {
+            local commit="$1"
+            local destination="$2"
+            local path relative entry
+            mkdir -p "$destination"
+            while IFS= read -r -d '' path; do
+              relative="${path#.github/workflows/}"
+              if [[ "$relative" == */* ]]; then
+                continue
+              fi
+              if [[ ! "$relative" =~ ^[A-Za-z0-9._-]+\.(yml|yaml)$ ]]; then
+                echo "::error file=${path}::unsupported workflow filename" >&2
+                return 1
+              fi
+              entry="$(git ls-tree "$commit" -- "$path")"
+              if [[ "$entry" != "100644 blob "* ]]; then
+                echo "::error file=${path}::workflow must be a regular non-symlink blob" >&2
+                return 1
+              fi
+              git show "${commit}:${path}" > "${destination}/${relative}"
+            done < <(git ls-tree -rz --name-only "$commit" -- .github/workflows)
+          }
+
+          extract_workflows FETCH_HEAD "$proposed_workflows"
+          extract_workflows "$merge_base" "$merge_base_workflows"
+
           python3 .github/scripts/verify_cross_build_policy.py \
             --self-test \
             --config "$proposed_cross" \
@@ -85,4 +113,6 @@ jobs:
             --merge-base-ci-workflow "$merge_base_ci" \
             --proposed-ci-workflow "$proposed_ci" \
             --merge-base-release-workflow "$merge_base_release" \
-            --proposed-release-workflow "$proposed_release"
+            --proposed-release-workflow "$proposed_release" \
+            --merge-base-workflows-dir "$merge_base_workflows" \
+            --proposed-workflows-dir "$proposed_workflows"

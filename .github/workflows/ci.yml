@@ -44,14 +44,38 @@ jobs:
       - name: Validate PR CI planner examples
         run: python3 .github/scripts/pr_ci_plan.py --self-test
 
-      - name: Validate proposed ARM64 cross-build policy
+      - name: Validate ARM64 Cross policy without executing a PR verifier
         run: |
-          python3 .github/scripts/verify_cross_build_policy.py \
+          set -euo pipefail
+          policy=.github/scripts/verify_cross_build_policy.py
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base_ref="origin/${BASE_REF}"
+            git fetch --no-tags origin \
+              "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            if git cat-file -e "${base_ref}:${policy}" 2>/dev/null; then
+              trusted_policy="$RUNNER_TEMP/verify-cross-build-policy.py"
+              git show "${base_ref}:${policy}" > "$trusted_policy"
+              policy="$trusted_policy"
+            else
+              # Bootstrap PR: syntax-compile the proposed source as inert data.
+              # The trusted pull_request_target workflow is the policy verdict.
+              PYTHONPYCACHEPREFIX="$RUNNER_TEMP/cross-policy-pyc" \
+                python3 -m py_compile "$policy"
+              exit 0
+            fi
+          fi
+
+          python3 "$policy" \
             --self-test \
             --config Cross.toml \
             --cargo-config Cargo.toml \
             --ci-workflow .github/workflows/ci.yml \
-            --release-workflow .github/workflows/release.yml
+            --release-workflow .github/workflows/release.yml \
+            --workflows-dir .github/workflows
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
 
       - name: Check PR diff hygiene
         if: github.event_name == 'pull_request'

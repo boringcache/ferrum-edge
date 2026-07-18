@@ -58,8 +58,8 @@ adding, removing, or materially changing a workflow.
 ```
 Pull Request
     ├─► Trusted Cross Build Policy (`pull_request_target`, base code only)
-            └─► Validate proposed Cross.toml, Cargo metadata, and protected
-                ARM64 invocation-job changes as hostile data
+            └─► Validate proposed Cross.toml, Cargo metadata, and every
+                workflow invocation surface as hostile data
     ├─► CI plan
             ├─► Docs/license/agent-only: lightweight Tests aggregate
             └─► Full CI
@@ -369,12 +369,15 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   `release.yml` are isolated from the shared native matrix. Their exact job
   blocks, inherited top-level `env` mappings, and workflow trigger blocks are
   hashed by the trusted verifier, and merge-base comparison rejects any
-  PR-authored mutation while allowing unrelated workflow jobs to evolve. Any
-  new or changed Cross executable/configuration token outside those isolated
-  jobs is also rejected, including quoted or shell/GitHub-interpolated
-  executable spellings and Cross environment aliases; Bash backslash-newline
-  continuations are normalized before scanning. These jobs use only pinned
-  external setup actions before revalidation.
+  PR-authored mutation while allowing unrelated workflow jobs to evolve. Every
+  `.yml` and `.yaml` file directly under `.github/workflows` is also compared
+  as a collection, so a PR cannot move or add an invocation in a different
+  workflow. Any new or changed Cross executable/configuration token outside
+  the isolated jobs is rejected, including quoted or nested shell/GitHub-
+  interpolated executable spellings and Cross environment aliases; Bash
+  backslash-newline continuations are normalized before scanning. Unrelated
+  workflow additions and edits remain permitted. The isolated jobs use only
+  pinned external setup actions before revalidation.
 - The Cross process starts through `env -i` with an explicit minimal host
   environment and fixed compiler variables. This removes `CROSS_CONFIG`, every
   `CROSS_BUILD_*`/`CROSS_TARGET_*` alias, image/Dockerfile/pre-build/runner
@@ -385,13 +388,16 @@ boundary therefore uses a complete allowlist rather than a field denylist:
 The trusted `pull_request_target` job checks out only the base SHA with
 read-only contents permission. It fetches the PR head without checking it out,
 requires the fetched object to equal the immutable head SHA from the triggering
-event, then extracts `Cross.toml`, `Cargo.toml`, `ci.yml`, and `release.yml` as
-hostile data,
-and runs only the base branch's verifier. The verifier and trusted workflow are
+event, then extracts `Cross.toml`, `Cargo.toml`, and the complete proposed and
+merge-base workflow directories as hostile data, and runs only the base
+branch's verifier. The verifier and trusted workflow are
 compared with `HEAD...FETCH_HEAD`, preserving merge-base behavior for stale
 branches while rejecting a PR-authored modification, mode change, rename, or
-deletion. The ordinary `CI Plan` separately runs the proposed verifier's hosted
-self-tests so a broken maintenance proposal cannot reach `main` unnoticed.
+deletion. On pull requests, the ordinary `CI Plan` executes the base branch's
+trusted verifier when it exists and never imports or runs the proposed script.
+For this bootstrap PR, where the base has no verifier yet, it only syntax-
+compiles the proposed file as inert data; main pushes execute the newly trusted
+verifier and its hosted self-tests.
 
 #### 8. Latest Release and Docker Jobs
 

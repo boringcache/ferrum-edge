@@ -79,9 +79,11 @@ CROSS_ENVIRONMENT = re.compile(
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
 )
 SHELL_INTERPOLATION = re.compile(
-    r"\$\{\{[^{}\n]*\}\}|\$\{[^{}\n]*\}|\$\([^()\n]*\)|`[^`\n]*`|"
+    r"\$\{\{[^{}\n]*\}\}|\$\{[^{}\n]*\}|`[^`\n]*`|"
     r"\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]"
 )
+WORKFLOW_FILENAME = re.compile(r"^[A-Za-z0-9._-]+\.(?:yml|yaml)$")
+PROTECTED_WORKFLOW_FILENAMES = frozenset({"ci.yml", "release.yml"})
 
 
 def exact_keys(value: Any, expected: set[str], location: str) -> list[str]:
@@ -359,6 +361,60 @@ def interpolation_literal(raw: str) -> str:
     return next((word for word in reversed(words) if word in "cross"), "")
 
 
+def command_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
+    """Locate complete outer $(...) spans, including nested parentheses."""
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while (start := line.find("$(", cursor)) >= 0:
+        depth = 1
+        quote: str | None = None
+        index = start + 2
+        while index < len(line) and depth:
+            character = line[index]
+            if quote is not None:
+                if character == "\\" and quote == '"':
+                    index += 2
+                    continue
+                if character == quote:
+                    quote = None
+                index += 1
+                continue
+            if character in "'\"":
+                quote = character
+            elif character == "\\":
+                index += 2
+                continue
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            index += 1
+
+        # An unterminated substitution cannot execute as a valid shell word,
+        # but consume it to the line end so partial content is not trusted.
+        end = index if depth == 0 else len(line)
+        spans.append((start, end))
+        cursor = end
+    return tuple(spans)
+
+
+def replace_command_substitutions(line: str, *, literal: bool) -> str:
+    spans = command_substitution_spans(line)
+    if not spans:
+        return line
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        parts.append(line[cursor:start])
+        raw = line[start:end]
+        parts.append(interpolation_literal(raw) if literal and raw.endswith(")") else "")
+        cursor = end
+    parts.append(line[cursor:])
+    return "".join(parts)
+
+
 def scan_variants(line: str) -> tuple[str, ...]:
     """Expose ordinary YAML/shell quoting variants to the lexical boundary."""
 
@@ -367,12 +423,14 @@ def scan_variants(line: str) -> tuple[str, ...]:
     if collapsed != line:
         variants.append(collapsed)
 
-    without_interpolation = SHELL_INTERPOLATION.sub("", line)
+    without_commands = replace_command_substitutions(line, literal=False)
+    without_interpolation = SHELL_INTERPOLATION.sub("", without_commands)
     if without_interpolation != line:
         variants.append(without_interpolation)
+    with_literal_commands = replace_command_substitutions(line, literal=True)
     with_literal_defaults = SHELL_INTERPOLATION.sub(
         lambda match: interpolation_literal(match.group()),
-        line,
+        with_literal_commands,
     )
     if with_literal_defaults != line:
         variants.append(with_literal_defaults)
@@ -386,6 +444,17 @@ def scan_variants(line: str) -> tuple[str, ...]:
             variants.append(decoded)
 
     return tuple(dict.fromkeys(variants))
+
+
+def contains_cross_surface(contents: str) -> bool:
+    """Return whether lexical normalization exposes a Cross-controlled input."""
+
+    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    return any(
+        STANDALONE_CROSS.search(variant) or CROSS_ENVIRONMENT.search(variant)
+        for line in logical_contents.splitlines()
+        for variant in scan_variants(line)
+    )
 
 
 def unprotected_cross_surfaces(
@@ -482,6 +551,82 @@ def unprotected_cross_surfaces(
         if name in sensitive_jobs
     ]
     return tuple([*top_level_surfaces, *job_surfaces]), []
+
+
+def generic_workflow_cross_surfaces(
+    contents: str,
+    source: str,
+) -> tuple[tuple[str, ...], list[str]]:
+    """Scan a workflow that must not contain any Cross-controlled surface."""
+
+    # Avoid imposing a YAML layout contract on unrelated workflows. As soon as
+    # a Cross token is exposed, however, parse the job layout conservatively so
+    # malformed, duplicate, and alias-shaped jobs fail closed.
+    if not contains_cross_surface(contents):
+        return (), []
+    return unprotected_cross_surfaces(
+        contents,
+        source,
+        "__no_unprotected_cross_job__",
+        required_job=False,
+    )
+
+
+def validate_workflow_collection(
+    workflows: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Reject Cross inputs in every workflow except the two hashed contracts."""
+
+    errors: list[str] = []
+    for name, contents in sorted(workflows.items()):
+        if name in PROTECTED_WORKFLOW_FILENAMES:
+            continue
+        surfaces, failures = generic_workflow_cross_surfaces(
+            contents,
+            f"{source}/{name}",
+        )
+        errors.extend(failures)
+        if surfaces:
+            errors.append(
+                f"{source}/{name} contains an unprotected Cross executable or "
+                "configuration input"
+            )
+    return errors
+
+
+def compare_pr_workflow_collection(
+    merge_base_workflows: dict[str, str],
+    proposed_workflows: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Permit safe workflow edits while rejecting new or changed Cross inputs."""
+
+    errors: list[str] = []
+    names = sorted(
+        (set(merge_base_workflows) | set(proposed_workflows))
+        - PROTECTED_WORKFLOW_FILENAMES
+    )
+    for name in names:
+        baseline_contents = merge_base_workflows.get(name, "")
+        proposed_contents = proposed_workflows.get(name, "")
+        baseline_surfaces, baseline_failures = generic_workflow_cross_surfaces(
+            baseline_contents,
+            f"merge-base {source}/{name}",
+        )
+        proposed_surfaces, proposed_failures = generic_workflow_cross_surfaces(
+            proposed_contents,
+            f"proposed {source}/{name}",
+        )
+        errors.extend(baseline_failures)
+        errors.extend(proposed_failures)
+        if not baseline_failures and not proposed_failures:
+            if baseline_surfaces != proposed_surfaces:
+                errors.append(
+                    f"{source}/{name} cannot add or change Cross executable/"
+                    "configuration surfaces"
+                )
+    return errors
 
 
 def validate_workflow_contract(
@@ -990,6 +1135,11 @@ pre_build = []
             "echo safe",
             "cr$(printf o)ss build --target aarch64-unknown-linux-gnu",
         ),
+        "unprotected nested command substitution": workflow.replace(
+            "echo safe",
+            "cr$(python3 -c 'print(\"o\")')ss build "
+            "--target aarch64-unknown-linux-gnu",
+        ),
         "unprotected GitHub interpolation": workflow.replace(
             "echo safe",
             "cr${{ 'o' }}ss build --target aarch64-unknown-linux-gnu",
@@ -1099,6 +1249,54 @@ pre_build = []
     ):
         failures.append("merge-base comparison allowed a newly added protected job")
 
+    safe_extra_workflow = (
+        "name: Coverage\n"
+        "on: [pull_request]\n"
+        "jobs:\n"
+        "  coverage:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo safe\n"
+    )
+    benign_extra_edit = safe_extra_workflow.replace("echo safe", "echo still-safe")
+    if validate_workflow_collection(
+        {"coverage.yml": safe_extra_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append("safe additional workflow was rejected")
+    if compare_pr_workflow_collection(
+        {"coverage.yml": safe_extra_workflow},
+        {
+            "coverage.yml": benign_extra_edit,
+            "new-benign.yaml": safe_extra_workflow,
+        },
+        "self-test workflow directory",
+    ):
+        failures.append("benign workflow collection edits were rejected")
+
+    added_cross_workflow = safe_extra_workflow.replace(
+        "echo safe",
+        "cross build --target aarch64-unknown-linux-gnu",
+    )
+    if not compare_pr_workflow_collection(
+        {"coverage.yml": safe_extra_workflow},
+        {"coverage.yml": safe_extra_workflow, "attacker.yml": added_cross_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append("new workflow Cross invocation was not rejected")
+
+    malformed_cross_workflow = (
+        added_cross_workflow
+        + "jobs:\n"
+        + "  duplicate:\n"
+        + "    runs-on: ubuntu-latest\n"
+    )
+    if not validate_workflow_collection(
+        {"malformed.yml": malformed_cross_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append("malformed Cross workflow was not rejected")
+
     return failures
 
 
@@ -1110,6 +1308,39 @@ def load_workflow(path: Path, label: str) -> tuple[str | None, list[str]]:
     if "\x00" in contents:
         return None, [f"{label} contains a NUL byte"]
     return contents, []
+
+
+def load_workflow_directory(
+    path: Path,
+    label: str,
+) -> tuple[dict[str, str], list[str]]:
+    """Load direct GitHub workflow files without following filesystem aliases."""
+
+    if path.is_symlink() or not path.is_dir():
+        return {}, [f"{label} must be a non-symlink directory"]
+
+    workflows: dict[str, str] = {}
+    errors: list[str] = []
+    try:
+        entries = sorted(path.iterdir(), key=lambda entry: entry.name)
+    except OSError as error:
+        return {}, [f"cannot list {label}: {error}"]
+
+    for entry in entries:
+        if entry.suffix not in {".yml", ".yaml"}:
+            continue
+        if WORKFLOW_FILENAME.fullmatch(entry.name) is None:
+            errors.append(f"{label} contains unsupported workflow name {entry.name!r}")
+            continue
+        if entry.is_symlink() or not entry.is_file():
+            errors.append(f"{label}/{entry.name} must be a non-symlink regular file")
+            continue
+        contents, failures = load_workflow(entry, f"{label}/{entry.name}")
+        errors.extend(failures)
+        if not failures:
+            assert contents is not None
+            workflows[entry.name] = contents
+    return workflows, errors
 
 
 def main() -> int:
@@ -1128,6 +1359,13 @@ def main() -> int:
     parser.add_argument("--proposed-ci-workflow", type=Path)
     parser.add_argument("--merge-base-release-workflow", type=Path)
     parser.add_argument("--proposed-release-workflow", type=Path)
+    parser.add_argument(
+        "--workflows-dir",
+        type=Path,
+        default=Path(".github/workflows"),
+    )
+    parser.add_argument("--merge-base-workflows-dir", type=Path)
+    parser.add_argument("--proposed-workflows-dir", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -1170,11 +1408,21 @@ def main() -> int:
                 )
             )
 
+    workflows, workflow_directory_failures = load_workflow_directory(
+        args.workflows_dir,
+        "workflow directory",
+    )
+    failures.extend(workflow_directory_failures)
+    if not workflow_directory_failures:
+        failures.extend(validate_workflow_collection(workflows, "workflow directory"))
+
     pr_paths = (
         args.merge_base_ci_workflow,
         args.proposed_ci_workflow,
         args.merge_base_release_workflow,
         args.proposed_release_workflow,
+        args.merge_base_workflows_dir,
+        args.proposed_workflows_dir,
     )
     if any(path is not None for path in pr_paths) and not all(
         path is not None for path in pr_paths
@@ -1207,6 +1455,27 @@ def main() -> int:
                 failures.extend(
                     compare_pr_workflow_job(baseline, proposed, label, job_name)
                 )
+
+        assert args.merge_base_workflows_dir is not None
+        assert args.proposed_workflows_dir is not None
+        merge_base_workflows, merge_base_directory_failures = load_workflow_directory(
+            args.merge_base_workflows_dir,
+            "merge-base workflow directory",
+        )
+        proposed_workflows, proposed_directory_failures = load_workflow_directory(
+            args.proposed_workflows_dir,
+            "proposed workflow directory",
+        )
+        failures.extend(merge_base_directory_failures)
+        failures.extend(proposed_directory_failures)
+        if not merge_base_directory_failures and not proposed_directory_failures:
+            failures.extend(
+                compare_pr_workflow_collection(
+                    merge_base_workflows,
+                    proposed_workflows,
+                    "workflow directory",
+                )
+            )
 
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
