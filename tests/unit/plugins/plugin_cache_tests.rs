@@ -2,7 +2,8 @@
 
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    plugin_cache_with_real_ip_header_for_test,
+    incremental_plugin_rebuild_targets_for_test, plugin_cache_with_real_ip_header_for_test,
+    reconcile_fault_plugin_generations_for_test,
     validate_correlation_id_composition_with_real_ip_header_for_test,
     validate_plugin_composition_candidate_with_real_ip_header_for_test,
 };
@@ -2985,6 +2986,91 @@ fn fault_delta_priority_change_is_targeted_and_unchanged_config_is_noop() {
     let p1_after = cache.get_plugins("p1");
     assert!(!Arc::ptr_eq(&p1_before[0], &p1_after[0]));
     assert!(Arc::ptr_eq(&p2_before, &cache.get_plugins("p2")));
+}
+
+#[test]
+fn fault_reconciliation_scope_move_advances_the_actual_generation() {
+    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let mut fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::Global,
+        None,
+        true,
+    );
+    fault.created_at = generation;
+    fault.updated_at = generation;
+    let accepted = make_config(vec![], vec![fault]);
+
+    let mut candidate = accepted.clone();
+    candidate.plugin_configs[0].scope = PluginScope::Proxy;
+    candidate.plugin_configs[0].proxy_id = Some("p1".to_string());
+    reconcile_fault_plugin_generations_for_test(&mut candidate, &accepted);
+
+    assert!(candidate.plugin_configs[0].updated_at > generation);
+    let delta = ConfigDelta::compute(&accepted, &candidate);
+    assert_eq!(delta.modified_plugin_configs.len(), 1);
+    assert!(delta.global_plugin_configs_changed);
+}
+
+#[test]
+fn fault_reconciliation_priority_change_advances_the_actual_generation() {
+    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let mut fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    fault.created_at = generation;
+    fault.updated_at = generation;
+    let accepted = make_config(vec![make_proxy("p1", "/one", vec!["fault"])], vec![fault]);
+
+    let mut candidate = accepted.clone();
+    candidate.plugin_configs[0].priority_override = Some(42);
+    reconcile_fault_plugin_generations_for_test(&mut candidate, &accepted);
+
+    assert!(candidate.plugin_configs[0].updated_at > generation);
+    let delta = ConfigDelta::compute(&accepted, &candidate);
+    assert_eq!(delta.modified_plugin_configs.len(), 1);
+    assert_eq!(
+        incremental_plugin_rebuild_targets_for_test(&accepted, &candidate),
+        HashSet::from(["p1".to_string()]),
+        "the staged rebuild count and targets must come from this accepted snapshot"
+    );
+}
+
+#[test]
+fn fault_reconciliation_comparison_is_schema_complete_and_normalizes_only_timestamps() {
+    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let mut fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::Global,
+        None,
+        true,
+    );
+    fault.created_at = generation;
+    fault.updated_at = generation;
+    let accepted = make_config(vec![], vec![fault]);
+
+    let mut persistence_only = accepted.clone();
+    persistence_only.plugin_configs[0].created_at += chrono::Duration::seconds(1);
+    reconcile_fault_plugin_generations_for_test(&mut persistence_only, &accepted);
+    assert_eq!(persistence_only.plugin_configs[0].updated_at, generation);
+
+    let mut metadata_changed = accepted.clone();
+    metadata_changed.plugin_configs[0].api_spec_id = Some("spec-owner".to_string());
+    reconcile_fault_plugin_generations_for_test(&mut metadata_changed, &accepted);
+    assert!(metadata_changed.plugin_configs[0].updated_at > generation);
+    assert_eq!(
+        ConfigDelta::compute(&accepted, &metadata_changed)
+            .modified_plugin_configs
+            .len(),
+        1,
+        "a field outside the former hand-written list must not retain a stale generation"
+    );
 }
 
 #[test]

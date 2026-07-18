@@ -1475,7 +1475,7 @@ fn materialize_fault_runtime_overlay(
     }
 }
 
-/// Advance only the fault-plugin generations whose materialized config changed.
+/// Advance fault-plugin generations whose reconciled non-persistence content changed.
 ///
 /// RTDS is not one of the mesh slice's version-coherence resource types, so an
 /// RTDS-only response can legitimately keep `GatewayConfig.loaded_at` stable.
@@ -1483,7 +1483,10 @@ fn materialize_fault_runtime_overlay(
 /// cold-path stamp makes the affected instances rebuild from their materialized
 /// effective config before `RequestEpoch` publishes the candidate. Unchanged
 /// and unrelated scopes retain their stateful plugin instances.
-fn reconcile_fault_plugin_generations(candidate: &mut GatewayConfig, previous: &GatewayConfig) {
+pub(crate) fn reconcile_fault_plugin_generations(
+    candidate: &mut GatewayConfig,
+    previous: &GatewayConfig,
+) {
     let previous_plugins = previous
         .plugin_configs
         .iter()
@@ -1500,18 +1503,12 @@ fn reconcile_fault_plugin_generations(candidate: &mut GatewayConfig, previous: &
         else {
             continue;
         };
-        if plugin.config == previous.config
-            && plugin.scope == previous.scope
-            && plugin.proxy_id == previous.proxy_id
-            && plugin.enabled == previous.enabled
-            && plugin.priority_override == previous.priority_override
-        {
+        if plugin_config_content_eq_ignoring_persistence(plugin, previous) {
             // The candidate may have been reconstructed from the static mesh
             // source timestamp while `previous` carries the synthetic stamp
             // assigned to an earlier RTDS materialization. Preserve that
-            // accepted stamp when the effective config, placement, and order
-            // are identical so ConfigDelta does not rebuild the plugin or
-            // reset its sampler.
+            // accepted stamp when every non-persistence field is identical so
+            // ConfigDelta does not rebuild the plugin or reset its sampler.
             plugin.updated_at = previous.updated_at;
             continue;
         }
@@ -1525,6 +1522,33 @@ fn reconcile_fault_plugin_generations(candidate: &mut GatewayConfig, previous: &
         } else {
             now
         };
+    }
+}
+
+/// Whether two plugin configs are identical after neutralizing persistence-only
+/// timestamps.
+///
+/// Serializing the normalized configs makes this comparison automatically
+/// complete over the `PluginConfig` schema: a future runtime-relevant field is
+/// included without another hand-maintained equality update. `api_spec_id` is
+/// intentionally still compared; an extra cold-path rebuild for an admin-only
+/// metadata edit is safer than retaining a stale runtime instance. A
+/// serialization failure is treated as changed so reconciliation fails toward
+/// rebuilding rather than stale reuse.
+fn plugin_config_content_eq_ignoring_persistence(
+    candidate: &PluginConfig,
+    previous: &PluginConfig,
+) -> bool {
+    let mut normalized_candidate = candidate.clone();
+    normalized_candidate.created_at = previous.created_at;
+    normalized_candidate.updated_at = previous.updated_at;
+
+    match (
+        serde_json::to_value(&normalized_candidate),
+        serde_json::to_value(previous),
+    ) {
+        (Ok(candidate), Ok(previous)) => candidate == previous,
+        _ => false,
     }
 }
 
