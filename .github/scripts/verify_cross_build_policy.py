@@ -75,6 +75,10 @@ CROSS_ENVIRONMENT = re.compile(
     r"(?<![A-Za-z0-9_])(?:CROSS_[A-Z0-9_]*|DOCKER_OPTS|QEMU_STRACE|"
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
 )
+SHELL_INTERPOLATION = re.compile(
+    r"\$\{\{[^{}\n]*\}\}|\$\{[^{}\n]*\}|\$\([^()\n]*\)|`[^`\n]*`|"
+    r"\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]"
+)
 
 
 def exact_keys(value: Any, expected: set[str], location: str) -> list[str]:
@@ -322,6 +326,28 @@ def extract_top_level_block(
     return block, []
 
 
+def interpolation_literal(raw: str) -> str:
+    """Extract a literal/default fragment while treating unknown expansion as empty."""
+
+    if raw.startswith("${{"):
+        inner = raw[3:-2].strip()
+        if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in "'\"":
+            return inner[1:-1]
+        return ""
+
+    if raw.startswith("${"):
+        inner = raw[2:-1]
+        default = re.match(r"^[A-Za-z_][A-Za-z0-9_]*(?::?[-+?=])(.*)$", inner)
+        return default.group(1) if default is not None else ""
+
+    if raw.startswith("$("):
+        inner = raw[2:-1]
+    else:
+        inner = raw[1:-1]
+    words = re.findall(r"[A-Za-z]+", inner)
+    return next((word for word in reversed(words) if word in "cross"), "")
+
+
 def scan_variants(line: str) -> tuple[str, ...]:
     """Expose ordinary YAML/shell quoting variants to the lexical boundary."""
 
@@ -329,6 +355,16 @@ def scan_variants(line: str) -> tuple[str, ...]:
     collapsed = re.sub(r"[\\'\"]", "", line)
     if collapsed != line:
         variants.append(collapsed)
+
+    without_interpolation = SHELL_INTERPOLATION.sub("", line)
+    if without_interpolation != line:
+        variants.append(without_interpolation)
+    with_literal_defaults = SHELL_INTERPOLATION.sub(
+        lambda match: interpolation_literal(match.group()),
+        line,
+    )
+    if with_literal_defaults != line:
+        variants.append(with_literal_defaults)
 
     for match in re.finditer(r'"(?:[^"\\]|\\.)*"', line):
         try:
@@ -865,6 +901,26 @@ pre_build = []
         ),
         "unprotected split-quoted Cross executable": workflow.replace(
             "echo safe", 'cr"oss build --target aarch64-unknown-linux-gnu'
+        ),
+        "unprotected empty shell expansion": workflow.replace(
+            "echo safe",
+            "cr${UNSET:-}oss build --target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected default shell expansion": workflow.replace(
+            "echo safe",
+            "cr${UNSET:-o}ss build --target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected command substitution": workflow.replace(
+            "echo safe",
+            "cr$(printf o)ss build --target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected GitHub interpolation": workflow.replace(
+            "echo safe",
+            "cr${{ 'o' }}ss build --target aarch64-unknown-linux-gnu",
+        ),
+        "unprotected positional shell expansion": workflow.replace(
+            "echo safe",
+            "cr$1oss build --target aarch64-unknown-linux-gnu",
         ),
         "unprotected flow environment alias": workflow.replace(
             "  unrelated:\n",

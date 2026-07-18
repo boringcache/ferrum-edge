@@ -370,8 +370,9 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   verifier, and merge-base comparison rejects any PR-authored mutation while
   allowing unrelated workflow jobs to evolve. Any new or changed Cross
   executable/configuration token outside those isolated jobs is also rejected,
-  including quoted executable spellings and Cross environment aliases. These
-  jobs use only pinned external setup actions before revalidation.
+  including quoted or shell/GitHub-interpolated executable spellings and Cross
+  environment aliases. These jobs use only pinned external setup actions before
+  revalidation.
 - The Cross process starts through `env -i` with an explicit minimal host
   environment and fixed compiler variables. This removes `CROSS_CONFIG`, every
   `CROSS_BUILD_*`/`CROSS_TARGET_*` alias, image/Dockerfile/pre-build/runner
