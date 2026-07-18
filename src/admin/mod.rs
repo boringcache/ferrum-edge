@@ -995,6 +995,7 @@ pub async fn handle_admin_request(
 
     // Health check (unauthenticated)
     if path == "/health" || path == "/status" {
+        let detailed = observability_detail_allowed(&state, auth_header.as_deref(), &client_ip);
         let mut health_status = json!({
             "status": "ok",
             "timestamp": Utc::now().to_rfc3339(),
@@ -1180,6 +1181,15 @@ pub async fn handle_admin_request(
             });
         }
 
+        // Sink internals are authenticated detail. The minimal health body
+        // below deliberately omits queue sizes, loss counters, and failure
+        // timestamps while operators using the established observability auth
+        // paths can diagnose stdout/stderr independently.
+        if detailed {
+            health_status["logging"] =
+                serde_json::to_value(crate::logging::snapshot()).unwrap_or_default();
+        }
+
         let response_code = if !ready {
             // Distinguish "never became ready" (still starting up) from "was
             // ready, then a serving listener died after startup" (degraded).
@@ -1203,7 +1213,7 @@ pub async fn handle_admin_request(
         // receives only liveness + readiness, which is enough to drive health
         // checks without leaking operational internals. Authorized callers
         // (admin JWT / metrics token / allowlisted CIDR) get the full body.
-        if observability_detail_allowed(&state, auth_header.as_deref(), &client_ip) {
+        if detailed {
             return Ok(json_response(response_code, &health_status));
         }
         let minimal = json!({
@@ -1264,6 +1274,7 @@ pub async fn handle_admin_request(
         let inventory = tls_management::collect_inventory(&state);
         registry.refresh_tls_certificate_inventory(&inventory);
         let mut metrics_output = registry.render();
+        metrics_output.push_str(&crate::logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
         let resp = Response::builder()
             .status(StatusCode::OK)

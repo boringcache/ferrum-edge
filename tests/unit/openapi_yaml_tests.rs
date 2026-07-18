@@ -1826,6 +1826,30 @@ fn assert_component_validity(
 }
 
 #[test]
+fn stdout_logging_schema_rejects_unknown_outer_and_filter_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for valid in [
+        serde_json::Value::Null,
+        json!({}),
+        json!({"filter": null}),
+        json!({"filter": {"status_code_min": 500, "errors_only": true}}),
+        json!({"schema_ref": "common"}),
+    ] {
+        assert_component_validity(&spec, "StdoutLoggingConfig", &valid, true);
+    }
+    for invalid in [
+        json!({"filters": {"errors_only": true}}),
+        json!({"log_level": "info"}),
+        json!({"filter": {"error_only": true}}),
+        json!({"filter": {"min_latency_msec": 100}}),
+    ] {
+        assert_component_validity(&spec, "StdoutLoggingConfig", &invalid, false);
+    }
+}
+
+#[test]
 fn correlation_id_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::correlation_id::CorrelationId;
 

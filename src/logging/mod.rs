@@ -9,9 +9,30 @@
 
 use std::sync::OnceLock;
 
-use tracing_appender::non_blocking::NonBlocking;
+use serde::Serialize;
 
+pub mod non_blocking;
 pub mod runtime_overlay;
+
+pub use non_blocking::{
+    ErrorCounter, NonBlockingOptions, NonBlockingSink, SinkName, SinkSnapshot, WorkerGuard,
+};
+
+// Process-log defaults and clamp ranges are consumed before EnvConfig exists,
+// then retained on EnvConfig for diagnostics/documentation parity. Keep the
+// numeric policy here so both startup paths use one source of truth.
+pub const LOG_BUFFER_CAPACITY_DEFAULT: usize = 4_096;
+pub const LOG_BUFFER_CAPACITY_MIN: usize = 1;
+pub const LOG_BUFFER_CAPACITY_MAX: usize = 65_536;
+pub const LOG_BUFFER_BYTES_DEFAULT: usize = 32 * 1_048_576;
+pub const LOG_BUFFER_BYTES_MIN: usize = 1_024;
+pub const LOG_BUFFER_BYTES_MAX: usize = 1_073_741_824;
+pub const LOG_MAX_RECORD_BYTES_DEFAULT: usize = 65_536;
+pub const LOG_MAX_RECORD_BYTES_MIN: usize = 1_024;
+pub const LOG_MAX_RECORD_BYTES_MAX: usize = 1_048_576;
+pub const LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT: usize = 2_000;
+pub const LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MIN: usize = 100;
+pub const LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MAX: usize = 30_000;
 
 /// Stable callback that knows how to rebuild the gateway-wide tracing
 /// filter. `directive` is a `RUST_LOG`-style filter expression
@@ -65,25 +86,161 @@ pub fn log_level_reloader() -> Option<&'static dyn LogLevelReloader> {
 /// plugin-enablement decision, not a diagnostic verbosity knob, so lowering
 /// the runtime log level must never silence it.
 ///
-/// `init_logging` (in the binary) installs a clone of the same
-/// `tracing_appender` non-blocking stdout writer the fmt layers use. Writing
-/// here is a bounded-channel send handled off-thread, and the writer bypasses
-/// the `EnvFilter`/`SeverityWriter` tracing stack entirely. The plugin holds
-/// only a sender clone; the flush-on-exit `WorkerGuard` stays owned by
-/// `run_gateway()`.
-static ACCESS_LOG_WRITER: OnceLock<NonBlocking> = OnceLock::new();
+/// `init_logging` installs the same bounded stdout sink used by the fmt layer.
+/// The sink enforces both record and byte budgets and exposes independent
+/// saturation, I/O, flush, and shutdown-drain counters.
+struct ProcessLogSinks {
+    stdout: NonBlockingSink,
+    stderr: NonBlockingSink,
+    stdout_errors: ErrorCounter,
+    stderr_errors: ErrorCounter,
+}
 
-/// Install the process-global access-log writer. Called once from the
-/// binary's `init_logging`. A second call is a no-op (the first writer
-/// stays in effect), matching the single-install contract of the rest of
-/// this module.
-pub fn set_access_log_writer(writer: NonBlocking) {
-    let _ = ACCESS_LOG_WRITER.set(writer);
+static PROCESS_LOG_SINKS: OnceLock<ProcessLogSinks> = OnceLock::new();
+
+/// Install the process-global stdout/stderr sinks. Called once from the
+/// binary's `init_logging`; a second call returns an error and leaves the
+/// original sinks in place.
+pub fn set_process_log_sinks(
+    stdout: NonBlockingSink,
+    stderr: NonBlockingSink,
+) -> Result<(), &'static str> {
+    let stdout_errors = stdout.error_counter();
+    let stderr_errors = stderr.error_counter();
+    PROCESS_LOG_SINKS
+        .set(ProcessLogSinks {
+            stdout,
+            stderr,
+            stdout_errors,
+            stderr_errors,
+        })
+        .map_err(|_| "process log sinks are already installed")
 }
 
 /// Read access for the access-log sink. `None` before `init_logging` runs
-/// (validate-only mode, unit tests). Callers must fall back to a direct
-/// write so output is still produced in those contexts.
-pub fn access_log_writer() -> Option<&'static NonBlocking> {
-    ACCESS_LOG_WRITER.get()
+/// (unit/library contexts). Callers must remain non-blocking and may skip
+/// output; the gateway binary treats sink initialization failure as fatal.
+pub fn access_log_writer() -> Option<&'static NonBlockingSink> {
+    PROCESS_LOG_SINKS.get().map(|sinks| &sinks.stdout)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LoggingSnapshot {
+    pub stdout: Option<SinkSnapshot>,
+    pub stderr: Option<SinkSnapshot>,
+}
+
+pub fn snapshot() -> LoggingSnapshot {
+    match PROCESS_LOG_SINKS.get() {
+        Some(sinks) => LoggingSnapshot {
+            stdout: Some(sinks.stdout.snapshot()),
+            stderr: Some(sinks.stderr.snapshot()),
+        },
+        None => LoggingSnapshot {
+            stdout: None,
+            stderr: None,
+        },
+    }
+}
+
+/// Render process log sink telemetry with fixed labels only. This is appended
+/// to the authenticated `/metrics` response and never written through either
+/// log sink, avoiding recursive failure reporting.
+pub fn render_prometheus() -> String {
+    let Some(sinks) = PROCESS_LOG_SINKS.get() else {
+        return String::new();
+    };
+    let mut output = String::with_capacity(2_048);
+    output.push_str(
+        "# HELP ferrum_log_sink_healthy Whether the process log sink has recovered from its latest I/O or drain failure.\n\
+# TYPE ferrum_log_sink_healthy gauge\n",
+    );
+    output.push_str(
+        "# HELP ferrum_log_sink_queued_records Records admitted but not yet completed.\n\
+# TYPE ferrum_log_sink_queued_records gauge\n",
+    );
+    output.push_str(
+        "# HELP ferrum_log_sink_reserved_bytes Byte budget reserved by admitted records.\n\
+# TYPE ferrum_log_sink_reserved_bytes gauge\n",
+    );
+    output.push_str(
+        "# HELP ferrum_log_sink_queued_bytes Serialized bytes admitted but not yet completed.\n\
+# TYPE ferrum_log_sink_queued_bytes gauge\n",
+    );
+    output.push_str(
+        "# HELP ferrum_log_sink_accepted_records_total Records accepted by the bounded process log sink.\n\
+# TYPE ferrum_log_sink_accepted_records_total counter\n",
+    );
+    output.push_str(
+        "# HELP ferrum_log_sink_dropped_records_total Log records dropped by bounded admission.\n\
+# TYPE ferrum_log_sink_dropped_records_total counter\n",
+    );
+    output.push_str(
+        "# HELP ferrum_log_sink_shutdown_timeouts_total Bounded process log drain deadlines reached.\n\
+# TYPE ferrum_log_sink_shutdown_timeouts_total counter\n",
+    );
+    output.push_str(
+        "# HELP ferrum_log_sink_shutdown_incomplete_records_total Records still outstanding when a bounded drain deadline was reached.\n\
+# TYPE ferrum_log_sink_shutdown_incomplete_records_total counter\n",
+    );
+    output.push_str(
+        "# HELP ferrum_log_sink_io_failures_total Underlying writer and flush failures.\n\
+# TYPE ferrum_log_sink_io_failures_total counter\n",
+    );
+    for (sink, error_counter) in [
+        (&sinks.stdout, &sinks.stdout_errors),
+        (&sinks.stderr, &sinks.stderr_errors),
+    ] {
+        let snapshot = sink.snapshot();
+        let name = snapshot.sink.as_str();
+        output.push_str(&format!(
+            "ferrum_log_sink_healthy{{sink=\"{name}\"}} {}\n",
+            u8::from(snapshot.healthy)
+        ));
+        output.push_str(&format!(
+            "ferrum_log_sink_queued_records{{sink=\"{name}\"}} {}\n",
+            snapshot.queued_records
+        ));
+        output.push_str(&format!(
+            "ferrum_log_sink_reserved_bytes{{sink=\"{name}\"}} {}\n",
+            snapshot.reserved_bytes
+        ));
+        output.push_str(&format!(
+            "ferrum_log_sink_queued_bytes{{sink=\"{name}\"}} {}\n",
+            snapshot.queued_bytes
+        ));
+        output.push_str(&format!(
+            "ferrum_log_sink_accepted_records_total{{sink=\"{name}\"}} {}\n",
+            snapshot.accepted_records_total
+        ));
+        for (reason, value) in [
+            ("saturation", error_counter.saturation_dropped_records()),
+            (
+                "record_too_large",
+                error_counter.oversized_dropped_records(),
+            ),
+            ("closed", error_counter.closed_dropped_records()),
+        ] {
+            output.push_str(&format!(
+                "ferrum_log_sink_dropped_records_total{{sink=\"{name}\",reason=\"{reason}\"}} {value}\n"
+            ));
+        }
+        output.push_str(&format!(
+            "ferrum_log_sink_shutdown_timeouts_total{{sink=\"{name}\"}} {}\n",
+            snapshot.shutdown_timeouts_total
+        ));
+        output.push_str(&format!(
+            "ferrum_log_sink_shutdown_incomplete_records_total{{sink=\"{name}\"}} {}\n",
+            snapshot.shutdown_incomplete_records_total
+        ));
+        for (operation, value) in [
+            ("write", snapshot.writer_failures_total),
+            ("flush", snapshot.flush_failures_total),
+        ] {
+            output.push_str(&format!(
+                "ferrum_log_sink_io_failures_total{{sink=\"{name}\",operation=\"{operation}\"}} {value}\n"
+            ));
+        }
+    }
+    output
 }

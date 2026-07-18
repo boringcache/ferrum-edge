@@ -153,12 +153,12 @@ These headers are injected on all proxy paths (HTTP, gRPC, and WebSocket).
 
 ### `stdout_logging`
 
-Writes one JSON transaction (or stream) summary per line to stdout for each request. Output goes through the same non-blocking writer the runtime tracing logs use, so logging never blocks request-processing threads. It is emitted independent of `FERRUM_LOG_LEVEL` — enabling the plugin is the on/off switch, so lowering runtime verbosity never silences access logs and the default runtime stdout stays quiet until you turn this on.
+Writes one JSON transaction (or stream) summary per line to stdout for each request. Output goes through the same bounded non-blocking writer as runtime stdout events, so logging never waits for stdout on request-processing threads. Capacity is reserved before JSON serialization; saturation and oversize records are dropped with monotonic telemetry. It is emitted independent of `FERRUM_LOG_LEVEL` — enabling the plugin is the on/off switch.
 
-Scope it to one or more proxies to log only those proxies' traffic, or attach it globally to log every proxy's transactions. An optional `filter` (evaluated before any `schema:`) suppresses entries by status code, latency, or error class. This is also the sink mesh mode injects to honor a Telemetry CRD's `accessLogging` configuration.
+Scope it to one or more proxies to log only those proxies' traffic, or attach it globally to log every proxy's transactions. An optional `filter` (evaluated before any `schema:`) suppresses entries by status code, latency, or terminal outcome. For HTTP-family terminal summaries, `errors_only` uses one final predicate: dispatch/error class, response-body error, incomplete streamed body, client disconnect, gateway rejection, or nonzero final gRPC status. TCP, UDP, WebSocket, and DTLS stream/disconnect summaries instead match `error_class` or `connection_error`. HTTP status and latency filters remain independent and all configured predicates must match. This is also the sink mesh mode injects to honor a Telemetry CRD's `accessLogging` configuration.
 
 **Priority:** 9000
-**Config**: All fields optional; `config: {}` logs every transaction.
+**Config**: The accepted outer keys are exactly `filter`, `schema`, and `schema_ref`; filter keys are exactly `status_code_min`, `status_code_max`, `min_latency_ms`, and `errors_only`. Unknown keys are rejected with their full path. `null`, `{}`, and `filter: null` preserve the default of logging every transaction.
 
 ```yaml
 plugin_name: stdout_logging
@@ -166,7 +166,7 @@ config:
   filter:                 # optional; all present predicates must match
     status_code_min: 500  # skip responses with status < 500
     min_latency_ms: 1000  # skip transactions/streams faster than 1s
-    errors_only: true     # skip transactions with no error
+    errors_only: true     # require an authoritative terminal failure
 ```
 
 ### `http_logging`
@@ -699,6 +699,7 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `backend_target` | String or null | Backend the request was forwarded to. For HTTP this is the full URL (`scheme://host:port/path`); `null` when the request was rejected before backend selection. Same JSON key as `StreamTransactionSummary.backend_target` (which uses `host:port` form because stream proxies have no path). |
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
 | `response_status_code` | u16 | HTTP status code |
+| `grpc_status` | u32 | Final normalized gRPC application status, separate from HTTP transport status; emitted for gRPC transactions. Missing terminal status normalizes to `2` (UNKNOWN); malformed input uses the existing `u32::MAX` invalid-status sentinel |
 | `latency_total_ms` | f64 | Total request-to-response time |
 | `latency_gateway_processing_ms` | f64 | Total time excluding backend communication |
 | `latency_backend_ttfb_ms` | f64 | Time to first byte from backend; -1.0 if no backend call |
@@ -717,7 +718,7 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `mirror` | bool | Present and `true` when this entry is a mirror (shadow) request rather than the client-facing transaction |
 | `metadata` | Object | Plugin-injected key-value pairs (correlation ID, trace ID, etc.) |
 
-**Notes on conditional fields:** `auth_method`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when false/null to keep log entries compact.
+**Notes on conditional fields:** `auth_method`, `grpc_status`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when not applicable/false/null to keep log entries compact.
 
 **`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_received` reflect the full client-visible outcome.
 
