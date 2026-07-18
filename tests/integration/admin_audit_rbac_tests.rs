@@ -272,6 +272,24 @@ async fn non_admin_cannot_read_backup_unredacted_credentials() {
 }
 
 #[tokio::test]
+async fn audit_rbac_precedes_route_local_pagination_validation() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+
+    let viewer = token("view-only", Some("viewer"));
+    let (status, body) = get_json(&base, "/audit?limit=abc", &viewer).await;
+    assert_eq!(status, 403, "audit RBAC must precede pagination: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("required role is 'admin'"),
+        "unexpected RBAC error body: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn viewer_restore_is_rejected_before_large_body_buffering() {
     let tmp = TempDir::new().unwrap();
     let mut state = admin_state(make_store(&tmp).await);

@@ -2628,27 +2628,30 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
 
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
-        let key = parts.next().unwrap_or("");
+        let raw_key = parts.next().unwrap_or("");
         let raw_val = parts.next().unwrap_or("");
-        // URL-decode the value (simple percent-decoding for common chars).
+        // URL-decode both names and values. Decoding only values lets encoded
+        // pagination names bypass this endpoint's narrower `u32` offset bound.
         // Invalid UTF-8 sequences in percent-encoded bytes are rejected with 400
         // to prevent bypassing downstream character-validation checks (e.g. the
         // `title_contains` wildcard rejection below).
+        let key = percent_decode(raw_key)?;
         let val = percent_decode(raw_val)?;
 
-        match key {
+        match key.as_str() {
             // `/api-specs` keeps its own stricter bounds (default 50, max 200)
             // and its `{items, next_offset}` envelope, but malformed input is
             // rejected with 400 exactly as `parse_pagination` does for every
             // other list route — never silently coerced to a default.
             "limit" => {
-                let parsed: u32 = val.parse().map_err(|_| invalid_pagination("limit"))?;
+                let parsed: u64 = val.parse().map_err(|_| invalid_pagination("limit"))?;
                 // `0` keeps the documented "server default" meaning; values
                 // above the maximum are capped.
                 filter.limit = if parsed == 0 {
                     DEFAULT_LIMIT
                 } else {
-                    parsed.min(MAX_LIMIT)
+                    u32::try_from(parsed.min(u64::from(MAX_LIMIT)))
+                        .map_err(|_| invalid_pagination("limit"))?
                 };
             }
             "offset" => {
@@ -3288,8 +3291,6 @@ pub async fn handle_list_api_specs(
         Ok(f) => f,
         Err(e) => return Ok(error_response(e)),
     };
-    let limit = filter.limit as usize;
-    let offset = filter.offset as usize;
 
     let paginated = match db.list_api_specs(namespace, &filter).await {
         Ok(p) => p,
@@ -3325,16 +3326,13 @@ pub async fn handle_list_api_specs(
         })
         .collect();
 
-    let next_offset: Option<usize> = if (offset + items.len()) < (paginated.total.max(0) as usize) {
-        Some(offset + items.len())
-    } else {
-        None
-    };
+    let next_offset =
+        crate::admin::advancing_u32_offset(filter.offset, items.len(), paginated.total);
 
     let body = json!({
         "items": items,
-        "limit": limit,
-        "offset": offset,
+        "limit": filter.limit,
+        "offset": filter.offset,
         "next_offset": next_offset,
         "total": paginated.total,
     });

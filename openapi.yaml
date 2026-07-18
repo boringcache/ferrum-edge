@@ -3060,6 +3060,8 @@ paths:
         even though other list endpoints accept it up to 2^63 - 1. The audit
         response uses its own `{items, limit, offset, next_offset, total}`
         envelope rather than the shared `data`/`pagination` envelope.
+        `next_offset` is `null` when the next page does not exist or its cursor
+        cannot be represented without exceeding the 32-bit ceiling.
       tags: [Audit]
       parameters:
         - name: actor
@@ -3095,7 +3097,18 @@ paths:
             type: string
             format: date-time
         - $ref: "#/components/parameters/PaginationLimit"
-        - $ref: "#/components/parameters/PaginationOffset"
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: uint32
+            minimum: 0
+            maximum: 4294967295
+            default: 0
+          description: |
+            Number of audit events to skip. Negative, non-integer, or values
+            above 4294967295 are rejected with `400`.
       responses:
         "200":
           description: Paginated audit events
@@ -4391,18 +4404,27 @@ paths:
           required: false
           schema:
             type: integer
-            minimum: 1
-            maximum: 200
+            format: uint64
+            minimum: 0
+            maximum: 18446744073709551615
             default: 50
-          description: Maximum number of items to return (max 200).
+          description: |
+            Maximum number of items to return. `0` selects the default of 50;
+            values above 200 are accepted and capped at 200. Negative,
+            non-integer, or values beyond the unsigned 64-bit range are
+            rejected with `400`.
         - name: offset
           in: query
           required: false
           schema:
             type: integer
+            format: uint32
             minimum: 0
+            maximum: 4294967295
             default: 0
-          description: Number of items to skip.
+          description: |
+            Number of items to skip. Negative, non-integer, or values above
+            4294967295 are rejected with `400`.
         - name: proxy_id
           in: query
           required: false
@@ -5142,7 +5164,9 @@ components:
       required: false
       schema:
         type: integer
+        format: int64
         minimum: 0
+        maximum: 9223372036854775807
         default: 0
       description: |
         Number of items to skip. Non-integer, negative, or values beyond the
@@ -5156,8 +5180,9 @@ components:
       required: false
       schema:
         type: integer
-        minimum: 1
-        maximum: 1000
+        format: uint64
+        minimum: 0
+        maximum: 18446744073709551615
         default: 100
       description: |
         Maximum number of items to return. When omitted, the server applies the
@@ -5165,6 +5190,7 @@ components:
         (`GET /backup` is the intentional full-export mechanism). `0` is
         coerced to the default of 100, and values above 1000 are capped at
         1000. Non-integer or negative values are rejected with `400`.
+        Values beyond the unsigned 64-bit range are also rejected with `400`.
         List endpoints return a paginated envelope containing `data` and
         `pagination` fields even when this parameter is omitted.
 
@@ -6036,7 +6062,7 @@ components:
 
     AuditEventListResponse:
       type: object
-      required: [items, limit, offset, total]
+      required: [items, limit, offset, next_offset, total]
       properties:
         items:
           type: array
@@ -6044,12 +6070,26 @@ components:
             $ref: "#/components/schemas/AuditEvent"
         limit:
           type: integer
+          format: uint32
+          minimum: 1
+          maximum: 1000
         offset:
           type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
         next_offset:
           type: [integer, "null"]
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
+          description: |
+            Strictly advancing offset for the next page, or `null` when no
+            further page exists or the next offset cannot be represented.
         total:
           type: integer
+          format: int64
+          minimum: 0
 
     # ── Proxy ───────────────────────────────────────────────────────
     Proxy:
@@ -10181,9 +10221,15 @@ components:
       properties:
         offset:
           type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
           description: Number of items skipped
         limit:
           type: integer
+          format: int32
+          minimum: 1
+          maximum: 1000
           description: |
             The page size the server actually applied — not the number of items
             returned. When the request omits `limit` this reports the server
@@ -10191,6 +10237,8 @@ components:
             the capped value of 1000.
         total:
           type: integer
+          format: int64
+          minimum: 0
           description: Total number of items in the collection (before pagination)
 
     # ── Batch ──────────────────────────────────────────────────────────
@@ -19361,6 +19409,7 @@ components:
     ApiSpecListResponse:
       type: object
       description: Paginated response from `GET /api-specs`.
+      required: [items, limit, offset, next_offset, total]
       properties:
         items:
           type: array
@@ -19369,16 +19418,31 @@ components:
           description: Spec summary records for the current page
         limit:
           type: integer
-          description: Maximum items per page (as requested)
+          format: uint32
+          minimum: 1
+          maximum: 200
+          description: Page size applied after defaulting or capping
         offset:
           type: integer
-          description: Number of items skipped (as requested)
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
+          description: Number of items skipped
         next_offset:
           type: [integer, "null"]
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
           description: |
             Offset to use for the next page, or `null` when this is the last
-            page. A non-null value means `items.length == limit`; the actual
-            total item count is not returned to avoid an expensive COUNT query.
+            page or when the next offset cannot be represented. A non-null
+            value is strictly greater than `offset` and equals
+            `offset + items.length` while that value remains below `total`.
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Total number of matching API specs before pagination
 
     ApiSpecCreateResponse:
       type: object

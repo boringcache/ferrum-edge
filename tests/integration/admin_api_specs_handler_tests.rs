@@ -3510,7 +3510,10 @@ async fn list_endpoint_malformed_pagination_returns_400() {
         "/api-specs?offset=-1",
         // Above u32::MAX: this endpoint's offset is a 32-bit value.
         "/api-specs?offset=4294967296",
-        "/api-specs?limit=9223372036854775808",
+        // Percent-encoding the key must not bypass the same narrower ceiling.
+        "/api-specs?%6fffset=4294967296",
+        // One past u64::MAX cannot be represented by the coercion parser.
+        "/api-specs?limit=18446744073709551616",
     ] {
         let (status, body) = client.get_json(query).await;
         assert_eq!(
@@ -3537,6 +3540,12 @@ async fn list_endpoint_limit_zero_and_over_max_are_bounded() {
     let (status, body) = client.get_json("/api-specs?limit=100000").await;
     assert_eq!(status, reqwest::StatusCode::OK, "over-max body: {body}");
     assert_eq!(body["limit"], 200, "over-max limit caps at 200");
+
+    let (status, body) = client
+        .get_json("/api-specs?limit=9223372036854775808")
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "u64 limit body: {body}");
+    assert_eq!(body["limit"], 200, "any representable over-max limit caps");
 }
 
 /// The list summary includes Tier 1 metadata fields but excludes resource_hash.

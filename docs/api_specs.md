@@ -316,9 +316,12 @@ These fields are stored at INSERT time and do not require re-parsing the spec fo
 
 `GET /api-specs` uses a stricter pagination scheme than the other admin list
 endpoints: `limit` defaults to 50 with a maximum of 200 (`0` means the default,
-higher values are capped), and `offset` is a 32-bit value defaulting to 0. As
-everywhere else, malformed or negative `limit`/`offset` values are rejected with
-HTTP 400 rather than coerced to a default.
+higher unsigned 64-bit values are capped), and `offset` is an unsigned 32-bit
+value defaulting to 0. As everywhere else, malformed or negative
+`limit`/`offset` values, limits beyond the unsigned 64-bit range, and offsets
+above `2^32 - 1` are rejected with HTTP 400 rather than coerced to a default.
+Percent-encoded query parameter names are decoded before matching, so encoding
+`limit` or `offset` cannot bypass these bounds.
 
 It supports the following query parameters in addition to `limit` and `offset`:
 
@@ -349,7 +352,7 @@ Unknown `sort_by` or `order` values, SQL `LIKE` wildcards in `spec_version` or
 
 - `items` — page of spec summaries (no `spec_content` or `resource_hash`).
 - `limit` / `offset` — the pagination parameters that were applied.
-- `next_offset` — set to `offset + items.len()` when that value is still below `total`, i.e. when more results remain; `null` on the last page.
+- `next_offset` — set to `offset + items.len()` when that value is strictly greater than `offset`, remains below `total`, and fits in the 32-bit offset range; `null` on the last page or when the next cursor cannot be represented.
 - `total` — count of all rows matching the filter (ignoring `limit`/`offset`). Use this to build "showing 1–50 of 327" pagination UI.
 
 ### Tag-name rules

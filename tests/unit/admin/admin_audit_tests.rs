@@ -5,6 +5,7 @@ use ferrum_edge::admin::audit::{
     AuditActor, AuditEvent, AuditListFilter, create_diff, credential_update_diff, delete_diff,
     update_diff,
 };
+use ferrum_edge::admin::advancing_u32_offset;
 use ferrum_edge::admin::jwt_auth::{AdminClaims, AdminRole};
 use serde_json::json;
 use uuid::Uuid;
@@ -127,4 +128,13 @@ fn test_audit_list_filter_default_is_empty_with_zero_pagination() {
     assert!(filter.end.is_none());
     assert_eq!(filter.limit, 0);
     assert_eq!(filter.offset, 0);
+}
+
+#[test]
+fn audit_next_offset_is_strictly_advancing_and_representable() {
+    assert_eq!(advancing_u32_offset(10, 25, 100), Some(35));
+    assert_eq!(advancing_u32_offset(75, 25, 100), None);
+    assert_eq!(advancing_u32_offset(10, 0, 100), None);
+    assert_eq!(advancing_u32_offset(u32::MAX - 1, 2, i64::MAX), None);
+    assert_eq!(advancing_u32_offset(u32::MAX, 1, i64::MAX), None);
 }

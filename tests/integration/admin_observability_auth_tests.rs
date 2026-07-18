@@ -180,9 +180,9 @@ async fn malformed_pagination_does_not_preempt_the_observability_tier() {
     let (base, _sd) = start_admin(admin_state(MetricsAuthPolicy::default())).await;
     let client = reqwest::Client::new();
 
-    // Pagination is parsed at the top of `handle_admin_request` but resolved
-    // only after the admin JWT gate. Were it resolved eagerly, every one of
-    // these would answer `400` instead of its documented tier response.
+    // Pagination is parsed only by routes that consume it. If observability
+    // routes shared eager validation, every one of these would answer `400`
+    // instead of its documented tier response.
     for query in [
         "limit=abc",
         "offset=-1",

@@ -1335,6 +1335,45 @@ async fn test_list_proxies_offset_beyond_total_returns_empty() {
 }
 
 #[tokio::test]
+async fn test_list_offset_width_is_independent_of_target_pointer_size() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // One past u32::MAX must remain a valid backend-safe offset even on a
+    // 32-bit target. An in-memory collection cannot reach it, so the explicit
+    // policy is an empty page with the requested offset preserved.
+    let (status, body, _) =
+        admin_get(&base_url, "/proxies?offset=4294967296&limit=10", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert_eq!(body["pagination"]["offset"], 4_294_967_296u64);
+    assert_eq!(body["pagination"]["limit"], 10);
+    assert_eq!(body["pagination"]["total"], 5);
+}
+
+#[tokio::test]
+async fn malformed_pagination_is_ignored_by_non_paginated_routes() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/namespaces?limit=abc", &token).await;
+    assert_eq!(status, 200, "namespaces must ignore limit: {body:?}");
+    assert!(body.is_array());
+
+    let (status, body, _) = admin_get(&base_url, "/backup?limit=abc", &token).await;
+    assert_eq!(status, 200, "backup must ignore limit: {body:?}");
+    assert_eq!(body["counts"]["proxies"], 5);
+
+    let (status, body, _) = admin_get(&base_url, "/cluster?offset=-1", &token).await;
+    assert_eq!(status, 200, "cluster must ignore offset: {body:?}");
+    assert_eq!(body["mode"], "test");
+}
+
+#[tokio::test]
 async fn test_list_consumers_with_pagination() {
     let tc = TestConfig::default();
     let state = create_pagination_admin_state(&tc);
@@ -1389,6 +1428,15 @@ async fn test_pagination_limit_clamped_to_max() {
     // Should still return all 5 (since 5 < 1000)
     assert_eq!(body["data"].as_array().unwrap().len(), 5);
     assert_eq!(body["pagination"]["limit"], 1000);
+
+    let (status, body, _) = admin_get(
+        &base_url,
+        "/proxies?limit=18446744073709551615",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["pagination"]["limit"], 1000);
 }
 
 #[tokio::test]
@@ -1403,6 +1451,7 @@ async fn test_malformed_pagination_is_rejected_with_400() {
         "/proxies?limit=-1",
         "/proxies?offset=abc",
         "/proxies?offset=-1",
+        "/proxies?limit=18446744073709551616",
         // i64::MAX + 1: wrapped negative under the old `as i64` cast and became
         // an enormous MongoDB u64 skip.
         "/proxies?offset=9223372036854775808",
