@@ -3538,12 +3538,32 @@ paths:
     delete:
       operationId: deleteProxy
       summary: Delete a proxy
+      description: |
+        Deletes the proxy and its proxy-owned cascade resources. If the proxy is
+        owned by an API spec, the spec row and spec-owned resources are also
+        deleted. When namespace admission is lost after that deletion commits,
+        SQL backends and replica-set MongoDB use the API-spec compensation
+        transaction to restore the stamped spec resources, an orphaned
+        hand-owned upstream, hand-owned cascade plugins, associations, and
+        config-change records together. Before persistence, the namespace
+        snapshot is used only to discover affected IDs; the current upstream
+        and cascade plugins are re-read with ownership metadata intact.
+        Hand-owned rows remain hand-owned, the API-spec snapshot supplies
+        stamped bundle rows, and foreign ownership or an unrestorable ownership
+        shape returns 400 without deleting the proxy. A shared hand-owned
+        upstream that remained live is reused rather than inserted again only
+        when its stable creation identity and ownership match the pre-delete
+        snapshot; a same-ID replacement rejects recovery. The recovered proxy
+        graph's current upstream, plugin-composition, and named-schema
+        dependencies are revalidated before commit with the configured backend
+        egress policy and real-IP header. Standalone MongoDB fails closed before
+        multi-document compensation writes.
       tags: [Proxies]
       responses:
         "204":
           description: Proxy deleted
         "400":
-          description: Deletion would leave an invalid plugin-composition graph, such as a global TCP connection throttle with no supported TCP/TCP+TLS target
+          description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely
           content:
             application/json:
               schema:
@@ -4468,6 +4488,9 @@ paths:
         separately. Plugin `config` values must not contain credential or
         consumer fields (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`,
         `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`).
+        `api_spec_id` is server-managed and must be omitted from
+        `x-ferrum-proxy`, `x-ferrum-upstream`, and `x-ferrum-plugins`; copied
+        ownership tags return a 422 validation response on both POST and PUT.
 
         **Content-Type detection**: `application/json` → JSON parser;
         `application/yaml` / `application/x-yaml` / `text/yaml` / `text/x-yaml` → YAML parser;
@@ -4853,8 +4876,26 @@ paths:
         left with a dangling `schema_ref`, or when the cascade would leave a
         global TCP connection throttle without a supported TCP/TCP+TLS target.
 
+        Ferrum also validates that the complete pre-delete compensation snapshot
+        is owned and shaped so it can be restored atomically. A cascade plugin
+        owned by another API spec, an explicitly associated global plugin, a
+        proxy-scoped association targeting another proxy, a global plugin carrying
+        the deleted proxy ID, a proxy-group plugin carrying `proxy_id`, or an
+        embedded proxy association naming a missing plugin config returns a
+        structured 422 validation failure without deleting anything.
+
+        If namespace admission is lost after deletion commits, SQL backends and
+        replica-set MongoDB compensate in one transaction: the spec-owned and
+        current hand-owned upstream snapshots, proxy, spec-owned and hand-owned
+        cascade plugins, associations, API-spec row, and config-change records
+        are all restored or all remain deleted. The
+        recovered proxy's current upstream, plugin-composition, and named-schema
+        dependencies are revalidated before commit. A standalone MongoDB
+        deployment fails closed before compensation writes because it cannot
+        provide that multi-document atomic boundary.
+
         Returns 204 on success, 404 if the spec does not exist, or 422 when the
-        prospective deletion fails plugin-graph validation.
+        prospective deletion fails plugin-graph or restore-snapshot validation.
 
         This mutation requires the `admin` role.
       tags: [API Specs]
@@ -4881,7 +4922,11 @@ paths:
             Deleting the spec and its cascaded resources would leave an invalid
             aggregate plugin-composition graph in the namespace, such as a dangling
             transaction-log `schema_ref` or a global TCP connection throttle
-            with no supported TCP/TCP+TLS target. No resources are deleted.
+            with no supported TCP/TCP+TLS target, or the pre-delete compensation
+            snapshot contains foreign ownership, an unrestorable plugin scope/proxy
+            association, or an embedded proxy association naming a missing plugin
+            config. The response identifies the offending restore-snapshot
+            resource and validation details. No resources are deleted.
           content:
             application/json:
               schema:
@@ -19260,8 +19305,9 @@ components:
         or database cross-checks (e.g., duplicate `listen_path`, invalid plugin
         config). For DELETE, removing the spec-owned and cascaded resources
         would leave an invalid transaction-log schema graph or TCP-throttle
-        plugin composition. An authoritative in-transaction rejection may omit
-        `spec_version` and the failure `id`.
+        plugin composition, or the compensation snapshot contains an
+        unrestorable resource. An authoritative in-transaction rejection may
+        omit `spec_version` and the failure `id`.
       properties:
         error:
           type: string
@@ -19277,8 +19323,8 @@ components:
             properties:
               resource_type:
                 type: string
-                enum: [proxy, upstream, plugin, plugin_composition, plugin_graph]
-                description: Kind of resource or aggregate plugin composition that failed
+                enum: [proxy, upstream, upstream_graph, plugin, plugin_composition, plugin_graph, restore_snapshot]
+                description: Kind of resource, upstream/plugin graph, or pre-delete restore snapshot that failed
               id:
                 type: string
                 description: ID of the resource (from the extension object)
