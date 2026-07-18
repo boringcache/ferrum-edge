@@ -4016,6 +4016,7 @@ mod inner {
     #[derive(Clone)]
     struct PreparedApiSpecBundleDocs {
         upstream: Option<(String, Document)>,
+        additional_upstreams: Vec<(String, Document)>,
         plugins: Vec<(String, Document)>,
         proxy: (String, Document),
         spec: Document,
@@ -4048,6 +4049,7 @@ mod inner {
 
         Ok(PreparedApiSpecBundleDocs {
             upstream,
+            additional_upstreams: Vec::new(),
             plugins,
             proxy: (bundle.proxy.id.clone(), proxy_doc),
             spec: spec_doc,
@@ -4057,9 +4059,18 @@ mod inner {
     fn prepare_api_spec_restore_docs(
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &ApiSpec,
+        additional_upstreams: &[Upstream],
         additional_plugins: &[PluginConfig],
     ) -> Result<PreparedApiSpecBundleDocs, anyhow::Error> {
         let mut prepared = prepare_api_spec_bundle_docs(bundle, spec)?;
+        prepared
+            .additional_upstreams
+            .reserve(additional_upstreams.len());
+        for upstream in additional_upstreams {
+            prepared
+                .additional_upstreams
+                .push((upstream.id.clone(), upstream_to_doc(upstream)?));
+        }
         prepared.plugins.reserve(additional_plugins.len());
         for plugin in additional_plugins {
             prepared
@@ -4114,6 +4125,8 @@ mod inner {
                 errors.join("; ")
             );
         }
+        crate::config::db_backend::validate_api_spec_recovered_plugin_graph(&recovered_graph)
+            .await?;
         crate::plugin_cache::validate_tcp_connection_throttle_attachments(&candidate).map_err(
             |errors| anyhow::Error::new(TcpConnectionThrottleAttachmentConflict::new(errors)),
         )?;
@@ -8960,7 +8973,13 @@ mod inner {
             bundle: &crate::admin::api_specs::ExtractedBundle,
             spec: &ApiSpec,
         ) -> Result<(), anyhow::Error> {
-            crate::config::db_backend::validate_api_spec_restore_inputs(bundle, spec, &[], false)?;
+            crate::config::db_backend::validate_api_spec_restore_inputs(
+                bundle,
+                spec,
+                &[],
+                &[],
+                false,
+            )?;
             // Pre-flight size check: BSON document limit is 16 MiB.
             // Measure the actual serialized BSON size rather than estimating
             // with a hardcoded overhead constant.
@@ -9202,11 +9221,13 @@ mod inner {
             &self,
             bundle: &crate::admin::api_specs::ExtractedBundle,
             spec: &ApiSpec,
+            additional_upstreams: &[Upstream],
             additional_plugins: &[PluginConfig],
         ) -> Result<(), anyhow::Error> {
             crate::config::db_backend::validate_api_spec_restore_inputs(
                 bundle,
                 spec,
+                additional_upstreams,
                 additional_plugins,
                 true,
             )?;
@@ -9243,11 +9264,22 @@ mod inner {
             Self::run_mtls_dns_mutations(&mut mtls_leases, async {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
-                let prepared_docs =
-                    prepare_api_spec_restore_docs(bundle, spec, additional_plugins)?;
+                let prepared_docs = prepare_api_spec_restore_docs(
+                    bundle,
+                    spec,
+                    additional_upstreams,
+                    additional_plugins,
+                )?;
                 let guard_params = ProxyWriteGuardParams::from_proxy(&bundle.proxy);
                 let mut upsert_changes: Vec<(String, &'static str, String)> = Vec::new();
                 if let Some(upstream) = &bundle.upstream {
+                    upsert_changes.push((
+                        upstream.namespace.clone(),
+                        "upstream",
+                        upstream.id.clone(),
+                    ));
+                }
+                for upstream in additional_upstreams {
                     upsert_changes.push((
                         upstream.namespace.clone(),
                         "upstream",
@@ -9291,6 +9323,12 @@ mod inner {
                         )| {
                             Box::pin(async move {
                                 if let Some((_, doc)) = &prepared_docs.upstream {
+                                    this.upstreams()
+                                        .insert_one(doc.clone())
+                                        .session(&mut *s)
+                                        .await?;
+                                }
+                                for (_, doc) in &prepared_docs.additional_upstreams {
                                     this.upstreams()
                                         .insert_one(doc.clone())
                                         .session(&mut *s)

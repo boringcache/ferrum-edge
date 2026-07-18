@@ -496,8 +496,13 @@ async fn compensate_late_api_spec_delete(
             anyhow::bail!("late API-spec delete compensation validation returned an HTTP response")
         }
     }
-    db.restore_api_spec_bundle(&previous_bundle, &previous_spec, &additional_plugins)
-        .await?;
+    db.restore_api_spec_bundle(
+        &previous_bundle,
+        &previous_spec,
+        &[],
+        &additional_plugins,
+    )
+    .await?;
     Ok(ApiSpecLateWriteRecovery::NotRetained)
 }
 

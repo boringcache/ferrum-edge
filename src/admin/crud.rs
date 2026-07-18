@@ -3817,14 +3817,14 @@ impl AdminResource for Proxy {
                         .find(|upstream| upstream.api_spec_id.as_deref() == Some(spec.id.as_str()))
                 })
                 .cloned();
-            for upstream in &affected_upstreams {
-                if bundle_upstream.as_ref().map(|item| item.id.as_str())
-                    != Some(upstream.id.as_str())
-                    && db.get_upstream(namespace, &upstream.id).await?.is_none()
-                {
-                    db.create_upstream(upstream).await?;
-                }
-            }
+            let additional_upstreams = affected_upstreams
+                .iter()
+                .filter(|upstream| {
+                    bundle_upstream.as_ref().map(|item| item.id.as_str())
+                        != Some(upstream.id.as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             let additional_plugins = affected_plugins
                 .iter()
                 .filter(|plugin| !spec_plugin_ids.contains(plugin.id.as_str()))
@@ -3835,8 +3835,13 @@ impl AdminResource for Proxy {
                 upstream: bundle_upstream,
                 plugins: spec_plugins,
             };
-            db.restore_api_spec_bundle(&bundle, spec, &additional_plugins)
-                .await?;
+            db.restore_api_spec_bundle(
+                &bundle,
+                spec,
+                &additional_upstreams,
+                &additional_plugins,
+            )
+            .await?;
             return Ok(());
         }
 

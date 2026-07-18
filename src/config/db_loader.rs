@@ -1177,6 +1177,8 @@ impl DatabaseStore {
             "restore_api_spec_bundle",
             &recovered_graph,
         )?;
+        crate::config::db_backend::validate_api_spec_recovered_plugin_graph(&recovered_graph)
+            .await?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
             .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
@@ -6440,7 +6442,7 @@ impl DatabaseStore {
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &crate::config::types::ApiSpec,
     ) -> Result<(), anyhow::Error> {
-        self.restore_api_spec_bundle_inner(bundle, spec, &[], false)
+        self.restore_api_spec_bundle_inner(bundle, spec, &[], &[], false)
             .await
     }
 
@@ -6448,16 +6450,24 @@ impl DatabaseStore {
         &self,
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &crate::config::types::ApiSpec,
+        additional_upstreams: &[crate::config::types::Upstream],
         additional_plugins: &[crate::config::types::PluginConfig],
     ) -> Result<(), anyhow::Error> {
-        self.restore_api_spec_bundle_inner(bundle, spec, additional_plugins, true)
-            .await
+        self.restore_api_spec_bundle_inner(
+            bundle,
+            spec,
+            additional_upstreams,
+            additional_plugins,
+            true,
+        )
+        .await
     }
 
     async fn restore_api_spec_bundle_inner(
         &self,
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &crate::config::types::ApiSpec,
+        additional_upstreams: &[crate::config::types::Upstream],
         additional_plugins: &[crate::config::types::PluginConfig],
         compensation_restore: bool,
     ) -> Result<(), anyhow::Error> {
@@ -6466,6 +6476,7 @@ impl DatabaseStore {
         crate::config::db_backend::validate_api_spec_restore_inputs(
             bundle,
             spec,
+            additional_upstreams,
             additional_plugins,
             compensation_restore,
         )?;
@@ -6475,7 +6486,16 @@ impl DatabaseStore {
             .await?;
 
         // 1. INSERT upstream (if present), tagged with api_spec_id.
-        if let Some(u) = &bundle.upstream {
+        for (u, api_spec_id) in bundle
+            .upstream
+            .iter()
+            .map(|upstream| (upstream, Some(spec.id.as_str())))
+            .chain(
+                additional_upstreams
+                    .iter()
+                    .map(|upstream| (upstream, upstream.api_spec_id.as_deref())),
+            )
+        {
             let targets_json = serde_json::to_string(&u.targets)?;
             let algo_json = serde_json::to_string(&u.algorithm)?;
             let algo_str = algo_json.trim_matches('"');
@@ -6520,7 +6540,7 @@ impl DatabaseStore {
             .bind(&u.backend_tls_server_ca_cert_path)
             .bind(&u.backend_tls_sni)
             .bind(&backend_tls_san_allow_list_json)
-            .bind(&spec.id)
+            .bind(api_spec_id)
             .bind(u.created_at.to_rfc3339())
             .bind(u.updated_at.to_rfc3339())
             .execute(&mut *tx)
@@ -6720,7 +6740,7 @@ impl DatabaseStore {
             self.validate_namespace_admission_tx(&mut tx, &spec.namespace)
                 .await?;
         }
-        if let Some(u) = &bundle.upstream {
+        for u in bundle.upstream.iter().chain(additional_upstreams) {
             self.record_config_change_tx(&mut tx, &u.namespace, "upstream", &u.id, "upsert")
                 .await?;
         }
@@ -8573,9 +8593,17 @@ impl DatabaseBackend for DatabaseStore {
         &self,
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &crate::config::types::ApiSpec,
+        additional_upstreams: &[crate::config::types::Upstream],
         additional_plugins: &[crate::config::types::PluginConfig],
     ) -> Result<(), anyhow::Error> {
-        DatabaseStore::restore_api_spec_bundle(self, bundle, spec, additional_plugins).await
+        DatabaseStore::restore_api_spec_bundle(
+            self,
+            bundle,
+            spec,
+            additional_upstreams,
+            additional_plugins,
+        )
+        .await
     }
 
     async fn replace_api_spec_bundle(

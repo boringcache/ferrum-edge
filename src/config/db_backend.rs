@@ -72,17 +72,48 @@ pub(crate) fn api_spec_recovered_proxy_graph(
     Ok(candidate)
 }
 
+/// Re-run the plugin composition and named-schema contracts against the exact
+/// recovered proxy graph. Compensation can follow an intervening writer, so
+/// the pre-delete admission result is no longer authoritative when the restore
+/// transaction commits.
+pub(crate) async fn validate_api_spec_recovered_plugin_graph(
+    candidate: &GatewayConfig,
+) -> Result<(), anyhow::Error> {
+    let candidate = candidate.clone();
+    let http_client = crate::plugins::PluginHttpClient::default()
+        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header());
+    tokio::task::spawn_blocking(move || {
+        crate::plugin_cache::validate_plugin_composition_candidate(&candidate, &http_client)
+            .map_err(anyhow::Error::msg)?;
+        crate::plugins::transaction_log_schema::validate_config_graph(
+            &candidate,
+            &http_client,
+            true,
+        )
+        .map_err(|errors| {
+            anyhow::anyhow!(
+                "API-spec restore produced an invalid transaction-log schema graph: {}",
+                errors.join("; ")
+            )
+        })
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("API-spec restore graph validation task failed: {error}"))?
+}
+
 /// Validate the immutable identity and ownership boundaries of an API-spec
 /// bundle before a backend starts an atomic restore.
 ///
 /// A restore deliberately uses plain inserts rather than upserts. These checks
 /// make that contract explicit: normal submissions must be unstamped, while
-/// compensation resources must be stamped with this spec and compensating
-/// plugins must remain hand-owned. Existing rows are left for the backend's
-/// uniqueness constraints and transaction-candidate validation to reject.
+/// compensation resources must be stamped with this spec, while compensating
+/// upstreams and plugins preserve their exact ownership. Existing rows are left
+/// for the backend's uniqueness constraints and transaction-candidate
+/// validation to reject.
 pub(crate) fn validate_api_spec_restore_inputs(
     bundle: &crate::admin::api_specs::ExtractedBundle,
     spec: &ApiSpec,
+    additional_upstreams: &[Upstream],
     additional_plugins: &[PluginConfig],
     compensation_restore: bool,
 ) -> Result<(), anyhow::Error> {
@@ -141,6 +172,43 @@ pub(crate) fn validate_api_spec_restore_inputs(
                 upstream.id
             ),
             (Some(_), true) | (None, false) => {}
+        }
+    }
+
+    let mut inserted_upstream_ids = HashSet::with_capacity(
+        bundle
+            .upstream
+            .iter()
+            .count()
+            .saturating_add(additional_upstreams.len()),
+    );
+    if let Some(upstream) = &bundle.upstream {
+        inserted_upstream_ids.insert(upstream.id.as_str());
+    }
+    for upstream in additional_upstreams {
+        if upstream.namespace != spec.namespace {
+            anyhow::bail!(
+                "API-spec restore additional upstream '{}' belongs to namespace '{}', not '{}'",
+                upstream.id,
+                upstream.namespace,
+                spec.namespace
+            );
+        }
+        if upstream
+            .api_spec_id
+            .as_deref()
+            .is_some_and(|owner| owner != spec.id.as_str())
+        {
+            anyhow::bail!(
+                "API-spec restore additional upstream '{}' is owned by a different API spec",
+                upstream.id
+            );
+        }
+        if !inserted_upstream_ids.insert(upstream.id.as_str()) {
+            anyhow::bail!(
+                "API-spec restore contains overlapping upstream id '{}'",
+                upstream.id
+            );
         }
     }
 
@@ -1246,8 +1314,8 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         spec: &ApiSpec,
     ) -> Result<(), anyhow::Error>;
 
-    /// Atomically restore a deleted API spec together with non-spec-owned plugins
-    /// that were removed by the proxy delete cascade.
+    /// Atomically restore a deleted API spec together with upstreams and
+    /// non-spec-owned plugins that were removed by the proxy delete cascade.
     ///
     /// SQL backends and replica-set MongoDB implement this transactionally for
     /// database and control-plane modes. A backend/topology without a
@@ -1257,6 +1325,7 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         &self,
         bundle: &crate::admin::api_specs::ExtractedBundle,
         spec: &ApiSpec,
+        additional_upstreams: &[Upstream],
         additional_plugins: &[PluginConfig],
     ) -> Result<(), anyhow::Error>;
 

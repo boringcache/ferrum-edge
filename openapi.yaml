@@ -3543,9 +3543,12 @@ paths:
         owned by an API spec, the spec row and spec-owned resources are also
         deleted. When namespace admission is lost after that deletion commits,
         SQL backends and replica-set MongoDB use the API-spec compensation
-        transaction to restore the stamped spec resources, hand-owned cascade
-        plugins, associations, and config-change records together. Standalone
-        MongoDB fails closed before multi-document compensation writes.
+        transaction to restore the stamped spec resources, an orphaned
+        hand-owned upstream, hand-owned cascade plugins, associations, and
+        config-change records together. The recovered proxy graph's current
+        upstream, plugin-composition, and named-schema dependencies are
+        revalidated before commit. Standalone MongoDB fails closed before
+        multi-document compensation writes.
       tags: [Proxies]
       responses:
         "204":
@@ -4875,9 +4878,11 @@ paths:
         If namespace admission is lost after deletion commits, SQL backends and
         replica-set MongoDB compensate in one transaction: the upstream, proxy,
         spec-owned and hand-owned cascade plugins, associations, API-spec row,
-        and config-change records are all restored or all remain deleted. A
-        standalone MongoDB deployment fails closed before compensation writes
-        because it cannot provide that multi-document atomic boundary.
+        and config-change records are all restored or all remain deleted. The
+        recovered proxy's current upstream, plugin-composition, and named-schema
+        dependencies are revalidated before commit. A standalone MongoDB
+        deployment fails closed before compensation writes because it cannot
+        provide that multi-document atomic boundary.
 
         Returns 204 on success, 404 if the spec does not exist, or 422 when the
         prospective deletion fails plugin-graph or restore-snapshot validation.
