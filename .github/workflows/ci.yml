@@ -84,8 +84,14 @@ jobs:
               echo "::error::trusted base branch has no PR CI planner" >&2
               exit 1
             fi
-            trusted_planner="$RUNNER_TEMP/pr-ci-plan-self-test.py"
+            trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"
+            trusted_planner="$trusted_dir/pr_ci_plan.py"
+            trusted_live_filter="$trusted_dir/live_suite_path_filter.py"
+            mkdir -p "$trusted_dir"
             git show "${base_ref}:${planner}" > "$trusted_planner"
+            git show \
+              "${base_ref}:.github/scripts/live_suite_path_filter.py" \
+              > "$trusted_live_filter"
             planner="$trusted_planner"
           fi
           python3 "$planner" --self-test

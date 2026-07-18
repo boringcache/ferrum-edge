@@ -400,7 +400,8 @@ For this bootstrap PR, where the base has no verifier yet, it only syntax-
 compiles the proposed file as inert data; main pushes execute the newly trusted
 verifier and its hosted self-tests. This policy step runs before every other
 repository Python entry point in the plan job, and the subsequent planner
-self-test is also extracted from the base branch on pull requests.
+self-test and its imported live-suite path filter are also extracted from the
+base branch on pull requests.
 
 #### 8. Latest Release and Docker Jobs
 
