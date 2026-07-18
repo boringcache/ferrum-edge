@@ -2479,8 +2479,20 @@ async fn direct_proxy_delete_rejects_foreign_owned_cascade_plugin_without_retagg
     assert!(error.contains(&plugin_id));
     assert!(error.contains(&spec_id));
     assert!(error.contains(&foreign_spec_id));
-    assert!(store.get_api_spec("ferrum", &spec_id).await.unwrap().is_some());
-    assert!(store.get_proxy("ferrum", &proxy_id).await.unwrap().is_some());
+    assert!(
+        store
+            .get_api_spec("ferrum", &spec_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_proxy("ferrum", &proxy_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
     let preserved_plugin = store
         .get_plugin_config("ferrum", &plugin_id)
         .await
@@ -2558,8 +2570,20 @@ async fn direct_proxy_delete_rejects_foreign_upstream_then_allows_hand_owned_gra
     assert!(error.contains(&upstream_id));
     assert!(error.contains(&spec_id));
     assert!(error.contains(&foreign_spec_id));
-    assert!(store.get_api_spec("ferrum", &spec_id).await.unwrap().is_some());
-    assert!(store.get_proxy("ferrum", &proxy_id).await.unwrap().is_some());
+    assert!(
+        store
+            .get_api_spec("ferrum", &spec_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_proxy("ferrum", &proxy_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     sqlx::query("UPDATE upstreams SET api_spec_id = NULL WHERE namespace = ? AND id = ?")
         .bind("ferrum")
@@ -2574,8 +2598,20 @@ async fn direct_proxy_delete_rejects_foreign_upstream_then_allows_hand_owned_gra
         reqwest::StatusCode::NO_CONTENT,
         "legitimate hand-owned upstream and plugin must pass direct delete preflight: {delete_body}"
     );
-    assert!(store.get_api_spec("ferrum", &spec_id).await.unwrap().is_none());
-    assert!(store.get_proxy("ferrum", &proxy_id).await.unwrap().is_none());
+    assert!(
+        store
+            .get_api_spec("ferrum", &spec_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_proxy("ferrum", &proxy_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let preserved_upstream = store
         .get_upstream("ferrum", &upstream_id)
         .await

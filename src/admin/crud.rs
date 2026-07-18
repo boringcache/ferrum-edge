@@ -4052,14 +4052,11 @@ impl AdminResource for Proxy {
             additional_plugins.push(plugin);
         }
 
-        let additional_plugin_id_set: HashSet<&str> = additional_plugin_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let additional_plugin_id_set: HashSet<&str> =
+            additional_plugin_ids.iter().map(String::as_str).collect();
         for association in &previous.plugins {
             let plugin_id = association.plugin_config_id.as_str();
-            if owned_plugin_ids.contains(plugin_id)
-                || additional_plugin_id_set.contains(plugin_id)
+            if owned_plugin_ids.contains(plugin_id) || additional_plugin_id_set.contains(plugin_id)
             {
                 continue;
             }
