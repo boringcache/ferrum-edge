@@ -3312,28 +3312,37 @@ def opaque_word_starts_command(
     line: str,
     start: int,
     *,
-    standalone_command: bool,
+    shell_evaluated: bool,
 ) -> bool:
     """Return whether an opaque word occupies a slot a shell dispatches.
 
-    Substituting a whole command is only sound where a whole command would run.
-    An explicit executable slot — `run:`, a statement separator, `$(`, a
-    conditional keyword — says so on the line itself. A bare line start says so
-    only when the line is shell the runner evaluates rather than block-scalar
-    prose or heredoc data.
+    Substituting a whole command is only sound where a whole command would run,
+    which takes both a line a shell evaluates and a slot on it. Block-scalar
+    prose and heredoc bodies are never evaluated, so no slot on them counts:
+    ``out_lines.append(f"**Runner:** `${{ inputs.runner }}`")`` inside a
+    `python3 <<'PYEOF'` body is Python string formatting whose backticks are
+    Markdown. On a line a shell does evaluate, an explicit executable slot —
+    `run:`, a statement separator, `$(`, a backtick, a conditional keyword —
+    counts, and so does a bare line start.
+
+    A backslash-escaped backtick is literal text rather than a substitution, so
+    ``echo "- Test: \\`${{ matrix.test }}\\`"`` writes Markdown in a real `run:`
+    block and opens no slot.
     """
 
-    prefix = line[:start]
+    if not shell_evaluated:
+        return False
+    prefix = line[:start].replace("\\`", "").replace("\\$", "")
     if EXPLICIT_COMMAND_WORD_PREFIX.search(prefix):
         return True
-    return standalone_command and not prefix.strip()
+    return not prefix.strip()
 
 
 def opaque_executable_variants(
     line: str,
     spans: tuple[tuple[int, int], ...],
     *,
-    standalone_command: bool = True,
+    shell_evaluated: bool = True,
 ) -> tuple[str, ...]:
     """Substitute Cross into every opaque word that could hold the executable."""
 
@@ -3368,7 +3377,7 @@ def opaque_executable_variants(
             if opaque_word_starts_command(
                 line,
                 start,
-                standalone_command=standalone_command,
+                shell_evaluated=shell_evaluated,
             ):
                 whole_command = line[:start] + WHOLE_CROSS_COMMAND + line[end:]
                 if has_cross_command_context(whole_command):
@@ -3379,21 +3388,21 @@ def opaque_executable_variants(
 def opaque_command_completion_variants(
     line: str,
     *,
-    standalone_command: bool = True,
+    shell_evaluated: bool = True,
 ) -> tuple[str, ...]:
     """Expose opaque substitutions that can complete a literal Cross token."""
 
     return opaque_executable_variants(
         line,
         command_substitution_spans(line),
-        standalone_command=standalone_command,
+        shell_evaluated=shell_evaluated,
     )
 
 
 def opaque_github_expression_variants(
     line: str,
     *,
-    standalone_command: bool = True,
+    shell_evaluated: bool = True,
 ) -> tuple[str, ...]:
     """Fail closed when a dynamic expression occupies a Cross command slot."""
 
@@ -3414,14 +3423,14 @@ def opaque_github_expression_variants(
     return opaque_executable_variants(
         line,
         tuple(dynamic_spans),
-        standalone_command=standalone_command,
+        shell_evaluated=shell_evaluated,
     )
 
 
 def opaque_shell_interpolation_variants(
     line: str,
     *,
-    standalone_command: bool = True,
+    shell_evaluated: bool = True,
 ) -> tuple[str, ...]:
     """Expose a shell interpolation that can occupy a Cross executable word."""
 
@@ -3434,7 +3443,7 @@ def opaque_shell_interpolation_variants(
     return opaque_executable_variants(
         line,
         spans,
-        standalone_command=standalone_command,
+        shell_evaluated=shell_evaluated,
     )
 
 
@@ -3565,7 +3574,7 @@ def scan_variants(
     line: str,
     *,
     include_opaque_shell_executable: bool = False,
-    standalone_command: bool = True,
+    shell_evaluated: bool = True,
 ) -> tuple[str, ...]:
     """Expose ordinary YAML/shell quoting variants to the lexical boundary."""
 
@@ -3573,20 +3582,20 @@ def scan_variants(
     variants.extend(
         opaque_command_completion_variants(
             line,
-            standalone_command=standalone_command,
+            shell_evaluated=shell_evaluated,
         )
     )
     variants.extend(
         opaque_github_expression_variants(
             line,
-            standalone_command=standalone_command,
+            shell_evaluated=shell_evaluated,
         )
     )
     if include_opaque_shell_executable:
         variants.extend(
             opaque_shell_interpolation_variants(
                 line,
-                standalone_command=standalone_command,
+                shell_evaluated=shell_evaluated,
             )
         )
     variants.extend(ansi_c_quoted_variants(line))
@@ -3686,7 +3695,7 @@ def literal_command_text_has_cross(
         has_cross_command_context(variant)
         or (not executable_only and CROSS_ENVIRONMENT.search(variant))
         for index, line in enumerate(logical_text.splitlines())
-        for variant in scan_variants(line, standalone_command=index in evaluated)
+        for variant in scan_variants(line, shell_evaluated=index in evaluated)
     )
 
 
@@ -3941,11 +3950,11 @@ def contains_cross_surface(
                 include_opaque_shell_executable=include_opaque_shell_executable,
             )
             or CROSS_ENVIRONMENT.search(variant)
-            for line, standalone_command in logical_scan_lines(logical_contents)
+            for line, shell_evaluated in logical_scan_lines(logical_contents)
             for variant in scan_variants(
                 line,
                 include_opaque_shell_executable=include_opaque_shell_executable,
-                standalone_command=standalone_command,
+                shell_evaluated=shell_evaluated,
             )
         )
 
@@ -3966,14 +3975,14 @@ def cross_surface_line_report(
     # Alias and shim expansions follow the source lines and are synthesized
     # rather than located, so they are reported without a line number.
     source_line_count = len(logical_contents.splitlines())
-    for number, (line, standalone_command) in enumerate(
+    for number, (line, shell_evaluated) in enumerate(
         logical_scan_lines(logical_contents),
         start=1,
     ):
         for variant in scan_variants(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
-            standalone_command=standalone_command,
+            shell_evaluated=shell_evaluated,
         ):
             if has_cross_command_context(
                 variant,
@@ -4601,8 +4610,14 @@ def unprotected_cross_surfaces(
     *,
     required_job: bool,
     include_opaque_shell_executable: bool = False,
+    reasons: dict[str, str] | None = None,
 ) -> tuple[tuple[str, ...], list[str]]:
-    """Return Cross executable/config tokens outside the isolated trusted job."""
+    """Return Cross executable/config tokens outside the isolated trusted job.
+
+    A surface string is a contract value compared across revisions, so it stays
+    exactly as it is. `reasons`, when given, collects the text behind each
+    sensitive job for the rejection message alone.
+    """
 
     block, failures = extract_job_block(
         contents,
@@ -4651,6 +4666,9 @@ def unprotected_cross_surfaces(
     line_jobs: list[str | None] = [None] * len(lines)
     job_digests: dict[str, str] = {}
     sensitive_jobs: set[str] = set()
+    # Why each job was read as Cross-sensitive, so a digest-level rejection can
+    # name the text it came from instead of only the job.
+    job_reasons: dict[str, str] = {} if reasons is None else reasons
     for position, (start, name) in enumerate(job_starts):
         end = job_starts[position + 1][0] if position + 1 < len(job_starts) else jobs_end
         for index in range(start, end):
@@ -4667,15 +4685,16 @@ def unprotected_cross_surfaces(
             OPAQUE_ARM_CROSS_EXECUTION.search(logical_contents)
         ):
             sensitive_jobs.add(name)
+            job_reasons[name] = "opaque inline shell"
             continue
         with shell_argv_dispatch_scope(logical_contents):
-            for logical_line, standalone_command in logical_scan_lines(
+            for logical_line, shell_evaluated in logical_scan_lines(
                 logical_contents
             ):
                 for variant in scan_variants(
                     logical_line,
                     include_opaque_shell_executable=include_opaque_shell_executable,
-                    standalone_command=standalone_command,
+                    shell_evaluated=shell_evaluated,
                 ):
                     if has_cross_command_context(
                         variant,
@@ -4684,6 +4703,7 @@ def unprotected_cross_surfaces(
                         ),
                     ) or CROSS_ENVIRONMENT.search(variant):
                         sensitive_jobs.add(name)
+                        job_reasons[name] = repr(logical_line.strip()[:160])
                         break
                 if name in sensitive_jobs:
                     break
@@ -4707,7 +4727,7 @@ def unprotected_cross_surfaces(
         for variant in scan_variants(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
-            standalone_command=index in evaluated_lines,
+            shell_evaluated=index in evaluated_lines,
         ):
             normalized = re.sub(r"\s+", " ", variant).strip()
             if has_cross_command_context(
@@ -4724,6 +4744,10 @@ def unprotected_cross_surfaces(
             top_level_surfaces.extend(sorted(line_surfaces))
         else:
             sensitive_jobs.add(job_name_for_line)
+            job_reasons.setdefault(
+                job_name_for_line,
+                ", ".join(sorted(line_surfaces))[:160],
+            )
 
     job_surfaces = [
         f"job:{name}:{job_digests[name]}"
@@ -4805,9 +4829,16 @@ def validate_workflow_collection(
         )
         errors.extend(failures)
         if surfaces:
+            located = cross_surface_line_report(contents)
+            if not located:
+                # The file was rejected by a whole-file signal — a remote
+                # action or a resolved run program — rather than by a line.
+                located = " (" + ", ".join(
+                    surface[:160] for surface in surfaces[:3]
+                ) + ")"
             errors.append(
                 f"{source}/{name} contains an unprotected Cross executable or "
-                "configuration input" + cross_surface_line_report(contents)
+                "configuration input" + located
             )
     return errors
 
@@ -4883,13 +4914,13 @@ def generic_action_cross_surfaces(
                     include_opaque_shell_executable=include_opaque_shell_executable,
                 )
                 or CROSS_ENVIRONMENT.search(variant)
-                for line, standalone_command in logical_scan_lines(
+                for line, shell_evaluated in logical_scan_lines(
                     logical_contents
                 )
                 for variant in scan_variants(
                     line,
                     include_opaque_shell_executable=include_opaque_shell_executable,
-                    standalone_command=standalone_command,
+                    shell_evaluated=shell_evaluated,
                 )
             )
         )
@@ -4906,11 +4937,11 @@ def contains_literal_executable_cross(contents: str) -> bool:
     with shell_argv_dispatch_scope(logical_contents):
         return any(
             has_cross_command_context(variant) or CROSS_ENVIRONMENT.search(variant)
-            for line, standalone_command in logical_scan_lines(logical_contents)
+            for line, shell_evaluated in logical_scan_lines(logical_contents)
             for variant in scan_variants(
                 line,
                 include_opaque_shell_executable=False,
-                standalone_command=standalone_command,
+                shell_evaluated=shell_evaluated,
             )
         )
 
@@ -6988,18 +7019,28 @@ def validate_workflow_contract(
                 f"got {actual_trigger})"
             )
 
+    surface_reasons: dict[str, str] = {}
     surfaces, surface_failures = unprotected_cross_surfaces(
         contents,
         source,
         job_name,
         required_job=True,
         include_opaque_shell_executable=False,
+        reasons=surface_reasons,
     )
     errors.extend(surface_failures)
     if surfaces:
-        # Name the surfaces themselves: a bare rejection leaves the author to
-        # rediscover which line the scan matched.
-        listed = ", ".join(surface[:160] for surface in surfaces[:3])
+        # Name what was matched: a bare rejection leaves the author to
+        # rediscover which job and which line the scan read.
+        listed = ", ".join(
+            (
+                f"{surface.split(':')[1]}: {surface_reasons[surface.split(':')[1]]}"
+                if surface.startswith("job:")
+                and surface.split(":")[1] in surface_reasons
+                else surface[:160]
+            )
+            for surface in surfaces[:3]
+        )
         errors.append(
             f"{source} contains Cross executable or configuration input outside "
             f"protected job {job_name!r} ({listed})"
@@ -9209,6 +9250,50 @@ pre_build = []
         "substitution alone after a heredoc terminator",
         "cat <<EOF > config.yaml\nkey: value\nEOF\n$(plan)",
     )
+
+    # Markdown in a report is not a command slot. A backtick inside a heredoc
+    # body is data, and an escaped backtick is literal text even in a real
+    # `run:` block, so neither may stand in for a whole command.
+    markdown_workflow = (
+        "name: Report\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  report:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          BODY\n"
+    )
+    benign_markdown_bodies = {
+        "escaped backticks around an expression": (
+            'echo "- Test: \\`${{ matrix.test }}\\`"'
+        ),
+        "backticks around an expression in a heredoc body": (
+            "python3 - <<'PYEOF'\n"
+            '          out.append(f"**Runner:** `${{ inputs.runner }}`")\n'
+            "          PYEOF"
+        ),
+    }
+    for label, body in benign_markdown_bodies.items():
+        surfaces, errors = generic_workflow_cross_surfaces(
+            markdown_workflow.replace("BODY", body),
+            "self-test markdown workflow",
+            include_opaque_shell_executable=True,
+        )
+        if surfaces or errors:
+            failures.append(f"{label} was rejected")
+
+    # An unescaped backtick in evaluated shell is a real substitution and still
+    # fails closed, so the Markdown allowance must not reach it.
+    backtick_surfaces, backtick_errors = generic_workflow_cross_surfaces(
+        markdown_workflow.replace("BODY", "echo `${{ inputs.cmd }}`"),
+        "self-test markdown workflow",
+        include_opaque_shell_executable=True,
+    )
+    if not backtick_surfaces and not backtick_errors:
+        failures.append(
+            "backtick substitution holding a whole command was not protected"
+        )
     shell_automation_escapes(
         "env with a separate option operand",
         f"env -u FOO cross {arm_target}",
@@ -10399,11 +10484,11 @@ pre_build = []
             logical_benign = re.sub(r"\\\r?\n[ \t]*", "", benign_contents)
             matching_variants = [
                 variant
-                for line, standalone_command in logical_scan_lines(logical_benign)
+                for line, shell_evaluated in logical_scan_lines(logical_benign)
                 for variant in scan_variants(
                     line,
                     include_opaque_shell_executable=True,
-                    standalone_command=standalone_command,
+                    shell_evaluated=shell_evaluated,
                 )
                 if has_cross_command_context(
                     variant,

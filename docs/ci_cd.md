@@ -420,16 +420,20 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   `run: $CMD`, and `run: $(plan)` all fail closed even though no literal
   `build --target` text is left on the line; an expression that is an argument
   to a named command, or that is only data, does not occupy a command word and
-  stays editable. Substituting a whole command needs a slot that dispatches
-  one. An explicit executable slot on the line — `run:`, a statement separator,
-  `$(`, a conditional keyword — always counts; a bare line start counts only
-  where a shell evaluates the line, because a raw line scan also reads a
-  workflow's non-`run` block scalars and a script's heredoc bodies. An
-  expression standing alone inside a `prompt: |` block or a `cat <<EOF`
-  configuration body is data the runner never dispatches, while the same
-  expression alone on its own line inside a `run: |` block is a command and
-  still fails closed. An executable heredoc is unaffected either way: it is
-  extracted and rescanned as its own program.
+  stays editable. Substituting a whole command needs both a line a shell
+  evaluates and a slot on it. A raw line scan also reads a workflow's non-`run`
+  block scalars and a script's heredoc bodies, and those are never evaluated, so
+  no slot on them counts: an expression inside a `prompt: |` block, a `cat <<EOF`
+  configuration body, or a `python3 <<'PYEOF'` body is data the runner never
+  dispatches, backticks there being Markdown rather than substitutions. On a line
+  a shell does evaluate, an explicit executable slot — `run:`, a statement
+  separator, `$(`, a backtick, a conditional keyword — counts, and so does a bare
+  line start, so the same expression alone on its own line inside a `run: |`
+  block still fails closed. A backslash-escaped backtick is literal text and
+  opens no slot, so ``echo "- Test: \`${{ matrix.test }}\`"`` writes Markdown in a
+  real `run:` block and stays editable. An executable heredoc is unaffected
+  throughout: it is extracted and rescanned as its own program, where its lines
+  are command lines again.
   Binding Cross to another executable name is itself a Cross surface: linking,
   copying, moving, or installing the Cross binary under a new name, and writing
   a wrapper script whose body runs Cross, are all detected, and every later
