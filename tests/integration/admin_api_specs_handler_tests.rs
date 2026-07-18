@@ -2185,7 +2185,7 @@ async fn api_spec_delete_rejects_owned_global_with_proxy_id_before_persistence()
         &proxy_id,
         "backend.internal",
         &plugin_id,
-        "request_body_transformer",
+        "request_transformer",
         request_body_transformer_config(),
     );
 
