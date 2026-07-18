@@ -267,6 +267,42 @@ impl TestGateway {
         }
         Ok(combined)
     }
+
+    /// Poll [`read_combined_captured_output`](Self::read_combined_captured_output)
+    /// until `predicate` matches, then return that snapshot. On timeout (or a
+    /// persistent read error) the last result is returned so the caller can
+    /// assert on it and print the output it actually saw.
+    ///
+    /// The gateway logs through an async `NonBlockingSink`, so a line the child
+    /// has already emitted may not have reached the capture file yet — a
+    /// readiness or exit barrier does not imply the log worker drained. Polling
+    /// is strictly safer than a one-shot read: it can only turn a flush-race
+    /// miss into a hit, never a hit into a miss. If the line is never emitted,
+    /// the predicate stays false and the caller fails exactly as before.
+    ///
+    /// Requires [`TestGatewayBuilder::capture_output`]; without it both capture
+    /// files are absent, the snapshot is always empty, and the predicate never
+    /// matches.
+    pub async fn wait_for_captured_output<F>(
+        &self,
+        predicate: F,
+        timeout: Duration,
+    ) -> Result<String, std::io::Error>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let snapshot = self.read_combined_captured_output();
+            let matched = snapshot
+                .as_ref()
+                .is_ok_and(|output| predicate(output.as_str()));
+            if matched || Instant::now() >= deadline {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 impl Drop for TestGateway {

@@ -29,8 +29,9 @@
 //!   suffixes, any of which would silently replace the deliberately missing
 //!   paths these tests configure.
 //! - **File-backed log capture** (`capture_output`): no pipe buffer to
-//!   deadlock and no detached drainer thread that could be racing the child's
-//!   final log line when an assertion reads the output.
+//!   deadlock and no detached drainer thread on the test side. The child's own
+//!   async log sink is still asynchronous, so the positive test waits for its
+//!   marker through `wait_for_captured_output` rather than reading once.
 //! - **Bounded retry** with fresh ports and a fresh temp dir/DB per attempt,
 //!   and `Drop` cleanup of the child.
 //!
@@ -44,6 +45,11 @@ use tempfile::TempDir;
 /// Budget for "CP reaches full readiness" and for "CP aborts startup". Both
 /// are seconds-scale locally; the headroom is for loaded CI runners.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Budget for the gateway's async log worker to drain an already-emitted line
+/// into the capture file. Sub-millisecond in practice; the headroom is for
+/// loaded CI runners.
+const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Substring proving the gateway touched the admin TLS material in *either*
 /// direction: the failure log ("Failed to load admin TLS configuration" /
@@ -148,19 +154,29 @@ async fn functional_admin_https_disabled_port_zero_ignores_unloadable_tls() {
         "CP exited after reporting ready with FERRUM_ADMIN_HTTPS_PORT=0"
     );
 
-    // Read after `ready`: everything the admin HTTPS branch could log happens
-    // strictly before the readiness store, so this is not a race with a
-    // still-running child.
+    // The admin HTTPS branch runs strictly before the readiness store, but the
+    // gateway logs through an async `NonBlockingSink`: `ready` can be observed
+    // before the log worker drains that line into the capture file. Poll for
+    // the marker instead of reading once. Polling cannot weaken the assertion —
+    // if the port-0 branch never ran, the marker never appears and this fails
+    // at the deadline exactly as a single read would have.
     let output = gateway
-        .read_combined_captured_output()
+        .wait_for_captured_output(
+            |output| output.contains(ADMIN_HTTPS_DISABLED_MARKER),
+            LOG_FLUSH_TIMEOUT,
+        )
+        .await
         .expect("read captured gateway output");
+    assert!(
+        output.contains(ADMIN_HTTPS_DISABLED_MARKER),
+        "expected the port-0 disable log, so the assertion below is not vacuous; output: {output}"
+    );
+    // Asserted on the same snapshot: the disable log and the admin TLS logs come
+    // from mutually exclusive arms of one startup step, so a run that reached
+    // this line took the port-0 arm and never entered the loading arm.
     assert!(
         !mentions_admin_tls_load(&output),
         "CP loaded admin TLS material for a disabled HTTPS listener; output: {output}"
-    );
-    assert!(
-        output.contains(ADMIN_HTTPS_DISABLED_MARKER),
-        "expected the port-0 disable log, so the assertion above is not vacuous; output: {output}"
     );
 }
 
