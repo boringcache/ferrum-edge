@@ -4621,6 +4621,29 @@ def inline_interpreter_has_cross(
     return False
 
 
+def shell_inline_interpreter_has_cross(value: str) -> bool:
+    """Inspect only recognized inline interpreters in trusted shell text."""
+
+    tokens = shell_tokens(value)
+    if tokens is None:
+        return False
+    for segment in shell_statement_segments(tokens):
+        expanded = expand_env_split_strings(segment)
+        index, executes = executable_index(expanded)
+        if not executes or index >= len(expanded):
+            continue
+        inline = inline_interpreter_programs(expanded, index)
+        if inline is None:
+            continue
+        programs, opaque = inline
+        if opaque or inline_interpreter_has_cross(
+            programs,
+            include_opaque_shell_executable=True,
+        ):
+            return True
+    return False
+
+
 def segments_dispatch_argv(body: tuple[str, ...]) -> bool:
     """Return whether any statement puts an argument reference in command position."""
 
@@ -7406,6 +7429,11 @@ def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
         or bool(heredoc_failures)
         or bool(heredoc_runtime_failures)
         or heredoc_sensitive
+        # Inline foreign interpreters can dispatch Cross or evaluate generated
+        # code without putting a Cross word in the surrounding shell command.
+        # Reuse their token model here so reached trusted shell scripts enforce
+        # the same boundary as workflow `run:` fields.
+        or shell_inline_interpreter_has_cross(command_text)
         or WRAPPED_LITERAL_CROSS.search(command_text) is not None
         or OPAQUE_INLINE_SHELL.search(command_text) is not None
         # An executable word assembled from shell expansions is opaque, so an
