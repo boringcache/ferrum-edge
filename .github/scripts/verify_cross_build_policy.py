@@ -8316,6 +8316,29 @@ def heredoc_body_substitution_commands(
     )
 
 
+def tokenized_stdin_interpreter_language(
+    segment: tuple[str, ...],
+) -> str | None:
+    """Classify a literal or opaque command that executes a heredoc body."""
+
+    expanded = expand_env_split_strings(segment)
+    language, _, _ = shell_stdin_program(expanded)
+    if language is not None:
+        return language
+
+    index, executes = executable_index(expanded)
+    if (
+        executes
+        and index < len(expanded)
+        and dynamic_shell_word(expanded[index])
+    ):
+        # A computed receiver may select an interpreter at runtime. Treat the
+        # body as an unsupported executable program rather than withdrawing it
+        # as inert data; `runtime_program_cross_surface()` then fails closed.
+        return "opaque"
+    return None
+
+
 def executable_heredoc_language(line: str, start: int) -> str | None:
     """Classify the interpreter that receives one heredoc body, if any."""
 
@@ -8330,14 +8353,45 @@ def executable_heredoc_language(line: str, start: int) -> str | None:
             heredoc_pipeline_tail(line, start)
         )
     ]
-    if not interpreters:
-        return None
-    executable = tool_name(interpreters[-1])
-    if PYTHON_INTERPRETER.fullmatch(executable):
-        return "python"
-    if executable.lower() in {"pwsh", "powershell"}:
-        return "powershell"
-    return "shell"
+    if interpreters:
+        executable = tool_name(interpreters[-1])
+        if PYTHON_INTERPRETER.fullmatch(executable):
+            return "python"
+        if executable.lower() in {"pwsh", "powershell"}:
+            return "powershell"
+        return "shell"
+
+    # The regex layer intentionally accepts only bounded, visibly separated
+    # prefixes. Tokenize as a fallback for literal command shapes whose quoting
+    # is semantically meaningful, most importantly `env -S 'bash -s'`. The
+    # stdin-program scanner already understands every supported interpreter and
+    # expands `env -S`; without this fallback it deferred a real heredoc here,
+    # then this classifier withdrew the body as template data.
+    prefix_tokens = shell_tokens(line[:start])
+    if prefix_tokens is not None:
+        prefix_segments = shell_statement_segments(prefix_tokens)
+        if prefix_segments:
+            language = tokenized_stdin_interpreter_language(prefix_segments[-1])
+            if language is not None:
+                return language
+
+    # Preserve raw quote content while limiting the token fallback to the same
+    # outer pipeline the quote-aware tail scanner approved. The visible tail
+    # has exactly the same length as this raw slice, so nested or later-command
+    # pipes remain excluded without destroying an `env -S` operand.
+    visible_tail = heredoc_pipeline_tail(line, start)
+    raw_tail = line[start : start + len(visible_tail)]
+    tail_tokens = shell_tokens(raw_tail)
+    if tail_tokens is not None:
+        tail_languages = [
+            language
+            for segment in shell_statement_segments(tail_tokens)
+            if (language := tokenized_stdin_interpreter_language(segment))
+            is not None
+        ]
+        if tail_languages:
+            return tail_languages[-1]
+    return None
 
 
 def opaque_arm_command_line_projection(contents: str) -> tuple[str, ...] | None:
@@ -9579,6 +9633,13 @@ def runtime_program_cross_surface(
             )
             sensitive = sensitive or powershell_sensitive
             errors.extend(powershell_errors)
+            continue
+        if language == "foreign":
+            if inline_interpreter_has_cross(
+                ((language, program),),
+                include_opaque_shell_executable=include_opaque_shell_executable,
+            ):
+                sensitive = True
             continue
         errors.append(f"{source} uses an unsupported executable interpreter")
     return sensitive, errors
@@ -14467,6 +14528,121 @@ pre_build = []
         failures.append(
             "a later heredoc piped into Python was skipped behind the first one"
         )
+    # `env -S` keeps the interpreter and its options in one quoted operand.
+    # The token stdin scanner already expands that operand, but executable
+    # heredoc extraction used to rely only on the regex layer and withdrew the
+    # body after the scanner deferred to it. Direct and piped forms must both
+    # retain their actual interpreter provenance.
+    env_split_heredocs = (
+        (
+            "env -S 'bash -s' <<'SH'\n"
+            f"cross build --target {TARGET}\n"
+            "SH\n",
+            "shell",
+            "direct shell",
+        ),
+        (
+            "cat <<'PY' | env -S 'python3 -I'\n"
+            "subprocess.run(['cross', 'build'])\n"
+            "PY\n",
+            "python",
+            "piped Python",
+        ),
+    )
+    for env_program, expected_language, env_label in env_split_heredocs:
+        programs, errors = executable_heredocs(
+            env_program,
+            f"self-test env split-string {env_label} heredoc",
+        )
+        if errors or not any(
+            language == expected_language for language, _ in programs
+        ):
+            failures.append(
+                f"an env split-string {env_label} heredoc lost interpreter provenance"
+            )
+        sensitive, runtime_errors = runtime_program_cross_surface(
+            list(programs),
+            f"self-test env split-string {env_label} heredoc",
+            include_opaque_shell_executable=True,
+        )
+        if runtime_errors or not sensitive:
+            failures.append(
+                f"an env split-string {env_label} heredoc lost its Cross surface"
+            )
+
+    benign_env_split, benign_env_errors = executable_heredocs(
+        "env -S 'bash -s' <<'SH'\nprintf '%s\\n' safe\nSH\n",
+        "self-test benign env split-string heredoc",
+    )
+    benign_env_sensitive, benign_env_runtime_errors = runtime_program_cross_surface(
+        list(benign_env_split),
+        "self-test benign env split-string heredoc",
+        include_opaque_shell_executable=True,
+    )
+    if (
+        benign_env_errors
+        or benign_env_runtime_errors
+        or benign_env_sensitive
+    ):
+        failures.append("a benign env split-string shell heredoc was rejected")
+
+    # Known foreign interpreters also execute stdin as program text. Treating
+    # their heredocs as data drops ordinary process dispatch such as Ruby's
+    # `system`, while rejecting every foreign body would make benign scripts
+    # unusable. Route them through the existing foreign inline-program reader.
+    foreign_heredoc_programs, foreign_heredoc_errors = executable_heredocs(
+        "ruby <<'RUBY'\nsystem('cross build')\nRUBY\n",
+        "self-test foreign executable heredoc",
+    )
+    foreign_sensitive, foreign_runtime_errors = runtime_program_cross_surface(
+        list(foreign_heredoc_programs),
+        "self-test foreign executable heredoc",
+        include_opaque_shell_executable=True,
+    )
+    if (
+        foreign_heredoc_errors
+        or foreign_runtime_errors
+        or not foreign_sensitive
+    ):
+        failures.append("a foreign executable heredoc lost its Cross surface")
+    benign_foreign_programs, benign_foreign_errors = executable_heredocs(
+        "ruby <<'RUBY'\nputs 'safe'\nRUBY\n",
+        "self-test benign foreign executable heredoc",
+    )
+    benign_foreign_sensitive, benign_foreign_runtime_errors = (
+        runtime_program_cross_surface(
+            list(benign_foreign_programs),
+            "self-test benign foreign executable heredoc",
+            include_opaque_shell_executable=True,
+        )
+    )
+    if (
+        benign_foreign_errors
+        or benign_foreign_runtime_errors
+        or benign_foreign_sensitive
+    ):
+        failures.append("a benign foreign executable heredoc was rejected")
+
+    # A computed receiver can select Bash or another interpreter at runtime.
+    # Its body is therefore executable but unreadable, and must fail closed
+    # rather than being withdrawn with an ordinary `cat` template body.
+    opaque_heredoc_programs, opaque_heredoc_errors = executable_heredocs(
+        "$INTERPRETER <<'PROGRAM'\n"
+        f"cross build --target {TARGET}\n"
+        "PROGRAM\n",
+        "self-test opaque executable heredoc receiver",
+    )
+    opaque_sensitive, opaque_runtime_errors = runtime_program_cross_surface(
+        list(opaque_heredoc_programs),
+        "self-test opaque executable heredoc receiver",
+        include_opaque_shell_executable=True,
+    )
+    if (
+        opaque_heredoc_errors
+        or not opaque_runtime_errors
+        or opaque_sensitive
+    ):
+        failures.append("an opaque executable heredoc receiver did not fail closed")
     # A separator inside a nested construct is that construct's own, not the
     # line's. `$(true; true)` expands to nothing, so `cat` still receives the
     # heredoc and the outer `| bash` still executes it. Stopping the pipeline
