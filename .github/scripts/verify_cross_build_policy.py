@@ -7399,11 +7399,24 @@ def heredoc_pipeline_tail(line: str, start: int) -> str:
     first quote close the *enclosing* word, so the scan read that literal `;`
     as an outer boundary, truncated before `| bash`, and withdrew an executed
     body as data. Each opener therefore saves the quote it interrupted and
-    restores it at its closer. The reset is limited to `$(` and backticks:
-    inside single quotes nothing expands, and process substitutions and
-    subshell groups are literal inside a double-quoted word, so promoting
-    either would let quoted prose open a construct that swallows a real outer
-    separator — the fail-open direction.
+    restores it at its closer.
+
+    Parameter expansion behaves the same way. `${NAME:-word}` is expanded
+    inside a double-quoted word, and its `word` — for `:-`, `:=`, `:?` and
+    `:+` — carries its own nested quoting, so
+    `cat <<'DOC' 3>"${UNSET:-"x; true"}" | bash` also pipes the body into
+    Bash: with `UNSET` absent the redirection just names the ordinary file
+    `x; true`, `cat` still reads the heredoc on stdin, and the outer pipe
+    hands its stdout to Bash. Leaving `${` on the quoted-text shortcut let the
+    expansion word's own quote close the enclosing word and turned that
+    literal `;` into an outer boundary, so it opens a saved-and-restored quote
+    context exactly like `$(`.
+
+    The reset is limited to `$(`, `${` and backticks: inside single quotes
+    nothing expands, and process substitutions and subshell groups are literal
+    inside a double-quoted word, so promoting any of those would let quoted
+    prose open a construct that swallows a real outer separator — the
+    fail-open direction.
 
     The stack is maintained by this same loop rather than by intersecting the
     result of a separate span scan: two scanners with independent quote state
@@ -7440,17 +7453,22 @@ def heredoc_pipeline_tail(line: str, start: int) -> str:
             escaped = True
             index += 1
             continue
-        # Command substitutions stay active inside double quotes and parse
-        # their body in a *fresh* quote context, so they are recognised before
-        # the quoted-text shortcut below. Treating the opener as prose let the
-        # substitution's own first quote close the enclosing double-quoted
-        # word, after which a separator that Bash reads as literal text inside
-        # the substitution looked like an outer boundary and truncated the tail
-        # short of the real `| bash`. Only `$(` and backticks earn this: single
-        # quotes make everything literal, and neither process substitutions nor
-        # subshell groups are expanded inside a double-quoted word, so none of
-        # them may open nesting while a quote is open.
-        if quote != "'" and (tail.startswith("$(", index) or character == "`"):
+        # Command substitutions and parameter expansions stay active inside
+        # double quotes and parse their interior in a *fresh* quote context, so
+        # they are recognised before the quoted-text shortcut below. Treating
+        # such an opener as prose let its own first quote close the enclosing
+        # double-quoted word, after which a separator that Bash reads as
+        # literal text inside the construct looked like an outer boundary and
+        # truncated the tail short of the real `| bash`. Only `$(`, `${` and
+        # backticks earn this: single quotes make everything literal, and
+        # neither process substitutions nor subshell groups are expanded inside
+        # a double-quoted word, so none of them may open nesting while a quote
+        # is open.
+        if quote != "'" and (
+            tail.startswith("$(", index)
+            or tail.startswith("${", index)
+            or character == "`"
+        ):
             if character == "`":
                 # Backticks are their own closer, so the same character ends an
                 # open backtick region and otherwise opens one. An unmatched
@@ -7461,6 +7479,14 @@ def heredoc_pipeline_tail(line: str, start: int) -> str:
                     pending.append(("`", quote))
                     quote = None
                 index += 1
+                continue
+            if tail.startswith("${", index):
+                # The `word` of `${NAME:-word}` and friends has its own nested
+                # quoting, so the expansion body is parsed fresh and the
+                # enclosing quote resumes at the matching `}`.
+                pending.append(("}", quote))
+                quote = None
+                index += 2
                 continue
             # `$((` arithmetic opens `$(` then a bare `(`, so `))` closes both.
             pending.append((")", quote))
@@ -7479,12 +7505,6 @@ def heredoc_pipeline_tail(line: str, start: int) -> str:
         if pending and character == pending[-1][0]:
             _, quote = pending.pop()
             index += 1
-            continue
-        if tail.startswith("${", index):
-            # A parameter expansion is not a new command context, so it never
-            # resets quoting and is only an opener outside quotes.
-            pending.append(("}", quote))
-            index += 2
             continue
         if character == "(" or (
             character in "<>" and tail.startswith("(", index + 1)
@@ -13663,17 +13683,52 @@ pre_build = []
                 f"a heredoc piped past a {quoted_label} was not read as a "
                 "program"
             )
+    # Parameter expansion is expanded inside a double-quoted word too, and the
+    # `word` of `:-` carries its own nested quoting. With `UNSET` absent the
+    # fd-3 redirection names the ordinary file `x; true`, so `cat` still reads
+    # the heredoc on stdin and the outer `| bash` executes it. Leaving `${` on
+    # the quoted-text shortcut let the expansion word's own quote close the
+    # enclosing word, so that literal `;` read as an outer boundary and
+    # withdrew an executed body as inert data.
+    for parameter_opener, parameter_label in (
+        (
+            "cat <<'DOC' 3>\"${UNSET:-\"x; true\"}\" | bash\n",
+            "double-quoted parameter expansion",
+        ),
+        (
+            "cat <<'DOC' 3>\"${UNSET:-\"$(printf \"%s; true\" x)\"}\" | bash\n",
+            "nested substitution in a parameter word",
+        ),
+        (
+            "cat <<'DOC' 3>\"${UNSET:-\"${INNER:-\"x; true\"}\"}\" | bash\n",
+            "nested parameter expansion",
+        ),
+    ):
+        parameter_programs, _ = executable_heredocs(
+            f"{parameter_opener}key: $cmd build\nDOC\n",
+            f"self-test {parameter_label} heredoc pipeline",
+        )
+        if not parameter_programs:
+            failures.append(
+                f"a heredoc piped past a {parameter_label} was not read as a "
+                "program"
+            )
     # The discriminating controls for that quote context. Restoring the
     # enclosing quote must leave a *following* outer separator terminating, and
-    # nothing expands inside single quotes: promoting a quoted `$(` or backtick
-    # into real nesting would leave an unbalanced closer owed, swallow the
-    # outer separator, and attach a later interpreter to this body.
+    # nothing expands inside single quotes: promoting a quoted `$(`, `${` or
+    # backtick into real nesting would leave an unbalanced closer owed, swallow
+    # the outer separator, and attach a later interpreter to this body.
     for inert_opener, inert_label in (
         (
             "cat <<'DOC' 3>\"$(printf \"%s\" x)\"; echo safe | python3\n",
             "balanced quoted substitution",
         ),
+        (
+            "cat <<'DOC' 3>\"${UNSET:-\"x\"}\"; echo safe | python3\n",
+            "balanced quoted parameter expansion",
+        ),
         ("cat <<'DOC' '$(' ; echo safe | python3\n", "single-quoted `$(`"),
+        ("cat <<'DOC' '${' ; echo safe | python3\n", "single-quoted `${`"),
         ("cat <<'DOC' '`' ; echo safe | python3\n", "single-quoted backtick"),
     ):
         inert_programs, _ = executable_heredocs(
