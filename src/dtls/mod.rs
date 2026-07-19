@@ -1273,7 +1273,10 @@ pub fn load_dtls_certificate(
     let cert_der = rustls_pemfile::certs(&mut cert_reader)
         .next()
         .ok_or_else(|| {
-            anyhow::anyhow!("No certificate found in {}", cert_material.display_source_id)
+            anyhow::anyhow!(
+                "No certificate found in {}",
+                cert_material.display_source_id
+            )
         })?
         .map_err(|e| anyhow::anyhow!("Failed to parse certificate PEM: {}", e))?;
 
@@ -1298,14 +1301,13 @@ pub fn load_dtls_certificate(
 /// Load a rustls root store from a PEM file.
 pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore, anyhow::Error> {
     let source = CertSource::parse(pem_path, MaterialKind::CaBundle);
-    let material = load_material_blocking(&source, MaterialKind::CaBundle)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to load PEM source {}: {}",
-                source.redacted_source_id(),
-                e
-            )
-        })?;
+    let material = load_material_blocking(&source, MaterialKind::CaBundle).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load PEM source {}: {}",
+            source.redacted_source_id(),
+            e
+        )
+    })?;
     let mut certs = Vec::new();
     let mut parse_errors = 0usize;
     let mut reader = material.bytes.expose_secret();

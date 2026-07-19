@@ -705,8 +705,8 @@ fn load_server_cert_resolver(
     }
 
     let key_material = load_material_blocking(key_source, MaterialKind::Key)?;
-    let key = private_key(&mut Cursor::new(key_material.bytes.expose_secret()))?
-        .ok_or_else(|| {
+    let key =
+        private_key(&mut Cursor::new(key_material.bytes.expose_secret()))?.ok_or_else(|| {
             anyhow::anyhow!("No private key found in {}", key_material.display_source_id)
         })?;
     let resolver = acme_tls_alpn_cert_resolver(cert_chain, key, ocsp_response, crypto_provider)?;
@@ -1096,8 +1096,8 @@ pub fn load_mesh_server_identity(
         ));
     }
 
-    let key = private_key(&mut Cursor::new(key_material.bytes.expose_secret()))?
-        .ok_or_else(|| {
+    let key =
+        private_key(&mut Cursor::new(key_material.bytes.expose_secret()))?.ok_or_else(|| {
             anyhow::anyhow!("No private key found in {}", key_material.display_source_id)
         })?;
 
