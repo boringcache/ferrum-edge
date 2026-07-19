@@ -3638,12 +3638,27 @@ jobs:
               # with the same display name from satisfying this requirement.
               # The remaining fields independently bind the run to this exact
               # file, name, commit, push event, and branch.
-              runs="$({
-                gh api --paginate \
-                  -H "Accept: application/vnd.github+json" \
-                  "/repos/${REPOSITORY}/actions/workflows/${workflow_file}/runs?head_sha=${HEAD_SHA}&event=push&branch=${BRANCH_NAME}&per_page=100" \
-                  --jq '.workflow_runs[] | [.name, .path, .status, (.conclusion // ""), .head_branch, .event, .head_sha] | @tsv'
-              })"
+              runs=""
+              api_succeeded=0
+              for attempt in 1 2 3; do
+                if runs="$(
+                  gh api --paginate \
+                    -H "Accept: application/vnd.github+json" \
+                    "/repos/${REPOSITORY}/actions/workflows/${workflow_file}/runs?head_sha=${HEAD_SHA}&event=push&branch=${BRANCH_NAME}&per_page=100" \
+                    --jq '.workflow_runs[] | [.name, .path, .status, (.conclusion // ""), .head_branch, .event, .head_sha] | @tsv'
+                )"; then
+                  api_succeeded=1
+                  break
+                fi
+                if [ "$attempt" -lt 3 ]; then
+                  echo "::warning::Actions API query failed for ${workflow_path}; retrying (${attempt}/3)."
+                  sleep $((attempt * 5))
+                fi
+              done
+              if [ "$api_succeeded" -ne 1 ]; then
+                echo "::error::Actions API query failed for ${workflow_path} after 3 attempts."
+                exit 1
+              fi
 
               # A record that does not carry exactly seven fields cannot be
               # matched field by field. Reject malformed data instead of

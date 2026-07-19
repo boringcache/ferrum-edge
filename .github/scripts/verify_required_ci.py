@@ -134,11 +134,11 @@ MAIN_PUBLISH_WORKFLOWS = {
 # The polling implementation is a release-integrity boundary. Pinning the exact
 # job body prevents a later pull request from satisfying individual substring
 # checks with comments while changing the array, query, row validation, or
-# fail-closed conclusions the publishing jobs actually consume. This verifier is
-# itself protected by the trusted Cross policy, so updating the digest requires
-# the same trusted-base procedure as updating the gate.
+# fail-closed conclusions the publishing jobs actually consume. The protected
+# Cross verifier independently freezes this complete job, so changing either
+# the implementation or this diagnostic digest requires a trusted-base update.
 MAIN_PUBLISH_GATE_SHA256 = (
-    "3de694218bad2aa7286a9cef1843ea6e12a0c0f5d75fdfaa8c1a3b7bdc7f35cc"
+    "940043d915ff213230b679ca3ea9b1165c06dbc757b26b9473494f841f5220df"
 )
 
 
@@ -169,14 +169,6 @@ def extract_job_body(ci_yml: str, job: str) -> str:
     return match.group("body")
 
 
-def job_needs(body: str, dependency: str) -> bool:
-    scalar = re.search(rf"(?m)^    needs: {re.escape(dependency)}$", body)
-    inline = re.search(
-        rf"(?m)^    needs: \[[^\n]*\b{re.escape(dependency)}\b[^\n]*\]$", body
-    )
-    block = re.search(rf"(?m)^      - {re.escape(dependency)}$", body)
-    return bool(scalar or inline or block)
-
 def extract_job_needs(job_body: str) -> set[str]:
     list_match = re.search(
         r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)", job_body
@@ -188,37 +180,78 @@ def extract_job_needs(job_body: str) -> set[str]:
             if line.strip().startswith("- ")
         }
 
+    inline_match = re.search(
+        r"(?m)^    needs: \["
+        r"(?P<needs>[A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)"
+        r"\]$",
+        job_body,
+    )
+    if inline_match:
+        return set(inline_match.group("needs").split(", "))
+
     scalar_match = re.search(r"(?m)^    needs: ([A-Za-z0-9_-]+)$", job_body)
     if scalar_match:
         return {scalar_match.group(1)}
     return set()
 
 
-def pull_request_trigger_is_unconditional(workflow_yml: str) -> bool:
-    workflow_header = workflow_yml.split("\njobs:\n", maxsplit=1)[0]
-    pull_request = re.search(
-        r"(?ms)^  pull_request:(?P<body>.*?)(?=^  [A-Za-z_]+:|\Z)",
-        workflow_header,
+def job_needs(body: str, dependency: str) -> bool:
+    return dependency in extract_job_needs(body)
+
+
+def workflow_event_body(workflow_yml: str, event: str) -> str | None:
+    """Extract one canonical event mapping without crossing the `on` scope."""
+
+    lines = workflow_yml.splitlines(keepends=True)
+    on_headers = [
+        index for index, line in enumerate(lines) if line.rstrip("\r\n") == "on:"
+    ]
+    if len(on_headers) != 1:
+        return None
+
+    on_start = on_headers[0]
+    on_end = next(
+        (
+            index
+            for index in range(on_start + 1, len(lines))
+            if re.match(r"^[A-Za-z0-9_-]+:", lines[index])
+        ),
+        len(lines),
     )
-    if not pull_request:
+    event_line = f"  {event}:"
+    event_headers = [
+        index
+        for index in range(on_start + 1, on_end)
+        if lines[index].rstrip("\r\n") == event_line
+    ]
+    if len(event_headers) != 1:
+        return None
+
+    event_start = event_headers[0]
+    event_end = next(
+        (
+            index
+            for index in range(event_start + 1, on_end)
+            if re.match(r"^  [A-Za-z0-9_-]+:", lines[index])
+        ),
+        on_end,
+    )
+    return "".join(lines[event_start + 1 : event_end])
+
+
+def pull_request_trigger_is_unconditional(workflow_yml: str) -> bool:
+    body = workflow_event_body(workflow_yml, "pull_request")
+    if body is None:
         return False
-    body = pull_request.group("body")
     return not re.search(r"(?m)^    paths(?:-ignore)?:", body)
 
 
 def main_push_trigger_is_unconditional(workflow_yml: str) -> bool:
     """Return whether every push to main starts this workflow."""
 
-    workflow_header = workflow_yml.split("\njobs:\n", maxsplit=1)[0]
-    pushes = list(
-        re.finditer(
-            r"(?ms)^  push:(?P<body>.*?)(?=^  [A-Za-z_]+:|\Z)",
-            workflow_header,
-        )
-    )
-    if len(pushes) != 1:
+    body = workflow_event_body(workflow_yml, "push")
+    if body is None:
         return False
-    body = pushes[0].group("body")
     if re.search(r"(?m)^    (?:branches-ignore|paths|paths-ignore):", body):
         return False
     branches = re.search(
@@ -237,7 +270,12 @@ def main_push_trigger_is_unconditional(workflow_yml: str) -> bool:
 
 def workflow_has_exact_name(workflow_yml: str, expected: str) -> bool:
     names = re.findall(r"(?m)^name: ([^\n]+)$", workflow_yml)
-    return names == [expected]
+    if len(names) != 1:
+        return False
+    actual = names[0].strip()
+    if len(actual) >= 2 and actual[0] == actual[-1] and actual[0] in "'\"":
+        actual = actual[1:-1]
+    return actual == expected
 
 
 def extract_documentation_paths(workflow_yml: str) -> set[str]:
