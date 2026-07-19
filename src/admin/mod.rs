@@ -4750,10 +4750,6 @@ async fn handle_delete_credentials(
         return Ok(*resp);
     }
 
-    if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
-        return Ok(invalid_credential_type_response(cred_type));
-    }
-
     let db = match require_db(state) {
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
@@ -4776,6 +4772,17 @@ async fn handle_delete_credentials(
                 Ok(consumer) => consumer,
                 Err(resp) => return *resp,
             };
+        // Whole-Consumer PUT preserves credential types the ordinary response
+        // projection hides, so this route is the only way to remove them. It
+        // therefore also accepts an unknown/custom type that the Consumer
+        // actually stores; an unknown type it does not store stays a 400, so
+        // no new credential-type namespace is opened. Known types keep their
+        // idempotent delete regardless of whether an entry is present.
+        if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type)
+            && !consumer.credentials.contains_key(cred_type)
+        {
+            return invalid_credential_type_response(cred_type);
+        }
         let before = consumer.clone();
         consumer.credentials.remove(cred_type);
         let response = persist_consumer_update(
@@ -6340,8 +6347,27 @@ async fn handle_backup(
         .as_ref()
         .is_none_or(|f| f.contains("upstreams"));
 
+    // Backups must stay restorable. Exactly-one-field Consumer credential
+    // entries stored before that contract was enforced can carry ignored extra
+    // fields, and legacy single-object credential values are not the array
+    // shape `POST /restore` requires, so export the canonical form documented
+    // by `ConsumerBackup`. Credential types without a single-field rule, and
+    // unknown/custom credential maps, keep their fields verbatim.
+    //
+    // A resource-filtered backup that excludes consumers must not pay for this:
+    // cloning and canonicalizing credential-heavy consumers only to discard
+    // them would defeat the documented purpose of `?resources=`.
+    let canonical_consumers: Vec<Consumer> = if include_consumers {
+        config
+            .consumers
+            .iter()
+            .map(crate::config::types::canonicalize_consumer_credentials_for_backup)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let empty_proxies: Vec<Proxy> = Vec::new();
-    let empty_consumers: Vec<Consumer> = Vec::new();
     let empty_plugin_configs: Vec<PluginConfig> = Vec::new();
     let empty_upstreams: Vec<Upstream> = Vec::new();
 
@@ -6350,11 +6376,9 @@ async fn handle_backup(
     } else {
         empty_proxies.as_slice()
     };
-    let consumers = if include_consumers {
-        config.consumers.as_slice()
-    } else {
-        empty_consumers.as_slice()
-    };
+    // Empty when consumers are filtered out, so no separate placeholder is
+    // needed here.
+    let consumers = canonical_consumers.as_slice();
     let plugin_configs = if include_plugin_configs {
         config.plugin_configs.as_slice()
     } else {

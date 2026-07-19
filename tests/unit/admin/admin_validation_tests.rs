@@ -667,6 +667,21 @@ fn test_basic_auth_audit_redaction_uses_one_shape_independent_marker() {
 }
 
 #[test]
+fn test_audit_redaction_omits_unknown_credential_values() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "custom_auth".to_string(),
+        json!([{"api_token": "audit-must-not-disclose-this-secret"}]),
+    );
+    let consumer = make_consumer(credentials);
+
+    let redacted = ferrum_edge::config::types::redact_consumer_credentials_for_audit(&consumer);
+    assert!(!redacted.credentials.contains_key("custom_auth"));
+    let serialized = serde_json::to_string(&redacted).expect("redacted consumer serializes");
+    assert!(!serialized.contains("audit-must-not-disclose-this-secret"));
+}
+
+#[test]
 fn test_redact_hmac_auth_secret() {
     let mut credentials = std::collections::HashMap::new();
     credentials.insert(
@@ -677,8 +692,8 @@ fn test_redact_hmac_auth_secret() {
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
     let hmac = redacted.credentials.get("hmac_auth").unwrap();
-    assert_eq!(hmac["secret"], "[REDACTED]");
-    assert_eq!(hmac["username"], "bob");
+    assert_eq!(hmac[0]["secret"], "[REDACTED]");
+    assert!(hmac[0].get("username").is_none());
 }
 
 #[test]
@@ -692,8 +707,8 @@ fn test_redact_jwt_secret() {
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
     let jwt = redacted.credentials.get("jwt").unwrap();
-    assert_eq!(jwt["secret"], "[REDACTED]");
-    assert_eq!(jwt["algorithm"], "HS256");
+    assert_eq!(jwt[0]["secret"], "[REDACTED]");
+    assert!(jwt[0].get("algorithm").is_none());
 }
 
 #[test]
@@ -704,7 +719,7 @@ fn test_redact_keyauth_key() {
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
     let keyauth = redacted.credentials.get("keyauth").unwrap();
-    assert_eq!(keyauth["key"], "[REDACTED]");
+    assert_eq!(keyauth[0]["key"], "[REDACTED]");
 }
 
 #[test]
@@ -724,8 +739,8 @@ fn test_redact_multiple_credential_types() {
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
 
     assert!(!redacted.credentials.contains_key("basicauth"));
-    assert_eq!(redacted.credentials["hmac_auth"]["secret"], "[REDACTED]");
-    assert_eq!(redacted.credentials["keyauth"]["key"], "[REDACTED]");
+    assert_eq!(redacted.credentials["hmac_auth"][0]["secret"], "[REDACTED]");
+    assert_eq!(redacted.credentials["keyauth"][0]["key"], "[REDACTED]");
 }
 
 #[test]
@@ -739,7 +754,7 @@ fn test_redact_mtls_identity_unchanged() {
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
     assert_eq!(
-        redacted.credentials["mtls_auth"]["identity"],
+        redacted.credentials["mtls_auth"][0]["identity"],
         "CN=client.example.com"
     );
 }
@@ -770,9 +785,9 @@ fn test_redact_array_jwt_secrets() {
     let arr = jwt.as_array().unwrap();
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["secret"], "[REDACTED]");
-    assert_eq!(arr[0]["algorithm"], "HS256");
+    assert!(arr[0].get("algorithm").is_none());
     assert_eq!(arr[1]["secret"], "[REDACTED]");
-    assert_eq!(arr[1]["algorithm"], "HS256");
+    assert!(arr[1].get("algorithm").is_none());
 }
 
 #[test]
@@ -990,4 +1005,400 @@ fn late_restore_clear_validates_the_union_before_additive_replay() {
         .expect("missing snapshot resources must be replayed");
     assert!(graph_validation < persistence);
     assert!(restore_source.contains("finish_failed_restore_after_intervening_clear("));
+}
+
+/// Ordinary Consumer responses omit `basicauth` and unknown/custom credential
+/// types entirely, so a read-modify-write PUT of such a response must not
+/// persist them as deleted.
+#[test]
+fn test_consumer_update_preserves_response_hidden_credential_types() {
+    let jwt_secret = "j".repeat(32);
+    let hmac_secret = "h".repeat(32);
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "basicauth".to_string(),
+        json!([{"password_hash": format!("hmac_sha256:{}", "a".repeat(64))}]),
+    );
+    credentials.insert(
+        "custom_auth".to_string(),
+        json!([{"api_token": "custom-token-must-survive"}]),
+    );
+    credentials.insert("another_custom".to_string(), json!([{"opaque": "value"}]));
+    credentials.insert("keyauth".to_string(), json!([{"key": "live-api-key"}]));
+    credentials.insert("jwt".to_string(), json!([{"secret": jwt_secret.clone()}]));
+    credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{"secret": hmac_secret.clone()}]),
+    );
+    credentials.insert("mtls_auth".to_string(), json!([{"identity": "spiffe://a"}]));
+    let stored = make_consumer(credentials);
+
+    // Exactly what a client receives from GET /consumers/{id}.
+    let mut round_tripped = ferrum_edge::config::types::redact_consumer_credentials(&stored);
+    assert!(!round_tripped.credentials.contains_key("basicauth"));
+    assert!(!round_tripped.credentials.contains_key("custom_auth"));
+    assert!(!round_tripped.credentials.contains_key("another_custom"));
+    round_tripped.acl_groups = vec!["editors".to_string()];
+
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut round_tripped,
+        &stored,
+    );
+
+    // Types the projection cannot represent are restored verbatim.
+    for hidden in ["basicauth", "custom_auth", "another_custom"] {
+        assert_eq!(
+            round_tripped.credentials.get(hidden),
+            stored.credentials.get(hidden),
+            "{hidden} must survive a response round trip"
+        );
+    }
+    // Placeholder secrets are restored, never persisted literally.
+    assert_eq!(
+        round_tripped.credentials["keyauth"],
+        json!([{"key": "live-api-key"}])
+    );
+    assert_eq!(
+        round_tripped.credentials["jwt"],
+        json!([{"secret": jwt_secret}])
+    );
+    assert_eq!(
+        round_tripped.credentials["hmac_auth"],
+        json!([{"secret": hmac_secret}])
+    );
+    assert_eq!(
+        round_tripped.credentials["mtls_auth"],
+        json!([{"identity": "spiffe://a"}])
+    );
+    let serialized = serde_json::to_string(&round_tripped).expect("consumer serializes");
+    assert!(!serialized.contains("[REDACTED]"));
+    assert_eq!(round_tripped.acl_groups, vec!["editors".to_string()]);
+}
+
+/// Preservation must not make credentials undeletable or unwritable: a type the
+/// ordinary response does represent is still removed by omission, and an
+/// explicitly supplied hidden type still replaces the stored value.
+#[test]
+fn test_consumer_update_preserves_only_unexpressible_credential_state() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert("keyauth".to_string(), json!([{"key": "old-api-key"}]));
+    credentials.insert("mtls_auth".to_string(), json!([{"identity": "spiffe://a"}]));
+    credentials.insert("custom_auth".to_string(), json!([{"api_token": "old"}]));
+    credentials.insert(
+        "basicauth".to_string(),
+        json!([{"password_hash": format!("hmac_sha256:{}", "b".repeat(64))}]),
+    );
+    let stored = make_consumer(credentials);
+
+    let mut updated = make_consumer(std::collections::HashMap::new());
+    updated
+        .credentials
+        .insert("custom_auth".to_string(), json!([{"api_token": "new"}]));
+    updated
+        .credentials
+        .insert("keyauth".to_string(), json!([{"key": "rotated-api-key"}]));
+
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut updated,
+        &stored,
+    );
+
+    // Omitted projected types are deleted; explicit values win over preservation.
+    assert!(!updated.credentials.contains_key("mtls_auth"));
+    assert_eq!(
+        updated.credentials["custom_auth"],
+        json!([{"api_token": "new"}])
+    );
+    assert_eq!(
+        updated.credentials["keyauth"],
+        json!([{"key": "rotated-api-key"}])
+    );
+    // Hidden types the request never mentioned are still preserved.
+    assert_eq!(
+        updated.credentials.get("basicauth"),
+        stored.credentials.get("basicauth")
+    );
+}
+
+/// A partially edited rotation set must restore only the placeholder entries.
+#[test]
+fn test_consumer_update_restores_placeholder_entries_positionally() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "keyauth".to_string(),
+        json!([{"key": "first-live-key"}, {"key": "second-live-key"}]),
+    );
+    let stored = make_consumer(credentials);
+
+    let mut updated = make_consumer(std::collections::HashMap::new());
+    updated.credentials.insert(
+        "keyauth".to_string(),
+        json!([{"key": "rotated-key"}, {"key": "[REDACTED]"}]),
+    );
+
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut updated,
+        &stored,
+    );
+
+    assert_eq!(
+        updated.credentials["keyauth"],
+        json!([{"key": "rotated-key"}, {"key": "second-live-key"}])
+    );
+}
+
+/// A backup taken from a database written before the HS256-only JWT contract
+/// must still satisfy restore validation.
+#[test]
+fn test_backup_canonicalizes_legacy_jwt_credentials_only() {
+    let first_secret = "j".repeat(32);
+    let second_secret = "r".repeat(40);
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "jwt".to_string(),
+        json!([
+            {"secret": first_secret.clone(), "algorithm": "HS256"},
+            {"secret": second_secret.clone(), "algorithm": "HS256", "key_id": "rotation"},
+        ]),
+    );
+    credentials.insert(
+        "basicauth".to_string(),
+        json!([{"password_hash": format!("hmac_sha256:{}", "a".repeat(64))}]),
+    );
+    credentials.insert(
+        "custom_auth".to_string(),
+        json!([{"api_token": "custom", "extra": {"nested": true}}]),
+    );
+    let stored = make_consumer(credentials);
+
+    let exported =
+        ferrum_edge::config::types::canonicalize_consumer_credentials_for_backup(&stored);
+
+    // Rotation entries and order are preserved; ignored selectors are dropped.
+    assert_eq!(
+        exported.credentials["jwt"],
+        json!([{"secret": first_secret}, {"secret": second_secret}])
+    );
+    // Every other credential type, including custom maps, is exported verbatim.
+    assert_eq!(
+        exported.credentials.get("basicauth"),
+        stored.credentials.get("basicauth")
+    );
+    assert_eq!(
+        exported.credentials.get("custom_auth"),
+        stored.credentials.get("custom_auth")
+    );
+    // The canonical export is what restore validation accepts.
+    exported
+        .validate_fields()
+        .expect("canonical backup must restore");
+    // The stored consumer is never mutated.
+    assert_eq!(
+        stored.credentials["jwt"][0]["algorithm"],
+        json!("HS256"),
+        "backup export must not mutate stored credentials"
+    );
+}
+
+/// Canonicalization must not invent a secret it cannot see: an entry with no
+/// string `secret` is left alone so restore reports it instead of silently
+/// dropping stored data.
+#[test]
+fn test_backup_leaves_unrepresentable_jwt_entries_untouched() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "jwt".to_string(),
+        json!([{"algorithm": "RS256", "public_key": "pem"}]),
+    );
+    let stored = make_consumer(credentials);
+
+    let exported =
+        ferrum_edge::config::types::canonicalize_consumer_credentials_for_backup(&stored);
+
+    assert_eq!(exported.credentials["jwt"], stored.credentials["jwt"]);
+    assert!(exported.validate_fields().is_err());
+}
+
+/// Restore requires every credential value to be a non-empty array of objects,
+/// so a legacy single-object value must be wrapped during export or the backup
+/// it produces is rejected by the very endpoint it exists for.
+#[test]
+fn test_backup_normalizes_legacy_single_object_credentials_to_arrays() {
+    let secret = "s".repeat(32);
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "jwt".to_string(),
+        json!({"secret": secret.clone(), "algorithm": "HS256"}),
+    );
+    credentials.insert("keyauth".to_string(), json!({"key": "legacy-key"}));
+    let stored = make_consumer(credentials);
+    assert!(
+        stored.validate_fields().is_err(),
+        "the legacy single-object shape is not restorable as stored"
+    );
+
+    let exported =
+        ferrum_edge::config::types::canonicalize_consumer_credentials_for_backup(&stored);
+
+    assert_eq!(exported.credentials["jwt"], json!([{"secret": secret}]));
+    assert_eq!(
+        exported.credentials["keyauth"],
+        json!([{"key": "legacy-key"}]),
+        "types without a single-field rule keep their fields, only the shape changes"
+    );
+    exported
+        .validate_fields()
+        .expect("the canonical export must be restorable");
+    assert!(
+        stored.credentials["jwt"].is_object(),
+        "backup export must not mutate stored credentials"
+    );
+}
+
+/// A `[REDACTED]` placeholder is replaced with the stored entry's canonical
+/// field, not the raw stored entry: restoring a legacy `jwt` row verbatim would
+/// reintroduce an `algorithm` selector and fail validation, breaking an edit to
+/// an unrelated field on the same Consumer.
+#[test]
+fn test_consumer_update_restores_legacy_jwt_entries_canonically() {
+    let secret = "s".repeat(32);
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "jwt".to_string(),
+        json!([{"secret": secret.clone(), "algorithm": "HS256"}]),
+    );
+    let stored = make_consumer(credentials);
+
+    let mut round_tripped = ferrum_edge::config::types::redact_consumer_credentials(&stored);
+    assert_eq!(
+        round_tripped.credentials["jwt"],
+        json!([{"secret": "[REDACTED]"}])
+    );
+
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut round_tripped,
+        &stored,
+    );
+
+    assert_eq!(
+        round_tripped.credentials["jwt"],
+        json!([{"secret": secret}]),
+        "the placeholder resolves to the canonical secret, not the legacy object"
+    );
+    round_tripped
+        .validate_fields()
+        .expect("an unrelated edit to a legacy-JWT consumer must still validate");
+}
+
+/// The placeholder is a round-trip marker, never credential material. A
+/// submitted placeholder with no stored entry at that index — an array the
+/// client grew — is left in place and rejected by validation instead of being
+/// silently stored or silently matched to an unrelated entry.
+#[test]
+fn test_consumer_update_rejects_unmatched_redaction_placeholders() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert("keyauth".to_string(), json!([{"key": "live-key"}]));
+    let stored = make_consumer(credentials);
+
+    let mut submitted = ferrum_edge::config::types::redact_consumer_credentials(&stored);
+    submitted.credentials.insert(
+        "keyauth".to_string(),
+        json!([{"key": "[REDACTED]"}, {"key": "[REDACTED]"}]),
+    );
+
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut submitted,
+        &stored,
+    );
+
+    assert_eq!(
+        submitted.credentials["keyauth"],
+        json!([{"key": "live-key"}, {"key": "[REDACTED]"}]),
+        "only the index backed by a stored entry is restored"
+    );
+    let errors = submitted
+        .validate_fields()
+        .expect_err("an unmatched placeholder must not become a live API key");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("reserved redaction placeholder")),
+        "expected a reserved-placeholder rejection, got {errors:?}"
+    );
+}
+
+/// The preservation rule follows the projection itself, not a static type
+/// list: an `mtls_auth` map the projection filters out entirely is hidden from
+/// the client too, so a round-tripped response must not delete it.
+#[test]
+fn test_consumer_update_preserves_credentials_the_projection_filtered_out() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert("mtls_auth".to_string(), json!([{"identity": "   "}]));
+    let stored = make_consumer(credentials);
+
+    let mut round_tripped = ferrum_edge::config::types::redact_consumer_credentials(&stored);
+    assert!(!round_tripped.credentials.contains_key("mtls_auth"));
+
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut round_tripped,
+        &stored,
+    );
+
+    assert_eq!(
+        round_tripped.credentials.get("mtls_auth"),
+        stored.credentials.get("mtls_auth")
+    );
+}
+
+/// A partially visible mTLS map is just as lossy as one the projection omits
+/// entirely. An unchanged response round-trip must restore the filtered rows,
+/// while an edited mTLS value remains an intentional wholesale replacement.
+#[test]
+fn test_consumer_update_preserves_partially_filtered_mtls_credentials() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "mtls_auth".to_string(),
+        json!([
+            {"identity": "spiffe://visible"},
+            {"identity": "   ", "legacy_private_field": "must-survive"}
+        ]),
+    );
+    let stored = make_consumer(credentials);
+
+    let projected = ferrum_edge::config::types::redact_consumer_credentials(&stored);
+    assert_eq!(
+        projected.credentials["mtls_auth"],
+        json!([{"identity": "spiffe://visible"}])
+    );
+
+    let mut round_tripped = projected.clone();
+    round_tripped.acl_groups = vec!["editors".to_string()];
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut round_tripped,
+        &stored,
+    );
+    assert_eq!(
+        round_tripped.credentials.get("mtls_auth"),
+        stored.credentials.get("mtls_auth"),
+        "an unchanged projection must not delete its filtered mTLS entries"
+    );
+    assert!(
+        round_tripped.validate_fields().is_err(),
+        "legacy-invalid hidden state must fail closed instead of being deleted"
+    );
+
+    let mut replacement = projected;
+    replacement.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "spiffe://replacement"}]),
+    );
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut replacement,
+        &stored,
+    );
+    assert_eq!(
+        replacement.credentials["mtls_auth"],
+        json!([{"identity": "spiffe://replacement"}]),
+        "an edited mTLS value must remain an intentional replacement"
+    );
 }
