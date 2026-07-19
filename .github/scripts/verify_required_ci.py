@@ -239,6 +239,17 @@ def main() -> int:
             planner_errors.append(
                 f"jobs.main-publish-gate must wait for `{workflow}`"
             )
+    # The gate polls the Actions API, so it must stay scoped to `main` pushes.
+    # Without this it would become a runner-holding mirror job on every pull
+    # request, which is exactly what the dedicated workflows replaced.
+    for condition in (
+        "github.event_name == 'push'",
+        "github.ref == 'refs/heads/main'",
+    ):
+        if condition not in publish_gate_body:
+            planner_errors.append(
+                f"jobs.main-publish-gate must stay scoped by `{condition}`"
+            )
     for job in ("latest-release", "docker"):
         body = extract_job_body(ci_yml, job)
         if not job_needs(body, "main-publish-gate"):

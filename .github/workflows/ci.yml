@@ -3593,7 +3593,10 @@ jobs:
     needs: [test, build-binaries]
     if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The polling loop stops at its own 60-minute deadline, so the fail-closed
+    # timeout below is always the branch that fires. This job-level ceiling is
+    # only a backstop against a wedged runner and bounds runner occupancy.
+    timeout-minutes: 75
     permissions:
       actions: read
       contents: read
@@ -3613,7 +3616,11 @@ jobs:
             "Mesh E2E Sidecar Live Datapath"
           )
 
-          for attempt in $(seq 1 180); do
+          # Bound the wait inside `timeout-minutes` so the runner is never held
+          # past this deadline and the diagnostic below stays reachable.
+          deadline=$((SECONDS + 3600))
+
+          while :; do
             # Accept only runs of this exact commit, produced by a `push` event
             # on this exact branch. Without the branch check a same-SHA push run
             # on any other branch could satisfy the gate before the real `main`
@@ -3624,28 +3631,49 @@ jobs:
                 "/repos/${REPOSITORY}/actions/runs?head_sha=${HEAD_SHA}&event=push&branch=${BRANCH_NAME}&per_page=100" \
                 --jq '.workflow_runs[] | [.name, .status, (.conclusion // ""), .head_branch, .event, .head_sha] | @tsv'
             })"
+
+            # A record that does not carry exactly six fields cannot be matched
+            # field by field, so reject malformed run data instead of silently
+            # skipping it and concluding the workflow never started.
+            if awk -F '\t' 'NF > 0 && NF != 6 { found = 1 } END { exit !found }' \
+              <<<"$runs"; then
+              echo "::error::Malformed workflow run data for ${HEAD_SHA}."
+              exit 1
+            fi
+
             pending=0
 
             for workflow in "${required_workflows[@]}"; do
-              run="$(awk -F '\t' \
+              # Every matching run must succeed. Selecting a single run would
+              # let one passing duplicate mask a failed run of the same
+              # workflow for this same commit and branch.
+              matching="$(awk -F '\t' \
                 -v name="$workflow" \
                 -v branch="$BRANCH_NAME" \
                 -v sha="$HEAD_SHA" \
-                '$1 == name && $4 == branch && $5 == "push" && $6 == sha { print; exit }' \
+                'NF == 6 && $1 == name && $4 == branch && $5 == "push" && $6 == sha { print $2 "\t" $3 }' \
                 <<<"$runs")"
-              if [ -z "$run" ]; then
+              if [ -z "$matching" ]; then
                 echo "Waiting for ${workflow} to start for ${HEAD_SHA}."
                 pending=1
                 continue
               fi
 
-              IFS=$'\t' read -r _ status conclusion _ _ _ <<<"$run"
-              if [ "$status" != "completed" ]; then
-                echo "Waiting for ${workflow}: ${status}."
+              workflow_pending=0
+              # A here-string keeps this loop in the current shell so the flag
+              # it sets, and any `exit`, take effect for the whole step.
+              while IFS=$'\t' read -r status conclusion; do
+                if [ "$status" != "completed" ]; then
+                  echo "Waiting for ${workflow}: ${status}."
+                  workflow_pending=1
+                elif [ "$conclusion" != "success" ]; then
+                  echo "::error::${workflow} concluded ${conclusion:-unknown} for ${HEAD_SHA}."
+                  exit 1
+                fi
+              done <<<"$matching"
+
+              if [ "$workflow_pending" -eq 1 ]; then
                 pending=1
-              elif [ "$conclusion" != "success" ]; then
-                echo "::error::${workflow} concluded ${conclusion} for ${HEAD_SHA}."
-                exit 1
               else
                 echo "${workflow} passed."
               fi
@@ -3653,6 +3681,9 @@ jobs:
 
             if [ "$pending" -eq 0 ]; then
               exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              break
             fi
             sleep 30
           done
