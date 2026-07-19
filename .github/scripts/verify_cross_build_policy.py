@@ -1342,6 +1342,25 @@ HEREDOC_PIPED_INTERPRETER = re.compile(
     + r"(?P<interpreter>bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|"
     r"pypy[0-9]*|pwsh|powershell)\b"
 )
+OPAQUE_INLINE_GITHUB_EXPRESSION = r"\$\{\{[^\n]*?\}\}"
+OPAQUE_INLINE_SHELL_EXPANSION = (
+    r"(?:\$\(|\$\{[^{}\n]*\}|\$[A-Za-z_][A-Za-z0-9_]*|"
+    r"\$[0-9@*#?$!-]|\x60)"
+)
+OPAQUE_INLINE_OUTER_EXPANSION = (
+    rf"(?:{OPAQUE_INLINE_SHELL_EXPANSION}|"
+    rf"\\?{OPAQUE_INLINE_GITHUB_EXPRESSION})"
+)
+OPAQUE_INLINE_LITERAL_WORD_PREFIX = (
+    r"(?:\\.|[^\s'\"\\$\x60]|'(?:[^']*)'|"
+    r'"(?:[^"\\$\x60]|\\.)*")*'
+)
+OPAQUE_INLINE_SHELL_C_PREFIX = (
+    rf"(?<![A-Za-z0-9_-]){TOOL_PATH_PREFIX}"
+    r"(?:busybox\s+sh|bash|sh|dash|zsh|ksh|ash)"
+    r"(?:\s+--?[A-Za-z][A-Za-z-]*)*"
+    r"\s+-[A-Za-z]*c[A-Za-z]*\s+"
+)
 OPAQUE_INLINE_SHELL = re.compile(
     # A double-quoted or unquoted `-c` operand is assembled by the outer shell,
     # so a substitution can change the program text before the nested shell
@@ -1349,10 +1368,15 @@ OPAQUE_INLINE_SHELL = re.compile(
     # substitutions inside it belong to the nested shell and are scanned there
     # as ordinary command/argument positions instead of making the whole script
     # opaque.
-    r"(?:\b(?:bash|sh)\s+-c\s+(?:"
-    r'"(?:[^"\\]|\\.)*\$\('
-    r"|(?:\\.|[^\s'\"\\])*\$\()|"
-    r"\beval\s+[^\n]*\$\(|"
+    rf"(?:{OPAQUE_INLINE_SHELL_C_PREFIX}"
+    + OPAQUE_INLINE_LITERAL_WORD_PREFIX
+    + rf"(?:{OPAQUE_INLINE_OUTER_EXPANSION}|"
+    r'"(?:[^"\\$\x60]|\\.)*'
+    + rf"{OPAQUE_INLINE_OUTER_EXPANSION}|"
+    r"'(?:[^'])*\\?"
+    + OPAQUE_INLINE_GITHUB_EXPRESSION
+    + r")|"
+    rf"\beval\s+[^\n]*{OPAQUE_INLINE_OUTER_EXPANSION}|"
     r"(?:\bsource|(?<!\S)\.)\s+<\()"
 )
 # One command word may be assembled from several adjacent expansions, with or
@@ -13864,6 +13888,49 @@ pre_build = []
             "a literal single-quoted nested shell with a benign substitution "
             "was reported as generated code"
         )
+    escaped_nested_parameter = 'sh -c "echo \\$payload" sh\n'
+    if contains_direct_trusted_shell_cross_surface(
+        escaped_nested_parameter
+    ) or generic_action_cross_surfaces(
+        escaped_nested_parameter,
+        name="scripts/escaped-nested-parameter.sh",
+        include_opaque_shell_executable=True,
+    ):
+        failures.append(
+            "an outer-escaped nested-shell parameter was reported as generated code"
+        )
+    braced_parameter = "$" + "{payload}"
+    github_expression = "$" + "{{ inputs.payload }}"
+    for generated_label, generated_program in (
+        ("double-quoted parameter", 'sh -c "echo $payload" sh\n'),
+        (
+            "combined-option parameter",
+            f'dash -lc "echo {braced_parameter}" sh\n',
+        ),
+        (
+            "adjacent quote parameter",
+            "busybox sh -c 'echo '\"$payload\" sh\n",
+        ),
+        (
+            "single-quoted GitHub expression",
+            f"sh -c 'echo {github_expression}' sh\n",
+        ),
+        (
+            "escaped GitHub expression",
+            f'sh -c "echo \\{github_expression}" sh\n',
+        ),
+    ):
+        if not contains_direct_trusted_shell_cross_surface(generated_program) or not (
+            generic_action_cross_surfaces(
+                generated_program,
+                name="scripts/generated-nested-shell.sh",
+                include_opaque_shell_executable=True,
+            )
+        ):
+            failures.append(
+                f"a {generated_label} assembling nested-shell source stopped "
+                "failing closed"
+            )
     for nested_label, nested_program in (
         (
             "literal",
