@@ -238,7 +238,9 @@ fn test_x509_malformed_pem_error_withholds_configured_source() {
             "trusted_certs": [MALFORMED_INLINE_PEM]
         }
     });
-    let err = SoapWsSecurity::new(&config).expect_err("malformed PEM must fail");
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("malformed PEM must fail");
     assert!(
         err.contains("failed to decode PEM"),
         "must fail on the decode arm, not an earlier one: {err}"
@@ -265,7 +267,9 @@ fn test_saml_malformed_pem_error_withholds_configured_source() {
             "allowed_algorithms": ["rsa-sha256"]
         }
     });
-    let err = SoapWsSecurity::new(&config).expect_err("malformed PEM must fail");
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("malformed PEM must fail");
     assert!(
         err.contains("failed to decode PEM"),
         "must fail on the SAML decode arm: {err}"
@@ -296,7 +300,9 @@ fn test_x509_unparsable_cert_error_withholds_configured_source() {
             "trusted_certs": [source]
         }
     });
-    let err = SoapWsSecurity::new(&config).expect_err("unparsable cert must fail");
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("unparsable cert must fail");
     assert!(
         err.contains("failed to parse X.509 cert"),
         "must fail on the DER-parse arm: {err}"
