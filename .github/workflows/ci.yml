@@ -3609,10 +3609,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          required_workflows=(
-            "Coverage"
-            "Gateway API Conformance"
-            "Mesh E2E Sidecar Live Datapath"
+          # Each record binds the API endpoint, the run-reported workflow path,
+          # and the display name. A display name alone is not an identity: a
+          # second workflow can reuse it and must never satisfy publication for
+          # a missing canonical run.
+          required_workflow_specs=(
+            "coverage.yml|.github/workflows/coverage.yml|Coverage"
+            "gateway-api-conformance.yml|.github/workflows/gateway-api-conformance.yml|Gateway API Conformance"
+            "mesh-e2e-sidecar-live.yml|.github/workflows/mesh-e2e-sidecar-live.yml|Mesh E2E Sidecar Live Datapath"
           )
 
           # Bound the wait inside `timeout-minutes` so the runner is never held
@@ -3620,37 +3624,53 @@ jobs:
           deadline=$((SECONDS + 3600))
 
           while :; do
-            # Accept only runs of this exact commit, produced by a `push` event
-            # on this exact branch. Without the branch check a same-SHA push run
-            # on any other branch could satisfy the gate before the real `main`
-            # run finished.
-            runs="$({
-              gh api --paginate \
-                -H "Accept: application/vnd.github+json" \
-                "/repos/${REPOSITORY}/actions/runs?head_sha=${HEAD_SHA}&event=push&branch=${BRANCH_NAME}&per_page=100" \
-                --jq '.workflow_runs[] | [.name, .status, (.conclusion // ""), .head_branch, .event, .head_sha] | @tsv'
-            })"
-
-            # A record that does not carry exactly six fields cannot be matched
-            # field by field, so reject malformed run data instead of silently
-            # skipping it and concluding the workflow never started.
-            if awk -F '\t' 'NF > 0 && NF != 6 { found = 1 } END { exit !found }' \
-              <<<"$runs"; then
-              echo "::error::Malformed workflow run data for ${HEAD_SHA}."
-              exit 1
-            fi
-
             pending=0
 
-            for workflow in "${required_workflows[@]}"; do
+            for specification in "${required_workflow_specs[@]}"; do
+              IFS='|' read -r workflow_file workflow_path workflow <<<"$specification"
+
+              # Query the canonical workflow endpoint, not the repository-wide
+              # run list. The endpoint identity prevents a different workflow
+              # with the same display name from satisfying this requirement.
+              # The remaining fields independently bind the run to this exact
+              # file, name, commit, push event, and branch.
+              runs="$({
+                gh api --paginate \
+                  -H "Accept: application/vnd.github+json" \
+                  "/repos/${REPOSITORY}/actions/workflows/${workflow_file}/runs?head_sha=${HEAD_SHA}&event=push&branch=${BRANCH_NAME}&per_page=100" \
+                  --jq '.workflow_runs[] | [.name, .path, .status, (.conclusion // ""), .head_branch, .event, .head_sha] | @tsv'
+              })"
+
+              # A record that does not carry exactly seven fields cannot be
+              # matched field by field. Reject malformed data instead of
+              # silently treating the canonical workflow as absent.
+              if awk -F '\t' 'NF > 0 && NF != 7 { found = 1 } END { exit !found }' \
+                <<<"$runs"; then
+                echo "::error::Malformed ${workflow_path} run data for ${HEAD_SHA}."
+                exit 1
+              fi
+
+              # The workflow-specific endpoint should return only this file.
+              # Verify both server-reported identity fields anyway so an API or
+              # repository identity drift fails immediately and visibly.
+              if awk -F '\t' \
+                -v name="$workflow" \
+                -v path="$workflow_path" \
+                'NF == 7 && ($1 != name || $2 != path) { found = 1 } END { exit !found }' \
+                <<<"$runs"; then
+                echo "::error::Workflow identity mismatch for ${workflow_path}."
+                exit 1
+              fi
+
               # Every matching run must succeed. Selecting a single run would
               # let one passing duplicate mask a failed run of the same
               # workflow for this same commit and branch.
               matching="$(awk -F '\t' \
                 -v name="$workflow" \
+                -v path="$workflow_path" \
                 -v branch="$BRANCH_NAME" \
                 -v sha="$HEAD_SHA" \
-                'NF == 6 && $1 == name && $4 == branch && $5 == "push" && $6 == sha { print $2 "\t" $3 }' \
+                'NF == 7 && $1 == name && $2 == path && $5 == branch && $6 == "push" && $7 == sha { print $3 "\t" $4 }' \
                 <<<"$runs")"
               if [ -z "$matching" ]; then
                 echo "Waiting for ${workflow} to start for ${HEAD_SHA}."

@@ -138,7 +138,7 @@ MAIN_PUBLISH_WORKFLOWS = {
 # itself protected by the trusted Cross policy, so updating the digest requires
 # the same trusted-base procedure as updating the gate.
 MAIN_PUBLISH_GATE_SHA256 = (
-    "a9b0c774543958c3b1b7d176ace545f2817eee86af907f145105646fee9c183b"
+    "3de694218bad2aa7286a9cef1843ea6e12a0c0f5d75fdfaa8c1a3b7bdc7f35cc"
 )
 
 
@@ -287,10 +287,13 @@ def main() -> int:
         planner_errors.append(
             "jobs.main-publish-gate must depend on Tests and build-binaries"
         )
-    for workflow in sorted(MAIN_PUBLISH_WORKFLOWS.values()):
-        if f'            "{workflow}"' not in publish_gate_body:
+    for workflow_path, workflow in sorted(MAIN_PUBLISH_WORKFLOWS.items()):
+        workflow_file = Path(workflow_path).name
+        specification = f"{workflow_file}|{workflow_path}|{workflow}"
+        if f'            "{specification}"' not in publish_gate_body:
             planner_errors.append(
-                f"jobs.main-publish-gate must wait for `{workflow}`"
+                "jobs.main-publish-gate must bind canonical workflow "
+                f"`{workflow_path}` to display name `{workflow}`"
             )
     # The gate polls the Actions API, so it must stay scoped to `main` pushes.
     # Without this it would become a runner-holding mirror job on every pull
