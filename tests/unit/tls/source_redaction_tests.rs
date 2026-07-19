@@ -151,6 +151,69 @@ fn non_provider_sources_are_reported_verbatim() {
     }
 }
 
+/// A provider URI's query options are part of the same secret reference as its
+/// identifier, so they must be withheld on the same test.
+///
+/// `subscription::source_poll_interval` logs the offending `?poll=` value beside
+/// `redacted_source_id()` when it cannot be parsed. Redacting the identifier and
+/// then printing an option out of the same URI re-disclosed a slice of exactly
+/// what was just withheld. The textual backstop cannot cover it either: it
+/// matches a candidate *inside* a message, and the printed option is a
+/// **substring of** the resolved URI rather than the other way round, so no
+/// candidate ever matches.
+#[test]
+fn provider_uri_option_values_are_withheld() {
+    const POLL_SENTINEL: &str = "poll-option-sentinel-must-not-be-printed";
+    for raw in PROVIDER_URIS {
+        let source = uri_source(&format!("{raw}?poll={POLL_SENTINEL}"));
+        let CertSource::Uri(uri) = &source else {
+            panic!("{raw} must parse as a URI source");
+        };
+        let rendered = uri.redacted_option_value(POLL_SENTINEL);
+        assert!(
+            !rendered.contains(POLL_SENTINEL),
+            "{raw}: a provider URI's option value must not be echoed, got: {rendered}"
+        );
+        assert_eq!(
+            rendered,
+            ferrum_edge::secrets::EXTERNAL_SECRET_PLACEHOLDER,
+            "{raw}: the option must be withheld with the shared placeholder"
+        );
+    }
+}
+
+/// Non-vacuity control for the above: a locally configured source keeps its
+/// option value verbatim.
+///
+/// Without this, withholding unconditionally would pass the redaction assertion
+/// while destroying the diagnostic. `file`/`k8s`/`acme`/`managed` URIs are
+/// operator-authored local configuration — a malformed `?poll=` there is a
+/// typo the operator must be able to see, and the same reasoning already keeps
+/// their identifiers verbatim in `non_provider_sources_are_reported_verbatim`.
+///
+/// This process resolved no external secrets, so the provenance test is `false`
+/// and only the scheme test applies.
+#[test]
+fn local_source_option_values_stay_verbatim() {
+    let local = [
+        "file:///etc/ferrum/tls/server.pem",
+        "k8s://ferrum/tls-secret#tls.crt",
+        "acme://certificates/edge-cert#cert",
+        "managed://edge-cert#cert",
+    ];
+    for raw in local {
+        let source = uri_source(&format!("{raw}?poll=nope"));
+        let CertSource::Uri(uri) = &source else {
+            panic!("{raw} must parse as a URI source");
+        };
+        assert_eq!(
+            uri.redacted_option_value("nope"),
+            "nope",
+            "{raw} is local configuration; its malformed option must stay diagnosable"
+        );
+    }
+}
+
 /// Inline PEM keeps its existing constant, which already discloses nothing.
 #[test]
 fn inline_pem_stays_redacted() {

@@ -230,6 +230,50 @@ impl CertSourceUri {
             self.source_id()
         }
     }
+
+    /// Render one of this URI's query-option values for an operator-facing
+    /// diagnostic, withholding it when the URI it came from is secret material.
+    ///
+    /// [`Self::redacted_source_id`] withholds the *identifier*, but the query
+    /// string is part of the same configured value, and an option logged beside
+    /// the redacted identifier re-disclosed a slice of what was just withheld:
+    /// `vault://secret/data/cert?poll=<token>` printed `<token>` verbatim.
+    ///
+    /// The textual backstop cannot reach it. `secrets::redact_external_secret_values`
+    /// matches a candidate *inside* a message, and here the containment is
+    /// inverted — the printed option is a **substring of** the resolved URI, so
+    /// the URI candidate never matches it. Deriving each query value into its own
+    /// candidate was rejected for the reason
+    /// [`RedactionPlan::MIN_DERIVED_CANDIDATE_LEN`][min] gives: arming short,
+    /// arbitrary option values process-wide shreds unrelated output.
+    ///
+    /// Two provenance tests, matching the two ways the value can be secret:
+    ///
+    /// 1. A secret-provider scheme (`vault`/`aws`/`azure`/`gcp`) — the whole URI
+    ///    is a secret reference, so its options are too. Same classifier as
+    ///    [`Self::redacted_source_id`], so identifier and options cannot diverge.
+    /// 2. A URI that embeds an externally resolved value
+    ///    ([`crate::secrets::contains_external_secret_value`]) — a `file://`
+    ///    source materialized from `FERRUM_FRONTEND_TLS_CERT_SOURCE_FILE` is
+    ///    operator-authored in shape but secret in provenance, and its
+    ///    `source_id` is otherwise printed verbatim.
+    ///
+    /// Otherwise the value is returned unchanged: `file`/`k8s`/`acme`/`managed`/
+    /// `pkcs11` sources that were configured locally are ordinary operator input,
+    /// and a malformed option there must stay diagnosable.
+    ///
+    /// [min]: crate::secrets
+    pub fn redacted_option_value(&self, rendered: &str) -> String {
+        if self.scheme.is_secret_provider()
+            || crate::secrets::contains_external_secret_value(&self.source_id())
+        {
+            return crate::secrets::EXTERNAL_SECRET_PLACEHOLDER.to_string();
+        }
+        // The option is not itself secret-derived, but the text may still quote
+        // some *other* resolved variable's value verbatim. A no-op in a process
+        // that resolved no external secrets.
+        crate::secrets::redact_external_secret_values(rendered)
+    }
 }
 
 /// Substituted for a secret provider's identifier in operator-facing output.

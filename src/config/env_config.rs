@@ -4744,7 +4744,10 @@ impl EnvConfig {
             return Err(format!(
                 "FERRUM_ADMIN_JWT_MAX_TTL ({}) exceeds the maximum supported value ({}); \
                  use 0 to disable the lifetime cap",
-                self.admin_jwt_max_ttl,
+                crate::secrets::report_env_field(
+                    "FERRUM_ADMIN_JWT_MAX_TTL",
+                    &self.admin_jwt_max_ttl.to_string()
+                ),
                 i64::MAX
             ));
         }
@@ -4752,9 +4755,18 @@ impl EnvConfig {
         if self.http3_initial_mtu < crate::http3::config::QUIC_INITIAL_MTU_MIN
             || self.http3_initial_mtu > crate::http3::config::QUIC_INITIAL_MTU_MAX
         {
+            // Key-tied for the same reason as the overload thresholds below: the
+            // rejected MTU is re-rendered as its canonical `u16` `Display`, so a
+            // secret-backed `071` surfaces as `71` — two bytes, below
+            // `MIN_DERIVED_CANDIDATE_LEN`, which the textual pass may not admit.
+            // Only values under `QUIC_INITIAL_MTU_MIN` (1200) can reach here in
+            // practice, so the leaked rendering is always 1-4 digits.
             return Err(format!(
                 "FERRUM_HTTP3_INITIAL_MTU ({}) is outside quinn's legal range [{}, {}]",
-                self.http3_initial_mtu,
+                crate::secrets::report_env_field(
+                    "FERRUM_HTTP3_INITIAL_MTU",
+                    &self.http3_initial_mtu.to_string()
+                ),
                 crate::http3::config::QUIC_INITIAL_MTU_MIN,
                 crate::http3::config::QUIC_INITIAL_MTU_MAX,
             ));

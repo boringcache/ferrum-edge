@@ -678,6 +678,102 @@ async fn functional_cli_validate_redacts_resolved_value_in_settings_error() {
     );
 }
 
+/// A hand-written `EnvConfig::validate()` scalar diagnostic must withhold a
+/// secret-backed value by key, not rely on the textual backstop.
+///
+/// `FERRUM_HTTP3_INITIAL_MTU` is re-rendered as the canonical `u16` `Display` of
+/// what was parsed, so a resolved `071` reaches the operator as `71`. The exact
+/// materialized value has no minimum length and would be filtered, but `71` is a
+/// *derived* form at two bytes — below `MIN_DERIVED_CANDIDATE_LEN`, which the
+/// textual pass deliberately will not admit, because arming a two-digit string
+/// process-wide shreds every unrelated diagnostic containing it. So this
+/// rendering is only covered if the site names the variable.
+///
+/// The padding is load-bearing: `071` parses to a legal `u16` but is below
+/// `QUIC_INITIAL_MTU_MIN` (1200), so it reaches the range check rather than
+/// failing to parse earlier, and it is the *only* thing that can produce this
+/// error — reaching it proves the `_FILE` source really was materialized.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_withholds_secret_backed_scalar_in_range_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let jwt_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&jwt_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+    let mtu_path = temp_dir.path().join("initial-mtu");
+    std::fs::write(&mtu_path, "071").unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env("FERRUM_ADMIN_JWT_SECRET_FILE", jwt_path.to_str().unwrap())
+        .env("FERRUM_HTTP3_INITIAL_MTU_FILE", mtu_path.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "an out-of-range resolved MTU must fail validation: stdout={stdout}, stderr={stderr}"
+    );
+    // The variable name and the legal range stay actionable.
+    assert!(
+        stderr.contains("FERRUM_HTTP3_INITIAL_MTU"),
+        "expected the range diagnostic, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("value from external secret source"),
+        "expected the withheld-value marker, got: {stderr}"
+    );
+    // The canonical rendering of the resolved value is what leaked. Assert the
+    // exact interpolation rather than a bare `71`, which occurs incidentally in
+    // unrelated numbers.
+    assert!(
+        !stderr.contains("FERRUM_HTTP3_INITIAL_MTU (71)")
+            && !stdout.contains("FERRUM_HTTP3_INITIAL_MTU (71)"),
+        "the parsed rendering of an externally resolved value must not be printed: \
+         stdout={stdout}, stderr={stderr}"
+    );
+}
+
+/// Non-vacuity control for the test above: an ordinary, non-secret-backed value
+/// stays visible in the same diagnostic.
+///
+/// Key-tied withholding is scoped to variables that were externally resolved.
+/// Without this control, a site that withheld the value unconditionally — or one
+/// that simply stopped printing it — would satisfy the redaction assertion while
+/// making an ordinary misconfiguration undiagnosable.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_shows_ordinary_scalar_in_range_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let jwt_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&jwt_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env("FERRUM_ADMIN_JWT_SECRET_FILE", jwt_path.to_str().unwrap())
+        // Set directly rather than through a `_FILE` suffix: this variable was
+        // not externally resolved, so the value must survive.
+        .env("FERRUM_HTTP3_INITIAL_MTU", "1199")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "an out-of-range MTU must fail validation: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("FERRUM_HTTP3_INITIAL_MTU (1199)"),
+        "an ordinary configuration value must stay diagnosable, got: {stderr}"
+    );
+}
+
 /// Redaction must read the original diagnostic only, never the text it just
 /// substituted.
 ///

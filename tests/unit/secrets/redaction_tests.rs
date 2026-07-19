@@ -1005,6 +1005,61 @@ fn a_scheme_stripped_file_source_is_redacted() {
     assert!(message.contains("Invalid certificate at"));
 }
 
+/// A `file://` TLS source URI that was *itself* materialized from a `_FILE`
+/// suffix is secret in provenance even though its scheme is local in shape, so
+/// its query options must be withheld too.
+///
+/// This is the second half of `CertSourceUri::redacted_option_value`. The scheme
+/// test alone would report this source's `?poll=` value verbatim — `file://` is
+/// not a secret provider — but the whole URI came out of
+/// `FERRUM_FRONTEND_TLS_CERT_SOURCE_FILE`, so the option is a slice of resolved
+/// secret material. `contains_external_secret_value` answers that by provenance
+/// rather than by arming the option value as a candidate, which at these lengths
+/// would shred unrelated output.
+///
+/// Lives in this file because it needs redaction armed, and this file owns the
+/// single `record_external_secret_keys` call for the `unit_tests` binary.
+#[test]
+fn an_externally_sourced_file_uri_withholds_its_option_values() {
+    use ferrum_edge::tls::source::{CertSource, MaterialKind};
+    arm_redaction();
+
+    const POLL_SENTINEL: &str = "poll-provenance-sentinel-must-not-be-printed";
+    let source = CertSource::parse(
+        &format!("{FILE_URI_VALUE}?poll={POLL_SENTINEL}"),
+        MaterialKind::Cert,
+    );
+    let CertSource::Uri(uri) = &source else {
+        panic!("the fixture must parse as a URI source");
+    };
+
+    // Precondition: the scheme test does not fire, so this asserts the
+    // provenance test specifically rather than passing for the other reason.
+    assert!(
+        !uri.scheme.is_secret_provider(),
+        "the fixture must be a non-provider scheme for this test to be meaningful"
+    );
+
+    let rendered = uri.redacted_option_value(POLL_SENTINEL);
+    assert!(
+        !rendered.contains(POLL_SENTINEL),
+        "an option out of an externally resolved URI must not be echoed: {rendered}"
+    );
+    assert_eq!(rendered, EXTERNAL_SECRET_PLACEHOLDER);
+
+    // Non-vacuity: an otherwise identical URI that was *not* externally
+    // resolved keeps its option, so the withholding above is provenance-driven
+    // and not a blanket rule for every `file://` source.
+    let local = CertSource::parse(
+        "file:///etc/ferrum/tls/local-cert.pem?poll=nope",
+        MaterialKind::Cert,
+    );
+    let CertSource::Uri(local_uri) = &local else {
+        panic!("the control must parse as a URI source");
+    };
+    assert_eq!(local_uri.redacted_option_value("nope"), "nope");
+}
+
 /// A database URL reaches the operator credential-redacted, which leaves the
 /// host, path, and query of the externally resolved value intact.
 #[test]

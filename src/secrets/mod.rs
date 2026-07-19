@@ -214,6 +214,32 @@ pub fn quoted_env_value(env_key: &str, rendered: &str) -> String {
     format!("'{}'", redact_external_secret_values(rendered))
 }
 
+/// True when `text` carries an externally resolved secret value, or one of the
+/// bounded derived forms [`derive_candidates`] produces for it.
+///
+/// This answers a question [`redact_external_secret_values`] cannot: whether a
+/// string is *made of* resolved material, rather than what it looks like once
+/// the resolved material has been removed from it. Redaction matches a candidate
+/// **inside** a message, so it covers a diagnostic that quotes a whole resolved
+/// value — but a caller that is about to print a *fragment* of such a value has
+/// the containment the other way round, and no candidate matches. The fragment
+/// then escapes even though the value it came from is armed.
+///
+/// `tls::source::CertSourceUri::redacted_option_value` is the motivating case: a
+/// source URI materialized from `FERRUM_FRONTEND_TLS_CERT_SOURCE_FILE` carries
+/// its `?poll=` option inside the resolved value, so logging that option alone
+/// discloses a slice of a secret the redactor will never match. Deriving every
+/// query value into a candidate instead was rejected: it would arm short,
+/// arbitrary strings process-wide, which is precisely the blind substring
+/// corruption [`RedactionPlan::MIN_DERIVED_CANDIDATE_LEN`] exists to prevent.
+/// Asking about provenance is exact, bounded, and arms nothing.
+///
+/// `false` in any process that resolved no external secrets, so ordinary
+/// configuration diagnostics keep printing their values.
+pub fn contains_external_secret_value(text: &str) -> bool {
+    redaction_plan().is_some_and(|plan| plan.contains_candidate(text))
+}
+
 /// Remove externally resolved secret values from an operator-facing message.
 ///
 /// This is the backstop behind the structured boundary in

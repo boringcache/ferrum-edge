@@ -825,12 +825,23 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // Start the main multi-threaded runtime for the gateway
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     rt_builder.enable_all();
+    // Key-tied for the same reason as the logging-clamp fields above: both are
+    // parsed to `usize` and clamped with `.max(1)` before being re-rendered, so
+    // a secret-backed `004` surfaces as `4` and a `0` as `1`. Those are derived
+    // one-byte forms, below `MIN_DERIVED_CANDIDATE_LEN`, which the structural
+    // log-record redactor deliberately will not admit.
     if let Some(workers) = env_config.worker_threads {
-        info!("Tokio worker threads: {}", workers);
+        info!(
+            "Tokio worker threads: {}",
+            secrets::report_env_field("FERRUM_WORKER_THREADS", &workers.to_string())
+        );
         rt_builder.worker_threads(workers);
     }
     if let Some(blocking) = env_config.blocking_threads {
-        info!("Tokio max blocking threads: {}", blocking);
+        info!(
+            "Tokio max blocking threads: {}",
+            secrets::report_env_field("FERRUM_BLOCKING_THREADS", &blocking.to_string())
+        );
         rt_builder.max_blocking_threads(blocking);
     }
     let rt = match rt_builder.build() {

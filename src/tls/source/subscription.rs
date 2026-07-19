@@ -189,7 +189,11 @@ fn source_poll_interval(
                 Err(details) => {
                     warn!(
                         source_id = %uri.redacted_source_id(),
-                        poll = %raw,
+                        // The option is part of the same configured URI as the
+                        // identifier above, so it is withheld on the same
+                        // provenance test. `details` is a fixed classification
+                        // string and stays actionable either way.
+                        poll = %uri.redacted_option_value(raw),
                         details = %details,
                         "Invalid TLS material source poll interval; using default"
                     );
