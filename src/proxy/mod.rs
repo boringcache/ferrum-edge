@@ -496,14 +496,11 @@ pub(crate) fn stamp_original_response_metadata(
     // response be inspected as though it carried no coding at all. Pure
     // `identity` stays unstamped, so no consumer of this key sees an
     // unencoded response as encoded.
-    if let Some(encoding) = response_headers
-        .get("content-encoding")
-        .filter(|encoding| {
-            crate::plugins::response_representation::content_encoding_requires_decode_judgment(
-                encoding.as_str(),
-            )
-        })
-    {
+    if let Some(encoding) = response_headers.get("content-encoding").filter(|encoding| {
+        crate::plugins::response_representation::content_encoding_requires_decode_judgment(
+            encoding.as_str(),
+        )
+    }) {
         ctx.metadata.insert(
             ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
             encoding.clone(),

@@ -2182,7 +2182,8 @@ async fn empty_backend_coding_tokens_are_rejected_as_malformed() {
         headers.insert("content-encoding".to_string(), content_encoding.to_string());
         let body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
 
-        let (replaced, _, status, _, body, reason) = run_backend_transform(200, headers, body).await;
+        let (replaced, _, status, _, body, reason) =
+            run_backend_transform(200, headers, body).await;
 
         assert!(
             replaced,
@@ -2346,7 +2347,12 @@ async fn relabelled_framed_grpc_responses_are_not_claimed_as_json() {
             None,
         ),
         // Native gRPC over an H3/extended path that also omitted the type.
-        (HttpFlavor::Grpc, Some("application/grpc-web+proto"), None, None),
+        (
+            HttpFlavor::Grpc,
+            Some("application/grpc-web+proto"),
+            None,
+            None,
+        ),
     ];
 
     for (flavor, retained, backend_content_type, relabelled) in cases {
