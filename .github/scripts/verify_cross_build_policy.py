@@ -7382,6 +7382,27 @@ def heredoc_pipeline_tail(line: str, start: int) -> str:
     operators rather than separators, so only `;`, `;;`, `&&`, `||`, and a lone
     `&` end the search.
 
+    Only *outer* separators end the pipeline. A separator written inside a
+    nested command construct belongs to that construct, not to the line:
+    `cat <<'EOF' $(true; true) | bash` still pipes the body into Bash, because
+    the `;` is the substitution's own separator. Tracking quotes alone stopped
+    at that `;`, never reached the outer `| bash`, and let a body that Bash
+    really executes be withdrawn as inert template data. Backticks, process
+    substitutions, subshells and nesting of any depth create the same
+    confusion, so the scan carries a stack of the closers it still owes.
+
+    The stack is maintained by this same loop rather than by intersecting the
+    result of a separate span scan: two scanners with independent quote state
+    disagree on which openers are real (a `$(` inside quotes is a span to one
+    and prose to the other), and the disagreement resolves toward truncating
+    early, which is the fail-open direction. One pass keeps quote state and
+    nesting state consistent by construction.
+
+    Unbalanced syntax is resolved fail-closed. An unterminated construct
+    consumes the rest of the line, so the tail is returned whole and a piped
+    interpreter inside it is still found: the body is scanned as a possible
+    program instead of being trusted as data.
+
     This is the one place that decision is made; both heredoc classifiers call
     it so they cannot drift apart.
     """
@@ -7389,6 +7410,10 @@ def heredoc_pipeline_tail(line: str, start: int) -> str:
     tail = line[start:]
     quote: str | None = None
     escaped = False
+    # Closers still owed by the nested constructs the scan has entered. While
+    # this is non-empty every separator belongs to a nested command, not to the
+    # pipeline this heredoc opened.
+    pending: list[str] = []
     index = 0
     while index < len(tail):
         character = tail[index]
@@ -7407,6 +7432,32 @@ def heredoc_pipeline_tail(line: str, start: int) -> str:
             continue
         if character in "'\"":
             quote = character
+            index += 1
+            continue
+        if pending and character == pending[-1]:
+            pending.pop()
+            index += 1
+            continue
+        if character == "`":
+            # Backticks are their own closer, so an unmatched one opens a
+            # region that runs to the end of the line.
+            pending.append("`")
+            index += 1
+            continue
+        if tail.startswith("$(", index) or tail.startswith("${", index):
+            # `$((` arithmetic opens `$(` then a bare `(`, so `))` closes both.
+            pending.append(")" if tail[index + 1] == "(" else "}")
+            index += 2
+            continue
+        if character == "(" or (
+            character in "<>" and tail.startswith("(", index + 1)
+        ):
+            # A subshell group or a `<(...)`/`>(...)` process substitution.
+            pending.append(")")
+            index += 2 if character in "<>" else 1
+            continue
+        if pending:
+            # Inside a nested construct nothing below terminates the pipeline.
             index += 1
             continue
         if character == ";":
@@ -13511,6 +13562,44 @@ pre_build = []
         if not piped_programs:
             failures.append(
                 f"a {piped_label} piped heredoc body was not read as a program"
+            )
+    # A separator inside a nested construct is that construct's own, not the
+    # line's. `$(true; true)` expands to nothing, so `cat` still receives the
+    # heredoc and the outer `| bash` still executes it. Stopping the pipeline
+    # scan at the nested `;` never reached that pipe and withdrew a body Bash
+    # really runs as inert template data.
+    for nested_opener, nested_label in (
+        ("cat <<'DOC' $(true; true) | bash\n", "substitution"),
+        ("cat <<'DOC' `true; true` | bash\n", "backtick"),
+        ("cat <<'DOC' $(echo $(true; true)) | bash\n", "nested substitution"),
+        ("cat <<'DOC' <(true; true) | bash\n", "process substitution"),
+        # Unbalanced syntax resolves toward scanning the body, not trusting it.
+        ("cat <<'DOC' $(true; true | bash\n", "unterminated substitution"),
+    ):
+        nested_programs, _ = executable_heredocs(
+            f"{nested_opener}key: $cmd build\nDOC\n",
+            f"self-test {nested_label} heredoc pipeline",
+        )
+        if not nested_programs:
+            failures.append(
+                f"a heredoc piped past a {nested_label} was not read as a "
+                "program"
+            )
+    # The discriminating controls: nesting awareness must not blanket-classify.
+    # An outer separator that *follows* a balanced construct still ends the
+    # pipeline, so the later interpreter never receives this body.
+    for outer_opener, outer_label in (
+        ("cat <<'DOC' $(true); echo safe | python3\n", "substitution"),
+        ("cat <<'DOC' `true` && echo safe | python3\n", "backtick"),
+    ):
+        outer_programs, _ = executable_heredocs(
+            f"{outer_opener}key: $cmd build\nDOC\n",
+            f"self-test post-{outer_label} separator heredoc pipeline",
+        )
+        if outer_programs:
+            failures.append(
+                f"a separator after a {outer_label} did not end the heredoc "
+                "pipeline"
             )
     # A wrapper that execs its operand directly leaves `NAME=value` as argv, and
     # no later pass may skip it back into an assignment word.
