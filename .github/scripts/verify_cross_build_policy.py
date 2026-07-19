@@ -4406,10 +4406,21 @@ def inline_interpreter_has_cross(
                     "inline python program",
                     reject_dynamic_commands=True,
                 )
-                if any(
-                    literal_command_text_has_cross(command) for command in commands
-                ):
-                    return True
+                # Keep the recursion-safe literal command reader here: this
+                # path is itself reached from the shell scanner, so re-entering
+                # the alias/shim-aware top-level reader can recurse through the
+                # same inline program. The process command still owes the same
+                # opaque-stdin policy as every other Python provenance path.
+                # Without the scope, PR comparison (which enables opaque
+                # executable words) could accept an escaped producer because
+                # this narrower reader did not receive that flag, while exact
+                # workflow validation rejected it through its outer scope.
+                with opaque_stdin_program_scope():
+                    if any(
+                        literal_command_text_has_cross(command)
+                        for command in commands
+                    ):
+                        return True
                 # Inline Python one-liners that shell scripts already use to
                 # reshape JSON dispatch no processes at all, so an unresolvable
                 # command only fails closed once the program itself mentions
@@ -15804,6 +15815,36 @@ pre_build = []
         failures.append(
             "a readable benign stdin program extracted from Python failed "
             "automation validation"
+        )
+    # Inline `python -c` reaches the recursion-safe literal command reader
+    # rather than `process_commands_have_cross`. PR comparison supplies its
+    # opaque-executable policy through an argument, not the global stdin scope,
+    # so dropping that distinction inside the narrower reader used to make the
+    # proposed workflow look insensitive even though trusted-tree validation
+    # rejected the same escaped producer.
+    opaque_inline_python_run = (
+        "python3 -c \"import subprocess; "
+        "subprocess.run('printf \\\"\\\\\\\\x63ross build --target "
+        "aarch64-unknown-linux-gnu\\\" | bash', shell=True)\""
+    )
+    opaque_inline_python_workflow = opaque_stdin_workflow.replace(
+        opaque_stdin_run,
+        opaque_inline_python_run,
+        1,
+    )
+    benign_inline_python_workflow = opaque_stdin_workflow.replace(
+        opaque_stdin_run,
+        "python3 -c \"print('safe')\"",
+        1,
+    )
+    if not compare_pr_workflow_collection(
+        {"inline-python.yml": benign_inline_python_workflow},
+        {"inline-python.yml": opaque_inline_python_workflow},
+        "self-test inline Python workflow",
+    ):
+        failures.append(
+            "an opaque stdin producer extracted from inline Python passed PR "
+            "workflow comparison"
         )
     # The benign controls: a producer this scanner *can* decode, and whose
     # decoded program dispatches nothing, must stay accepted on both entry

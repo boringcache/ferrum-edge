@@ -617,7 +617,8 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   through the literal scan — accepted on `main` what comparison had rejected on
   the pull request. Literal shell commands extracted from Python process APIs
   re-enter that same opaque-stdin scope, including commands discovered through
-  an explicit Python interpreter edge to a suffixless helper.
+  an explicit Python interpreter edge to a suffixless helper or an inline
+  `python -c` program.
   A `shell: pwsh`/`powershell` body, a PowerShell `-Command` operand, a
   PowerShell heredoc, and a `SHELL ["pwsh", ...]` Dockerfile selection are
   parsed as PowerShell rather than as POSIX shell: `Start-Process`,
