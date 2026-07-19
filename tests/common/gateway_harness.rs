@@ -822,6 +822,11 @@ impl TestGatewayBuilder {
             db_url,
             config_path,
             env,
+            // Keep the harness temp dir alive for as long as callers hold this
+            // result: `db_url` / `config_path` (and the captured log files we
+            // already read) live inside it. Dropping it here would make those
+            // public diagnostics point at already-deleted paths.
+            _temp_dir: temp_dir,
         })
     }
 }
@@ -834,6 +839,9 @@ pub struct FailedGatewayStart {
     pub db_url: Option<String>,
     pub config_path: Option<PathBuf>,
     env: HashMap<String, String>,
+    /// Retains the spawn temp dir so `db_url` / `config_path` stay valid while
+    /// this result is inspected. Not part of the public diagnostic surface.
+    _temp_dir: TempDir,
 }
 
 impl FailedGatewayStart {

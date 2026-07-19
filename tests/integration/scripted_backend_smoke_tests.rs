@@ -716,6 +716,108 @@ async fn serve_drains_spawned_tasks_when_late_startup_fails() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Regression (PR #2722 / Codex): a pre-bound `ServeOptions.admin_https`
+// socket without both admin TLS paths must be dropped before reserved-port
+// calculation. Without the drop, `serve()` keeps the FD until shutdown and
+// `effective_reserved_ports()` still reserves it — so a stream proxy on that
+// port is rejected and the OS port stays occupied even though nothing serves
+// HTTPS on it.
+//
+// Non-vacuous proof: configure a TCP stream proxy on the same port the
+// unused admin HTTPS socket held. `serve()` succeeding means the port was
+// neither reserved nor still owned by the prebound FD (reserved-port
+// validation and stream bind would both fail otherwise). `bound.admin_https`
+// must stay `None`. The deliberate exception — prebound + both TLS paths
+// still served under port 0 — is unchanged; this test targets the no-TLS
+// drop path only.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_drops_prebound_admin_https_without_tls_before_reserved_ports() {
+    use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
+    use ferrum_edge::config::types::GatewayConfig;
+    use ferrum_edge::config::{EnvConfig, OperatingMode};
+    use ferrum_edge::modes::file::{self, ServeOptions};
+
+    let admin_https_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind prebound admin HTTPS");
+    let admin_https_port = admin_https_listener.local_addr().unwrap().port();
+
+    // Stream proxy on the same port the unused admin HTTPS socket held.
+    // If the prebound FD were still reserved or still bound, serve() fails.
+    let config_json = serde_json::json!({
+        "version": "1",
+        "proxies": [{
+            "id": "stream-on-former-admin-https",
+            "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 65000_u16,
+            "listen_port": admin_https_port,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    });
+    let mut config: GatewayConfig =
+        serde_json::from_value(config_json).expect("deserialize config");
+    config.resolve_dispatch_kind();
+
+    let env_config = EnvConfig {
+        mode: OperatingMode::File,
+        proxy_http_port: 0,
+        proxy_https_port: 0,
+        admin_http_port: 0,
+        // Port 0 plus a prebound socket: the documented exception path, but
+        // without TLS material so the socket must be dropped unused.
+        admin_https_port: 0,
+        admin_tls_cert_path: None,
+        admin_tls_key_path: None,
+        admin_jwt_secret: Some("regression-test-secret-32-chars-min-len".to_string()),
+        admin_jwt_issuer: "regression-test".to_string(),
+        shutdown_drain_seconds: 0,
+        pool_warmup_enabled: false,
+        max_connections: 0,
+        proxy_bind_address: "127.0.0.1".to_string(),
+        stream_proxy_bind_address: "127.0.0.1".to_string(),
+        ..EnvConfig::default()
+    };
+
+    let opts = ServeOptions {
+        admin_https: Some(admin_https_listener),
+        admin_jwt_manager: Some(JwtManager::new(JwtConfig {
+            secret: env_config.admin_jwt_secret.clone().unwrap(),
+            issuer: env_config.admin_jwt_issuer.clone(),
+            audience: None,
+            max_ttl_seconds: 3600,
+            algorithm: jsonwebtoken::Algorithm::HS256,
+        })),
+        skip_initial_capability_refresh: true,
+        background_drain_timeout: Some(Duration::from_millis(200)),
+        ..ServeOptions::default()
+    };
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let handles = file::serve(env_config, config, opts, shutdown_tx.clone())
+        .await
+        .expect(
+            "serve() must accept a stream proxy on the former admin HTTPS port when \
+             the prebound socket is dropped for missing TLS material",
+        );
+
+    assert!(
+        handles.bound.admin_https.is_none(),
+        "no-TLS prebound admin HTTPS must not be served; bound={:?}",
+        handles.bound.admin_https
+    );
+
+    shutdown_tx.send(true).expect("shutdown_tx send");
+    tokio::time::timeout(Duration::from_secs(2), handles.join())
+        .await
+        .expect("join() did not complete within 2 s of shutdown")
+        .expect("listener task panicked");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Regression: `pool_warmup_enabled(...)` and `.env("FERRUM_POOL_WARMUP_ENABLED",
 // ...)` must agree on last-wins ordering across binary AND in-process modes.
 // Pre-fix the helper updated `inner` (binary subprocess env) but NOT

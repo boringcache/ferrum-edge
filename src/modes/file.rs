@@ -74,7 +74,9 @@ pub struct ServeOptions {
     /// FD take precedence over `FERRUM_ADMIN_HTTPS_PORT=0`, but the socket is
     /// served only when both admin TLS paths are configured; that path loads
     /// the TLS material and sets up frontend TLS live reload, starting the
-    /// watcher when enabled. Without both paths, the socket is dropped unused.
+    /// watcher when enabled. Without both paths, the socket is dropped unused
+    /// before reserved-port calculation so it neither occupies the port nor
+    /// reserves it against stream proxies.
     pub admin_https: Option<TcpListener>,
     /// Pre-built admin JWT manager. When `None`, `serve` reads the JWT
     /// secret/issuer/ttl from environment variables (same as the binary
@@ -645,6 +647,31 @@ pub async fn serve(
         config.consumers.len()
     );
 
+    // A caller-owned admin HTTPS socket is served only when both admin TLS
+    // paths are configured (including over `FERRUM_ADMIN_HTTPS_PORT=0`).
+    // Without both paths the socket cannot be used — drop it *before*
+    // reserved-port calculation and later listener setup so it neither
+    // occupies the port until shutdown nor reserves it against stream
+    // proxies. Enabled nonzero env-bound HTTPS still fail-closes later when
+    // paths are set but unloadable.
+    let admin_tls_paths_ready = env_config.admin_tls_cert_path.is_some()
+        && env_config.admin_tls_key_path.is_some();
+    if !admin_tls_paths_ready
+        && let Some(listener) = prebound.admin_https.take()
+    {
+        match listener.local_addr() {
+            Ok(addr) => info!(
+                "Dropping unused pre-bound admin HTTPS listener on {addr} — \
+                 admin TLS cert/key paths are not both configured"
+            ),
+            Err(_) => info!(
+                "Dropping unused pre-bound admin HTTPS listener — \
+                 admin TLS cert/key paths are not both configured"
+            ),
+        }
+        drop(listener);
+    }
+
     // Compute reserved ports from the listeners we'll actually bind, NOT
     // from env_config alone. With pre-bound listeners (in-process harness,
     // and any other `serve()` caller that adopts FDs) the live port can
@@ -993,7 +1020,8 @@ pub async fn serve(
     // the port setting (per-listener precedence — the caller already owns the
     // FD). It is served only when both admin TLS paths are configured; that
     // path loads the material and sets up frontend TLS live reload, starting
-    // the watcher when enabled. Otherwise the socket is dropped unused. Only
+    // the watcher when enabled. Unusable prebound sockets (missing either TLS
+    // path) were already taken/dropped above before reserved ports. Only
     // in-process embedders/tests can supply one; `file::run` passes
     // `ServeOptions::default()`, so for the binary this is exactly
     // "`FERRUM_ADMIN_HTTPS_PORT != 0`". Documented in `ferrum.conf` and

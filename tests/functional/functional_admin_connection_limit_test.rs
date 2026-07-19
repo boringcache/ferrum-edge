@@ -434,4 +434,18 @@ async fn functional_admin_https_enabled_port_still_fails_on_unloadable_tls() {
         mentions_admin_tls_load(&output),
         "expected an admin TLS configuration error in CP output, got: {output}"
     );
+    // `db_url` points inside the harness temp dir. Retaining that dir on
+    // `FailedGatewayStart` is what keeps this diagnostic usable after spawn.
+    let db_url = failure
+        .db_url
+        .as_deref()
+        .expect("CP SQLite failure must expose db_url");
+    let db_path = db_url
+        .strip_prefix("sqlite:")
+        .and_then(|rest| rest.split('?').next())
+        .expect("sqlite db_url shape");
+    assert!(
+        std::path::Path::new(db_path).exists(),
+        "FailedGatewayStart must retain its temp dir so db_url stays alive; missing {db_path}"
+    );
 }
