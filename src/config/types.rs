@@ -15,7 +15,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
 
@@ -5433,6 +5433,13 @@ pub(crate) struct CountryMmdbLoadSession {
     state: Mutex<CountryMmdbLoadSessionState>,
     refresh_country_mmdb_plugins: bool,
     allow_synchronous_load: bool,
+    /// Last-known-good snapshots from the live plugin-cache generation, keyed
+    /// by the `db_path` each was loaded from. Only a node-local refresh
+    /// populates this: it is the one path where the configuration source (CP)
+    /// deliberately skipped node-local validation, so a file that is merely
+    /// *temporarily* unavailable on this node must not silently downgrade an
+    /// already-enforcing geo instance to its `on_lookup_failure` fallback.
+    retained_snapshots: HashMap<PathBuf, Arc<CountryMmdbSnapshot>>,
 }
 
 impl Default for CountryMmdbLoadSession {
@@ -5441,6 +5448,7 @@ impl Default for CountryMmdbLoadSession {
             state: Mutex::new(CountryMmdbLoadSessionState::default()),
             refresh_country_mmdb_plugins: false,
             allow_synchronous_load: true,
+            retained_snapshots: HashMap::new(),
         }
     }
 }
@@ -5466,6 +5474,7 @@ impl CountryMmdbLoadSession {
             state: Mutex::new(state),
             refresh_country_mmdb_plugins,
             allow_synchronous_load: true,
+            retained_snapshots: HashMap::new(),
         })
     }
 
@@ -5483,9 +5492,22 @@ impl CountryMmdbLoadSession {
     /// matching handoff is still consumed, but its absence must not suppress
     /// the refresh: each path is loaded directly under the same aggregate
     /// budget before the replacement cache generation can publish.
-    pub(crate) fn for_node_local_refresh(paths: &HashSet<PathBuf>) -> Result<Self, String> {
+    ///
+    /// `retained_snapshots` carries the live generation's already-validated
+    /// snapshots keyed by `db_path`. A path that is temporarily unreadable on
+    /// this node falls back to its retained snapshot instead of producing a
+    /// reader-less instance, so an enforcing geo gate survives a transient file
+    /// outage. A *readable but invalid* file still rejects the generation, and
+    /// a path with no retained entry — a first load, or a `db_path` the
+    /// configuration just repointed — keeps the documented
+    /// `on_lookup_failure` fallback.
+    pub(crate) fn for_node_local_refresh(
+        paths: &HashSet<PathBuf>,
+        retained_snapshots: HashMap<PathBuf, Arc<CountryMmdbSnapshot>>,
+    ) -> Result<Self, String> {
         let mut session = Self::claim(paths)?;
         session.refresh_country_mmdb_plugins = true;
+        session.retained_snapshots = retained_snapshots;
         Ok(session)
     }
 
@@ -5507,8 +5529,11 @@ impl CountryMmdbLoadSession {
         if let Some(snapshot) = state.snapshots.get(&path_key) {
             return Ok(Arc::clone(snapshot));
         }
-        if let Some(error) = state.failures.get(&path_key) {
-            return Err(error.clone());
+        if let Some(error) = state.failures.get(&path_key).cloned() {
+            return match self.retain_last_known_good(&mut state, &path_key, path, &error) {
+                Some(snapshot) => Ok(snapshot),
+                None => Err(error),
+            };
         }
         if !self.allow_synchronous_load {
             return Err(CountryMmdbLoadError::Invalid(format!(
@@ -5516,11 +5541,56 @@ impl CountryMmdbLoadSession {
             )));
         }
 
-        let loaded =
-            load_validated_country_mmdb_inner(path, None, Some(&mut state.aggregate_budget))?;
+        let loaded = match load_validated_country_mmdb_inner(
+            path,
+            None,
+            Some(&mut state.aggregate_budget),
+        ) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return match self.retain_last_known_good(&mut state, &path_key, path, &error) {
+                    Some(snapshot) => Ok(snapshot),
+                    None => Err(error),
+                };
+            }
+        };
         Ok(Arc::clone(
             state.snapshots.entry(path_key).or_insert(loaded),
         ))
+    }
+
+    /// Substitute the live generation's snapshot for a path that is
+    /// *temporarily unavailable* on this node, memoizing it so every geo
+    /// instance sharing the path resolves identically within one build and the
+    /// operator warning is emitted at most once per path per refresh.
+    ///
+    /// Returns `None` — leaving the caller to propagate the original error —
+    /// for a `CountryMmdbLoadError::Invalid`, which is a readable but corrupt,
+    /// wrong-type, or budget-exceeding database and must still reject the
+    /// generation, and for any path with no retained snapshot.
+    fn retain_last_known_good(
+        &self,
+        state: &mut CountryMmdbLoadSessionState,
+        path_key: &Path,
+        path: &str,
+        error: &CountryMmdbLoadError,
+    ) -> Option<Arc<CountryMmdbSnapshot>> {
+        if !matches!(error, CountryMmdbLoadError::Unavailable(_)) {
+            return None;
+        }
+        let retained = self.retained_snapshots.get(path_key)?;
+        tracing::warn!(
+            db_path = %path,
+            error = %error,
+            plugin = "geo_restriction",
+            retained_snapshot_bytes = retained.size_bytes(),
+            "MaxMind database temporarily unavailable during node-local refresh; retaining the last known good snapshot so geo enforcement is not downgraded to the on_lookup_failure fallback"
+        );
+        let snapshot = Arc::clone(retained);
+        state
+            .snapshots
+            .insert(path_key.to_path_buf(), Arc::clone(&snapshot));
+        Some(snapshot)
     }
 }
 

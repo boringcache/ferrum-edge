@@ -14,7 +14,7 @@
 //! to the polling loop in `src/modes/database.rs` to verify the cursor only
 //! advances on `Applied`/`Unchanged`, never on `Rejected`.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use base64::Engine;
 use chrono::{Duration, Utc};
@@ -881,6 +881,45 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
             ..
         }
     ));
+    let rejecting_geo_after_delta = Arc::clone(geo);
+
+    std::fs::remove_file(&mmdb_path).unwrap();
+    let mut missing_candidate = candidate.clone();
+    missing_candidate.consumers.push(test_consumer(
+        "second-unrelated-consumer",
+        "second-unrelated-user",
+    ));
+    assert_eq!(
+        state.update_config(missing_candidate),
+        ConfigApplyOutcome::Applied,
+        "an unrelated DP full snapshot must not replace a loaded MMDB with a missing fail-open plugin"
+    );
+
+    let plugins = state
+        .plugin_cache
+        .request_view("geo-proxy", ProxyProtocol::Http)
+        .plugins();
+    let geo = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "geo_restriction")
+        .unwrap();
+    assert!(
+        !Arc::ptr_eq(&rejecting_geo_after_delta, geo),
+        "the refresh still rebuilds the instance from the incoming config; only the validated \
+         snapshot is retained"
+    );
+    let mut after_missing_refresh = RequestContext::new(
+        "89.160.20.112".to_string(),
+        "GET".to_string(),
+        "/geo".to_string(),
+    );
+    assert!(matches!(
+        geo.on_request_received(&mut after_missing_refresh).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
 
     std::fs::write(&mmdb_path, country_mmdb_with_country(b"US")).unwrap();
     assert_eq!(
@@ -914,6 +953,177 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
         geo.on_request_received(&mut after_replacement).await,
         PluginResult::Continue
     ));
+}
+
+/// A DP full snapshot that changes the geo policy while the node-local `.mmdb`
+/// is temporarily unreadable must apply the *incoming* policy over the retained
+/// last-known-good snapshot. Preserving the previous instance wholesale would
+/// silently keep stale `allow_countries`/`deny_countries`/`on_lookup_failure`
+/// while still reporting the update as `Applied`.
+///
+/// Retention is keyed on `db_path`, so a snapshot repointed at a different file
+/// is never inherited: that instance falls back to `on_lookup_failure` exactly
+/// as the documented first-load behavior does.
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_full_snapshot_applies_new_geo_policy_over_retained_mmdb() {
+    let directory = TempDir::new().unwrap();
+    let mmdb_path = directory.path().join("country.mmdb");
+    std::fs::write(&mmdb_path, country_mmdb_bytes()).unwrap();
+
+    let geo_plugin_config = |config: serde_json::Value| PluginConfig {
+        id: "geo-policy".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "geo_restriction".to_string(),
+        config,
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let geo_request = || {
+        RequestContext::new(
+            "89.160.20.112".to_string(),
+            "GET".to_string(),
+            "/geo".to_string(),
+        )
+    };
+    let live_geo_plugin = |state: &ProxyState| {
+        state
+            .plugin_cache
+            .request_view("geo-proxy", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .find(|plugin| plugin.name() == "geo_restriction")
+            .cloned()
+            .unwrap()
+    };
+
+    let config = GatewayConfig {
+        version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
+        proxies: vec![test_proxy("geo-proxy", "/geo")],
+        plugin_configs: vec![geo_plugin_config(serde_json::json!({
+            "db_path": mmdb_path.to_str().unwrap(),
+            "deny_countries": ["SE"],
+            "on_lookup_failure": "allow"
+        }))],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let state = proxy_state_with_config_and_mode(
+        config.clone(),
+        ferrum_edge::config::env_config::OperatingMode::DataPlane,
+    );
+
+    // The snapshot resolves 89.160.20.112 to SE, which the initial policy denies.
+    let geo = live_geo_plugin(&state);
+    assert!(matches!(
+        geo.on_request_received(&mut geo_request()).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+
+    // The file disappears and the policy simultaneously stops denying SE. The
+    // retained snapshot still resolves the IP, but the *new* policy governs, so
+    // the request is now allowed.
+    std::fs::remove_file(&mmdb_path).unwrap();
+    let mut repolicied = config.clone();
+    repolicied.plugin_configs = vec![geo_plugin_config(serde_json::json!({
+        "db_path": mmdb_path.to_str().unwrap(),
+        "deny_countries": ["US"],
+        "on_lookup_failure": "allow"
+    }))];
+    assert_eq!(
+        state.update_config(repolicied.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    let geo = live_geo_plugin(&state);
+    assert!(
+        matches!(
+            geo.on_request_received(&mut geo_request()).await,
+            PluginResult::Continue
+        ),
+        "a geo policy change applied while the .mmdb was unavailable must take effect rather than \
+         silently preserving the previous instance's deny list"
+    );
+
+    // Tightening the policy while the file is still unavailable must also take
+    // effect: SE is denied again, resolved from the retained snapshot.
+    let mut retightened = config.clone();
+    retightened.plugin_configs = vec![geo_plugin_config(serde_json::json!({
+        "db_path": mmdb_path.to_str().unwrap(),
+        "deny_countries": ["SE"],
+        "on_lookup_failure": "allow"
+    }))];
+    assert_eq!(
+        state.update_config(retightened),
+        ConfigApplyOutcome::Applied
+    );
+    let geo = live_geo_plugin(&state);
+    assert!(matches!(
+        geo.on_request_received(&mut geo_request()).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+
+    // Repointing `db_path` at a different, absent file must not inherit the
+    // retained snapshot: with no resolvable country the instance follows the
+    // configured `on_lookup_failure` fallback, here `deny`.
+    let repointed_path = directory.path().join("other-country.mmdb");
+    let mut repointed = config.clone();
+    repointed.plugin_configs = vec![geo_plugin_config(serde_json::json!({
+        "db_path": repointed_path.to_str().unwrap(),
+        "deny_countries": ["US"],
+        "on_lookup_failure": "deny"
+    }))];
+    assert_eq!(state.update_config(repointed), ConfigApplyOutcome::Applied);
+    let geo = live_geo_plugin(&state);
+    assert!(
+        matches!(
+            geo.on_request_received(&mut geo_request()).await,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "a repointed db_path must fall back to on_lookup_failure, never inherit the previous \
+         file's snapshot"
+    );
+
+    // Once a file exists at the new path its own snapshot is adopted: the IP
+    // resolves to SE again, which the repointed policy denies. Use
+    // `on_lookup_failure: allow` so a 403 can only come from that successful SE
+    // lookup — a reader-less miss would Continue instead.
+    std::fs::write(&repointed_path, country_mmdb_bytes()).unwrap();
+    let mut repointed_present = config.clone();
+    repointed_present.plugin_configs = vec![geo_plugin_config(serde_json::json!({
+        "db_path": repointed_path.to_str().unwrap(),
+        "deny_countries": ["SE"],
+        "on_lookup_failure": "allow"
+    }))];
+    assert_eq!(
+        state.update_config(repointed_present),
+        ConfigApplyOutcome::Applied
+    );
+    let geo = live_geo_plugin(&state);
+    assert!(
+        matches!(
+            geo.on_request_received(&mut geo_request()).await,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "a newly available repointed db_path must load its own snapshot; with \
+         on_lookup_failure=allow, 403 proves SE was resolved rather than a \
+         reader-less lookup failure"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
