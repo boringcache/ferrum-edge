@@ -1483,7 +1483,14 @@ NON_PYTHON_PROCESS_DISPATCH = re.compile(
     r"(?<![A-Za-z0-9_$.])(?:exec|execFile|fork|spawn)(?:Sync)?\s*\(|"
     r"\b(?:Bun\.spawn|Deno\.Command)\s*\(|"
     r"\b(?:Process\.spawn|IO\.popen|Open3\.[A-Za-z_]+|system|exec)\s*\(|"
-    r"\b(?:os\.execute|io\.popen)\s*\()",
+    r"\b(?:os\.execute|io\.popen)\s*\(|"
+    # Dynamic evaluation can turn stdin or another data value into a process
+    # dispatch while the inline source itself contains no Cross token. The
+    # foreign-language reader cannot prove the evaluated text, so these common
+    # evaluation entry points are executable surfaces too.
+    r"(?<![A-Za-z0-9_$.])(?:eval|instance_eval|class_eval|module_eval|loadstring)"
+    r"\s*\(|"
+    r"\b(?:new\s+)?Function\s*\()",
     re.MULTILINE,
 )
 # A Bash helper that enables `expand_aliases` and binds a short name to Cross
@@ -1545,6 +1552,9 @@ INLINE_SOURCE_SUBCOMMANDS = {"deno": ("eval",)}
 # operand is a script *path*, while an invocation with no script executes stdin,
 # so it remains in the ordinary foreign-interpreter model below.
 INLINE_OPERAND_INTERPRETERS = frozenset({"awk", "gawk", "mawk"})
+STDIN_PROGRAM_PATHS = frozenset(
+    {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
+)
 FOREIGN_STRING_LITERAL = re.compile(
     r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|`((?:[^`\\]|\\.)*)`"
 )
@@ -3955,13 +3965,12 @@ def interpreter_stdin_language(
         # equivalent standard-input paths make the heredoc itself the program.
         # The generic executable-heredoc classifier must retain that body after
         # the stdin scanner defers to it.
-        stdin_paths = {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
         arguments = segment[index + 1 :]
         for position, argument in enumerate(arguments):
             if argument in {"-f", "--file"}:
                 if (
                     position + 1 < len(arguments)
-                    and arguments[position + 1] in stdin_paths
+                    and arguments[position + 1] in STDIN_PROGRAM_PATHS
                 ):
                     return language
                 return None
@@ -3970,7 +3979,7 @@ def interpreter_stdin_language(
             if argument.startswith("--file="):
                 return (
                     language
-                    if argument.removeprefix("--file=") in stdin_paths
+                    if argument.removeprefix("--file=") in STDIN_PROGRAM_PATHS
                     else None
                 )
         return None
@@ -3978,7 +3987,7 @@ def interpreter_stdin_language(
     if inline is not None and (inline[0] or inline[1]):
         return None
     for argument in segment[index + 1 :]:
-        if argument == "-":
+        if argument in STDIN_PROGRAM_PATHS:
             return language
         if redirection_token(argument):
             break
@@ -4138,7 +4147,7 @@ def shell_invocation_mode(
         if option == "--":
             position += 1
             return None, False, force_stdin or position >= len(tokens)
-        if option == "-":
+        if option in STDIN_PROGRAM_PATHS:
             return None, False, True
         if not option.startswith("-"):
             # The first non-option is a script operand. Its later arguments
@@ -8345,15 +8354,29 @@ def tokenized_stdin_interpreter_language(
     """Classify a literal or opaque command that executes a heredoc body."""
 
     expanded = expand_env_split_strings(segment)
+    index, executes = executable_index(expanded)
+    if not executes or index >= len(expanded):
+        return None
+
+    command = expanded[index]
+    if command == "." or tool_name(command) == "source":
+        if index + 1 >= len(expanded):
+            return None
+        operand = expanded[index + 1]
+        if operand in STDIN_PROGRAM_PATHS:
+            return "shell"
+        if dynamic_shell_word(operand):
+            # A computed source path may resolve to stdin and execute this
+            # heredoc body. Retain it as an opaque program rather than data.
+            return "opaque"
+        return None
+
     language, _, _ = shell_stdin_program(expanded)
     if language is not None:
         return language
 
-    index, executes = executable_index(expanded)
     if (
-        executes
-        and index < len(expanded)
-        and dynamic_shell_word(expanded[index])
+        dynamic_shell_word(expanded[index])
     ):
         # A computed receiver may select an interpreter at runtime. Treat the
         # body as an unsupported executable program rather than withdrawing it
@@ -14665,6 +14688,18 @@ pre_build = []
     ):
         failures.append("a benign foreign executable heredoc was rejected")
 
+    # Inline foreign source can evaluate stdin as code even though the inline
+    # operand contains no Cross word itself. The dynamic evaluator is an opaque
+    # executable surface and must fail closed before the heredoc is mistaken
+    # for ordinary data.
+    evaluated_stdin = (
+        "ruby -e 'eval(STDIN.read)' <<'RUBY'\n"
+        "system('cross build')\n"
+        "RUBY\n"
+    )
+    if not contains_direct_trusted_shell_cross_surface(evaluated_stdin):
+        failures.append("a foreign inline evaluator hid an executable heredoc")
+
     for stdin_program, stdin_label in (
         (
             "tclsh <<'TCL'\nexec cross build\nTCL\n",
@@ -14717,6 +14752,58 @@ pre_build = []
             or benign_stdin_sensitive
         ):
             failures.append(f"a {benign_stdin_label} heredoc was rejected")
+
+    for sourced_program, sourced_label in (
+        (
+            "source /dev/stdin <<'SH'\n"
+            f"cross build --target {TARGET}\n"
+            "SH\n",
+            "source stdin path",
+        ),
+        (
+            ". /dev/fd/0 <<'SH'\n"
+            f"cross build --target {TARGET}\n"
+            "SH\n",
+            "dot stdin path",
+        ),
+        (
+            "source \"$PROGRAM_PATH\" <<'SH'\n"
+            f"cross build --target {TARGET}\n"
+            "SH\n",
+            "opaque source path",
+        ),
+    ):
+        sourced_programs, sourced_errors = executable_heredocs(
+            sourced_program,
+            f"self-test {sourced_label} heredoc",
+        )
+        sourced_sensitive, sourced_runtime_errors = runtime_program_cross_surface(
+            list(sourced_programs),
+            f"self-test {sourced_label} heredoc",
+            include_opaque_shell_executable=True,
+        )
+        if sourced_errors or (
+            not sourced_sensitive and not sourced_runtime_errors
+        ):
+            failures.append(f"a {sourced_label} heredoc did not fail closed")
+
+    benign_sourced_programs, benign_sourced_errors = executable_heredocs(
+        "source /proc/self/fd/0 <<'SH'\necho safe\nSH\n",
+        "self-test benign sourced stdin heredoc",
+    )
+    benign_sourced_sensitive, benign_sourced_runtime_errors = (
+        runtime_program_cross_surface(
+            list(benign_sourced_programs),
+            "self-test benign sourced stdin heredoc",
+            include_opaque_shell_executable=True,
+        )
+    )
+    if (
+        benign_sourced_errors
+        or benign_sourced_runtime_errors
+        or benign_sourced_sensitive
+    ):
+        failures.append("a benign sourced stdin heredoc was rejected")
 
     # A computed receiver can select Bash or another interpreter at runtime.
     # Its body is therefore executable but unreadable, and must fail closed
