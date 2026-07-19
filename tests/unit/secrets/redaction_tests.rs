@@ -185,12 +185,19 @@ const PADDED_SHORT_KEY: &str = "FERRUM_REDACTION_FIXTURE_PADDED_SHORT";
 const PADDED_SHORT_VALUE: &str = "  w  ";
 
 /// An externally sourced port whose canonical `Display` is below the derived
-/// minimum: `080` materializes as three bytes (armed exactly) while parsed
-/// listeners log `80`. Admitting `80` process-wide would shred every diagnostic
-/// that mentions an HTTP port, so listen/port sites withhold key-tied instead.
+/// minimum: a zero-padded three-byte materialization is armed exactly, while
+/// parsed listeners log the two-digit form. Admitting that short canonical
+/// form process-wide would shred every diagnostic that mentions a matching
+/// port fragment, so listen/port sites withhold key-tied instead.
+///
+/// The fixture deliberately avoids `080`→`80`. Exact values have no minimum,
+/// so arming `080` process-wide would substring-match the common unrelated
+/// listen diagnostic `0.0.0.0:8080` (…`8` + `080`) and defeat
+/// [`a_record_with_no_resolved_value_round_trips_unchanged`]. `071`→`71` is the
+/// same length/canonicalization class without that collision.
 const SHORT_PORT_KEY: &str = "FERRUM_REDACTION_FIXTURE_SHORT_PORT";
-const SHORT_PORT_VALUE: &str = "080";
-const SHORT_PORT_RENDERED: &str = "80";
+const SHORT_PORT_VALUE: &str = "071";
+const SHORT_PORT_RENDERED: &str = "71";
 
 const FIXTURES: [(&str, &str); 23] = [
     (PLAIN_KEY, PLAIN_VALUE),
@@ -390,9 +397,10 @@ fn withheld_transformed_value_is_not_quoted() {
 /// it key-tied through [`report_env_field`].
 ///
 /// This is the admin/proxy-port leak the P2 named: `FERRUM_ADMIN_HTTP_PORT_FILE`
-/// holding `080` or ` 80` is re-rendered as `80` in startup logs, a form the
-/// length filter drops. Widening the candidate set to admit `80` would shred
-/// unrelated diagnostics, so the fix is provenance-exact withholding.
+/// holding a zero-padded or space-padded short port is re-rendered as the
+/// two-digit canonical form in startup logs, which the length filter drops.
+/// Widening the candidate set to admit that short form would shred unrelated
+/// diagnostics, so the fix is provenance-exact withholding.
 #[test]
 fn withholds_short_canonical_port_by_key() {
     arm_redaction();
@@ -414,7 +422,7 @@ fn withholds_short_canonical_port_by_key() {
     );
     // Listener logs render a SocketAddr; the whole address is withheld by key.
     assert_eq!(
-        report_env_field(SHORT_PORT_KEY, "0.0.0.0:80"),
+        report_env_field(SHORT_PORT_KEY, "0.0.0.0:71"),
         EXTERNAL_SECRET_PLACEHOLDER
     );
     assert_eq!(
@@ -775,8 +783,19 @@ fn escaped_string_values_are_redacted_and_reescaped() {
 /// parse/reserialize path — and must come out byte-for-byte identical,
 /// including field order. Otherwise every ordinary diagnostic in a process
 /// using external secrets would be silently rewritten.
+///
+/// Port `8080` is intentional: it is a common unrelated listen diagnostic and
+/// must not be substring-redacted merely because another fixture armed a short
+/// exact scalar. In particular it must not collide with
+/// [`SHORT_PORT_VALUE`]'s exact candidate (see that constant's rationale).
 #[test]
 fn a_record_with_no_resolved_value_round_trips_unchanged() {
+    // Non-vacuity against the short-port fixture: if an exact candidate is ever
+    // a substring of this control message, the round-trip below is vacuous.
+    assert!(
+        !"listening on 0.0.0.0:8080".contains(SHORT_PORT_VALUE),
+        "control listen diagnostic must not contain exact short-port fixture {SHORT_PORT_VALUE}"
+    );
     let line = through_sink(|sink| {
         emit_tracing(
             sink,
