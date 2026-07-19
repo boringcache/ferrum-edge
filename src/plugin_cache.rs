@@ -1963,11 +1963,7 @@ fn collect_route_override_destinations(
             };
             for destination in rules
                 .iter()
-                .filter(|rule| {
-                    !rule
-                        .get("redirect")
-                        .is_some_and(|redirect| !redirect.is_null())
-                })
+                .filter(|rule| rule.get("redirect").is_none_or(serde_json::Value::is_null))
                 .filter_map(|rule| {
                     rule.get("destination")
                         .and_then(serde_json::Value::as_object)

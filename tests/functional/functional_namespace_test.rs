@@ -9,7 +9,8 @@
 //!   within one
 //! - `X-Ferrum-Namespace` header defaulting to `ferrum`
 //! - invalid namespace header rejection
-//! - `GET /namespaces` returning the full set regardless of the current header
+//! - `GET /namespaces` returning the full set as a paginated envelope,
+//!   regardless of the current header
 //! - delete isolation (deleting a namespace's resource by id from another
 //!   namespace returns 404)
 //! - cross-process mTLS DNS-identity admission against a shared persistent
@@ -591,9 +592,9 @@ async fn run_namespace_suite(backend: Backend) {
         .await;
         assert!(resp.status().is_success(), "GET /namespaces failed");
         let body: Value = resp.json().await.unwrap();
-        let names: Vec<&str> = body
+        let names: Vec<&str> = body["data"]
             .as_array()
-            .expect("namespaces array")
+            .expect("namespaces data array")
             .iter()
             .map(|v| v.as_str().unwrap_or(""))
             .collect();

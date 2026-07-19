@@ -1741,3 +1741,157 @@ async fn read_replica_tracks_primary_topology_across_failover_and_failback() {
         "the configured read replica should become eligible again after primary failback"
     );
 }
+
+// ---- list_namespaces_paginated ----
+
+async fn connect_namespaces_test_store(dir: &tempfile::TempDir, name: &str) -> DatabaseStore {
+    let db_path = dir.path().join(format!("{name}.db"));
+    let url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    DatabaseStore::connect_with_pool_config("sqlite", &url, DbPoolConfig::default())
+        .await
+        .expect("connect sqlite store")
+}
+
+async fn seed_namespace_upstream(store: &DatabaseStore, namespace: &str, id: &str) {
+    sqlx::query("INSERT INTO upstreams (id, namespace, name, targets) VALUES (?, ?, ?, '[]')")
+        .bind(id)
+        .bind(namespace)
+        .bind(format!("{id}-name"))
+        .execute(&store.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn list_namespaces_paginated_empty_store_returns_zero_total() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let store = connect_namespaces_test_store(&temp_dir, "ns-empty").await;
+
+    let page = store.list_namespaces_paginated(100, 0).await.unwrap();
+    assert_eq!(page.total, 0);
+    assert!(page.items.is_empty());
+}
+
+#[tokio::test]
+async fn list_namespaces_paginated_dedupes_across_tables_and_orders() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let store = connect_namespaces_test_store(&temp_dir, "ns-dedup").await;
+
+    // The same namespace in two tables must be counted once; namespaces only
+    // present in consumers or plugin_configs must still appear.
+    seed_namespace_upstream(&store, "zeta", "up-1").await;
+    seed_namespace_upstream(&store, "alpha", "up-2").await;
+    sqlx::query("INSERT INTO consumers (id, namespace, username) VALUES (?, ?, ?)")
+        .bind("consumer-1")
+        .bind("alpha")
+        .bind("user-1")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO plugin_configs (id, namespace, plugin_name) VALUES (?, ?, ?)")
+        .bind("plugin-1")
+        .bind("middle")
+        .bind("rate_limiting")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+    let page = store.list_namespaces_paginated(100, 0).await.unwrap();
+    assert_eq!(page.total, 3);
+    assert_eq!(page.items, vec!["alpha", "middle", "zeta"]);
+}
+
+#[tokio::test]
+async fn list_namespaces_paginated_slices_pages_and_preserves_total() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let store = connect_namespaces_test_store(&temp_dir, "ns-pages").await;
+    for i in 0..5 {
+        seed_namespace_upstream(&store, &format!("ns-{i:02}"), &format!("up-{i:02}")).await;
+    }
+
+    let page = store.list_namespaces_paginated(2, 0).await.unwrap();
+    assert_eq!(page.items, vec!["ns-00", "ns-01"]);
+    assert_eq!(page.total, 5);
+
+    let page = store.list_namespaces_paginated(2, 2).await.unwrap();
+    assert_eq!(page.items, vec!["ns-02", "ns-03"]);
+    assert_eq!(page.total, 5);
+
+    let page = store.list_namespaces_paginated(2, 4).await.unwrap();
+    assert_eq!(page.items, vec!["ns-04"]);
+    assert_eq!(page.total, 5);
+
+    // An offset at or beyond the total is a valid empty page, not an error.
+    let page = store.list_namespaces_paginated(2, 5).await.unwrap();
+    assert!(page.items.is_empty());
+    assert_eq!(page.total, 5);
+
+    let page = store.list_namespaces_paginated(2, 100).await.unwrap();
+    assert!(page.items.is_empty());
+    assert_eq!(page.total, 5);
+}
+
+#[tokio::test]
+async fn list_namespaces_paginated_large_collection_pages_stably() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let store = connect_namespaces_test_store(&temp_dir, "ns-large").await;
+    for i in 0..120 {
+        seed_namespace_upstream(&store, &format!("ns-{i:03}"), &format!("up-{i:03}")).await;
+    }
+
+    let mut collected = Vec::new();
+    let mut offset = 0i64;
+    loop {
+        let page = store.list_namespaces_paginated(50, offset).await.unwrap();
+        assert_eq!(page.total, 120);
+        if page.items.is_empty() {
+            break;
+        }
+        offset += page.items.len() as i64;
+        collected.extend(page.items);
+    }
+    assert_eq!(collected.len(), 120);
+    let mut sorted = collected.clone();
+    sorted.sort();
+    assert_eq!(
+        collected, sorted,
+        "pages must concatenate in ascending order"
+    );
+    assert_eq!(collected.first().map(String::as_str), Some("ns-000"));
+    assert_eq!(collected.last().map(String::as_str), Some("ns-119"));
+}
+
+#[tokio::test]
+async fn list_namespaces_paginated_insert_after_cursor_keeps_pages_stable() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let store = connect_namespaces_test_store(&temp_dir, "ns-insert").await;
+    for i in 0..10 {
+        seed_namespace_upstream(&store, &format!("ns-{i:02}"), &format!("up-{i:02}")).await;
+    }
+
+    let first = store.list_namespaces_paginated(4, 0).await.unwrap();
+    assert_eq!(first.items, vec!["ns-00", "ns-01", "ns-02", "ns-03"]);
+    assert_eq!(first.total, 10);
+
+    // Inserts that sort after the fetched window must not shift already-
+    // returned rows into a later page.
+    for i in 0..5 {
+        seed_namespace_upstream(&store, &format!("ns-a{i}"), &format!("up-a{i}")).await;
+    }
+
+    let second = store.list_namespaces_paginated(100, 4).await.unwrap();
+    assert_eq!(second.total, 15);
+    let remainder: Vec<&str> = second.items.iter().map(String::as_str).collect();
+    assert_eq!(
+        remainder[..6],
+        ["ns-04", "ns-05", "ns-06", "ns-07", "ns-08", "ns-09"],
+        "rows after the cursor keep their relative order; new inserts append"
+    );
+    assert!(
+        !first
+            .items
+            .iter()
+            .any(|returned| second.items.contains(returned)),
+        "no row from the first page may reappear after the cursor"
+    );
+}

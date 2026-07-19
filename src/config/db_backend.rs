@@ -1381,6 +1381,16 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         self.list_namespaces().await
     }
 
+    /// Return a stable, backend-paginated namespace page and the total
+    /// namespace count, ordered ascending by namespace name.
+    /// Callers must pass a positive bounded `limit` and an `offset` in
+    /// `0..=i64::MAX`; admin callers satisfy this through validated pagination.
+    async fn list_namespaces_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<String>, anyhow::Error>;
+
     // -----------------------------------------------------------------------
     // ApiSpec CRUD (admin-only — NEVER call from polling loops, gRPC
     // distribution, or GatewayConfig loading. Hot-path isolation is critical.)
