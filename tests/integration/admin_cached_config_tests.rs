@@ -6629,7 +6629,10 @@ async fn malformed_pagination_on_get_list_precedes_body_buffering() {
             "{path} must return the pagination 400 without buffering the body: {body:?}"
         );
         assert!(
-            body["error"].as_str().unwrap_or_default().contains("must be")
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("must be")
                 || body["error"]
                     .as_str()
                     .unwrap_or_default()
