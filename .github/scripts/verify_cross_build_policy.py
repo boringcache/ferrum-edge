@@ -1338,6 +1338,7 @@ HEREDOC_PIPED_INTERPRETER = re.compile(
     + r"(?P<interpreter>bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|"
     r"pypy[0-9]*|pwsh|powershell)\b"
 )
+DYNAMIC_HEREDOC_PIPE_INTERPRETER = "__dynamic_heredoc_pipe_interpreter__"
 OPAQUE_INLINE_SHELL = re.compile(
     r"(?:\b(?:bash|sh)\s+-c\s+[^\n]*\$\(|"
     r"\beval\s+[^\n]*\$\(|"
@@ -7678,6 +7679,53 @@ def heredoc_pipeline_tail(line: str, start: int) -> str:
     return "".join(visible)
 
 
+def piped_heredoc_interpreters(line: str, start: int) -> tuple[str, ...]:
+    """Return interpreters that can receive a heredoc body through a pipeline.
+
+    The regex path handles literal command words on quote-filtered text. A
+    second token pass preserves quoted command words after a real top-level pipe
+    so `cat <<'EOF' | "$interp"` is treated fail-closed: the dynamic word may
+    expand to Bash and execute the body.
+    """
+
+    tail = heredoc_pipeline_tail(line, start)
+    interpreters = [
+        match.group("interpreter")
+        for match in HEREDOC_PIPED_INTERPRETER.finditer(tail)
+    ]
+    if not re.search(r"(?<!\|)\|(?!\|)&?", tail):
+        return tuple(interpreters)
+    tokens = shell_tokens(line[start:])
+    if tokens is None:
+        return tuple(interpreters)
+    for index, token in enumerate(tokens):
+        if token in {";", "&&", "||", "&"}:
+            break
+        if token not in {"|", "|&"}:
+            continue
+        candidate_index = index + 1
+        if candidate_index < len(tokens) and tokens[candidate_index] == "!":
+            candidate_index += 1
+        if candidate_index >= len(tokens):
+            continue
+        candidate = tokens[candidate_index]
+        executable = tool_name(candidate)
+        if executable in {
+            "bash",
+            "sh",
+            "dash",
+            "zsh",
+            "ksh",
+            "ash",
+            "pwsh",
+            "powershell",
+        } or PYTHON_INTERPRETER.fullmatch(executable):
+            interpreters.append(candidate)
+        elif dynamic_shell_word(candidate):
+            interpreters.append(DYNAMIC_HEREDOC_PIPE_INTERPRETER)
+    return tuple(dict.fromkeys(interpreters))
+
+
 def quote_aware_heredoc_starts(line: str) -> tuple[tuple[int, str], ...]:
     """Find real shell heredoc openers without matching quoted prose."""
 
@@ -8011,13 +8059,7 @@ def opaque_arm_command_line_projection(contents: str) -> tuple[str, ...] | None:
                 delimiter,
                 quoted,
                 HEREDOC_EXECUTABLE.search(line[:start]) is not None
-                or HEREDOC_PIPED_INTERPRETER.search(
-                    # Truncated at the first command separator for the same
-                    # reason `executable_heredocs` truncates it: a pipe in a
-                    # later statement never receives this body.
-                    heredoc_pipeline_tail(line, start)
-                )
-                is not None,
+                or bool(piped_heredoc_interpreters(line, start)),
             )
             for start, delimiter, quoted in quote_aware_heredoc_start_details(line)
         )
@@ -8647,16 +8689,13 @@ def executable_heredocs(
             interpreters = [
                 match.group("interpreter")
                 for match in HEREDOC_EXECUTABLE.finditer(line[:start])
-            ] + [
-                match.group("interpreter")
-                for match in HEREDOC_PIPED_INTERPRETER.finditer(
-                    heredoc_pipeline_tail(line, start)
-                )
-            ]
+            ] + list(piped_heredoc_interpreters(line, start))
             interpreter: str | None = None
             if interpreters:
                 executable = tool_name(interpreters[-1])
-                if PYTHON_INTERPRETER.fullmatch(executable):
+                if executable == DYNAMIC_HEREDOC_PIPE_INTERPRETER:
+                    interpreter = "shell"
+                elif PYTHON_INTERPRETER.fullmatch(executable):
                     interpreter = "python"
                 elif executable.lower() in {"pwsh", "powershell"}:
                     interpreter = "powershell"
@@ -13748,6 +13787,25 @@ pre_build = []
     if not contains_direct_trusted_shell_cross_surface(piped_program):
         failures.append(
             "a generated inline shell surface inside a piped heredoc did not "
+            "fail closed"
+        )
+    dynamic_piped_program = (
+        "interp=bash\n"
+        "cmd=cross\n"
+        "cat <<'EOF' | \"$interp\"\n"
+        "$cmd build --target x86_64-unknown-linux-gnu\n"
+        "EOF\n"
+    )
+    if "$cmd build --target x86_64-unknown-linux-gnu" not in automation_command_text(
+        dynamic_piped_program
+    ):
+        failures.append(
+            "a heredoc piped into a quoted dynamic interpreter was projected "
+            "away as data"
+        )
+    if not contains_direct_trusted_shell_cross_surface(dynamic_piped_program):
+        failures.append(
+            "an opaque Cross executable inside a dynamic piped heredoc did not "
             "fail closed"
         )
     # The benign control redirects the same body to a file, where it really is
