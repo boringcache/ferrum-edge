@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 from pathlib import Path
@@ -123,10 +124,22 @@ DEDICATED_REQUIRED_CHECKS = {
 }
 
 MAIN_PUBLISH_WORKFLOWS = {
-    "Coverage",
-    "Gateway API Conformance",
-    "Mesh E2E Sidecar Live Datapath",
+    ".github/workflows/coverage.yml": "Coverage",
+    ".github/workflows/gateway-api-conformance.yml": "Gateway API Conformance",
+    ".github/workflows/mesh-e2e-sidecar-live.yml": (
+        "Mesh E2E Sidecar Live Datapath"
+    ),
 }
+
+# The polling implementation is a release-integrity boundary. Pinning the exact
+# job body prevents a later pull request from satisfying individual substring
+# checks with comments while changing the array, query, row validation, or
+# fail-closed conclusions the publishing jobs actually consume. This verifier is
+# itself protected by the trusted Cross policy, so updating the digest requires
+# the same trusted-base procedure as updating the gate.
+MAIN_PUBLISH_GATE_SHA256 = (
+    "a9b0c774543958c3b1b7d176ace545f2817eee86af907f145105646fee9c183b"
+)
 
 
 def extract_test_needs(ci_yml: str) -> set[str]:
@@ -193,6 +206,40 @@ def pull_request_trigger_is_unconditional(workflow_yml: str) -> bool:
     return not re.search(r"(?m)^    paths(?:-ignore)?:", body)
 
 
+def main_push_trigger_is_unconditional(workflow_yml: str) -> bool:
+    """Return whether every push to main starts this workflow."""
+
+    workflow_header = workflow_yml.split("\njobs:\n", maxsplit=1)[0]
+    pushes = list(
+        re.finditer(
+            r"(?ms)^  push:(?P<body>.*?)(?=^  [A-Za-z_]+:|\Z)",
+            workflow_header,
+        )
+    )
+    if len(pushes) != 1:
+        return False
+    body = pushes[0].group("body")
+    if re.search(r"(?m)^    (?:branches-ignore|paths|paths-ignore):", body):
+        return False
+    branches = re.search(
+        r"(?m)^    branches:\n(?P<branches>(?:^      - [^\n]+\n?)+)",
+        body,
+    )
+    if not branches:
+        return False
+    configured = {
+        line.strip().removeprefix("- ").strip("'\"")
+        for line in branches.group("branches").splitlines()
+        if line.strip().startswith("- ")
+    }
+    return configured == {"main"}
+
+
+def workflow_has_exact_name(workflow_yml: str, expected: str) -> bool:
+    names = re.findall(r"(?m)^name: ([^\n]+)$", workflow_yml)
+    return names == [expected]
+
+
 def extract_documentation_paths(workflow_yml: str) -> set[str]:
     paths = set(
         re.findall(
@@ -227,6 +274,12 @@ def main() -> int:
         planner_errors.append("ci.yml must not contain runner-holding CI mirror jobs")
 
     publish_gate_body = extract_job_body(ci_yml, "main-publish-gate")
+    publish_gate_sha256 = hashlib.sha256(publish_gate_body.encode()).hexdigest()
+    if publish_gate_sha256 != MAIN_PUBLISH_GATE_SHA256:
+        planner_errors.append(
+            "jobs.main-publish-gate differs from the trusted same-SHA polling "
+            "contract"
+        )
     if not all(
         job_needs(publish_gate_body, dependency)
         for dependency in ("test", "build-binaries")
@@ -234,7 +287,7 @@ def main() -> int:
         planner_errors.append(
             "jobs.main-publish-gate must depend on Tests and build-binaries"
         )
-    for workflow in sorted(MAIN_PUBLISH_WORKFLOWS):
+    for workflow in sorted(MAIN_PUBLISH_WORKFLOWS.values()):
         if f'            "{workflow}"' not in publish_gate_body:
             planner_errors.append(
                 f"jobs.main-publish-gate must wait for `{workflow}`"
@@ -287,6 +340,18 @@ def main() -> int:
 
     for workflow_path, required_check in DEDICATED_REQUIRED_CHECKS.items():
         workflow_yml = Path(workflow_path).read_text(encoding="utf-8")
+        expected_workflow_name = MAIN_PUBLISH_WORKFLOWS.get(workflow_path)
+        if expected_workflow_name is not None:
+            if not workflow_has_exact_name(workflow_yml, expected_workflow_name):
+                planner_errors.append(
+                    f"{workflow_path} must keep workflow name "
+                    f"`{expected_workflow_name}` for the main publish gate"
+                )
+            if not main_push_trigger_is_unconditional(workflow_yml):
+                planner_errors.append(
+                    f"{workflow_path} must run on every push to main for the "
+                    "main publish gate"
+                )
         if not pull_request_trigger_is_unconditional(workflow_yml):
             planner_errors.append(
                 f"{workflow_path} must trigger on every pull request without path filters"
