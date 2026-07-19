@@ -3791,21 +3791,6 @@ paths:
         schema:
           type: string
         description: Consumer ID
-      - name: cred_type
-        in: path
-        required: true
-        schema:
-          $ref: "#/components/schemas/CredentialTypeName"
-        description: |
-          Credential type to set or remove. `PUT` and `POST` accept only the
-          built-in types `keyauth`, `basicauth`, `jwt`, `hmac_auth`, and
-          `mtls_auth`; any other value returns `400`. `DELETE` additionally
-          accepts an unknown/custom type that the consumer actually stores,
-          because whole-Consumer `PUT` preserves credential types the ordinary
-          response hides and this route is the only way to remove them. An
-          unknown type the consumer does not store still returns `400`, so no
-          new credential-type namespace is opened. Credential type keys are one
-          path-safe URI segment, so every stored type is addressable here.
       - $ref: "#/components/parameters/XFerrumNamespace"
 
     put:
@@ -3815,8 +3800,19 @@ paths:
         Replaces the entire credential value for the given type. Accepts a single
         JSON object or an array of objects; stored credentials are normalized to
         a non-empty array. For `basicauth`, plaintext `password` fields are
-        automatically hashed and stored as `password_hash`.
+        automatically hashed and stored as `password_hash`. Custom credential
+        types are not writable here; use whole-Consumer create/update/batch for
+        custom maps and `DELETE` to remove them.
       tags: [Consumers]
+      parameters:
+        - name: cred_type
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/BuiltInCredentialType"
+          description: >-
+            Built-in credential type to replace. Matches runtime
+            `ALLOWED_CREDENTIAL_TYPES`; any other path segment returns `400`.
       requestBody:
         required: true
         content:
@@ -3862,8 +3858,19 @@ paths:
         credential rotation. Credentials are stored as arrays. Max entries per
         type is controlled by
         `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2). For `basicauth`, plaintext
-        `password` fields are automatically hashed.
+        `password` fields are automatically hashed. Custom credential types are
+        not writable here; use whole-Consumer create/update/batch for custom
+        maps and `DELETE` to remove them.
       tags: [Consumers]
+      parameters:
+        - name: cred_type
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/BuiltInCredentialType"
+          description: >-
+            Built-in credential type to append to. Matches runtime
+            `ALLOWED_CREDENTIAL_TYPES`; any other path segment returns `400`.
       requestBody:
         required: true
         content:
@@ -3911,12 +3918,14 @@ paths:
           schema:
             $ref: "#/components/schemas/CredentialTypeName"
           description: |
-            Credential type to remove: one of `keyauth`, `basicauth`, `jwt`,
-            `hmac_auth`, `mtls_auth`, or an unknown/custom credential type
-            already stored on the consumer. Because credential type keys are
-            restricted to one path-safe URI segment, every stored type — including
-            hidden custom types that whole-Consumer `PUT` preserves — is
-            addressable here.
+            Credential type to remove: one of the built-in types
+            (`keyauth`, `basicauth`, `jwt`, `hmac_auth`, `mtls_auth`) or an
+            unknown/custom credential type already stored on the consumer.
+            Because credential type keys are restricted to one path-safe URI
+            segment, every stored type — including hidden custom types that
+            whole-Consumer `PUT` preserves — is addressable here. `PUT` and
+            `POST` on this path advertise only `BuiltInCredentialType`; this
+            `DELETE` parameter stays the broader `CredentialTypeName`.
       responses:
         "204":
           description: Credential removed
@@ -3945,9 +3954,10 @@ paths:
         in: path
         required: true
         schema:
-          type: string
-          enum: [keyauth, basicauth, jwt, hmac_auth, mtls_auth]
-        description: Credential type (e.g. `keyauth`, `jwt`, `basicauth`).
+          $ref: "#/components/schemas/BuiltInCredentialType"
+        description: >-
+          Built-in credential type whose indexed entry to remove. Matches
+          runtime `ALLOWED_CREDENTIAL_TYPES`.
       - name: index
         in: path
         required: true
@@ -6748,7 +6758,9 @@ components:
         never returned by ordinary Consumer responses. Every credential value
         must be a real secret; the reserved `[REDACTED]` placeholder is rejected
         here, and only `PUT` (see `ConsumerUpdate`) accepts it as a round-trip
-        marker.
+        marker. Unknown top-level fields are rejected (`unevaluatedProperties:
+        false`), matching runtime `Consumer` serde `deny_unknown_fields` on
+        create, update, batch, restore, and file/CP-DP config deserialization.
 
 
         Update (`PUT`, `ConsumerUpdate`) is non-destructive for credential state
@@ -7088,7 +7100,20 @@ components:
         the raw request path split on `/` and does not percent-decode. Keys that
         are empty, contain `/`, `%`, whitespace, control bytes, or other
         reserved URI characters are rejected on create, update, batch, and
-        restore.
+        restore. Dedicated credential `PUT`/`POST` path parameters use the
+        narrower `BuiltInCredentialType` enum; this broader name stays on
+        credential maps and on `DELETE`.
+
+    BuiltInCredentialType:
+      type: string
+      enum: [basicauth, keyauth, jwt, hmac_auth, mtls_auth]
+      description: >-
+        Built-in Consumer credential type accepted by
+        `PUT`/`POST /consumers/{consumer_id}/credentials/{cred_type}` and by
+        indexed `DELETE .../credentials/{cred_type}/{index}`. Matches runtime
+        `ALLOWED_CREDENTIAL_TYPES` exactly. Custom types remain writable only
+        through whole-Consumer create/update/batch credential maps and
+        removable through type-level `DELETE` with `CredentialTypeName`.
 
     # ── Consumer Credential Types ──────────────────────────────────
 
@@ -7324,13 +7349,19 @@ components:
           allOf:
             - pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
             - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
+          not:
+            const: "[REDACTED]"
           description: >-
             Canonical stored API key (1-4096 characters, non-whitespace and
             free of disallowed ASCII control bytes), carried unredacted in
-            backup and restore payloads.
+            backup and restore payloads. The exact string `[REDACTED]` is
+            reserved as the ordinary-response redaction placeholder and is
+            rejected by runtime `Consumer::validate_fields()` on restore,
+            create, and update — matching `KeyAuthCredential`.
       description: >-
         `keyauth` entry in backup/restore payloads: the canonical unredacted
-        stored API key.
+        stored API key. The reserved `[REDACTED]` marker is excluded here and
+        accepted only by the explicit redacted/update-marker alternatives.
 
     JwtCredentialBackup:
       type: object

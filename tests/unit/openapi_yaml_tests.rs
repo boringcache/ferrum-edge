@@ -853,19 +853,20 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
             spec["components"]["schemas"][surface]["unevaluatedProperties"], false,
             "{surface} must mirror Consumer's deny_unknown_fields contract"
         );
-        assert_component_validity(
-            &spec,
-            surface,
-            &json!({"username": "alice", "unknown_top_level": true}),
-            false,
-        );
+        // Closed request/response/backup/restore surfaces must reject unknown
+        // top-level fields the same way runtime `Consumer` serde does.
+        for unknown_payload in [
+            json!({"username": "alice", "unknown_top_level": true}),
+            json!({"username": "alice", "unexpected": 1}),
+        ] {
+            assert_component_validity(&spec, surface, &unknown_payload, false);
+            let serde_unknown = serde_json::from_value::<Consumer>(unknown_payload.clone());
+            assert!(
+                serde_unknown.is_err(),
+                "Consumer serde must reject unknown fields for {unknown_payload}"
+            );
+        }
     }
-    let serde_unknown =
-        serde_json::from_value::<Consumer>(json!({"username": "alice", "unknown_top_level": true}));
-    assert!(
-        serde_unknown.is_err(),
-        "Consumer serde must reject unknown fields"
-    );
 
     let credential_input = &spec["components"]["schemas"]["ConsumerCredentialInput"];
     assert!(credential_input.get("discriminator").is_none());
@@ -919,13 +920,56 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         credentials["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
         json!("#/components/schemas/ConsumerCredentialInput")
     );
+    // PUT/POST advertise only built-in credential types; DELETE stays broad so
+    // path-safe custom types remain removable. Path-level parameters must not
+    // also declare `cred_type` (that would conflict with the per-operation
+    // overrides).
+    assert!(
+        credentials["parameters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|parameter| parameter["name"] != "cred_type"),
+        "shared path parameters must not declare cred_type when operations override it"
+    );
+    let built_in_enum = json!(["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"]);
+    assert_eq!(
+        spec["components"]["schemas"]["BuiltInCredentialType"]["enum"],
+        built_in_enum,
+        "BuiltInCredentialType must match ALLOWED_CREDENTIAL_TYPES"
+    );
     for operation in ["put", "post"] {
+        assert_eq!(
+            credentials[operation]["parameters"][0]["name"],
+            json!("cred_type"),
+            "credential {operation} must override cred_type"
+        );
+        assert_eq!(
+            credentials[operation]["parameters"][0]["schema"]["$ref"],
+            json!("#/components/schemas/BuiltInCredentialType"),
+            "credential {operation} must advertise only built-in types"
+        );
         assert_eq!(
             credentials[operation]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
             json!("#/components/schemas/Consumer"),
             "credential {operation} returns the redacted Consumer surface"
         );
     }
+    assert_eq!(
+        credentials["delete"]["parameters"][0]["schema"]["$ref"],
+        json!("#/components/schemas/CredentialTypeName"),
+        "credential DELETE must keep the broader path-safe CredentialTypeName"
+    );
+    assert_eq!(
+        paths["/consumers/{consumer_id}/credentials/{cred_type}/{index}"]["parameters"]
+            .as_array()
+            .expect("indexed credential path parameters")
+            .iter()
+            .find(|parameter| parameter["name"] == "cred_type")
+            .expect("indexed credential path declares cred_type")["schema"]["$ref"],
+        json!("#/components/schemas/BuiltInCredentialType"),
+        "indexed credential DELETE is built-in-only, matching runtime"
+    );
     assert_eq!(
         paths["/consumers/{consumer_id}/credentials/{cred_type}/{index}"]["delete"]["responses"]["200"]
             ["content"]["application/json"]["schema"]["$ref"],
@@ -990,13 +1034,21 @@ fn consumer_update_surface_accepts_redaction_placeholders_and_reserves_them() {
     assert_component_validity(&spec, "ConsumerCreate", &real_values, true);
 
     // The two `oneOf` branches must stay mutually exclusive, which requires
-    // `KeyAuthCredential` to exclude the placeholder explicitly.
-    assert_component_validity(
-        &spec,
-        "KeyAuthCredential",
-        &json!({"key": "[REDACTED]"}),
-        false,
-    );
+    // real keyauth input and backup schemas to exclude the placeholder
+    // explicitly. Redacted/update-marker alternatives keep accepting it.
+    for real_keyauth in ["KeyAuthCredential", "KeyAuthCredentialBackup"] {
+        assert_component_validity(
+            &spec,
+            real_keyauth,
+            &json!({"key": "[REDACTED]"}),
+            false,
+        );
+        assert_eq!(
+            spec["components"]["schemas"][real_keyauth]["properties"]["key"]["not"]["const"],
+            json!("[REDACTED]"),
+            "{real_keyauth}.key must reserve the redaction marker"
+        );
+    }
     for update in [
         "KeyAuthCredentialUpdate",
         "JwtCredentialUpdate",
@@ -1009,10 +1061,16 @@ fn consumer_update_surface_accepts_redaction_placeholders_and_reserves_them() {
         };
         assert_component_validity(&spec, update, &json!({(field): "[REDACTED]"}), true);
     }
+    assert_component_validity(
+        &spec,
+        "KeyAuthCredentialRedacted",
+        &json!({"key": "[REDACTED]"}),
+        true,
+    );
 
     // `[REDACTED]` is reserved at runtime on every write surface, including the
     // update surface, which only accepts it as a marker the server replaces
-    // before validation.
+    // before validation, and restore/backup payloads that carry real keys.
     let placeholder_consumer: Consumer = serde_json::from_value(json!({
         "username": "alice",
         "credentials": {"keyauth": [{"key": "[REDACTED]"}]}
@@ -1026,6 +1084,15 @@ fn consumer_update_surface_accepts_redaction_placeholders_and_reserves_them() {
             .iter()
             .any(|error| error.contains("reserved redaction placeholder")),
         "expected a reserved-placeholder rejection, got {errors:?}"
+    );
+    assert_component_validity(
+        &spec,
+        "ConsumerRestore",
+        &json!({
+            "username": "alice",
+            "credentials": {"keyauth": [{"key": "[REDACTED]"}]}
+        }),
+        false,
     );
 
     // Credential type keys are one path-safe URI segment on every input
