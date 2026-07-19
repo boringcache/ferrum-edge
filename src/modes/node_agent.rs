@@ -682,10 +682,10 @@ async fn start_node_agent_admin_listeners(
         info!(
             "Starting node_agent admin HTTP listener on {}",
             crate::secrets::report_listener_addr(
-                    "FERRUM_ADMIN_BIND_ADDRESS",
-                    "FERRUM_ADMIN_HTTP_PORT",
-                    &admin_http_addr.to_string()
-                )
+                "FERRUM_ADMIN_BIND_ADDRESS",
+                "FERRUM_ADMIN_HTTP_PORT",
+                &admin_http_addr.to_string()
+            )
         );
         if let Err(err) = admin::start_admin_listener_with_tls_and_signal(
             admin_http_addr,

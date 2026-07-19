@@ -1205,10 +1205,7 @@ pub async fn run(
         let grpc_listener = tokio::net::TcpListener::bind(grpc_addr).await?;
         info!(
             "CP gRPC server listening on {}",
-            crate::secrets::report_env_field(
-                "FERRUM_CP_GRPC_LISTEN_ADDR",
-                &grpc_addr.to_string()
-            )
+            crate::secrets::report_env_field("FERRUM_CP_GRPC_LISTEN_ADDR", &grpc_addr.to_string())
         );
         let grpc_http2_max_concurrent_streams = env_config.server_http2_max_concurrent_streams;
         let grpc_http2_max_pending_accept_reset_streams =

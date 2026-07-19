@@ -1225,7 +1225,10 @@ mod tests {
     #[test]
     fn client_init_timeout_error_is_deterministic_and_reference_free() {
         let err = client_init_timeout_error("GCP Secret Manager", Duration::from_secs(7));
-        assert_eq!(err, "Timeout initializing GCP Secret Manager client after 7s");
+        assert_eq!(
+            err,
+            "Timeout initializing GCP Secret Manager client after 7s"
+        );
         assert!(
             !err.contains("projects/")
                 && !err.contains("secrets/")

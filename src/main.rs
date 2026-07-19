@@ -754,14 +754,8 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     );
     info!(
         "Proxy bind address: {}, Admin bind address: {}",
-        secrets::report_env_field(
-            "FERRUM_PROXY_BIND_ADDRESS",
-            &env_config.proxy_bind_address
-        ),
-        secrets::report_env_field(
-            "FERRUM_ADMIN_BIND_ADDRESS",
-            &env_config.admin_bind_address
-        )
+        secrets::report_env_field("FERRUM_PROXY_BIND_ADDRESS", &env_config.proxy_bind_address),
+        secrets::report_env_field("FERRUM_ADMIN_BIND_ADDRESS", &env_config.admin_bind_address)
     );
     // Surface the plaintext admin HTTP listener's network exposure. The
     // unsafe writable-mode case (database/cp, public, no allowlist, no opt-in)

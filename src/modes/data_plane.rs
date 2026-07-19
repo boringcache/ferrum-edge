@@ -512,10 +512,10 @@ pub async fn run(
                 info!(
                     "Starting HTTP/3 (QUIC) proxy listener on {}",
                     crate::secrets::report_listener_addr(
-                    "FERRUM_PROXY_BIND_ADDRESS",
-                    "FERRUM_PROXY_HTTPS_PORT",
-                    &h3_addr.to_string()
-                )
+                        "FERRUM_PROXY_BIND_ADDRESS",
+                        "FERRUM_PROXY_HTTPS_PORT",
+                        &h3_addr.to_string()
+                    )
                 );
                 if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
                     h3_addr,

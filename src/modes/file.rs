@@ -1197,10 +1197,10 @@ pub async fn serve(
                 info!(
                     "Starting admin HTTPS listener on {}",
                     crate::secrets::report_listener_addr(
-                    "FERRUM_ADMIN_BIND_ADDRESS",
-                    "FERRUM_ADMIN_HTTPS_PORT",
-                    &admin_https_addr.to_string()
-                )
+                        "FERRUM_ADMIN_BIND_ADDRESS",
+                        "FERRUM_ADMIN_HTTPS_PORT",
+                        &admin_https_addr.to_string()
+                    )
                 );
                 let result = if let Some(slot) = admin_tls_slot {
                     admin::start_admin_listener_with_dynamic_tls_and_signal(
@@ -1315,10 +1315,10 @@ pub async fn serve(
                 info!(
                     "Starting HTTPS proxy listener on {}",
                     crate::secrets::report_listener_addr(
-                    "FERRUM_PROXY_BIND_ADDRESS",
-                    "FERRUM_PROXY_HTTPS_PORT",
-                    &https_addr.to_string()
-                )
+                        "FERRUM_PROXY_BIND_ADDRESS",
+                        "FERRUM_PROXY_HTTPS_PORT",
+                        &https_addr.to_string()
+                    )
                 );
                 let result = if let Some(slot) = reload_slot {
                     proxy::start_proxy_listener_with_dynamic_tls_and_signal(
@@ -1398,10 +1398,10 @@ pub async fn serve(
                     info!(
                         "Starting HTTP/3 (QUIC) proxy listener on {}",
                         crate::secrets::report_listener_addr(
-                    "FERRUM_PROXY_BIND_ADDRESS",
-                    "FERRUM_PROXY_HTTPS_PORT",
-                    &h3_addr.to_string()
-                )
+                            "FERRUM_PROXY_BIND_ADDRESS",
+                            "FERRUM_PROXY_HTTPS_PORT",
+                            &h3_addr.to_string()
+                        )
                     );
                     crate::http3::server::start_http3_listener_with_signal(
                         h3_addr,
