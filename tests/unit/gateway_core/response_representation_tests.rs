@@ -2957,7 +2957,11 @@ async fn run_backend_transform_reporting_stamped_length(
         false,
     )
     .await;
-    (stamped_response_content_length_for_test(&ctx), body, headers)
+    (
+        stamped_response_content_length_for_test(&ctx),
+        body,
+        headers,
+    )
 }
 
 /// The finding: a CHUNKED encoded upstream stamps no `Content-Length` at all, so
@@ -3212,9 +3216,13 @@ async fn untyped_valid_grpc_framing_is_still_passed_through() {
 
     for (flavor, retained) in untyped_grpc_route_shapes() {
         for expected in &bodies {
-            let (replaced, status, reason, body) =
-                run_untyped_grpc_route_transform(flavor, retained, HashMap::new(), expected.clone())
-                    .await;
+            let (replaced, status, reason, body) = run_untyped_grpc_route_transform(
+                flavor,
+                retained,
+                HashMap::new(),
+                expected.clone(),
+            )
+            .await;
 
             let case = format!("{flavor:?}/{retained:?}/{} bytes", expected.len());
             assert!(!replaced, "{case}: valid framing must not be claimed");
@@ -3261,7 +3269,10 @@ async fn untyped_truncated_grpc_framing_on_a_grpc_route_fails_closed() {
     let (replaced, status, reason, _) =
         run_untyped_grpc_route_transform(HttpFlavor::Grpc, None, HashMap::new(), truncated).await;
 
-    assert!(replaced, "truncated framing is not a provable representation");
+    assert!(
+        replaced,
+        "truncated framing is not a provable representation"
+    );
     assert_eq!(status, 502);
     assert_eq!(reason.as_deref(), Some("unparseable_document"));
 }
