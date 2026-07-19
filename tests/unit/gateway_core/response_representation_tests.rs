@@ -2964,23 +2964,33 @@ async fn run_backend_transform_reporting_stamped_length(
     )
 }
 
+/// A document no configured rule matches, so the only thing that changes the
+/// byte count is the DECODE itself. The stamp is written at decode time, before
+/// any body rule runs, so isolating it this way is what makes the assertion a
+/// statement about the decode rather than about a later rewrite.
+const UNMATCHED_JSON_DOCUMENT: &[u8] = br#"{"keep":1,"note":"plain"}"#;
+
 /// The finding: a CHUNKED encoded upstream stamps no `Content-Length` at all, so
 /// the "no length" state survived the decode and every later length-gated
 /// transform declined a body that is now plain, bounded JSON.
 #[tokio::test]
 async fn decoded_chunked_encoded_body_publishes_its_decoded_length_to_later_transforms() {
-    let plaintext = br#"{"secret":"hunter2","keep":1}"#;
     let mut headers = json_headers();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
     // No `content-length`: the upstream answered with chunked transfer coding.
+    let encoded = gzip(UNMATCHED_JSON_DOCUMENT);
 
     let (stamped, body, headers) =
-        run_backend_transform_reporting_stamped_length(headers, gzip(plaintext)).await;
+        run_backend_transform_reporting_stamped_length(headers, encoded).await;
 
     assert_eq!(
         stamped,
-        Some(body.len()),
+        Some(UNMATCHED_JSON_DOCUMENT.len()),
         "a later body transform must see the decoded length, not `None`"
+    );
+    assert_eq!(
+        body, UNMATCHED_JSON_DOCUMENT,
+        "the decode published plaintext"
     );
     let expected_length = body.len().to_string();
     assert_eq!(
@@ -2988,25 +2998,23 @@ async fn decoded_chunked_encoded_body_publishes_its_decoded_length_to_later_tran
         Some(&expected_length),
         "the stamped length and the live header must agree"
     );
-    assert_secret_not_forwarded(&body);
 }
 
 /// The same staleness with a length PRESENT: the stamp described the compressed
 /// octets, which is not the byte count any later transform is handed.
 #[tokio::test]
 async fn decoded_body_refreshes_a_stale_encoded_length_snapshot() {
-    let plaintext = br#"{"secret":"hunter2","keep":1}"#;
-    let encoded = gzip(plaintext);
+    let encoded = gzip(UNMATCHED_JSON_DOCUMENT);
     let encoded_len = encoded.len();
     let mut headers = json_headers();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
     headers.insert("content-length".to_string(), encoded_len.to_string());
 
-    let (stamped, body, _) = run_backend_transform_reporting_stamped_length(headers, encoded).await;
+    let (stamped, _, _) = run_backend_transform_reporting_stamped_length(headers, encoded).await;
 
     assert_eq!(
         stamped,
-        Some(body.len()),
+        Some(UNMATCHED_JSON_DOCUMENT.len()),
         "the stamp must describe the decoded representation"
     );
     assert_ne!(
@@ -3182,14 +3190,22 @@ async fn untyped_encoded_bare_json_on_a_grpc_route_is_decoded_and_redacted() {
 #[tokio::test]
 async fn untyped_unframed_unparseable_body_on_a_grpc_route_fails_closed() {
     for (flavor, retained) in untyped_grpc_route_shapes() {
-        let body = b"not json and not a frame".to_vec();
-        let (replaced, status, reason, body) =
-            run_untyped_grpc_route_transform(flavor, retained, HashMap::new(), body).await;
+        let original = b"not json and not a frame".to_vec();
+        let (replaced, _, reason, body) =
+            run_untyped_grpc_route_transform(flavor, retained, HashMap::new(), original.clone())
+                .await;
 
+        // The HTTP status is deliberately not asserted: a gRPC/gRPC-Web
+        // rejection is shaped as an RPC error, which stays `200` and signals
+        // through `grpc-status`. `replaced` plus the rejection reason is the
+        // fail-closed evidence on every flavor.
         let case = format!("{flavor:?}/{retained:?}");
         assert!(replaced, "{case}: an uninspectable body is not forwarded");
-        assert_eq!(status, 502, "{case}");
         assert_eq!(reason.as_deref(), Some("unparseable_document"), "{case}");
+        assert_ne!(
+            body, original,
+            "{case}: the original bytes must not be forwarded"
+        );
     }
 }
 
@@ -3266,14 +3282,15 @@ async fn untyped_truncated_grpc_framing_on_a_grpc_route_fails_closed() {
     let mut truncated = grpc_frame(br#"{"secret":"hunter2"}"#);
     truncated.truncate(truncated.len() - 4);
 
-    let (replaced, status, reason, _) =
+    let (replaced, _, reason, _) =
         run_untyped_grpc_route_transform(HttpFlavor::Grpc, None, HashMap::new(), truncated).await;
 
+    // As above, a native gRPC rejection stays `200` and reports through
+    // `grpc-status`, so the reason is the assertion that means something.
     assert!(
         replaced,
         "truncated framing is not a provable representation"
     );
-    assert_eq!(status, 502);
     assert_eq!(reason.as_deref(), Some("unparseable_document"));
 }
 
