@@ -3839,10 +3839,30 @@ paths:
     delete:
       operationId: deleteConsumerCredentials
       summary: Remove all credentials of a type
+      description: |
+        Removes the entire credential value for the given type. The known types
+        are always accepted and the delete is idempotent. An unknown/custom
+        credential type is accepted only when the consumer actually stores it —
+        such types are hidden from ordinary Consumer responses and therefore
+        preserved across whole-Consumer `PUT`, so this endpoint is the only way
+        to remove them. An unknown type the consumer does not store returns
+        `400`.
       tags: [Consumers]
+      parameters:
+        - name: cred_type
+          in: path
+          required: true
+          schema:
+            type: string
+          description: |
+            Credential type to remove: one of `keyauth`, `basicauth`, `jwt`,
+            `hmac_auth`, `mtls_auth`, or an unknown/custom credential type
+            already stored on the consumer.
       responses:
         "204":
           description: Credential removed
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -6627,6 +6647,20 @@ components:
         items in `POST /batch`. Credential values are write-only inputs:
         plaintext `basicauth` `password` fields are hashed on write and stored
         secrets are never returned by ordinary Consumer responses.
+
+
+        Update (`PUT`) is non-destructive for credential state the ordinary
+        `Consumer` response cannot express, so a read-modify-write round trip of
+        a `Consumer` response is safe: an omitted credential type the ordinary
+        response does not emit at all (`basicauth`, any unknown/custom type, or
+        an `mtls_auth` map whose entries the projection filtered out) is
+        preserved from the stored consumer, and a
+        `keyauth`/`jwt`/`hmac_auth` entry submitted as the exact `[REDACTED]`
+        placeholder is restored from the stored entry at the same array index.
+        Omitting a credential type that the ordinary response does represent
+        (`keyauth`, `jwt`, `hmac_auth`, `mtls_auth`) still removes it; removing
+        a hidden type uses
+        `DELETE /consumers/{consumer_id}/credentials/{cred_type}`.
       unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ConsumerBase"
@@ -6640,7 +6674,12 @@ components:
         Consumer item in a `GET /backup` export. Credentials carry canonical
         unredacted stored values (`basicauth` entries carry the stored
         `password_hash`; plaintext passwords are never exported) suitable for
-        disaster-recovery restoration via `POST /restore`.
+        disaster-recovery restoration via `POST /restore`. Export canonicalizes
+        stored `jwt` entries to their single `secret` field so entries written
+        before the HS256-only contract — which may still carry ignored
+        selectors such as `algorithm` — stay restorable; rotation entries, every
+        other credential type, and unknown/custom credential maps are exported
+        verbatim.
       unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ConsumerBase"

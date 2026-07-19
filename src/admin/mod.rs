@@ -4496,10 +4496,6 @@ async fn handle_delete_credentials(
         return Ok(*resp);
     }
 
-    if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
-        return Ok(invalid_credential_type_response(cred_type));
-    }
-
     let db = match require_db(state) {
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
@@ -4522,6 +4518,17 @@ async fn handle_delete_credentials(
                 Ok(consumer) => consumer,
                 Err(resp) => return *resp,
             };
+        // Whole-Consumer PUT preserves credential types the ordinary response
+        // projection hides, so this route is the only way to remove them. It
+        // therefore also accepts an unknown/custom type that the Consumer
+        // actually stores; an unknown type it does not store stays a 400, so
+        // no new credential-type namespace is opened. Known types keep their
+        // idempotent delete regardless of whether an entry is present.
+        if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type)
+            && !consumer.credentials.contains_key(cred_type)
+        {
+            return invalid_credential_type_response(cred_type);
+        }
         let before = consumer.clone();
         consumer.credentials.remove(cred_type);
         let response = persist_consumer_update(
@@ -6086,6 +6093,17 @@ async fn handle_backup(
         .as_ref()
         .is_none_or(|f| f.contains("upstreams"));
 
+    // Backups must stay restorable. Consumer `jwt` credentials stored before
+    // the HS256-only contract was enforced can carry ignored selectors that
+    // `POST /restore` now rejects, so export the canonical single-`secret`
+    // form documented by `ConsumerBackup`. Every other credential type, and
+    // unknown/custom credential maps, are exported verbatim.
+    let canonical_consumers: Vec<Consumer> = config
+        .consumers
+        .iter()
+        .map(crate::config::types::canonicalize_consumer_credentials_for_backup)
+        .collect();
+
     let empty_proxies: Vec<Proxy> = Vec::new();
     let empty_consumers: Vec<Consumer> = Vec::new();
     let empty_plugin_configs: Vec<PluginConfig> = Vec::new();
@@ -6097,7 +6115,7 @@ async fn handle_backup(
         empty_proxies.as_slice()
     };
     let consumers = if include_consumers {
-        config.consumers.as_slice()
+        canonical_consumers.as_slice()
     } else {
         empty_consumers.as_slice()
     };

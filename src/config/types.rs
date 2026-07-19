@@ -98,6 +98,14 @@ pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
 pub const MIN_JWT_SECRET_LENGTH: usize = 32;
 /// Minimum length for hmac_auth shared secrets.
 pub const MIN_HMAC_SECRET_LENGTH: usize = 32;
+/// Placeholder substituted for secret credential values in ordinary Consumer
+/// responses and audit diffs.
+pub const CREDENTIAL_REDACTION_PLACEHOLDER: &str = "[REDACTED]";
+/// Known credential types whose secret field the ordinary Consumer response
+/// projection replaces with [`CREDENTIAL_REDACTION_PLACEHOLDER`], paired with
+/// that field name.
+pub const REDACTED_CREDENTIAL_SECRET_FIELDS: &[(&str, &str)] =
+    &[("keyauth", "key"), ("jwt", "secret"), ("hmac_auth", "secret")];
 
 // Current ISO 3166-1 alpha-2 assignments plus XK, the user-assigned Kosovo
 // code emitted by MaxMind country-capable products. Keeping this list in the
@@ -7092,7 +7100,7 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     ) -> Option<serde_json::Value> {
         let entries: Vec<_> = entry_objects(credential_value)
             .into_iter()
-            .map(|_| serde_json::json!({(field): "[REDACTED]"}))
+            .map(|_| serde_json::json!({(field): CREDENTIAL_REDACTION_PLACEHOLDER}))
             .collect();
         (!entries.is_empty()).then(|| serde_json::Value::Array(entries))
     }
@@ -7118,11 +7126,7 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     // credential map; this projection affects ordinary responses and audit
     // events only.
     redacted.credentials.clear();
-    for (cred_type, field) in [
-        ("keyauth", "key"),
-        ("jwt", "secret"),
-        ("hmac_auth", "secret"),
-    ] {
+    for &(cred_type, field) in REDACTED_CREDENTIAL_SECRET_FIELDS {
         if let Some(entries) = consumer
             .credentials
             .get(cred_type)
@@ -7151,11 +7155,122 @@ pub fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
         // changed, but must not disclose values, entry fields, or even the
         // stored credential shape/cardinality. A single stable marker keeps
         // the mutation visible without creating a credential side channel.
-        redacted
-            .credentials
-            .insert("basicauth".to_string(), serde_json::json!("[REDACTED]"));
+        redacted.credentials.insert(
+            "basicauth".to_string(),
+            serde_json::json!(CREDENTIAL_REDACTION_PLACEHOLDER),
+        );
     }
     redacted
+}
+
+/// Whether `entry` is exactly the redaction projection of one credential entry
+/// of `cred_type`, i.e. a lone `field` set to
+/// [`CREDENTIAL_REDACTION_PLACEHOLDER`].
+fn is_redaction_placeholder_entry(entry: &serde_json::Value, field: &str) -> bool {
+    entry.as_object().is_some_and(|object| {
+        object.len() == 1
+            && object.get(field).and_then(serde_json::Value::as_str)
+                == Some(CREDENTIAL_REDACTION_PLACEHOLDER)
+    })
+}
+
+/// Restores the credential state a whole-Consumer update cannot express.
+///
+/// Ordinary Consumer responses are a closed projection, so a read-modify-write
+/// client that GETs a Consumer, edits a scalar field, and PUTs the body back
+/// never sends the credential state it was not shown. Two rewrites are needed
+/// so that flow stays non-destructive:
+///
+/// 1. A stored credential type the ordinary projection does not emit at all —
+///    `basicauth`, every unknown/custom type, and an `mtls_auth` map whose
+///    entries the projection all filtered out — is copied from `existing` when
+///    the request omits it, because the client was never shown it. A type the
+///    projection does emit is still deleted by omission, so that contract is
+///    unchanged. Explicit removal of a hidden type uses
+///    `DELETE /consumers/{id}/credentials/{cred_type}`, which is authoritative
+///    for them.
+/// 2. `keyauth`/`jwt`/`hmac_auth` entries submitted as the exact
+///    [`CREDENTIAL_REDACTION_PLACEHOLDER`] projection are restored positionally
+///    from the stored entry at the same index, so a round-tripped response
+///    cannot overwrite a live API key or shared secret with the placeholder
+///    string. Entries carrying real values are left untouched, so rotation
+///    through this path still works.
+///
+/// Credential types the request does send are otherwise replaced wholesale, so
+/// deleting a projected known type by omission keeps working.
+pub fn preserve_response_hidden_consumer_credentials(updated: &mut Consumer, existing: &Consumer) {
+    // Ask the projection itself which types a client could have seen, so this
+    // stays correct by construction if the projection changes.
+    let projected = redact_consumer_credentials(existing);
+    for (cred_type, stored) in &existing.credentials {
+        if !projected.credentials.contains_key(cred_type)
+            && !updated.credentials.contains_key(cred_type)
+        {
+            updated.credentials.insert(cred_type.clone(), stored.clone());
+        }
+    }
+
+    for &(cred_type, field) in REDACTED_CREDENTIAL_SECRET_FIELDS {
+        // The projection emits one entry per stored entry, in order, for both
+        // the array form and the legacy single-object form, so stored entries
+        // are indexed the same way here.
+        let stored_entries: Vec<&serde_json::Value> = match existing.credentials.get(cred_type) {
+            Some(serde_json::Value::Array(entries)) => entries.iter().collect(),
+            Some(entry @ serde_json::Value::Object(_)) => vec![entry],
+            _ => continue,
+        };
+        let Some(submitted_entries) = updated
+            .credentials
+            .get_mut(cred_type)
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for (index, entry) in submitted_entries.iter_mut().enumerate() {
+            if is_redaction_placeholder_entry(entry, field)
+                && let Some(stored_entry) = stored_entries.get(index)
+            {
+                *entry = (*stored_entry).clone();
+            }
+        }
+    }
+}
+
+/// Canonicalizes a Consumer for `GET /backup` export.
+///
+/// Backups carry unredacted stored credentials so `POST /restore` can recreate
+/// them faithfully. Consumer `jwt` credentials are HS256-only and must contain
+/// exactly one `secret` field, but data stored before that contract was
+/// enforced can still carry ignored selectors such as `algorithm`, which
+/// restore now rejects. Reducing those entries to their `secret` keeps a
+/// backup taken from a deployed database restorable, which is also the shape
+/// `ConsumerBackup` already documents.
+///
+/// The rewrite is deliberately narrow: it never mutates the stored Consumer,
+/// keeps every rotation entry in order, leaves the outer credential container
+/// shape alone, leaves entries without a string `secret` untouched so genuinely
+/// unrepresentable data surfaces at restore instead of being silently dropped,
+/// and copies every other credential type — including unknown/custom maps —
+/// through verbatim.
+pub fn canonicalize_consumer_credentials_for_backup(consumer: &Consumer) -> Consumer {
+    fn canonical_jwt_entry(entry: &serde_json::Value) -> serde_json::Value {
+        match entry.get("secret").and_then(serde_json::Value::as_str) {
+            Some(secret) => serde_json::json!({"secret": secret}),
+            None => entry.clone(),
+        }
+    }
+
+    let mut canonical = consumer.clone();
+    if let Some(jwt) = canonical.credentials.get_mut("jwt") {
+        if jwt.is_object() {
+            *jwt = canonical_jwt_entry(jwt);
+        } else if let serde_json::Value::Array(entries) = jwt {
+            for entry in entries.iter_mut() {
+                *entry = canonical_jwt_entry(entry);
+            }
+        }
+    }
+    canonical
 }
 
 pub(crate) fn hash_consumer_secrets(
