@@ -505,7 +505,11 @@ impl ResponseTransformer {
 ///   any hook) and the separately retained gRPC-Web representation, the pair the
 ///   rejection shaper already trusts to pick the client's error flavor. This
 ///   covers the case where no media type was ever stamped, so the snapshot
-///   cannot speak: a gRPC/gRPC-Web request's response is framed regardless.
+///   cannot speak. The flavor only SELECTS the grammar there; the bytes then
+///   have to satisfy it in full — see "the untyped case is decided on the
+///   BYTES" below. A live type present without a pristine one does not settle
+///   it either: `after_proxy` can add or relabel a type on a response the
+///   backend sent untyped, so that label describes nothing the backend proved.
 ///
 /// Deliberately NOT a decline: a gRPC-Web request whose backend genuinely
 /// answered with a bare `application/json` document. The pristine type proves
@@ -554,7 +558,6 @@ impl ResponseTransformer {
 /// with data after it is not a servable complete representation either.
 fn framed_grpc_request_without_proven_media_type(
     ctx: &RequestContext,
-    response_content_type: Option<&str>,
     response_body: &[u8],
 ) -> bool {
     let pristine_content_type = ctx
@@ -567,19 +570,28 @@ fn framed_grpc_request_without_proven_media_type(
         return body_transform::is_framed_grpc_content_type(pristine);
     }
 
-    // No stamped type to consult. Fall back to the request's immutable flavor,
-    // but only when the live header does not already prove a non-framed
-    // representation — a `Content-Type` the gate would decline on its own needs
-    // no help, and one naming a real document type is evidence in its own right.
-    if response_content_type.is_some() {
-        return false;
-    }
-    // The request's representation selects the grammar; the bytes then have to
-    // satisfy exactly that one. Asking the union of all three grammars was the
-    // gap: base64 is a legal body only for a text-mode gRPC-Web client, and a
-    // body trailer frame only for a gRPC-Web one, so accepting either on a
-    // native gRPC request let a non-RPC byte string pass as framing and skip the
-    // fail-closed `unparseable_document` rejection.
+    // No stamped type to consult, so the BYTES decide — including when a live
+    // `Content-Type` is present.
+    //
+    // The live map cannot stand in for the missing snapshot here: an
+    // `after_proxy` hook is free to ADD or relabel a type on a response the
+    // backend sent untyped, and `application/json` invented by such a hook is
+    // not evidence about bytes the backend never described. Returning early on
+    // any live type let that hook-authored label claim a complete gRPC/gRPC-Web
+    // frame sequence as a JSON document, which the gate then failed to parse and
+    // replaced with a `502 unparseable_document` — a valid RPC reply destroyed
+    // by a header rule. A PRISTINE type still wins outright above; only the
+    // unproven post-hook label yields to a total frame parse.
+    //
+    // Deciding it on a total parse is what keeps this from re-opening the
+    // earlier fail-open: bytes that are not exactly complete frames stay
+    // claimed, so a genuine JSON document under a hook-added (or hook-removed)
+    // type is redacted exactly as before. The request's representation selects
+    // the grammar and the bytes must satisfy exactly that one. Asking the union
+    // of all three grammars was the other gap: base64 is a legal body only for a
+    // text-mode gRPC-Web client, and a body trailer frame only for a gRPC-Web
+    // one, so accepting either on a native gRPC request let a non-RPC byte
+    // string pass as framing and skip the fail-closed rejection.
     let Some(representation) = super::grpc_web::client_grpc_framing_representation(ctx) else {
         return false;
     };
@@ -753,11 +765,7 @@ impl Plugin for ResponseTransformer {
         // stays claimed and redacted instead of being waved through as framing.
         !self.body_rules.is_empty()
             && self.rules_enabled()
-            && !framed_grpc_request_without_proven_media_type(
-                ctx,
-                response_content_type,
-                response_body,
-            )
+            && !framed_grpc_request_without_proven_media_type(ctx, response_body)
             && response_content_type.is_none_or(|ct| {
                 body_transform::is_json_content_type(ct)
                     && !body_transform::is_framed_grpc_content_type(ct)
@@ -924,7 +932,7 @@ impl Plugin for ResponseTransformer {
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if framed_grpc_request_without_proven_media_type(ctx, content_type, body) {
+        if framed_grpc_request_without_proven_media_type(ctx, body) {
             return None;
         }
         self.transform_response_body(body, content_type, response_headers)

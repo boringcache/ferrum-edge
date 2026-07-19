@@ -211,28 +211,75 @@ fn binary_frames_are_complete(data: &[u8], trailer_frame_allowed: bool) -> bool 
 /// that base64-decodes to valid frames is not a JSON document a field rule could
 /// have redacted.
 ///
+/// The encoding is decoded segment-wise by [`decode_grpc_web_text_body`] because
+/// a text-mode producer may flush — and therefore pad — at frame or chunk
+/// boundaries, so in-stream `=` is valid rather than a defect.
+///
 /// Reachable ONLY through [`GrpcFramingRepresentation::WebText`]. A native or
 /// binary gRPC-Web response body is not base64, so base64-shaped bytes there are
 /// an unprovable representation rather than framing.
 fn bytes_are_grpc_web_text_frames(data: &[u8]) -> bool {
-    // Standard base64 with padding: a whole number of 4-character groups, and
-    // `=` padding only in the final group.
+    decode_grpc_web_text_body(data)
+        .is_some_and(|decoded| binary_frames_are_complete(&decoded, true))
+}
+
+/// Decode a gRPC-Web **text** body that may be a CONCATENATION of independently
+/// padded base64 segments, or `None` when the bytes are not a total base64 parse.
+///
+/// A text-mode producer is free to flush at frame or chunk boundaries, and every
+/// flush emits its own complete base64 run — trailing `=` padding included. So a
+/// valid text body is `segment+`, where a segment ends at the first group that
+/// carries padding, and interior `=` is ordinary in-stream padding rather than
+/// corruption. Demanding ONE padded run (strip a single trailing `=`/`==`, then
+/// reject any remaining `=`) misclassified those bodies as unframed; with a
+/// response body rule configured, the representation gate then claimed a real
+/// gRPC-Web reply it could not parse as a document and replaced it with a `502`.
+///
+/// The parse stays TOTAL, which is what keeps the gate fail-closed: the length
+/// must be a whole number of 4-character groups, padding may appear only in a
+/// group's last two positions (and `=` in the third position forces `=` in the
+/// fourth), every other character must be in the standard alphabet, and each
+/// segment must itself decode. Anything else answers `None`, leaving the body
+/// claimed. A JSON document still never reaches the decoder — `{`, `[`, and `"`
+/// are outside the alphabet, so the very first group rejects.
+fn decode_grpc_web_text_body(data: &[u8]) -> Option<Vec<u8>> {
+    fn is_base64_alphabet(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
+    }
+
     if data.is_empty() || !data.len().is_multiple_of(4) {
-        return false;
+        return None;
     }
-    let payload = match data.strip_suffix(b"==") {
-        Some(payload) => payload,
-        None => data.strip_suffix(b"=").unwrap_or(data),
-    };
-    if !payload
-        .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'+' || *byte == b'/')
-    {
-        return false;
+
+    let mut decoded = Vec::with_capacity(data.len() / 4 * 3);
+    let mut segment_start = 0usize;
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let group = &data[pos..pos + 4];
+        if !is_base64_alphabet(group[0]) || !is_base64_alphabet(group[1]) {
+            return None;
+        }
+        let padded = match (group[2], group[3]) {
+            (b'=', b'=') => true,
+            // `=` in the third position is padding, so the fourth must be `=`
+            // too. `A=BC` is not a base64 group in any dialect.
+            (b'=', _) => return None,
+            (third, b'=') if is_base64_alphabet(third) => true,
+            (third, fourth) if is_base64_alphabet(third) && is_base64_alphabet(fourth) => false,
+            _ => return None,
+        };
+        pos += 4;
+        if padded {
+            // Padding closes this flush. Decode it on its own so the next group,
+            // if any, is read as a fresh segment rather than as trailing garbage.
+            decoded.extend(BASE64.decode(&data[segment_start..pos]).ok()?);
+            segment_start = pos;
+        }
     }
-    BASE64
-        .decode(data)
-        .is_ok_and(|decoded| binary_frames_are_complete(&decoded, true))
+    if segment_start < data.len() {
+        decoded.extend(BASE64.decode(&data[segment_start..]).ok()?);
+    }
+    Some(decoded)
 }
 
 /// Returns a header map with `content-type: application/grpc` for gRPC error responses.

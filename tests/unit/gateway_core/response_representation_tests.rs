@@ -22,8 +22,9 @@ use ferrum_edge::_test_support::{
     apply_synthetic_response_body_hooks_for_test, clone_log_metadata_for_test,
     discard_grpc_application_trailers_after_body_rewrite_for_test,
     finalize_selected_buffered_grpc_terminal_response_for_test,
-    representation_rejection_reason_for_test, retain_grpc_web_client_content_type_for_test,
-    run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
+    refresh_grpc_status_metadata_for_test, representation_rejection_reason_for_test,
+    retain_grpc_web_client_content_type_for_test, run_after_proxy_hooks_for_test,
+    set_grpc_deadline_budget_for_test,
     set_original_response_content_encoding_for_test, set_request_http_flavor_for_test,
     stamp_original_request_metadata_for_test, stamp_original_response_metadata_for_test,
     stamped_response_content_length_for_test,
@@ -2324,7 +2325,7 @@ type RelabelledCase = (
 #[tokio::test]
 async fn relabelled_framed_grpc_responses_are_not_claimed_as_json() {
     // (request flavor, retained gRPC-Web type, backend type, relabelled type)
-    let cases: [RelabelledCase; 10] = [
+    let cases: [RelabelledCase; 13] = [
         // --- The pristine snapshot proves the framing. ---
         // Native gRPC whose response type was removed outright by `after_proxy`.
         (HttpFlavor::Grpc, None, Some("application/grpc+proto"), None),
@@ -2387,6 +2388,24 @@ async fn relabelled_framed_grpc_responses_are_not_claimed_as_json() {
             None,
             None,
         ),
+        // --- No type was stamped, and `after_proxy` ADDED one. ---
+        // A hook may add or relabel a type on a response the backend sent
+        // untyped. That label describes nothing the backend ever proved, so it
+        // must not override a complete frame parse: treating it as evidence let
+        // a header rule turn a valid RPC reply into `502 unparseable_document`.
+        (HttpFlavor::Grpc, None, None, Some("application/json")),
+        (
+            HttpFlavor::Plain,
+            Some("application/grpc-web+proto"),
+            None,
+            Some("application/json"),
+        ),
+        (
+            HttpFlavor::Plain,
+            Some("application/grpc-web-text+proto"),
+            None,
+            Some("application/vnd.acme+json"),
+        ),
     ];
 
     for (flavor, retained, backend_content_type, relabelled) in cases {
@@ -2410,6 +2429,55 @@ async fn relabelled_framed_grpc_responses_are_not_claimed_as_json() {
             "{case}: frames must never reach `unparseable_document`"
         );
         assert_eq!(body, expected, "{case}: the frames pass through intact");
+    }
+}
+
+/// The control that keeps the hook-added-type decline from becoming a blanket
+/// exemption: when the backend sent an untyped body that is a real JSON
+/// DOCUMENT, an `after_proxy` hook adding `application/json` changes nothing —
+/// the bytes are not a frame sequence, so the response stays claimed and the
+/// configured redaction still runs. Only a TOTAL frame parse declines.
+#[tokio::test]
+async fn a_hook_added_json_type_still_claims_a_genuine_untyped_document() {
+    for (flavor, retained) in untyped_grpc_route_shapes() {
+        let plugins = redacting_plugins();
+        let mut ctx = make_ctx();
+        set_request_http_flavor_for_test(&mut ctx, flavor);
+        if let Some(content_type) = retained {
+            retain_grpc_web_client_content_type_for_test(&mut ctx, content_type);
+        }
+
+        let mut status = 200;
+        // The backend stamped nothing at all.
+        let mut headers = HashMap::new();
+        stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+        // An `after_proxy` hook then labels it.
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let mut body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+
+        let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+            false,
+        )
+        .await;
+
+        let case = format!("{flavor:?}/{retained:?}");
+        assert!(!replaced, "{case}: a JSON document is servable");
+        assert_eq!(
+            representation_rejection_reason_for_test(&ctx),
+            None,
+            "{case}"
+        );
+        assert_secret_not_forwarded(&body);
+        assert!(
+            String::from_utf8_lossy(&body).contains("keep"),
+            "{case}: the document was redacted, not passed through"
+        );
     }
 }
 
@@ -3614,6 +3682,211 @@ async fn text_mode_also_accepts_the_binary_framing_base64_encodes() {
     assert_eq!(status, 200);
     assert_eq!(reason, None);
     assert_eq!(body, expected);
+}
+
+/// Encode each element separately, so every flush contributes its own padded
+/// base64 run — the shape a text-mode producer emits when it flushes at frame or
+/// chunk boundaries, and therefore a body with `=` padding in the MIDDLE.
+fn segmented_base64(segments: &[Vec<u8>]) -> Vec<u8> {
+    use base64::Engine;
+    let mut encoded = String::new();
+    for segment in segments {
+        encoded.push_str(&base64::engine::general_purpose::STANDARD.encode(segment));
+    }
+    encoded.into_bytes()
+}
+
+/// gRPC-Web text is not required to be one base64 run. A producer may flush at a
+/// frame or chunk boundary and pad there, so `=` appears mid-body and the stream
+/// is a CONCATENATION of independently padded segments.
+///
+/// Requiring a single padded run classified those valid replies as unframed, and
+/// with a response body rule configured the gate then claimed bytes it could not
+/// parse as a document and answered `502 unparseable_document` — destroying a
+/// working RPC reply. Each case below carries interior padding.
+#[tokio::test]
+async fn text_mode_accepts_in_stream_base64_padding() {
+    let data = grpc_frame(b"\x08\x01");
+    let trailer = grpc_trailer_frame(b"grpc-status: 0\r\n");
+
+    let cases = [
+        // Two flushes: DATA, then the terminal trailer.
+        (
+            "data then trailer",
+            segmented_base64(&[data.clone(), trailer.clone()]),
+        ),
+        // Three flushes, two of them DATA.
+        (
+            "two data frames then trailer",
+            segmented_base64(&[data.clone(), grpc_frame(b"\x08\x02"), trailer.clone()]),
+        ),
+        // The other legal tail shape: a PADDED final segment. (The two cases
+        // above already end in an unpadded run — a 21-byte trailer frame
+        // base64-encodes to 28 characters with no `=` — so between them both
+        // tail shapes are covered.)
+        (
+            "padded final segment",
+            segmented_base64(&[
+                data.clone(),
+                grpc_trailer_frame(b"grpc-status: 0\r\ngrpc-message: x\r\n"),
+            ]),
+        ),
+    ];
+
+    for (case, expected) in cases {
+        // Sanity: the fixture must actually exercise interior padding (the last
+        // case's padding is interior by construction).
+        assert!(
+            expected[..expected.len() - 2].contains(&b'='),
+            "{case}: fixture must carry padding before the final group"
+        );
+
+        let (replaced, status, reason, body) = run_untyped_grpc_route_transform(
+            HttpFlavor::Plain,
+            Some("application/grpc-web-text+proto"),
+            HashMap::new(),
+            expected.clone(),
+        )
+        .await;
+
+        assert!(
+            !replaced,
+            "{case}: in-stream padding is valid gRPC-Web text, not an unframed body"
+        );
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(reason, None, "{case}");
+        assert_eq!(body, expected, "{case}: the frames pass through intact");
+    }
+}
+
+/// The parse stays TOTAL, so accepting segmented padding did not turn into
+/// accepting anything base64-ish. Each body below is malformed in exactly one
+/// way and must stay CLAIMED, which on this route means the fail-closed
+/// `unparseable_document` rejection.
+#[tokio::test]
+async fn segmented_text_parsing_still_fails_closed_on_malformed_bodies() {
+    let data = grpc_frame(b"\x08\x01");
+    let trailer = grpc_trailer_frame(b"grpc-status: 0\r\n");
+    let valid = segmented_base64(&[data.clone(), trailer.clone()]);
+
+    // `=` in a group's THIRD position with a non-`=` fourth is not a base64
+    // group in any dialect.
+    let mut misplaced_padding = valid.clone();
+    let group = valid.len() - 4;
+    misplaced_padding[group + 2] = b'=';
+    misplaced_padding[group + 3] = b'A';
+
+    // Padding at the very start of a group is likewise not base64.
+    let mut leading_padding = valid.clone();
+    leading_padding[0] = b'=';
+
+    // A segment that decodes but leaves a truncated frame sequence.
+    let mut truncated = data.clone();
+    truncated.pop();
+    let decodes_to_truncated_frames = segmented_base64(&[truncated]);
+
+    // A trailing group that is not a whole 4-character group.
+    let mut ragged = valid.clone();
+    ragged.push(b'A');
+
+    for (case, body) in [
+        ("misplaced padding", misplaced_padding),
+        ("leading padding", leading_padding),
+        ("decodes to truncated frames", decodes_to_truncated_frames),
+        ("ragged length", ragged),
+    ] {
+        let (replaced, _, reason, forwarded) = run_untyped_grpc_route_transform(
+            HttpFlavor::Plain,
+            Some("application/grpc-web-text+proto"),
+            HashMap::new(),
+            body.clone(),
+        )
+        .await;
+
+        assert!(replaced, "{case}: an unprovable body must not be forwarded");
+        assert_eq!(reason.as_deref(), Some("unparseable_document"), "{case}");
+        assert_ne!(forwarded, body, "{case}: original bytes must not be served");
+    }
+}
+
+/// Segmented decoding must not widen the text grammar into the OTHER
+/// representations: base64 — padded mid-stream or not — is still not a body a
+/// native gRPC or gRPC-Web BINARY client can receive.
+#[tokio::test]
+async fn segmented_base64_is_still_refused_outside_text_mode() {
+    let body = segmented_base64(&[
+        grpc_frame(b"\x08\x01"),
+        grpc_trailer_frame(b"grpc-status: 0\r\n"),
+    ]);
+
+    for (flavor, retained) in binary_framed_grpc_route_shapes() {
+        let (replaced, _, reason, forwarded) =
+            run_untyped_grpc_route_transform(flavor, retained, HashMap::new(), body.clone()).await;
+
+        let case = format!("{flavor:?}/{retained:?}");
+        assert!(
+            replaced,
+            "{case}: base64 is not this client's representation"
+        );
+        assert_eq!(reason.as_deref(), Some("unparseable_document"), "{case}");
+        assert_ne!(forwarded, body, "{case}: original bytes must not be served");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A gRPC-Web replacement's terminal status lives in the BODY trailer frame.
+//
+// gRPC-Web carries `grpc-status` in the body, and the gateway-authored terminal
+// responses that use it — the representation gate's `unparseable_document`
+// refusal above all — clear the wire trailers and strip the terminal fields from
+// the initial header block on purpose, because that is the shape the client must
+// receive. The post-hook metadata refresh reads only those two maps, so it read
+// their (deliberate) silence as "a hook removed the status" and overwrote the
+// recorded INTERNAL(13) with the synthesized UNKNOWN(2) — misreporting every
+// fail-closed gRPC-Web rejection in logs, transaction summaries, and the
+// Prometheus status bucket.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn body_framed_grpc_web_status_survives_the_metadata_refresh() {
+    let mut metadata = HashMap::from([("grpc_status".to_string(), "13".to_string())]);
+    // Exactly what a gRPC-Web replacement leaves behind: no terminal metadata in
+    // either map, because it rides in the body trailer frame.
+    let headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web+proto".to_string(),
+    )]);
+
+    refresh_grpc_status_metadata_for_test(&mut metadata, &HashMap::new(), &headers, true);
+
+    assert_eq!(
+        metadata.get("grpc_status").map(String::as_str),
+        Some("13"),
+        "the body-framed status must not be overwritten with UNKNOWN"
+    );
+}
+
+#[test]
+fn the_metadata_refresh_still_follows_hook_edits_and_native_replacements() {
+    // A status present in either map stays authoritative even under the
+    // body-framed flag, so a genuine post-hook edit is never ignored.
+    let mut metadata = HashMap::from([("grpc_status".to_string(), "13".to_string())]);
+    let trailers = HashMap::from([("grpc-status".to_string(), "7".to_string())]);
+    refresh_grpc_status_metadata_for_test(&mut metadata, &trailers, &HashMap::new(), true);
+    assert_eq!(metadata.get("grpc_status").map(String::as_str), Some("7"));
+
+    // A native gRPC replacement keeps `grpc-status` in the headers, so the flag
+    // is never set for it and the ordinary refresh reads it back.
+    let mut metadata = HashMap::from([("grpc_status".to_string(), "0".to_string())]);
+    let headers = HashMap::from([("grpc-status".to_string(), "13".to_string())]);
+    refresh_grpc_status_metadata_for_test(&mut metadata, &HashMap::new(), &headers, false);
+    assert_eq!(metadata.get("grpc_status").map(String::as_str), Some("13"));
+
+    // And an ordinary buffered gRPC response whose hooks really did remove the
+    // status still falls back to UNKNOWN.
+    let mut metadata = HashMap::from([("grpc_status".to_string(), "0".to_string())]);
+    refresh_grpc_status_metadata_for_test(&mut metadata, &HashMap::new(), &HashMap::new(), false);
+    assert_eq!(metadata.get("grpc_status").map(String::as_str), Some("2"));
 }
 
 // ---------------------------------------------------------------------------

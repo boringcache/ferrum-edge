@@ -1685,6 +1685,23 @@ pub mod _test_support {
         (response_headers, stale_backend_trailers)
     }
 
+    /// Drive the transaction-metadata status refresh the buffered gRPC paths run
+    /// after trailer reconciliation, including the body-framed gRPC-Web case
+    /// where the terminal status is deliberately absent from both maps.
+    pub fn refresh_grpc_status_metadata_for_test(
+        metadata: &mut HashMap<String, String>,
+        trailers: &HashMap<String, String>,
+        headers: &HashMap<String, String>,
+        terminal_metadata_is_body_framed: bool,
+    ) {
+        crate::proxy::grpc_proxy::refresh_grpc_status_metadata_with_body_framed_terminal(
+            metadata,
+            trailers,
+            headers,
+            terminal_metadata_is_body_framed,
+        );
+    }
+
     pub async fn run_after_proxy_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,

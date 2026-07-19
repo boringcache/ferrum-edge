@@ -17871,6 +17871,20 @@ async fn handle_proxy_request_inner(
             })
     };
     let grpc_web_request = grpc_web_response_content_type.is_some();
+    // Retain the representation just classified, exactly as the H3 frontend does
+    // right after it builds its context. Without this the marker existed only
+    // when the `grpc_web` plugin was configured, so an H1/H2 PASS-THROUGH
+    // deployment — the backend speaks gRPC-Web itself and the translator is
+    // deliberately absent — left `client_grpc_framing_representation` with
+    // nothing to read. A backend that omits `Content-Type` (or a response hook
+    // that strips it) then reached the buffered representation gate as untyped
+    // JSON, and valid gRPC-Web frames were replaced with a `502` whenever a
+    // response body rule was configured. The classification is taken from the
+    // immutable inbound content-type before any hook runs, so it records the
+    // client's own representation and never a rewritten one.
+    if let Some(content_type) = grpc_web_response_content_type {
+        crate::plugins::grpc_web::retain_client_content_type_for_errors(&mut ctx, content_type);
+    }
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
 
@@ -21969,6 +21983,12 @@ async fn handle_proxy_request_inner(
                         &response_headers,
                         &response_trailers,
                     );
+                // Set when a gateway-authored terminal response encodes its
+                // gRPC status in the gRPC-Web BODY trailer frame instead of in
+                // the header/trailer maps, so the metadata refresh below does
+                // not read those (deliberately emptied) maps as a hook-removed
+                // status and overwrite the recorded status with UNKNOWN.
+                let mut terminal_metadata_is_body_framed = false;
                 let initial_response_header_policy_names =
                     plugin_cache_view.initial_response_header_policy_names();
                 // Set once an `on_response_body` hook replaces the backend
@@ -22127,6 +22147,14 @@ async fn handle_proxy_request_inner(
                             &mut authoritative_trailers_only_terminal_metadata,
                         );
                         buffered_initial_response_header_policy_state = None;
+                        // A gRPC-Web replacement (representation rejection or
+                        // deadline) puts its status in the body trailer frame
+                        // and keeps it out of both maps. The native gRPC
+                        // replacement leaves `grpc-status` in the headers, so
+                        // this flag stays false and the ordinary refresh reads
+                        // it back.
+                        terminal_metadata_is_body_framed |=
+                            grpc_web_response_content_type.is_some();
                     }
                     // Record genuine transform-phase edits BEFORE retiring stale
                     // compatibility-view trailers below. The discard removes
@@ -22207,6 +22235,10 @@ async fn handle_proxy_request_inner(
                                     response_status = 200;
                                     response_headers = translated.headers;
                                     response_body = translated.body;
+                                    // Same body-framed shape as the gate's
+                                    // replacement above: the finalized status
+                                    // lives in the trailer frame only.
+                                    terminal_metadata_is_body_framed = true;
                                 } else {
                                     response_status = normalized.http_status.as_u16();
                                     response_headers = normalized.headers;
@@ -22262,10 +22294,11 @@ async fn handle_proxy_request_inner(
                 // pristine backend status above. Metrics and logs instead track
                 // the final status after response hooks reconciled their edits
                 // back onto the client-visible header/trailer maps.
-                grpc_proxy::refresh_grpc_status_metadata(
+                grpc_proxy::refresh_grpc_status_metadata_with_body_framed_terminal(
                     &mut ctx.metadata,
                     &response_trailers,
                     &response_headers,
+                    terminal_metadata_is_body_framed,
                 );
                 if response_body.is_empty() {
                     // True Trailers-Only encoding: no DATA frame, grpc-status

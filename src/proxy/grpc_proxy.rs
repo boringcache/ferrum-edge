@@ -1445,6 +1445,41 @@ pub(crate) fn refresh_grpc_status_metadata(
     metadata.insert("grpc_status".to_string(), status.to_string());
 }
 
+/// [`refresh_grpc_status_metadata`] for a buffered response whose terminal
+/// metadata may ride in the BODY rather than in either map.
+///
+/// gRPC-Web carries `grpc-status`/`grpc-message` in a body trailer frame, and
+/// the gateway-authored terminal responses that use it — the representation
+/// gate's `unparseable_document` refusal, the deadline replacement, and a
+/// finalized body rejection — clear the wire trailers and strip the terminal
+/// fields from the initial header block on purpose, because that is the shape
+/// the client must see. Both maps are therefore legitimately silent, and the
+/// plain refresh would read that silence as "the hooks removed the status" and
+/// overwrite the status the replacement just recorded with the synthesized
+/// `UNKNOWN(2)` — reporting `2` in logs, transaction summaries, and the
+/// Prometheus status bucket for a fail-closed `INTERNAL(13)` error the client
+/// actually received.
+///
+/// So when the terminal metadata is body-framed and neither map names a status,
+/// an already-recorded status stands. A status present in either map is still
+/// authoritative and still refreshes, so a genuine post-hook edit is never
+/// ignored, and a request with no recorded status at all still falls back to
+/// `UNKNOWN`.
+pub(crate) fn refresh_grpc_status_metadata_with_body_framed_terminal(
+    metadata: &mut HashMap<String, String>,
+    trailers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+    terminal_metadata_is_body_framed: bool,
+) {
+    if terminal_metadata_is_body_framed
+        && grpc_status_from_maps(trailers, headers).is_none()
+        && metadata.contains_key("grpc_status")
+    {
+        return;
+    }
+    refresh_grpc_status_metadata(metadata, trailers, headers);
+}
+
 /// Effective request-body cap for the sidecar mesh-mTLS dispatch path (issue
 /// #2003 codex r1-3): gRPC-flavored uploads — native `application/grpc` or
 /// gRPC-Web translated to it by the `grpc_web` plugin; both are wire-native

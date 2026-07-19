@@ -4412,6 +4412,17 @@ where
             .then(|| {
                 crate::proxy::grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&resp.headers)
             });
+            // A gRPC-Web client's terminal metadata rides in the BODY trailer
+            // frame, and the gateway-authored replacements below empty the
+            // header/trailer maps of `grpc-status` on purpose because that is the
+            // shape the client must receive. Track when that happened so the
+            // metadata refresh does not read the emptied maps as a hook-removed
+            // status and overwrite the status the replacement recorded with the
+            // synthesized UNKNOWN(2). Same rule, same reason, as the buffered
+            // H1/H2 gRPC path in `proxy::handle_proxy_request`.
+            let client_terminal_metadata_is_body_framed =
+                crate::plugins::grpc_web::client_uses_grpc_web(ctx);
+            let mut terminal_metadata_is_body_framed = false;
             // Capture original response invariants before `after_proxy` rewrites
             // the header view below, exactly as `dispatch_plain` and the native
             // H3 path do. `resp.headers` is the untouched backend initial header
@@ -4551,6 +4562,7 @@ where
                         &mut response_trailers,
                         &mut authoritative_trailers_only_terminal_metadata,
                     );
+                    terminal_metadata_is_body_framed |= client_terminal_metadata_is_body_framed;
                 } else {
                     // Same ordering contract as the transform phase below: the
                     // decode-only normalize rewrite must not let the trailer
@@ -4658,6 +4670,7 @@ where
                     &mut authoritative_trailers_only_terminal_metadata,
                 );
                 buffered_initial_response_header_policy_state = None;
+                terminal_metadata_is_body_framed |= grpc_web_response_content_type.is_some();
             }
             let mut representation_rewritten = matches!(
                 admission,
@@ -4700,6 +4713,8 @@ where
                                 &mut response_trailers,
                                 &mut authoritative_trailers_only_terminal_metadata,
                             );
+                            terminal_metadata_is_body_framed |=
+                                client_terminal_metadata_is_body_framed;
                             break;
                         }
                     };
@@ -4806,10 +4821,11 @@ where
             );
             // Admission retains the pristine backend status; transaction
             // metadata follows the post-hook status that the H3 client sees.
-            crate::proxy::grpc_proxy::refresh_grpc_status_metadata(
+            crate::proxy::grpc_proxy::refresh_grpc_status_metadata_with_body_framed_terminal(
                 &mut ctx.metadata,
                 &response_trailers,
                 &plugin_response_headers,
+                terminal_metadata_is_body_framed,
             );
             let mut response_headers = plugin_response_headers;
             let authoritative_terminal_metadata =
