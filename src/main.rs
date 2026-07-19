@@ -738,7 +738,16 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         env_config.dtls_record_overhead_bytes,
     );
 
-    info!("Operating mode: {:?}", env_config.mode);
+    // Key-tied, not left to the emission-boundary redactor: this line re-renders
+    // the value rather than echoing it, so a `FERRUM_MODE_FILE` holding
+    // `database` would reach the sink as `Database` — a form
+    // `secrets::derive_candidates` deliberately does not produce. See
+    // `secrets::report_env_field`. `{:?}` on the withheld path would re-quote
+    // the placeholder, so the rendering is formatted first and printed as `{}`.
+    info!(
+        "Operating mode: {}",
+        secrets::report_env_field("FERRUM_MODE", &format!("{:?}", env_config.mode))
+    );
     info!(
         "Proxy bind address: {}, Admin bind address: {}",
         env_config.proxy_bind_address, env_config.admin_bind_address

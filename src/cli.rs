@@ -359,25 +359,20 @@ pub fn execute_reload(args: &ReloadArgs) -> Result<(), String> {
 /// to filter. Every value-bearing line is therefore filtered at its own call
 /// site.
 ///
-/// Filtering is **key-tied first**, not textual, because the report re-renders
-/// values rather than echoing them. `Mode: {:?}` prints the `OperatingMode`
-/// variant, so a `FERRUM_MODE_FILE` holding `database` reaches stdout as
-/// `Database` — a form `secrets::derive_candidates` deliberately does not
-/// produce (it derives upper- and lowercase, not `Display`/`Debug` casing of
-/// every enum in the crate). Widening candidate derivation to chase that would
-/// be exactly the open-ended normalization the redaction design rejects.
-/// Withholding by key instead is exact: the variable is known by name to have
-/// been externally resolved, so *no* rendering of its value can escape.
+/// The key-tied rule and its rationale live with the redaction design in
+/// [`crate::secrets::report_env_field`] — in short, the report *re-renders*
+/// values (`Mode: {:?}` turns a resolved `database` into `Database`, a form
+/// candidate derivation deliberately does not produce), so the variable is
+/// withheld by name rather than by matching text. `run`'s `Operating mode:`
+/// record shares that helper, so both surfaces withhold the same re-rendered
+/// value.
 ///
-/// `redact_external_secret_values` still runs as the second pass, covering a
-/// field that interpolates some *other* externally resolved variable's value
-/// verbatim (the spec path is one such: it is the value of
-/// `FERRUM_FILE_CONFIG_PATH`, but a future field could embed one).
+/// The textual second pass still covers a field that interpolates some *other*
+/// externally resolved variable's value verbatim (the spec path is one such: it
+/// is the value of `FERRUM_FILE_CONFIG_PATH`, but a future field could embed
+/// one).
 fn report_field(env_key: &str, rendered: &str) -> String {
-    if crate::secrets::is_external_secret_key(env_key) {
-        return crate::secrets::EXTERNAL_SECRET_PLACEHOLDER.to_string();
-    }
-    crate::secrets::redact_external_secret_values(rendered)
+    crate::secrets::report_env_field(env_key, rendered)
 }
 
 /// Validate configuration without starting the gateway.

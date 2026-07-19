@@ -1956,3 +1956,221 @@ async fn functional_cli_precedence_env_beats_conf_file() {
         last_err
     );
 }
+
+// ── validate: non-Unicode environment ───────────────────────────────────────
+//
+// Startup secret discovery enumerates the environment before settings are
+// parsed. `std::env::vars()` *panics* on any non-Unicode name or value, and it
+// panics during iteration — before the `FERRUM_` filter can run — so a single
+// unrelated variable was enough to abort `validate` with no diagnostic at all.
+// Discovery therefore uses `vars_os()` and screens the prefix on raw bytes.
+//
+// Unix-gated: these stage genuinely invalid UTF-8 through `OsStr::from_bytes`,
+// which is a Unix extension. Windows environment strings are WTF-16 and cannot
+// express this case.
+
+/// An unrelated non-Unicode variable must be ignored, not fatal.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_ignores_unrelated_non_unicode_env() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new().unwrap();
+    let secret_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&secret_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET_FILE",
+            secret_path.to_str().unwrap(),
+        )
+        // Not `FERRUM_`-prefixed, and invalid UTF-8 in both name and value.
+        // Set *after* the hermetic builder, whose `env_clear()` would drop it.
+        .env(
+            std::ffi::OsStr::from_bytes(b"UNRELATED_NON_UNICODE_\xff"),
+            std::ffi::OsStr::from_bytes(b"\xff\xfe"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "an unrelated non-Unicode variable must not fail validate: stdout={stdout}, stderr={stderr}"
+    );
+    // Non-vacuous: proves discovery still ran and resolved the `_FILE` source
+    // rather than skipping the environment wholesale.
+    assert!(
+        stdout.contains("Validation passed."),
+        "validate must still succeed: {stdout}"
+    );
+    assert!(
+        stdout.contains("Loaded FERRUM_ADMIN_JWT_SECRET from file"),
+        "discovery must still resolve suffixed sources: {stdout}"
+    );
+}
+
+/// A `FERRUM_*` variable whose *name* is not Unicode fails closed with a
+/// sanitized diagnostic. The suffix sits at the end of the name, so an
+/// undecodable name may well be a configured source that cannot be read;
+/// skipping it would silently drop it.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_non_unicode_ferrum_name() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            std::ffi::OsStr::from_bytes(b"FERRUM_BAD_\xff_FILE"),
+            "/nonexistent",
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a non-Unicode FERRUM_ name must fail closed: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("is not valid Unicode"),
+        "the diagnostic must name the failure class: {stderr}"
+    );
+    // Sanitized to its ASCII skeleton: the operator can find the variable, and
+    // the undecodable byte is never echoed.
+    assert!(
+        stderr.contains("FERRUM_BAD_?_FILE"),
+        "the diagnostic must name the sanitized variable: {stderr}"
+    );
+    assert!(
+        !output.stderr.contains(&0xffu8),
+        "raw undecodable bytes must never reach the operator: {stderr}"
+    );
+}
+
+/// A recognized suffixed *source* key whose value is not Unicode is an unusable
+/// reference and fails closed. (An undecodable value on an ordinary base key is
+/// deliberately not fatal — it is still counted as a directly configured source
+/// by the conflict check, so it cannot silently coexist with a suffixed one.)
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_non_unicode_source_reference() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET_FILE",
+            std::ffi::OsStr::from_bytes(b"/tmp/\xff-secret"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an undecodable source reference must fail closed: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("is not valid Unicode"),
+        "the diagnostic must name the failure class: {stderr}"
+    );
+    assert!(
+        stderr.contains("FERRUM_ADMIN_JWT_SECRET_FILE"),
+        "the diagnostic must name the variable: {stderr}"
+    );
+    assert!(
+        !output.stderr.contains(&0xffu8),
+        "the undecodable reference bytes must never be echoed: {stderr}"
+    );
+}
+
+// ── run: externally resolved operating mode is not disclosed ────────────────
+
+/// `run` logs `Operating mode:` through the tracing sink. That line *re-renders*
+/// the value — a resolved `database` becomes the `OperatingMode::Database`
+/// Debug rendering — and the structural redactor at the emission boundary
+/// deliberately does not derive enum casings, so the line is withheld by key
+/// (`secrets::report_env_field`) instead.
+///
+/// Driven through the real binary rather than a unit test because the leak only
+/// exists once resolution, `EnvConfig` parsing, and the tracing sink are all
+/// wired together.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_run_withholds_externally_resolved_mode() {
+    let temp_dir = TempDir::new().unwrap();
+    let mode_path = temp_dir.path().join("mode");
+    std::fs::write(&mode_path, "database").unwrap();
+    let log_path = temp_dir.path().join("run.log");
+
+    // Stdout goes to a file rather than a pipe: an unread `Stdio::piped()` can
+    // deadlock the child, and the tracing sink writes continuously so the line
+    // is on disk well before the process is signalled.
+    let log_file = std::fs::File::create(&log_path).unwrap();
+
+    let mut cmd = Command::new(binary_abs_path());
+    cmd.arg("run");
+    // Base hermetic env only: the mode must come from the `_FILE` source, so
+    // `FERRUM_MODE` is deliberately not pinned.
+    apply_hermetic_env(&mut cmd, &temp_dir);
+    let mut child = cmd
+        .env("FERRUM_MODE_FILE", mode_path.to_str().unwrap())
+        .env("FERRUM_DB_TYPE", "sqlite")
+        .env("FERRUM_DB_URL", "sqlite::memory:")
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "run-mode-fixture-secret-with-well-over-32-bytes",
+        )
+        // The line is `info!`; the hermetic env drops any inherited level.
+        .env("FERRUM_LOG_LEVEL", "info")
+        .env("FERRUM_PROXY_HTTP_PORT", "18994")
+        .env("FERRUM_ADMIN_HTTP_PORT", "18995")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start ferrum-edge run");
+
+    sleep(Duration::from_secs(3)).await;
+    let pid = child.id();
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    let _ = child.wait();
+
+    let logs = std::fs::read_to_string(&log_path).unwrap_or_default();
+    // Scoped to the record under test. Mode-specific startup records elsewhere
+    // may legitimately mention the mode as a static string chosen by the code
+    // path; the finding is about *re-rendering the resolved value*, which is
+    // this line.
+    let record = logs
+        .lines()
+        .find(|line| line.contains("Operating mode:"))
+        // Non-vacuous: the assertions below are meaningless unless the line was
+        // actually emitted at this level with the mode sourced externally.
+        .unwrap_or_else(|| panic!("the operating-mode record must be emitted: {logs}"));
+    assert!(
+        !record.contains("Database"),
+        "the externally resolved mode must not reach the log in its Debug \
+         rendering: {record}"
+    );
+    assert!(
+        record.contains("redacted: value from external secret source"),
+        "the operating-mode record must carry the placeholder: {record}"
+    );
+}

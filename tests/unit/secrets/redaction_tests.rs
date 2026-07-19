@@ -120,7 +120,22 @@ const NUMBER_CANON_RENDERED: &str = "918273646";
 const WITHHELD_TARGET_KEY: &str = "FERRUM_REDACTION_FIXTURE_WITHHELD_TARGET";
 const WITHHELD_TARGET_VALUE: &str = "ferrum_edge::secrets";
 
-const FIXTURES: [(&str, &str); 16] = [
+/// A value that reaches a record in **key** position.
+///
+/// `TransactionSummary.metadata` / `StreamTransactionSummary.metadata`
+/// serialize plugin-inserted `HashMap` keys as a JSON object, and
+/// `plugins::utils::log_schema` promotes operator config straight into key
+/// position (`rename:`, `static_fields:`, and `MetadataPolicy::Flatten`'s
+/// prefix), so a key is not necessarily a static schema field name.
+const METADATA_KEY_KEY: &str = "FERRUM_REDACTION_FIXTURE_METADATA_KEY";
+const METADATA_KEY_VALUE: &str = "metadata-key-sentinel";
+
+/// A second key-position value, so the duplicate-collapse path is exercised
+/// with two *distinct* resolved values rather than one repeated.
+const METADATA_KEY_TWO_KEY: &str = "FERRUM_REDACTION_FIXTURE_METADATA_KEY_TWO";
+const METADATA_KEY_TWO_VALUE: &str = "second-metadata-key-sentinel";
+
+const FIXTURES: [(&str, &str); 18] = [
     (PLAIN_KEY, PLAIN_VALUE),
     (LIST_KEY, LIST_VALUE),
     (CASE_KEY, CASE_VALUE),
@@ -137,6 +152,8 @@ const FIXTURES: [(&str, &str); 16] = [
     (DB_URL_KEY, DB_URL_VALUE),
     (NUMBER_CANON_KEY, NUMBER_CANON_VALUE),
     (WITHHELD_TARGET_KEY, WITHHELD_TARGET_VALUE),
+    (METADATA_KEY_KEY, METADATA_KEY_VALUE),
+    (METADATA_KEY_TWO_KEY, METADATA_KEY_TWO_VALUE),
 ];
 
 static RECORDED: Once = Once::new();
@@ -414,9 +431,12 @@ fn structural_delimiter_secret_does_not_rewrite_json_syntax() {
     assert!(message.contains(EXTERNAL_SECRET_PLACEHOLDER));
 }
 
-/// A secret equal to a schema field name must not rename the field. Keys are
-/// static field names, never interpolated config, so they are not a leak
-/// channel — but occurrences in *values* still are.
+/// A secret equal to a schema field name must not rename the field. `level` is
+/// one of the fixed tracing schema names, whose presence is structural rather
+/// than derived from configuration — it appears in every record whatever the
+/// secret holds — so it is exempt from the key redaction that dynamic keys get
+/// (see the key-position tests at the end of this file). Occurrences in
+/// *values* are still a leak channel and must go.
 #[test]
 fn field_name_secret_keeps_the_key_and_redacts_the_value() {
     let line = through_sink(|sink| {
@@ -751,5 +771,213 @@ fn a_null_scalar_value_is_redacted() {
         record["tls"],
         serde_json::Value::Bool(true),
         "unrelated scalars must survive"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Key-position redaction.
+//
+// Access records are not all-static. `TransactionSummary.metadata` and
+// `StreamTransactionSummary.metadata` serialize plugin-inserted `HashMap` keys
+// as a nested JSON object, and `plugins::utils::log_schema` puts operator
+// configuration directly in key position (`rename:`, `static_fields:`, and
+// `MetadataPolicy::Flatten`'s prefix). So a resolved value can reach the sink
+// as a key, where value-only redaction would emit it verbatim.
+//
+// Records here are built with explicit `serde_json::Map`s rather than `json!`
+// so the dynamic keys are unambiguously runtime strings, and emission *order*
+// is asserted against the raw line: `serde_json::Map` is a `BTreeMap` in this
+// build (no `preserve_order` feature), so a parsed record would report sorted
+// keys and could not distinguish preserved order from re-sorted order.
+// ---------------------------------------------------------------------------
+
+/// Build a JSON object preserving the given entry order on the wire.
+fn object(entries: Vec<(&str, serde_json::Value)>) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (key, value) in entries {
+        map.insert(key.to_string(), value);
+    }
+    serde_json::Value::Object(map)
+}
+
+fn string(value: &str) -> serde_json::Value {
+    serde_json::Value::String(value.to_string())
+}
+
+/// Byte offset of `needle` in `haystack`, failing the test if absent.
+fn offset_of(haystack: &str, needle: &str) -> usize {
+    haystack
+        .find(needle)
+        .unwrap_or_else(|| panic!("expected `{needle}` in: {haystack}"))
+}
+
+/// The `metadata` shape: a nested object whose key is a resolved value.
+///
+/// Both the key *and* the value beneath it must go. A key built from resolved
+/// material routinely names material of the same provenance, and once the key
+/// is gone a retained value is unattributable.
+#[test]
+fn a_resolved_metadata_key_and_its_value_are_both_redacted() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &object(vec![
+                ("level", string("INFO")),
+                ("message", string("access")),
+                (
+                    "metadata",
+                    object(vec![
+                        (METADATA_KEY_VALUE, string("value-under-the-resolved-key")),
+                        ("request_id", string("abc-123")),
+                    ]),
+                ),
+            ]),
+        );
+    });
+
+    assert!(
+        !line.contains(METADATA_KEY_VALUE),
+        "the resolved value must not survive in key position: {line}"
+    );
+    assert!(
+        !line.contains("value-under-the-resolved-key"),
+        "the value beneath a resolved key must not survive either: {line}"
+    );
+
+    let record = parse_record(&line);
+    let metadata = record["metadata"]
+        .as_object()
+        .expect("metadata stays an object");
+    assert_eq!(
+        metadata.get(EXTERNAL_SECRET_PLACEHOLDER),
+        Some(&string(EXTERNAL_SECRET_PLACEHOLDER)),
+        "the entry must collapse to placeholder key and placeholder value: {line}"
+    );
+    assert_eq!(
+        metadata["request_id"], "abc-123",
+        "an unrelated metadata entry must survive untouched: {line}"
+    );
+    assert_eq!(
+        record["message"], "access",
+        "fixed schema fields must be unaffected: {line}"
+    );
+}
+
+/// The `log_schema` flatten/rename shape: the resolved value is a *top-level*
+/// key, not nested under `metadata`. Depth is not what makes a key dynamic.
+#[test]
+fn a_resolved_top_level_key_is_redacted() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &object(vec![
+                ("level", string("INFO")),
+                (METADATA_KEY_VALUE, string("flattened-value")),
+            ]),
+        );
+    });
+
+    assert!(
+        !line.contains(METADATA_KEY_VALUE),
+        "a resolved top-level key must not survive: {line}"
+    );
+    assert!(
+        !line.contains("flattened-value"),
+        "the value beneath it must not survive: {line}"
+    );
+    let record = parse_record(&line);
+    assert_eq!(
+        record["level"], "INFO",
+        "the fixed schema key must be unaffected: {line}"
+    );
+}
+
+/// Two distinct resolved keys in one object both collapse to the placeholder,
+/// which would be a duplicate key. A JSON object with repeated keys is
+/// ambiguous, so the first wins and later ones are dropped — the record must
+/// stay parseable and must not retain either secret.
+#[test]
+fn colliding_redacted_keys_collapse_to_one_parseable_entry() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &object(vec![
+                ("level", string("INFO")),
+                (
+                    "metadata",
+                    object(vec![
+                        (METADATA_KEY_VALUE, string("first")),
+                        (METADATA_KEY_TWO_VALUE, string("second")),
+                        ("kept", string("yes")),
+                    ]),
+                ),
+            ]),
+        );
+    });
+
+    assert!(
+        !line.contains(METADATA_KEY_VALUE),
+        "first resolved key must not survive: {line}"
+    );
+    assert!(
+        !line.contains(METADATA_KEY_TWO_VALUE),
+        "second resolved key must not survive: {line}"
+    );
+    assert_eq!(
+        line.matches(EXTERNAL_SECRET_PLACEHOLDER).count(),
+        2,
+        "exactly one entry survives, rendered as \
+         `\"<placeholder>\":\"<placeholder>\"` — two occurrences, one for the \
+         key and one for the value. Four would mean the collided second entry \
+         was kept as a duplicate key: {line}"
+    );
+
+    // `parse_record` already fails the test on invalid JSON.
+    let record = parse_record(&line);
+    let metadata = record["metadata"]
+        .as_object()
+        .expect("metadata stays an object");
+    assert_eq!(
+        metadata.len(),
+        2,
+        "the collided entry is dropped, the unrelated one kept: {line}"
+    );
+    assert_eq!(metadata["kept"], "yes", "{line}");
+}
+
+/// The fixed tracing schema keys stay verbatim and in emitted order even when a
+/// resolved value matches one of them. Their presence is structural — `level`
+/// is in every record whatever a secret holds — so leaving them discloses
+/// nothing, while rewriting one would break every downstream consumer.
+#[test]
+fn fixed_schema_keys_survive_and_keep_their_order() {
+    let line = through_sink(|sink| {
+        emit(
+            sink,
+            &object(vec![
+                ("timestamp", string("2026-07-18T00:00:00Z")),
+                ("level", string("WARN")),
+                ("target", string("ferrum_edge::fixture")),
+                ("fields", object(vec![("message", string("unrelated"))])),
+            ]),
+        );
+    });
+
+    for key in ["timestamp", "level", "target", "fields", "message"] {
+        assert!(
+            line.contains(&format!("\"{key}\":")),
+            "the fixed schema key `{key}` must survive verbatim: {line}"
+        );
+    }
+    // Order is asserted on the wire, not through the parsed map.
+    let positions = [
+        offset_of(&line, "\"timestamp\":"),
+        offset_of(&line, "\"level\":"),
+        offset_of(&line, "\"target\":"),
+        offset_of(&line, "\"fields\":"),
+    ];
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "fixed schema keys must keep their emitted order: {line}"
     );
 }

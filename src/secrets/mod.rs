@@ -101,6 +101,38 @@ pub fn is_external_secret_key(key: &str) -> bool {
         .is_some_and(|keys| keys.contains(key))
 }
 
+/// Render one operator-facing field that was derived from `env_key`, withholding
+/// it entirely when that variable was externally resolved.
+///
+/// **Key-tied first, not textual**, because these call sites *re-render* a value
+/// rather than echoing it. `OperatingMode`'s `Debug` rendering is the motivating
+/// case: a `FERRUM_MODE_FILE` holding `database` surfaces as `Database`, a form
+/// [`derive_candidates`] deliberately does not produce (it derives ASCII upper-
+/// and lowercase, not the `Debug`/`Display` casing of every enum in the crate).
+/// Widening candidate derivation to chase enum renderings would be exactly the
+/// open-ended normalization the redaction design rejects, and would cost the
+/// bounded-candidate guarantee. Withholding by key instead is exact: the
+/// variable is known by name to have been externally resolved, so *no* rendering
+/// of its value can escape.
+///
+/// [`redact_external_secret_values`] still runs as the second pass, covering a
+/// field that interpolates some *other* externally resolved variable's value
+/// verbatim.
+///
+/// Both disclosure surfaces that re-render a typed config value use this: the
+/// `validate` report's `Mode:` line (`cli::report_field`, a `println!` the
+/// tracing boundary never sees) and `run`'s `Operating mode:` record in
+/// `main.rs` (which *does* reach [`redact_log_record`], but where the structural
+/// redactor cannot match the re-rendered form for the reason above). A new
+/// value-bearing startup line that re-renders a typed value must go through
+/// here and name the variable it came from.
+pub fn report_env_field(env_key: &str, rendered: &str) -> String {
+    if is_external_secret_key(env_key) {
+        return EXTERNAL_SECRET_PLACEHOLDER.to_string();
+    }
+    redact_external_secret_values(rendered)
+}
+
 /// Remove externally resolved secret values from an operator-facing message.
 ///
 /// This is the backstop behind the structured boundary in
@@ -174,12 +206,25 @@ pub fn redact_external_secret_values(message: &str) -> String {
 ///
 /// So the record is parsed, redacted per *value*, and reserialized:
 ///
-/// * object **keys** are never rewritten. They are the compile-time-static
-///   field names of the tracing/serde schema (plus, in access records, header
-///   names), never an interpolated config value, so they are not a leak
-///   channel — and rewriting one would silently change the record's schema for
-///   every downstream consumer. `level` stays `level` even when `level` is
-///   itself a resolved secret; its occurrences in *values* are still redacted.
+/// * object **keys** are rewritten only when they are *not* one of the fixed
+///   tracing schema names in [`FIXED_LOG_SCHEMA_KEYS`]. Access records are not
+///   all-static: `TransactionSummary.metadata` and
+///   `StreamTransactionSummary.metadata` serialize a `HashMap` as a nested JSON
+///   object whose keys are whatever plugins inserted at runtime, and
+///   `plugins::utils::log_schema` promotes operator configuration into key
+///   position outright — `rename:` renames a field to an operator-supplied
+///   string, `static_fields:` takes its keys straight from the config map, and
+///   `MetadataPolicy::Flatten` lifts metadata keys to the top level behind an
+///   operator-supplied prefix. Any of those can carry an externally resolved
+///   value, so a key that matches a candidate has both the key *and* the value
+///   beneath it replaced (see [`RedactionPlan::redact_json_value`]).
+///
+///   The fixed schema names are exempt because their presence is structural,
+///   not derived: `level` appears in every record regardless of what any secret
+///   holds, so leaving it discloses nothing, while rewriting it would silently
+///   change the record's schema for every downstream consumer. `level` stays
+///   `level` even when `level` is itself a resolved secret; its occurrences in
+///   *values* are still redacted.
 /// * string **values** are matched after unescaping, so JSON escaping cannot
 ///   smuggle a value past the scan and the reserializer re-escapes correctly.
 ///   (The escaped form stays a candidate in its own right — for
@@ -297,6 +342,32 @@ fn withheld_record(plan: &RedactionPlan, trailing_newline: bool) -> Vec<u8> {
     }
     bytes
 }
+
+/// Object keys whose presence in a record is structural rather than derived
+/// from configuration, and which are therefore exempt from key redaction.
+///
+/// These are the field names the `tracing_subscriber` JSON formatter emits.
+/// They appear in every record no matter what any resolved value holds, so
+/// leaving them intact discloses nothing about a secret, while rewriting one
+/// would make the record unparseable for downstream consumers — the contract
+/// that fixed schema keys stay stable and ordered.
+///
+/// Deliberately *not* listed: access-log field names. `log_schema`'s `rename:`
+/// can move an operator-supplied string into any of those positions, so they
+/// are not structural and stay subject to the candidate screen.
+const FIXED_LOG_SCHEMA_KEYS: [&str; 11] = [
+    "timestamp",
+    "level",
+    "fields",
+    "message",
+    "target",
+    "span",
+    "spans",
+    "threadId",
+    "threadName",
+    "filename",
+    "line_number",
+];
 
 /// An order-preserving JSON document, used only by [`redact_log_record`].
 ///
@@ -764,12 +835,50 @@ impl RedactionPlan {
                 }
                 false
             }
-            // Keys are intentionally untouched: they are the schema's stable
-            // field names, not interpolated configuration.
+            // Keys are redacted too, because access records put runtime and
+            // operator-supplied strings in key position (plugin `metadata`
+            // maps, `log_schema` `rename:`/`static_fields:`/flatten prefixes).
+            // Only the fixed tracing schema names are exempt; see
+            // `FIXED_LOG_SCHEMA_KEYS` and the contract on `redact_log_record`.
             LogJson::Object(entries) => {
-                for (_key, entry) in entries.iter_mut() {
+                // A key that carries a resolved value collapses to the
+                // placeholder, and so could several keys in one object. JSON
+                // objects with duplicate keys are ambiguous, so the first such
+                // entry wins and later ones are dropped: losing a field is
+                // acceptable, emitting an ambiguous record is not. An entry
+                // whose key already *equals* the placeholder occupies the slot
+                // as well, so a crafted key cannot force a collision that
+                // re-admits a second redacted entry.
+                let mut placeholder_key_taken = false;
+                entries.retain_mut(|(key, entry)| {
+                    if key.as_str() == EXTERNAL_SECRET_PLACEHOLDER {
+                        if placeholder_key_taken {
+                            return false;
+                        }
+                        placeholder_key_taken = true;
+                        self.redact_json_value(entry);
+                        return true;
+                    }
+                    if !FIXED_LOG_SCHEMA_KEYS.contains(&key.as_str())
+                        && self.contains_candidate(key)
+                    {
+                        if placeholder_key_taken {
+                            return false;
+                        }
+                        placeholder_key_taken = true;
+                        // The value is dropped rather than redacted in place.
+                        // A key built from a resolved value routinely names
+                        // material of the same provenance beneath it, and the
+                        // key is gone, so retaining the subtree would leave a
+                        // value no operator can attribute and that the scan
+                        // may not match in full.
+                        *key = EXTERNAL_SECRET_PLACEHOLDER.to_string();
+                        *entry = LogJson::String(EXTERNAL_SECRET_PLACEHOLDER.to_string());
+                        return true;
+                    }
                     self.redact_json_value(entry);
-                }
+                    true
+                });
                 false
             }
             // Scalars are unquoted in the record, so a resolved port or flag

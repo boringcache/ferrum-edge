@@ -159,7 +159,7 @@ pub struct ResolvedSecret {
 /// The result of resolving all env-based secrets at startup.
 ///
 /// Every vector is sorted by base key. Candidate sources are discovered by
-/// iterating `std::env::vars()` into a `HashMap`, whose order varies between
+/// iterating `std::env::vars_os()` into a `HashMap`, whose order varies between
 /// processes, so an unsorted result would let two runs of `ferrum-edge
 /// validate` on identical input print the `Loaded <KEY> from <provider>` lines
 /// in different orders. Base keys are unique across the result (two sources for
@@ -446,19 +446,48 @@ pub fn external_source_configured(base_key: &str) -> bool {
         if NON_SECRET_FILE_SUFFIX_KEYS.contains(&suffixed_key.as_str()) {
             return false;
         }
-        std::env::var(&suffixed_key)
-            .ok()
-            .is_some_and(|value| !value.is_empty())
+        env_var_os_is_set(&suffixed_key)
     })
+}
+
+/// Render a non-Unicode environment variable name for an operator diagnostic
+/// without disclosing its bytes.
+///
+/// Every byte that is not an ASCII alphanumeric or `_` — which is every byte a
+/// legal `FERRUM_*` name can contain — becomes `?`. That keeps the ASCII skeleton
+/// an operator needs to find the variable while emitting nothing that could
+/// reconstruct undecodable content, and it is deterministic, so two runs on the
+/// same environment produce the same message.
+fn sanitize_env_key(key: &std::ffi::OsStr) -> String {
+    key.as_encoded_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || *byte == b'_' {
+                *byte as char
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// True when a variable is set to a non-empty value, tolerating a value that is
+/// not valid Unicode.
+///
+/// `std::env::var` reports a non-Unicode value as `Err`, which would read as
+/// *unset* here. That matters only for conflict detection, but there it is
+/// load-bearing: a base key holding undecodable bytes is still a directly
+/// configured source, and treating it as absent would let a suffixed source
+/// resolve alongside it and silently overwrite it instead of failing the
+/// documented "only one source is allowed" check.
+fn env_var_os_is_set(key: &str) -> bool {
+    std::env::var_os(key).is_some_and(|value| !value.is_empty())
 }
 
 fn unsupported_cloud_suffix_for_base_key(key: &str) -> Option<(&'static str, &'static str)> {
     for suffix in ["_AZURE", "_VAULT", "_AWS", "_GCP"] {
         let suffixed_key = format!("{key}{suffix}");
-        let is_set = std::env::var(&suffixed_key)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .is_some();
+        let is_set = env_var_os_is_set(&suffixed_key);
         if is_set && let Some(unsupported) = unsupported_cloud_suffix(&suffixed_key) {
             return Some(unsupported);
         }
@@ -468,37 +497,90 @@ fn unsupported_cloud_suffix_for_base_key(key: &str) -> Option<(&'static str, &'s
 
 pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     let mut to_resolve: HashMap<String, Vec<(String, String, BackendKind)>> = HashMap::new();
-    // Collected rather than returned on first sight: `std::env::vars()` order
+    // Collected rather than returned on first sight: `std::env::vars_os()` order
     // varies between processes, so returning inside the loop would let two
     // runs on an identical environment blame a different `FERRUM_*_AWS`/`_GCP`
     // key. Sorted and reported after discovery, matching the determinism the
     // rest of `ResolvedEnvSecrets` already guarantees.
     let mut unsupported: Vec<(String, &'static str, &'static str)> = Vec::new();
 
-    for (raw_key, value) in std::env::vars() {
-        if !raw_key.starts_with(FERRUM_PREFIX) {
+    // Same collect-then-report reasoning as `unsupported`, for the same
+    // determinism reason.
+    let mut invalid_unicode: Vec<String> = Vec::new();
+
+    // `std::env::vars()` *panics* on any variable whose name or value is not
+    // valid Unicode, and it panics during iteration — before this loop can
+    // filter to `FERRUM_*`. A single unrelated non-UTF-8 variable elsewhere in
+    // a POSIX environment would therefore abort `run` and `validate` outright,
+    // with no diagnostic. `vars_os` yields the same entries without decoding,
+    // so an unrelated variable is skipped by the prefix screen below and never
+    // decoded at all.
+    for (raw_key_os, value_os) in std::env::vars_os() {
+        // Screened on raw bytes so a non-Unicode name is rejected here rather
+        // than decoded. `FERRUM_` is ASCII, and `as_encoded_bytes` guarantees
+        // ASCII substrings match at the same positions they would in the
+        // decoded string, so this cannot match mid-character.
+        if !raw_key_os
+            .as_encoded_bytes()
+            .starts_with(FERRUM_PREFIX.as_bytes())
+        {
             continue;
         }
+        let Some(raw_key) = raw_key_os.to_str() else {
+            // A `FERRUM_*` name we cannot decode may well be a suffixed source
+            // (the suffix is at the *end*, which we cannot read). Skipping it
+            // would silently drop a configured secret source, so fail closed.
+            invalid_unicode.push(sanitize_env_key(&raw_key_os));
+            continue;
+        };
+        let Some(value) = value_os.to_str() else {
+            // The name decoded, so we can tell whether this is a *source*
+            // reference or an ordinary direct value. An undecodable source
+            // reference is unusable and fails closed; an ordinary `FERRUM_*`
+            // variable holding undecodable bytes is not this function's
+            // business — it is still counted as a directly configured source
+            // by `env_var_os_is_set` in the conflict check below, so it cannot
+            // silently coexist with a suffixed source.
+            let is_source = unsupported_cloud_suffix(raw_key).is_some()
+                || match_suffix(raw_key).is_some_and(|(_, base_key)| !base_key.is_empty());
+            if is_source {
+                invalid_unicode.push(sanitize_env_key(&raw_key_os));
+            }
+            continue;
+        };
         // Empty suffixed variables are unset-equivalent for every backend.
         // Check this before feature gating so behavior does not change based
         // on whether a cloud provider was compiled into the binary.
         if value.is_empty() {
             continue;
         }
-        if let Some((suffix, backend_name)) = unsupported_cloud_suffix(&raw_key) {
-            unsupported.push((raw_key.clone(), suffix, backend_name));
+        if let Some((suffix, backend_name)) = unsupported_cloud_suffix(raw_key) {
+            unsupported.push((raw_key.to_string(), suffix, backend_name));
             continue;
         }
-        if let Some((backend, base_key)) = match_suffix(&raw_key) {
+        if let Some((backend, base_key)) = match_suffix(raw_key) {
             if base_key.is_empty() {
                 continue;
             }
             to_resolve.entry(base_key.to_string()).or_default().push((
-                raw_key.clone(),
-                value,
+                raw_key.to_string(),
+                value.to_string(),
                 backend.kind(),
             ));
         }
+    }
+
+    // Fail closed before anything is fetched, naming the lexicographically
+    // first offender so the message is identical across processes. The name is
+    // sanitized to its ASCII skeleton: an operator needs to find the variable,
+    // and undecodable bytes are never echoed.
+    if !invalid_unicode.is_empty() {
+        invalid_unicode.sort();
+        return Err(format!(
+            "Environment variable {} is not valid Unicode. External secret source names and \
+             references must be valid Unicode; fix or unset the variable.",
+            invalid_unicode[0]
+        ));
     }
 
     // Fail closed on an unsupported suffix before anything is fetched, naming
@@ -524,10 +606,11 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
 
     for base_key in base_keys {
         let sources = &to_resolve[base_key];
-        let direct_set = std::env::var(base_key)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .is_some();
+        // `var_os`, not `var`: a base key holding non-Unicode bytes is still a
+        // directly configured source. Reading it with `var` would report it as
+        // unset and let a suffixed source resolve on top of it instead of
+        // failing the "only one source is allowed" check below.
+        let direct_set = env_var_os_is_set(base_key);
 
         let total_sources = sources.len() + if direct_set { 1 } else { 0 };
         if total_sources > 1 {
@@ -535,7 +618,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             for (suffixed_key, _, _) in sources {
                 names.push(suffixed_key.clone());
             }
-            // Suffixed sources arrive in `std::env::vars()` order; sort them so
+            // Suffixed sources arrive in `std::env::vars_os()` order; sort them so
             // the conflict message is byte-identical across processes. The
             // direct variable is prepended afterwards because it is the source
             // an operator is most likely to have forgotten about.
