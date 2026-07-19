@@ -42,16 +42,33 @@ const REDACTED_REFERENCE: &str = "<redacted source reference>";
 /// The full reference, its pre-`#` path half, and every provider-normalized
 /// component the fetch was actually issued with are replaced, longest first, so
 /// a `path#field` reference cannot leak its path and a rewritten reference
-/// cannot leak through the rewrite. Very short candidates are left alone: they
-/// carry no meaningful location and replacing a one- or two-character substring
-/// would corrupt unrelated text.
-fn redact_source_reference(error: String, reference: &str) -> String {
+/// cannot leak through the rewrite. When a one- or two-character candidate is
+/// present in the backend detail, selective replacement would corrupt unrelated
+/// text, so the whole provider-controlled detail is replaced with a fixed
+/// key-level diagnostic instead.
+fn redact_source_reference(error: String, reference: &str, key: &str) -> String {
     const MIN_REDACTABLE_REFERENCE_LEN: usize = 3;
 
     let mut candidates = source_reference_candidates(reference);
     candidates.sort_unstable();
     candidates.dedup();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.len()));
+
+    // A one- or two-byte reference cannot be removed selectively: replacing
+    // every matching character/pair would destroy the diagnostic, while
+    // leaving it alone lets an SDK echo the source reference verbatim. Fail
+    // closed to a fixed key-level message whenever such a candidate occurs in
+    // the backend detail. The base key is trusted configuration metadata and
+    // remains actionable; no text derived from the provider error survives.
+    if candidates.iter().any(|candidate| {
+        !candidate.is_empty()
+            && candidate.len() < MIN_REDACTABLE_REFERENCE_LEN
+            && error.contains(candidate)
+    }) {
+        return format!(
+            "Failed to resolve external secret for {key}: provider error withheld to protect the source reference"
+        );
+    }
 
     // Single left-to-right pass over the *original* error. A `replace()` loop
     // over the running message re-scans text it just inserted: a reference
@@ -289,7 +306,9 @@ pub(crate) trait SecretBackend: Sync + Send {
                     timeout.as_secs()
                 )
             })?
-            .map_err(|error| redact_source_reference(error, &secret.reference))?;
+            .map_err(|error| {
+                redact_source_reference(error, &secret.reference, &secret.base_key)
+            })?;
             resolved.push(ResolvedPendingSecret {
                 base_key: secret.base_key.clone(),
                 value,
@@ -426,7 +445,9 @@ where
                 tokio::time::timeout(timeout, fetch(client, &secret.reference, &secret.base_key))
                     .await
                     .map_err(|_| timeout_error(&secret.base_key, backend_name, timeout))?
-                    .map_err(|error| redact_source_reference(error, &secret.reference))?;
+                    .map_err(|error| {
+                        redact_source_reference(error, &secret.reference, &secret.base_key)
+                    })?;
             Ok::<_, String>(ResolvedPendingSecret {
                 base_key: secret.base_key.clone(),
                 value,
@@ -833,7 +854,7 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
     let value = tokio::time::timeout(secret_fetch_timeout(), backend.resolve_one(&reference, key))
         .await
         .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))?
-        .map_err(|error| redact_source_reference(error, &reference))?;
+        .map_err(|error| redact_source_reference(error, &reference, key))?;
 
     if backend.log_loaded() {
         info!("Loaded {} from {}", key, backend.display_name());
@@ -875,7 +896,7 @@ pub async fn resolve_external_reference(
     let value = tokio::time::timeout(secret_fetch_timeout(), backend.resolve_one(reference, key))
         .await
         .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))?
-        .map_err(|error| redact_source_reference(error, reference))?;
+        .map_err(|error| redact_source_reference(error, reference, key))?;
 
     if backend.log_loaded() {
         info!("Loaded {} from {}", key, backend.display_name());
@@ -1332,7 +1353,11 @@ mod tests {
              in https://ferrum-vault-sentinel.vault.azure.net:8443)"
             .to_string();
 
-        let redacted = redact_source_reference(sdk_error, REFERENCE);
+        let redacted = redact_source_reference(
+            sdk_error,
+            REFERENCE,
+            "FERRUM_ADMIN_JWT_SECRET",
+        );
 
         assert!(
             !redacted.contains("ferrum-vault-sentinel")
@@ -1363,7 +1388,7 @@ mod tests {
     fn redact_source_reference_does_not_mangle_its_own_placeholder() {
         let error =
             "backend failed for source#field: permission denied (source unavailable)".to_string();
-        let redacted = redact_source_reference(error, "source#field");
+        let redacted = redact_source_reference(error, "source#field", "FERRUM_TEST_SECRET");
         assert!(
             !redacted.contains("source#field"),
             "the full reference must not survive: {redacted}"
@@ -1379,8 +1404,34 @@ mod tests {
         );
         // Idempotent: a second pass leaves the message byte-for-byte identical.
         assert_eq!(
-            redact_source_reference(redacted.clone(), "source#field"),
+            redact_source_reference(
+                redacted.clone(),
+                "source#field",
+                "FERRUM_TEST_SECRET",
+            ),
             redacted
+        );
+    }
+
+    /// A short provider identifier cannot be selectively replaced without
+    /// shredding unrelated words in the SDK error. It is still a source
+    /// reference, so the safe fallback is a fixed key-level diagnostic rather
+    /// than emitting the provider detail unchanged.
+    #[test]
+    fn redact_source_reference_fails_closed_for_short_reference() {
+        let redacted = redact_source_reference(
+            "AWS request for secret x failed with HTTP 404".to_string(),
+            "x",
+            "FERRUM_ADMIN_JWT_SECRET",
+        );
+
+        assert_eq!(
+            redacted,
+            "Failed to resolve external secret for FERRUM_ADMIN_JWT_SECRET: provider error withheld to protect the source reference"
+        );
+        assert!(
+            !redacted.contains("HTTP 404") && !redacted.contains("AWS request"),
+            "no provider-controlled detail may survive the fail-closed path: {redacted}"
         );
     }
 
