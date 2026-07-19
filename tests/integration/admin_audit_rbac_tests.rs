@@ -273,6 +273,24 @@ async fn non_admin_cannot_read_backup_unredacted_credentials() {
 }
 
 #[tokio::test]
+async fn audit_rbac_precedes_route_local_pagination_validation() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+
+    let viewer = token("view-only", Some("viewer"));
+    let (status, body) = get_json(&base, "/audit?limit=abc", &viewer).await;
+    assert_eq!(status, 403, "audit RBAC must precede pagination: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("required role is 'admin'"),
+        "unexpected RBAC error body: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn viewer_restore_is_rejected_before_large_body_buffering() {
     let tmp = TempDir::new().unwrap();
     let mut state = admin_state(make_store(&tmp).await);
@@ -1070,7 +1088,7 @@ async fn audit_list_rejects_offset_above_backend_range() {
 }
 
 #[tokio::test]
-async fn audit_list_clamps_zero_limit_to_one() {
+async fn audit_list_coerces_zero_limit_to_server_default() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
     let (base, _shutdown) = start_admin(state).await;
@@ -1079,7 +1097,10 @@ async fn audit_list_clamps_zero_limit_to_one() {
     let (status, body) = get_json(&base, "/audit?limit=0", &admin).await;
 
     assert_eq!(status, 200, "zero limit body: {body:?}");
-    assert_eq!(body["limit"], 1);
+    // `/audit` shares the canonical pagination parser, so `limit=0` means the
+    // documented server default (100) here exactly as it does on every other
+    // list endpoint — it is no longer re-parsed into a 1-item clamp.
+    assert_eq!(body["limit"], 100);
 }
 
 #[tokio::test]
