@@ -3476,7 +3476,10 @@ async fn native_grpc_rejects_a_body_trailer_frame() {
         // A native gRPC rejection is shaped as an RPC error and stays `200`,
         // signalling through `grpc-status`, so `replaced` plus the reason is the
         // fail-closed evidence.
-        assert!(replaced, "{case}: a body trailer frame is not native framing");
+        assert!(
+            replaced,
+            "{case}: a body trailer frame is not native framing"
+        );
         assert_eq!(reason.as_deref(), Some("unparseable_document"), "{case}");
         assert_ne!(forwarded, body, "{case}: original bytes must not be served");
     }
@@ -3488,7 +3491,10 @@ async fn native_grpc_rejects_a_body_trailer_frame() {
 async fn grpc_web_binary_accepts_a_legal_terminal_trailer_frame() {
     let bodies = [
         ("data then trailer", data_then_trailer()),
-        ("trailers-only reply", grpc_trailer_frame(b"grpc-status: 5\r\n")),
+        (
+            "trailers-only reply",
+            grpc_trailer_frame(b"grpc-status: 5\r\n"),
+        ),
     ];
 
     for (case, expected) in bodies {
@@ -3500,7 +3506,10 @@ async fn grpc_web_binary_accepts_a_legal_terminal_trailer_frame() {
         )
         .await;
 
-        assert!(!replaced, "{case}: a legal gRPC-Web body must not be claimed");
+        assert!(
+            !replaced,
+            "{case}: a legal gRPC-Web body must not be claimed"
+        );
         assert_eq!(status, 200, "{case}");
         assert_eq!(reason, None, "{case}");
         assert_eq!(body, expected, "{case}: the frames pass through intact");
@@ -3548,7 +3557,10 @@ async fn base64_framing_is_not_excused_outside_grpc_web_text_mode() {
             run_untyped_grpc_route_transform(flavor, retained, HashMap::new(), body.clone()).await;
 
         let case = format!("{flavor:?}/{retained:?}");
-        assert!(replaced, "{case}: base64 is not this client's representation");
+        assert!(
+            replaced,
+            "{case}: base64 is not this client's representation"
+        );
         assert_eq!(reason.as_deref(), Some("unparseable_document"), "{case}");
         assert_ne!(forwarded, body, "{case}: original bytes must not be served");
     }
@@ -3595,7 +3607,10 @@ async fn text_mode_also_accepts_the_binary_framing_base64_encodes() {
     )
     .await;
 
-    assert!(!replaced, "raw framing under a text marker is still framing");
+    assert!(
+        !replaced,
+        "raw framing under a text marker is still framing"
+    );
     assert_eq!(status, 200);
     assert_eq!(reason, None);
     assert_eq!(body, expected);
@@ -3654,13 +3669,14 @@ async fn run_untyped_grpc_route_with_accept_encoding(
 async fn encoded_framed_rpc_is_forwarded_when_the_client_forbids_identity() {
     for (flavor, retained) in binary_framed_grpc_route_shapes() {
         let encoded = gzip(&data_then_trailer_for(flavor));
-        let (replaced, status, reason, body, headers) = run_untyped_grpc_route_with_accept_encoding(
-            flavor,
-            retained,
-            "gzip, identity;q=0",
-            encoded.clone(),
-        )
-        .await;
+        let (replaced, status, reason, body, headers) =
+            run_untyped_grpc_route_with_accept_encoding(
+                flavor,
+                retained,
+                "gzip, identity;q=0",
+                encoded.clone(),
+            )
+            .await;
 
         let case = format!("{flavor:?}/{retained:?}");
         assert!(!replaced, "{case}: a valid RPC reply must not become a 502");
