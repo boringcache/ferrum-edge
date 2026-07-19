@@ -111,7 +111,7 @@ fn read_cert_chain_source(
     let source = CertSource::parse(source_value, kind);
     let material = load_material_blocking(&source, kind)
         .map_err(|e| SpiffeTlsError::BadKeyMaterial(format!("{label}: {e}")))?;
-    let source_id = material.source_id.clone();
+    let source_id = material.display_source_id.clone();
     let mut reader = material.bytes.expose_secret();
     let certs: Vec<Vec<u8>> = rustls_pemfile::certs(&mut reader)
         .map(|cert| {
@@ -137,7 +137,7 @@ fn read_pkcs8_key_source(source_value: &str) -> Result<Vec<u8>, SpiffeTlsError> 
     let source = CertSource::parse(source_value, MaterialKind::Key);
     let material = load_material_blocking(&source, MaterialKind::Key)
         .map_err(|e| SpiffeTlsError::BadKeyMaterial(format!("gateway SVID key: {e}")))?;
-    let source_id = material.source_id.clone();
+    let source_id = material.display_source_id.clone();
     let mut reader = material.bytes.expose_secret();
     let mut keys = rustls_pemfile::pkcs8_private_keys(&mut reader);
     let key = keys

@@ -399,7 +399,25 @@ pub struct MaterializedMaterial {
     pub version: Option<String>,
     pub fetched_at: SystemTime,
     pub source_kind: SourceScheme,
-    pub source_id: String,
+    /// **Operator-facing label only. Never an identity.**
+    ///
+    /// This is the redacted rendering of the source the material came from
+    /// (`CertSource::redacted_source_id`): for a `vault://`/`aws://`/`azure://`/
+    /// `gcp://` source it is the provider label with the identifier withheld, so
+    /// two *different* references under one provider render identically. It is
+    /// named `display_` rather than `source_id` precisely so that nothing can
+    /// use it for equality, keying, filtering, or rotation detection by
+    /// accident — every producer of this struct stamps a redacted value, and a
+    /// consumer that needs to tell two sources apart must go back to the
+    /// `CertSource` and call [`CertSource::source_id`].
+    ///
+    /// It exists as a field rather than being re-derived at each print site
+    /// because it is interpolated into PEM-parse and verifier-construction
+    /// failures across `tls::mod`, `tls::backend`, `dtls`, `identity::file_loader`,
+    /// `config::types`, `config::mongo_store`, `ldap_auth`, `tcp_logging`,
+    /// `ws_logging`, `soap_ws_security`, `spec_expose`, `http_client`, and
+    /// `modes::mesh` — one producer is the only enforceable point.
+    pub display_source_id: String,
     pub kind: MaterialKind,
 }
 
@@ -411,17 +429,20 @@ impl fmt::Debug for MaterializedMaterial {
             .field("version", &self.version)
             .field("fetched_at", &self.fetched_at)
             .field("source_kind", &self.source_kind)
-            .field("source_id", &self.source_id)
+            // Redacted by construction — see the field's own documentation.
+            .field("display_source_id", &self.display_source_id)
             .field("kind", &self.kind)
             .finish()
     }
 }
 
 impl MaterializedMaterial {
+    /// `display_source_id` must already be redacted; callers pass
+    /// [`CertSource::redacted_source_id`] or an equivalent non-secret label.
     pub fn from_bytes(
         bytes: Vec<u8>,
         source_kind: SourceScheme,
-        source_id: String,
+        display_source_id: String,
         kind: MaterialKind,
         version: Option<String>,
     ) -> Self {
@@ -433,7 +454,7 @@ impl MaterializedMaterial {
             version,
             fetched_at: SystemTime::now(),
             source_kind,
-            source_id,
+            display_source_id,
             kind,
         }
     }
@@ -614,6 +635,9 @@ fn load_managed_material(
     Ok(MaterializedMaterial::from_bytes(
         material.bytes,
         SourceScheme::Managed,
+        // `managed::ManagedMaterial`, not a `MaterializedMaterial`. `managed`
+        // is not a secret-provider scheme, so its id is local configuration and
+        // is already safe as a display label.
         material.source_id,
         material.kind,
         material.version,
@@ -644,6 +668,8 @@ fn load_acme_material(
     Ok(MaterializedMaterial::from_bytes(
         material.bytes,
         SourceScheme::Acme,
+        // `acme::AcmeMaterial`, not a `MaterializedMaterial` — see the managed
+        // loader above for why this id is already safe to display.
         material.source_id,
         material.kind,
         material.version,
@@ -937,7 +963,7 @@ impl InlineLoader {
         match source {
             CertSource::InlinePem(_) => load_material_blocking(source, kind),
             other => Err(MaterialError::InvalidSource {
-                source_id: other.source_id(),
+                source_id: other.redacted_source_id(),
                 details: "InlineLoader only accepts inline PEM sources".to_string(),
             }),
         }

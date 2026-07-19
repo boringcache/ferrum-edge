@@ -11785,12 +11785,12 @@ fn mesh_inbound_tls_reload_snapshot(
             load_material_blocking(&source, MaterialKind::CaBundle).with_context(|| {
                 format!(
                     "failed to load mesh frontend client CA bundle at {}",
-                    source.source_id()
+                    source.redacted_source_id()
                 )
             })?;
         let pem: Arc<[u8]> = material.bytes.expose_secret().to_vec().into();
         Some(MeshInboundClientCaBundle {
-            path: material.source_id,
+            path: material.display_source_id,
             pem,
         })
     } else {

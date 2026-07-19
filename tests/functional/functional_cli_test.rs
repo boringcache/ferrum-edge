@@ -2287,6 +2287,71 @@ async fn functional_cli_validate_accepts_valid_direct_values() {
     assert!(stdout.contains("Validation passed."));
 }
 
+/// A short externally resolved `FERRUM_MODE` is withheld from the *invalid
+/// mode* diagnostic, which is the one surface that re-renders it.
+///
+/// `OperatingMode::resolve` lowercases before echoing, so an operator only ever
+/// sees a transformation of the resolved value — `DB`, two bytes, surfaces as
+/// `db`. The textual backstop deliberately cannot cover that: a two-byte
+/// derived candidate armed process-wide would shred every unrelated diagnostic
+/// containing `db`, which is the blind short-substring corruption the derived
+/// minimum exists to prevent (see
+/// `does_not_admit_a_short_case_fold_as_a_global_candidate`). This site is
+/// therefore withheld **key-tied**, on `is_external_secret_key("FERRUM_MODE")`,
+/// which is exact on provenance and independent of length.
+///
+/// Driven through the real binary because the guarantee only exists once
+/// resolution has actually recorded the key and `EnvConfig` parsing has run.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_withholds_short_externally_resolved_mode() {
+    let temp_dir = TempDir::new().unwrap();
+    let mode_path = temp_dir.path().join("mode");
+    std::fs::write(&mode_path, "DB").unwrap();
+
+    let mut cmd = Command::new(binary_abs_path());
+    cmd.arg("validate");
+    // Base hermetic env only: `FERRUM_MODE` must come from the `_FILE` source,
+    // so it is deliberately not pinned (the helper that pins it would make this
+    // a multiple-sources conflict instead).
+    apply_hermetic_env(&mut cmd, &temp_dir);
+    let output = cmd
+        .env("FERRUM_MODE_FILE", mode_path.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an invalid mode must fail validation: {stderr}"
+    );
+    // Scoped to the record under test: the expected-value list legitimately
+    // names every valid mode, and other lines may mention modes as static
+    // strings. The finding is about re-rendering the *resolved value*.
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("Invalid FERRUM_MODE"))
+        // Non-vacuous: the assertions below mean nothing unless this is the
+        // diagnostic that actually ran.
+        .unwrap_or_else(|| panic!("the invalid-mode diagnostic must be emitted: {stderr}"));
+    assert!(
+        !line.contains("'db'") && !line.contains("'DB'"),
+        "neither the resolved value nor its lowercased rendering may be echoed: {line}"
+    );
+    assert!(
+        line.contains("redacted: value from external secret source"),
+        "the diagnostic must carry the placeholder: {line}"
+    );
+    // The actionable part survives.
+    assert!(
+        line.contains("Expected: database, file, cp, dp"),
+        "the expected-value list must be kept: {line}"
+    );
+}
+
 // ── run: externally resolved operating mode is not disclosed ────────────────
 
 /// `run` logs `Operating mode:` through the tracing sink. That line *re-renders*

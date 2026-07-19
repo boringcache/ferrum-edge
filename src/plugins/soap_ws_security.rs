@@ -245,7 +245,7 @@ impl SoapWsSecurity {
             let pem_str = std::str::from_utf8(material.bytes.expose_secret()).map_err(|e| {
                 format!(
                     "soap_ws_security: trusted cert '{}' is not valid UTF-8: {}",
-                    material.source_id, e
+                    material.display_source_id, e
                 )
             })?;
 
@@ -375,7 +375,7 @@ impl SoapWsSecurity {
             let pem_str = std::str::from_utf8(material.bytes.expose_secret()).map_err(|e| {
                 format!(
                     "soap_ws_security: SAML trusted signing cert '{}' is not valid UTF-8: {}",
-                    material.source_id, e
+                    material.display_source_id, e
                 )
             })?;
 

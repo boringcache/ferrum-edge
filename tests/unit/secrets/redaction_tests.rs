@@ -101,7 +101,9 @@ const NULL_VALUE: &str = "null";
 /// single-key `resolve_secret`/`resolve_external_reference` caller echoes.
 ///
 /// TLS material itself no longer carries it: `load_secret_material` stamps the
-/// provider-only `redacted_source_id()` into `MaterializedMaterial`. This
+/// provider-only `redacted_source_id()` into `MaterializedMaterial`'s
+/// display-only `display_source_id` (its identity comes from the
+/// `CertSource`, not from here). This
 /// fixture stays because the derivation must still cover the callers that do
 /// echo the rewritten reference — a textual defense that only holds while one
 /// call site keeps its current shape is not a defense.
@@ -154,21 +156,21 @@ const METADATA_KEY_VALUE: &str = "metadata-key-sentinel";
 const METADATA_KEY_TWO_KEY: &str = "FERRUM_REDACTION_FIXTURE_METADATA_KEY_TWO";
 const METADATA_KEY_TWO_VALUE: &str = "second-metadata-key-sentinel";
 
-/// A short externally sourced value whose only operator-visible rendering is a
-/// *whole-value transformation* of it.
+/// A short externally sourced value whose case fold is a *common* string.
 ///
-/// `FERRUM_MODE_FILE=DB` is the shape: `OperatingMode::resolve` lowercases
-/// before echoing, so the diagnostic carries `db` and never the exact `DB`. At
-/// two bytes the lowercased form sits below the derived-candidate minimum and
-/// was filtered out of the plan, so the resolved value was printed verbatim.
+/// This pins the boundary the textual pass must not cross. `Db` is two bytes,
+/// so the exact value is a candidate (exact values carry no minimum) while its
+/// derived `db`/`DB` forms are below `MIN_DERIVED_CANDIDATE_LEN` and are
+/// dropped. Admitting them "because they are no shorter than the value" is
+/// unsound: equal length is not equal content, and `db` matches text that `Db`
+/// never would — `dbname`, `mongodb`, most of a database diagnostic.
 ///
-/// Deliberately a digraph that appears in no diagnostic in this binary: arming
-/// a two-byte candidate process-wide is only safe when it is genuinely rare.
-/// This adds no new *class* of risk — the exact value already carries no
-/// minimum, so `Qz` itself was armed process-wide before this fixture existed.
+/// The genuine leak that motivated the exemption (`FERRUM_MODE_FILE=DB`
+/// lowercased to `db`) is closed **key-tied** at `OperatingMode::resolve`
+/// instead, which is exact on provenance and length-independent. See
+/// `functional_cli_validate_withholds_short_externally_resolved_mode`.
 const SHORT_CASE_KEY: &str = "FERRUM_REDACTION_FIXTURE_SHORT_CASE";
-const SHORT_CASE_VALUE: &str = "Qz";
-const SHORT_CASE_LOWERED: &str = "qz";
+const SHORT_CASE_VALUE: &str = "Db";
 
 /// The deliberate residual, pinned as a control: a *shortening* whole-value
 /// rewrite that lands below the minimum stays out of the candidate set.
@@ -266,26 +268,27 @@ fn redacts_the_value_exactly_as_materialized() {
     assert!(redacted.contains(PLAIN_KEY) && redacted.contains(EXTERNAL_SECRET_PLACEHOLDER));
 }
 
-/// A whole-value rewrite that is *no shorter than the value itself* carries no
-/// minimum length, because the exact value is already an unconditional
-/// candidate at that same length — so admitting the rewrite cannot cause any
-/// replacement the secret would not already cause.
+/// A short *derived* form is not admitted merely for being no shorter than the
+/// value it came from — equal length is not equal content.
 ///
-/// Without that exemption `FERRUM_MODE_FILE=DB` leaked: the only rendering an
-/// operator ever sees is the lowercased `db`, and at two bytes it was dropped.
+/// The regression this pins: admitting `Db`'s two-byte case folds arms `db` and
+/// `DB` process-wide, and every unrelated diagnostic that happens to contain
+/// either is shredded. That is precisely the blind short-substring corruption
+/// the minimum exists to prevent, so the diagnostic below must come back
+/// **byte-for-byte identical**.
 #[test]
-fn redacts_a_short_whole_value_case_transformation() {
+fn does_not_admit_a_short_case_fold_as_a_global_candidate() {
     arm_redaction();
-    let redacted = redact_external_secret_values(&format!(
-        "Invalid FERRUM_MODE '{SHORT_CASE_LOWERED}'. Expected: database, file, cp, dp"
-    ));
-    assert!(
-        !redacted.contains(SHORT_CASE_LOWERED),
-        "a lowercased whole-value rendering must not survive just for being short: {redacted}"
-    );
-    assert!(redacted.contains(EXTERNAL_SECRET_PLACEHOLDER));
-    // The actionable part of the diagnostic is untouched.
-    assert!(redacted.contains("Expected: database, file, cp, dp"));
+    for message in [
+        "Failed to connect: db pool exhausted for dbname=orders (mongodb driver)",
+        "DB_URL parse failed; check the DB section of ferrum.conf",
+    ] {
+        assert_eq!(
+            redact_external_secret_values(message),
+            message,
+            "a two-byte case fold must not be a candidate"
+        );
+    }
 }
 
 /// The exact value of the same fixture stays covered, as it always was.
@@ -300,14 +303,15 @@ fn redacts_the_short_value_as_materialized() {
     );
 }
 
-/// Control for the deliberate residual: the exemption is keyed on the derived
-/// form being *no shorter than* the value, so a shortening rewrite below the
-/// minimum is still excluded and unrelated diagnostics stay readable.
+/// The same boundary for a *shortening* rewrite: `trim()` of this fixture is
+/// one byte and stays out of the candidate set, so unrelated diagnostics stay
+/// readable.
 ///
 /// If this ever starts failing because `w` was admitted as a candidate, the
-/// exemption has been widened into the diagnostic-shredding behavior the
-/// minimum exists to prevent — and the fix is key-tied withholding at the
-/// affected site, not a wider candidate set.
+/// minimum has been widened into the diagnostic-shredding behavior it exists to
+/// prevent — and the fix is key-tied withholding at the affected site
+/// (`report_env_field`, `invalid_env_value`, `OperatingMode::resolve`), not a
+/// wider candidate set.
 #[test]
 fn does_not_admit_a_shortening_rewrite_below_the_minimum() {
     arm_redaction();

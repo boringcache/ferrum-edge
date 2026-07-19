@@ -7,7 +7,10 @@
 //! `source_id` was the full secret path, ARN, or Key Vault URL — so the
 //! reference leaked through the wrapper instead of through the detail.
 
-use ferrum_edge::tls::source::{CertSource, MaterialError, MaterialKind, SourceScheme};
+use ferrum_edge::tls::source::subscription::{WatchedMaterialSource, material_set_fingerprint};
+use ferrum_edge::tls::source::{
+    CertSource, MaterialError, MaterialKind, MaterializedMaterial, SourceScheme,
+};
 
 /// The four schemes whose identifier is a secret source reference, with an
 /// identifier shaped like the real thing for each.
@@ -155,4 +158,103 @@ fn inline_pem_stays_redacted() {
     let inline = CertSource::parse(pem, MaterialKind::Cert);
     assert_eq!(inline.redacted_source_id(), inline.source_id());
     assert!(!inline.redacted_source_id().contains("BEGIN CERTIFICATE"));
+}
+
+// ── identity vs. display: the two must not be the same string ───────────────
+//
+// `MaterializedMaterial` carries only the *display* rendering, and it is
+// redacted at the producer. That is safe precisely because nothing keys off it:
+// every consumer that needs to tell two sources apart reads the configured
+// `CertSource`. The tests below pin both halves of that split — the field is
+// non-disclosing, and the identity consumers stayed distinguishing.
+
+/// The materialized value carries the redacted label and nothing else, on the
+/// struct's `Debug` as well as its field.
+///
+/// `MaterializedMaterial` is `Debug`-formatted into diagnostics, so a raw
+/// identifier stored here would leak through `{:?}` even at call sites that
+/// never touch the field by name.
+#[test]
+fn materialized_material_debug_withholds_the_provider_identifier() {
+    for raw in PROVIDER_URIS {
+        let material = MaterializedMaterial::from_bytes(
+            b"-----BEGIN CERTIFICATE-----\nAAA\n".to_vec(),
+            SourceScheme::Vault,
+            uri_source(raw).redacted_source_id(),
+            MaterialKind::Cert,
+            None,
+        );
+        assert!(
+            !material.display_source_id.contains(identifier_of(raw)),
+            "the display label must not carry the identifier: {}",
+            material.display_source_id
+        );
+        let rendered = format!("{material:?}");
+        assert!(
+            !rendered.contains(identifier_of(raw)),
+            "Debug must not re-disclose the identifier: {rendered}"
+        );
+        // The bytes are redacted by `SecretBytes` as before.
+        assert!(!rendered.contains("BEGIN CERTIFICATE"), "{rendered}");
+    }
+}
+
+/// The rotation predicate keeps seeing a source change.
+///
+/// `MaterialSetFingerprint` equality is what decides whether TLS material is
+/// rebuilt, and `tls::events` derives `cert_id`, `source_id`, and its
+/// source-id filter from these same entries. The entry's `source_id` therefore
+/// comes from the **configured** `CertSource`, never from
+/// `MaterializedMaterial::display_source_id` — which is redacted, so every
+/// provider reference under one scheme renders identically and two distinct
+/// references with equal bytes and version would compare equal.
+///
+/// Driven with `file://` sources because a provider fetch needs a live backend,
+/// but the property under test is the same one and is visible here: the two
+/// files hold **identical bytes**, so `fingerprint` and `version` match exactly
+/// and only the source identity can tell the entries apart. It also pins the
+/// specific regression shape, since a `file://` source's configured id
+/// (`file:///path`) and its materialized display id (the bare `/path`) are
+/// different strings.
+#[test]
+fn identical_material_under_different_references_stays_distinguishable() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let pem = b"-----BEGIN CERTIFICATE-----\nQUFB\n-----END CERTIFICATE-----\n";
+    let first_path = dir.path().join("first.pem");
+    let second_path = dir.path().join("second.pem");
+    std::fs::write(&first_path, pem).expect("write first");
+    std::fs::write(&second_path, pem).expect("write second");
+
+    let watched = |path: &std::path::Path| {
+        WatchedMaterialSource::new(
+            "test-cert",
+            CertSource::parse(format!("file://{}", path.display()), MaterialKind::Cert),
+            MaterialKind::Cert,
+        )
+    };
+
+    let first = material_set_fingerprint(&[watched(&first_path)]).expect("first fingerprint");
+    let second = material_set_fingerprint(&[watched(&second_path)]).expect("second fingerprint");
+
+    assert_eq!(
+        first.entries[0].fingerprint, second.entries[0].fingerprint,
+        "the fixture is only meaningful if the bytes really are identical"
+    );
+    assert_ne!(
+        first, second,
+        "a changed source reference must remain visible to the rotation predicate \
+         even when the material behind it is byte-identical"
+    );
+
+    // The identity recorded is the configured source id, which is also what
+    // `events::event_material_from_source` reports for a not-yet-loaded source,
+    // so both event paths agree on one identity for the same source.
+    assert_eq!(
+        first.entries[0].source_id,
+        CertSource::parse(
+            format!("file://{}", first_path.display()),
+            MaterialKind::Cert
+        )
+        .source_id(),
+    );
 }

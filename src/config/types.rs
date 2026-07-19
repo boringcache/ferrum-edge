@@ -4827,7 +4827,7 @@ pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String
             return Err(format!(
                 "{}: failed to load certificate source '{}': {}",
                 field_name,
-                source.source_id(),
+                source.redacted_source_id(),
                 e
             ));
         }
@@ -4838,7 +4838,7 @@ pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String
     if certs.is_empty() {
         return Err(format!(
             "{}: no valid PEM certificates found in '{}'",
-            field_name, material.source_id
+            field_name, material.display_source_id
         ));
     }
     Ok(())
@@ -4865,7 +4865,7 @@ pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String>
             return Err(format!(
                 "{}: failed to load key source '{}': {}",
                 field_name,
-                source.source_id(),
+                source.redacted_source_id(),
                 e
             ));
         }
@@ -4874,13 +4874,13 @@ pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String>
         .map_err(|e| {
             format!(
                 "{}: failed to parse private key from '{}': {}",
-                field_name, material.source_id, e
+                field_name, material.display_source_id, e
             )
         })?;
     if key.is_none() {
         return Err(format!(
             "{}: no valid private keys found in '{}'",
-            field_name, material.source_id
+            field_name, material.display_source_id
         ));
     }
     Ok(())

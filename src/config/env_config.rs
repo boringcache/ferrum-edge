@@ -59,11 +59,16 @@ impl OperatingMode {
             "migrate" => Ok(Self::Migrate),
             other => {
                 const MODES: &str = "database, file, cp, dp, mesh, injector, node_agent, migrate";
-                // Withheld by key, not by shape. This site *lowercases* before
-                // echoing, so what an operator sees is a rendering of the
-                // resolved value rather than the value itself, and a short
-                // rendering (`DB` -> `db`) is exactly where the textual
-                // backstop is weakest. `is_external_secret_key` is exact: the
+                // Withheld by key, not by shape, and this is the *only*
+                // defense here rather than a belt-and-braces one. The site
+                // lowercases before echoing, so what an operator sees is a
+                // rendering of the resolved value rather than the value
+                // itself, and for a short value (`DB` -> `db`) the textual
+                // backstop cannot cover that rendering at all: a two-byte
+                // derived candidate is below `MIN_DERIVED_CANDIDATE_LEN` and
+                // is dropped, because arming `db` process-wide would shred
+                // every unrelated diagnostic containing it.
+                // `is_external_secret_key` is exact: the
                 // variable is known by name to have been externally resolved,
                 // so no rendering of it escapes here. The expected-value list
                 // is the actionable part and is kept. Same boundary and same
@@ -3898,7 +3903,7 @@ impl EnvConfig {
             return Ok(path.display().to_string());
         }
 
-        let source_id = source.source_id();
+        let source_id = source.redacted_source_id();
         let material = crate::tls::source::load_material_blocking(&source, kind)
             .map_err(|e| format!("Failed to load database TLS material: {e}"))?;
         let temp_file = tempfile::Builder::new()

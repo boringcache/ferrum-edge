@@ -267,7 +267,19 @@ pub fn material_set_fingerprint(
         );
         entries.push(MaterialFingerprintEntry {
             label: watched.label,
-            source_id: material.source_id,
+            // Identity, taken from the *configured* source, never from the
+            // materialized value. `MaterializedMaterial::display_source_id` is
+            // redacted at the producer, so every `vault://` reference renders
+            // identically there; using it here would make two distinct
+            // provider references compare equal whenever their bytes and
+            // version match, and `MaterialSetFingerprint` equality is the
+            // rotation predicate. A configured source change would then evade
+            // reload/rebuild detection, and `tls::events` — which derives
+            // `cert_id`, `source_id`, and source-id filtering from this entry —
+            // would collapse distinct sources onto one event identity. This is
+            // also the same rendering `events::event_material_from_source`
+            // uses for the not-yet-loaded case, so the two event paths agree.
+            source_id: watched.source.source_id(),
             fingerprint: material.fingerprint,
             version: material.version,
             source_kind: material.source_kind,

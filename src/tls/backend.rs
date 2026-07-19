@@ -848,7 +848,7 @@ fn load_cert_chain(
     kind: &'static str,
 ) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let material = load_backend_material(path, material_kind, kind)?;
-    let source_id = material.source_id.clone();
+    let source_id = material.display_source_id.clone();
     let certs = rustls_pemfile::certs(&mut Cursor::new(material.bytes.expose_secret()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TlsError::Pem {
@@ -870,7 +870,7 @@ fn load_cert_chain(
 
 fn load_private_key(path: &Path, kind: &'static str) -> Result<PrivateKeyDer<'static>, TlsError> {
     let material = load_backend_material(path, MaterialKind::Key, kind)?;
-    let source_id = material.source_id.clone();
+    let source_id = material.display_source_id.clone();
     rustls_pemfile::private_key(&mut Cursor::new(material.bytes.expose_secret()))
         .map_err(|e| TlsError::Pem {
             kind,

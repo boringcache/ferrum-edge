@@ -1021,10 +1021,14 @@ mod inner {
                 info!(
                     "MongoDB TLS enabled (ca={}, client_cert={}, insecure={})",
                     tls_ca_cert_path
-                        .map(|value| CertSource::parse(value, MaterialKind::CaBundle).source_id())
+                        .map(|value| {
+                            CertSource::parse(value, MaterialKind::CaBundle).redacted_source_id()
+                        })
                         .unwrap_or_else(|| "system-roots".to_string()),
                     tls_client_cert_path
-                        .map(|value| CertSource::parse(value, MaterialKind::Cert).source_id())
+                        .map(|value| {
+                            CertSource::parse(value, MaterialKind::Cert).redacted_source_id()
+                        })
                         .unwrap_or_else(|| "none".to_string()),
                     tls_insecure
                 );
@@ -1103,7 +1107,7 @@ mod inner {
 
             info!(
                 "Combined MongoDB client cert ({}) + key ({}) into owned temporary PEM",
-                cert_material.source_id, key_material.source_id
+                cert_material.display_source_id, key_material.display_source_id
             );
             Ok(materialized)
         }
@@ -1131,7 +1135,7 @@ mod inner {
 
             info!(
                 "Materialized MongoDB TLS source {} into owned temporary PEM",
-                material.source_id
+                material.display_source_id
             );
             Ok(materialized)
         }

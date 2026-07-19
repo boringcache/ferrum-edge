@@ -229,7 +229,9 @@ fn load_grpc_material(
 ) -> Result<Vec<u8>, anyhow::Error> {
     let source = CertSource::parse(raw, kind);
     let material = load_material_blocking(&source, kind)
-        .map_err(|e| anyhow::anyhow!("Failed to load {label} {}: {e}", source.source_id()))?;
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to load {label} {}: {e}", source.redacted_source_id())
+        })?;
     Ok(material.bytes.expose_secret().to_vec())
 }
 
