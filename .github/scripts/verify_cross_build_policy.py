@@ -1540,9 +1540,11 @@ INLINE_SOURCE_OPTIONS = {
 # `deno eval '<source>'` takes the program as a subcommand operand rather than
 # as the operand of an option.
 INLINE_SOURCE_SUBCOMMANDS = {"deno": ("eval",)}
-# awk-family and Tcl interpreters take the program as their first non-option
-# operand unless a `-f` script file supplies it instead.
-INLINE_OPERAND_INTERPRETERS = frozenset({"awk", "gawk", "mawk", "tclsh"})
+# Awk-family interpreters take the program as their first non-option operand
+# unless a `-f` script file supplies it instead. Tclsh is different: a named
+# operand is a script *path*, while an invocation with no script executes stdin,
+# so it remains in the ordinary foreign-interpreter model below.
+INLINE_OPERAND_INTERPRETERS = frozenset({"awk", "gawk", "mawk"})
 FOREIGN_STRING_LITERAL = re.compile(
     r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|`((?:[^`\\]|\\.)*)`"
 )
@@ -3949,7 +3951,28 @@ def interpreter_stdin_language(
     else:
         return None
     if executable in INLINE_OPERAND_INTERPRETERS:
-        # An awk-family program is always an operand, never stdin.
+        # Awk normally receives its program as an operand, but `-f -` and the
+        # equivalent standard-input paths make the heredoc itself the program.
+        # The generic executable-heredoc classifier must retain that body after
+        # the stdin scanner defers to it.
+        stdin_paths = {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
+        arguments = segment[index + 1 :]
+        for position, argument in enumerate(arguments):
+            if argument in {"-f", "--file"}:
+                if (
+                    position + 1 < len(arguments)
+                    and arguments[position + 1] in stdin_paths
+                ):
+                    return language
+                return None
+            if argument == "-f-" or argument == "--file=-":
+                return language
+            if argument.startswith("--file="):
+                return (
+                    language
+                    if argument.removeprefix("--file=") in stdin_paths
+                    else None
+                )
         return None
     inline = inline_interpreter_programs(segment, index)
     if inline is not None and (inline[0] or inline[1]):
@@ -14641,6 +14664,59 @@ pre_build = []
         or benign_foreign_sensitive
     ):
         failures.append("a benign foreign executable heredoc was rejected")
+
+    for stdin_program, stdin_label in (
+        (
+            "tclsh <<'TCL'\nexec cross build\nTCL\n",
+            "Tcl",
+        ),
+        (
+            "awk -f - <<'AWK'\nBEGIN { system(\"cross build\") }\nAWK\n",
+            "awk file-stdin",
+        ),
+        (
+            "gawk --file=- <<'AWK'\nBEGIN { system(\"cross build\") }\nAWK\n",
+            "gawk joined file-stdin",
+        ),
+    ):
+        stdin_programs, stdin_errors = executable_heredocs(
+            stdin_program,
+            f"self-test {stdin_label} executable heredoc",
+        )
+        stdin_sensitive, stdin_runtime_errors = runtime_program_cross_surface(
+            list(stdin_programs),
+            f"self-test {stdin_label} executable heredoc",
+            include_opaque_shell_executable=True,
+        )
+        if stdin_errors or stdin_runtime_errors or not stdin_sensitive:
+            failures.append(
+                f"a {stdin_label} executable heredoc lost its Cross surface"
+            )
+
+    for benign_stdin_program, benign_stdin_label in (
+        ("tclsh <<'TCL'\nputs safe\nTCL\n", "benign Tcl"),
+        (
+            "awk -f /dev/stdin <<'AWK'\nBEGIN { print \"safe\" }\nAWK\n",
+            "benign awk file-stdin",
+        ),
+    ):
+        benign_stdin_programs, benign_stdin_errors = executable_heredocs(
+            benign_stdin_program,
+            f"self-test {benign_stdin_label} executable heredoc",
+        )
+        benign_stdin_sensitive, benign_stdin_runtime_errors = (
+            runtime_program_cross_surface(
+                list(benign_stdin_programs),
+                f"self-test {benign_stdin_label} executable heredoc",
+                include_opaque_shell_executable=True,
+            )
+        )
+        if (
+            benign_stdin_errors
+            or benign_stdin_runtime_errors
+            or benign_stdin_sensitive
+        ):
+            failures.append(f"a {benign_stdin_label} heredoc was rejected")
 
     # A computed receiver can select Bash or another interpreter at runtime.
     # Its body is therefore executable but unreadable, and must fail closed
