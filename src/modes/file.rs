@@ -70,7 +70,14 @@ pub struct ServeOptions {
     /// Plaintext admin port. `None` disables the plaintext admin listener.
     pub admin_http: Option<TcpListener>,
     /// TLS admin port. `None` disables the HTTPS admin listener even when
-    /// admin TLS material is configured.
+    /// admin TLS material is configured. `Some` requests that the caller-owned
+    /// FD take precedence over `FERRUM_ADMIN_HTTPS_PORT=0`, but the socket is
+    /// served only when both admin TLS paths are configured; that path loads
+    /// the TLS material and sets up frontend TLS live reload, starting the
+    /// watcher when enabled. Without both paths, the socket is dropped unused
+    /// before reserved-port calculation so it neither occupies the port nor
+    /// leaves a stale env `FERRUM_ADMIN_HTTPS_PORT` reservation against stream
+    /// proxies (no admin HTTPS listener starts without both TLS paths).
     pub admin_https: Option<TcpListener>,
     /// Pre-built admin JWT manager. When `None`, `serve` reads the JWT
     /// secret/issuer/ttl from environment variables (same as the binary
@@ -412,9 +419,16 @@ pub(crate) async fn join_background_handles(handles: Vec<JoinHandle<()>>, timeou
 /// integrations). Falls back to the env-config port when no listener
 /// is pre-bound. Port `0` is "disabled" — never reserved. CP gRPC
 /// isn't pre-bindable via `ServeOptions` so it always comes from env.
+///
+/// `suppress_env_admin_https_reservation` is set when [`serve`] drops an
+/// unusable pre-bound admin HTTPS FD (missing TLS paths). After that
+/// `take()`, `prebound.admin_https` is `None`, so the env fallback would
+/// otherwise reserve `env_config.admin_https_port` even though no admin
+/// HTTPS listener will start without both TLS paths.
 fn effective_reserved_ports(
     env_config: &EnvConfig,
     prebound: &ServeOptions,
+    suppress_env_admin_https_reservation: bool,
 ) -> std::collections::HashSet<u16> {
     let mut ports = std::collections::HashSet::new();
     let resolve = |listener: &Option<TcpListener>, env_port: u16| -> Option<u16> {
@@ -426,11 +440,16 @@ fn effective_reserved_ports(
             None
         }
     };
+    let admin_https_env_port = if suppress_env_admin_https_reservation {
+        0
+    } else {
+        env_config.admin_https_port
+    };
     for port in [
         resolve(&prebound.proxy_http, env_config.proxy_http_port),
         resolve(&prebound.proxy_https, env_config.proxy_https_port),
         resolve(&prebound.admin_http, env_config.admin_http_port),
-        resolve(&prebound.admin_https, env_config.admin_https_port),
+        resolve(&prebound.admin_https, admin_https_env_port),
     ]
     .into_iter()
     .flatten()
@@ -641,6 +660,35 @@ pub async fn serve(
         config.consumers.len()
     );
 
+    // A caller-owned admin HTTPS socket is served only when both admin TLS
+    // paths are configured (including over `FERRUM_ADMIN_HTTPS_PORT=0`).
+    // Without both paths the socket cannot be used — drop it *before*
+    // reserved-port calculation and later listener setup so it neither
+    // occupies the port until shutdown nor leaves a stale env admin HTTPS
+    // reservation against stream proxies. Enabled nonzero env-bound HTTPS
+    // still fail-closes later when paths are set but unloadable.
+    let admin_tls_paths_ready =
+        env_config.admin_tls_cert_path.is_some() && env_config.admin_tls_key_path.is_some();
+    let mut suppress_env_admin_https_reservation = false;
+    if !admin_tls_paths_ready && let Some(listener) = prebound.admin_https.take() {
+        match listener.local_addr() {
+            Ok(addr) => info!(
+                "Dropping unused pre-bound admin HTTPS listener on {addr} — \
+                 admin TLS cert/key paths are not both configured"
+            ),
+            Err(_) => info!(
+                "Dropping unused pre-bound admin HTTPS listener — \
+                 admin TLS cert/key paths are not both configured"
+            ),
+        }
+        drop(listener);
+        // `take()` cleared `prebound.admin_https`. Suppress the env fallback
+        // so `effective_reserved_ports` does not reserve
+        // `env_config.admin_https_port` (e.g. default 9443) for a listener
+        // that will not start without both TLS paths.
+        suppress_env_admin_https_reservation = true;
+    }
+
     // Compute reserved ports from the listeners we'll actually bind, NOT
     // from env_config alone. With pre-bound listeners (in-process harness,
     // and any other `serve()` caller that adopts FDs) the live port can
@@ -652,7 +700,8 @@ pub async fn serve(
     //     bind time, where they bypass the up-front validation contract.
     // CP gRPC isn't pre-bindable via `ServeOptions` so it still comes
     // from env_config.
-    let reserved_ports = effective_reserved_ports(&env_config, &prebound);
+    let reserved_ports =
+        effective_reserved_ports(&env_config, &prebound, suppress_env_admin_https_reservation);
     if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
         for msg in &errors {
             error!("{}", msg);
@@ -984,6 +1033,17 @@ pub async fn serve(
         env_config.admin_max_connections_per_ip,
     ));
 
+    // Port 0 is the repository-wide disable sentinel, with one documented
+    // exception: a pre-bound socket supplied through `ServeOptions` wins over
+    // the port setting (per-listener precedence — the caller already owns the
+    // FD). It is served only when both admin TLS paths are configured; that
+    // path loads the material and sets up frontend TLS live reload, starting
+    // the watcher when enabled. Unusable prebound sockets (missing either TLS
+    // path) were already taken/dropped above before reserved ports. Only
+    // in-process embedders/tests can supply one; `file::run` passes
+    // `ServeOptions::default()`, so for the binary this is exactly
+    // "`FERRUM_ADMIN_HTTPS_PORT != 0`". Documented in `ferrum.conf` and
+    // `docs/configuration.md` alongside the sentinel.
     let admin_https_enabled = prebound.admin_https.is_some() || env_config.admin_https_port != 0;
     let admin_tls_runtime = if admin_https_enabled
         && let (Some(admin_cert), Some(admin_key)) = (
@@ -1085,15 +1145,24 @@ pub async fn serve(
     // ── Admin HTTPS listener ─────────────────────────────────────────────
     if let Some((admin_tls_config, admin_tls_slot)) = admin_tls_runtime {
         if let Some(listener) = prebound.admin_https.take() {
+            // Caller-owned FD takes precedence over FERRUM_ADMIN_HTTPS_PORT=0.
+            // When frontend TLS live reload prepared a slot, use the dynamic
+            // accept loop so cert rotation reaches this socket the same way it
+            // reaches the env-bound listener below; otherwise serve the static
+            // startup ServerConfig.
             bound.admin_https = listener.local_addr().ok();
             let st = admin_state.clone();
             let sh = shutdown_tx.subscribe();
             let cfg = Some(admin_tls_config);
             let lim = admin_conn_limiter.clone();
             let h = tokio::spawn(async move {
-                admin::serve_admin_on_listener(listener, st, sh, cfg, lim)
-                    .await
-                    .context("Admin HTTPS listener failed")
+                let result = if let Some(slot) = admin_tls_slot {
+                    admin::serve_admin_on_listener_with_dynamic_tls(listener, st, sh, slot, lim)
+                        .await
+                } else {
+                    admin::serve_admin_on_listener(listener, st, sh, cfg, lim).await
+                };
+                result.context("Admin HTTPS listener failed")
             });
             handles.push(("Admin HTTPS listener".to_string(), h));
         } else if env_config.admin_https_port != 0 {
@@ -1601,7 +1670,7 @@ mod tests {
             ..ServeOptions::default()
         };
 
-        let reserved = effective_reserved_ports(&env_config, &prebound);
+        let reserved = effective_reserved_ports(&env_config, &prebound, false);
 
         assert!(
             reserved.contains(&prebound_proxy_port),
@@ -1671,7 +1740,7 @@ mod tests {
             admin_https_port: 0, // disabled
             ..EnvConfig::default()
         };
-        let reserved = effective_reserved_ports(&env_config, &ServeOptions::default());
+        let reserved = effective_reserved_ports(&env_config, &ServeOptions::default(), false);
         assert!(reserved.contains(&8000));
         assert!(reserved.contains(&8443));
         assert!(reserved.contains(&9000));
@@ -1692,7 +1761,7 @@ mod tests {
             cp_grpc_listen_addr: Some("127.0.0.1:0".to_string()),
             ..EnvConfig::default()
         };
-        let reserved = effective_reserved_ports(&env_config, &ServeOptions::default());
+        let reserved = effective_reserved_ports(&env_config, &ServeOptions::default(), false);
         assert!(
             !reserved.contains(&0),
             "CP gRPC port 0 means disabled and must not be reserved; got {reserved:?}",
