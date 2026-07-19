@@ -516,6 +516,12 @@ impl Plugin for GeoRestriction {
         self.reader.as_deref()
     }
 
+    fn country_mmdb_retained_load(&self) -> Option<(&str, Arc<CountryMmdbSnapshot>)> {
+        self.reader
+            .as_ref()
+            .map(|reader| (self.db_path.as_str(), Arc::clone(reader)))
+    }
+
     fn priority(&self) -> u16 {
         super::priority::GEO_RESTRICTION
     }
