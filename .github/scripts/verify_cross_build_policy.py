@@ -919,6 +919,7 @@ CROSS_ENVIRONMENT = re.compile(
 SHELL_INTERPRETER_NAMES = frozenset(
     {"ash", "bash", "busybox", "dash", "ksh", "pwsh", "powershell", "sh", "zsh"}
 )
+BUSYBOX_SHELL_APPLETS = frozenset({"ash", "sh"})
 PYTHON_INTERPRETER = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|pypy\d*)$")
 # An executable word may be spelled with a leading directory path
 # (`/usr/bin/cargo cross`, `~/.cargo/bin/cross`, `./tools/cross`). Absorbing the
@@ -930,7 +931,8 @@ TOOL_PATH_PREFIX = r"(?:[~.]{0,2}(?:/[A-Za-z0-9_.$@{}+-]+)*/)?"
 # (`subprocess.run(['sh', '-c', 'cross build ...'])`) loses its quoting before
 # it reaches this scanner. `-lc` and `-l -c` are the same end-of-flags form.
 SHELL_C_CONTEXT = (
-    rf"(?<![A-Za-z0-9_-]){TOOL_PATH_PREFIX}(?:bash|sh|dash|ksh|zsh|ash)"
+    rf"(?<![A-Za-z0-9_-]){TOOL_PATH_PREFIX}"
+    r"(?:busybox\s+(?:ash|sh)|bash|sh|dash|ksh|zsh|ash)"
     r"(?:\s+-[A-Za-z]+)*\s+-[A-Za-z]*c[A-Za-z]*\s+['\"]?"
 )
 # `case $x in *) cross build ...;; esac` puts the executable straight after a
@@ -1264,7 +1266,7 @@ LOCAL_COMMAND_REFERENCE = re.compile(
     # were never followed.
     + r"(?:(?P<redirected_interpreter>bash|sh|dash|zsh|ksh|ash|"
     r"python(?:[0-9.]+)?|pypy[0-9]*|ruby|node|"
-    r"perl|php|Rscript|deno|bun|pwsh|powershell|busybox\s+sh|awk\s+-f)"
+    r"perl|php|Rscript|deno|bun|pwsh|powershell|busybox\s+(?:ash|sh)|awk\s+-f)"
     r"(?:\s+--?[^\s]+)*\s*(?:[0-9]+)?(?<!<)<(?![<&])\s*"
     r"(?P<redirected>(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|"
     r"\{[A-Za-z_][A-Za-z0-9_]*\})/)?"
@@ -1273,7 +1275,8 @@ LOCAL_COMMAND_REFERENCE = re.compile(
     r"[A-Za-z0-9._+@~-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|js|mjs|cjs|ts|"
     r"ps1)))|"
     r"(?P<interpreter>bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|pypy[0-9]*|"
-    r"ruby|node|perl|php|Rscript|deno|bun|pwsh|powershell|busybox\s+sh|"
+    r"ruby|node|perl|php|Rscript|deno|bun|pwsh|powershell|"
+    r"busybox\s+(?:ash|sh)|"
     r"awk\s+-f|source|\.)"
     r"(?P<interpreter_options>(?:\s+--?[^\s]+)*)\s+"
     r"(?P<interpreted>(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|"
@@ -1321,7 +1324,8 @@ HEREDOC_EXECUTABLE = re.compile(
     # heredoc that `sudo env bash <<EOF` does, and the fixed
     # assignment-then-wrapper-then-`env` ordering described only some of them.
     + COMMAND_WORD_PREFIX
-    + r"(?P<interpreter>bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|"
+    + r"(?P<interpreter>busybox\s+(?:ash|sh)|bash|sh|dash|zsh|ksh|ash|"
+    r"python(?:[0-9.]+)?|"
     r"pypy[0-9]*|pwsh|powershell)\b"
 )
 # The other half of the same question, read from the text *after* an opener.
@@ -1339,7 +1343,8 @@ HEREDOC_PIPED_INTERPRETER = re.compile(
     r"(?<!\|)\|(?!\|)&?\s*"
     r"(?:!\s*)?"
     + COMMAND_WORD_PREFIX
-    + r"(?P<interpreter>bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|"
+    + r"(?P<interpreter>busybox\s+(?:ash|sh)|bash|sh|dash|zsh|ksh|ash|"
+    r"python(?:[0-9.]+)?|"
     r"pypy[0-9]*|pwsh|powershell)\b"
 )
 OPAQUE_INLINE_GITHUB_EXPRESSION = r"\$\{\{[^\n]*?\}\}"
@@ -1357,7 +1362,7 @@ OPAQUE_INLINE_LITERAL_WORD_PREFIX = (
 )
 OPAQUE_INLINE_SHELL_C_PREFIX = (
     rf"(?<![A-Za-z0-9_-]){TOOL_PATH_PREFIX}"
-    r"(?:busybox\s+sh|bash|sh|dash|zsh|ksh|ash)"
+    r"(?:busybox\s+(?:ash|sh)|bash|sh|dash|zsh|ksh|ash)"
     r"(?:\s+--?[A-Za-z][A-Za-z-]*)*"
     r"\s+-[A-Za-z]*c[A-Za-z]*\s+"
 )
@@ -3887,7 +3892,11 @@ def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
         # still opaque because the scanner does not model producer semantics.
         if any("\\" in argument for argument in arguments[1:]):
             return None
-        separator = "\n" if arguments[0] == "%s\\n" else ""
+        # Preserve each repeated format boundary as an explicit statement
+        # separator. The tokenizer otherwise collapses a physical newline to
+        # whitespace and can merge a later command into the first command's
+        # argv. Keeping the newline too preserves shell comment termination.
+        separator = ";\n" if arguments[0] == "%s\\n" else ""
         return separator.join(arguments[1:])
     if (
         arguments[0].count("%") == 1
@@ -3969,7 +3978,16 @@ def shell_stdin_program(
     index, executes = executable_index(segment)
     if not executes or index >= len(segment):
         return None, None, False
-    if tool_name(segment[index]) in SHELL_INTERPRETER_NAMES:
+    executable = tool_name(segment[index])
+    if executable == "busybox":
+        if (
+            index + 1 >= len(segment)
+            or tool_name(segment[index + 1]) not in BUSYBOX_SHELL_APPLETS
+        ):
+            return None, None, False
+        index += 1
+        executable = tool_name(segment[index])
+    if executable in SHELL_INTERPRETER_NAMES:
         language = "shell"
         command_program, option_opaque, reads_stdin = shell_invocation_mode(
             segment,
@@ -4782,7 +4800,15 @@ def token_command_has_cross(
             return True
         return bool(powershell_errors) and include_opaque_shell_executable
     if command in SHELL_INTERPRETER_NAMES:
-        program, opaque, _ = shell_invocation_mode(tokens, index)
+        shell_index = index
+        if command == "busybox":
+            if (
+                index + 1 >= len(tokens)
+                or tool_name(tokens[index + 1]) not in BUSYBOX_SHELL_APPLETS
+            ):
+                return False
+            shell_index += 1
+        program, opaque, _ = shell_invocation_mode(tokens, shell_index)
         if opaque:
             return include_opaque_shell_executable
         if program is not None:
@@ -8817,7 +8843,8 @@ def interpreter_kind(words: tuple[str, ...] | None) -> str | None:
     if executable == "busybox":
         return (
             "shell"
-            if index + 1 < len(words) and tool_name(words[index + 1]) == "sh"
+            if index + 1 < len(words)
+            and tool_name(words[index + 1]) in BUSYBOX_SHELL_APPLETS
             else None
         )
     if executable.lower() in {"pwsh", "powershell"}:
@@ -9080,7 +9107,15 @@ def shell_argv_reads_stdin_program(words: tuple[str, ...]) -> bool:
 
     if not words or tool_name(words[0]) not in SHELL_INTERPRETER_NAMES:
         return False
-    for argument in words[1:]:
+    argument_start = 1
+    if tool_name(words[0]) == "busybox":
+        if (
+            len(words) < 2
+            or tool_name(words[1]) not in BUSYBOX_SHELL_APPLETS
+        ):
+            return False
+        argument_start = 2
+    for argument in words[argument_start:]:
         if argument.startswith("-"):
             if "c" in argument.lstrip("-"):
                 return False
@@ -12582,6 +12617,7 @@ pre_build = []
         "Deno": "deno ci/unsafe.ts",
         "Bun": "bun ci/unsafe.ts",
         "BusyBox shell": "busybox sh ci/unsafe.sh",
+        "BusyBox ash": "busybox ash ci/unsafe.sh",
         "nested shell interpreter": "sh -c 'dash ci/unsafe.sh'",
         "extensionless bare executable": "ci/unsafe",
     }
@@ -13401,6 +13437,14 @@ pre_build = []
 
     arm_target = f"build --target {TARGET}"
     shell_automation_escapes(
+        "BusyBox shell reading a literal stdin program",
+        f"printf 'cross {arm_target}' | busybox sh",
+    )
+    shell_automation_escapes(
+        "BusyBox shell reading an executable heredoc",
+        f"busybox ash <<'EOF'\ncross {arm_target}\nEOF",
+    )
+    shell_automation_escapes(
         "brace-delimited variable concatenation",
         f"x=cr\ny=oss\n${{x}}${{y}} {arm_target}",
     )
@@ -13949,6 +13993,10 @@ pre_build = []
         (
             "literal",
             f"sh -c 'echo $(printf safe); cross build --target {TARGET}'\n",
+        ),
+        (
+            "literal BusyBox",
+            f"busybox sh -c 'cross build --target {TARGET}'\n",
         ),
         (
             "opaque",
@@ -16773,6 +16821,11 @@ pre_build = []
         "literal subprocess shell input",
         "import subprocess\n"
         f"subprocess.run(['bash'], input='cross {arm_target}', text=True)\n",
+    )
+    python_automation_escapes(
+        "literal subprocess BusyBox shell input",
+        "import subprocess\n"
+        f"subprocess.run(['busybox', 'sh'], input='cross {arm_target}', text=True)\n",
     )
     python_automation_escapes(
         "literal getattr process alias",
