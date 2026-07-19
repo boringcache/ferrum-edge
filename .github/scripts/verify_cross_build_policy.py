@@ -8956,8 +8956,9 @@ def self_test() -> list[str]:
         has_cross_command_context(variant)
         for variant in word_splitting_variants(nested_split_command)
     ):
-        threats = "word-split Cross executable in a nested subshell"
-        failures.append(f"{threats} was not recognized")
+        failures.append(
+            "word-split Cross executable in a nested subshell was not recognized"
+        )
 
     # Above the expansion cap only the all-split view survives, and it must
     # still land in the nested-subshell executable slot.
