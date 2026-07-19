@@ -1099,15 +1099,24 @@ pub async fn serve(
     // ── Admin HTTPS listener ─────────────────────────────────────────────
     if let Some((admin_tls_config, admin_tls_slot)) = admin_tls_runtime {
         if let Some(listener) = prebound.admin_https.take() {
+            // Caller-owned FD takes precedence over FERRUM_ADMIN_HTTPS_PORT=0.
+            // When frontend TLS live reload prepared a slot, use the dynamic
+            // accept loop so cert rotation reaches this socket the same way it
+            // reaches the env-bound listener below; otherwise serve the static
+            // startup ServerConfig.
             bound.admin_https = listener.local_addr().ok();
             let st = admin_state.clone();
             let sh = shutdown_tx.subscribe();
             let cfg = Some(admin_tls_config);
             let lim = admin_conn_limiter.clone();
             let h = tokio::spawn(async move {
-                admin::serve_admin_on_listener(listener, st, sh, cfg, lim)
-                    .await
-                    .context("Admin HTTPS listener failed")
+                let result = if let Some(slot) = admin_tls_slot {
+                    admin::serve_admin_on_listener_with_dynamic_tls(listener, st, sh, slot, lim)
+                        .await
+                } else {
+                    admin::serve_admin_on_listener(listener, st, sh, cfg, lim).await
+                };
+                result.context("Admin HTTPS listener failed")
             });
             handles.push(("Admin HTTPS listener".to_string(), h));
         } else if env_config.admin_https_port != 0 {
