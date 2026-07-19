@@ -306,9 +306,7 @@ pub(crate) trait SecretBackend: Sync + Send {
                     timeout.as_secs()
                 )
             })?
-            .map_err(|error| {
-                redact_source_reference(error, &secret.reference, &secret.base_key)
-            })?;
+            .map_err(|error| redact_source_reference(error, &secret.reference, &secret.base_key))?;
             resolved.push(ResolvedPendingSecret {
                 base_key: secret.base_key.clone(),
                 value,
@@ -1353,11 +1351,7 @@ mod tests {
              in https://ferrum-vault-sentinel.vault.azure.net:8443)"
             .to_string();
 
-        let redacted = redact_source_reference(
-            sdk_error,
-            REFERENCE,
-            "FERRUM_ADMIN_JWT_SECRET",
-        );
+        let redacted = redact_source_reference(sdk_error, REFERENCE, "FERRUM_ADMIN_JWT_SECRET");
 
         assert!(
             !redacted.contains("ferrum-vault-sentinel")
@@ -1404,11 +1398,7 @@ mod tests {
         );
         // Idempotent: a second pass leaves the message byte-for-byte identical.
         assert_eq!(
-            redact_source_reference(
-                redacted.clone(),
-                "source#field",
-                "FERRUM_TEST_SECRET",
-            ),
+            redact_source_reference(redacted.clone(), "source#field", "FERRUM_TEST_SECRET",),
             redacted
         );
     }
