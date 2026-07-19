@@ -118,6 +118,26 @@ const FILE_URI_KEY: &str = "FERRUM_REDACTION_FIXTURE_FILE_URI";
 const FILE_URI_VALUE: &str = "file:///run/secrets/cert-path-sentinel.pem";
 const FILE_URI_STRIPPED: &str = "/run/secrets/cert-path-sentinel.pem";
 
+/// A **complete** `file://` TLS source URI, query included, materialized from a
+/// `_FILE` suffix — the whole string production resolves when
+/// `FERRUM_FRONTEND_TLS_CERT_SOURCE_FILE` names a source carrying poll options.
+///
+/// Recording the queryless URI here instead would make the provenance test
+/// vacuous: `CertSourceUri::parse` strips the query, so a stripped identity
+/// would still exactly contain a separately recorded queryless candidate and a
+/// containment-based mechanism would pass without ever being exercised.
+///
+/// Identifier and option value are one byte each, deliberately. Provenance is
+/// whole-value equality against this exact string and so is length-independent.
+/// A mechanism keyed on the parsed identity (`file://x`) fails here — that is a
+/// strict prefix of the resolved value — and one that armed the option (`p`) as
+/// a candidate would be below `MIN_DERIVED_CANDIDATE_LEN` and would shred
+/// unrelated output if it were admitted anyway.
+const POLL_URI_KEY: &str = "FERRUM_REDACTION_FIXTURE_POLL_URI";
+const POLL_URI_IDENTIFIER: &str = "x";
+const POLL_URI_OPTION: &str = "p";
+const POLL_URI_VALUE: &str = "file://x?poll=p";
+
 /// A database URL. MongoDB TLS-conflict diagnostics render it through
 /// `db_backend::redact_url`, which scrubs the credentials but leaves the host,
 /// path, and remaining query of the resolved value in the message.
@@ -215,7 +235,7 @@ const SHORT_FLOAT_RENDERED: &str = "1";
 const SHORT_BIND_KEY: &str = "FERRUM_REDACTION_FIXTURE_SHORT_BIND";
 const SHORT_BIND_VALUE: &str = "0:0:0:0:0:0:0:1";
 
-const FIXTURES: [(&str, &str); 25] = [
+const FIXTURES: [(&str, &str); 26] = [
     (PLAIN_KEY, PLAIN_VALUE),
     (LIST_KEY, LIST_VALUE),
     (CASE_KEY, CASE_VALUE),
@@ -231,6 +251,7 @@ const FIXTURES: [(&str, &str); 25] = [
     (NULL_KEY, NULL_VALUE),
     (SOURCE_URI_KEY, SOURCE_URI_VALUE),
     (FILE_URI_KEY, FILE_URI_VALUE),
+    (POLL_URI_KEY, POLL_URI_VALUE),
     (DB_URL_KEY, DB_URL_VALUE),
     (NUMBER_CANON_KEY, NUMBER_CANON_VALUE),
     (WITHHELD_TARGET_KEY, WITHHELD_TARGET_VALUE),
@@ -1013,22 +1034,35 @@ fn a_scheme_stripped_file_source_is_redacted() {
 /// test alone would report this source's `?poll=` value verbatim — `file://` is
 /// not a secret provider — but the whole URI came out of
 /// `FERRUM_FRONTEND_TLS_CERT_SOURCE_FILE`, so the option is a slice of resolved
-/// secret material. `contains_external_secret_value` answers that by provenance
-/// rather than by arming the option value as a candidate, which at these lengths
-/// would shred unrelated output.
+/// secret material. `is_external_secret_value` answers that by whole-value
+/// provenance rather than by arming the option value as a candidate, which at
+/// these lengths would shred unrelated output.
+///
+/// The fixture is the **complete URI including its query** — what production
+/// actually materializes — and its identifier and option are one byte each, so
+/// this pins both that provenance is taken before query stripping and that it is
+/// length-independent.
 ///
 /// Lives in this file because it needs redaction armed, and this file owns the
 /// single `record_external_secret_keys` call for the `unit_tests` binary.
 #[test]
 fn an_externally_sourced_file_uri_withholds_its_option_values() {
+    use ferrum_edge::secrets::is_external_secret_value;
     use ferrum_edge::tls::source::{CertSource, MaterialKind};
     arm_redaction();
 
-    const POLL_SENTINEL: &str = "poll-provenance-sentinel-must-not-be-printed";
-    let source = CertSource::parse(
-        &format!("{FILE_URI_VALUE}?poll={POLL_SENTINEL}"),
-        MaterialKind::Cert,
+    assert_eq!(
+        POLL_URI_VALUE,
+        format!("file://{POLL_URI_IDENTIFIER}?poll={POLL_URI_OPTION}"),
+        "the fixture parts must still describe the armed value"
     );
+    // Otherwise the leak assertion below passes for the wrong reason.
+    assert!(
+        !EXTERNAL_SECRET_PLACEHOLDER.contains(POLL_URI_OPTION),
+        "pick an option value the placeholder does not itself contain"
+    );
+
+    let source = CertSource::parse(POLL_URI_VALUE, MaterialKind::Cert);
     let CertSource::Uri(uri) = &source else {
         panic!("the fixture must parse as a URI source");
     };
@@ -1040,24 +1074,93 @@ fn an_externally_sourced_file_uri_withholds_its_option_values() {
         "the fixture must be a non-provider scheme for this test to be meaningful"
     );
 
-    let rendered = uri.redacted_option_value(POLL_SENTINEL);
+    // Regression: provenance must be taken from the complete configured value,
+    // never from the post-parse identity. `parse` strips the query, so
+    // `source_id()` is a strict prefix of what was resolved — it is not itself a
+    // resolved value, and at this length it contains no derived candidate
+    // either. A mechanism keyed on it answers `false` here and prints the option.
+    assert_eq!(uri.source_id(), format!("file://{POLL_URI_IDENTIFIER}"));
     assert!(
-        !rendered.contains(POLL_SENTINEL),
+        !is_external_secret_value(&uri.source_id()),
+        "the query-stripped identity must not be mistaken for the resolved value"
+    );
+    assert!(
+        is_external_secret_value(POLL_URI_VALUE),
+        "the complete configured URI is what was externally materialized"
+    );
+
+    let rendered = uri.redacted_option_value(POLL_URI_OPTION);
+    assert!(
+        !rendered.contains(POLL_URI_OPTION),
         "an option out of an externally resolved URI must not be echoed: {rendered}"
     );
     assert_eq!(rendered, EXTERNAL_SECRET_PLACEHOLDER);
+}
 
-    // Non-vacuity: an otherwise identical URI that was *not* externally
-    // resolved keeps its option, so the withholding above is provenance-driven
-    // and not a blanket rule for every `file://` source.
-    let local = CertSource::parse(
-        "file:///etc/ferrum/tls/local-cert.pem?poll=nope",
-        MaterialKind::Cert,
-    );
-    let CertSource::Uri(local_uri) = &local else {
-        panic!("the control must parse as a URI source");
+/// A secret-provider URI withholds its option values on the scheme test alone,
+/// with no suffix provenance anywhere in the process.
+///
+/// The two tests are independent and must stay that way: `vault://…?poll=…` is a
+/// secret reference whether or not the operator also routed it through a `_FILE`
+/// suffix, so the option cannot become printable just because the URI was typed
+/// into the settings file directly.
+#[test]
+fn a_provider_uri_withholds_its_option_values_without_suffix_provenance() {
+    use ferrum_edge::secrets::is_external_secret_value;
+    use ferrum_edge::tls::source::{CertSource, MaterialKind};
+    arm_redaction();
+
+    const LOCAL_PROVIDER_URI: &str = "vault://secret/data/locally-typed?poll=nope";
+    let source = CertSource::parse(LOCAL_PROVIDER_URI, MaterialKind::Cert);
+    let CertSource::Uri(uri) = &source else {
+        panic!("the fixture must parse as a URI source");
     };
-    assert_eq!(local_uri.redacted_option_value("nope"), "nope");
+
+    // Precondition: only the scheme test can be carrying this assertion.
+    assert!(uri.scheme.is_secret_provider());
+    assert!(
+        !is_external_secret_value(LOCAL_PROVIDER_URI),
+        "the fixture must not be externally resolved for this test to be meaningful"
+    );
+
+    assert_eq!(
+        uri.redacted_option_value("nope"),
+        EXTERNAL_SECRET_PLACEHOLDER
+    );
+}
+
+/// Provenance is origin, not coincidence: an ordinary locally configured
+/// `file://` source keeps its malformed option value even in a process that
+/// resolved external secrets.
+///
+/// The second control is the discriminating one. Its identifier embeds an
+/// unrelated resolved value verbatim, so a containment test over the post-parse
+/// `source_id` answers `true` there — `metadata-key-sentinel` is an armed
+/// candidate from an entirely different variable, and its appearing inside a
+/// path the operator wrote says nothing about where that path came from.
+/// Withholding on it would make an ordinary configuration typo undiagnosable
+/// while demonstrating the abstraction was never key/value provenance.
+#[test]
+fn a_locally_configured_file_uri_keeps_its_option_value() {
+    use ferrum_edge::tls::source::{CertSource, MaterialKind};
+    arm_redaction();
+
+    let colliding = format!("file:///etc/ferrum/tls/{METADATA_KEY_VALUE}.pem?poll=nope");
+    for raw in [
+        "file:///etc/ferrum/tls/local-cert.pem?poll=nope",
+        colliding.as_str(),
+    ] {
+        let source = CertSource::parse(raw, MaterialKind::Cert);
+        let CertSource::Uri(uri) = &source else {
+            panic!("the control must parse as a URI source: {raw}");
+        };
+        assert!(!uri.scheme.is_secret_provider());
+        assert_eq!(
+            uri.redacted_option_value("nope"),
+            "nope",
+            "a locally configured source must stay diagnosable: {raw}"
+        );
+    }
 }
 
 /// A database URL reaches the operator credential-redacted, which leaves the

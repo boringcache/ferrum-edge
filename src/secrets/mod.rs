@@ -214,16 +214,15 @@ pub fn quoted_env_value(env_key: &str, rendered: &str) -> String {
     format!("'{}'", redact_external_secret_values(rendered))
 }
 
-/// True when `text` carries an externally resolved secret value, or one of the
-/// bounded derived forms [`derive_candidates`] produces for it.
+/// True when `value` **is**, exactly, an externally resolved secret value.
 ///
-/// This answers a question [`redact_external_secret_values`] cannot: whether a
-/// string is *made of* resolved material, rather than what it looks like once
-/// the resolved material has been removed from it. Redaction matches a candidate
-/// **inside** a message, so it covers a diagnostic that quotes a whole resolved
-/// value — but a caller that is about to print a *fragment* of such a value has
-/// the containment the other way round, and no candidate matches. The fragment
-/// then escapes even though the value it came from is armed.
+/// This answers a question [`redact_external_secret_values`] cannot: where a
+/// string came from, rather than what it looks like once resolved material has
+/// been removed from it. Redaction matches a candidate **inside** a message, so
+/// it covers a diagnostic that quotes a whole resolved value — but a caller that
+/// is about to print a *fragment* of such a value has the containment the other
+/// way round, and no candidate matches. The fragment then escapes even though
+/// the value it came from is armed.
 ///
 /// `tls::source::CertSourceUri::redacted_option_value` is the motivating case: a
 /// source URI materialized from `FERRUM_FRONTEND_TLS_CERT_SOURCE_FILE` carries
@@ -232,12 +231,44 @@ pub fn quoted_env_value(env_key: &str, rendered: &str) -> String {
 /// query value into a candidate instead was rejected: it would arm short,
 /// arbitrary strings process-wide, which is precisely the blind substring
 /// corruption [`RedactionPlan::MIN_DERIVED_CANDIDATE_LEN`] exists to prevent.
-/// Asking about provenance is exact, bounded, and arms nothing.
+///
+/// Matching is **whole-value equality against the value as materialized**. It is
+/// deliberately neither containment nor a match against a [`derive_candidates`]
+/// form, because neither of those is provenance:
+///
+/// * Containment is not origin. A candidate that merely occurs somewhere inside
+///   a locally authored string proves nothing about where that string came from,
+///   and a *derived* fragment proves less still — it is a rewrite of some other
+///   variable's value. Answering `true` there withholds an ordinary local
+///   diagnostic on a coincidence, and a caller that reads it as "this is secret
+///   material" is reading a claim the implementation cannot support.
+/// * Containment also fails in the direction that matters here, so it is not
+///   even a safe over-approximation. The caller must hand over the value it
+///   actually holds, **complete**: a URI's query is part of the resolved string,
+///   so a query-stripped identifier is a strict prefix of the secret, contains
+///   no whole candidate, and answers `false` on genuinely secret material.
+///
+/// Equality carries **no minimum length** — unlike
+/// [`RedactionPlan::MIN_DERIVED_CANDIDATE_LEN`], which exists to stop a short
+/// derived form being armed as a process-wide substring. Nothing is armed here:
+/// a one-byte resolved value is answered exactly and no unrelated text is ever
+/// rewritten because of it. The materialized value and its `trim()`ed form are
+/// both accepted because a configuration reader may trim before storing; both
+/// are whole representations of the same secret rather than fragments of it.
 ///
 /// `false` in any process that resolved no external secrets, so ordinary
 /// configuration diagnostics keep printing their values.
-pub fn contains_external_secret_value(text: &str) -> bool {
-    redaction_plan().is_some_and(|plan| plan.contains_candidate(text))
+///
+/// **Residual, deliberate:** this is *value* provenance, so a caller must pass
+/// the string exactly as configured. A value Ferrum has already rewritten — a
+/// serde round trip through `tls::source::CertSource::to_config_value`, which
+/// reorders options and drops percent-encoding — is no longer the materialized
+/// string and is answered `false`. Widening to cover rewrites would reintroduce
+/// exactly the derived-form guessing this exists to avoid; a site that cannot
+/// hold the original string must withhold key-tied instead
+/// ([`report_env_field`]).
+pub fn is_external_secret_value(value: &str) -> bool {
+    redaction_plan().is_some_and(|plan| plan.is_exact_value(value))
 }
 
 /// Remove externally resolved secret values from an operator-facing message.
@@ -909,6 +940,15 @@ struct RedactionPlan {
     /// candidate list; with it the common no-match position costs one indexed
     /// bool load.
     first_bytes: [bool; 256],
+    /// The resolved values *as materialized*, plus their `trim()`ed forms.
+    ///
+    /// Kept separate from `candidates` because it answers a different question —
+    /// see [`is_external_secret_value`]. `candidates` mixes in derived rewrites
+    /// and is searched for *inside* a message, which is sound for removing a
+    /// secret from text but is not evidence of where a string came *from*.
+    /// Nothing in this set is ever substring-matched, so it needs no minimum
+    /// length and arms nothing.
+    exact_values: std::collections::BTreeSet<String>,
     /// [`WITHHELD_LOG_RECORD`] with its own field values already redacted
     /// against `candidates`. Computed once here rather than per withheld
     /// record, which keeps the fail-closed path allocation-cheap and, more
@@ -952,10 +992,21 @@ impl RedactionPlan {
 
     fn build<I: IntoIterator<Item = String>>(values: I) -> Self {
         let mut candidates: Vec<String> = Vec::new();
+        let mut exact_values: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         for value in values {
             if value.is_empty() {
                 continue;
             }
+            // Provenance set: the value as materialized, and the same value with
+            // surrounding whitespace removed, because a configuration reader may
+            // trim before storing what it was handed. Both are the whole secret;
+            // no derived form joins them (see `is_external_secret_value`).
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                exact_values.insert(trimmed.to_string());
+            }
+            exact_values.insert(value.clone());
             candidates.push(value.clone());
             // The JSON-escaped body of the value *as materialized* is another
             // exact representation of the same secret, not a transformed
@@ -994,6 +1045,7 @@ impl RedactionPlan {
         let mut plan = Self {
             candidates,
             first_bytes,
+            exact_values,
             withheld_record: String::new(),
         };
         // The fail-closed replacement is a record like any other: an exact
@@ -1015,6 +1067,15 @@ impl RedactionPlan {
             .unwrap_or_else(|| MINIMAL_WITHHELD_LOG_RECORD.to_string());
         plan.withheld_record = withheld_record;
         plan
+    }
+
+    /// Whole-value provenance: is this string one of the resolved values?
+    ///
+    /// A set lookup, not a scan. Nothing here participates in substring
+    /// matching, which is what lets it skip the derived-candidate minimum
+    /// entirely — see [`is_external_secret_value`].
+    fn is_exact_value(&self, value: &str) -> bool {
+        self.exact_values.contains(value)
     }
 
     /// Allocation-free "is there anything to do here?" screen.

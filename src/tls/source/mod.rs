@@ -161,12 +161,42 @@ impl fmt::Debug for SecretBytes {
 }
 
 /// Parsed typed source URI.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Eq)]
 pub struct CertSourceUri {
     pub scheme: SourceScheme,
     pub identifier: String,
     pub kind: MaterialKind,
     pub options: BTreeMap<String, String>,
+    /// The complete configured string this URI was parsed from, before the
+    /// query was split off. **Provenance only** — never an identity, never
+    /// operator-facing.
+    ///
+    /// [`Self::redacted_option_value`] has to ask whether *this whole value* was
+    /// externally materialized, and nothing else on this struct can answer that.
+    /// `parse` drops the query before [`Self::source_id`] reconstructs
+    /// the identity, so for a source resolved as `file://x?poll=p` the id is
+    /// `file://x` — a strict prefix of what was resolved, equal to no resolved
+    /// value. Asking `secrets::is_external_secret_value` about the id therefore
+    /// answers `false` on genuinely secret material and the option gets printed.
+    ///
+    /// Excluded from [`PartialEq`] deliberately. `CertSource` equality reaches
+    /// `subscription::MaterialFingerprintEntry`, whose `Eq` **is** the rotation
+    /// predicate, and identity there is the *parsed* source —
+    /// scheme/identifier/kind/options. Two spellings that parse to the same
+    /// source are the same source; letting a raw-text difference compare unequal
+    /// would report a rotation that never happened.
+    raw: String,
+}
+
+impl PartialEq for CertSourceUri {
+    /// Compares the *parsed* source, not the text it was written as — see
+    /// the `raw` field.
+    fn eq(&self, other: &Self) -> bool {
+        self.scheme == other.scheme
+            && self.identifier == other.identifier
+            && self.kind == other.kind
+            && self.options == other.options
+    }
 }
 
 impl fmt::Debug for CertSourceUri {
@@ -199,6 +229,7 @@ impl CertSourceUri {
             identifier,
             kind,
             options,
+            raw: raw.to_string(),
         })
     }
 
@@ -252,11 +283,32 @@ impl CertSourceUri {
     /// 1. A secret-provider scheme (`vault`/`aws`/`azure`/`gcp`) — the whole URI
     ///    is a secret reference, so its options are too. Same classifier as
     ///    [`Self::redacted_source_id`], so identifier and options cannot diverge.
-    /// 2. A URI that embeds an externally resolved value
-    ///    ([`crate::secrets::contains_external_secret_value`]) — a `file://`
-    ///    source materialized from `FERRUM_FRONTEND_TLS_CERT_SOURCE_FILE` is
+    ///    This test is independent of the second and is applied first: a
+    ///    provider URI withholds its options whether or not it was itself
+    ///    externally materialized.
+    /// 2. The complete configured URI was externally materialized
+    ///    ([`crate::secrets::is_external_secret_value`]) — a `file://` source
+    ///    resolved from `FERRUM_FRONTEND_TLS_CERT_SOURCE_FILE` is
     ///    operator-authored in shape but secret in provenance, and its
     ///    `source_id` is otherwise printed verbatim.
+    ///
+    /// The second test is against the `raw` field, the string as configured, and
+    /// asks for **whole-value equality** — not whether a candidate occurs
+    /// somewhere inside the parsed identity. Both halves of that matter:
+    ///
+    /// * [`Self::source_id`] is the wrong input. `parse` strips the
+    ///   query before it is reconstructed, so a source resolved as
+    ///   `file://x?poll=p` yields `file://x` — a strict prefix of the secret
+    ///   that equals no resolved value and contains no whole candidate (the
+    ///   one-byte identifier is below `MIN_DERIVED_CANDIDATE_LEN`). The raw
+    ///   `poll` option would then be logged despite coming from the secret.
+    /// * Containment is the wrong question. Any unrelated resolved value that
+    ///   happens to appear inside a locally configured identifier would answer
+    ///   `true` — coincidence, not origin — and would withhold an ordinary local
+    ///   diagnostic the operator needs.
+    ///
+    /// Equality needs no minimum length and arms nothing process-wide, so a
+    /// one- or two-byte identifier and option are covered exactly.
     ///
     /// Otherwise the value is returned unchanged: `file`/`k8s`/`acme`/`managed`/
     /// `pkcs11` sources that were configured locally are ordinary operator input,
@@ -264,9 +316,7 @@ impl CertSourceUri {
     ///
     /// [min]: crate::secrets
     pub fn redacted_option_value(&self, rendered: &str) -> String {
-        if self.scheme.is_secret_provider()
-            || crate::secrets::contains_external_secret_value(&self.source_id())
-        {
+        if self.scheme.is_secret_provider() || crate::secrets::is_external_secret_value(&self.raw) {
             return crate::secrets::EXTERNAL_SECRET_PLACEHOLDER.to_string();
         }
         // The option is not itself secret-derived, but the text may still quote
