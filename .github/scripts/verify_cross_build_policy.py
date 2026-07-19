@@ -9764,7 +9764,7 @@ def runtime_program_cross_surface(
 
 
 def literal_nested_shell_programs(value: str) -> tuple[str, ...]:
-    """Return literal programs passed to sh-family `-c` command modes."""
+    """Return literal programs passed to `eval` or sh-family `-c` modes."""
 
     tokens = shell_tokens(value)
     if tokens is None:
@@ -9792,7 +9792,21 @@ def literal_nested_shell_programs(value: str) -> tuple[str, ...]:
             index, executes = executable_index(segment)
             if not executes or index >= len(segment):
                 continue
-            if tool_name(segment[index]) not in {
+            command = tool_name(segment[index])
+            if command == "eval":
+                arguments = segment[index + 1 :]
+                # POSIX eval joins its arguments with spaces and parses the
+                # result as shell source. Re-scan a fully literal operand so a
+                # quoted `eval "bash scripts/build"` keeps the repository edge
+                # that quote-aware raw discovery intentionally ignores. A
+                # generated operand remains opaque and is rejected by the
+                # executable-surface scan instead of being guessed here.
+                if arguments and not any(
+                    dynamic_shell_word(argument) for argument in arguments
+                ):
+                    programs.append(" ".join(arguments))
+                continue
+            if command not in {
                 "ash",
                 "bash",
                 "dash",
@@ -13354,6 +13368,51 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("trusted revalidation allowed reached Cross automation")
+
+    literal_eval_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        'eval "bash scripts/safe.sh"',
+    )
+    if not compare_pr_automation_collection(
+        {"ci.yml": literal_eval_workflow},
+        {"ci.yml": literal_eval_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        cross_automation,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "a quoted literal eval lost its reached Cross automation during PR "
+            "comparison"
+        )
+    baseline_without_eval_reference = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "echo safe",
+    )
+    if not compare_pr_automation_collection(
+        {"ci.yml": baseline_without_eval_reference},
+        {"ci.yml": literal_eval_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        cross_automation,
+        cross_automation,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "a newly reached Cross script inside a quoted literal eval was not "
+            "rejected"
+        )
+    if not validate_automation_collection(
+        {"ci.yml": literal_eval_workflow},
+        {"setup/action.yml": safe_action},
+        cross_automation,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "trusted revalidation allowed Cross automation reached through a "
+            "quoted literal eval"
+        )
 
     hostname_automation = {
         "scripts/safe.sh": "#!/bin/sh\necho cross.blackbox.example\n"
@@ -17816,6 +17875,16 @@ pre_build = []
             "was not retained: "
             f"references={sorted(quoted_substitution_references)!r}, "
             f"errors={quoted_substitution_errors!r}"
+        )
+
+    literal_eval_references, _, literal_eval_errors = command_reference_result(
+        'eval "bash scripts/unsafe.sh"'
+    )
+    if "scripts/unsafe.sh" not in literal_eval_references or literal_eval_errors:
+        failures.append(
+            "a repository command inside a quoted literal eval was not retained: "
+            f"references={sorted(literal_eval_references)!r}, "
+            f"errors={literal_eval_errors!r}"
         )
 
     # An unquoted heredoc body still expands `$()`, so the substitution really
