@@ -1616,6 +1616,22 @@ pub mod _test_support {
         crate::proxy::clone_log_metadata(ctx)
     }
 
+    /// The stamped `Content-Length` a LATER buffered body transform will read
+    /// for this response.
+    ///
+    /// This is `mcp_gateway`'s own precheck expression, character for character
+    /// (`get(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY).and_then(parse)`), so
+    /// a test asserting on it is asserting on what the MCP reverse-mapping
+    /// transform actually sees. The key is deliberately stripped from transaction
+    /// metadata, so `clone_log_metadata_for_test` cannot answer this.
+    pub fn stamped_response_content_length_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<usize> {
+        ctx.metadata
+            .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY)
+            .and_then(|value| value.parse::<usize>().ok())
+    }
+
     /// The low-cardinality reason the shared representation gate rejected this
     /// response, or `None` when it was never rejected.
     pub fn representation_rejection_reason_for_test(

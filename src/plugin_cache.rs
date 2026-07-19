@@ -778,13 +778,14 @@ impl Plugin for PriorityOverridePlugin {
         &self,
         ctx: &RequestContext,
         response_content_type: Option<&str>,
+        response_body: &[u8],
     ) -> bool {
         // Must forward: falling back to the trait default (`false`) would make a
         // priority-overridden body policy invisible to the shared representation
         // gate, reopening the encoded/partial bypass for exactly the proxies that
         // reorder their plugins.
         self.inner
-            .enforces_response_body_policy(ctx, response_content_type)
+            .enforces_response_body_policy(ctx, response_content_type, response_body)
     }
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
         self.inner.may_enforce_response_body_policy(ctx)

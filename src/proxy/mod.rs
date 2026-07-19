@@ -307,9 +307,18 @@ pub(crate) const ORIGINAL_RESPONSE_METADATA_STAMPED_KEY: &str =
 pub(crate) const ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY: &str =
     "ferrum:original_response_content_type";
 
-/// Parsed `Content-Length` from the original backend response. Body transforms
-/// use this snapshot when a later gateway plugin (notably `compression`)
-/// removes the wire header before the buffered-body phase.
+/// Parsed `Content-Length` for the buffered representation a body transform will
+/// be handed. Stamped from the original backend response, because a later gateway
+/// plugin (notably `compression`) can remove the wire header before the
+/// buffered-body phase.
+///
+/// Refreshed — not left pristine — by
+/// [`crate::plugins::response_representation::install_decoded_response_body`]
+/// when the representation gate decodes a protected body. The stamp answers "how
+/// many bytes will the transform see?", and after a decode the encoded wire
+/// length (or, for a chunked upstream, the ABSENCE of one) is no longer that
+/// answer. Leaving it stale made `mcp_gateway`'s size precheck reject a decoded,
+/// bounded, fully inspectable JSON body and skip MCP reverse mapping.
 pub(crate) const ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY: &str =
     "ferrum:original_response_content_length";
 
@@ -543,9 +552,9 @@ pub(crate) fn stamp_original_response_metadata(
 /// already REPLACED. The gate's own reads are provenance-switched
 /// (`origin_content_encoding`, `is_partial_representation` both branch on
 /// [`RepresentationOrigin`]), but the claim predicates it consults are not: a
-/// plugin's `enforces_response_body_policy` receives only `&RequestContext` and
-/// the live `Content-Type`, so it cannot tell a backend snapshot from a stale
-/// one. `response_transformer::framed_grpc_request_without_proven_media_type`
+/// plugin's `enforces_response_body_policy` receives only `&RequestContext`, the
+/// live `Content-Type`, and the bytes, so it cannot tell a backend snapshot from
+/// a stale one. `response_transformer::framed_grpc_request_without_proven_media_type`
 /// reads [`ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY`] exactly that way: left
 /// in place, a backend that answered `application/grpc+json` would make the
 /// claim predicate decline a gateway-generated JSON rejection that has replaced

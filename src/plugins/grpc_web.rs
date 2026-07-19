@@ -74,6 +74,89 @@ pub(crate) const BASE_EXPOSE_HEADERS_VALUE: &str =
 pub(crate) const GRPC_FRAME_DATA: u8 = 0x00;
 /// gRPC frame flag: trailer frame (used in gRPC-Web to embed trailers in body).
 pub(crate) const GRPC_FRAME_TRAILER: u8 = 0x80;
+/// gRPC frame flag: data frame whose payload carries a per-message content
+/// coding (the wire spec's `Compressed-Flag` set to 1).
+pub(crate) const GRPC_FRAME_DATA_COMPRESSED: u8 = 0x01;
+/// gRPC frame flag: gRPC-Web trailer frame with `Compressed-Flag` set.
+pub(crate) const GRPC_FRAME_TRAILER_COMPRESSED: u8 = 0x81;
+
+/// Whether `data` is EXACTLY a non-empty sequence of complete gRPC
+/// length-prefixed frames, with nothing left over.
+///
+/// This is a total structural parse, not a sniff: every frame must carry a
+/// recognized `Compressed-Flag`/trailer flag byte, declare a length that fits
+/// inside the remaining bytes, and the last frame must end precisely at the end
+/// of the buffer. Truncated, padded, or malformed framing answers `false`.
+///
+/// It exists so the buffered representation gate can tell framed gRPC apart from
+/// a bare document when NO `Content-Type` was ever stamped or left on the
+/// response, without falling back to the request flavor alone. The two answers
+/// cannot collide: a valid frame begins with `0x00`, `0x01`, `0x80`, or `0x81`,
+/// none of which can begin a JSON document, so classifying a frame sequence as
+/// framed never costs a redaction a field rule could have applied.
+pub(crate) fn bytes_are_complete_grpc_frames(data: &[u8]) -> bool {
+    let mut pos = 0usize;
+    let mut frames = 0usize;
+    while pos < data.len() {
+        if data.len() - pos < 5 {
+            return false;
+        }
+        if !matches!(
+            data[pos],
+            GRPC_FRAME_DATA
+                | GRPC_FRAME_DATA_COMPRESSED
+                | GRPC_FRAME_TRAILER
+                | GRPC_FRAME_TRAILER_COMPRESSED
+        ) {
+            return false;
+        }
+        let length =
+            u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]);
+        let header_end = pos + 5;
+        // Compare against the REMAINING bytes rather than adding to `pos`, so a
+        // 4 GiB declared length cannot wrap on a 32-bit target.
+        let Ok(length) = usize::try_from(length) else {
+            return false;
+        };
+        if length > data.len() - header_end {
+            return false;
+        }
+        pos = header_end + length;
+        frames += 1;
+    }
+    frames > 0
+}
+
+/// Whether `data` is a gRPC-Web **text**-mode body: standard base64 whose decoded
+/// octets are exactly a complete gRPC frame sequence.
+///
+/// Text mode base64-encodes the whole framed body, so its wire bytes are ASCII
+/// and [`bytes_are_complete_grpc_frames`] cannot recognize them directly. The
+/// cheap alphabet/length pre-scan runs first so an ordinary JSON document — whose
+/// leading `{`, `[`, or `"` is outside the base64 alphabet — never reaches the
+/// decoder. As with the binary case there is no collision to worry about: a body
+/// that base64-decodes to valid frames is not a JSON document a field rule could
+/// have redacted.
+pub(crate) fn bytes_are_grpc_web_text_frames(data: &[u8]) -> bool {
+    // Standard base64 with padding: a whole number of 4-character groups, and
+    // `=` padding only in the final group.
+    if data.is_empty() || data.len() % 4 != 0 {
+        return false;
+    }
+    let payload = match data.strip_suffix(b"==") {
+        Some(payload) => payload,
+        None => data.strip_suffix(b"=").unwrap_or(data),
+    };
+    if !payload
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'+' || *byte == b'/')
+    {
+        return false;
+    }
+    BASE64
+        .decode(data)
+        .is_ok_and(|decoded| bytes_are_complete_grpc_frames(&decoded))
+}
 
 /// Returns a header map with `content-type: application/grpc` for gRPC error responses.
 fn grpc_content_type_header() -> HashMap<String, String> {

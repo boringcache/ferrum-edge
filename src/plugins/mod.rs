@@ -5965,10 +5965,22 @@ pub trait Plugin: Send + Sync {
     ///
     /// `response_content_type` is the live `Content-Type`, matching what
     /// [`Plugin::transform_response_body_with_context`] will receive.
+    ///
+    /// `response_body` is the byte string the enforcer will actually be handed —
+    /// the decoded identity representation once the gate has decoded one, the
+    /// wire bytes otherwise. It is supplied because media type and request
+    /// flavor are not always sufficient evidence: a gRPC/gRPC-Web request whose
+    /// response carries NO `Content-Type` at all is either framed gRPC (which no
+    /// JSON field rule can act on) or a bare JSON error/envelope document (which
+    /// a configured redaction must still cover), and only the bytes distinguish
+    /// them. Implementations must decide structurally — a total parse such as
+    /// [`crate::plugins::grpc_web::bytes_are_complete_grpc_frames`] — never by
+    /// sniffing a prefix.
     fn enforces_response_body_policy(
         &self,
         _ctx: &RequestContext,
         _response_content_type: Option<&str>,
+        _response_body: &[u8],
     ) -> bool {
         false
     }
@@ -5976,14 +5988,20 @@ pub trait Plugin: Send + Sync {
     /// Whether this plugin may make [`Plugin::enforces_response_body_policy`]
     /// return `true` for the current request.
     ///
-    /// The response lifecycle consults this before `after_proxy`, when the
-    /// final live `Content-Type` is not yet known, to decide whether it must
-    /// retain gateway-header provenance for a possible representation
-    /// rejection. The default probes the untyped response shape; plugins whose
-    /// policy claims only specific present media types must override this
-    /// capability predicate.
+    /// The response lifecycle consults this before `after_proxy`, when neither
+    /// the final live `Content-Type` nor the response body is known, to decide
+    /// whether it must retain gateway-header provenance for a possible
+    /// representation rejection. It is therefore a CAPABILITY question and must
+    /// OVER-approximate: answering `false` for a request whose claim later turns
+    /// out to be `true` means the rejection sheds gateway decorators (CORS,
+    /// security, correlation headers) that had already been applied.
+    ///
+    /// The default probes the untyped, empty-bodied response shape, which is an
+    /// under-approximation for any plugin whose claim depends on the media type
+    /// or the bytes. Such plugins MUST override this predicate with one that
+    /// depends only on configuration and request state.
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
-        self.enforces_response_body_policy(ctx, None)
+        self.enforces_response_body_policy(ctx, None, &[])
     }
 
     /// Whether this plugin's response inspection just determined that its

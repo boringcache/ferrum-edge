@@ -517,9 +517,37 @@ impl ResponseTransformer {
 /// Likewise NOT a decline: an ordinary HTTP request with an absent or vendor
 /// `+json` response `Content-Type`. That claim is the earlier absent-type fix and
 /// is untouched here — this predicate only fires for gRPC/gRPC-Web traffic.
+///
+/// # The untyped case is decided on the BYTES, not the flavor
+///
+/// When neither the snapshot nor the live map names a type, the request flavor
+/// alone cannot answer, and treating it as proof of framing was a fail-OPEN: a
+/// mixed gRPC route whose backend returns a bare JSON error/envelope document
+/// with no `Content-Type` would be declined by both this predicate and the
+/// transform, so a configured redaction over that document never ran while the
+/// operator believed it had. `response_transformer` otherwise treats an absent
+/// type as JSON precisely so that class stays covered.
+///
+/// The bytes settle it, and they settle it by a TOTAL PARSE rather than a sniff:
+/// [`super::grpc_web::bytes_are_complete_grpc_frames`] accepts only a byte string
+/// that is exactly a sequence of complete length-prefixed frames, and
+/// [`super::grpc_web::bytes_are_grpc_web_text_frames`] the base64 form a
+/// text-mode gRPC-Web client receives. Neither can collide with a JSON document:
+/// a frame's first octet is a `Compressed-Flag`/trailer flag (`0x00`, `0x01`,
+/// `0x80`, `0x81`) and base64 excludes `{`, `[`, and `"`. So valid framing is
+/// never claimed and spuriously rejected as an unparseable document, and a bare
+/// document is never waved through unredacted — the two failure directions this
+/// predicate has to keep apart.
+///
+/// Malformed or truncated framing is not "framed" and therefore stays claimed;
+/// it then fails the gate's JSON parse and is rejected. That is the documented
+/// fail-closed posture — the gateway cannot prove a redaction applied to bytes it
+/// cannot parse, and truncated frames are not a servable complete representation
+/// either.
 fn framed_grpc_request_without_proven_media_type(
     ctx: &RequestContext,
     response_content_type: Option<&str>,
+    response_body: &[u8],
 ) -> bool {
     let pristine_content_type = ctx
         .metadata
@@ -538,9 +566,12 @@ fn framed_grpc_request_without_proven_media_type(
     if response_content_type.is_some() {
         return false;
     }
-    ctx.is_native_grpc_request()
+    let grpc_flavor = ctx.is_native_grpc_request()
         || super::grpc_web::client_uses_grpc_web(ctx)
-        || super::grpc_web::request_is_grpc_web_translated(ctx)
+        || super::grpc_web::request_is_grpc_web_translated(ctx);
+    grpc_flavor
+        && (super::grpc_web::bytes_are_complete_grpc_frames(response_body)
+            || super::grpc_web::bytes_are_grpc_web_text_frames(response_body))
 }
 
 #[async_trait]
@@ -633,6 +664,7 @@ impl Plugin for ResponseTransformer {
         &self,
         ctx: &RequestContext,
         response_content_type: Option<&str>,
+        response_body: &[u8],
     ) -> bool {
         // Claim exactly the responses the transform phase would actually
         // rewrite, so the shared representation gate fails closed on those and
@@ -703,14 +735,56 @@ impl Plugin for ResponseTransformer {
         // stamped — so stripping or relabelling the header cannot smuggle frames
         // onto the untyped branch. `transform_response_body_with_context` applies
         // the identical predicate, which is what keeps this decline symmetric
-        // rather than reopening the gap the SSE decline had.
+        // rather than reopening the gap the SSE decline had. When NOTHING named a
+        // type, that helper decides on the response bytes rather than the request
+        // flavor, so an untyped bare JSON error/envelope on a mixed gRPC route
+        // stays claimed and redacted instead of being waved through as framing.
         !self.body_rules.is_empty()
             && self.rules_enabled()
-            && !framed_grpc_request_without_proven_media_type(ctx, response_content_type)
+            && !framed_grpc_request_without_proven_media_type(
+                ctx,
+                response_content_type,
+                response_body,
+            )
             && response_content_type.is_none_or(|ct| {
                 body_transform::is_json_content_type(ct)
                     && !body_transform::is_framed_grpc_content_type(ct)
             })
+    }
+
+    /// The pre-`after_proxy` capability probe, deliberately WIDER than the claim.
+    ///
+    /// The lifecycle asks this before any response hook has run, to decide
+    /// whether to retain terminal-replacement provenance for a representation
+    /// rejection. Neither of the two inputs the claim actually turns on is
+    /// available yet: the live `Content-Type` has not been finalized and the body
+    /// has not been read. The trait default therefore probes the claim with
+    /// `(None, &[])`, i.e. it asks the *untyped, empty-body* question and hopes
+    /// the answer generalizes.
+    ///
+    /// It did not. While the untyped branch of
+    /// `framed_grpc_request_without_proven_media_type` keyed on the request
+    /// flavor alone, that probe answered "framed" for every gRPC/gRPC-Web request
+    /// and the claim came back `false`. On a mixed gRPC route whose backend then
+    /// answered with a real bare `application/json` document, the claim predicate
+    /// DID claim it, an encoded/partial/unparseable body WAS replaced, and the
+    /// rejection path had no provenance to restore from: it dropped the
+    /// decorators completed gateway hooks had already applied (CORS, security,
+    /// correlation headers) while clearing backend fields. The same response on
+    /// an HTTP route kept them, so the gRPC flavor silently got a weaker error.
+    ///
+    /// Deciding that branch on the bytes happens to make the default probe
+    /// answer correctly today — an empty probe body is not a frame sequence — but
+    /// relying on that is relying on a coincidence between a capability question
+    /// and a claim evaluated over evidence this predicate does not have. The
+    /// override consults only configuration and request-scoped overlay state,
+    /// which is exactly the set of conditions that cannot change between the
+    /// probe and the claim, so the two cannot diverge again as the claim's
+    /// evidence grows. Answering `true` costs one provenance-mode selection and
+    /// no request-path allocation; answering `false` too eagerly costs
+    /// correctness, so this predicate errs wide by construction.
+    fn may_enforce_response_body_policy(&self, _ctx: &RequestContext) -> bool {
+        !self.body_rules.is_empty() && self.rules_enabled()
     }
 
     async fn after_proxy(
@@ -812,13 +886,18 @@ impl Plugin for ResponseTransformer {
     ///
     /// Declining here rather than widening the claim to match is the correct
     /// direction, and it costs no redaction: the pristine stamped media type (or,
-    /// unstamped, the request's immutable gRPC flavor) is proof that these bytes
-    /// are length-prefixed FRAMES, which can never parse as the bare document a
-    /// JSON field rule acts on. `apply_body_rules` would have returned `None` for
-    /// them anyway — the explicit decline only makes that provable at the
-    /// predicate instead of incidental to the parser. Claiming them instead would
-    /// send every valid RPC reply on a mixed HTTP/gRPC proxy into the gate's
-    /// `unparseable_document` rejection.
+    /// unstamped, a total parse of the bytes as complete length-prefixed frames)
+    /// is proof that these bytes are FRAMES, which can never parse as the bare
+    /// document a JSON field rule acts on. `apply_body_rules` would have returned
+    /// `None` for them anyway — the explicit decline only makes that provable at
+    /// the predicate instead of incidental to the parser. Claiming them instead
+    /// would send every valid RPC reply on a mixed HTTP/gRPC proxy into the
+    /// gate's `unparseable_document` rejection.
+    ///
+    /// `body` is passed through for exactly that untyped case. It is the same
+    /// byte string the claim predicate was asked about — the gate re-asks the
+    /// claim over the decoded bytes before enforcing, so both sides see one
+    /// representation and the symmetry holds after a decode as well as before.
     ///
     /// SSE is deliberately NOT declined here. The opposite half of the fix
     /// removed the SSE-specific *decline* from the claim predicate — widening
@@ -833,7 +912,7 @@ impl Plugin for ResponseTransformer {
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if framed_grpc_request_without_proven_media_type(ctx, content_type) {
+        if framed_grpc_request_without_proven_media_type(ctx, content_type, body) {
             return None;
         }
         self.transform_response_body(body, content_type, response_headers)

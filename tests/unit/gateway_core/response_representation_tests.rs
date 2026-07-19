@@ -26,6 +26,7 @@ use ferrum_edge::_test_support::{
     run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
     set_original_response_content_encoding_for_test, set_request_http_flavor_for_test,
     stamp_original_request_metadata_for_test, stamp_original_response_metadata_for_test,
+    stamped_response_content_length_for_test,
     transform_buffered_response_body_with_deadline_and_policy_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
@@ -1136,6 +1137,7 @@ impl Plugin for ClaimEverythingPolicy {
         &self,
         _ctx: &RequestContext,
         _response_content_type: Option<&str>,
+        _response_body: &[u8],
     ) -> bool {
         true
     }
@@ -2918,4 +2920,463 @@ fn no_internal_origin_response_stamp_reaches_transaction_metadata() {
         leaked.is_empty(),
         "internal origin-response stamps leaked into transaction metadata: {leaked:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A decoded representation must describe ITSELF to later body transforms.
+//
+// The gate installs identity bytes and rewrites the live `content-length`, but
+// later transforms do not read the live header. `mcp_gateway`'s buffered
+// transform reads `ferrum:original_response_metadata_stamped` and then consults
+// ONLY `ferrum:original_response_content_length`. A chunked encoded backend
+// response stamps no length, so that snapshot said "no length" while the bytes
+// were decoded, bounded, and fully inspectable — and the precheck's `is_none_or`
+// rejected them, silently skipping MCP reverse mapping and forwarding the
+// upstream-native MCP names/URIs the transform exists to rewrite.
+// ---------------------------------------------------------------------------
+
+/// Drive the real backend body phase and report the stamped length a later
+/// transform would read, alongside the published bytes.
+async fn run_backend_transform_reporting_stamped_length(
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+) -> (Option<usize>, Vec<u8>, HashMap<String, String>) {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    let mut status = 200;
+    let mut headers = headers;
+    let mut body = body;
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    (stamped_response_content_length_for_test(&ctx), body, headers)
+}
+
+/// The finding: a CHUNKED encoded upstream stamps no `Content-Length` at all, so
+/// the "no length" state survived the decode and every later length-gated
+/// transform declined a body that is now plain, bounded JSON.
+#[tokio::test]
+async fn decoded_chunked_encoded_body_publishes_its_decoded_length_to_later_transforms() {
+    let plaintext = br#"{"secret":"hunter2","keep":1}"#;
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    // No `content-length`: the upstream answered with chunked transfer coding.
+
+    let (stamped, body, headers) =
+        run_backend_transform_reporting_stamped_length(headers, gzip(plaintext)).await;
+
+    assert_eq!(
+        stamped,
+        Some(body.len()),
+        "a later body transform must see the decoded length, not `None`"
+    );
+    let expected_length = body.len().to_string();
+    assert_eq!(
+        headers.get("content-length"),
+        Some(&expected_length),
+        "the stamped length and the live header must agree"
+    );
+    assert_secret_not_forwarded(&body);
+}
+
+/// The same staleness with a length PRESENT: the stamp described the compressed
+/// octets, which is not the byte count any later transform is handed.
+#[tokio::test]
+async fn decoded_body_refreshes_a_stale_encoded_length_snapshot() {
+    let plaintext = br#"{"secret":"hunter2","keep":1}"#;
+    let encoded = gzip(plaintext);
+    let encoded_len = encoded.len();
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), encoded_len.to_string());
+
+    let (stamped, body, _) = run_backend_transform_reporting_stamped_length(headers, encoded).await;
+
+    assert_eq!(
+        stamped,
+        Some(body.len()),
+        "the stamp must describe the decoded representation"
+    );
+    assert_ne!(
+        stamped,
+        Some(encoded_len),
+        "the compressed wire length must not survive the decode"
+    );
+}
+
+/// A response the gate did NOT decode keeps its genuine pristine length. The
+/// refresh is scoped to the field the decode actually invalidated.
+#[tokio::test]
+async fn an_undecoded_body_keeps_its_pristine_stamped_length() {
+    let plaintext = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+    let wire_len = plaintext.len();
+    let mut headers = json_headers();
+    headers.insert("content-length".to_string(), wire_len.to_string());
+
+    let (stamped, _, _) = run_backend_transform_reporting_stamped_length(headers, plaintext).await;
+
+    assert_eq!(
+        stamped,
+        Some(wire_len),
+        "no decode happened, so the pristine stamp is still the truth"
+    );
+}
+
+/// Gateway-generated bytes have no backend snapshot, and the decode must not
+/// fabricate one: their readers correctly fall back to the live headers the gate
+/// just rewrote.
+#[tokio::test]
+async fn a_decoded_gateway_generated_body_is_never_given_a_backend_length_stamp() {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    let mut status = 200;
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut body = gzip(br#"{"secret":"hunter2","keep":1}"#);
+
+    apply_synthetic_response_body_hooks_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+
+    assert_eq!(
+        stamped_response_content_length_for_test(&ctx),
+        None,
+        "gateway-authored bytes must carry no backend length stamp"
+    );
+    let expected_length = body.len().to_string();
+    assert_eq!(
+        headers.get("content-length"),
+        Some(&expected_length),
+        "the live header is the only description these bytes have"
+    );
+    assert_secret_not_forwarded(&body);
+}
+
+// ---------------------------------------------------------------------------
+// Untyped responses on a mixed gRPC route are decided on the BYTES.
+//
+// When neither the pristine snapshot nor the live map names a media type, the
+// request's gRPC flavor is necessary but NOT sufficient evidence of framing.
+// Treating it as sufficient was a fail-open: a backend JSON error/envelope
+// document with no `Content-Type` was declined by both the claim predicate and
+// the transform, so a configured redaction over exactly the untyped-JSON class
+// this gate otherwise covers never ran.
+//
+// The discriminator is a total parse of the bytes, never a prefix sniff, and it
+// cannot collide with JSON in either direction: a frame's first octet is a
+// `Compressed-Flag`/trailer flag (0x00/0x01/0x80/0x81) and base64 excludes `{`.
+// ---------------------------------------------------------------------------
+
+/// A gRPC-Web trailer frame: flag 0x80, 4-byte length, then the trailer block.
+fn grpc_trailer_frame(trailers: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(5 + trailers.len());
+    framed.push(0x80);
+    framed.extend_from_slice(&(trailers.len() as u32).to_be_bytes());
+    framed.extend_from_slice(trailers);
+    framed
+}
+
+/// Drive the real backend body phase for a gRPC-flavored request whose response
+/// names NO media type anywhere — neither in the pristine snapshot nor live.
+async fn run_untyped_grpc_route_transform(
+    flavor: HttpFlavor,
+    retained_grpc_web_content_type: Option<&str>,
+    response_headers: HashMap<String, String>,
+    body: Vec<u8>,
+) -> (bool, u16, Option<String>, Vec<u8>) {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    set_request_http_flavor_for_test(&mut ctx, flavor);
+    if let Some(content_type) = retained_grpc_web_content_type {
+        retain_grpc_web_client_content_type_for_test(&mut ctx, content_type);
+    }
+
+    let mut status = 200;
+    let mut headers = response_headers;
+    let mut body = body;
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
+    (replaced, status, reason, body)
+}
+
+/// The three request shapes that reach the untyped branch: native gRPC, and
+/// gRPC-Web in binary and text representations.
+fn untyped_grpc_route_shapes() -> [(HttpFlavor, Option<&'static str>); 3] {
+    [
+        (HttpFlavor::Grpc, None),
+        (HttpFlavor::Plain, Some("application/grpc-web+proto")),
+        (HttpFlavor::Plain, Some("application/grpc-web-text+proto")),
+    ]
+}
+
+/// The fail-open: a bare JSON error/envelope document with no `Content-Type` on
+/// a mixed gRPC route was forwarded with the configured redaction skipped.
+#[tokio::test]
+async fn untyped_bare_json_on_a_grpc_route_is_claimed_and_redacted() {
+    for (flavor, retained) in untyped_grpc_route_shapes() {
+        let body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+        let (replaced, status, reason, body) =
+            run_untyped_grpc_route_transform(flavor, retained, HashMap::new(), body).await;
+
+        let case = format!("{flavor:?}/{retained:?}");
+        assert!(!replaced, "{case}: a bare JSON document is servable");
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(reason, None, "{case}");
+        assert_secret_not_forwarded(&body);
+        assert!(
+            String::from_utf8_lossy(&body).contains("keep"),
+            "{case}: the document was transformed, not passed through"
+        );
+    }
+}
+
+/// An untyped ENCODED bare JSON document on the same route is decoded first, so
+/// the redaction still applies to the plaintext the client receives.
+#[tokio::test]
+async fn untyped_encoded_bare_json_on_a_grpc_route_is_decoded_and_redacted() {
+    for (flavor, retained) in untyped_grpc_route_shapes() {
+        let headers = HashMap::from([("content-encoding".to_string(), "gzip".to_string())]);
+        let encoded = gzip(br#"{"secret":"hunter2","keep":1}"#);
+        let (replaced, status, reason, body) =
+            run_untyped_grpc_route_transform(flavor, retained, headers, encoded).await;
+
+        let case = format!("{flavor:?}/{retained:?}");
+        assert!(!replaced, "{case}: a decodable JSON document is servable");
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(reason, None, "{case}");
+        assert_secret_not_forwarded(&body);
+        assert!(String::from_utf8_lossy(&body).contains("keep"), "{case}");
+    }
+}
+
+/// The fail-closed half: an untyped body on a gRPC route that is neither valid
+/// framing nor parseable JSON is rejected, not forwarded.
+#[tokio::test]
+async fn untyped_unframed_unparseable_body_on_a_grpc_route_fails_closed() {
+    for (flavor, retained) in untyped_grpc_route_shapes() {
+        let body = b"not json and not a frame".to_vec();
+        let (replaced, status, reason, body) =
+            run_untyped_grpc_route_transform(flavor, retained, HashMap::new(), body).await;
+
+        let case = format!("{flavor:?}/{retained:?}");
+        assert!(replaced, "{case}: an uninspectable body is not forwarded");
+        assert_eq!(status, 502, "{case}");
+        assert_eq!(reason.as_deref(), Some("unparseable_document"), "{case}");
+    }
+}
+
+/// The control the fix must not break: VALID untyped framing on the same route
+/// is still passed through untouched, across every frame shape the wire allows —
+/// multiple frames, a `Compressed-Flag` payload, and a gRPC-Web trailer frame.
+#[tokio::test]
+async fn untyped_valid_grpc_framing_is_still_passed_through() {
+    let mut compressed_frame = grpc_frame(b"\x08\x01");
+    compressed_frame[0] = 0x01;
+
+    let mut multi_frame = grpc_frame(br#"{"secret":"hunter2"}"#);
+    multi_frame.extend_from_slice(&grpc_frame(b"\x08\x02"));
+
+    let mut data_then_trailer = grpc_frame(b"\x08\x01");
+    data_then_trailer.extend_from_slice(&grpc_trailer_frame(b"grpc-status: 0\r\n"));
+
+    let bodies = [
+        grpc_frame(b"\x08\x01"),
+        compressed_frame,
+        multi_frame,
+        data_then_trailer,
+    ];
+
+    for (flavor, retained) in untyped_grpc_route_shapes() {
+        for expected in &bodies {
+            let (replaced, status, reason, body) =
+                run_untyped_grpc_route_transform(flavor, retained, HashMap::new(), expected.clone())
+                    .await;
+
+            let case = format!("{flavor:?}/{retained:?}/{} bytes", expected.len());
+            assert!(!replaced, "{case}: valid framing must not be claimed");
+            assert_eq!(status, 200, "{case}: a valid RPC reply stays a 200");
+            assert_eq!(reason, None, "{case}: frames must never reject");
+            assert_eq!(&body, expected, "{case}: the frames pass through intact");
+        }
+    }
+}
+
+/// A text-mode gRPC-Web client receives base64, so the frame parse has to see
+/// through the encoding or a valid RPC reply would be claimed and 502'd.
+#[tokio::test]
+async fn untyped_base64_grpc_web_text_framing_is_still_passed_through() {
+    use base64::Engine;
+
+    let mut framed = grpc_frame(b"\x08\x01");
+    framed.extend_from_slice(&grpc_trailer_frame(b"grpc-status: 0\r\n"));
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(&framed)
+        .into_bytes();
+
+    let (replaced, status, reason, body) = run_untyped_grpc_route_transform(
+        HttpFlavor::Plain,
+        Some("application/grpc-web-text+proto"),
+        HashMap::new(),
+        encoded.clone(),
+    )
+    .await;
+
+    assert!(!replaced, "base64 framing must not be claimed");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_eq!(body, encoded, "the text-mode body passes through intact");
+}
+
+/// Truncated framing is not framing. It stays claimed and fails closed rather
+/// than being waved through as though the policy had applied.
+#[tokio::test]
+async fn untyped_truncated_grpc_framing_on_a_grpc_route_fails_closed() {
+    let mut truncated = grpc_frame(br#"{"secret":"hunter2"}"#);
+    truncated.truncate(truncated.len() - 4);
+
+    let (replaced, status, reason, _) =
+        run_untyped_grpc_route_transform(HttpFlavor::Grpc, None, HashMap::new(), truncated).await;
+
+    assert!(replaced, "truncated framing is not a provable representation");
+    assert_eq!(status, 502);
+    assert_eq!(reason.as_deref(), Some("unparseable_document"));
+}
+
+/// The claim is re-asked over the DECODED bytes, which is what keeps a decode
+/// from turning valid framing into a `502`: the wire bytes are not frames, so a
+/// decode is owed, and the plaintext then withdraws the claim. The original
+/// encoded representation is forwarded untouched.
+#[tokio::test]
+async fn untyped_encoded_grpc_framing_is_forwarded_not_rejected_after_the_decode() {
+    let framed = grpc_frame(b"\x08\x01");
+    let encoded = gzip(&framed);
+    let headers = HashMap::from([("content-encoding".to_string(), "gzip".to_string())]);
+
+    let (replaced, status, reason, body) =
+        run_untyped_grpc_route_transform(HttpFlavor::Grpc, None, headers, encoded.clone()).await;
+
+    assert!(!replaced, "a valid RPC reply must not become a 502");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_eq!(
+        body, encoded,
+        "the claim was withdrawn, so nothing was installed"
+    );
+}
+
+/// An ordinary (non-gRPC) request is untouched by all of this: the untyped
+/// branch is reached only for gRPC/gRPC-Web flavors, and a frame-shaped body on
+/// a plain HTTP route still fails closed rather than being excused as framing.
+#[tokio::test]
+async fn frame_shaped_bytes_on_a_plain_http_route_are_not_excused_as_framing() {
+    let (replaced, status, reason, _) = run_untyped_grpc_route_transform(
+        HttpFlavor::Plain,
+        None,
+        HashMap::new(),
+        grpc_frame(b"\x08\x01"),
+    )
+    .await;
+
+    assert!(replaced, "a plain HTTP route has no framing to preserve");
+    assert_eq!(status, 502);
+    assert_eq!(reason.as_deref(), Some("unparseable_document"));
+}
+
+// ---------------------------------------------------------------------------
+// Replacement provenance must be retained whenever a policy MAY claim.
+//
+// `run_after_proxy_hooks` decides which provenance mode to keep before any
+// response hook runs, from `may_enforce_response_body_policy` — a CAPABILITY
+// question asked when neither the final `Content-Type` nor the body is known.
+// Inheriting the trait default probed the claim with `(None, &[])`, which on a
+// gRPC/gRPC-Web request answers the untyped, empty-body question and returns
+// `false`. The claim then DOES claim the real bare JSON response, the gate
+// replaces it, and the rejection path has no provenance to restore from: it
+// sheds the decorators completed gateway hooks had already applied, while the
+// same response on an HTTP route keeps them.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn grpc_route_json_replacement_keeps_completed_gateway_decorators() {
+    for (flavor, retained) in untyped_grpc_route_shapes() {
+        let mut plugins = redacting_plugins();
+        plugins.push(Arc::new(RejectDecorator));
+
+        let mut ctx = make_ctx();
+        set_request_http_flavor_for_test(&mut ctx, flavor);
+        if let Some(content_type) = retained {
+            retain_grpc_web_client_content_type_for_test(&mut ctx, content_type);
+        }
+
+        // No pre-`after_proxy` snapshot: the shape every publication path that
+        // does not stamp produces, and the one where the capability probe sees
+        // nothing but the request's gRPC flavor.
+        let mut status = 200;
+        let mut headers = json_headers();
+        headers.insert("etag".to_string(), "\"backend-v1\"".to_string());
+        headers.insert("set-cookie".to_string(), "backend=secret".to_string());
+        let mut body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+
+        assert!(
+            !run_after_proxy_hooks_for_test(&plugins, &mut ctx, status, &mut headers).await,
+            "decorators must not reject the response"
+        );
+
+        let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+            false,
+        )
+        .await;
+
+        let case = format!("{flavor:?}/{retained:?}");
+        assert!(replaced, "{case}: an unprovable representation is replaced");
+        assert_eq!(
+            representation_rejection_reason_for_test(&ctx),
+            Some("unproven_origin_state"),
+            "{case}"
+        );
+        assert_eq!(
+            headers
+                .get("access-control-allow-origin")
+                .map(String::as_str),
+            Some("https://app.example"),
+            "{case}: a completed gateway decorator was lost on the rejection"
+        );
+        for leaked in ["etag", "set-cookie"] {
+            assert!(
+                !headers.contains_key(leaked),
+                "{case}: backend `{leaked}` survived onto the gateway error"
+            );
+        }
+        assert_secret_not_forwarded(&body);
+    }
 }

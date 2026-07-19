@@ -95,13 +95,26 @@
 //!   transform, which keeps a mixed HTTP/gRPC proxy's valid gRPC responses out
 //!   of this gate entirely instead of failing them as unparseable. That decline
 //!   is made on pre-`after_proxy` evidence, not only on the live response
-//!   `Content-Type`: the pristine stamped media type answers first, and the
-//!   request's immutable gRPC flavor plus the retained gRPC-Web representation
-//!   answer when the backend stamped no type at all. So a header rule that
-//!   strips or relabels that header cannot push a framed response onto the
-//!   untyped-JSON branch and have its frames rejected as an unparseable
+//!   `Content-Type`: the pristine stamped media type answers first. So a header
+//!   rule that strips or relabels that header cannot push a framed response onto
+//!   the untyped-JSON branch and have its frames rejected as an unparseable
 //!   document. Redacting inside gRPC frames would need a frame-aware body
 //!   policy.
+//!
+//!   When NOTHING named a type — no snapshot and no live header — the request's
+//!   gRPC flavor is a necessary but not sufficient condition, and the response
+//!   BYTES decide. The flavor alone was a fail-open: a mixed gRPC route whose
+//!   backend answers a bare JSON error/envelope document with no `Content-Type`
+//!   would have been declined, skipping a configured redaction over exactly the
+//!   untyped-JSON class this gate otherwise covers. The discriminator is a total
+//!   parse — the bytes must be exactly a sequence of complete length-prefixed
+//!   frames (or the base64 form a text-mode gRPC-Web client receives) — never a
+//!   prefix sniff, and it cannot collide with JSON in either direction.
+//!
+//!   Because a decode changes which bytes that parse must run over, the claim is
+//!   asked twice: once over the wire bytes to decide whether a decode is owed,
+//!   and again over the decoded identity bytes, which is the binding answer and
+//!   the exact representation the enforcer receives.
 //! * **Backend-chosen media type.** A backend that *mislabels* a JSON payload
 //!   `text/plain` or `application/octet-stream` is not claimed by a JSON body
 //!   policy, here or in the transform itself. Content-type sniffing or an
@@ -245,14 +258,22 @@ pub(crate) enum ResponseBodyPolicyPosture {
 }
 
 /// Whether any active plugin's configured body policy claims this response.
+///
+/// `body` is the byte string a claim predicate may need to decide structurally
+/// (see [`Plugin::enforces_response_body_policy`]). It is asked TWICE for one
+/// response: once over the wire bytes, to decide whether a decode is owed, and
+/// again over the decoded identity bytes, which are what the enforcer is handed.
+/// Only the second answer is binding — see
+/// [`evaluate_response_body_policy_posture`].
 fn body_policy_claimed(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
     content_type: Option<&str>,
+    body: &[u8],
 ) -> bool {
     plugins
         .iter()
-        .any(|plugin| plugin.enforces_response_body_policy(ctx, content_type))
+        .any(|plugin| plugin.enforces_response_body_policy(ctx, content_type, body))
 }
 
 /// Whether a `Content-Encoding` field value names any coding that actually
@@ -565,7 +586,7 @@ pub(crate) fn evaluate_response_body_policy_posture(
     response_body: &[u8],
 ) -> ResponseBodyPolicyPosture {
     let content_type = response_headers.get("content-type").map(String::as_str);
-    if !body_policy_claimed(plugins, ctx, content_type) {
+    if !body_policy_claimed(plugins, ctx, content_type, response_body) {
         return ResponseBodyPolicyPosture::Unprotected;
     }
     // An absent body carries nothing the policy could redact, and rejecting
@@ -610,6 +631,23 @@ pub(crate) fn evaluate_response_body_policy_posture(
     };
 
     let inspected = decoded.as_deref().unwrap_or(response_body);
+    // Re-ask the claim over the bytes the enforcer will actually be handed. The
+    // first ask ran over the WIRE bytes, which is the only way to know whether a
+    // decode was owed at all; but a predicate that decides structurally (framed
+    // gRPC vs. a bare JSON document on an untyped response) can only be right
+    // about the decoded representation. Without this second ask, an untyped
+    // `gzip` body whose plaintext is valid gRPC frames would be claimed on its
+    // compressed bytes, decode to frames, fail the JSON parse, and turn a valid
+    // RPC reply into a `502`.
+    //
+    // Declining here forwards the ORIGINAL bytes untouched: `decoded` is dropped
+    // with this posture, so nothing is installed and the client still receives
+    // the encoded representation the origin produced. No redaction is lost,
+    // because a claim predicate only withdraws over bytes it has proven its
+    // field rules cannot act on.
+    if decoded.is_some() && !body_policy_claimed(plugins, ctx, content_type, inspected) {
+        return ResponseBodyPolicyPosture::Unprotected;
+    }
     if !document_is_parseable(content_type, inspected) {
         return ResponseBodyPolicyPosture::Reject(RepresentationRejection::UnparseableDocument);
     }
@@ -634,6 +672,38 @@ pub(crate) fn evaluate_response_body_policy_posture(
 /// change never reaches that call, and would otherwise be served as identity
 /// bytes carrying a validator for the encoded ones, corrupting cache
 /// revalidation and integrity checks.
+///
+/// # Refreshing the stamped representation state
+///
+/// The pre-`after_proxy` snapshot describes the ENCODED response, and a decode
+/// makes two of its fields false. Both are refreshed here, together, because a
+/// later body transform reads them as one description:
+///
+/// * [`crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY`] is cleared — these
+///   bytes are identity-coded now.
+/// * [`crate::proxy::ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY`] is set to
+///   the decoded length. Clearing the encoding marker alone was not enough:
+///   `mcp_gateway`'s buffered transform reads
+///   [`crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY`] and then consults
+///   ONLY the stamped length, never the live header. A chunked encoded backend
+///   response stamps no length at all, so the snapshot said "no length", and the
+///   transform's `is_none_or` precheck rejected a body that is now decoded,
+///   bounded, and fully inspectable — silently skipping MCP reverse mapping and
+///   forwarding upstream-native MCP names and URIs the transform exists to
+///   rewrite.
+///
+/// The refresh is not a fabrication and it does not corrupt pristine origin
+/// evidence. The stamped length exists to answer "how many bytes will a body
+/// transform be handed?", which every other stamped field (media type, fragment
+/// state, range state) already answers about the CURRENT representation once the
+/// gate has spoken. The decoded length is bounded by
+/// [`decoded_inspection_limit`], so it is a truthful bounded value rather than an
+/// attacker-chosen one. The keys describing what the gate still needs to judge
+/// provenance — the stamped marker, media type, and fragment/range state — are
+/// deliberately untouched; only the two fields the decode actually invalidated
+/// are rewritten, and only when a backend snapshot exists to rewrite. Gateway-
+/// generated bytes have no snapshot and must keep none: their readers correctly
+/// fall back to the live headers this function just set.
 pub(crate) fn install_decoded_response_body(
     ctx: &mut RequestContext,
     response_headers: &mut HashMap<String, String>,
@@ -644,7 +714,16 @@ pub(crate) fn install_decoded_response_body(
     response_headers.retain(|name, _| !name.eq_ignore_ascii_case("content-encoding"));
     super::invalidate_content_bound_response_headers(response_headers);
     let length = response_body.len().to_string();
-    response_headers.insert("content-length".to_string(), length);
+    response_headers.insert("content-length".to_string(), length.clone());
     ctx.metadata
         .remove(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
+    if ctx
+        .metadata
+        .contains_key(crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY)
+    {
+        ctx.metadata.insert(
+            crate::proxy::ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY.to_string(),
+            length,
+        );
+    }
 }
