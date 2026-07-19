@@ -686,8 +686,15 @@ const MAX_REFERENCE_FORMS: usize = 5;
 /// * `tls::source::CertSourceUri::parse` splits `<scheme>://<identifier>?<query>`
 ///   and keeps only the identifier, and
 ///   `secrets::registry::SecretBackend::source` renders the completed fetch as
-///   `<provider>:<identifier>` — one colon, no `//`. That is what lands in
-///   `MaterializedMaterial`'s `source_id` and what a PEM-parse failure prints.
+///   `<provider>:<identifier>` — one colon, no `//`, which is the shape a
+///   single-key `resolve_secret`/`resolve_external_reference` caller reports.
+///   (TLS material no longer carries that string: `load_secret_material` now
+///   stamps `MaterializedMaterial`'s `source_id` with the provider-only
+///   `CertSourceUri::redacted_source_id()`, so a PEM-parse failure prints
+///   `vault://<redacted source reference>`. This derivation stays because it
+///   covers the callers that still echo the rewritten reference, and because a
+///   defense that only holds while one call site keeps its current shape is not
+///   a defense.)
 /// * a `file://` source is reported by its bare filesystem path, the scheme
 ///   stripped entirely (`CertSource::Path` / `load_file_material`).
 /// * a database URL is echoed credential-redacted by
@@ -1136,8 +1143,9 @@ mod derivation_tests {
     #[test]
     fn provider_source_rendering_of_a_uri_is_derived() {
         // `SecretBackend::source` renders the completed fetch with one colon
-        // and no `//`; that string becomes `MaterializedMaterial`'s source id
-        // and is what a PEM parse failure prints.
+        // and no `//`. TLS material now stamps the provider-only redacted id
+        // instead, but single-key callers still report this shape, so the
+        // derivation must keep covering it.
         let forms = derive_reference_forms("vault://secret/data/gw#cert");
         assert!(forms.contains(&"vault:secret/data/gw#cert".to_string()));
         assert!(forms.contains(&"secret/data/gw#cert".to_string()));

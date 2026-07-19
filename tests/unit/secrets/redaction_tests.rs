@@ -97,8 +97,14 @@ const NULL_VALUE: &str = "null";
 
 /// A TLS source URI. A successful fetch is reported back by
 /// `SecretBackend::source` as `<provider>:<identifier>` — one colon, no `//` —
-/// and that rewritten string, not the value as materialized, is the
-/// `source_id` a PEM parse failure prints.
+/// and that rewritten string, not the value as materialized, is what a
+/// single-key `resolve_secret`/`resolve_external_reference` caller echoes.
+///
+/// TLS material itself no longer carries it: `load_secret_material` stamps the
+/// provider-only `redacted_source_id()` into `MaterializedMaterial`. This
+/// fixture stays because the derivation must still cover the callers that do
+/// echo the rewritten reference — a textual defense that only holds while one
+/// call site keeps its current shape is not a defense.
 const SOURCE_URI_KEY: &str = "FERRUM_REDACTION_FIXTURE_SOURCE_URI";
 const SOURCE_URI_VALUE: &str = "vault://secret/data/gw-sentinel#cert-sentinel";
 const SOURCE_URI_REPORTED: &str = "vault:secret/data/gw-sentinel#cert-sentinel";
@@ -732,8 +738,13 @@ fn the_withheld_record_does_not_disclose_a_colliding_short_secret() {
 
 /// A successful fetch is reported by a *rewritten* reference: `vault://x` is
 /// echoed back as `vault:x`. That transformed form is not the value as
-/// materialized, so exact matching alone lets a TLS parse failure print the
-/// operator's Vault path.
+/// materialized, so exact matching alone lets a diagnostic print the operator's
+/// Vault path.
+///
+/// TLS material is now additionally protected at the producer — it stamps the
+/// provider-only `redacted_source_id()` — but this textual coverage is kept for
+/// every other caller that echoes the rewritten reference, and so that the
+/// guarantee does not depend on one call site keeping its current shape.
 #[test]
 fn a_provider_rewritten_source_reference_is_redacted() {
     arm_redaction();
