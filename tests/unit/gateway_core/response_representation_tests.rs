@@ -1775,7 +1775,8 @@ async fn run_with_accept_encoding(
     let plugins = redacting_plugins();
     let mut ctx = make_ctx();
     if let Some(value) = accept_encoding {
-        ctx.headers.insert("accept-encoding".to_string(), value.to_string());
+        ctx.headers
+            .insert("accept-encoding".to_string(), value.to_string());
     }
     let mut status = 200;
     let mut headers = headers;
