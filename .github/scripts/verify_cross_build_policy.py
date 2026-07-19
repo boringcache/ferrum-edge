@@ -8381,16 +8381,35 @@ def executable_heredoc_language(line: str, start: int) -> str | None:
     # pipes remain excluded without destroying an `env -S` operand.
     visible_tail = heredoc_pipeline_tail(line, start)
     raw_tail = line[start : start + len(visible_tail)]
-    tail_tokens = shell_tokens(raw_tail)
-    if tail_tokens is not None:
-        tail_languages = [
-            language
-            for segment in shell_statement_segments(tail_tokens)
-            if (language := tokenized_stdin_interpreter_language(segment))
-            is not None
-        ]
-        if tail_languages:
-            return tail_languages[-1]
+    # Tokenize only slices introduced by pipes that remain visible at the outer
+    # level. Tokenizing the entire raw tail would reintroduce a `| bash` that the
+    # quote/nesting pass deliberately blanked inside a backtick, substitution,
+    # or quoted template and attach the heredoc to an interpreter that never
+    # receives it.
+    outer_pipes = [
+        index
+        for index, character in enumerate(visible_tail)
+        if character == "|"
+        and not visible_tail.startswith("||", index)
+        and (index == 0 or visible_tail[index - 1] != "|")
+    ]
+    tail_languages: list[str] = []
+    for offset, pipe in enumerate(outer_pipes):
+        segment_start = pipe + (2 if raw_tail.startswith("|&", pipe) else 1)
+        segment_end = (
+            outer_pipes[offset + 1]
+            if offset + 1 < len(outer_pipes)
+            else len(raw_tail)
+        )
+        segment_tokens = shell_tokens(raw_tail[segment_start:segment_end])
+        if segment_tokens is None:
+            continue
+        for segment in shell_statement_segments(segment_tokens):
+            language = tokenized_stdin_interpreter_language(segment)
+            if language is not None:
+                tail_languages.append(language)
+    if tail_languages:
+        return tail_languages[-1]
     return None
 
 
