@@ -5,13 +5,11 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
-    '                         --effort medium|high' \
     '                         [--name NAME]' >&2
 }
 
 worktree=''
 prompt_file=''
-effort=''
 name=''
 
 while (($#)); do
@@ -34,15 +32,6 @@ while (($#)); do
       prompt_file=${2-}
       shift 2
       ;;
-    --effort)
-      if (($# < 2)); then
-        printf 'Missing value for --effort\n' >&2
-        usage
-        exit 2
-      fi
-      effort=${2-}
-      shift 2
-      ;;
     --name)
       if (($# < 2)); then
         printf 'Missing value for --name\n' >&2
@@ -63,20 +52,6 @@ while (($#)); do
       ;;
   esac
 done
-
-case "$effort" in
-  medium)
-    fast='true'
-    ;;
-  high)
-    fast='false'
-    ;;
-  *)
-    printf 'Invalid effort: %s\n' "${effort:-<empty>}" >&2
-    usage
-    exit 2
-    ;;
-esac
 
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
   printf 'Worktree must be an existing absolute directory: %s\n' "${worktree:-<empty>}" >&2
@@ -145,14 +120,13 @@ launch_args=(
   "$runner"
   --worktree "$physical_worktree"
   --prompt-file "$prompt_file"
-  --fast "$fast"
 )
 
 if [[ -n "$name" ]]; then
   launch_args+=(--name "$name")
 fi
 
-printf '[grok-agents] dispatch model=grok-4.5 effort=%s fast=%s worktree=%s\n' \
-  "$effort" "$fast" "$physical_worktree" >&2
+printf '[grok-agents] dispatch model=grok-4.5 worktree=%s\n' \
+  "$physical_worktree" >&2
 
 exec "${launch_args[@]}"

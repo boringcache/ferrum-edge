@@ -10,7 +10,7 @@ paths to both briefs; do not use this continuation brief alone.
 Write, commit, and push the changes yourself in this session. Do not invoke any agent-dispatch
 skill or script, including `grok-agents`, `sol-agents`, `opus-agents`, `fable-agents`,
 `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not
-spawn nested workers. The orchestrator selected this model and effort deliberately.
+spawn nested workers. The orchestrator selected this model deliberately.
 
 ## Reconstruct state before editing
 

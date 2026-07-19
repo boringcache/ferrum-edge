@@ -12,7 +12,6 @@
  * Args:
  *   --worktree ABS_PATH
  *   --prompt-file ABS_PATH
- *   --fast true|false
  *   --name optional agent name
  */
 
@@ -27,7 +26,7 @@ function usage(exitCode = 2) {
   process.stderr.write(
     [
       "Usage: run-cursor-agent.mjs --worktree ABS_PATH --prompt-file ABS_PATH",
-      "                            --fast true|false [--name NAME]",
+      "                            [--name NAME]",
       "",
     ].join("\n"),
   );
@@ -38,7 +37,6 @@ function parseArgs(argv) {
   const out = {
     worktree: "",
     promptFile: "",
-    fast: null,
     name: "",
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -51,10 +49,6 @@ function parseArgs(argv) {
         break;
       case "--prompt-file":
         out.promptFile = next ?? "";
-        i += 1;
-        break;
-      case "--fast":
-        out.fast = next ?? "";
         i += 1;
         break;
       case "--name":
@@ -131,11 +125,7 @@ function emitAssistantText(text) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (!args.worktree || !args.promptFile || args.fast === null) {
-    usage(2);
-  }
-  if (args.fast !== "true" && args.fast !== "false") {
-    process.stderr.write(`Invalid --fast value: ${args.fast}\n`);
+  if (!args.worktree || !args.promptFile) {
     usage(2);
   }
   if (!path.isAbsolute(args.worktree) || !fs.statSync(args.worktree).isDirectory()) {
@@ -157,18 +147,14 @@ async function main() {
     throw new Error(`Prompt file is empty: ${args.promptFile}`);
   }
 
-  const fastMode = args.fast === "true";
-  const model = {
-    id: "grok-4.5",
-    params: [{ id: "fast", value: fastMode ? "true" : "false" }],
-  };
+  const model = { id: "grok-4.5" };
 
   const { Agent } = loadCursorSdk();
   const agentId = `grok-agents-${randomUUID()}`;
-  const name = args.name?.trim() || `grok-4.5 ${fastMode ? "fast" : "standard"}`;
+  const name = args.name?.trim() || "grok-4.5";
 
   process.stderr.write(
-    `[grok-agents] launching local Cursor agent model=grok-4.5 fast=${fastMode} cwd=${args.worktree} id=${agentId}\n`,
+    `[grok-agents] launching local Cursor agent model=grok-4.5 cwd=${args.worktree} id=${agentId}\n`,
   );
 
   const agent = await Agent.create({

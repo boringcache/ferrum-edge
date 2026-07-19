@@ -1,20 +1,20 @@
 ---
 name: grok-agents
-description: Dispatch and orchestrate local Cursor Grok 4.5 agents via the Conductor Cursor SDK harness for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to Grok or Cursor Grok workers, run multiple Grok 4.5 agents, select medium/high effort (fast vs standard), resume interrupted Grok runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local Cursor Grok 4.5 agents via the Conductor Cursor SDK harness for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to Grok or Cursor Grok workers, run multiple Grok 4.5 agents, resume interrupted Grok runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
 # Grok agents
 
 Act as the orchestrator. Treat local Cursor Grok 4.5 processes as implementation workers. Own
-task decomposition, worktree isolation, effort selection, liveness, independent diff review, and
-the final merge recommendation. Never accept a worker's report without checking the repository and
-GitHub state yourself.
+task decomposition, worktree isolation, liveness, independent diff review, and the final merge
+recommendation. Never accept a worker's report without checking the repository and GitHub state
+yourself.
 
 **Guard: do not use this skill when you are yourself a dispatched worker.** If the session prompt
 references this skill's `agent-brief.md` or `continuation-brief.md`, says "YOU are the implementer,"
 or assigns an existing worktree and findings to fix, implement directly in the current session.
 Do not recursively dispatch another Grok, Sol, Opus, or Fable worker. The orchestrator selected
-this session's model and effort deliberately.
+this session's model deliberately.
 
 ## Preflight
 
@@ -41,21 +41,6 @@ worker in the orchestrator's checkout or another worker's worktree.
 Include the absolute worktree path, branch, base branch, and current head SHA in every prompt.
 Worktree isolation prevents git collisions; it is not a host sandbox.
 
-## Select effort deliberately
-
-Cursor Grok 4.5 exposes a `fast` model parameter. This skill maps effort to that harness knob:
-
-- `medium`: default for scoped fixes, review findings, tests, documentation, CI repairs with a
-  known failure mode, and other routine work where latency and cost matter. Launches with
-  `fast=true`.
-- `high`: use for unfamiliar multi-module work, concurrency or lifecycle bugs, protocol
-  correctness, security boundaries, greenfield features, and difficult root-cause analysis.
-  Launches with `fast=false`.
-
-Honor an explicit user choice. Use only `medium` or `high`; do not invent other effort names and
-do not silently remap unsupported tiers. Record the selected level beside each worker and keep it
-stable across continuation rounds unless verified evidence justifies changing it.
-
 ## Dispatch with the exact model contract
 
 Read the appropriate bundled references before constructing the task prompt:
@@ -71,14 +56,12 @@ one long-lived execution session:
 ```bash
 <ABS_SKILL_DIR>/scripts/dispatch-agent.sh \
   --worktree <ABS_WORKTREE> \
-  --prompt-file <ABS_PROMPT_FILE> \
-  --effort <medium|high>
+  --prompt-file <ABS_PROMPT_FILE>
 ```
 
-The launcher pins `grok-4.5`, maps effort to Conductor's Cursor `fast` parameter, verifies the
-worktree root, loads `CURSOR_API_KEY` from the environment or Conductor keychain, and executes
-through Conductor's bundled Node runtime and `@cursor/sdk`. Delete the temporary prompt after the
-worker exits.
+The launcher pins `grok-4.5`, verifies the worktree root, loads `CURSOR_API_KEY` from the
+environment or Conductor keychain, and executes through Conductor's bundled Node runtime and
+`@cursor/sdk`. Delete the temporary prompt after the worker exits.
 
 Start each worker in its own long-lived execution session and retain its exact session handle or
 PID. Prefer one tool call per worker so completions and failures remain attributable. Never wrap
@@ -96,7 +79,7 @@ invoke agent-dispatch skills or scripts (including grok-agents, sol-agents, opus
 fable-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 
-This prevents a worker from replacing the selected model or effort through nested delegation.
+This prevents a worker from replacing the selected model through nested delegation.
 
 ## Construct prompts by mode
 
@@ -140,8 +123,7 @@ handle the next round.
 5. Diagnose every red CI check from logs. Rerun only demonstrated infrastructure failures or
    repository-known flakes; fix deterministic failures.
 6. If a worker dies, inspect its worktree, local commits, upstream, and remote branch before
-   relaunching. Preserve useful work and launch a continuation round at the same effort unless the
-   evidence justifies escalation from `medium` to `high`.
+   relaunching. Preserve useful work and launch a continuation round.
 7. Merge only when the user authorized it, the review applies to the current head, CI is green,
    findings are fixed or accepted as rebutted, and your own review is complete.
 
@@ -162,5 +144,5 @@ Never put credentials, tokens, cookies, or secrets in prompts or worker logs. Do
   orchestration yourself.
 - No review response: verify the trigger, bot identity, availability, and head SHA before posting
   another trigger.
-- Model or effort mismatch: stop the worker, record the exact diagnostic, correct the launch
-  contract, and relaunch. Never claim `medium`, `high`, or `grok-4.5` without launch evidence.
+- Model mismatch: stop the worker, record the exact diagnostic, correct the launch contract, and
+  relaunch. Never claim `grok-4.5` without launch evidence.

@@ -1,6 +1,6 @@
 ---
 name: grok-agents
-description: Dispatch and orchestrate local Cursor Grok 4.5 subagents (medium/high effort via Conductor's Cursor SDK harness) for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Use when the user asks Claude to spawn Grok/Cursor Grok agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate local Cursor Grok 4.5 subagents via Conductor's Cursor SDK harness for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Use when the user asks Claude to spawn Grok/Cursor Grok agents on issues, PRs, review findings, or red CI.
 ---
 
 # grok-agents: Cursor Grok 4.5 subagent orchestration
@@ -22,24 +22,14 @@ prompt file outside the repo, then launch:
 ```bash
 <ABS_REPO>/.agents/skills/grok-agents/scripts/dispatch-agent.sh \
   --worktree <ABS_PATH_TO_WORKER_WORKTREE> \
-  --prompt-file <ABS_PROMPT_FILE> \
-  --effort <medium|high>
+  --prompt-file <ABS_PROMPT_FILE>
 ```
 
 Non-negotiables:
 - The launcher pins **`grok-4.5`** through Conductor's bundled Node + `@cursor/sdk`.
-- Effort mapping: `medium` → `fast=true`; `high` → `fast=false`.
 - `CURSOR_API_KEY` must be available (env or Conductor provider keychain). Do not print it.
 - Run each dispatch as a **background / long-lived task**; prefer one task per agent.
 - **Parallel cap: 7** unless the user sets a lower limit.
-
-## Effort selection
-
-- **medium** — default for scoped fixes, review findings, tests, docs, and known CI repairs
-  (`fast=true`).
-- **high** — unfamiliar multi-module work, concurrency/lifecycle bugs, protocol correctness,
-  security boundaries, greenfield features, difficult RCA (`fast=false`).
-- The user may override per prompt ("on high", "on medium") — honor it. Do not invent other tiers.
 
 ## Prompt construction (all modes)
 
@@ -94,4 +84,4 @@ checks -> fmt -> push -> ONE review trigger -> EXIT with report."
 - Capacity or transport kills mid-loop — work may already be pushed; check PR state first.
 - Agents may exit claiming "waiting on monitor" — treat every completion as end-of-turn.
 - Nested dispatch: if a completed run's report mentions "dispatching a worker", treat the actual
-  implementing model/effort as unknown and weight your independent diff review accordingly.
+  implementing model as unknown and weight your independent diff review accordingly.
