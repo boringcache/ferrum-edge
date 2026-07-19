@@ -3744,7 +3744,20 @@ impl PluginCache {
                     &mut tcp_connection_throttle_instances,
                 ) {
                     Ok(Some(plugin)) => {
-                        forced_country_mmdb_instances.insert(id.clone(), plugin);
+                        let current_has_snapshot = current
+                            .country_mmdb_instances
+                            .get(id)
+                            .is_some_and(|current| current.country_mmdb_snapshot().is_some());
+                        if plugin.country_mmdb_snapshot().is_some() || !current_has_snapshot {
+                            forced_country_mmdb_instances.insert(id.clone(), plugin);
+                        } else {
+                            warn!(
+                                plugin_id = %id.plugin_config_id,
+                                namespace = %id.namespace,
+                                plugin = "geo_restriction",
+                                "MaxMind database refresh unavailable; preserving existing loaded geo_restriction snapshot"
+                            );
+                        }
                     }
                     Ok(None) => {}
                     Err(error) => {

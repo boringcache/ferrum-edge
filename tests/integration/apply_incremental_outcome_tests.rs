@@ -14,7 +14,7 @@
 //! to the polling loop in `src/modes/database.rs` to verify the cursor only
 //! advances on `Applied`/`Unchanged`, never on `Rejected`.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use base64::Engine;
 use chrono::{Duration, Utc};
@@ -876,6 +876,41 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
     );
     assert!(matches!(
         geo.on_request_received(&mut after).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    let rejecting_geo_after_delta = Arc::clone(geo);
+
+    std::fs::remove_file(&mmdb_path).unwrap();
+    let mut missing_candidate = candidate.clone();
+    missing_candidate.consumers.push(test_consumer(
+        "second-unrelated-consumer",
+        "second-unrelated-user",
+    ));
+    assert_eq!(
+        state.update_config(missing_candidate),
+        ConfigApplyOutcome::Applied,
+        "an unrelated DP full snapshot must not replace a loaded MMDB with a missing fail-open plugin"
+    );
+
+    let plugins = state
+        .plugin_cache
+        .request_view("geo-proxy", ProxyProtocol::Http)
+        .plugins();
+    let geo = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "geo_restriction")
+        .unwrap();
+    assert!(Arc::ptr_eq(&rejecting_geo_after_delta, geo));
+    let mut after_missing_refresh = RequestContext::new(
+        "89.160.20.112".to_string(),
+        "GET".to_string(),
+        "/geo".to_string(),
+    );
+    assert!(matches!(
+        geo.on_request_received(&mut after_missing_refresh).await,
         PluginResult::Reject {
             status_code: 403,
             ..
