@@ -536,7 +536,10 @@ impl MeshRuntimeConfig {
                 return Err(format!(
                     "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: entry {} looks like a URI \
                      but is not a 'spiffe://' SPIFFE id",
-                    crate::secrets::quoted_env_value("FERRUM_MESH_TRUSTED_HBONE_ASSERTORS", trimmed)
+                    crate::secrets::quoted_env_value(
+                        "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS",
+                        trimmed
+                    )
                 ));
             }
         }
