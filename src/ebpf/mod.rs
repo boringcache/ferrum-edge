@@ -110,7 +110,8 @@ impl NodeAgentProxyMode {
             "local_pod" => Ok(Self::LocalPod),
             "node_waypoint" => Ok(Self::NodeWaypoint),
             other => Err(format!(
-                "Invalid FERRUM_NODE_AGENT_PROXY_MODE '{other}'. Expected: local_pod or node_waypoint"
+                "Invalid FERRUM_NODE_AGENT_PROXY_MODE {}. Expected: local_pod or node_waypoint",
+                crate::secrets::quoted_env_value("FERRUM_NODE_AGENT_PROXY_MODE", other)
             )),
         }
     }
@@ -520,7 +521,8 @@ impl FallbackMode {
             "iptables" => Ok(Self::Iptables),
             "fail" => Ok(Self::Fail),
             other => Err(format!(
-                "Invalid FERRUM_NODE_AGENT_FALLBACK_MODE '{other}'. Expected: iptables, fail"
+                "Invalid FERRUM_NODE_AGENT_FALLBACK_MODE {}. Expected: iptables, fail",
+                crate::secrets::quoted_env_value("FERRUM_NODE_AGENT_FALLBACK_MODE", other)
             )),
         }
     }

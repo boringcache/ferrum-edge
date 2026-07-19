@@ -133,6 +133,49 @@ pub fn report_env_field(env_key: &str, rendered: &str) -> String {
     redact_external_secret_values(rendered)
 }
 
+/// Render the `'…'`-quoted echo of a value a hand-written validator produced by
+/// **transforming** `env_key`'s value, withholding it when that variable was
+/// externally resolved.
+///
+/// This is the boundary [`RedactionPlan::MIN_DERIVED_CANDIDATE_LEN`] names as
+/// the one it cannot cover. Ferrum's validators do not echo what was
+/// materialized; they echo a normalization of it — `trim()`, an ASCII case
+/// fold, a comma-segment split, or some composition of the three. Those forms
+/// *are* derived by [`derive_candidates`], but only above a 3-byte minimum,
+/// because arming a one- or two-byte string process-wide would shred every
+/// unrelated diagnostic containing it. So a short value slips the textual pass
+/// in precisely the case the pass exists for: `FERRUM_MIGRATE_ACTION_FILE=X`
+/// errors as `'x'`, and `FERRUM_TLS_EARLY_DATA_METHODS_FILE=p` warns as `'P'` —
+/// neither of which equals the materialized value, and neither of which the
+/// filter may admit at that length.
+///
+/// Withholding by key is exact where widening the filter is not: the variable
+/// is known *by name* to have been externally resolved, so no rendering of its
+/// value — present or future, however normalized — can escape, and nothing is
+/// armed globally. The quoting lives here rather than at the call sites so the
+/// withheld form is never `'<redacted: …>'`, which reads as though the operator
+/// had literally configured the placeholder.
+///
+/// When `env_key` was **not** externally resolved this is byte-for-byte the
+/// `'{value}'` the site printed before, so ordinary configuration typos keep
+/// showing the value that makes them diagnosable. The final-error backstop
+/// ([`redact_external_secret_values`]) and the log-record boundary
+/// ([`redact_log_record`]) still run downstream and still cover a message that
+/// interpolates some *other* variable's value verbatim.
+///
+/// A new hand-written validator that re-renders a `FERRUM_*` value must call
+/// this rather than widen candidate derivation.
+pub fn quoted_env_value(env_key: &str, rendered: &str) -> String {
+    if is_external_secret_key(env_key) {
+        return EXTERNAL_SECRET_PLACEHOLDER.to_string();
+    }
+    // Same second pass as `report_env_field`: `env_key` itself was not
+    // externally resolved, but the text may still interpolate some *other*
+    // resolved variable's value verbatim. A no-op when nothing is armed, which
+    // is every process that resolved no external secrets.
+    format!("'{}'", redact_external_secret_values(rendered))
+}
+
 /// Remove externally resolved secret values from an operator-facing message.
 ///
 /// This is the backstop behind the structured boundary in

@@ -9,7 +9,7 @@
 
 use crate::unit::env_lock::ENV_LOCK;
 use ferrum_edge::secrets::{
-    EXTERNAL_SECRET_PLACEHOLDER, WITHHELD_LOG_RECORD, is_external_secret_key,
+    EXTERNAL_SECRET_PLACEHOLDER, WITHHELD_LOG_RECORD, is_external_secret_key, quoted_env_value,
     record_external_secret_keys, redact_external_secret_values, withheld_log_record,
 };
 use std::sync::Once;
@@ -327,6 +327,76 @@ fn does_not_admit_a_shortening_rewrite_below_the_minimum() {
         exact.contains(EXTERNAL_SECRET_PLACEHOLDER),
         "the padded value as materialized must still redact: {exact}"
     );
+}
+
+/// The other side of the two tests above: what the textual pass may not admit,
+/// `quoted_env_value` withholds by key.
+///
+/// Both renderings here are exactly the leaks the P2 named — a case fold
+/// (`FERRUM_MIGRATE_ACTION_FILE=X` erroring as `'x'`) and a `trim()`
+/// (`FERRUM_TLS_EARLY_DATA_METHODS_FILE=p` warning as `'P'`). Neither equals
+/// the materialized value, so `redact_external_secret_values` alone leaves both
+/// intact — which is asserted here rather than assumed, so this test fails if
+/// the boundary ever silently moves back to the textual pass.
+#[test]
+fn withholds_short_transformed_values_by_key() {
+    arm_redaction();
+    for (key, transformed) in [
+        (SHORT_CASE_KEY, "db"),
+        (SHORT_CASE_KEY, "DB"),
+        (PADDED_SHORT_KEY, "w"),
+    ] {
+        // Non-vacuity: the textual pass genuinely cannot cover this form.
+        assert_eq!(
+            redact_external_secret_values(transformed),
+            transformed,
+            "precondition: {transformed} must not be a global candidate"
+        );
+        let shown = quoted_env_value(key, transformed);
+        assert_eq!(
+            shown, EXTERNAL_SECRET_PLACEHOLDER,
+            "an externally resolved key must withhold every rendering"
+        );
+        assert!(
+            !shown.contains(transformed),
+            "the transformed value must not survive: {shown}"
+        );
+    }
+}
+
+/// The withheld form is never quoted, so it cannot read as a literal value the
+/// operator configured.
+#[test]
+fn withheld_transformed_value_is_not_quoted() {
+    arm_redaction();
+    let shown = quoted_env_value(SHORT_CASE_KEY, "db");
+    assert!(
+        !shown.starts_with('\'') && !shown.ends_with('\''),
+        "withheld value must not be wrapped in quotes: {shown}"
+    );
+}
+
+/// Control: a variable that was *not* externally resolved keeps its diagnostic
+/// byte-for-byte, quoting included. Withholding these would make ordinary
+/// configuration typos — the overwhelmingly common case — undiagnosable.
+#[test]
+fn preserves_quoted_value_for_a_non_external_key() {
+    arm_redaction();
+    for (key, transformed) in [
+        ("FERRUM_MIGRATE_ACTION", "x"),
+        ("FERRUM_TLS_EARLY_DATA_METHODS", "P"),
+        ("FERRUM_MESH_CAPTURE_MODE", "ebfp"),
+    ] {
+        assert!(
+            !is_external_secret_key(key),
+            "precondition: {key} must not be externally resolved here"
+        );
+        assert_eq!(
+            quoted_env_value(key, transformed),
+            format!("'{transformed}'"),
+            "a non-external key must keep its value verbatim"
+        );
+    }
 }
 
 /// Exact-value matching alone is insufficient: `Vec<String>` parsing trims each

@@ -217,21 +217,25 @@ fn validate_k8s_namespace(ns: &str) -> Result<(), String> {
 /// that does not parse, or that carries an unsupported scheme, is an `Err` so
 /// the misconfiguration surfaces at startup rather than at first dial.
 fn cp_dp_grpc_url_is_nonloopback_plaintext(url: &str) -> Result<bool, String> {
+    // `url` is a trimmed list segment and `scheme()` is a lowercased fragment of
+    // it, so both are transformed renderings; withhold by key.
+    let shown = crate::secrets::quoted_env_value("FERRUM_DP_CP_GRPC_URLS", url);
     let parsed = url::Url::parse(url)
-        .map_err(|e| format!("FERRUM_DP_CP_GRPC_URLS entry '{url}' is not a valid URL: {e}"))?;
+        .map_err(|e| format!("FERRUM_DP_CP_GRPC_URLS entry {shown} is not a valid URL: {e}"))?;
     let plaintext = match parsed.scheme() {
         "https" | "grpcs" => return Ok(false),
         "http" | "grpc" => true,
         other => {
             return Err(format!(
-                "FERRUM_DP_CP_GRPC_URLS entry '{url}' has unsupported scheme '{other}://' \
-                 (expected http:// or https://)"
+                "FERRUM_DP_CP_GRPC_URLS entry {shown} has unsupported scheme {} \
+                 (expected http:// or https://)",
+                crate::secrets::quoted_env_value("FERRUM_DP_CP_GRPC_URLS", &format!("{other}://"))
             ));
         }
     };
     let host = parsed
         .host()
-        .ok_or_else(|| format!("FERRUM_DP_CP_GRPC_URLS entry '{url}' is missing a host"))?;
+        .ok_or_else(|| format!("FERRUM_DP_CP_GRPC_URLS entry {shown} is missing a host"))?;
     let is_loopback = match host {
         url::Host::Ipv4(ip) => ip.is_loopback(),
         url::Host::Ipv6(ip) => ip.is_loopback(),
@@ -3006,17 +3010,22 @@ impl EnvConfig {
         for method in &tls_early_data_methods {
             if method != "GET" {
                 tracing::warn!(
-                    "FERRUM_TLS_EARLY_DATA_METHODS includes non-GET method '{}' — \
+                    "FERRUM_TLS_EARLY_DATA_METHODS includes non-GET method {} — \
                      0-RTT early data is replayable, which is dangerous for \
                      non-idempotent operations",
-                    method
+                    crate::secrets::quoted_env_value("FERRUM_TLS_EARLY_DATA_METHODS", method)
                 );
             }
         }
         if !tls_early_data_methods.is_empty() {
+            // The `{:?}` rendering is uppercased and re-quoted, so it is a
+            // transformed form like the warning above; withhold by key.
             tracing::info!(
-                "TLS 1.3 0-RTT early data enabled for methods: {:?}",
-                tls_early_data_methods
+                "TLS 1.3 0-RTT early data enabled for methods: {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_TLS_EARLY_DATA_METHODS",
+                    &format!("{:?}", tls_early_data_methods)
+                )
             );
         }
 
@@ -4270,8 +4279,9 @@ impl EnvConfig {
                     "native" | "xds" | "file" => {}
                     other => {
                         return Err(format!(
-                            "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. \
-                             Expected: native, xds, or file"
+                            "Invalid FERRUM_MESH_CONFIG_PROTOCOL {}. \
+                             Expected: native, xds, or file",
+                            crate::secrets::quoted_env_value("FERRUM_MESH_CONFIG_PROTOCOL", other)
                         ));
                     }
                 }
@@ -4528,9 +4538,12 @@ impl EnvConfig {
                         }
                     }
                     other => {
+                        // `migrate_action` is declared `lowercase()`, so this
+                        // echoes a case-folded form the textual redactor cannot
+                        // admit at one or two bytes. Withhold by key.
                         return Err(format!(
-                            "Invalid FERRUM_MIGRATE_ACTION '{}'. Expected: up, status, config",
-                            other
+                            "Invalid FERRUM_MIGRATE_ACTION {}. Expected: up, status, config",
+                            crate::secrets::quoted_env_value("FERRUM_MIGRATE_ACTION", other)
                         ));
                     }
                 }
@@ -4580,8 +4593,15 @@ impl EnvConfig {
             if entry == "*" {
                 continue;
             }
-            crate::config::types::validate_namespace(entry)
-                .map_err(|e| format!("Invalid FERRUM_CP_NAMESPACES entry '{}': {}", entry, e))?;
+            // `entry` is the *trimmed* segment, so a padded one- or two-byte
+            // entry renders as a form below the derived-candidate minimum.
+            crate::config::types::validate_namespace(entry).map_err(|e| {
+                format!(
+                    "Invalid FERRUM_CP_NAMESPACES entry {}: {}",
+                    crate::secrets::quoted_env_value("FERRUM_CP_NAMESPACES", entry),
+                    e
+                )
+            })?;
         }
         // `*` must stand alone. A mixed set like `"*,prod"` is ambiguous: it
         // implies "everything plus an extra one" or "wildcard subset of one".

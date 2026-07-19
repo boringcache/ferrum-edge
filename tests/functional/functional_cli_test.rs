@@ -2182,6 +2182,159 @@ async fn functional_cli_validate_rejects_non_unicode_direct_conf_path() {
     );
 }
 
+/// The same rule, but with smart discovery actually **armed** — the case the
+/// test above cannot reach.
+///
+/// `functional_cli_validate_rejects_non_unicode_direct_conf_path` runs in a
+/// temp `current_dir()` holding `hermetic-ferrum.conf`, not `ferrum.conf`, so
+/// `resolve_settings_path()` finds no candidate and returns `None` whatever its
+/// presence check does. It therefore passes with or without the bug. Planting a
+/// real `./ferrum.conf` is what makes the discovery branch reachable:
+///
+/// * with a `var(..).is_ok()` presence check the undecodable value reads as
+///   **unset**, discovery finds `./ferrum.conf`, `set_var` overwrites the
+///   operator's value with a valid path, and `resolve_all_env_secrets()` — which
+///   runs *after* the override — sees nothing wrong. Validate then **succeeds**
+///   against a settings file the operator never chose.
+/// * with `var_os(..).is_some()` the variable is seen as set, discovery yields,
+///   and the resolver rejects it.
+///
+/// The planted file is a valid (empty) settings file precisely so the buggy
+/// path would succeed rather than fail for some unrelated reason.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_non_unicode_conf_path_despite_discoverable_conf() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new().unwrap();
+    // The candidate `resolve_settings_path()` would discover, in the child's
+    // `current_dir()`. Empty parses to an empty map, so it is a *valid*
+    // settings file and cannot fail the command by itself.
+    std::fs::write(temp_dir.path().join("ferrum.conf"), "").unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_CONF_PATH",
+            std::ffi::OsStr::from_bytes(b"/etc/ferrum/\xff.conf"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a discoverable ./ferrum.conf must not overwrite an undecodable \
+         FERRUM_CONF_PATH before the resolver can reject it: \
+         stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("is not valid Unicode") && stderr.contains("FERRUM_CONF_PATH"),
+        "the diagnostic must name the failure class and the variable: {stderr}"
+    );
+    assert!(
+        !output.stderr.contains(&0xffu8),
+        "raw undecodable bytes must never reach the operator: {stderr}"
+    );
+}
+
+/// The spec-path half of the same bypass, with `./resources.yaml` planted so
+/// `resolve_spec_path()`'s discovery branch is genuinely reachable.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_non_unicode_spec_path_despite_discoverable_spec() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new().unwrap();
+    // A *valid* spec, so the buggy path would succeed rather than trip over a
+    // malformed document.
+    std::fs::write(
+        temp_dir.path().join("resources.yaml"),
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_FILE_CONFIG_PATH",
+            std::ffi::OsStr::from_bytes(b"/etc/ferrum/\xff.yaml"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a discoverable ./resources.yaml must not overwrite an undecodable \
+         FERRUM_FILE_CONFIG_PATH before the resolver can reject it: \
+         stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("is not valid Unicode") && stderr.contains("FERRUM_FILE_CONFIG_PATH"),
+        "the diagnostic must name the failure class and the variable: {stderr}"
+    );
+    assert!(
+        !output.stderr.contains(&0xffu8),
+        "raw undecodable bytes must never reach the operator: {stderr}"
+    );
+}
+
+/// Documented precedence: when an undecodable direct value *also* has a
+/// competing suffixed source, the specific multiple-sources diagnostic wins.
+///
+/// `env_var_os_is_set` counts the undecodable direct value as a configured
+/// source, so the conflict check (`registry.rs`) fires before the
+/// direct-value Unicode check that follows it. `docs/cli.md` documents this
+/// ordering; this pins it.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_prefers_conflict_over_non_unicode_direct_value() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new().unwrap();
+    let secret_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&secret_path, "a-sufficiently-long-admin-jwt-secret-value").unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            std::ffi::OsStr::from_bytes(b"direct-\xff-secret"),
+        )
+        .env("FERRUM_ADMIN_JWT_SECRET_FILE", &secret_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "two competing sources must fail closed: {stderr}"
+    );
+    assert!(
+        stderr.contains("Multiple secret sources configured for FERRUM_ADMIN_JWT_SECRET"),
+        "the more specific conflict diagnostic must take precedence over the \
+         direct-value Unicode error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Ferrum configuration values must be valid Unicode"),
+        "the conflict check runs first, so the direct-value message must not \
+         also appear: {stderr}"
+    );
+    assert!(
+        !output.stderr.contains(&0xffu8),
+        "raw undecodable bytes must never reach the operator: {stderr}"
+    );
+}
+
 /// A key ending in `_FILE` that is *not* a secret source is still ordinary
 /// Ferrum configuration, so it takes the direct-value path rather than being
 /// mistaken for an unreadable source reference.

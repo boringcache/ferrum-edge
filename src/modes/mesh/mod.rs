@@ -143,7 +143,8 @@ impl MeshTopology {
             "east_west_gateway" | "east-west-gateway" => Ok(Self::EastWestGateway),
             "egress_gateway" | "egress-gateway" => Ok(Self::EgressGateway),
             other => Err(format!(
-                "Invalid FERRUM_MESH_TOPOLOGY '{other}'. Expected: sidecar, ambient, node_waypoint, service_waypoint, east_west_gateway, or egress_gateway"
+                "Invalid FERRUM_MESH_TOPOLOGY {}. Expected: sidecar, ambient, node_waypoint, service_waypoint, east_west_gateway, or egress_gateway",
+                crate::secrets::quoted_env_value("FERRUM_MESH_TOPOLOGY", other)
             )),
         }
     }
@@ -207,7 +208,8 @@ impl MeshConfigProtocol {
             "xds" => Ok(Self::Xds),
             "file" => Ok(Self::File),
             other => Err(format!(
-                "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. Expected: native, xds, or file"
+                "Invalid FERRUM_MESH_CONFIG_PROTOCOL {}. Expected: native, xds, or file",
+                crate::secrets::quoted_env_value("FERRUM_MESH_CONFIG_PROTOCOL", other)
             )),
         }
     }
@@ -523,13 +525,18 @@ impl MeshRuntimeConfig {
                 let _ = rest;
                 crate::identity::SpiffeId::new(trimmed).map_err(|e| {
                     format!(
-                        "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: invalid SPIFFE id '{trimmed}': {e}"
+                        "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: invalid SPIFFE id {}: {e}",
+                        crate::secrets::quoted_env_value(
+                            "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS",
+                            trimmed
+                        )
                     )
                 })?;
             } else if trimmed.contains("://") {
                 return Err(format!(
-                    "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: entry '{trimmed}' looks like a URI \
-                     but is not a 'spiffe://' SPIFFE id"
+                    "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: entry {} looks like a URI \
+                     but is not a 'spiffe://' SPIFFE id",
+                    crate::secrets::quoted_env_value("FERRUM_MESH_TRUSTED_HBONE_ASSERTORS", trimmed)
                 ));
             }
         }
@@ -580,8 +587,9 @@ impl MeshRuntimeConfig {
             "registry_only" => crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly,
             other => {
                 return Err(format!(
-                    "Invalid FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY '{other}'. Expected: \
-                     allow_any or registry_only"
+                    "Invalid FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY {}. Expected: \
+                     allow_any or registry_only",
+                    crate::secrets::quoted_env_value("FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY", other)
                 ));
             }
         };
@@ -13577,19 +13585,26 @@ fn parse_workload_labels(
         if entry.is_empty() {
             continue;
         }
+        // `entry` and `key` are trimmed segments of the variable, so each is a
+        // transformed rendering the textual pass cannot admit when short.
         let (key, value) = entry.split_once('=').ok_or_else(|| {
-            format!("FERRUM_MESH_WORKLOAD_LABELS entry '{entry}' must be in 'key=value' form")
+            format!(
+                "FERRUM_MESH_WORKLOAD_LABELS entry {} must be in 'key=value' form",
+                crate::secrets::quoted_env_value("FERRUM_MESH_WORKLOAD_LABELS", entry)
+            )
         })?;
         let key = key.trim();
         let value = value.trim();
         if key.is_empty() {
             return Err(format!(
-                "FERRUM_MESH_WORKLOAD_LABELS entry '{entry}' has an empty key"
+                "FERRUM_MESH_WORKLOAD_LABELS entry {} has an empty key",
+                crate::secrets::quoted_env_value("FERRUM_MESH_WORKLOAD_LABELS", entry)
             ));
         }
         if labels.insert(key.to_string(), value.to_string()).is_some() {
             return Err(format!(
-                "FERRUM_MESH_WORKLOAD_LABELS contains duplicate key '{key}'"
+                "FERRUM_MESH_WORKLOAD_LABELS contains duplicate key {}",
+                crate::secrets::quoted_env_value("FERRUM_MESH_WORKLOAD_LABELS", key)
             ));
         }
     }

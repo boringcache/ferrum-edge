@@ -141,7 +141,8 @@ impl CaptureMode {
             "iptables" => Ok(Self::Iptables),
             "ebpf" => Ok(Self::Ebpf),
             other => Err(format!(
-                "Invalid FERRUM_MESH_CAPTURE_MODE '{other}'. Expected: explicit, iptables, or ebpf"
+                "Invalid FERRUM_MESH_CAPTURE_MODE {}. Expected: explicit, iptables, or ebpf",
+                crate::secrets::quoted_env_value("FERRUM_MESH_CAPTURE_MODE", other)
             )),
         }
     }
@@ -161,7 +162,8 @@ impl Ip6TablesMode {
             "true" | "required" => Ok(Self::Required),
             "false" | "disabled" => Ok(Self::Disabled),
             other => Err(format!(
-                "Invalid FERRUM_MESH_IP6TABLES_ENABLED '{other}'. Expected: auto, true, or false"
+                "Invalid FERRUM_MESH_IP6TABLES_ENABLED {}. Expected: auto, true, or false",
+                crate::secrets::quoted_env_value("FERRUM_MESH_IP6TABLES_ENABLED", other)
             )),
         }
     }

@@ -118,8 +118,10 @@ pub fn resolve_settings_path(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(resolve_path(p));
     }
-    // Don't override if the env var is already set.
-    if std::env::var("FERRUM_CONF_PATH").is_ok() {
+    // Don't override if the env var is already set. `var_os`, not `var`: see
+    // [`direct_env_var_is_set`] — a non-Unicode value is *set*, and smart
+    // discovery must not overwrite it before the resolver can reject it.
+    if direct_env_var_is_set("FERRUM_CONF_PATH") {
         return None;
     }
     if externally_sourced("FERRUM_CONF_PATH") {
@@ -143,7 +145,7 @@ pub fn resolve_spec_path(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(resolve_path(p));
     }
-    if std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok() {
+    if direct_env_var_is_set("FERRUM_FILE_CONFIG_PATH") {
         return None;
     }
     if externally_sourced("FERRUM_FILE_CONFIG_PATH") {
@@ -185,6 +187,30 @@ pub fn resolve_spec_path(explicit: Option<&Path>) -> Option<PathBuf> {
 /// operator made and should be told about.
 fn externally_sourced(base_key: &str) -> bool {
     crate::secrets::external_source_configured(base_key)
+}
+
+/// True when `key` is present in the environment *at all*, decodable or not.
+///
+/// Deliberately `var_os`, never `var`. `std::env::var` reports a non-Unicode
+/// value as `Err`, i.e. as **unset** — so a `FERRUM_CONF_PATH` holding
+/// undecodable bytes would look absent to a `var(..).is_ok()` presence check,
+/// smart discovery would find `./ferrum.conf` and `set_var` over it, and the
+/// operator's invalid value would be gone before anything could complain about
+/// it. That matters because the overwrite happens *first*: these checks run in
+/// `apply_run_overrides`/`apply_validate_overrides` (`main.rs`, before logging
+/// init), while the fail-closed rejection lives in
+/// `secrets::resolve_all_env_secrets` further down `main()`. Overwriting turns
+/// a command that must fail with `Ferrum configuration values must be valid
+/// Unicode` into one that silently starts on a settings file the operator
+/// never chose — exactly the silent-misconfiguration hazard
+/// `secrets::registry` documents and exists to prevent.
+///
+/// Presence semantics, not validity semantics: this only answers "did the
+/// operator set this variable", and every judgment about the *value* stays with
+/// the resolver, which is the one place that can report it safely (the bytes
+/// are never echoed — the name is reduced to an ASCII skeleton).
+fn direct_env_var_is_set(key: &str) -> bool {
+    std::env::var_os(key).is_some()
 }
 
 /// Resolve a user-provided path: absolute paths are kept as-is, relative paths
@@ -275,7 +301,7 @@ pub fn infer_file_mode() {
 
     // `-m/--mode` was already written to the environment by
     // `apply_run_overrides`, so this one check covers CLI and env alike.
-    if std::env::var("FERRUM_MODE").is_ok() {
+    if direct_env_var_is_set("FERRUM_MODE") {
         return;
     }
     let conf_mode = ConfFile::load()
@@ -284,7 +310,7 @@ pub fn infer_file_mode() {
     if conf_mode.is_some_and(|mode| !mode.trim().is_empty()) {
         return;
     }
-    if std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok() {
+    if direct_env_var_is_set("FERRUM_FILE_CONFIG_PATH") {
         // SAFETY: single-threaded context, before the multi-threaded runtime.
         unsafe { std::env::set_var("FERRUM_MODE", "file") };
     }
