@@ -1219,6 +1219,114 @@ fn test_backup_leaves_unrepresentable_jwt_entries_untouched() {
     assert!(exported.validate_fields().is_err());
 }
 
+/// Restore requires every credential value to be a non-empty array of objects,
+/// so a legacy single-object value must be wrapped during export or the backup
+/// it produces is rejected by the very endpoint it exists for.
+#[test]
+fn test_backup_normalizes_legacy_single_object_credentials_to_arrays() {
+    let secret = "s".repeat(32);
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "jwt".to_string(),
+        json!({"secret": secret.clone(), "algorithm": "HS256"}),
+    );
+    credentials.insert("keyauth".to_string(), json!({"key": "legacy-key"}));
+    let stored = make_consumer(credentials);
+    assert!(
+        stored.validate_fields().is_err(),
+        "the legacy single-object shape is not restorable as stored"
+    );
+
+    let exported =
+        ferrum_edge::config::types::canonicalize_consumer_credentials_for_backup(&stored);
+
+    assert_eq!(exported.credentials["jwt"], json!([{"secret": secret}]));
+    assert_eq!(
+        exported.credentials["keyauth"],
+        json!([{"key": "legacy-key"}]),
+        "types without a single-field rule keep their fields, only the shape changes"
+    );
+    exported
+        .validate_fields()
+        .expect("the canonical export must be restorable");
+    assert!(
+        stored.credentials["jwt"].is_object(),
+        "backup export must not mutate stored credentials"
+    );
+}
+
+/// A `[REDACTED]` placeholder is replaced with the stored entry's canonical
+/// field, not the raw stored entry: restoring a legacy `jwt` row verbatim would
+/// reintroduce an `algorithm` selector and fail validation, breaking an edit to
+/// an unrelated field on the same Consumer.
+#[test]
+fn test_consumer_update_restores_legacy_jwt_entries_canonically() {
+    let secret = "s".repeat(32);
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "jwt".to_string(),
+        json!([{"secret": secret.clone(), "algorithm": "HS256"}]),
+    );
+    let stored = make_consumer(credentials);
+
+    let mut round_tripped = ferrum_edge::config::types::redact_consumer_credentials(&stored);
+    assert_eq!(
+        round_tripped.credentials["jwt"],
+        json!([{"secret": "[REDACTED]"}])
+    );
+
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut round_tripped,
+        &stored,
+    );
+
+    assert_eq!(
+        round_tripped.credentials["jwt"],
+        json!([{"secret": secret}]),
+        "the placeholder resolves to the canonical secret, not the legacy object"
+    );
+    round_tripped
+        .validate_fields()
+        .expect("an unrelated edit to a legacy-JWT consumer must still validate");
+}
+
+/// The placeholder is a round-trip marker, never credential material. A
+/// submitted placeholder with no stored entry at that index — an array the
+/// client grew — is left in place and rejected by validation instead of being
+/// silently stored or silently matched to an unrelated entry.
+#[test]
+fn test_consumer_update_rejects_unmatched_redaction_placeholders() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert("keyauth".to_string(), json!([{"key": "live-key"}]));
+    let stored = make_consumer(credentials);
+
+    let mut submitted = ferrum_edge::config::types::redact_consumer_credentials(&stored);
+    submitted.credentials.insert(
+        "keyauth".to_string(),
+        json!([{"key": "[REDACTED]"}, {"key": "[REDACTED]"}]),
+    );
+
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut submitted,
+        &stored,
+    );
+
+    assert_eq!(
+        submitted.credentials["keyauth"],
+        json!([{"key": "live-key"}, {"key": "[REDACTED]"}]),
+        "only the index backed by a stored entry is restored"
+    );
+    let errors = submitted
+        .validate_fields()
+        .expect_err("an unmatched placeholder must not become a live API key");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("reserved redaction placeholder")),
+        "expected a reserved-placeholder rejection, got {errors:?}"
+    );
+}
+
 /// The preservation rule follows the projection itself, not a static type
 /// list: an `mtls_auth` map the projection filters out entirely is hidden from
 /// the client too, so a round-tripped response must not delete it.

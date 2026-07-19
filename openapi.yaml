@@ -3687,13 +3687,19 @@ paths:
         When `basicauth` is omitted from the request, an existing Basic
         credential type is preserved; use `DELETE
         /consumers/{id}/credentials/basicauth` to remove it.
+
+
+        Update accepts `ConsumerUpdate`, which differs from the create body
+        only in also accepting the exact `[REDACTED]` placeholder entries the
+        ordinary `Consumer` response returns, so a read-modify-write round trip
+        of that response validates against this schema.
       tags: [Consumers]
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/ConsumerCreate"
+              $ref: "#/components/schemas/ConsumerUpdate"
       responses:
         "200":
           description: Consumer updated
@@ -3746,10 +3752,17 @@ paths:
         in: path
         required: true
         schema:
-          type: string
-          enum: [keyauth, basicauth, jwt, hmac_auth, mtls_auth]
+          $ref: "#/components/schemas/CredentialTypeName"
         description: |
-          Credential type to set or remove.
+          Credential type to set or remove. `PUT` and `POST` accept only the
+          built-in types `keyauth`, `basicauth`, `jwt`, `hmac_auth`, and
+          `mtls_auth`; any other value returns `400`. `DELETE` additionally
+          accepts an unknown/custom type that the consumer actually stores,
+          because whole-Consumer `PUT` preserves credential types the ordinary
+          response hides and this route is the only way to remove them. An
+          unknown type the consumer does not store still returns `400`, so no
+          new credential-type namespace is opened. Credential type keys are one
+          path-safe URI segment, so every stored type is addressable here.
       - $ref: "#/components/parameters/XFerrumNamespace"
 
     put:
@@ -3853,11 +3866,14 @@ paths:
           in: path
           required: true
           schema:
-            type: string
+            $ref: "#/components/schemas/CredentialTypeName"
           description: |
             Credential type to remove: one of `keyauth`, `basicauth`, `jwt`,
             `hmac_auth`, `mtls_auth`, or an unknown/custom credential type
-            already stored on the consumer.
+            already stored on the consumer. Because credential type keys are
+            restricted to one path-safe URI segment, every stored type — including
+            hidden custom types that whole-Consumer `PUT` preserves — is
+            addressable here.
       responses:
         "204":
           description: Credential removed
@@ -6568,7 +6584,8 @@ components:
     # The Consumer wire shape is split per surface:
     #   ConsumerBase    — shared scalar fields (no credentials)
     #   Consumer        — ordinary redacted management response
-    #   ConsumerCreate  — create/update/batch request (credential input)
+    #   ConsumerCreate  — create/batch request (strict credential input)
+    #   ConsumerUpdate  — PUT request (input, plus `[REDACTED]` round trip)
     #   ConsumerBackup  — GET /backup item (canonical unredacted stored values)
     #   ConsumerRestore — POST /restore item (stored values or plaintext input)
     ConsumerBase:
@@ -6643,13 +6660,17 @@ components:
 
     ConsumerCreate:
       description: >-
-        Request body for creating or updating a consumer, and for consumer
-        items in `POST /batch`. Credential values are write-only inputs:
-        plaintext `basicauth` `password` fields are hashed on write and stored
-        secrets are never returned by ordinary Consumer responses.
+        Request body for creating a consumer and for consumer items in
+        `POST /batch`. Credential values are write-only inputs: plaintext
+        `basicauth` `password` fields are hashed on write and stored secrets are
+        never returned by ordinary Consumer responses. Every credential value
+        must be a real secret; the reserved `[REDACTED]` placeholder is rejected
+        here, and only `PUT` (see `ConsumerUpdate`) accepts it as a round-trip
+        marker.
 
 
-        Update (`PUT`) is non-destructive for credential state the ordinary
+        Update (`PUT`, `ConsumerUpdate`) is non-destructive for credential state
+        the ordinary
         `Consumer` response cannot express, so a read-modify-write round trip of
         a `Consumer` response is safe: an omitted credential type the ordinary
         response does not emit at all (`basicauth`, any unknown/custom type, or
@@ -6669,17 +6690,45 @@ components:
             credentials:
               $ref: "#/components/schemas/ConsumerCredentialsInput"
 
+    ConsumerUpdate:
+      description: >-
+        Request body for `PUT /consumers/{id}`. Identical to `ConsumerCreate`
+        except that a `keyauth`, `jwt`, or `hmac_auth` entry may also be the
+        exact `[REDACTED]` placeholder projection the ordinary `Consumer`
+        response returns, so a client that GETs a consumer, edits an unrelated
+        field, and PUTs the body back is schema-valid without ever holding the
+        stored secret. The server restores each such placeholder from the stored
+        entry at the same array index before validation; a placeholder with no
+        stored entry at that index is rejected, so the marker can never become
+        live credential material. `[REDACTED]` is a reserved value and is never
+        accepted as a real `keyauth` `key`, `jwt` `secret`, or `hmac_auth`
+        `secret` on any surface, including create, batch, restore, and the
+        dedicated credential endpoints.
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/ConsumerBase"
+        - type: object
+          properties:
+            credentials:
+              $ref: "#/components/schemas/ConsumerCredentialsUpdateInput"
+
     ConsumerBackup:
       description: >-
         Consumer item in a `GET /backup` export. Credentials carry canonical
         unredacted stored values (`basicauth` entries carry the stored
         `password_hash`; plaintext passwords are never exported) suitable for
         disaster-recovery restoration via `POST /restore`. Export canonicalizes
-        stored `jwt` entries to their single `secret` field so entries written
-        before the HS256-only contract — which may still carry ignored
-        selectors such as `algorithm` — stay restorable; rotation entries, every
-        other credential type, and unknown/custom credential maps are exported
-        verbatim.
+        exactly-one-field credential entries — `jwt` and `hmac_auth` to their
+        `secret`, `mtls_auth` to its `identity` — so entries written before that
+        contract, which may still carry ignored extra fields such as a `jwt`
+        `algorithm`, stay restorable, and wraps any credential value still held
+        in the legacy single-object form in a one-element array, because restore
+        requires every credential value to be a non-empty array of objects.
+        Rotation entries keep their order, entries without a string value at the
+        canonical field are exported untouched so unrepresentable data surfaces
+        at restore rather than being silently dropped, and credential types
+        without a single-field rule — `basicauth`, `keyauth`, and unknown/custom
+        credential maps — are exported with their fields verbatim.
       unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ConsumerBase"
@@ -6744,6 +6793,61 @@ components:
             $ref: "#/components/schemas/MtlsAuthCredential"
           minItems: 1
           description: Multiple mTLS identities for zero-downtime rotation. Each `identity` must be globally unique.
+      propertyNames:
+        $ref: "#/components/schemas/CredentialTypeName"
+      additionalProperties:
+        type: array
+        items:
+          type: object
+        minItems: 1
+
+    ConsumerCredentialsUpdateInput:
+      type: object
+      default: {}
+      description: |
+        Credential map for `PUT /consumers/{id}`. Identical to
+        `ConsumerCredentialsInput` except that `keyauth`, `jwt`, and
+        `hmac_auth` entries may also be the exact `[REDACTED]` placeholder
+        projection returned by ordinary Consumer responses, so the server's own
+        redacted response is a valid update body. Each placeholder is replaced
+        with the stored entry at the same array index before validation; a
+        placeholder with no stored entry at that index is rejected with `400`.
+        `basicauth` and `mtls_auth` take the same values as on create, because
+        the ordinary response never emits a `basicauth` entry and emits real
+        `mtls_auth` identities.
+      properties:
+        keyauth:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeyAuthCredentialUpdate"
+          minItems: 1
+          description: API key entries. Each entry is a real `key` or the exact `[REDACTED]` round-trip placeholder.
+        basicauth:
+          type: array
+          items:
+            $ref: "#/components/schemas/BasicAuthCredential"
+          minItems: 1
+          description: Multiple basic auth entries for zero-downtime rotation. Omitting `basicauth` preserves the stored value because ordinary responses never emit it.
+        jwt:
+          type: array
+          items:
+            $ref: "#/components/schemas/JwtCredentialUpdate"
+          minItems: 1
+          description: HS256 JWT entries. Each entry is a real 32-4096 character `secret` or the exact `[REDACTED]` round-trip placeholder.
+        hmac_auth:
+          type: array
+          items:
+            $ref: "#/components/schemas/HmacAuthCredentialUpdate"
+          minItems: 1
+          description: HMAC entries. Each entry is a real `secret` or the exact `[REDACTED]` round-trip placeholder.
+        mtls_auth:
+          type: array
+          items:
+            $ref: "#/components/schemas/MtlsAuthCredential"
+          minItems: 1
+          description: Multiple mTLS identities for zero-downtime rotation. Each `identity` must be globally unique.
+      propertyNames:
+        $ref: "#/components/schemas/CredentialTypeName"
       additionalProperties:
         type: array
         items:
@@ -6831,6 +6935,8 @@ components:
             $ref: "#/components/schemas/MtlsAuthCredential"
           minItems: 1
           description: Multiple mTLS identities for zero-downtime rotation. Each `identity` must be globally unique.
+      propertyNames:
+        $ref: "#/components/schemas/CredentialTypeName"
       additionalProperties:
         type: array
         items:
@@ -6876,11 +6982,31 @@ components:
             $ref: "#/components/schemas/MtlsAuthCredential"
           minItems: 1
           description: Multiple mTLS identities for zero-downtime rotation. Each `identity` must be globally unique.
+      propertyNames:
+        $ref: "#/components/schemas/CredentialTypeName"
       additionalProperties:
         type: array
         items:
           type: object
         minItems: 1
+
+    CredentialTypeName:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: "^[A-Za-z0-9_-]+$"
+      description: >-
+        Credential type key. The built-in types are `keyauth`, `basicauth`,
+        `jwt`, `hmac_auth`, and `mtls_auth`; any other key defines a custom
+        credential type whose entries Ferrum stores and exports verbatim but
+        does not interpret. Keys are restricted to one path-safe URI segment —
+        1-64 ASCII letters, digits, underscores, or hyphens — so that every
+        stored credential type stays removable through
+        `DELETE /consumers/{consumer_id}/credentials/{cred_type}`, which matches
+        the raw request path split on `/` and does not percent-decode. Keys that
+        are empty, contain `/`, `%`, whitespace, control bytes, or other
+        reserved URI characters are rejected on create, update, batch, and
+        restore.
 
     # ── Consumer Credential Types ──────────────────────────────────
 
@@ -6895,10 +7021,15 @@ components:
           allOf:
             - pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
             - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
+          not:
+            const: "[REDACTED]"
           description: >-
             API key value. Must be non-empty after trimming, no more than 4096
             characters, free of disallowed ASCII control bytes, and globally
-            unique across all consumers.
+            unique across all consumers. The exact string `[REDACTED]` is
+            reserved as the response redaction placeholder and is rejected as a
+            stored key on every write surface; `jwt` and `hmac_auth` secrets
+            exclude it implicitly through their 32-character minimum.
       description: "API key credential for the `key_auth` authentication plugin."
 
     BasicAuthCredential:
@@ -7064,6 +7195,41 @@ components:
       description: >-
         `hmac_auth` entry as returned by ordinary Consumer responses: the
         stored secret is replaced with the exact `[REDACTED]` placeholder.
+
+    # Update variants accept either a real credential entry or the exact
+    # redaction placeholder the ordinary response returns, so a client can PUT
+    # back a `Consumer` response it never held the secrets for. The two
+    # alternatives are mutually exclusive — `jwt` and `hmac_auth` secrets
+    # require 32+ characters and `KeyAuthCredential` explicitly excludes the
+    # placeholder — so `oneOf` is unambiguous.
+
+    KeyAuthCredentialUpdate:
+      oneOf:
+        - $ref: "#/components/schemas/KeyAuthCredential"
+        - $ref: "#/components/schemas/KeyAuthCredentialRedacted"
+      description: >-
+        `keyauth` entry accepted by `PUT /consumers/{id}`: a real API key, or
+        the exact `[REDACTED]` placeholder, which is replaced with the stored
+        entry at the same array index before validation.
+
+    JwtCredentialUpdate:
+      oneOf:
+        - $ref: "#/components/schemas/JwtCredential"
+        - $ref: "#/components/schemas/JwtCredentialRedacted"
+      description: >-
+        `jwt` entry accepted by `PUT /consumers/{id}`: a real HS256 secret, or
+        the exact `[REDACTED]` placeholder, which is replaced with the stored
+        entry's canonical `secret` at the same array index before validation.
+
+    HmacAuthCredentialUpdate:
+      oneOf:
+        - $ref: "#/components/schemas/HmacAuthCredential"
+        - $ref: "#/components/schemas/HmacAuthCredentialRedacted"
+      description: >-
+        `hmac_auth` entry accepted by `PUT /consumers/{id}`: a real shared
+        secret, or the exact `[REDACTED]` placeholder, which is replaced with
+        the stored entry's canonical `secret` at the same array index before
+        validation.
 
     KeyAuthCredentialBackup:
       type: object

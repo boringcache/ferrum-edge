@@ -773,6 +773,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     for (surface, credentials_schema) in [
         ("Consumer", "ConsumerCredentialsRedacted"),
         ("ConsumerCreate", "ConsumerCredentialsInput"),
+        ("ConsumerUpdate", "ConsumerCredentialsUpdateInput"),
         ("ConsumerBackup", "ConsumerCredentialsBackup"),
         ("ConsumerRestore", "ConsumerCredentialsRestore"),
     ] {
@@ -838,7 +839,8 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     );
     assert_eq!(
         consumer_id["put"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-        json!("#/components/schemas/ConsumerCreate")
+        json!("#/components/schemas/ConsumerUpdate"),
+        "PUT must use the update surface that also accepts `[REDACTED]` round-trip entries"
     );
     assert_eq!(
         consumer_id["put"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
@@ -882,6 +884,130 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         spec.pointer("/components/schemas/RestoreRequest/properties/consumers/items/$ref"),
         Some(&json!("#/components/schemas/ConsumerRestore"))
     );
+}
+
+/// The documented read-modify-write flow tells a client it may PUT back a
+/// `Consumer` response it never held the secrets for, so the PUT request schema
+/// must accept the exact `[REDACTED]` projection the server emits while create,
+/// batch, and restore stay strict. `[REDACTED]` is simultaneously reserved as a
+/// stored value, and credential type keys must stay path-safe so every stored
+/// type remains addressable by the DELETE credential route.
+#[test]
+fn consumer_update_surface_accepts_redaction_placeholders_and_reserves_them() {
+    use ferrum_edge::config::types::Consumer;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let jwt_secret = "j".repeat(32);
+    let hmac_secret = "h".repeat(32);
+    let redacted_response_body = json!({
+        "username": "alice",
+        "credentials": {
+            "keyauth": [{"key": "[REDACTED]"}],
+            "jwt": [{"secret": "[REDACTED]"}],
+            "hmac_auth": [{"secret": "[REDACTED]"}],
+            "mtls_auth": [{"identity": "client.example.com"}]
+        }
+    });
+    // The server's own redacted response is a valid update body, and is still
+    // rejected by the strict create/batch and restore surfaces.
+    assert_component_validity(&spec, "ConsumerUpdate", &redacted_response_body, true);
+    for strict in ["ConsumerCreate", "ConsumerRestore", "ConsumerBackup"] {
+        assert_component_validity(&spec, strict, &redacted_response_body, false);
+    }
+
+    // Real values still validate on the update surface, so rotation by PUT is
+    // expressible in the same schema.
+    let real_values = json!({
+        "username": "alice",
+        "credentials": {
+            "keyauth": [{"key": "live-api-key"}],
+            "jwt": [{"secret": jwt_secret}],
+            "hmac_auth": [{"secret": hmac_secret}]
+        }
+    });
+    assert_component_validity(&spec, "ConsumerUpdate", &real_values, true);
+    assert_component_validity(&spec, "ConsumerCreate", &real_values, true);
+
+    // The two `oneOf` branches must stay mutually exclusive, which requires
+    // `KeyAuthCredential` to exclude the placeholder explicitly.
+    assert_component_validity(
+        &spec,
+        "KeyAuthCredential",
+        &json!({"key": "[REDACTED]"}),
+        false,
+    );
+    for update in [
+        "KeyAuthCredentialUpdate",
+        "JwtCredentialUpdate",
+        "HmacAuthCredentialUpdate",
+    ] {
+        let field = if update.starts_with("KeyAuth") {
+            "key"
+        } else {
+            "secret"
+        };
+        assert_component_validity(&spec, update, &json!({(field): "[REDACTED]"}), true);
+    }
+
+    // `[REDACTED]` is reserved at runtime on every write surface, including the
+    // update surface, which only accepts it as a marker the server replaces
+    // before validation.
+    let placeholder_consumer: Consumer = serde_json::from_value(json!({
+        "username": "alice",
+        "credentials": {"keyauth": [{"key": "[REDACTED]"}]}
+    }))
+    .expect("placeholder Consumer deserializes");
+    let errors = placeholder_consumer
+        .validate_fields()
+        .expect_err("the reserved redaction placeholder is not a storable key");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("reserved redaction placeholder")),
+        "expected a reserved-placeholder rejection, got {errors:?}"
+    );
+
+    // Credential type keys are one path-safe URI segment on every input
+    // surface, so a hidden custom type cannot be created at an address the
+    // DELETE credential route cannot express.
+    for unsafe_key in [
+        "custom/auth",
+        "custom%2Fauth",
+        "",
+        "custom auth",
+        "custom.auth",
+        "..",
+    ] {
+        let instance = json!({
+            "username": "alice",
+            "credentials": {(unsafe_key): [{"token": "value"}]}
+        });
+        for surface in ["ConsumerCreate", "ConsumerUpdate", "ConsumerRestore"] {
+            assert_component_validity(&spec, surface, &instance, false);
+        }
+        let consumer: Consumer =
+            serde_json::from_value(instance).expect("Consumer with a custom key deserializes");
+        assert!(
+            consumer.validate_fields().is_err(),
+            "runtime must reject the non-path-safe credential type {unsafe_key:?}"
+        );
+    }
+
+    // A previously valid, path-safe custom type keeps working end to end.
+    let custom = json!({
+        "username": "alice",
+        "credentials": {"custom_auth-2": [{"api_token": "opaque-value"}]}
+    });
+    for surface in ["ConsumerCreate", "ConsumerUpdate", "ConsumerRestore"] {
+        assert_component_validity(&spec, surface, &custom, true);
+    }
+    let custom_consumer: Consumer =
+        serde_json::from_value(custom).expect("custom-credential Consumer deserializes");
+    custom_consumer
+        .validate_fields()
+        .expect("a path-safe custom credential type stays valid");
 }
 
 fn normalized_path_template(path: &str) -> String {

@@ -109,6 +109,73 @@ pub const REDACTED_CREDENTIAL_SECRET_FIELDS: &[(&str, &str)] = &[
     ("jwt", "secret"),
     ("hmac_auth", "secret"),
 ];
+/// Maximum length of a credential type key.
+pub const MAX_CREDENTIAL_TYPE_LENGTH: usize = 64;
+/// Credential types whose entries must contain exactly one field, paired with
+/// that field name. A row written before that contract was enforced can still
+/// carry extra ignored fields, so any path that re-validates such an entry has
+/// to reduce it to the canonical field first.
+pub const SINGLE_FIELD_CREDENTIAL_TYPES: &[(&str, &str)] = &[
+    ("jwt", "secret"),
+    ("hmac_auth", "secret"),
+    ("mtls_auth", "identity"),
+];
+
+/// The single canonical field of `cred_type`, when it has one.
+fn single_credential_field(cred_type: &str) -> Option<&'static str> {
+    SINGLE_FIELD_CREDENTIAL_TYPES
+        .iter()
+        .find(|(known, _)| *known == cred_type)
+        .map(|(_, field)| *field)
+}
+
+/// Reduces a credential entry to its single canonical `field`.
+///
+/// Entries without a string at `field` are returned untouched so genuinely
+/// unrepresentable data surfaces at validation instead of being silently
+/// rewritten.
+fn canonical_single_field_entry(entry: &serde_json::Value, field: &str) -> serde_json::Value {
+    match entry.get(field).and_then(serde_json::Value::as_str) {
+        Some(value) => serde_json::json!({ (field): value }),
+        None => entry.clone(),
+    }
+}
+
+fn is_path_safe_credential_type_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Validates a credential type key.
+///
+/// Credential type keys are addressable URI path segments: every stored type
+/// must stay removable through
+/// `DELETE /consumers/{consumer_id}/credentials/{cred_type}`, and the admin
+/// router matches that route by splitting the raw request path on `/` without
+/// percent-decoding. A key containing `/`, `%`, a control byte, or any other
+/// reserved or non-literal URI character would therefore become unreachable
+/// once stored. Restricting keys to one path-safe token at this single write
+/// and restore boundary — which create, update, batch, and restore all pass
+/// through — keeps that guarantee without per-route filtering. Every built-in
+/// credential type already satisfies the rule.
+fn validate_credential_type_name(cred_type: &str) -> Result<(), String> {
+    if cred_type.is_empty() {
+        return Err("credential type must not be empty".to_string());
+    }
+    let length = cred_type.chars().count();
+    if length > MAX_CREDENTIAL_TYPE_LENGTH {
+        return Err(format!(
+            "credential type must not exceed {} characters (got {})",
+            MAX_CREDENTIAL_TYPE_LENGTH, length
+        ));
+    }
+    if !cred_type.chars().all(is_path_safe_credential_type_char) {
+        return Err(format!(
+            "credential type '{}' must be ASCII letters, digits, underscores, or hyphens",
+            cred_type
+        ));
+    }
+    Ok(())
+}
 
 // Current ISO 3166-1 alpha-2 assignments plus XK, the user-assigned Kosovo
 // code emitted by MaxMind country-capable products. Keeping this list in the
@@ -6896,7 +6963,7 @@ impl Consumer {
 
         // Validate individual credential values.
         for (cred_type, cred_value) in &self.credentials {
-            if let Err(e) = validate_string_field("credential type", cred_type, 64) {
+            if let Err(e) = validate_credential_type_name(cred_type) {
                 errors.push(e);
             }
             // Collect array entries to validate. Non-object elements are
@@ -7012,6 +7079,24 @@ impl Consumer {
                         }
                         Some(_) => errors.push(format!("{}.key must be a string", prefix)),
                         None => errors.push(format!("{}.key is required", prefix)),
+                    }
+                }
+                // `[REDACTED]` is reserved: whole-Consumer update treats it as
+                // the round-trip sentinel for a secret the ordinary response
+                // never disclosed, so it must never be storable as a live
+                // credential value. Rejecting it here covers create, batch,
+                // restore, the dedicated credential endpoints, and any update
+                // placeholder left unmatched by a stored entry.
+                for &(known_type, field) in REDACTED_CREDENTIAL_SECRET_FIELDS {
+                    if known_type != cred_type.as_str() {
+                        continue;
+                    }
+                    let value = obj.get(field).and_then(serde_json::Value::as_str);
+                    if value == Some(CREDENTIAL_REDACTION_PLACEHOLDER) {
+                        errors.push(format!(
+                            "{}.{} must not be the reserved redaction placeholder",
+                            prefix, field
+                        ));
                     }
                 }
                 for (key, val) in *obj {
@@ -7235,7 +7320,19 @@ pub fn preserve_response_hidden_consumer_credentials(updated: &mut Consumer, exi
             if is_redaction_placeholder_entry(entry, field)
                 && let Some(stored_entry) = stored_entries.get(index)
             {
-                *entry = (*stored_entry).clone();
+                // Restoring an exactly-one-field type verbatim would reintroduce
+                // legacy selectors such as a `jwt` `algorithm`, which the
+                // current contract rejects, so an unrelated Consumer edit would
+                // fail on data the client was never shown. Restore the canonical
+                // field only — the same value the runtime uses and the same
+                // shape `GET /backup` exports. Types without a single-field rule
+                // (`keyauth`) keep every stored field.
+                *entry = match single_credential_field(cred_type) {
+                    Some(canonical_field) => {
+                        canonical_single_field_entry(stored_entry, canonical_field)
+                    }
+                    None => (*stored_entry).clone(),
+                };
             }
         }
     }
@@ -7244,34 +7341,36 @@ pub fn preserve_response_hidden_consumer_credentials(updated: &mut Consumer, exi
 /// Canonicalizes a Consumer for `GET /backup` export.
 ///
 /// Backups carry unredacted stored credentials so `POST /restore` can recreate
-/// them faithfully. Consumer `jwt` credentials are HS256-only and must contain
-/// exactly one `secret` field, but data stored before that contract was
-/// enforced can still carry ignored selectors such as `algorithm`, which
-/// restore now rejects. Reducing those entries to their `secret` keeps a
-/// backup taken from a deployed database restorable, which is also the shape
-/// `ConsumerBackup` already documents.
+/// them faithfully. Exactly-one-field credential types — `jwt` and `hmac_auth`
+/// (`secret`) and `mtls_auth` (`identity`) — can still hold rows written before
+/// that contract was enforced, carrying ignored extra fields such as a `jwt`
+/// `algorithm`, which restore now rejects. Reducing those entries to their
+/// canonical field keeps a backup taken from a deployed database restorable,
+/// which is also the shape `ConsumerBackup` already documents.
+///
+/// `POST /restore` also requires every credential value to be an array of
+/// objects, so a value still stored in the legacy single-object form is wrapped
+/// in a one-element array here rather than exported in a shape restore rejects.
 ///
 /// The rewrite is deliberately narrow: it never mutates the stored Consumer,
-/// keeps every rotation entry in order, leaves the outer credential container
-/// shape alone, leaves entries without a string `secret` untouched so genuinely
-/// unrepresentable data surfaces at restore instead of being silently dropped,
-/// and copies every other credential type — including unknown/custom maps —
-/// through verbatim.
+/// keeps every rotation entry in order, leaves entries without a string value at
+/// the canonical field untouched so genuinely unrepresentable data surfaces at
+/// restore instead of being silently dropped, and copies every credential type
+/// without a single-field rule — `basicauth`, `keyauth`, and unknown/custom
+/// maps — through with its fields intact.
 pub fn canonicalize_consumer_credentials_for_backup(consumer: &Consumer) -> Consumer {
-    fn canonical_jwt_entry(entry: &serde_json::Value) -> serde_json::Value {
-        match entry.get("secret").and_then(serde_json::Value::as_str) {
-            Some(secret) => serde_json::json!({"secret": secret}),
-            None => entry.clone(),
-        }
-    }
-
     let mut canonical = consumer.clone();
-    if let Some(jwt) = canonical.credentials.get_mut("jwt") {
-        if jwt.is_object() {
-            *jwt = canonical_jwt_entry(jwt);
-        } else if let serde_json::Value::Array(entries) = jwt {
+    for (cred_type, value) in canonical.credentials.iter_mut() {
+        if value.is_object() {
+            let legacy_single_entry = value.clone();
+            *value = serde_json::Value::Array(vec![legacy_single_entry]);
+        }
+        let Some(field) = single_credential_field(cred_type) else {
+            continue;
+        };
+        if let serde_json::Value::Array(entries) = value {
             for entry in entries.iter_mut() {
-                *entry = canonical_jwt_entry(entry);
+                *entry = canonical_single_field_entry(entry, field);
             }
         }
     }
