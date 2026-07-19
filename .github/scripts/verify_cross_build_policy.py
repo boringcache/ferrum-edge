@@ -938,6 +938,11 @@ CASE_ARM_CONTEXT = r"(?:\bin|;;)\s+\(?\s*[^\s;&|()]+(?:\s*\|\s*[^\s;&|()]+)*\)\s
 # executable slot. A bare `(` is deliberately still not a context: a real
 # subshell is covered by the opener sequence that follows each context, whereas
 # a bare `(` also appears literally inside quoted prose.
+# That opener sequence is `(?:\(\s*)*`, not `(?:\(\s+)*`: bash needs no blank
+# after a subshell opener, so `; (cross build ...` and `( (cross build ...` are
+# both real executable slots. Requiring the blank would repeat the single-`(`
+# slot the pre-nesting `(?:\(\s*)?` spelling already covered, turning a
+# generalization into a fail-open narrowing.
 # `$(`, a backtick, and `<(`/`>(` are unambiguous executable slots, so an
 # assignment such as `out=$(cross build ...)` is one.
 # Every context except a bare line start names the executable slot explicitly,
@@ -1001,7 +1006,7 @@ CROSS_COMMAND_CONTEXT = re.compile(
     COMMAND_START_CONTEXT
     + WRAPPER_PREFIX
     + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    r"(?:\(\s+)*"
+    r"(?:\(\s*)*"
     + CROSS_EXECUTABLE
 )
 # The same command slot, matched against the text that precedes a word instead
@@ -1011,7 +1016,7 @@ EXPLICIT_COMMAND_WORD_PREFIX = re.compile(
     r"(?:!\s*)?"
     + WRAPPER_PREFIX
     + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    r"(?:\(\s+)*$"
+    r"(?:\(\s*)*$"
 )
 WRAPPED_LITERAL_CROSS = re.compile(
     r"(?:\b(?:bash|sh)\s+-c\s+['\"][^'\"]*\bcross\s+|"
@@ -1184,7 +1189,7 @@ OPAQUE_EXPANSION = (
 )
 OPAQUE_ARM_CROSS_EXECUTION = re.compile(
     r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{(?:\s+|\s*(?=\())|\b(?:then|do|else)\s+)"
-    r"(?:\(\s+)*['\"]?"
+    r"(?:\(\s*)*['\"]?"
     rf"(?:[A-Za-z]*{OPAQUE_EXPANSION}['\"]?)+[A-Za-z]*['\"]?\s+"
     r"(?:\+[^\s]+\s+)?(?:build|rustc|run|test|check|clippy|doc|bench)\b"
     r"[^\n]*--target(?:=|\s+)aarch64-unknown-linux-gnu\b",
@@ -8901,6 +8906,18 @@ def self_test() -> list[str]:
         "function-body subshell": (
             "f(){( cross build --target aarch64-unknown-linux-gnu );}"
         ),
+        # Bash requires no blank after a subshell opener. These spellings were
+        # already recognized before nesting support was added, so generalizing
+        # the opener to a repeated group must not start demanding the blank.
+        "unspaced subshell after operator": (
+            "true;(cross build --target aarch64-unknown-linux-gnu)"
+        ),
+        "unspaced nested subshell": (
+            "( (cross build --target aarch64-unknown-linux-gnu) )"
+        ),
+        "unspaced function-body subshell": (
+            "f(){(cross build --target aarch64-unknown-linux-gnu);}"
+        ),
     }
     for name, command in nested_subshell_cross_forms.items():
         if not has_cross_command_context(command):
@@ -8913,10 +8930,73 @@ def self_test() -> list[str]:
     if not OPAQUE_ARM_CROSS_EXECUTION.search(nested_opaque_cross):
         failures.append("nested opaque Cross executable was not recognized")
 
+    unspaced_opaque_cross = (
+        "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+        "($cmd build --target aarch64-unknown-linux-gnu)"
+    )
+    if not OPAQUE_ARM_CROSS_EXECUTION.search(unspaced_opaque_cross):
+        failures.append(
+            "unspaced opaque Cross executable in a subshell was not recognized"
+        )
+
     if has_cross_command_context(
         '{"cross": "build --target aarch64-unknown-linux-gnu"}'
     ):
         failures.append("JSON object was mistaken for a Cross executable")
+
+    # Consolidated residual classes share helpers, so one normalization pass can
+    # undo another. These assert the composed behavior, not each fix alone.
+
+    # Word splitting rebuilds the executable word; the subshell opener sequence
+    # then has to still recognize the rebuilt word in an unspaced nested slot.
+    nested_split_command = (
+        "( (cross${IFS}build --target aarch64-unknown-linux-gnu) )"
+    )
+    if not any(
+        has_cross_command_context(variant)
+        for variant in word_splitting_variants(nested_split_command)
+    ):
+        threats = "word-split Cross executable in a nested subshell"
+        failures.append(f"{threats} was not recognized")
+
+    # Above the expansion cap only the all-split view survives, and it must
+    # still land in the nested-subshell executable slot.
+    capped_padding = " ".join(f"x$A{index}" for index in range(16))
+    capped_nested_command = (
+        f": {capped_padding}; "
+        "( (cross${IFS}build --target aarch64-unknown-linux-gnu) )"
+    )
+    if not any(
+        has_cross_command_context(variant)
+        for variant in word_splitting_variants(capped_nested_command)
+    ):
+        failures.append(
+            "capped word-split Cross executable in a nested subshell was not "
+            "recognized"
+        )
+
+    # The same padded line without any Cross literal stays benign: expansion
+    # padding alone must not manufacture a surface.
+    if word_splitting_variants(f": {capped_padding}; echo done"):
+        failures.append("expansion padding alone was treated as a Cross surface")
+
+    # A redirection between an executable and its operand must not make a real
+    # invocation look bare to the operand scanner.
+    redirected_tokens = shell_tokens(
+        "cross >build.log build --target aarch64-unknown-linux-gnu"
+    )
+    if redirected_tokens is None or not command_has_argument(redirected_tokens, 0):
+        failures.append(
+            "a redirection before the Cross operand hid the operand"
+        )
+
+    # The benign control shares that structure but genuinely has no operand, so
+    # the redirection walk must not invent one.
+    bare_redirected_tokens = shell_tokens("cross >build.log")
+    if bare_redirected_tokens is not None and command_has_argument(
+        bare_redirected_tokens, 0
+    ):
+        failures.append("a bare redirected command was given a phantom operand")
 
     cross_bypasses = {
         "global build configuration": {**valid_cross, "build": {"xargo": True}},
