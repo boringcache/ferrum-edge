@@ -809,21 +809,29 @@ RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
 PUBLISH_CONTROL_CONTRACTS = {
     "CI workflow": {
         "latest-release": {
-            "needs": "    needs: [test, build-binaries, build-arm64-cross]\n",
+            "needs": (
+                "    needs: [test, build-binaries, build-arm64-cross, "
+                "main-publish-gate]\n"
+            ),
             "if": (
                 "    if: always() && needs.test.result == 'success' && "
                 "needs.build-binaries.result == 'success' && "
                 "needs.build-arm64-cross.result == 'success' && "
+                "needs.main-publish-gate.result == 'success' && "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
             ),
             "steps": CI_LATEST_RELEASE_STEPS,
         },
         "docker": {
-            "needs": "    needs: [test, build-binaries, build-arm64-cross]\n",
+            "needs": (
+                "    needs: [test, build-binaries, build-arm64-cross, "
+                "main-publish-gate]\n"
+            ),
             "if": (
                 "    if: always() && needs.test.result == 'success' && "
                 "needs.build-binaries.result == 'success' && "
                 "needs.build-arm64-cross.result == 'success' && "
+                "needs.main-publish-gate.result == 'success' && "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
             ),
             "strategy": DOCKER_ARTIFACT_MATRIX,
