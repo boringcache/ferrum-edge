@@ -87,6 +87,7 @@ fn admin_state(metrics_auth: MetricsAuthPolicy) -> AdminState {
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: Arc::new(TrustedProxies::none()),
         cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -173,6 +174,65 @@ async fn health_unauthenticated_omits_detailed_fields() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body.get("mode").and_then(|v| v.as_str()), Some("file"));
     assert!(body.get("cached_config").is_some(), "detailed body: {body}");
+}
+
+#[tokio::test]
+async fn malformed_pagination_does_not_preempt_the_observability_tier() {
+    let (base, _sd) = start_admin(admin_state(MetricsAuthPolicy::default())).await;
+    let client = reqwest::Client::new();
+
+    // Pagination is parsed only by routes that consume it. If observability
+    // routes shared eager validation, every one of these would answer `400`
+    // instead of its documented tier response.
+    for query in [
+        "limit=abc",
+        "offset=-1",
+        // i64::MAX + 1 and u64::MAX: rejected as out-of-range on list routes.
+        "offset=9223372036854775808",
+        "offset=18446744073709551615",
+    ] {
+        // `/live` stays always-unauthenticated and exactly minimal.
+        let resp = client
+            .get(format!("{base}/live?{query}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "/live?{query} must stay 200");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body,
+            json!({"status": "ok"}),
+            "/live?{query} must stay exactly minimal"
+        );
+
+        // `/health` keeps its unauthenticated status+ready tier.
+        let resp = client
+            .get(format!("{base}/health?{query}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "/health?{query} must stay 200");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body.get("status").and_then(|v| v.as_str()), Some("ok"));
+        assert!(body.get("ready").is_some(), "ready present: {body}");
+        assert!(
+            body.get("database").is_none(),
+            "/health?{query} must not leak detail: {body}"
+        );
+
+        // `/metrics` still answers `401` — authentication, not validation,
+        // is what rejects an unauthenticated caller.
+        let resp = client
+            .get(format!("{base}/metrics?{query}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            401,
+            "/metrics?{query} must stay 401, not 400"
+        );
+    }
 }
 
 #[tokio::test]

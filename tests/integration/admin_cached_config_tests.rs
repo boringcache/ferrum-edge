@@ -330,6 +330,7 @@ async fn test_list_proxies_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -385,6 +386,7 @@ async fn test_list_consumers_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -435,6 +437,7 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -487,6 +490,7 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -534,6 +538,7 @@ async fn test_get_proxy_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -579,6 +584,7 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -626,6 +632,7 @@ async fn test_get_consumer_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -671,6 +678,7 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -719,6 +727,7 @@ async fn test_get_plugin_config_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -764,6 +773,7 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -812,6 +822,7 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -860,6 +871,7 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -912,6 +924,7 @@ async fn test_health_endpoint_shows_cached_config_info() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -970,6 +983,7 @@ async fn test_health_endpoint_shows_no_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -1025,6 +1039,7 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -1088,6 +1103,7 @@ async fn test_cached_config_reflects_live_updates() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -1200,6 +1216,7 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -1283,7 +1300,8 @@ async fn test_list_proxies_without_pagination_returns_envelope() {
     assert!(body["data"].is_array(), "Should have data field");
     assert_eq!(body["data"].as_array().unwrap().len(), 5);
     assert_eq!(body["pagination"]["offset"], 0);
-    assert_eq!(body["pagination"]["limit"], 5);
+    // An omitted limit reports the server default (100), not the result count.
+    assert_eq!(body["pagination"]["limit"], 100);
     assert_eq!(body["pagination"]["total"], 5);
 }
 
@@ -1317,6 +1335,8 @@ async fn test_list_proxies_with_offset_and_limit() {
     assert_eq!(data.len(), 2);
     assert_eq!(data[0]["id"], "proxy-2");
     assert_eq!(data[1]["id"], "proxy-3");
+    assert_eq!(body["pagination"]["offset"], 2);
+    assert_eq!(body["pagination"]["limit"], 2);
     assert_eq!(body["pagination"]["total"], 5);
 }
 
@@ -1331,6 +1351,45 @@ async fn test_list_proxies_offset_beyond_total_returns_empty() {
     assert_eq!(status, 200);
     assert_eq!(body["data"].as_array().unwrap().len(), 0);
     assert_eq!(body["pagination"]["total"], 5);
+}
+
+#[tokio::test]
+async fn test_list_offset_width_is_independent_of_target_pointer_size() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // One past u32::MAX must remain a valid backend-safe offset even on a
+    // 32-bit target. An in-memory collection cannot reach it, so the explicit
+    // policy is an empty page with the requested offset preserved.
+    let (status, body, _) =
+        admin_get(&base_url, "/proxies?offset=4294967296&limit=10", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert_eq!(body["pagination"]["offset"], 4_294_967_296u64);
+    assert_eq!(body["pagination"]["limit"], 10);
+    assert_eq!(body["pagination"]["total"], 5);
+}
+
+#[tokio::test]
+async fn malformed_pagination_is_ignored_by_non_paginated_routes() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/namespaces?limit=abc", &token).await;
+    assert_eq!(status, 200, "namespaces must ignore limit: {body:?}");
+    assert!(body.is_array());
+
+    let (status, body, _) = admin_get(&base_url, "/backup?limit=abc", &token).await;
+    assert_eq!(status, 200, "backup must ignore limit: {body:?}");
+    assert_eq!(body["counts"]["proxies"], 5);
+
+    let (status, body, _) = admin_get(&base_url, "/cluster?offset=-1", &token).await;
+    assert_eq!(status, 200, "cluster must ignore offset: {body:?}");
+    assert_eq!(body["mode"], "test");
 }
 
 #[tokio::test]
@@ -1388,6 +1447,65 @@ async fn test_pagination_limit_clamped_to_max() {
     // Should still return all 5 (since 5 < 1000)
     assert_eq!(body["data"].as_array().unwrap().len(), 5);
     assert_eq!(body["pagination"]["limit"], 1000);
+
+    let (status, body, _) =
+        admin_get(&base_url, "/proxies?limit=18446744073709551615", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["pagination"]["limit"], 1000);
+}
+
+#[tokio::test]
+async fn test_malformed_pagination_is_rejected_with_400() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (query, expected_message) in [
+        (
+            "/proxies?limit=abc",
+            "Invalid limit pagination parameter: must be a non-negative integer",
+        ),
+        (
+            "/proxies?limit=-1",
+            "Invalid limit pagination parameter: must be a non-negative integer",
+        ),
+        (
+            "/proxies?offset=abc",
+            "Invalid offset pagination parameter: must be a non-negative integer",
+        ),
+        (
+            "/proxies?offset=-1",
+            "Invalid offset pagination parameter: must be a non-negative integer",
+        ),
+        (
+            "/proxies?limit=18446744073709551616",
+            "Invalid limit pagination parameter: exceeds the maximum supported value",
+        ),
+        // i64::MAX + 1 wrapped negative under the old `as i64` cast and became
+        // an enormous MongoDB u64 skip.
+        (
+            "/proxies?offset=9223372036854775808",
+            "Invalid offset pagination parameter: exceeds the maximum supported value",
+        ),
+    ] {
+        let (status, body, _) = admin_get(&base_url, query, &token).await;
+        assert_eq!(status, 400, "{query} must be rejected: {body:?}");
+        assert_eq!(body["error"], expected_message, "wrong error for {query}");
+    }
+}
+
+#[tokio::test]
+async fn test_malformed_pagination_does_not_preempt_authentication() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+
+    // Pagination is validated only after the admin JWT gate, so an
+    // unauthenticated caller still gets 401 rather than a 400 that would leak
+    // input validation ahead of authentication.
+    let (status, body, _) = admin_get(&base_url, "/proxies?limit=abc", "not-a-valid-token").await;
+    assert_eq!(status, 401, "unauthenticated caller must get 401: {body:?}");
 }
 
 // ---- Batch endpoint tests ----
@@ -1433,6 +1551,7 @@ fn db_admin_state(
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -1785,6 +1904,7 @@ async fn create_db_admin_state_with_availability(
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -2455,6 +2575,7 @@ async fn test_batch_create_read_only_rejected() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4164,6 +4285,7 @@ async fn test_restore_read_only_rejected() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4345,6 +4467,7 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4400,6 +4523,7 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4447,6 +4571,7 @@ async fn test_get_upstream_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4490,6 +4615,7 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4538,6 +4664,7 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -5111,6 +5238,7 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -5163,6 +5291,7 @@ async fn test_backup_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -5214,6 +5343,7 @@ async fn test_create_proxy_returns_503_when_no_db() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -5262,6 +5392,7 @@ async fn test_create_upstream_returns_503_when_no_db() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -5356,6 +5487,7 @@ async fn test_cached_config_reflects_upstream_updates() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -5899,6 +6031,7 @@ async fn test_health_endpoint_shows_db_availability() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -6071,6 +6204,7 @@ async fn test_cluster_endpoint_requires_auth() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -6118,6 +6252,7 @@ async fn test_cluster_endpoint_cp_mode_empty_registry() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: Some(registry),
         mesh_registry: None,
         cp_connection_state: None,
@@ -6180,6 +6315,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: Some(registry),
         mesh_registry: None,
         cp_connection_state: None,
@@ -6246,6 +6382,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_mesh_nodes() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: Some(registry),
         cp_connection_state: None,
@@ -6307,6 +6444,7 @@ async fn test_cluster_endpoint_dp_mode_connected() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: Some(conn_state),
@@ -6356,6 +6494,7 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: Some(conn_state),
@@ -6401,6 +6540,7 @@ async fn test_cluster_endpoint_database_mode() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -6416,4 +6556,230 @@ async fn test_cluster_endpoint_database_mode() {
     assert_eq!(status, 200);
     assert_eq!(body["mode"], "database");
     assert!(body["message"].is_string());
+}
+
+// ---- Pagination is validated before the shared request-body read ----
+
+fn generate_test_token_with_role(config: &TestConfig, role: &str) -> String {
+    let now = chrono::Utc::now();
+    let claims = json!({
+        "iss": config.jwt_issuer,
+        "sub": "test-user",
+        "role": role,
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string()
+    });
+    let header = Header::new(jsonwebtoken::Algorithm::HS256);
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    encode(&header, &claims, &key).unwrap()
+}
+
+/// Send a request carrying `body_len` bytes, past the admin 1 MiB body cap.
+async fn admin_request_with_body(
+    method: reqwest::Method,
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+    body_len: usize,
+) -> (reqwest::StatusCode, Value) {
+    let client = reqwest::Client::new();
+    let mut req = client
+        .request(method, format!("{}{}", base_url, path))
+        .body(vec![b'x'; body_len]);
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {}", token));
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(json!(null));
+    (status, body)
+}
+
+const OVERSIZED_BODY: usize = 2 * 1024 * 1024;
+
+/// A paginated GET must resolve `limit`/`offset` from the request line before
+/// the shared `Limited::collect` body read. Otherwise an oversized (and wholly
+/// unused) GET body turns the documented malformed-pagination `400` into a
+/// `413`, after buffering up to the cap on a read endpoint.
+#[tokio::test]
+async fn malformed_pagination_on_get_list_precedes_body_buffering() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for path in [
+        "/proxies?limit=abc",
+        "/consumers?offset=-1",
+        "/plugins/config?limit=1.5",
+        "/upstreams?offset=18446744073709551616",
+    ] {
+        let (status, body) = admin_request_with_body(
+            reqwest::Method::GET,
+            &base_url,
+            path,
+            Some(&token),
+            OVERSIZED_BODY,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "{path} must return the pagination 400 without buffering the body: {body:?}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("must be")
+                || body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("maximum supported value"),
+            "{path} must report the pagination error, not a body error: {body:?}"
+        );
+    }
+
+    // Well-formed pagination on the same route still succeeds; only the
+    // malformed case short-circuits ahead of the body read.
+    let (status, body, _) = admin_get(&base_url, "/proxies?limit=2", &token).await;
+    assert_eq!(status, 200, "valid pagination unaffected: {body:?}");
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+
+    // Body handling for mutation routes is unchanged: an oversized POST body is
+    // still rejected with 413 by the shared reader.
+    let (status, body) = admin_request_with_body(
+        reqwest::Method::POST,
+        &base_url,
+        "/proxies?limit=abc",
+        Some(&token),
+        OVERSIZED_BODY,
+    )
+    .await;
+    assert_eq!(
+        status, 413,
+        "mutation routes keep the shared body cap: {body:?}"
+    );
+}
+
+/// `/audit` narrows the shared `i64` offset to the audit store's `u32`. That
+/// route-specific ceiling has to be replayed in the pre-body gate too, or an
+/// offset the handler would reject with `400` instead buffers an unused body
+/// and returns `413`.
+#[tokio::test]
+async fn audit_offset_ceiling_precedes_body_buffering() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // u32::MAX + 1: inside the shared parser's range, outside the audit store's.
+    let (status, body) = admin_request_with_body(
+        reqwest::Method::GET,
+        &base_url,
+        "/audit?offset=4294967296",
+        Some(&token),
+        OVERSIZED_BODY,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "audit offset ceiling must precede the body read: {body:?}"
+    );
+    assert_eq!(
+        body["error"], "Audit offset exceeds supported range",
+        "pre-body rejection must reuse the handler's message: {body:?}"
+    );
+
+    // Without a body the same request reports the identical error, so the two
+    // paths through `audit_pagination_offset` cannot diverge.
+    let (status, body, _) = admin_get(&base_url, "/audit?offset=4294967296", &token).await;
+    assert_eq!(status, 400, "no-body audit offset: {body:?}");
+    assert_eq!(body["error"], "Audit offset exceeds supported range");
+
+    // The bound is exact: `u32::MAX` is still accepted, so the oversized body
+    // reaches the shared reader and its `413` — proving the `400` above came
+    // from the ceiling, not from a blanket rejection of the route.
+    let (status, body) = admin_request_with_body(
+        reqwest::Method::GET,
+        &base_url,
+        "/audit?offset=4294967295",
+        Some(&token),
+        OVERSIZED_BODY,
+    )
+    .await;
+    assert_eq!(
+        status, 413,
+        "u32::MAX offset is in range and must not be pre-rejected: {body:?}"
+    );
+
+    // Unrelated list routes keep the wider `i64` contract: the same offset is a
+    // valid request beyond the collection, not a `400`.
+    let (status, body, _) = admin_get(&base_url, "/proxies?offset=4294967296", &token).await;
+    assert_eq!(
+        status, 200,
+        "the audit ceiling must not narrow other routes: {body:?}"
+    );
+    assert!(
+        body["data"].as_array().unwrap().is_empty(),
+        "offset beyond the collection returns an empty page: {body:?}"
+    );
+}
+
+/// The pre-body pagination gate must not reorder the security checks ahead of
+/// it: an unauthenticated caller still gets `401` and an under-privileged one
+/// still gets `403`, even when the pagination is malformed.
+#[tokio::test]
+async fn pre_body_pagination_never_preempts_authentication_or_rbac() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let viewer = generate_test_token_with_role(&tc, "viewer");
+
+    // No credentials at all -> 401, never the pagination 400.
+    let (status, body) = admin_request_with_body(
+        reqwest::Method::GET,
+        &base_url,
+        "/proxies?limit=abc",
+        None,
+        OVERSIZED_BODY,
+    )
+    .await;
+    assert_eq!(
+        status, 401,
+        "unauthenticated malformed pagination must stay 401: {body:?}"
+    );
+
+    // Authenticated but under-privileged on routes whose arm gates on a role
+    // before parsing pagination -> 403, never the pagination 400.
+    for path in [
+        "/audit?limit=abc",
+        "/admin/tls/inventory?limit=abc",
+        "/admin/tls/certificates?offset=-1",
+    ] {
+        let (status, body) = admin_request_with_body(
+            reqwest::Method::GET,
+            &base_url,
+            path,
+            Some(&viewer),
+            OVERSIZED_BODY,
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "{path} must return 403 before pagination validation: {body:?}"
+        );
+    }
+
+    // `/live` stays unauthenticated and minimal regardless of query garbage.
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/live?limit=abc", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({"status": "ok"}));
 }

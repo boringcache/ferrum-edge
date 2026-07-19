@@ -635,6 +635,24 @@ pub mod _test_support {
         plugin.request_identity_for_tests(ctx)
     }
 
+    pub fn request_deduplication_set_request_state_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        ctx: &mut crate::plugins::RequestContext,
+        key: &str,
+        fingerprint: &str,
+        local_inflight_owner_token: &str,
+        redis_lock_token: Option<&str>,
+    ) {
+        crate::plugins::request_deduplication::set_request_state_for_test(
+            plugin,
+            ctx,
+            key,
+            fingerprint,
+            local_inflight_owner_token,
+            redis_lock_token,
+        );
+    }
+
     pub fn request_deduplication_expire_completed_entries_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
     ) {

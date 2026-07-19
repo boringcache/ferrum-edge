@@ -2599,10 +2599,21 @@ fn spec_content_response(
 // Helper: parse list filter from query string (Wave 5)
 // ---------------------------------------------------------------------------
 
+/// Build the stable API-spec pagination error without exposing parser internals.
+fn invalid_pagination(field: &str, error: crate::admin::PaginationValueError) -> ApiSpecError {
+    ApiSpecError::BadRequest(format!("{field} {}", error.reason()))
+}
+
 /// Parse `GET /api-specs` query parameters into an [`ApiSpecListFilter`].
 ///
-/// Unknown parameters are silently ignored. Returns `Err` only for invalid
-/// `sort_by` values (rejected with 400 to prevent accidental SQL-like injection).
+/// Unknown parameters are silently ignored. Returns `Err` (400) for invalid
+/// `sort_by` values (rejected to prevent accidental SQL-like injection), for
+/// SQL `LIKE` wildcards in text filters, and for malformed `limit`/`offset`.
+///
+/// This endpoint keeps a stricter pagination scheme than the shared
+/// [`crate::admin::PaginationParams`] used elsewhere — default 50, maximum 200,
+/// and a `u32` offset — but shares its rejection contract: malformed values are
+/// never silently coerced into a default.
 fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError> {
     const DEFAULT_LIMIT: u32 = 50;
     const MAX_LIMIT: u32 = 200;
@@ -2618,21 +2629,69 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
 
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
-        let key = parts.next().unwrap_or("");
+        let raw_key = parts.next().unwrap_or("");
         let raw_val = parts.next().unwrap_or("");
-        // URL-decode the value (simple percent-decoding for common chars).
-        // Invalid UTF-8 sequences in percent-encoded bytes are rejected with 400
-        // to prevent bypassing downstream character-validation checks (e.g. the
-        // `title_contains` wildcard rejection below).
+        // URL-decode both names and values, NAME FIRST. Decoding only values
+        // lets encoded pagination names bypass this endpoint's narrower `u32`
+        // offset bound (e.g. `?%6fffset=` aliasing `offset`), so names are
+        // decoded too. A *name* that does not decode to valid UTF-8 cannot
+        // alias any recognized ASCII filter name, so it is an unknown parameter
+        // and is ignored like every other unknown key.
+        let Ok(key) = percent_decode(raw_key) else {
+            continue;
+        };
+
+        // Whether the name is recognized is decided BEFORE its value is
+        // decoded, and the value of an ignored name is never decoded at all.
+        // Otherwise a parameter that is ignored anyway (`?%80=%80`, or any
+        // third-party `?unknown=%80`) would still fail the request on its
+        // value. Invalid UTF-8 in the value of a *recognized* name stays a
+        // strict 400: decoding it is what stops percent-encoded bytes from
+        // bypassing the character-validation checks below (e.g. the
+        // `title_contains` LIKE-wildcard rejection).
+        //
+        // Keep this list in sync with the recognized arms of the match below;
+        // a name missing here is silently ignored.
+        if !matches!(
+            key.as_str(),
+            "limit"
+                | "offset"
+                | "proxy_id"
+                | "spec_version"
+                | "title_contains"
+                | "updated_since"
+                | "has_tag"
+                | "sort_by"
+                | "order"
+        ) {
+            continue;
+        }
         let val = percent_decode(raw_val)?;
 
-        match key {
+        match key.as_str() {
+            // `/api-specs` keeps its own stricter bounds (default 50, max 200)
+            // and its `{items, next_offset}` envelope, but malformed input is
+            // rejected with 400 exactly as `parse_pagination` does for every
+            // other list route — never silently coerced to a default.
             "limit" => {
-                let parsed = val.parse::<u32>().unwrap_or(DEFAULT_LIMIT);
-                filter.limit = parsed.clamp(1, MAX_LIMIT);
+                let parsed = crate::admin::parse_unsigned_pagination_value(&val)
+                    .map_err(|error| invalid_pagination("limit", error))?;
+                // `0` keeps the documented "server default" meaning; values
+                // above the maximum are capped.
+                filter.limit = if parsed == 0 {
+                    DEFAULT_LIMIT
+                } else {
+                    u32::try_from(parsed.min(u64::from(MAX_LIMIT))).map_err(|_| {
+                        invalid_pagination("limit", crate::admin::PaginationValueError::Overflow)
+                    })?
+                };
             }
             "offset" => {
-                filter.offset = val.parse::<u32>().unwrap_or(0);
+                let parsed = crate::admin::parse_unsigned_pagination_value(&val)
+                    .map_err(|error| invalid_pagination("offset", error))?;
+                filter.offset = u32::try_from(parsed).map_err(|_| {
+                    invalid_pagination("offset", crate::admin::PaginationValueError::Overflow)
+                })?;
             }
             "proxy_id" if !val.is_empty() => {
                 filter.proxy_id = Some(val);
@@ -3268,8 +3327,6 @@ pub async fn handle_list_api_specs(
         Ok(f) => f,
         Err(e) => return Ok(error_response(e)),
     };
-    let limit = filter.limit as usize;
-    let offset = filter.offset as usize;
 
     let paginated = match db.list_api_specs(namespace, &filter).await {
         Ok(p) => p,
@@ -3305,16 +3362,13 @@ pub async fn handle_list_api_specs(
         })
         .collect();
 
-    let next_offset: Option<usize> = if (offset + items.len()) < (paginated.total.max(0) as usize) {
-        Some(offset + items.len())
-    } else {
-        None
-    };
+    let next_offset =
+        crate::admin::advancing_u32_offset(filter.offset, items.len(), paginated.total);
 
     let body = json!({
         "items": items,
-        "limit": limit,
-        "offset": offset,
+        "limit": filter.limit,
+        "offset": filter.offset,
         "next_offset": next_offset,
         "total": paginated.total,
     });
