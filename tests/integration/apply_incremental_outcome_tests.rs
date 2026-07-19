@@ -1097,26 +1097,33 @@ async fn dp_full_snapshot_applies_new_geo_policy_over_retained_mmdb() {
     );
 
     // Once a file exists at the new path its own snapshot is adopted: the IP
-    // resolves to SE again, which the repointed policy denies.
+    // resolves to SE again, which the repointed policy denies. Use
+    // `on_lookup_failure: allow` so a 403 can only come from that successful SE
+    // lookup — a reader-less miss would Continue instead.
     std::fs::write(&repointed_path, country_mmdb_bytes()).unwrap();
     let mut repointed_present = config.clone();
     repointed_present.plugin_configs = vec![geo_plugin_config(serde_json::json!({
         "db_path": repointed_path.to_str().unwrap(),
         "deny_countries": ["SE"],
-        "on_lookup_failure": "deny"
+        "on_lookup_failure": "allow"
     }))];
     assert_eq!(
         state.update_config(repointed_present),
         ConfigApplyOutcome::Applied
     );
     let geo = live_geo_plugin(&state);
-    assert!(matches!(
-        geo.on_request_received(&mut geo_request()).await,
-        PluginResult::Reject {
-            status_code: 403,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            geo.on_request_received(&mut geo_request()).await,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "a newly available repointed db_path must load its own snapshot; with \
+         on_lookup_failure=allow, 403 proves SE was resolved rather than a \
+         reader-less lookup failure"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
