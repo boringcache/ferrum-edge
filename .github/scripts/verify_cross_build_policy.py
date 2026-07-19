@@ -10791,15 +10791,19 @@ def compare_pr_automation_collection(
         **{f"workflows/{name}": contents for name, contents in proposed_workflows.items()},
         **{f"actions/{name}": contents for name, contents in proposed_actions.items()},
     }
-    _, baseline_interpreters, baseline_errors = reachable_automation_references(
-        baseline_sources,
-        merge_base_automation,
-        f"merge-base {source}",
+    baseline_reachable, baseline_interpreters, baseline_errors = (
+        reachable_automation_references(
+            baseline_sources,
+            merge_base_automation,
+            f"merge-base {source}",
+        )
     )
-    _, proposed_interpreters, proposed_errors = reachable_automation_references(
-        proposed_sources,
-        proposed_automation,
-        f"proposed {source}",
+    proposed_reachable, proposed_interpreters, proposed_errors = (
+        reachable_automation_references(
+            proposed_sources,
+            proposed_automation,
+            f"proposed {source}",
+        )
     )
     errors = [*baseline_errors, *proposed_errors]
 
@@ -10818,9 +10822,12 @@ def compare_pr_automation_collection(
 
         return frozenset(kind for kind in recorded.get(name, set()) if kind)
 
-    # Compare every file in the narrowly approved automation roots. This also
-    # covers scripts selected through an existing trusted variable or sourced
+    # Compare every file in the narrowly approved automation roots. This covers
+    # scripts selected through an existing trusted variable or sourced
     # transitively without freezing files whose Cross surface remains empty.
+    # Reachability is part of the contract too: a PR that starts executing an
+    # unchanged, already Cross-sensitive helper adds the same protected surface
+    # as editing a reached helper to contain that command.
     for name in sorted(set(merge_base_automation) | set(proposed_automation)):
         baseline_surfaces = automation_file_cross_surfaces(
             name,
@@ -10832,7 +10839,17 @@ def compare_pr_automation_collection(
             proposed_automation.get(name, ""),
             named_interpreters(proposed_interpreters, name),
         )
-        if baseline_surfaces != proposed_surfaces:
+        newly_reached_cross_surface = (
+            name not in baseline_reachable
+            and name in proposed_reachable
+            and bool(proposed_surfaces)
+        )
+        if newly_reached_cross_surface and baseline_surfaces == proposed_surfaces:
+            errors.append(
+                f"{source}/{name} cannot newly reach an existing Cross "
+                "executable/configuration surface"
+            )
+        elif baseline_surfaces != proposed_surfaces:
             errors.append(
                 f"{source}/{name} cannot add or change Cross executable/"
                 "configuration surfaces"
@@ -13361,6 +13378,20 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("referenced-script Cross invocation was not rejected")
+    workflow_without_reference = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "echo safe",
+    )
+    if not compare_pr_automation_collection(
+        {"ci.yml": workflow_without_reference},
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        cross_automation,
+        cross_automation,
+        "self-test automation directory",
+    ):
+        failures.append("a newly reached existing Cross script was not rejected")
     if not validate_automation_collection(
         {"ci.yml": referenced_workflow},
         {"setup/action.yml": safe_action},
