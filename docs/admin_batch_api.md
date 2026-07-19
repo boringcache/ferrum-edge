@@ -453,12 +453,18 @@ done
 
 ## Pagination on List Endpoints
 
-All list endpoints (`GET /proxies`, `GET /consumers`, `GET /plugin-configs`, `GET /upstreams`) support pagination via query parameters:
+All list endpoints (`GET /proxies`, `GET /consumers`, `GET /plugins/config`, `GET /upstreams`) support pagination via query parameters:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `limit`   | 1000    | Maximum number of items to return (max: 10000) |
-| `offset`  | 0       | Number of items to skip |
+| `limit`   | 100     | Maximum number of items to return (max: 1000; `0` means the default) |
+| `offset`  | 0       | Number of items to skip (max: 2^63 - 1) |
+
+An omitted `limit` applies the default of 100 — list endpoints never return an
+unbounded collection. Use `GET /backup` when you need a full export. Malformed,
+negative, or out-of-range `limit`/`offset` values are rejected with `400` rather
+than coerced to a default, and validation runs after authentication, so an
+unauthenticated caller still receives `401`.
 
 ### Paginated Request
 
@@ -472,7 +478,8 @@ curl http://localhost:9000/proxies?limit=50&offset=50
 
 ### Response Format
 
-When `limit` or `offset` is provided, the response wraps items in an envelope with pagination metadata:
+List responses always use the pagination envelope, whether or not `limit` and
+`offset` are supplied:
 
 ```json
 {
@@ -480,13 +487,13 @@ When `limit` or `offset` is provided, the response wraps items in an envelope wi
   "pagination": {
     "offset": 50,
     "limit": 50,
-    "count": 50,
     "total": 3000
   }
 }
 ```
 
-List responses always use the pagination envelope shown above.
+`pagination.limit` reports the page size the server applied — 100 when the
+request omitted `limit` — not the number of items in `data`.
 
 ## Database Considerations
 

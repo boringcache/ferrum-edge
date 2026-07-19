@@ -271,10 +271,20 @@ JWKS-capable plugin fields can reference `managed://jwks/{id}#jwks` once the plu
 
 `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
 
+## Pagination
+
+Resource and TLS list endpoints — `GET /proxies`, `/consumers`, `/plugins/config`, `/upstreams`, and the ten `GET /admin/tls/*` list routes — return a paginated envelope `{ "data": [...], "pagination": { "offset", "limit", "total" } }` and accept `limit`/`offset` query parameters. An omitted `limit` applies the default of 100 (maximum 1000; `GET /backup` is the intentional full-export mechanism), `0` is coerced to the default, and representable unsigned 64-bit values above 1000 are capped. Malformed or negative values, limits beyond the unsigned 64-bit range, and offsets beyond `2^63 - 1` are rejected with `400`. The offset is retained as a 64-bit value on every target; for an in-memory collection, an offset too large for the target's address space is a valid request beyond the collection and returns an empty page.
+
+`pagination.limit` reports the page size the server applied, not the number of items returned: an omitted `limit` reports 100 even when fewer rows exist.
+
+Pagination is validated only by routes that consume it, after their authentication, namespace-claim, and role gates. A malformed `limit`/`offset` therefore never preempts the `401` or `403` the caller would otherwise receive, never affects the always-unauthenticated `/live` observability tier, and is ignored on non-paginated routes such as `/namespaces`, `/backup`, and `/cluster`. On the paginated `GET` routes the check runs before the request body is read, so a malformed `limit`/`offset` returns `400` without buffering a body the read endpoint would never use. Route-specific ceilings narrower than the shared bounds — such as the `GET /audit` `offset` cap described below — are applied in that same pre-body check, so they also return `400` rather than a body-size `413`.
+
+Two endpoints intentionally differ and document their own bounds below: `GET /audit` shares these bounds for `limit` but caps `offset` at `2^32 - 1`, and `GET /api-specs` uses a default of 50 and a maximum of 200. Both return their own `{ items, ..., next_offset }` envelope instead of `data`/`pagination`.
+
 ## Proxies
 
 ```bash
-# List all proxies
+# List proxies (first page)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies
 
 # Create a proxy
@@ -385,7 +395,7 @@ Consumer credential string maxima use Unicode character counts, matching OpenAPI
 # List available plugin types
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins
 
-# List all plugin configs
+# List plugin configs (first page)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins/config
 
 # Create plugin config
@@ -407,7 +417,7 @@ Plugin-config reads by `viewer` and `operator` roles use the same redacted proje
 ## Upstreams
 
 ```bash
-# List all upstreams
+# List upstreams (first page)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams
 
 # Create an upstream (load-balanced backend group)
@@ -481,7 +491,7 @@ See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
 When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. Partial `POST /batch` mutations that return `207 Multi-Status` emit an audit event when at least one resource was changed. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials and sensitive plugin configuration. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence. Loki plugin diffs preserve only the endpoint scheme/host/port and redact its path, query, authorization, and all custom-header values.
 
-`GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters.
+`GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters. `limit` follows the shared bounds (default 100, maximum 1000), and malformed or out-of-range values are rejected with `400`. The audit store indexes offsets as a 32-bit value, so `offset` is capped at `2^32 - 1` here rather than the `2^63 - 1` other list endpoints allow — a larger offset returns `400`. The audit response keeps its own `{ "items", "limit", "offset", "next_offset", "total" }` envelope. `next_offset` is always strictly greater than `offset`; it is `null` when no further page exists or the next cursor would exceed the 32-bit ceiling.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
@@ -734,6 +744,8 @@ Returns **201** with `{ id, proxy_id, content_hash, spec_version }` on success. 
 Returns paginated spec summaries (no spec content). The list includes Tier 1 metadata fields extracted at submit time (`description`, `contact_name`, `contact_email`, `license_name`, `license_identifier`, `tags`, `server_urls`, `operation_count`). The internal `resource_hash` is excluded.
 
 Response shape: `{ "items": [...], "limit": N, "offset": N, "next_offset": N|null, "total": N }`. The `total` field is the count of all matching rows ignoring pagination — use it to render "showing X–Y of Z" in UIs.
+
+`limit` defaults to 50 with a maximum of 200 here — stricter than the 100/1000 used by the other list endpoints — and `offset` is a 32-bit value. As elsewhere, malformed or negative `limit`/`offset` values are rejected with 400 rather than coerced to a default.
 
 Supports filter and sort query parameters: `proxy_id` (exact), `spec_version` (prefix), `title_contains` (case-insensitive substring), `updated_since` (ISO-8601), `has_tag` (exact tag membership), `sort_by` (`updated_at`, `title`, `operation_count`, `created_at`; default `updated_at`), and `order` (`asc`/`desc`; default `desc`). Unknown `sort_by` or `order` values return 400.
 

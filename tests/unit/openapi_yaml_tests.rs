@@ -86,6 +86,19 @@ fn schema_property_names(
         .collect()
 }
 
+fn operation_parameter<'a>(
+    spec: &'a serde_json::Value,
+    parameters_pointer: &str,
+    name: &str,
+) -> &'a serde_json::Value {
+    spec.pointer(parameters_pointer)
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("missing parameter array at {parameters_pointer}"))
+        .iter()
+        .find(|parameter| parameter.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        .unwrap_or_else(|| panic!("missing `{name}` parameter at {parameters_pointer}"))
+}
+
 fn assert_serde_schema_field_parity<T>(
     spec: &serde_json::Value,
     schema_label: &str,
@@ -133,6 +146,52 @@ fn assert_serde_component_field_parity<T>(
         &format!("/components/schemas/{component}/properties"),
         intentionally_undocumented,
         schema_only,
+    );
+}
+
+#[test]
+fn admin_pagination_schema_matches_runtime_bounds_and_coercion() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let shared_offset = spec
+        .pointer("/components/parameters/PaginationOffset/schema")
+        .expect("shared pagination offset schema");
+    assert_eq!(shared_offset["minimum"], json!(0));
+    assert_eq!(shared_offset["maximum"], json!(i64::MAX));
+    assert_eq!(shared_offset["format"], json!("int64"));
+
+    let shared_limit = spec
+        .pointer("/components/parameters/PaginationLimit/schema")
+        .expect("shared pagination limit schema");
+    assert_eq!(shared_limit["minimum"], json!(0));
+    assert_eq!(shared_limit["maximum"], json!(u64::MAX));
+    assert_eq!(shared_limit["default"], json!(100));
+
+    let api_spec_parameters = "/paths/~1api-specs/get/parameters";
+    let api_spec_limit = operation_parameter(&spec, api_spec_parameters, "limit");
+    assert_eq!(api_spec_limit["schema"]["minimum"], json!(0));
+    assert_eq!(api_spec_limit["schema"]["maximum"], json!(u64::MAX));
+    assert_eq!(api_spec_limit["schema"]["default"], json!(50));
+    let api_spec_offset = operation_parameter(&spec, api_spec_parameters, "offset");
+    assert_eq!(api_spec_offset["schema"]["minimum"], json!(0));
+    assert_eq!(api_spec_offset["schema"]["maximum"], json!(u32::MAX));
+
+    let audit_offset = operation_parameter(&spec, "/paths/~1audit/get/parameters", "offset");
+    assert_eq!(audit_offset["schema"]["minimum"], json!(0));
+    assert_eq!(audit_offset["schema"]["maximum"], json!(u32::MAX));
+
+    let api_spec_response = spec
+        .pointer("/components/schemas/ApiSpecListResponse")
+        .expect("API-spec list response schema");
+    assert!(
+        api_spec_response["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("total")))
+    );
+    assert_eq!(
+        api_spec_response["properties"]["total"]["minimum"],
+        json!(0)
     );
 }
 

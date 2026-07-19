@@ -5,8 +5,9 @@ You are one of several parallel implementer agents resolving GitHub issues in
 
 **YOU are the implementer — do not sub-dispatch.** Write, commit, and push the code yourself,
 in this session. Do NOT invoke any agent-dispatch skill or script in your environment
-(e.g. `opus-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, `claude` CLI workers) and do
-NOT spawn nested workers: the orchestrator chose this session's model and reasoning effort
+(e.g. `opus-agents`, `fable-agents`, `grok-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`,
+`claude` CLI workers) and do NOT spawn nested workers: the orchestrator chose this session's
+model and reasoning effort
 deliberately, and delegating silently substitutes different hands at a different effort. If a
 skill index entry fails to load (stale path), ignore it and continue — you need nothing beyond
 this brief and your prompt.

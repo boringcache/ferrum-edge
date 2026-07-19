@@ -314,7 +314,21 @@ These fields are stored at INSERT time and do not require re-parsing the spec fo
 
 ## List filters
 
-`GET /api-specs` supports the following query parameters in addition to `limit` and `offset`:
+`GET /api-specs` uses a stricter pagination scheme than the other admin list
+endpoints: `limit` defaults to 50 with a maximum of 200 (`0` means the default,
+higher unsigned 64-bit values are capped), and `offset` is an unsigned 32-bit
+value defaulting to 0. As everywhere else, malformed or negative
+`limit`/`offset` values, limits beyond the unsigned 64-bit range, and offsets
+above `2^32 - 1` are rejected with HTTP 400 rather than coerced to a default.
+Percent-encoded query parameter names are decoded before matching, so encoding
+`limit` or `offset` cannot bypass these bounds. Names are decoded before values:
+a name that is not one of the recognized filters below — including one whose
+percent-encoding is not valid UTF-8 — is ignored without decoding its value, so
+unrelated third-party query parameters never break the request. Malformed
+percent-encoding in the value of a *recognized* filter is still rejected with
+HTTP 400.
+
+It supports the following query parameters in addition to `limit` and `offset`:
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -326,7 +340,8 @@ These fields are stored at INSERT time and do not require re-parsing the spec fo
 | `sort_by` | enum | `updated_at` (default), `title`, `operation_count`, `created_at` |
 | `order` | enum | `desc` (default), `asc` |
 
-Unknown `sort_by` or `order` values return HTTP 400.
+Unknown `sort_by` or `order` values, SQL `LIKE` wildcards in `spec_version` or
+`title_contains`, and malformed `limit`/`offset` values all return HTTP 400.
 
 ### List response shape
 
@@ -342,7 +357,7 @@ Unknown `sort_by` or `order` values return HTTP 400.
 
 - `items` — page of spec summaries (no `spec_content` or `resource_hash`).
 - `limit` / `offset` — the pagination parameters that were applied.
-- `next_offset` — set when `items.len() == limit`, indicating there may be more results; `null` on the last page.
+- `next_offset` — set to `offset + items.len()` when that value is strictly greater than `offset`, remains below `total`, and fits in the 32-bit offset range; `null` on the last page or when the next cursor cannot be represented.
 - `total` — count of all rows matching the filter (ignoring `limit`/`offset`). Use this to build "showing 1–50 of 327" pagination UI.
 
 ### Tag-name rules

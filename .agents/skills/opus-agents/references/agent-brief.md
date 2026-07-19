@@ -4,6 +4,15 @@ You are a Claude Code Opus worker dispatched by a Codex orchestrator. Implement 
 Ferrum Edge task in the worktree named in the dispatch prompt. The orchestrator reviews your work
 and decides whether it can merge; never merge a PR yourself.
 
+## Implement directly
+
+Write, commit, and push the changes yourself in this session. Do not invoke any agent-dispatch
+skill or script in the environment, including `sol-agents`, `opus-agents`, `fable-agents`,
+`grok-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI
+workers. Do not spawn nested workers. The orchestrator chose this session's model and reasoning
+effort deliberately. If a skill registry entry is stale or unavailable, ignore it and continue
+with this brief and the dispatch prompt.
+
 ## Verify isolation first
 
 Before reading broadly or editing:

@@ -693,9 +693,15 @@ async fn handle_admin_connection(
 }
 
 /// Pagination parameters parsed from query string.
+///
+/// An omitted `limit` applies [`DEFAULT_PAGE_SIZE`] — list endpoints never
+/// return unbounded collections (`GET /backup` is the intentional full-export
+/// mechanism). `offset` is bounded at parse time to the backend-safe `i64`
+/// range so later conversions cannot wrap negative (which MongoDB would then
+/// reinterpret as a huge `u64` skip).
 pub(crate) struct PaginationParams {
-    offset: usize,
-    limit: Option<usize>,
+    offset: i64,
+    limit: usize,
 }
 
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -703,44 +709,162 @@ const MAX_PAGE_SIZE: usize = 1000;
 
 impl PaginationParams {
     fn in_memory_limit(&self) -> usize {
-        self.limit.unwrap_or(usize::MAX)
+        self.limit
+    }
+
+    /// Offset for an in-memory collection. A backend-safe offset can exceed
+    /// `usize` on a 32-bit target; that is a valid request beyond any
+    /// addressable in-memory collection, so callers return an empty page.
+    fn in_memory_offset(&self) -> Option<usize> {
+        usize::try_from(self.offset).ok()
     }
 
     pub(crate) fn query_limit_i64(&self) -> i64 {
-        self.limit.map(|limit| limit as i64).unwrap_or(i64::MAX)
+        self.limit as i64
     }
 
-    fn response_limit(&self, total: usize) -> usize {
+    /// Offset is stored in the backend-safe type, without a target-sized
+    /// narrowing between parsing and the database call.
+    pub(crate) fn query_offset_i64(&self) -> i64 {
+        self.offset
+    }
+
+    fn response_limit(&self) -> usize {
         self.limit
-            .unwrap_or_else(|| total.saturating_sub(self.offset))
     }
 }
 
-fn parse_pagination(uri: &hyper::Uri) -> PaginationParams {
-    let mut offset = 0usize;
-    let mut limit = None;
+/// Apply the documented limit default/cap and reject malformed values or
+/// offsets outside the backend-safe range with `400` rather than wrapping.
+fn invalid_pagination_response(field: &str, reason: &str) -> Box<Response<Full<Bytes>>> {
+    Box::new(json_response(
+        StatusCode::BAD_REQUEST,
+        &json!({"error": format!("Invalid {field} pagination parameter: {reason}")}),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaginationValueError {
+    Malformed,
+    Overflow,
+}
+
+impl PaginationValueError {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Malformed => "must be a non-negative integer",
+            Self::Overflow => "exceeds the maximum supported value",
+        }
+    }
+}
+
+/// Parse an unsigned pagination value while keeping malformed and numeric
+/// overflow diagnostics distinct. The distinction is part of the stable 400
+/// contract, not a reflection of parser internals.
+pub(crate) fn parse_unsigned_pagination_value(value: &str) -> Result<u64, PaginationValueError> {
+    value.parse().map_err(|_| {
+        if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+            PaginationValueError::Overflow
+        } else {
+            PaginationValueError::Malformed
+        }
+    })
+}
+
+fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<Full<Bytes>>>> {
+    let mut offset = 0i64;
+    let mut limit = DEFAULT_PAGE_SIZE;
     if let Some(query) = uri.query() {
-        for pair in query.split('&') {
-            let mut parts = pair.splitn(2, '=');
-            if let (Some(key), Some(val)) = (parts.next(), parts.next()) {
-                match key {
-                    "offset" => {
-                        offset = val.parse().unwrap_or(0);
+        for (key, val) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "offset" => {
+                    let parsed = parse_unsigned_pagination_value(&val)
+                        .map_err(|error| invalid_pagination_response("offset", error.reason()))?;
+                    if parsed > i64::MAX as u64 {
+                        return Err(invalid_pagination_response(
+                            "offset",
+                            "exceeds the maximum supported value",
+                        ));
                     }
-                    "limit" => {
-                        let parsed = val.parse().unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
-                        limit = Some(if parsed == 0 {
-                            DEFAULT_PAGE_SIZE
-                        } else {
-                            parsed
-                        });
-                    }
-                    _ => {}
+                    offset = i64::try_from(parsed).map_err(|_| {
+                        invalid_pagination_response("offset", "exceeds the maximum supported value")
+                    })?;
                 }
+                "limit" => {
+                    let parsed = parse_unsigned_pagination_value(&val)
+                        .map_err(|error| invalid_pagination_response("limit", error.reason()))?;
+                    // `0` keeps the documented "server default" meaning; values
+                    // above the maximum are capped, both per openapi.yaml.
+                    let parsed = if parsed == 0 {
+                        DEFAULT_PAGE_SIZE
+                    } else {
+                        usize::try_from(parsed.min(MAX_PAGE_SIZE as u64)).map_err(|_| {
+                            invalid_pagination_response(
+                                "limit",
+                                "exceeds the maximum supported value",
+                            )
+                        })?
+                    };
+                    limit = parsed;
+                }
+                _ => {}
             }
         }
     }
-    PaginationParams { offset, limit }
+    Ok(PaginationParams { offset, limit })
+}
+
+/// Narrow a shared `i64` pagination offset to the `u32` the audit store
+/// indexes by, producing the documented audit 400 when it does not fit.
+///
+/// Shared by `parse_audit_filter` and the pre-body validation in
+/// [`enforce_route_pagination_bounds`] so the two paths cannot report different
+/// results for the same request.
+fn audit_pagination_offset(offset: i64) -> Result<u32, Box<Response<Full<Bytes>>>> {
+    u32::try_from(offset).map_err(|_| {
+        Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Audit offset exceeds supported range"}),
+        ))
+    })
+}
+
+/// Apply the route-specific pagination ceilings that are narrower than the
+/// shared [`parse_pagination`] contract.
+///
+/// `parse_pagination` accepts any offset up to `i64::MAX`, but some routes
+/// narrow it further inside their handler. Replaying those ceilings in the
+/// pre-body path keeps its verdict identical to the one the route arm reaches
+/// after the body read — otherwise a request that the arm would reject with the
+/// documented `400` instead buffers an unused body and returns `413`.
+///
+/// Keep this in sync with the per-route narrowing the handlers perform; every
+/// route listed here must also appear in [`paginated_get_list_route_role`], or
+/// the bound is never reached before the body read.
+fn enforce_route_pagination_bounds(
+    segments: &[&str],
+    pagination: &PaginationParams,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    match segments {
+        // `parse_audit_filter` narrows the offset to the audit store's `u32`.
+        // `limit` needs no extra bound: `parse_pagination` already caps it at
+        // `MAX_PAGE_SIZE`, so the arm's `clamp(1, MAX_PAGE_SIZE) as u32` is
+        // infallible.
+        ["audit"] => {
+            audit_pagination_offset(pagination.offset)?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Return a representable, strictly advancing cursor only when more rows
+/// remain. `None` prevents clients from looping at the `u32` ceiling or when a
+/// backend unexpectedly returns an empty page before its reported total.
+pub fn advancing_u32_offset(offset: u32, item_count: usize, total: i64) -> Option<u32> {
+    let item_count = u32::try_from(item_count).ok()?;
+    let next = offset.checked_add(item_count)?;
+    (next > offset && i64::from(next) < total).then_some(next)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -793,6 +917,41 @@ fn require_admin_role(actor: &AuditActor, required: AdminRole) -> Option<Respons
             )
         }),
     ))
+}
+
+/// The GET list routes that actually consume `limit`/`offset`, paired with the
+/// role their route arm requires before parsing pagination.
+///
+/// `Some(None)` means the arm has no role gate (the caller's role is passed
+/// through to the handler for row-level filtering instead); `Some(Some(role))`
+/// mirrors the `require_admin_role` call the arm makes first. `None` means the
+/// route does not consume pagination — those routes must keep ignoring
+/// irrelevant `limit`/`offset` parameters, so they are deliberately absent
+/// (including the non-paginated `/admin/tls/**/{id}` detail routes that
+/// [`tls_route_required_role`] also matches).
+///
+/// This exists so pagination can be validated before the shared request-body
+/// read without reordering authentication, namespace-claim enforcement, or
+/// RBAC ahead of it. Keep it in sync with the `route_pagination!()` call sites.
+fn paginated_get_list_route_role(method: &Method, segments: &[&str]) -> Option<Option<AdminRole>> {
+    if method != Method::GET {
+        return None;
+    }
+    match segments {
+        ["proxies"] | ["consumers"] | ["upstreams"] | ["plugins", "config"] => Some(None),
+        ["audit"] => Some(Some(AdminRole::Admin)),
+        ["admin", "tls", "inventory"]
+        | ["admin", "tls", "events"]
+        | ["admin", "tls", "acme", "certificates"]
+        | ["admin", "tls", "acme", "accounts"]
+        | ["admin", "tls", "acme", "orders"]
+        | ["admin", "tls", "certificates"]
+        | ["admin", "tls", "ca-bundles"]
+        | ["admin", "tls", "crls"]
+        | ["admin", "tls", "ocsp-responses"]
+        | ["admin", "tls", "jwks"] => Some(Some(AdminRole::Operator)),
+        _ => None,
+    }
 }
 
 fn tls_route_required_role(method: &Method, segments: &[&str]) -> Option<AdminRole> {
@@ -869,27 +1028,38 @@ pub(crate) fn log_audit_enqueue_failure(_error: &anyhow::Error) {
     );
 }
 
-/// Apply pagination to a serializable collection.
-/// Always wraps the response in an envelope with metadata.
-fn paginate_response(items: &Value, pagination: &PaginationParams) -> Value {
-    let arr = match items.as_array() {
-        Some(a) => a,
-        None => return items.clone(),
+/// Apply pagination before mapping or serializing an in-memory collection.
+/// The iterator is cloned only to compute the total; the mapper runs for the
+/// selected page, so role-aware redaction and JSON conversion stay bounded by
+/// the applied limit.
+fn paginate_mapped_response<I, F>(items: I, pagination: &PaginationParams, map: F) -> Value
+where
+    I: Iterator + Clone,
+    F: FnMut(I::Item) -> Value,
+{
+    let total = items.clone().count();
+    let paginated: Vec<Value> = match pagination.in_memory_offset() {
+        Some(offset) => items
+            .skip(offset)
+            .take(pagination.in_memory_limit())
+            .map(map)
+            .collect(),
+        None => Vec::new(),
     };
-    let total = arr.len();
-    let paginated: Vec<_> = arr
-        .iter()
-        .skip(pagination.offset)
-        .take(pagination.in_memory_limit())
-        .collect();
     json!({
         "data": paginated,
         "pagination": {
             "offset": pagination.offset,
-            "limit": pagination.response_limit(total),
+            "limit": pagination.response_limit(),
             "total": total
         }
     })
+}
+
+/// Apply pagination to a serializable slice and wrap it in the shared
+/// response envelope. Serialization happens only for the selected page.
+fn paginate_response<T: Serialize>(items: &[T], pagination: &PaginationParams) -> Value {
+    paginate_mapped_response(items.iter(), pagination, |item| json!(item))
 }
 
 /// Build pagination envelope from database-paginated results.
@@ -902,7 +1072,7 @@ fn paginate_db_response<T: Serialize>(
         "data": items,
         "pagination": {
             "offset": pagination.offset,
-            "limit": pagination.response_limit(total.max(0) as usize),
+            "limit": pagination.response_limit(),
             "total": total
         }
     })
@@ -1040,7 +1210,10 @@ pub async fn handle_admin_request(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| q.to_string());
-    let pagination = parse_pagination(req.uri());
+    // Retain the URI after the request body is consumed. Pagination is parsed
+    // only inside list-route arms, after their authentication, namespace, and
+    // role gates, so irrelevant query keys cannot change another route.
+    let uri = req.uri().clone();
     // Extracted once: used both for observability-detail tiering below and the
     // main admin JWT gate further down.
     let auth_header = req
@@ -1490,6 +1663,44 @@ pub async fn handle_admin_request(
         return Ok(resp);
     }
 
+    // Pagination lives in the request line, not the body, so validate it for the
+    // GET list routes that consume it BEFORE the shared body read below. Without
+    // this, `GET /proxies?limit=abc` carrying an oversized (and entirely unused)
+    // body returns `413` and buffers up to the limit instead of the documented
+    // malformed-pagination `400`. The route's own role gate is replayed here
+    // first so pagination can never preempt the `403` the arm would return; the
+    // in-arm gates below remain authoritative and simply re-run idempotently.
+    let prevalidated_pagination =
+        match paginated_get_list_route_role(&method, segments_peek.as_slice()) {
+            Some(required_role) => {
+                if let Some(role) = required_role
+                    && let Some(resp) = require_admin_role(&auth, role)
+                {
+                    drop(req.into_body());
+                    return Ok(resp);
+                }
+                match parse_pagination(&uri) {
+                    Ok(pagination) => {
+                        // Routes whose handler narrows the shared bounds must
+                        // apply that ceiling here too, or their documented 400
+                        // is still preempted by the body-size 413 below.
+                        if let Err(response) =
+                            enforce_route_pagination_bounds(segments_peek.as_slice(), &pagination)
+                        {
+                            drop(req.into_body());
+                            return Ok(*response);
+                        }
+                        Some(pagination)
+                    }
+                    Err(response) => {
+                        drop(req.into_body());
+                        return Ok(*response);
+                    }
+                }
+            }
+            None => None,
+        };
+
     // Read body with size limit.
     // /restore gets a configurable limit (default 100 MiB) for large-scale
     // backups (30K+ proxies / 90K+ plugins can reach ~80 MB);
@@ -1529,9 +1740,25 @@ pub async fn handle_admin_request(
         return Ok(resp);
     }
 
+    macro_rules! route_pagination {
+        () => {
+            match prevalidated_pagination {
+                // Validated before the body read for every route in
+                // `paginated_get_list_route_role`; reuse it rather than
+                // re-parsing so the two paths cannot diverge.
+                Some(pagination) => pagination,
+                None => match parse_pagination(&uri) {
+                    Ok(pagination) => pagination,
+                    Err(response) => return Ok(*response),
+                },
+            }
+        };
+    }
+
     let response = match (method.clone(), segments.as_slice()) {
         // Proxies CRUD
         (Method::GET, ["proxies"]) => {
+            let pagination = route_pagination!();
             crud::handle_list::<Proxy>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::GET, ["proxies", id]) => {
@@ -1558,6 +1785,7 @@ pub async fn handle_admin_request(
 
         // Consumers CRUD
         (Method::GET, ["consumers"]) => {
+            let pagination = route_pagination!();
             crud::handle_list::<Consumer>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::POST, ["consumers"]) => {
@@ -1635,6 +1863,7 @@ pub async fn handle_admin_request(
         // Plugins
         (Method::GET, ["plugins"]) => handle_list_plugin_types().await,
         (Method::GET, ["plugins", "config"]) => {
+            let pagination = route_pagination!();
             crud::handle_list::<PluginConfig>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::POST, ["plugins", "config"]) => {
@@ -1661,6 +1890,7 @@ pub async fn handle_admin_request(
 
         // Upstreams CRUD
         (Method::GET, ["upstreams"]) => {
+            let pagination = route_pagination!();
             crud::handle_list::<Upstream>(&state, &pagination, auth.role, &namespace).await
         }
         (Method::POST, ["upstreams"]) => {
@@ -1709,6 +1939,7 @@ pub async fn handle_admin_request(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
+            let pagination = route_pagination!();
             handle_audit_list(&state, &pagination, query.as_deref(), &namespace).await
         }
 
@@ -1724,18 +1955,21 @@ pub async fn handle_admin_request(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let pagination = route_pagination!();
             tls_management::handle_inventory(&state, &pagination).await
         }
         (Method::GET, ["admin", "tls", "events"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let pagination = route_pagination!();
             tls_management::handle_events(&pagination, query.as_deref()).await
         }
         (Method::GET, ["admin", "tls", "acme", "certificates"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let pagination = route_pagination!();
             tls_management::handle_list_acme_certificates(&pagination).await
         }
         (Method::POST, ["admin", "tls", "acme", "certificates"]) => {
@@ -1766,6 +2000,7 @@ pub async fn handle_admin_request(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let pagination = route_pagination!();
             tls_management::handle_list_acme_accounts(&pagination).await
         }
         (Method::POST, ["admin", "tls", "acme", "renew", certificate_id]) => {
@@ -1778,6 +2013,7 @@ pub async fn handle_admin_request(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let pagination = route_pagination!();
             tls_management::handle_list_acme_orders(&pagination).await
         }
         (Method::POST, ["admin", "tls", "acme", "orders"]) => {
@@ -1808,6 +2044,7 @@ pub async fn handle_admin_request(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let pagination = route_pagination!();
             tls_management::handle_list_managed(ManagedTlsMaterialKind::Certificate, &pagination)
                 .await
         }
@@ -1840,6 +2077,7 @@ pub async fn handle_admin_request(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let pagination = route_pagination!();
             tls_management::handle_list_managed(ManagedTlsMaterialKind::CaBundle, &pagination).await
         }
         (Method::POST, ["admin", "tls", "ca-bundles"]) => {
@@ -1871,6 +2109,7 @@ pub async fn handle_admin_request(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let pagination = route_pagination!();
             tls_management::handle_list_managed(ManagedTlsMaterialKind::Crl, &pagination).await
         }
         (Method::POST, ["admin", "tls", "crls"]) => {
@@ -1901,6 +2140,7 @@ pub async fn handle_admin_request(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let pagination = route_pagination!();
             tls_management::handle_list_managed(ManagedTlsMaterialKind::OcspResponse, &pagination)
                 .await
         }
@@ -1933,6 +2173,7 @@ pub async fn handle_admin_request(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
+            let pagination = route_pagination!();
             tls_management::handle_list_managed(ManagedTlsMaterialKind::Jwks, &pagination).await
         }
         (Method::POST, ["admin", "tls", "jwks"]) => {
@@ -6962,17 +7203,11 @@ fn parse_audit_filter(
     query: Option<&str>,
     pagination: &PaginationParams,
 ) -> Result<audit::AuditListFilter, Box<Response<Full<Bytes>>>> {
-    let offset = u32::try_from(pagination.offset).map_err(|_| {
-        Box::new(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "Audit offset exceeds supported range"}),
-        ))
-    })?;
+    // Shared with the pre-body check in `enforce_route_pagination_bounds`, so a
+    // too-large offset yields this same 400 whether or not a body was sent.
+    let offset = audit_pagination_offset(pagination.offset)?;
     let mut filter = audit::AuditListFilter {
-        limit: pagination
-            .limit
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE) as u32,
+        limit: pagination.limit.clamp(1, MAX_PAGE_SIZE) as u32,
         offset,
         ..Default::default()
     };
@@ -7008,16 +7243,9 @@ fn parse_audit_filter(
                             .with_timezone(&Utc),
                     );
                 }
-                "limit" => {
-                    let parsed = value.parse::<usize>().map_err(|_| {
-                        Box::new(json_response(
-                            StatusCode::BAD_REQUEST,
-                            &json!({"error": "Invalid audit limit"}),
-                        ))
-                    })?;
-                    filter.limit = parsed.clamp(1, MAX_PAGE_SIZE) as u32;
-                }
-                "offset" => {}
+                // `limit`/`offset` are owned by `parse_pagination`, which has
+                // already validated and bounded them into `pagination`.
+                "limit" | "offset" => {}
                 _ => {}
             }
         }
@@ -7043,11 +7271,7 @@ async fn handle_audit_list(
 
     match db.list_audit_events(namespace, &filter).await {
         Ok(result) => {
-            let next_offset = if (filter.offset as i64 + result.items.len() as i64) < result.total {
-                Some(filter.offset + result.items.len() as u32)
-            } else {
-                None
-            };
+            let next_offset = advancing_u32_offset(filter.offset, result.items.len(), result.total);
             Ok(json_response(
                 StatusCode::OK,
                 &json!({
@@ -7635,23 +7859,26 @@ mod tests {
     }
 
     #[test]
-    fn unpaginated_response_returns_all_items() {
+    fn unpaginated_response_applies_default_page_size() {
         let uri: hyper::Uri = "/proxies".parse().unwrap();
-        let pagination = parse_pagination(&uri);
-        let items = json!((0..150).collect::<Vec<_>>());
+        let pagination = parse_pagination(&uri).expect("no query string is valid");
+        let items = (0..150).collect::<Vec<_>>();
 
         let response = paginate_response(&items, &pagination);
 
-        assert_eq!(response["data"].as_array().unwrap().len(), 150);
-        assert_eq!(response["pagination"]["limit"], 150);
-        assert_eq!(pagination.query_limit_i64(), i64::MAX);
+        // An omitted limit applies the 100-item default instead of returning
+        // the whole collection (GET /backup is the full-export mechanism).
+        assert_eq!(response["data"].as_array().unwrap().len(), 100);
+        assert_eq!(response["pagination"]["limit"], 100);
+        assert_eq!(response["pagination"]["total"], 150);
+        assert_eq!(pagination.query_limit_i64(), 100);
     }
 
     #[test]
     fn explicit_limit_still_caps_response() {
         let uri: hyper::Uri = "/proxies?limit=25&offset=10".parse().unwrap();
-        let pagination = parse_pagination(&uri);
-        let items = json!((0..150).collect::<Vec<_>>());
+        let pagination = parse_pagination(&uri).expect("valid pagination");
+        let items = (0..150).collect::<Vec<_>>();
 
         let response = paginate_response(&items, &pagination);
 
@@ -7659,6 +7886,72 @@ mod tests {
         assert_eq!(response["pagination"]["offset"], 10);
         assert_eq!(response["pagination"]["limit"], 25);
         assert_eq!(pagination.query_limit_i64(), 25);
+        assert_eq!(pagination.query_offset_i64(), 10);
+    }
+
+    #[test]
+    fn in_memory_pagination_maps_only_the_selected_page() {
+        use std::cell::Cell;
+
+        let uri: hyper::Uri = "/proxies?limit=2&offset=10".parse().unwrap();
+        let pagination = parse_pagination(&uri).expect("valid pagination");
+        let mapped = Cell::new(0);
+
+        let response = paginate_mapped_response(0..150, &pagination, |item| {
+            mapped.set(mapped.get() + 1);
+            json!(item)
+        });
+
+        assert_eq!(mapped.get(), 2, "only page items may be mapped/redacted");
+        assert_eq!(response["data"], json!([10, 11]));
+        assert_eq!(response["pagination"]["offset"], 10);
+        assert_eq!(response["pagination"]["limit"], 2);
+        assert_eq!(response["pagination"]["total"], 150);
+    }
+
+    #[test]
+    fn pagination_limit_zero_uses_default_and_large_values_cap() {
+        let uri: hyper::Uri = "/proxies?limit=0".parse().unwrap();
+        let pagination = parse_pagination(&uri).expect("limit=0 keeps default meaning");
+        assert_eq!(pagination.query_limit_i64(), DEFAULT_PAGE_SIZE as i64);
+
+        let uri: hyper::Uri = "/proxies?limit=5000".parse().unwrap();
+        let pagination = parse_pagination(&uri).expect("above-max limit caps");
+        assert_eq!(pagination.query_limit_i64(), MAX_PAGE_SIZE as i64);
+    }
+
+    #[test]
+    fn pagination_rejects_malformed_and_overflowing_values() {
+        for uri in [
+            "/proxies?offset=abc",
+            "/proxies?offset=-1",
+            "/proxies?offset=1.5",
+            "/proxies?limit=abc",
+            "/proxies?limit=-1",
+            // i64::MAX + 1 wrapped negative in the old `as i64` cast and
+            // became a huge MongoDB u64 skip.
+            "/proxies?offset=9223372036854775808",
+            // usize::MAX / u64::MAX likewise exceeds the backend-safe range.
+            "/proxies?offset=18446744073709551615",
+            "/proxies?limit=184467440737095516160",
+        ] {
+            let uri: hyper::Uri = uri.parse().unwrap();
+            let Err(response) = parse_pagination(&uri) else {
+                panic!("malformed/overflowing input must be rejected: {uri}");
+            };
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "malformed input must be rejected with 400: {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn pagination_offset_at_i64_max_is_backend_safe() {
+        let uri: hyper::Uri = "/proxies?offset=9223372036854775807".parse().unwrap();
+        let pagination = parse_pagination(&uri).expect("i64::MAX offset is backend-safe");
+        assert_eq!(pagination.query_offset_i64(), i64::MAX);
     }
 
     #[test]

@@ -10,12 +10,15 @@ The Admin Read-Only Mode restricts persisted configuration and database mutation
 
 ### Read Operations (Always Allowed)
 All GET endpoints continue to work normally in read-only mode:
-- `GET /proxies` - List all proxies
+- `GET /proxies` - List proxies (paginated)
 - `GET /proxies/{id}` - Get specific proxy
-- `GET /consumers` - List all consumers
+- `GET /consumers` - List consumers (paginated)
 - `GET /consumers/{id}` - Get specific consumer
-- `GET /plugin-configs` - List all plugin configurations
-- `GET /plugin-configs/{id}` - Get specific plugin configuration
+- `GET /plugins/config` - List plugin configurations (paginated)
+- `GET /plugins/config/{id}` - Get specific plugin configuration
+
+List endpoints return one page at a time (default 100 items, maximum 1000); see
+[admin_api.md](admin_api.md) for the full pagination contract.
 
 ### Configuration Mutations (Blocked in Read-Only Mode)
 Configuration and database mutations are blocked and return `403 Forbidden`:
@@ -25,9 +28,9 @@ Configuration and database mutations are blocked and return `403 Forbidden`:
 - `POST /consumers` - Create new consumer
 - `PUT /consumers/{id}` - Update existing consumer
 - `DELETE /consumers/{id}` - Delete consumer
-- `POST /plugin-configs` - Create new plugin configuration
-- `PUT /plugin-configs/{id}` - Update existing plugin configuration
-- `DELETE /plugin-configs/{id}` - Delete plugin configuration
+- `POST /plugins/config` - Create new plugin configuration
+- `PUT /plugins/config/{id}` - Update existing plugin configuration
+- `DELETE /plugins/config/{id}` - Delete plugin configuration
 
 Operational POST endpoints that do not persist configuration remain available
 with their normal JWT and role checks. These include
