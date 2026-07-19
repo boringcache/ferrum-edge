@@ -436,10 +436,20 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   for the opaque-ARM64-executable search, which reads a program's command text
   rather than its raw lines, so `cat <<EOF ... $cmd build --target
   aarch64-unknown-linux-gnu ... EOF` is the configuration data it is while the
-  same words inside a body `$()` still fail closed. An arithmetic expansion in
-  such a body dispatches nothing — `$((scripts/build))` evaluates a division —
-  so it is skipped in parity with the heredoc-opener parser, while `$( (cmd) )`,
-  the only spelling that nests a real substitution, still executes. Each
+  same words inside a body `$()` still fail closed. The whole body is joined
+  before its substitutions are read, because a substitution may open on one body
+  line and close on a later one: `$(` followed by `bash scripts/unsafe.sh` and
+  `)` on separate lines runs that script, and reading one physical line at a time
+  saw no balanced substitution on the opener and no command slot on the
+  continuation, which is still heredoc data. An arithmetic expansion in such a
+  body dispatches nothing of its own — `$((scripts/build))` evaluates a division
+  — so the expression itself gains no command slot, but the shell still performs
+  the command substitutions *inside* an arithmetic expansion before evaluating
+  it, so `$(( $(bash scripts/unsafe.sh) + 0 ))` is recursed into and that script
+  is recorded and scanned. `$( (cmd) )`, the only spelling that nests a real
+  substitution, still executes. Backtick substitutions stay line-local, because a
+  backtick pair spanning physical lines cannot be told apart from the Markdown a
+  documentation heredoc writes. Each
   interior runs in a subshell, so it is followed as its own nested program: a
   `cd` inside one resolves that interior's own operands and then ends with the
   subshell, instead of rewriting the working directory every later real line of
@@ -476,12 +486,22 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   positional operand: its duration is mandatory and precedes the command, so
   `timeout --preserve-status \` and `timeout -k 5 \` hand the next line that
   duration, while `timeout 30 \` and `timeout --preserve-status 30 \` have
-  already consumed it and do restore the slot.
+  already consumed it and do restore the slot. The same mandatory duration is
+  modelled in the pattern layer, not only in the token walk: `timeout` is not an
+  ordinary wrapper there either, so `timeout --preserve-status $seconds build`
+  reads `$seconds` as the duration operand it is and `build` as the executable,
+  instead of reporting the benign dynamic duration as an opaque Cross
+  executable.
   Leading words that precede the executable without being it do not close the
   slot: a negation (`! cmd`), assignment words (`FOO=bar $cmd`), process
   wrappers, `env` and its options, and any number of spaced or unspaced subshell
   openers (`(`, `((`, `( (`) may all sit between the command start and an opaque
-  executable word, in any combination and on either side of the opener. An
+  executable word, in any combination and on either side of the opener. That one
+  interleaved layer is shared by every executable-slot matcher, including the
+  literal Cross scan, so `env FOO=1 sudo BAR=2 env cross build --target
+  aarch64-unknown-linux-gnu` is recognized in workflows and reached shell
+  automation alike; a layer that fixed wrappers before assignment words and
+  allowed only a single `env` described just one of those orderings. An
   executable assembled from expansions that then dispatches a Cargo or Cross
   subcommand (`"$cmd" build`) is opaque for every target, not only the protected
   ARM64 one, so it fails closed in trusted-automation revalidation as well.
@@ -700,8 +720,11 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   skipped for having no detectable language. Those two halves are what close the
   edge: the first makes `ci/unsafe` and `scripts/build` discoverable without a
   `./` prefix or an interpreter word, the second makes them scannable once
-  discovered. `scripts/` is itself a scanned automation root, so omitting it
-  from the extensionless spellings left a direct `run: scripts/build` unscanned.
+  discovered. Every scanned automation root is spelled there as well —
+  `.github/scripts/`, `comparison/`, `tests/k8s/`, and `tests/performance/` —
+  because a root this policy already scans is exactly where a direct
+  `run: .github/scripts/build` would otherwise go unrecorded, just as omitting
+  `scripts/` once left `run: scripts/build` unscanned.
   Python automation reached this way has dynamic process commands rejected
   rather than silently dropped, so an argv assembled into a variable
   (`cmd = ['python3', 'ci/unsafe.py']; subprocess.run(cmd)`) fails closed
@@ -729,11 +752,30 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   merge-base and the proposed tree, so a proposed no-shebang `scripts/opaque`
   reached by `python3 scripts/opaque` is compared as Python rather than as
   unread text, and the two sides stay symmetric.
-  A reached build-dispatcher recipe is shell, so it is held to the same
-  opaque-stdin rule as any other reached shell automation: a `printf
-  '\x63ross build --target ...' | bash` recipe fails closed during exact-tree
-  revalidation instead of only during pull-request comparison. A recipe whose
-  producer is an ordinary unescaped literal stays readable and stays editable.
+  Provenance is applied whenever it appears, not only the first time a path is
+  reached. A suffixless script already reached bare and read as shell is re-read
+  when a later edge names `python3` or `pwsh` for it, so the process calls inside
+  that alternate-language reading are followed too; skipping on reachability
+  alone meant `scripts/a` discovered first as shell and later as `python3
+  scripts/a` never had its `subprocess.run(['bash', 'scripts/unsafe.sh'])` edge
+  added. Provenance only accumulates, so the walk settles in a bounded number of
+  passes and reports rather than assumes if it cannot.
+  A reached build-dispatcher recipe is shell, so it is scanned with the whole
+  trusted-shell surface policy rather than a subset of it: literal Cross, wrapped
+  literal Cross, generated inline shell, an opaque ARM64 execution, an opaque
+  Cross executable for *any* target (`cmd=$(printf cross); "$cmd" build`), and an
+  undecodable stdin producer such as `printf '\x63ross build --target ...' | bash`
+  all fail closed during exact-tree revalidation and not only during pull-request
+  comparison. A recipe whose producer is an ordinary unescaped literal stays
+  readable and stays editable.
+  Those raw-text searches read a program's command text rather than its raw
+  lines, for the same reason the opaque-ARM64 search does. A reached script that
+  *writes* a literal template — `cat <<'EOF'` holding `bash -c "$(render)"` — is
+  not executing that inline shell, so the quoted body no longer reports a
+  generated inline shell surface that would block safe automation edits. The
+  narrowing is not a weakening: an unquoted body's substitutions are re-emitted
+  as the command lines they really are, backslash continuations are folded first,
+  and an unterminated heredoc withdraws the narrowing and reads the program raw.
   Cross-sensitive jobs, local-action files, and
   reachable scripts are represented by full digests, while unrelated workflow,
   action, and script additions or edits remain permitted. The isolated jobs use
