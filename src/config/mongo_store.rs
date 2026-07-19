@@ -3747,6 +3747,20 @@ mod inner {
         Ok(doc)
     }
 
+    /// Convert a paginated `offset` into MongoDB's unsigned `skip`.
+    ///
+    /// Admin callers bound `offset` to `0..=i64::MAX` in
+    /// `admin::parse_pagination` before it ever reaches a store, so a negative
+    /// value is unreachable here. This helper enforces that invariant at the
+    /// call site anyway: a bare `offset as u64` would reinterpret a negative
+    /// offset as an enormous skip, which is precisely the wraparound this
+    /// pagination contract exists to prevent. Defense in depth for any future
+    /// caller of the public `DatabaseBackend` trait.
+    fn mongo_skip(offset: i64) -> u64 {
+        debug_assert!(offset >= 0, "offset must be non-negative");
+        offset.max(0) as u64
+    }
+
     /// Convert a BSON `Document` back into a domain `Proxy`.
     ///
     /// All admin resource types use `#[serde(deny_unknown_fields)]`, so every
@@ -5786,7 +5800,7 @@ mod inner {
             let total = self.proxies().count_documents(ns_filter.clone()).await? as i64;
             let options = FindOptions::builder()
                 .sort(doc! { "_id": 1 })
-                .skip(Some(offset as u64))
+                .skip(Some(mongo_skip(offset)))
                 .limit(Some(limit))
                 .build();
             let proxies = self.proxies();
@@ -6275,7 +6289,7 @@ mod inner {
             let total = self.consumers().count_documents(ns_filter.clone()).await? as i64;
             let options = FindOptions::builder()
                 .sort(doc! { "_id": 1 })
-                .skip(Some(offset as u64))
+                .skip(Some(mongo_skip(offset)))
                 .limit(Some(limit))
                 .build();
             let consumers = self.consumers();
@@ -6720,7 +6734,7 @@ mod inner {
                 .await? as i64;
             let options = FindOptions::builder()
                 .sort(doc! { "_id": 1 })
-                .skip(Some(offset as u64))
+                .skip(Some(mongo_skip(offset)))
                 .limit(Some(limit))
                 .build();
             let plugin_configs = self.plugin_configs();
@@ -7267,7 +7281,7 @@ mod inner {
             let total = self.upstreams().count_documents(ns_filter.clone()).await? as i64;
             let options = FindOptions::builder()
                 .sort(doc! { "_id": 1 })
-                .skip(Some(offset as u64))
+                .skip(Some(mongo_skip(offset)))
                 .limit(Some(limit))
                 .build();
             let upstreams = self.upstreams();
