@@ -143,7 +143,8 @@ impl MeshTopology {
             "east_west_gateway" | "east-west-gateway" => Ok(Self::EastWestGateway),
             "egress_gateway" | "egress-gateway" => Ok(Self::EgressGateway),
             other => Err(format!(
-                "Invalid FERRUM_MESH_TOPOLOGY '{other}'. Expected: sidecar, ambient, node_waypoint, service_waypoint, east_west_gateway, or egress_gateway"
+                "Invalid FERRUM_MESH_TOPOLOGY {}. Expected: sidecar, ambient, node_waypoint, service_waypoint, east_west_gateway, or egress_gateway",
+                crate::secrets::quoted_env_value("FERRUM_MESH_TOPOLOGY", other)
             )),
         }
     }
@@ -207,7 +208,8 @@ impl MeshConfigProtocol {
             "xds" => Ok(Self::Xds),
             "file" => Ok(Self::File),
             other => Err(format!(
-                "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. Expected: native, xds, or file"
+                "Invalid FERRUM_MESH_CONFIG_PROTOCOL {}. Expected: native, xds, or file",
+                crate::secrets::quoted_env_value("FERRUM_MESH_CONFIG_PROTOCOL", other)
             )),
         }
     }
@@ -523,13 +525,21 @@ impl MeshRuntimeConfig {
                 let _ = rest;
                 crate::identity::SpiffeId::new(trimmed).map_err(|e| {
                     format!(
-                        "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: invalid SPIFFE id '{trimmed}': {e}"
+                        "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: invalid SPIFFE id {}: {e}",
+                        crate::secrets::quoted_env_value(
+                            "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS",
+                            trimmed
+                        )
                     )
                 })?;
             } else if trimmed.contains("://") {
                 return Err(format!(
-                    "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: entry '{trimmed}' looks like a URI \
-                     but is not a 'spiffe://' SPIFFE id"
+                    "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS: entry {} looks like a URI \
+                     but is not a 'spiffe://' SPIFFE id",
+                    crate::secrets::quoted_env_value(
+                        "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS",
+                        trimmed
+                    )
                 ));
             }
         }
@@ -580,8 +590,9 @@ impl MeshRuntimeConfig {
             "registry_only" => crate::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly,
             other => {
                 return Err(format!(
-                    "Invalid FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY '{other}'. Expected: \
-                     allow_any or registry_only"
+                    "Invalid FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY {}. Expected: \
+                     allow_any or registry_only",
+                    crate::secrets::quoted_env_value("FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY", other)
                 ));
             }
         };
@@ -10493,7 +10504,14 @@ fn start_mesh_admin_listeners(
         let admin_serving_degraded = serving_degraded.clone();
         let admin_failures = serving_listener_failures.clone();
         handles.push(tokio::spawn(async move {
-            info!("Starting mesh admin HTTP listener on {}", admin_http_addr);
+            info!(
+                "Starting mesh admin HTTP listener on {}",
+                crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    "FERRUM_ADMIN_HTTP_PORT",
+                    &admin_http_addr.to_string()
+                )
+            );
             if let Err(err) = admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 admin_state,
@@ -10516,13 +10534,19 @@ fn start_mesh_admin_listeners(
         }));
         startup_signals.push(("Mesh admin HTTP listener".to_string(), started_rx));
     } else {
-        info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext mesh admin HTTP listener disabled");
+        info!(
+            "{} — plaintext mesh admin HTTP listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0")
+        );
     }
 
     // Admin HTTPS listener (only if TLS is configured and the port is not
     // disabled — port 0 is the repository-wide disable sentinel).
     if env_config.admin_https_port == 0 {
-        info!("FERRUM_ADMIN_HTTPS_PORT=0 — mesh admin HTTPS listener disabled");
+        info!(
+            "{} — mesh admin HTTPS listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
+        );
     } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
         &env_config.admin_tls_cert_path,
         &env_config.admin_tls_key_path,
@@ -10558,7 +10582,14 @@ fn start_mesh_admin_listeners(
         let admin_serving_degraded = serving_degraded.clone();
         let admin_failures = serving_listener_failures.clone();
         handles.push(tokio::spawn(async move {
-            info!("Starting mesh admin HTTPS listener on {}", admin_https_addr);
+            info!(
+                "Starting mesh admin HTTPS listener on {}",
+                crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    "FERRUM_ADMIN_HTTPS_PORT",
+                    &admin_https_addr.to_string()
+                )
+            );
             let result = if let Some(slot) = admin_tls_slot {
                 admin::start_admin_listener_with_dynamic_tls_and_signal(
                     admin_https_addr,
@@ -10598,7 +10629,9 @@ fn start_mesh_admin_listeners(
 
     if env_config.admin_http_port == 0 && !env_config.admin_https_listener_enabled() {
         warn!(
-            "No mesh admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and admin HTTPS not configured or FERRUM_ADMIN_HTTPS_PORT=0. The admin API is unreachable."
+            "No mesh admin API listeners are active — {} and admin HTTPS not configured or {}. The admin API is unreachable.",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0"),
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
         );
     }
 
@@ -11789,12 +11822,12 @@ fn mesh_inbound_tls_reload_snapshot(
             load_material_blocking(&source, MaterialKind::CaBundle).with_context(|| {
                 format!(
                     "failed to load mesh frontend client CA bundle at {}",
-                    source.source_id()
+                    source.redacted_source_id()
                 )
             })?;
         let pem: Arc<[u8]> = material.bytes.expose_secret().to_vec().into();
         Some(MeshInboundClientCaBundle {
-            path: material.source_id,
+            path: material.display_source_id,
             pem,
         })
     } else {
@@ -13577,19 +13610,26 @@ fn parse_workload_labels(
         if entry.is_empty() {
             continue;
         }
+        // `entry` and `key` are trimmed segments of the variable, so each is a
+        // transformed rendering the textual pass cannot admit when short.
         let (key, value) = entry.split_once('=').ok_or_else(|| {
-            format!("FERRUM_MESH_WORKLOAD_LABELS entry '{entry}' must be in 'key=value' form")
+            format!(
+                "FERRUM_MESH_WORKLOAD_LABELS entry {} must be in 'key=value' form",
+                crate::secrets::quoted_env_value("FERRUM_MESH_WORKLOAD_LABELS", entry)
+            )
         })?;
         let key = key.trim();
         let value = value.trim();
         if key.is_empty() {
             return Err(format!(
-                "FERRUM_MESH_WORKLOAD_LABELS entry '{entry}' has an empty key"
+                "FERRUM_MESH_WORKLOAD_LABELS entry {} has an empty key",
+                crate::secrets::quoted_env_value("FERRUM_MESH_WORKLOAD_LABELS", entry)
             ));
         }
         if labels.insert(key.to_string(), value.to_string()).is_some() {
             return Err(format!(
-                "FERRUM_MESH_WORKLOAD_LABELS contains duplicate key '{key}'"
+                "FERRUM_MESH_WORKLOAD_LABELS contains duplicate key {}",
+                crate::secrets::quoted_env_value("FERRUM_MESH_WORKLOAD_LABELS", key)
             ));
         }
     }

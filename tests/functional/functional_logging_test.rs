@@ -332,9 +332,11 @@ async fn test_logging_clamped_settings_emit_startup_warnings() {
     let logs = gateway.read_combined_captured_output().unwrap_or_default();
     let entries = parse_log_lines(&logs);
 
+    // Production emits these via `%secrets::report_env_field(...)`, so JSON
+    // serializes supplied/applied as strings (unredacted for ordinary env inputs).
     for (variable, supplied, applied) in [
-        ("FERRUM_LOG_BUFFER_CAPACITY", 128_000, 65_536),
-        ("FERRUM_LOG_MAX_RECORD_BYTES", 512, 1_024),
+        ("FERRUM_LOG_BUFFER_CAPACITY", "128000", "65536"),
+        ("FERRUM_LOG_MAX_RECORD_BYTES", "512", "1024"),
     ] {
         assert!(
             entries.iter().any(|entry| {

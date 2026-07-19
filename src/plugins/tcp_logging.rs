@@ -310,7 +310,7 @@ fn build_tls_connector(
             let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
             let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
                 .map_err(|error| format!("TCP logging: failed to load CA bundle: {error}"))?;
-            let source_id = ca_material.source_id.clone();
+            let source_id = ca_material.display_source_id.clone();
             let mut reader = ca_material.bytes.expose_secret();
             let certs = rustls_pemfile::certs(&mut reader)
                 .filter_map(|cert| cert.ok())

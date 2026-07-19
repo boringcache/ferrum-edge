@@ -368,7 +368,7 @@ impl SpecExpose {
         // Load custom CA bundle when not skipping verification.
         if !tls_no_verify && let Some(ca_path) = plugin_http_client.tls_ca_bundle_path() {
             let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-            let source_id = source.source_id();
+            let source_id = source.redacted_source_id();
             let ca_material = load_material_blocking(&source, MaterialKind::CaBundle).map_err(
                 |error| {
                     format!(
@@ -381,14 +381,14 @@ impl SpecExpose {
                     |error| {
                         format!(
                             "spec_expose: configured CA bundle '{}' is invalid; refusing to widen trust: {error}",
-                            ca_material.source_id
+                            ca_material.display_source_id
                         )
                     },
                 )?;
             if certificates.is_empty() {
                 return Err(format!(
                     "spec_expose: configured CA bundle '{}' contains no certificates; refusing to widen trust",
-                    ca_material.source_id
+                    ca_material.display_source_id
                 ));
             }
             // reqwest 0.13: `tls_certs_only` replaces the trust store entirely

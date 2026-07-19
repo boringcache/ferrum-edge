@@ -972,7 +972,14 @@ pub async fn run(
         let admin_http_startup_ready = startup_ready.clone();
         let admin_http_serving_degraded = serving_degraded.clone();
         Some(tokio::spawn(async move {
-            info!("Starting Admin HTTP listener on {}", admin_http_addr);
+            info!(
+                "Starting Admin HTTP listener on {}",
+                crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    "FERRUM_ADMIN_HTTP_PORT",
+                    &admin_http_addr.to_string()
+                )
+            );
             if let Err(e) = admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 admin_state,
@@ -992,14 +999,20 @@ pub async fn run(
             }
         }))
     } else {
-        info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
+        info!(
+            "{} — plaintext admin HTTP listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0")
+        );
         None
     };
 
     // Admin HTTPS listener (only if TLS is configured and the port is not
     // disabled — port 0 is the repository-wide disable sentinel).
     let admin_https_handle = if env_config.admin_https_port == 0 {
-        info!("FERRUM_ADMIN_HTTPS_PORT=0 — admin HTTPS listener disabled");
+        info!(
+            "{} — admin HTTPS listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
+        );
         None
     } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
         &env_config.admin_tls_cert_path,
@@ -1064,7 +1077,14 @@ pub async fn run(
         let admin_https_serving_degraded = serving_degraded.clone();
 
         Some(tokio::spawn(async move {
-            info!("Starting Admin HTTPS listener on {}", admin_https_addr);
+            info!(
+                "Starting Admin HTTPS listener on {}",
+                crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    "FERRUM_ADMIN_HTTPS_PORT",
+                    &admin_https_addr.to_string()
+                )
+            );
             let result = if let Some(slot) = admin_tls_slot {
                 admin::start_admin_listener_with_dynamic_tls_and_signal(
                     admin_https_addr,
@@ -1101,7 +1121,9 @@ pub async fn run(
     };
     if env_config.admin_http_port == 0 && !env_config.admin_https_listener_enabled() {
         warn!(
-            "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and admin HTTPS not configured or FERRUM_ADMIN_HTTPS_PORT=0. The admin API is unreachable."
+            "No admin API listeners are active — {} and admin HTTPS not configured or {}. The admin API is unreachable.",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0"),
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
         );
     }
 
@@ -1157,9 +1179,13 @@ pub async fn run(
             // means either a loopback bind or an explicit operator opt-in. Either
             // way, surface a high-severity warning — DP JWTs and the full gateway
             // config travel unencrypted.
+            let grpc_addr_shown = crate::secrets::report_env_field(
+                "FERRUM_CP_GRPC_LISTEN_ADDR",
+                &grpc_addr.to_string(),
+            );
             if grpc_addr.ip().is_loopback() {
                 warn!(
-                    "SECURITY: CP gRPC config sync is running in PLAINTEXT on loopback {grpc_addr} \
+                    "SECURITY: CP gRPC config sync is running in PLAINTEXT on loopback {grpc_addr_shown} \
                      — acceptable for local development only. DP authentication JWTs and the full \
                      gateway configuration are unencrypted. Configure FERRUM_CP_GRPC_TLS_CERT_PATH \
                      + FERRUM_CP_GRPC_TLS_KEY_PATH before exposing this CP off-host."
@@ -1167,7 +1193,7 @@ pub async fn run(
             } else {
                 warn!(
                     "SECURITY: CP gRPC config sync is running in PLAINTEXT on non-loopback \
-                     {grpc_addr} because FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true is set. DP \
+                     {grpc_addr_shown} because FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true is set. DP \
                      authentication JWTs and the full gateway configuration are exposed UNENCRYPTED \
                      to the network and unprotected against MITM. Use TLS \
                      (FERRUM_CP_GRPC_TLS_CERT_PATH + FERRUM_CP_GRPC_TLS_KEY_PATH) in production."
@@ -1177,7 +1203,10 @@ pub async fn run(
         };
 
         let grpc_listener = tokio::net::TcpListener::bind(grpc_addr).await?;
-        info!("CP gRPC server listening on {}", grpc_addr);
+        info!(
+            "CP gRPC server listening on {}",
+            crate::secrets::report_env_field("FERRUM_CP_GRPC_LISTEN_ADDR", &grpc_addr.to_string())
+        );
         let grpc_http2_max_concurrent_streams = env_config.server_http2_max_concurrent_streams;
         let grpc_http2_max_pending_accept_reset_streams =
             env_config.server_http2_max_pending_accept_reset_streams;

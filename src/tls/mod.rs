@@ -164,7 +164,7 @@ pub fn load_crls(path: Option<&str>) -> Result<CrlList, anyhow::Error> {
     let material = load_material_blocking(&crl_source, MaterialKind::Crl).map_err(|e| {
         anyhow::anyhow!(
             "Failed to load CRL source '{}': {}",
-            crl_source.source_id(),
+            crl_source.redacted_source_id(),
             e
         )
     })?;
@@ -175,7 +175,7 @@ pub fn load_crls(path: Option<&str>) -> Result<CrlList, anyhow::Error> {
             .map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to parse CRL PEM blocks from '{}': {}",
-                    material.source_id,
+                    material.display_source_id,
                     e
                 )
             })?;
@@ -183,14 +183,14 @@ pub fn load_crls(path: Option<&str>) -> Result<CrlList, anyhow::Error> {
     if crls.is_empty() {
         return Err(anyhow::anyhow!(
             "No valid CRL entries found in '{}'. Expected PEM blocks with '-----BEGIN X509 CRL-----'",
-            material.source_id
+            material.display_source_id
         ));
     }
 
     info!(
         "Loaded {} CRL(s) from {} for certificate revocation checking",
         crls.len(),
-        material.source_id
+        material.display_source_id
     );
     Ok(Arc::new(crls))
 }
@@ -513,7 +513,7 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
     check_cert_expiry_from_pem_bytes(
         cert_material.bytes.expose_secret(),
         "server TLS cert",
-        &cert_material.source_id,
+        &cert_material.display_source_id,
         cert_expiry_warning_days,
     )?;
 
@@ -522,14 +522,14 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         .map_err(|e| {
             anyhow::anyhow!(
                 "server TLS cert: failed to parse PEM certificates from '{}': {}",
-                cert_material.source_id,
+                cert_material.display_source_id,
                 e
             )
         })?;
     if cert_chain.is_empty() {
         return Err(anyhow::anyhow!(
             "server TLS cert: no PEM certificates found in '{}'",
-            cert_material.source_id
+            cert_material.display_source_id
         ));
     }
 
@@ -540,11 +540,11 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
             if bytes.is_empty() {
                 return Err(anyhow::anyhow!(
                     "OCSP response source '{}' was empty",
-                    material.source_id
+                    material.display_source_id
                 ));
             }
             info!(
-                ocsp_source = %material.source_id,
+                ocsp_source = %material.display_source_id,
                 "Loaded stapled OCSP response for server TLS config"
             );
             bytes
@@ -570,7 +570,7 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         // No verification mode (for testing only)
         warn!(
             "TLS configuration loaded with certificate verification DISABLED (testing mode) from cert source: {}, key source: {}",
-            cert_material.source_id, key_source_id
+            cert_material.display_source_id, key_source_id
         );
 
         builder
@@ -582,7 +582,7 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         check_cert_expiry_from_pem_bytes(
             ca_material.bytes.expose_secret(),
             "client CA bundle",
-            &ca_material.source_id,
+            &ca_material.display_source_id,
             cert_expiry_warning_days,
         )?;
         let ca_certs: Vec<_> = certs(&mut Cursor::new(ca_material.bytes.expose_secret()))
@@ -590,7 +590,7 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
             .map_err(|e| {
                 anyhow::anyhow!(
                     "client CA bundle: failed to parse PEM certificates from '{}': {}",
-                    ca_material.source_id,
+                    ca_material.display_source_id,
                     e
                 )
             })?;
@@ -601,13 +601,17 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         if added == 0 {
             return Err(anyhow::anyhow!(
                 "No valid client CA certificates found in {}",
-                ca_material.source_id
+                ca_material.display_source_id
             ));
         }
 
         info!(
             "TLS configuration loaded with client certificate verification from cert source: {}, key source: {}, client CA source: {} (added: {}, ignored: {})",
-            cert_material.source_id, key_source_id, ca_material.source_id, added, ignored
+            cert_material.display_source_id,
+            key_source_id,
+            ca_material.display_source_id,
+            added,
+            ignored
         );
 
         let mut verifier_builder =
@@ -633,7 +637,7 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         // No client certificate verification
         info!(
             "TLS configuration loaded without client certificate verification from cert source: {}, key source: {}",
-            cert_material.source_id, key_source_id
+            cert_material.display_source_id, key_source_id
         );
 
         builder
@@ -701,12 +705,14 @@ fn load_server_cert_resolver(
     }
 
     let key_material = load_material_blocking(key_source, MaterialKind::Key)?;
-    let key = private_key(&mut Cursor::new(key_material.bytes.expose_secret()))?
-        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_material.source_id))?;
+    let key =
+        private_key(&mut Cursor::new(key_material.bytes.expose_secret()))?.ok_or_else(|| {
+            anyhow::anyhow!("No private key found in {}", key_material.display_source_id)
+        })?;
     let resolver = acme_tls_alpn_cert_resolver(cert_chain, key, ocsp_response, crypto_provider)?;
     Ok(ServerCertResolverLoad {
         resolver,
-        key_source_id: key_material.source_id,
+        key_source_id: key_material.display_source_id,
     })
 }
 
@@ -1079,23 +1085,25 @@ pub fn load_mesh_server_identity(
         .map_err(|e| {
             anyhow::anyhow!(
                 "mesh server TLS cert: failed to parse PEM certificates from '{}': {}",
-                cert_material.source_id,
+                cert_material.display_source_id,
                 e
             )
         })?;
     if cert_chain.is_empty() {
         return Err(anyhow::anyhow!(
             "No certificates found in mesh server TLS cert {}",
-            cert_material.source_id
+            cert_material.display_source_id
         ));
     }
 
-    let key = private_key(&mut Cursor::new(key_material.bytes.expose_secret()))?
-        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_material.source_id))?;
+    let key =
+        private_key(&mut Cursor::new(key_material.bytes.expose_secret()))?.ok_or_else(|| {
+            anyhow::anyhow!("No private key found in {}", key_material.display_source_id)
+        })?;
 
     Ok(Arc::new(MeshServerIdentity {
-        cert_path: cert_material.source_id,
-        key_path: key_material.source_id,
+        cert_path: cert_material.display_source_id,
+        key_path: key_material.display_source_id,
         source: MeshServerCertSource::Static { cert_chain, key },
     }))
 }
@@ -1122,7 +1130,7 @@ pub fn load_mesh_tls_config_with_identity(
         client_ca_bundle_material
             .as_ref()
             .map(|material| ClientCaBundleRef {
-                path: material.source_id.as_str(),
+                path: material.display_source_id.as_str(),
                 pem: material.bytes.expose_secret(),
             });
 
@@ -1465,7 +1473,7 @@ pub fn build_client_cert_verifier(
         .map_err(|e| {
             anyhow::anyhow!(
                 "client CA bundle: failed to parse PEM certificates from '{}': {}",
-                ca_material.source_id,
+                ca_material.display_source_id,
                 e
             )
         })?;
@@ -1476,7 +1484,7 @@ pub fn build_client_cert_verifier(
     if added == 0 {
         return Err(anyhow::anyhow!(
             "No valid client CA certificates found in {}",
-            ca_material.source_id
+            ca_material.display_source_id
         ));
     }
 
@@ -1516,7 +1524,7 @@ pub fn check_cert_expiry(
     check_cert_expiry_from_pem_bytes(
         material.bytes.expose_secret(),
         label,
-        &material.source_id,
+        &material.display_source_id,
         warning_days,
     )
 }
@@ -1615,7 +1623,7 @@ pub fn check_cert_expiry_for_validation(
         Ok(material) => check_cert_expiry_from_pem_bytes(
             material.bytes.expose_secret(),
             field_name,
-            &material.source_id,
+            &material.display_source_id,
             warning_days,
         )
         .map_err(|e| e.to_string()),

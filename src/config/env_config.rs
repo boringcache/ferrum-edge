@@ -57,10 +57,31 @@ impl OperatingMode {
             "injector" => Ok(Self::Injector),
             "node_agent" => Ok(Self::NodeAgent),
             "migrate" => Ok(Self::Migrate),
-            other => Err(format!(
-                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, mesh, injector, node_agent, migrate",
-                other
-            )),
+            other => {
+                const MODES: &str = "database, file, cp, dp, mesh, injector, node_agent, migrate";
+                // Withheld by key, not by shape, and this is the *only*
+                // defense here rather than a belt-and-braces one. The site
+                // lowercases before echoing, so what an operator sees is a
+                // rendering of the resolved value rather than the value
+                // itself, and for a short value (`DB` -> `db`) the textual
+                // backstop cannot cover that rendering at all: a two-byte
+                // derived candidate is below `MIN_DERIVED_CANDIDATE_LEN` and
+                // is dropped, because arming `db` process-wide would shred
+                // every unrelated diagnostic containing it.
+                // `is_external_secret_key` is exact: the
+                // variable is known by name to have been externally resolved,
+                // so no rendering of it escapes here. The expected-value list
+                // is the actionable part and is kept. Same boundary and same
+                // shape as `env_config_macro::invalid_env_value`, which this
+                // hand-written `format!` does not go through.
+                if crate::secrets::is_external_secret_key("FERRUM_MODE") {
+                    return Err(format!(
+                        "Invalid FERRUM_MODE {}. Expected: {MODES}",
+                        crate::secrets::EXTERNAL_SECRET_PLACEHOLDER
+                    ));
+                }
+                Err(format!("Invalid FERRUM_MODE '{other}'. Expected: {MODES}"))
+            }
         }
     }
 }
@@ -196,21 +217,25 @@ fn validate_k8s_namespace(ns: &str) -> Result<(), String> {
 /// that does not parse, or that carries an unsupported scheme, is an `Err` so
 /// the misconfiguration surfaces at startup rather than at first dial.
 fn cp_dp_grpc_url_is_nonloopback_plaintext(url: &str) -> Result<bool, String> {
+    // `url` is a trimmed list segment and `scheme()` is a lowercased fragment of
+    // it, so both are transformed renderings; withhold by key.
+    let shown = crate::secrets::quoted_env_value("FERRUM_DP_CP_GRPC_URLS", url);
     let parsed = url::Url::parse(url)
-        .map_err(|e| format!("FERRUM_DP_CP_GRPC_URLS entry '{url}' is not a valid URL: {e}"))?;
+        .map_err(|e| format!("FERRUM_DP_CP_GRPC_URLS entry {shown} is not a valid URL: {e}"))?;
     let plaintext = match parsed.scheme() {
         "https" | "grpcs" => return Ok(false),
         "http" | "grpc" => true,
         other => {
             return Err(format!(
-                "FERRUM_DP_CP_GRPC_URLS entry '{url}' has unsupported scheme '{other}://' \
-                 (expected http:// or https://)"
+                "FERRUM_DP_CP_GRPC_URLS entry {shown} has unsupported scheme {} \
+                 (expected http:// or https://)",
+                crate::secrets::quoted_env_value("FERRUM_DP_CP_GRPC_URLS", &format!("{other}://"))
             ));
         }
     };
     let host = parsed
         .host()
-        .ok_or_else(|| format!("FERRUM_DP_CP_GRPC_URLS entry '{url}' is missing a host"))?;
+        .ok_or_else(|| format!("FERRUM_DP_CP_GRPC_URLS entry {shown} is missing a host"))?;
     let is_loopback = match host {
         url::Host::Ipv4(ip) => ip.is_loopback(),
         url::Host::Ipv6(ip) => ip.is_loopback(),
@@ -2646,15 +2671,22 @@ impl EnvConfig {
             .is_some_and(|raw| raw.trim() == "0")
         {
             tracing::warn!(
-                "FERRUM_DB_POLL_INTERVAL=0 is clamped to 1 second; set a positive interval to avoid this implicit floor"
+                "{} is clamped to 1 second; set a positive interval to avoid this implicit floor",
+                crate::secrets::report_env_assignment("FERRUM_DB_POLL_INTERVAL", "0")
             );
         }
         let db_rejected_delta_backoff_max_seconds = if db_rejected_delta_backoff_max_seconds
             < db_rejected_delta_backoff_initial_seconds
         {
             tracing::warn!(
-                configured_initial = db_rejected_delta_backoff_initial_seconds,
-                configured_max = db_rejected_delta_backoff_max_seconds,
+                configured_initial = %crate::secrets::report_env_field(
+                    "FERRUM_DB_REJECTED_DELTA_BACKOFF_INITIAL_SECONDS",
+                    &db_rejected_delta_backoff_initial_seconds.to_string()
+                ),
+                configured_max = %crate::secrets::report_env_field(
+                    "FERRUM_DB_REJECTED_DELTA_BACKOFF_MAX_SECONDS",
+                    &db_rejected_delta_backoff_max_seconds.to_string()
+                ),
                 "FERRUM_DB_REJECTED_DELTA_BACKOFF_MAX_SECONDS is below the initial backoff; clamped to the initial value"
             );
             db_rejected_delta_backoff_initial_seconds
@@ -2667,7 +2699,10 @@ impl EnvConfig {
         let db_pool_statement_timeout_seconds =
             if db_pool_statement_timeout_seconds > MAX_STATEMENT_TIMEOUT_SECONDS {
                 tracing::warn!(
-                    configured = db_pool_statement_timeout_seconds,
+                    configured = %crate::secrets::report_env_field(
+                        "FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS",
+                        &db_pool_statement_timeout_seconds.to_string()
+                    ),
                     clamped = MAX_STATEMENT_TIMEOUT_SECONDS,
                     max = MAX_STATEMENT_TIMEOUT_SECONDS,
                     "FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS exceeds maximum, clamped"
@@ -2985,17 +3020,22 @@ impl EnvConfig {
         for method in &tls_early_data_methods {
             if method != "GET" {
                 tracing::warn!(
-                    "FERRUM_TLS_EARLY_DATA_METHODS includes non-GET method '{}' — \
+                    "FERRUM_TLS_EARLY_DATA_METHODS includes non-GET method {} — \
                      0-RTT early data is replayable, which is dangerous for \
                      non-idempotent operations",
-                    method
+                    crate::secrets::quoted_env_value("FERRUM_TLS_EARLY_DATA_METHODS", method)
                 );
             }
         }
         if !tls_early_data_methods.is_empty() {
+            // The `{:?}` rendering is uppercased and re-quoted, so it is a
+            // transformed form like the warning above; withhold by key.
             tracing::info!(
-                "TLS 1.3 0-RTT early data enabled for methods: {:?}",
-                tls_early_data_methods
+                "TLS 1.3 0-RTT early data enabled for methods: {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_TLS_EARLY_DATA_METHODS",
+                    &format!("{:?}", tls_early_data_methods)
+                )
             );
         }
 
@@ -3070,9 +3110,15 @@ impl EnvConfig {
             );
             if raw > http3_coalesce_max_bytes {
                 tracing::warn!(
-                    "FERRUM_HTTP3_COALESCE_MIN_BYTES={} exceeds FERRUM_HTTP3_COALESCE_MAX_BYTES={}; clamping MIN to MAX",
-                    raw,
-                    http3_coalesce_max_bytes,
+                    "{} exceeds {}; clamping MIN to MAX",
+                    crate::secrets::report_env_assignment(
+                        "FERRUM_HTTP3_COALESCE_MIN_BYTES",
+                        &raw.to_string()
+                    ),
+                    crate::secrets::report_env_assignment(
+                        "FERRUM_HTTP3_COALESCE_MAX_BYTES",
+                        &http3_coalesce_max_bytes.to_string()
+                    ),
                 );
             }
             clamped
@@ -3707,8 +3753,14 @@ impl EnvConfig {
              and FERRUM_ADMIN_TLS_KEY_PATH, then FERRUM_ADMIN_HTTP_PORT=0; \
              or (4) for local development only — FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true.",
             mode = self.mode,
-            port = self.admin_http_port,
-            bind = self.admin_bind_address,
+            port = crate::secrets::report_env_field(
+                "FERRUM_ADMIN_HTTP_PORT",
+                &self.admin_http_port.to_string()
+            ),
+            bind = crate::secrets::report_env_field(
+                "FERRUM_ADMIN_BIND_ADDRESS",
+                &self.admin_bind_address
+            ),
         ))
     }
 
@@ -3909,7 +3961,7 @@ impl EnvConfig {
             return Ok(path.display().to_string());
         }
 
-        let source_id = source.source_id();
+        let source_id = source.redacted_source_id();
         let material = crate::tls::source::load_material_blocking(&source, kind)
             .map_err(|e| format!("Failed to load database TLS material: {e}"))?;
         let temp_file = tempfile::Builder::new()
@@ -4249,8 +4301,9 @@ impl EnvConfig {
                     "native" | "xds" | "file" => {}
                     other => {
                         return Err(format!(
-                            "Invalid FERRUM_MESH_CONFIG_PROTOCOL '{other}'. \
-                             Expected: native, xds, or file"
+                            "Invalid FERRUM_MESH_CONFIG_PROTOCOL {}. \
+                             Expected: native, xds, or file",
+                            crate::secrets::quoted_env_value("FERRUM_MESH_CONFIG_PROTOCOL", other)
                         ));
                     }
                 }
@@ -4507,9 +4560,12 @@ impl EnvConfig {
                         }
                     }
                     other => {
+                        // `migrate_action` is declared `lowercase()`, so this
+                        // echoes a case-folded form the textual redactor cannot
+                        // admit at one or two bytes. Withhold by key.
                         return Err(format!(
-                            "Invalid FERRUM_MIGRATE_ACTION '{}'. Expected: up, status, config",
-                            other
+                            "Invalid FERRUM_MIGRATE_ACTION {}. Expected: up, status, config",
+                            crate::secrets::quoted_env_value("FERRUM_MIGRATE_ACTION", other)
                         ));
                     }
                 }
@@ -4559,8 +4615,15 @@ impl EnvConfig {
             if entry == "*" {
                 continue;
             }
-            crate::config::types::validate_namespace(entry)
-                .map_err(|e| format!("Invalid FERRUM_CP_NAMESPACES entry '{}': {}", entry, e))?;
+            // `entry` is the *trimmed* segment, so a padded one- or two-byte
+            // entry renders as a form below the derived-candidate minimum.
+            crate::config::types::validate_namespace(entry).map_err(|e| {
+                format!(
+                    "Invalid FERRUM_CP_NAMESPACES entry {}: {}",
+                    crate::secrets::quoted_env_value("FERRUM_CP_NAMESPACES", entry),
+                    e
+                )
+            })?;
         }
         // `*` must stand alone. A mixed set like `"*,prod"` is ambiguous: it
         // implies "everything plus an extra one" or "wildcard subset of one".
@@ -4609,14 +4672,20 @@ impl EnvConfig {
         // Validate bind addresses are valid IP addresses
         if self.proxy_bind_address.parse::<std::net::IpAddr>().is_err() {
             return Err(format!(
-                "Invalid FERRUM_PROXY_BIND_ADDRESS '{}'. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
-                self.proxy_bind_address
+                "Invalid FERRUM_PROXY_BIND_ADDRESS {}. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
+                crate::secrets::quoted_env_value(
+                    "FERRUM_PROXY_BIND_ADDRESS",
+                    &self.proxy_bind_address
+                )
             ));
         }
         if self.admin_bind_address.parse::<std::net::IpAddr>().is_err() {
             return Err(format!(
-                "Invalid FERRUM_ADMIN_BIND_ADDRESS '{}'. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
-                self.admin_bind_address
+                "Invalid FERRUM_ADMIN_BIND_ADDRESS {}. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
+                crate::secrets::quoted_env_value(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    &self.admin_bind_address
+                )
             ));
         }
 
@@ -4675,7 +4744,10 @@ impl EnvConfig {
             return Err(format!(
                 "FERRUM_ADMIN_JWT_MAX_TTL ({}) exceeds the maximum supported value ({}); \
                  use 0 to disable the lifetime cap",
-                self.admin_jwt_max_ttl,
+                crate::secrets::report_env_field(
+                    "FERRUM_ADMIN_JWT_MAX_TTL",
+                    &self.admin_jwt_max_ttl.to_string()
+                ),
                 i64::MAX
             ));
         }
@@ -4683,9 +4755,18 @@ impl EnvConfig {
         if self.http3_initial_mtu < crate::http3::config::QUIC_INITIAL_MTU_MIN
             || self.http3_initial_mtu > crate::http3::config::QUIC_INITIAL_MTU_MAX
         {
+            // Key-tied for the same reason as the overload thresholds below: the
+            // rejected MTU is re-rendered as its canonical `u16` `Display`, so a
+            // secret-backed `071` surfaces as `71` — two bytes, below
+            // `MIN_DERIVED_CANDIDATE_LEN`, which the textual pass may not admit.
+            // Only values under `QUIC_INITIAL_MTU_MIN` (1200) can reach here in
+            // practice, so the leaked rendering is always 1-4 digits.
             return Err(format!(
                 "FERRUM_HTTP3_INITIAL_MTU ({}) is outside quinn's legal range [{}, {}]",
-                self.http3_initial_mtu,
+                crate::secrets::report_env_field(
+                    "FERRUM_HTTP3_INITIAL_MTU",
+                    &self.http3_initial_mtu.to_string()
+                ),
                 crate::http3::config::QUIC_INITIAL_MTU_MIN,
                 crate::http3::config::QUIC_INITIAL_MTU_MAX,
             ));
@@ -4707,14 +4788,28 @@ impl EnvConfig {
         if self.overload_fd_pressure_threshold == self.overload_fd_critical_threshold {
             return Err(format!(
                 "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD ({})",
-                self.overload_fd_pressure_threshold, self.overload_fd_critical_threshold
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD",
+                    &self.overload_fd_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD",
+                    &self.overload_fd_critical_threshold.to_string()
+                )
             ));
         }
         if self.overload_fd_pressure_threshold > self.overload_fd_critical_threshold {
+            // Key-tied: `1.0` renders as `1`, below the derived-candidate minimum.
             tracing::warn!(
-                pressure = self.overload_fd_pressure_threshold,
-                critical = self.overload_fd_critical_threshold,
-                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD; swapping to correct ordering"
+                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD ({}) is greater than FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD ({}); swapping to correct ordering",
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD",
+                    &self.overload_fd_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD",
+                    &self.overload_fd_critical_threshold.to_string()
+                )
             );
             std::mem::swap(
                 &mut self.overload_fd_pressure_threshold,
@@ -4724,14 +4819,27 @@ impl EnvConfig {
         if self.overload_conn_pressure_threshold == self.overload_conn_critical_threshold {
             return Err(format!(
                 "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD ({})",
-                self.overload_conn_pressure_threshold, self.overload_conn_critical_threshold
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD",
+                    &self.overload_conn_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD",
+                    &self.overload_conn_critical_threshold.to_string()
+                )
             ));
         }
         if self.overload_conn_pressure_threshold > self.overload_conn_critical_threshold {
             tracing::warn!(
-                pressure = self.overload_conn_pressure_threshold,
-                critical = self.overload_conn_critical_threshold,
-                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD; swapping to correct ordering"
+                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD ({}) is greater than FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD ({}); swapping to correct ordering",
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD",
+                    &self.overload_conn_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD",
+                    &self.overload_conn_critical_threshold.to_string()
+                )
             );
             std::mem::swap(
                 &mut self.overload_conn_pressure_threshold,
@@ -4741,14 +4849,27 @@ impl EnvConfig {
         if self.overload_req_pressure_threshold == self.overload_req_critical_threshold {
             return Err(format!(
                 "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD ({})",
-                self.overload_req_pressure_threshold, self.overload_req_critical_threshold
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD",
+                    &self.overload_req_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD",
+                    &self.overload_req_critical_threshold.to_string()
+                )
             ));
         }
         if self.overload_req_pressure_threshold > self.overload_req_critical_threshold {
             tracing::warn!(
-                pressure = self.overload_req_pressure_threshold,
-                critical = self.overload_req_critical_threshold,
-                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD; swapping to correct ordering"
+                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD ({}) is greater than FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD ({}); swapping to correct ordering",
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD",
+                    &self.overload_req_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD",
+                    &self.overload_req_critical_threshold.to_string()
+                )
             );
             std::mem::swap(
                 &mut self.overload_req_pressure_threshold,
@@ -4761,8 +4882,14 @@ impl EnvConfig {
             tracing::warn!(
                 "WARNING: FERRUM_DB_POOL_MIN_CONNECTIONS ({}) exceeds FERRUM_DB_POOL_MAX_CONNECTIONS ({}). \
                  The pool will clamp min to max, wasting the higher setting.",
-                self.db_pool_min_connections,
-                self.db_pool_max_connections
+                crate::secrets::report_env_field(
+                    "FERRUM_DB_POOL_MIN_CONNECTIONS",
+                    &self.db_pool_min_connections.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_DB_POOL_MAX_CONNECTIONS",
+                    &self.db_pool_max_connections.to_string()
+                )
             );
         }
 
