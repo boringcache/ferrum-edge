@@ -1223,7 +1223,8 @@ mod tests {
     #[cfg(any(feature = "secrets-aws", feature = "secrets-gcp"))]
     #[test]
     fn client_init_timeout_error_is_deterministic_and_reference_free() {
-        let err = client_init_timeout_error("GCP Secret Manager", std::time::Duration::from_secs(7));
+        let err =
+            client_init_timeout_error("GCP Secret Manager", std::time::Duration::from_secs(7));
         assert_eq!(
             err,
             "Timeout initializing GCP Secret Manager client after 7s"
