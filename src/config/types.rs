@@ -5463,16 +5463,19 @@ impl CountryMmdbLoadSession {
             )));
         }
 
-        let loaded =
-            match load_validated_country_mmdb_inner(path, None, Some(&mut state.aggregate_budget)) {
-                Ok(loaded) => loaded,
-                Err(error) => {
-                    return match self.retain_last_known_good(&mut state, &path_key, path, &error) {
-                        Some(snapshot) => Ok(snapshot),
-                        None => Err(error),
-                    };
-                }
-            };
+        let loaded = match load_validated_country_mmdb_inner(
+            path,
+            None,
+            Some(&mut state.aggregate_budget),
+        ) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return match self.retain_last_known_good(&mut state, &path_key, path, &error) {
+                    Some(snapshot) => Ok(snapshot),
+                    None => Err(error),
+                };
+            }
+        };
         Ok(Arc::clone(
             state.snapshots.entry(path_key).or_insert(loaded),
         ))
