@@ -422,11 +422,57 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   to a named command, or that is only data, does not occupy a command word and
   stays editable. Substituting a whole command needs both a line a shell
   evaluates and a slot on it. A raw line scan also reads a workflow's non-`run`
-  block scalars and a script's heredoc bodies, and those are never evaluated, so
-  no slot on them counts: an expression inside a `prompt: |` block, a `cat <<EOF`
-  configuration body, or a `python3 <<'PYEOF'` body is data the runner never
-  dispatches, backticks there being Markdown rather than substitutions. On a line
-  a shell does evaluate, an explicit executable slot — `run:`, a statement
+  block scalars and a script's heredoc bodies. Prose block scalars and quoted
+  heredoc bodies attached to data-writing commands are not shell-evaluated, so
+  no slot on them counts: an expression inside a `prompt: |` block or a
+  `cat <<'EOF'` configuration body is data the runner never dispatches,
+  backticks there being Markdown rather than substitutions. An interpreter-fed
+  heredoc is different: quoting its delimiter suppresses expansion by the outer
+  shell, but `python3 <<'PYEOF'` still executes the body as Python, so the body
+  is extracted and rescanned in that language. Unquoted heredoc bodies are data
+  at line start, but the shell still evaluates command-substitution slots while
+  constructing their input, so
+  `$()` and backticks there fail closed — and, for the same reason, a
+  substitution in such a body is followed as a repository execution edge:
+  `cat <<EOF ... $(bash scripts/unsafe.sh) ... EOF` really runs that script, so
+  it is recorded and scanned. Only the substitution interior becomes a command;
+  the surrounding data line never gains a command slot of its own — including
+  for the opaque-ARM64-executable search, which reads a program's command text
+  rather than its raw lines, so `cat <<EOF ... $cmd build --target
+  aarch64-unknown-linux-gnu ... EOF` is the configuration data it is while the
+  same words inside a body `$()` still fail closed. The whole body is joined
+  before its substitutions are read, because a substitution may open on one body
+  line and close on a later one: `$(` followed by `bash scripts/unsafe.sh` and
+  `)` on separate lines runs that script, and reading one physical line at a time
+  saw no balanced substitution on the opener and no command slot on the
+  continuation, which is still heredoc data. An arithmetic expansion in such a
+  body dispatches nothing of its own — `$((scripts/build))` evaluates a division
+  — so the expression itself gains no command slot, but the shell still performs
+  the command substitutions *inside* an arithmetic expansion before evaluating
+  it, so `$(( $(bash scripts/unsafe.sh) + 0 ))` is recursed into and that script
+  is recorded and scanned. `$( (cmd) )`, the only spelling that nests a real
+  substitution, still executes. Backtick substitutions are paired across
+  physical lines too, because the shell permits that spelling and dropping it
+  would miss a real execution edge. This can conservatively scan a backtick pair
+  in Markdown written by an unquoted documentation heredoc, which is the
+  fail-closed side of the ambiguity. Each
+  interior runs in a subshell, so it is followed as its own nested program: a
+  `cd` inside one resolves that interior's own operands and then ends with the
+  subshell, instead of rewriting the working directory every later real line of
+  the parent script is resolved against.
+  Which bodies are quoted is decided by parsing the delimiter as the shell word
+  it is. A shell suppresses body expansion when *any* character of the delimiter
+  is quoted and terminates on the dequoted word, so `<<E"OF"` and `<<\EOF` are
+  quoted heredocs ending at `EOF`. Reading only a wholly quoted delimiter took
+  the first as the unquoted delimiter `E` — leaving the body expandable and
+  running the body state past the real terminator — and did not recognize the
+  second as a heredoc at all.
+  A `<<` inside an arithmetic expansion is the left-shift operator rather than a
+  heredoc opener, so a complete balanced `$(( ... ))` is skipped as a unit;
+  advancing past only the `$((` left `echo $((1 <<EOF))` able to mark the real
+  command lines after it as body data. A heredoc opened after arithmetic on the
+  same line is still a heredoc. On a line a shell does evaluate, an
+  explicit executable slot — `run:`, a statement
   separator, `$(`, a backtick, a conditional keyword — counts, and so does a bare
   line start, so the same expression alone on its own line inside a `run: |`
   block still fails closed. A raw source line that a backslash continuation
@@ -434,7 +480,67 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   'ferrumedge/ferrum-edge@sha256:%s ' *)` under `docker buildx imagetools create
   ... \` is that command's last argument — so only the bare-line-start allowance
   is withdrawn there; an explicit slot on the continuation line still counts, and
-  the joined logical line is scanned in its own right.
+  the joined logical line is scanned in its own right. A wrapper continuation
+  (`env \`, `sudo \`, `timeout 30 \`) is the exception that restores the next
+  line's slot, because the wrapper has not consumed its executable operand yet —
+  but not inside a heredoc body, where the receiving command reads that text as
+  input rather than dispatching it, and not when the wrapper is still waiting on
+  an option operand. `env -u \` and `sudo -u \` end the line mid-option, so the
+  word that follows is the name being unset or the user being assumed, not an
+  executable; treating it as a whole-command slot is a deterministic false
+  positive rather than a caught dispatch. `timeout` is the same case with a
+  positional operand: its duration is mandatory and precedes the command, so
+  `timeout --preserve-status \` and `timeout -k 5 \` hand the next line that
+  duration, while `timeout 30 \` and `timeout --preserve-status 30 \` have
+  already consumed it and do restore the slot. The same mandatory duration is
+  modelled in the pattern layer, not only in the token walk: `timeout` is not an
+  ordinary wrapper there either, so `timeout --preserve-status $seconds build`
+  reads `$seconds` as the duration operand it is and `build` as the executable,
+  instead of reporting the benign dynamic duration as an opaque Cross
+  executable. The restored raw-line slot also preserves the wrapper's assignment
+  semantics: after `env \` or `sudo \`, `FOO=bar $cmd` still dispatches `$cmd`,
+  while after `exec \`, `nohup \`, or `timeout 30 \`, `FOO=bar` is the wrapper's
+  command argv itself and no later executable slot is invented.
+  Leading words that precede the executable without being it do not close the
+  slot: a negation (`! cmd`), assignment words (`FOO=bar $cmd`), process
+  wrappers, `env` and its options, and any number of spaced or unspaced subshell
+  openers (`(`, `((`, `( (`) may all sit between the command start and an opaque
+  executable word, in any combination and on either side of the opener. That one
+  interleaved layer is shared by every executable-slot matcher, including the
+  literal Cross scan, so `env FOO=1 sudo BAR=2 env cross build --target
+  aarch64-unknown-linux-gnu` is recognized in workflows and reached shell
+  automation alike; a layer that fixed wrappers before assignment words and
+  allowed only a single `env` described just one of those orderings. An
+  executable assembled from expansions that then dispatches a Cargo or Cross
+  subcommand (`"$cmd" build`) is opaque for every target, not only the protected
+  ARM64 one, so it fails closed in trusted-automation revalidation as well.
+  The cheap check that decides which lines reach that analysis is held to the
+  same vocabulary as the analysis itself, because a narrower gate drops a line
+  before the substitution can fail closed on it. It therefore accepts the same
+  command starts, the same interleaved assignment/wrapper/`env` prefix layer,
+  and command substitutions as executable words, so `FOO=1 $cmd build`,
+  `env $cmd build`, and `$(pick-cross) build` are all analyzed. It also accepts
+  the two further spellings the ordinary Cargo/Cross parser accepts: a literal
+  `cross` subcommand, since `$tool cross build` runs Cross when `$tool` is
+  `cargo`, and a toolchain selector, since `$tool +nightly build` runs Cross
+  when `$tool` is `cross`. A command substitution with nested parentheses is
+  one expansion to the scanner but not to the cheap pattern, so every balanced
+  `$(...)` span is collapsed to a single placeholder before that gate runs and
+  `$( (printf cross) ) build --target aarch64-unknown-linux-gnu` reaches the
+  analysis it would otherwise be dropped before. When the substitution or a
+  backtick pair spans physical lines, only the newlines inside that one shell
+  word are joined before classification; unrelated commands on adjacent lines
+  remain separate. Widening that gate reports
+  nothing by itself — every admitted line is still decided by the substitution,
+  the Cross-subcommand check, and the command-context check.
+  The interleaved assignment/wrapper/`env` prefix layer is one model shared by
+  every discovery pattern, not only by opaque-executable scanning, so
+  `env sudo bash scripts/unsafe.sh`, `sudo FOO=bar bash scripts/unsafe.sh`,
+  `env sudo make -C build all`, and `env sudo python3 -m ci.build` are recorded
+  as the repository script, dispatcher manifest, and Python module they really
+  execute. Every alternative in that layer consumes a whole word, so it widens
+  the accepted orderings of prefix words without opening data or argument
+  positions.
   A block-scalar body is one string value rather than YAML structure, so prose in
   an action input declares no mapping key, alias, or merge key: `--allowedTools
   "Bash(gh pr comment:*)"` inside a `claude_args: |` body is not a `comment:` key
@@ -444,7 +550,12 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   opens no slot, so ``echo "- Test: \`${{ matrix.test }}\`"`` writes Markdown in a
   real `run:` block and stays editable. An executable heredoc is unaffected
   throughout: it is extracted and rescanned as its own program, where its lines
-  are command lines again.
+  are command lines again. Every queued heredoc on a command is consumed in
+  opener order, so a later body in `cat <<D <<'PY' | python3` cannot hide behind
+  the first delimiter. Only an outer pipeline attaches a body to an
+  interpreter; pipes inside quotes, substitutions, backticks, subshells, or
+  process substitutions remain nested command syntax rather than receivers of
+  the heredoc.
   Binding Cross to another executable name is itself a Cross surface: linking,
   copying, moving, or installing the Cross binary under a new name, and writing
   a wrapper script whose body runs Cross, are all detected, and every later
@@ -468,6 +579,10 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   receive the same AST analysis, while dynamic or unsupported shells fail
   closed. Shell, Python, Perl, PHP, R, JavaScript/TypeScript, PowerShell, awk,
   and BusyBox script launchers are recognized when resolving repository paths.
+  Only shell, Python, and PowerShell file bodies have language-aware transitive
+  readers; an explicit unsupported interpreter for any repository helper
+  therefore fails closed instead of relying on a suffix or being downgraded to
+  a bare shell reading.
   Inline interpreter source is dispatched the same way: a `run:` step that
   hands a program to Python (`-c`), PowerShell (`-Command`, any unambiguous
   prefix), Node, Deno, Bun, Perl, Ruby, PHP, Lua, R, Julia, Elixir, Groovy,
@@ -488,7 +603,22 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   operand. An interpreter that reads its program from stdin is dispatched the
   same way as a shell that does, so `python3 <<< '<source>'` and
   `python3 < <(printf '<source>')` are inspected in the interpreter's own
-  language instead of only in POSIX shell.
+  language instead of only in POSIX shell. Only an *unescaped* literal producer
+  is folded into readable source: `echo` behavior varies between shells and
+  `printf` decodes backslash escapes in its format, so `printf '\x63ross ...' |
+  bash` and `echo -e '\x63ross ...' | bash` would otherwise be read as harmless
+  text while the receiving shell runs Cross. A backslash anywhere in an `echo`
+  operand, in a `%s` operand, or in a literal `printf` format therefore leaves
+  the produced program opaque, which fails closed. That decision belongs to the
+  producer rather than to the executable word, so it is reached from both
+  directions: pull-request comparison and exact-tree revalidation of reached
+  shell automation both reject an undecodable stdin program. Deciding it only
+  under the opaque-executable analysis meant the tree path — which enters
+  through the literal scan — accepted on `main` what comparison had rejected on
+  the pull request. Literal shell commands extracted from Python process APIs
+  re-enter that same opaque-stdin scope, including commands discovered through
+  an explicit Python interpreter edge to a suffixless helper or an inline
+  `python -c` program.
   A `shell: pwsh`/`powershell` body, a PowerShell `-Command` operand, a
   PowerShell heredoc, and a `SHELL ["pwsh", ...]` Dockerfile selection are
   parsed as PowerShell rather than as POSIX shell: `Start-Process`,
@@ -554,15 +684,16 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   value sets, and a prior step or job output can be set to the ARM64 target,
   so an unknown value fails closed whenever the same input already declares a
   `--target` argument. Ordinary credential and context inputs carry no target
-  argument and stay editable. One narrow exception
-  exists so release downloads can be isolated to exact artifact names, which
-  necessarily name the protected target: for `actions/upload-artifact` and
-  `actions/download-artifact` **pinned to a full commit SHA**, the target
-  string in an artifact `name`/`path`/`pattern` input is not a surface, because
-  those two actions only move files between jobs and cannot start a build. That
-  carve-out accepts the block and flow spellings of the same YAML
-  (`with: {name: ...}`) equally, and applies only when every key on the line is
-  one of those closed artifact inputs. The
+  argument and stay editable. One narrow exception exists so release downloads
+  can be isolated to exact artifact names, which necessarily name the protected
+  target: for `actions/download-artifact` **pinned to a full commit SHA**, the
+  target string in an artifact `name`/`path`/`pattern` input is not a surface,
+  because the action only selects an already-published artifact for the current
+  job and cannot start a build. `actions/upload-artifact` names and paths remain
+  protected surfaces because they control the artifact identity consumed by
+  later publishing jobs. That carve-out accepts the block and flow spellings of
+  the same YAML (`with: {name: ...}`) equally, and applies only when every key
+  on the line is one of those closed artifact inputs. The
   Cross image, a `cross` executable token, every Cross-enabling input key, any
   other input key, an unpinned reference, and any other action are all still
   surfaces; self-test fixtures assert each of those boundaries.
@@ -605,6 +736,70 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   `$(shell ...)` and other make functions, stays opaque and keeps failing
   closed. Detection stays anchored to command positions, so prose or a
   comment mentioning `cargo install cross` does not freeze unrelated edits.
+  An automation file needs no recognized extension to be executable. A reference
+  under a conventional tool directory (`ci/`, `bin/`, `build/`, `scripts/`,
+  `tool`, `tools/`, `dev/`, `hack/`) is followed as a repository command even
+  when the name carries no suffix, and a reached file that is extensionless —
+  and is not a build-dispatcher manifest — is revalidated as shell rather than
+  skipped for having no detectable language. Those two halves are what close the
+  edge: the first makes `ci/unsafe` and `scripts/build` discoverable without a
+  `./` prefix or an interpreter word, the second makes them scannable once
+  discovered. Every scanned automation root is spelled there as well —
+  `.github/scripts/`, `comparison/`, `tests/k8s/`, and `tests/performance/` —
+  because a root this policy already scans is exactly where a direct
+  `run: .github/scripts/build` would otherwise go unrecorded, just as omitting
+  `scripts/` once left `run: scripts/build` unscanned.
+  Python automation reached this way has dynamic process commands rejected
+  rather than silently dropped, so an argv assembled into a variable
+  (`cmd = ['python3', 'ci/unsafe.py']; subprocess.run(cmd)`) fails closed
+  instead of reading as an unresolvable literal. The same rejection applies to a
+  Python heredoc a reached shell script executes (`python3 <<'PY' ... PY`),
+  which would otherwise be the one Python surface that accepted a variable
+  process command.
+  The interpreter an invocation names is carried with the path it runs, because
+  it is the only evidence of language a file with neither suffix nor shebang
+  has. `python3 ci/unsafe` therefore reads that file as Python — extracting and
+  checking its process calls — instead of reporting it as automation with no
+  scannable interpreter, while the extensionless shell revalidation above still
+  runs. The two readings are a union rather than a choice, so nothing an earlier
+  class already rejected stops being rejected, and a bare `./ci/unsafe` that
+  names no interpreter invents none. A bare extensionless reference is read as
+  shell during traversal as well as during revalidation, so `run: scripts/build`
+  is followed into the script instead of being reported as automation with no
+  scannable interpreter by the very stage whose successor does scan it; an
+  explicit interpreter and a build-dispatcher manifest keep their own readings.
+  PowerShell provenance is replayed the same way Python provenance is: `pwsh
+  scripts/opaque` reaching an extensionless file adds a cmdlet reading to the
+  shell one, so `Start-Process cross -ArgumentList 'build --target ...'` — which
+  is not a dispatch in POSIX shell at all — still fails closed. Pull-request
+  surface comparison receives the same provenance and applies it to both the
+  merge-base and the proposed tree, so a proposed no-shebang `scripts/opaque`
+  reached by `python3 scripts/opaque` is compared as Python rather than as
+  unread text, and the two sides stay symmetric.
+  Provenance is applied whenever it appears, not only the first time a path is
+  reached. A suffixless script already reached bare and read as shell is re-read
+  when a later edge names `python3` or `pwsh` for it, so the process calls inside
+  that alternate-language reading are followed too; skipping on reachability
+  alone meant `scripts/a` discovered first as shell and later as `python3
+  scripts/a` never had its `subprocess.run(['bash', 'scripts/unsafe.sh'])` edge
+  added. Provenance only accumulates, so the walk settles in a bounded number of
+  passes and reports rather than assumes if it cannot.
+  A reached build-dispatcher recipe is shell, so it is scanned with the whole
+  trusted-shell surface policy rather than a subset of it: literal Cross, wrapped
+  literal Cross, generated inline shell, an opaque ARM64 execution, an opaque
+  Cross executable for *any* target (`cmd=$(printf cross); "$cmd" build`), and an
+  undecodable stdin producer such as `printf '\x63ross build --target ...' | bash`
+  all fail closed during exact-tree revalidation and not only during pull-request
+  comparison. A recipe whose producer is an ordinary unescaped literal stays
+  readable and stays editable.
+  Those raw-text searches read a program's command text rather than its raw
+  lines, for the same reason the opaque-ARM64 search does. A reached script that
+  *writes* a literal template — `cat <<'EOF'` holding `bash -c "$(render)"` — is
+  not executing that inline shell, so the quoted body no longer reports a
+  generated inline shell surface that would block safe automation edits. The
+  narrowing is not a weakening: an unquoted body's substitutions are re-emitted
+  as the command lines they really are, backslash continuations are folded first,
+  and an unterminated heredoc withdraws the narrowing and reads the program raw.
   Cross-sensitive jobs, local-action files, and
   reachable scripts are represented by full digests, while unrelated workflow,
   action, and script additions or edits remain permitted. The isolated jobs use

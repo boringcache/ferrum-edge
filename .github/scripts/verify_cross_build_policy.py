@@ -15,7 +15,7 @@ import sys
 import tomllib
 from collections.abc import Callable, Iterable
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 
 
 TARGET = "aarch64-unknown-linux-gnu"
@@ -903,6 +903,15 @@ ATTACK_PAYLOADS = {
 }
 
 STANDALONE_CROSS = re.compile(r"(?<![A-Za-z0-9_-])cross(?![A-Za-z0-9_-])")
+# Cross forwards Cargo's toolchain selector, so `cross +nightly build` runs the
+# same build `cross build` does. Accepting the selector here keeps the opaque
+# variant of `$tool +nightly build` failing closed instead of being dropped
+# between the executable substitution and this subcommand check.
+OPAQUE_CROSS_SUBCOMMAND = re.compile(
+    r"[\"']?(?<![A-Za-z0-9_-])cross(?![A-Za-z0-9_-])[\"']?"
+    r"\s+(?:\+[^\s]+\s+)?"
+    r"(?:build|check|test|run|rustc|clippy|doc|fmt|metadata|bench|clean|install)\b"
+)
 CROSS_ENVIRONMENT = re.compile(
     r"(?<![A-Za-z0-9_])(?:CROSS_[A-Z0-9_]*|DOCKER_OPTS|QEMU_STRACE|"
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
@@ -932,10 +941,17 @@ CASE_ARM_CONTEXT = r"(?:\bin|;;)\s+\(?\s*[^\s;&|()]+(?:\s*\|\s*[^\s;&|()]+)*\)\s
 # line, or immediately inside a function body/group. `{` matters because a
 # one-line function such as `f(){ cross build ...; }` places the executable
 # directly after the brace with no other separator. Bash requires blank space
-# after that brace, and requiring it here keeps ordinary `{"cross": ...}` data
-# out of the executable slot. A bare `(` is deliberately still not a context: a
-# real subshell is already covered by the optional `\(` that follows each
-# context, whereas a bare `(` also appears literally inside quoted prose.
+# after a brace group opener, but `f(){( cross build ... );}` is also valid
+# because the brace is followed by a subshell opener; requiring either blank
+# space or a following `(` keeps ordinary `{"cross": ...}` data out of the
+# executable slot. A bare `(` is deliberately still not a context: a real
+# subshell is covered by the opener sequence that follows each context, whereas
+# a bare `(` also appears literally inside quoted prose.
+# That opener sequence is `(?:\(\s*)*`, not `(?:\(\s+)*`: bash needs no blank
+# after a subshell opener, so `; (cross build ...` and `( (cross build ...` are
+# both real executable slots. Requiring the blank would repeat the single-`(`
+# slot the pre-nesting `(?:\(\s*)?` spelling already covered, turning a
+# generalization into a fail-open narrowing.
 # `$(`, a backtick, and `<(`/`>(` are unambiguous executable slots, so an
 # assignment such as `out=$(cross build ...)` is one.
 # Every context except a bare line start names the executable slot explicitly,
@@ -943,7 +959,7 @@ CASE_ARM_CONTEXT = r"(?:\bin|;;)\s+\(?\s*[^\s;&|()]+(?:\s*\|\s*[^\s;&|()]+)*\)\s
 # all. A bare line start only means "command word" once the line is known to be
 # shell the runner evaluates, which `shell_evaluated_lines` decides.
 EXPLICIT_COMMAND_START_CONTEXT = (
-    r"(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|"
+    r"(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{(?:\s+|\s*(?=\())|"
     r"\$\(\s*|`\s*|[<>]\(\s*|"
     rf"{CASE_ARM_CONTEXT}|{SHELL_C_CONTEXT}|"
     r"\b(?:if|elif|while|until|then|do|else)\s+"
@@ -952,6 +968,15 @@ COMMAND_START_CONTEXT = (
     rf"(?:^\s*|{EXPLICIT_COMMAND_START_CONTEXT})"
     r"(?:!\s*)?"
 )
+# A shell assignment word may carry an empty value: `FOO= cross build` and
+# `env FOO= cross build` are both valid command prefixes, and the token model
+# already treats them as assignments (`NAME=.*`). Requiring at least one
+# non-space character after `=` made every regex layer disagree with that model
+# and drop the line before the token model could fail closed, so an opaque Cross
+# executable behind `FOO= $cmd build` escaped the assignment-aware scans
+# entirely. `[^\s]*` closes the gap; the alternative still consumes a whole word
+# of at least two characters, so no repeated group can match empty.
+ASSIGNMENT_VALUE = r"[A-Za-z_][A-Za-z0-9_]*=[^\s]*"
 # `env` and the ordinary command wrappers accept options whose operand is a
 # separate word (`env -u FOO cross`, `sudo -u builder cross`, `timeout 30
 # cross`). Enumerate the operand-taking forms before the self-contained ones so
@@ -966,7 +991,7 @@ ENV_OPTION = (
     r"--(?:unset|chdir|split-string|block-signal|default-signal|ignore-signal)"
     r"(?:=[^\s]+|\s+[^\s]+)|"
     r"--?[^\s]+|"
-    r"[A-Za-z_][A-Za-z0-9_]*=[^\s]+)"
+    rf"{ASSIGNMENT_VALUE})"
 )
 ENV_PREFIX = rf"(?:{TOOL_PATH_PREFIX}env(?:\s+{ENV_OPTION})*\s+)"
 WRAPPER_OPTION = (
@@ -977,12 +1002,86 @@ WRAPPER_OPTION = (
     r"--?[A-Za-z0-9][A-Za-z0-9-]*(?:=[^\s]+)?|"
     r"[0-9]+(?:\.[0-9]+)?[smhd]?)"
 )
+# `timeout` is the one wrapper whose first non-option word is a mandatory
+# duration rather than the command operand: `timeout --preserve-status $seconds
+# build` runs `build`, and `$seconds` is never executed. `skip_wrapper_prefixes`
+# already withholds the command slot until that operand is seen, but the regex
+# layer kept `timeout` in the generic list, where the numeric `WRAPPER_OPTION`
+# alternative made the duration optional. A benign dynamic-duration line was
+# therefore reported as an opaque Cross executable. Model the operand here so
+# both halves of the analysis agree.
+# `-k`/`--kill-after` and `-s`/`--signal` each take a separate operand of their
+# own. `timeout --help` documents both, and notes that an option's mandatory
+# long-form argument is mandatory for the short spelling too. The generic dash
+# form would otherwise consume the flag alone and let its operand be mistaken
+# for the mandatory duration: `timeout -s TERM 30 target/evil.sh` would read
+# `TERM` as the duration and put `30` in the executable slot, hiding the script
+# that really runs. Both are therefore excluded from the generic alternative and
+# spelled with their operands here. `-k5`/`-sTERM` keep the generic form because
+# those words are self contained.
+TIMEOUT_OPTION = (
+    r"(?:--(?=\s)|"
+    r"(?:-k|--kill-after|-s|--signal)(?:=[^\s]+|\s+[^\s]+)|"
+    r"(?!-k(?![A-Za-z0-9-])|--kill-after(?![A-Za-z0-9-])|"
+    r"-s(?![A-Za-z0-9-])|--signal(?![A-Za-z0-9-]))"
+    r"--?[A-Za-z0-9][A-Za-z0-9-]*(?:=[^\s]+)?)"
+)
+# The duration may be literal (`30`, `1.5m`) or expanded (`$seconds`), but it is
+# never an option word, so `(?!-)` stops an option from standing in for it and
+# handing the executable slot back to the option's own operand.
+TIMEOUT_UNIT = rf"(?:{TOOL_PATH_PREFIX}timeout(?:\s+{TIMEOUT_OPTION})*\s+(?!-)[^\s]+\s+)"
+ASSIGNMENT_WORD = ASSIGNMENT_VALUE
 # `command -v`/`-V` only looks a name up and prints it; it does not execute the
 # operand, so it must not open an executable slot.
-WRAPPER_PREFIX = (
-    rf"(?:{TOOL_PATH_PREFIX}(?!command\s+-[vV]\b)"
-    r"(?:command|exec|nohup|sudo|time|timeout|stdbuf|nice|ionice|setsid)"
-    rf"(?:\s+{WRAPPER_OPTION})*\s+)*"
+# `sudo` is spelled separately below because it is the one wrapper that parses
+# `NAME=value` operands of its own; the rest exec their operand directly.
+WRAPPER_UNIT = (
+    rf"(?:{TIMEOUT_UNIT}|{TOOL_PATH_PREFIX}(?!command\s+-[vV]\b)"
+    r"(?:command|exec|nohup|stdbuf|nice|ionice|setsid)"
+    rf"(?:\s+{WRAPPER_OPTION})*\s+)"
+)
+# `sudo VAR=value cmd` really does dispatch `cmd`: sudo consumes the assignment
+# words itself. `env` does the same through `ENV_OPTION`. No other *external*
+# wrapper does.
+SUDO_UNIT = (
+    rf"(?:{TOOL_PATH_PREFIX}sudo(?:\s+{WRAPPER_OPTION})*"
+    rf"(?:\s+{ASSIGNMENT_WORD})*\s+)"
+)
+# `time` is not an external wrapper at all: Bash, ksh and zsh document it as a
+# reserved word that times a *pipeline*, so the words after it are parsed as an
+# ordinary pipeline and `time FOO=1 "$cmd" build --target ...` still has `FOO=1`
+# as an assignment prefix of the simple command that dispatches `$cmd`. Leaving
+# `time` among the exec-their-operand wrappers stopped the executable slot at
+# `FOO=1` and dropped a real opaque Cross invocation. It is therefore spelled
+# like `SUDO_UNIT`, which carries its own assignment operands. `/usr/bin/time`
+# does exec its operand directly, so accepting the assignment words for both
+# spellings is the fail-closed reading: it can only widen the executable slot,
+# never remove one.
+TIME_UNIT = (
+    rf"(?:{TOOL_PATH_PREFIX}time(?:\s+{WRAPPER_OPTION})*"
+    rf"(?:\s+{ASSIGNMENT_WORD})*\s+)"
+)
+# The words that may stand between a command slot and the executable. `env
+# $cmd`, `FOO=bar sudo $cmd`, and `sudo FOO=bar env $cmd` all dispatch the
+# expanded word, so a layer that fixes wrappers before assignment words and
+# omits `env` entirely leaves real dispatches without a command slot.
+#
+# Assignment words are *not* part of the interleaved layer, though: in a shell
+# `NAME=value` is an assignment only while it precedes the command name. After
+# `exec`, `nohup`, `timeout`, or any other wrapper that execs its operand
+# directly, `NAME=value` is ordinary argv and the following word is never
+# dispatched — `exec FOO=bar $cmd build --target ...` asks the shell to run
+# `FOO=bar` and pass `$cmd` as an argument. Treating those as skippable reported
+# benign automation as an opaque Cross dispatch. Leading assignments are
+# therefore matched once, up front, and the wrappers that genuinely accept
+# assignment operands (`env`, `sudo`) carry them inside their own units.
+#
+# Every alternative in the repeated group consumes at least one word, so the
+# layer cannot match empty, and the leading group is anchored ahead of it rather
+# than interleaved with it, so there is exactly one way to match a given prefix.
+COMMAND_WORD_PREFIX = (
+    rf"(?:{ASSIGNMENT_WORD}\s+)*"
+    rf"(?:{WRAPPER_UNIT}|{ENV_PREFIX}|{SUDO_UNIT}|{TIME_UNIT})*"
 )
 # Every Cross spelling shares one command-start prefix, including the
 # `cargo install cross` form. Anchoring that form keeps benign prose such as
@@ -995,11 +1094,24 @@ CROSS_EXECUTABLE = (
     r"(?:\s+--[^\s=]+(?:=[^\s]+|\s+(?!cross\b)[^\s]+)?)*"
     r"\s+cross(?![A-Za-z0-9_-]))"
 )
+# The literal Cross scan uses the same interleaved prefix layer as every other
+# executable-slot matcher. The older wrapper-then-assignment spelling, with a
+# single optional `env` inside `CROSS_EXECUTABLE`, could not describe more than
+# one wrapper/`env` layer: `env FOO=1 sudo BAR=2 env cross build --target ...`
+# is a real literal Cross dispatch that stopped matching at the second `env`.
+# `COMMAND_WORD_PREFIX` accepts wrappers and `env` in any order, plus the
+# assignment words each position really allows, and every alternative consumes a
+# whole word, so this stays a superset of the spelling it replaces on real shell
+# without admitting data or argument positions.
+# The leading assignment words live inside `COMMAND_WORD_PREFIX` now, so they
+# are not repeated here: a second `(?:NAME=value\s+)*` group ahead of the
+# subshell openers would give the same text two parses. The only spelling that
+# loses is `FOO=bar (cross build ...)`, which is a shell syntax error — an
+# assignment prefix introduces a simple command, never a subshell.
 CROSS_COMMAND_CONTEXT = re.compile(
     COMMAND_START_CONTEXT
-    + WRAPPER_PREFIX
-    + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    r"(?:\(\s*)?"
+    + r"(?:\(\s*)*"
+    + COMMAND_WORD_PREFIX
     + CROSS_EXECUTABLE
 )
 # The same command slot, matched against the text that precedes a word instead
@@ -1007,9 +1119,24 @@ CROSS_COMMAND_CONTEXT = re.compile(
 EXPLICIT_COMMAND_WORD_PREFIX = re.compile(
     rf"(?:{EXPLICIT_COMMAND_START_CONTEXT})"
     r"(?:!\s*)?"
-    + WRAPPER_PREFIX
-    + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    r"(?:\(\s*)?$"
+    + COMMAND_WORD_PREFIX
+    + r"(?:\(\s*)*$"
+)
+# The bare-line-start form is valid only after the caller has already established
+# that the line is shell-evaluated. Leading assignment words are still part of
+# the same simple command: `FOO=bar $cmd` dispatches the expanded word as the
+# executable, not as assignment data, and `env $cmd` and `FOO=bar sudo $cmd`
+# dispatch it through a prefix layer that may interleave the two. Keep this
+# separate from the explicit matcher so prose and heredoc data do not regain a
+# synthetic command start.
+BARE_COMMAND_WORD_PREFIX = re.compile(
+    r"^\s*"
+    r"(?:!\s*)?"
+    + COMMAND_WORD_PREFIX
+    # `(?:\(\s*)*`, not `(?:\(\s*)?`, for the same reason as the explicit
+    # matcher above: a nested or unspaced subshell opener is still a command
+    # slot, so `((cmd build ...` must not fall out of the bare-start allowance.
+    + r"(?:\(\s*)*$"
 )
 WRAPPED_LITERAL_CROSS = re.compile(
     r"(?:\b(?:bash|sh)\s+-c\s+['\"][^'\"]*\bcross\s+|"
@@ -1052,6 +1179,18 @@ GENERATED_SCRIPT_PREFIXES = (
     "benchmark-results/",
     "comparison-results/",
     "tmp/",
+)
+# Directory prefixes under which an *extensionless* word is still a repository
+# command. The conventional layout names stay, and every approved automation
+# root is added: `.github/scripts/build` names an executable repository path
+# exactly as `scripts/build` does, and omitting the roots this file already
+# scans meant exact-tree validation never recorded the reached script or the
+# Cross surface inside it. Multi-segment roots are listed before the
+# single-segment names so the longer prefix is preferred, and the literal dot in
+# `.github` is escaped rather than left as a wildcard.
+EXTENSIONLESS_COMMAND_DIRECTORY = (
+    r"(?:\.github/scripts|tests/k8s|tests/performance|comparison|"
+    r"ci|bin|build|scripts|tool|tools|dev|hack)"
 )
 IGNORED_AUTOMATION_SUFFIXES = frozenset(
     {".gif", ".jpeg", ".jpg", ".pdf", ".png", ".webp"}
@@ -1105,12 +1244,22 @@ LOCAL_COMMAND_REFERENCE = re.compile(
     r"(?:<|>)\(\s*|\{\s+|"
     r"\b(?:if|elif|while|until|then|do|else)\s+)"
     r"(?:!\s*)?"
-    r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
     r"(?:\(\s*)?"
-    + WRAPPER_PREFIX
-    + ENV_PREFIX
-    + r"?"
-    r"(?:(?:bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|pypy[0-9]*|ruby|node|"
+    # The same interleaved wrapper/`env`/assignment layer the opaque executable
+    # scanners use. The older wrapper-then-`env` ordering could not describe
+    # `env sudo bash scripts/unsafe.sh` or `sudo FOO=bar bash scripts/unsafe.sh`,
+    # so repository automation those lines really execute was never recorded as
+    # reachable. Every alternative consumes a whole word, so this widens the
+    # accepted prefix orderings without admitting data or argument positions.
+    + COMMAND_WORD_PREFIX
+    # The interpreter is captured on this branch too. `python3 < scripts/driver`
+    # runs the redirected file through Python exactly as `python3 scripts/driver`
+    # does, but recording only the path left `reference_interpreter` empty, so a
+    # suffixless stdin script fell back to its own evidence and was read as
+    # shell — and the process-dispatch edges inside the real interpreter program
+    # were never followed.
+    + r"(?:(?P<redirected_interpreter>bash|sh|dash|zsh|ksh|ash|"
+    r"python(?:[0-9.]+)?|pypy[0-9]*|ruby|node|"
     r"perl|php|Rscript|deno|bun|pwsh|powershell|busybox\s+sh|awk\s+-f)"
     r"(?:\s+--?[^\s]+)*\s*(?:[0-9]+)?(?<!<)<(?![<&])\s*"
     r"(?P<redirected>(?:\$(?:[A-Za-z_][A-Za-z0-9_]*|"
@@ -1131,11 +1280,14 @@ LOCAL_COMMAND_REFERENCE = re.compile(
     r"ps1)))|"
     r"(?P<direct>(?:'\./[A-Za-z0-9._+@~ /-]+'|"
     r"\"\./[A-Za-z0-9._+@~ /-]+\"|\./[A-Za-z0-9._+@~/-]+))|"
-    r"(?P<bare>(?:'[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|"
-    r"js|mjs|cjs|ts|ps1)'|\"[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|"
-    r"awk|php|R|js|mjs|cjs|ts|ps1)\"|[A-Za-z0-9._+@~-]+"
-    r"(?:/[A-Za-z0-9._+@~-]+)+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|js|mjs|"
-    r"cjs|ts|ps1))))"
+    r"(?P<bare>(?:'(?:[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|"
+    rf"js|mjs|cjs|ts|ps1)|{EXTENSIONLESS_COMMAND_DIRECTORY}/[A-Za-z0-9._+@~ /-]+)'|"
+    r"\"(?:[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|js|mjs|"
+    rf"cjs|ts|ps1)|{EXTENSIONLESS_COMMAND_DIRECTORY}/[A-Za-z0-9._+@~ /-]+)\"|"
+    r"[A-Za-z0-9._+@~-]+(?:/[A-Za-z0-9._+@~-]+)+\.(?:sh|bash|pyc|pyo|py|rb|pl|"
+    r"awk|php|R|js|mjs|cjs|ts|ps1)|"
+    rf"{EXTENSIONLESS_COMMAND_DIRECTORY}/[A-Za-z0-9._+@~-]+"
+    r"(?:/[A-Za-z0-9._+@~-]+)*)))"
 )
 YAML_RUN_FIELD = re.compile(
     r"^(?P<indent> *)(?:-\s*)?"
@@ -1160,11 +1312,30 @@ HEREDOC_EXECUTABLE = re.compile(
     r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\$\(\s*|\{\s+|"
     r"\b(?:if|elif|while|until|then|do|else)\s+)"
     r"(?:!\s*)?"
-    r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    + WRAPPER_PREFIX
-    + ENV_PREFIX
-    + r"?"
-    r"(?P<interpreter>bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|"
+    # The interleaved prefix layer, for the same reason as
+    # `CROSS_COMMAND_CONTEXT`: `env sudo bash <<EOF` opens the same executable
+    # heredoc that `sudo env bash <<EOF` does, and the fixed
+    # assignment-then-wrapper-then-`env` ordering described only some of them.
+    + COMMAND_WORD_PREFIX
+    + r"(?P<interpreter>bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|"
+    r"pypy[0-9]*|pwsh|powershell)\b"
+)
+# The other half of the same question, read from the text *after* an opener.
+# `cat <<'EOF' | bash` hands the body to an interpreter just as plainly as
+# `bash <<'EOF'` does — the body is program text either way — but evidence read
+# only from the left of the opener called it data. `automation_command_text()`
+# then dropped a body holding `bash -c "$(render)"`, so exact-tree validation
+# stopped seeing a generated inline shell surface the pipeline really executes,
+# where the older raw-text `OPAQUE_INLINE_SHELL` search had failed closed.
+#
+# A single `|` only: `||` is a control operator that starts a new command rather
+# than a pipeline stage fed by this heredoc. `|&` (bash's stderr pipe) still
+# pipes, so it is accepted.
+HEREDOC_PIPED_INTERPRETER = re.compile(
+    r"(?<!\|)\|(?!\|)&?\s*"
+    r"(?:!\s*)?"
+    + COMMAND_WORD_PREFIX
+    + r"(?P<interpreter>bash|sh|dash|zsh|ksh|ash|python(?:[0-9.]+)?|"
     r"pypy[0-9]*|pwsh|powershell)\b"
 )
 OPAQUE_INLINE_SHELL = re.compile(
@@ -1180,14 +1351,87 @@ OPAQUE_EXPANSION = (
     r"(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|"
     r"\$\([^()\n]*\)|`[^`\n]*`)"
 )
+# The boundary between an opaque executable word and its subcommand. Literal
+# whitespace is the obvious spelling, but the shell splits an unquoted expansion
+# into words *before* it dispatches, so `$cmd${IFS}build --target ...` runs
+# `cross build` just as plainly once `$cmd` expands to `cross`. Requiring
+# literal whitespace here dropped that dispatch from both the ARM64 scan and the
+# prefilter that gates the opaque-variant scan, so neither could report it.
+# Any expansion can supply the separator, not only `${IFS}`, so the whole
+# expansion vocabulary is accepted. Both alternatives are still anchored between
+# two matched words, so this cannot invent a subcommand where the source has no
+# boundary at all.
+OPAQUE_WORD_SEPARATOR = rf"(?:\s+|{OPAQUE_EXPANSION}\s*)"
+# Both opaque classifiers deliberately retain `$(` as a standalone command-start
+# context even though their current production callers flatten balanced command
+# substitutions to `$(_)` first. The redundant alternative keeps direct
+# classifier assertions, and any future unflattened caller, from silently using
+# a narrower command-start vocabulary; it cannot widen a decision after the
+# production flattening step.
 OPAQUE_ARM_CROSS_EXECUTION = re.compile(
-    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|\b(?:then|do|else)\s+)"
-    r"(?:\(\s*)?['\"]?"
-    rf"(?:[A-Za-z]*{OPAQUE_EXPANSION}['\"]?)+[A-Za-z]*['\"]?\s+"
-    r"(?:\+[^\s]+\s+)?(?:build|rustc|run|test|check|clippy|doc|bench)\b"
+    # The brace context keeps `\s*(?=\()` so a `{(` group opener still counts
+    # while the `{"cross": ...}` JSON benign control stays excluded, and the
+    # subshell opener stays `(?:\(\s*)*` rather than `(?:\(\s*)?` so nested and
+    # unspaced openers both match. Negation, assignment words, process wrappers
+    # and `env` may appear either side of that opener, so both positions are
+    # accepted; every group can match empty, so this is a strict superset.
+    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{(?:\s+|\s*(?=\())|\$\(\s*|`\s*|"
+    r"[<>]\(\s*|\b(?:if|elif|while|until|then|do|else)\s+)"
+    r"(?:!\s*)?"
+    rf"(?:{ASSIGNMENT_VALUE}\s+)*"
+    r"(?:\(\s*)*"
+    r"(?:!\s*)?"
+    # The same interleaved layer `OPAQUE_EXECUTABLE_WITH_SUBCOMMAND` — the
+    # prefilter that guards this scan — already uses. A scanner narrower than
+    # its own prefilter cannot be reached for the orderings the prefilter
+    # admits, so the two are spelled from one constant.
+    + COMMAND_WORD_PREFIX
+    + r"['\"]?"
+    rf"(?:[A-Za-z]*{OPAQUE_EXPANSION}['\"]?)+[A-Za-z]*['\"]?"
+    rf"{OPAQUE_WORD_SEPARATOR}"
+    rf"(?:cross{OPAQUE_WORD_SEPARATOR})?"
+    rf"(?:\+[A-Za-z0-9._-]+{OPAQUE_WORD_SEPARATOR})?"
+    r"(?:build|rustc|run|test|check|clippy|doc|bench)\b"
     r"[^\n]*--target(?:=|\s+)aarch64-unknown-linux-gnu\b",
     # The leading context anchors on a line start, so this must match every
     # line of a multi-line script, not only the first.
+    re.MULTILINE,
+)
+# The prefilter that gates the opaque variant scan in
+# `contains_opaque_executable_cross`. A prefilter narrower than the scanner it
+# guards fails open: the line is dropped before `scan_variants` can substitute
+# Cross into it. It therefore reuses the same command-start contexts, the same
+# interleaved wrapper/`env`/assignment prefix layer, and the same expansion
+# vocabulary as `OPAQUE_ARM_CROSS_EXECUTION` above, so `FOO=1 $cmd build`,
+# `env $cmd build`, and `$(pick-cross) build` all reach the scanner. Unlike
+# that pattern it is not restricted to the ARM64 target, and it accepts two
+# further forms the ordinary Cargo/Cross parser accepts: the literal `cross`
+# subcommand (`$tool cross build` executes Cross when `$tool` is `cargo`) and
+# the toolchain selector (`$tool +nightly build` executes Cross when `$tool` is
+# `cross`). Widening a prefilter cannot report anything on its own: every line
+# it admits is still decided by `scan_variants`, `OPAQUE_CROSS_SUBCOMMAND`, and
+# `has_cross_command_context`.
+OPAQUE_EXECUTABLE_WITH_SUBCOMMAND = re.compile(
+    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{(?:\s+|\s*(?=\())|\$\(\s*|`\s*|"
+    r"[<>]\(\s*|\b(?:if|elif|while|until|then|do|else)\s+)"
+    r"(?:!\s*)?"
+    # Assignment words only before the subshell opener and the full interleaved
+    # layer after it, exactly as `OPAQUE_ARM_CROSS_EXECUTION` is built. Both
+    # positions can match empty and assignments belong to the layer as well, so
+    # every ordering is still reachable while the two layers stay unambiguous
+    # enough to bound backtracking on a long non-matching line.
+    rf"(?:{ASSIGNMENT_VALUE}\s+)*"
+    r"(?:\(\s*)*"
+    r"(?:!\s*)?"
+    + COMMAND_WORD_PREFIX
+    + r"['\"]?"
+    rf"(?:[A-Za-z]*{OPAQUE_EXPANSION}['\"]?)+[A-Za-z]*['\"]?"
+    rf"{OPAQUE_WORD_SEPARATOR}"
+    r"(?:\+[^\s]+\s+)?"
+    r"(?:cross|build|check|test|run|rustc|clippy|doc|fmt|metadata|bench|clean|"
+    r"install)\b",
+    # The leading context anchors on a line start, so this must match every line
+    # of a multi-line script, not only the first.
     re.MULTILINE,
 )
 NON_PYTHON_PROCESS_DISPATCH = re.compile(
@@ -1325,14 +1569,15 @@ CROSS_CAPABLE_ACTION_INPUTS = frozenset(
     }
 )
 # Isolating a release download to an exact artifact name requires naming the
-# protected target in that artifact name. `actions/upload-artifact` and
-# `actions/download-artifact` only move files between jobs and cannot start a
-# build, so — and only when pinned to a full commit SHA — the target string in
-# an artifact `name`/`path`/`pattern` is not a build-execution surface. The
-# Cross image, a `cross` executable token, and every Cross-enabling input key
-# remain surfaces for these actions like any other.
+# protected target in that artifact name. `actions/download-artifact` only
+# selects an already-published artifact for the current job; unlike
+# `actions/upload-artifact`, it does not control the artifact identity later
+# consumed by release publishing. Therefore, and only when pinned to a full
+# commit SHA, the target string in a download artifact `name`/`path`/`pattern`
+# input is not a build-execution surface. Upload artifact publication names and
+# paths remain protected surfaces like any other remote-action input.
 ARTIFACT_TRANSFER_ACTION = re.compile(
-    r"^actions/(?:up|down)load-artifact@[0-9a-f]{40}$"
+    r"^actions/download-artifact@[0-9a-f]{40}$"
 )
 ARTIFACT_INPUT_KEYS = frozenset({"name", "path", "pattern"})
 # `with:` only introduces the input mapping, so it does not itself widen the
@@ -1437,10 +1682,11 @@ DISPATCHER_MANIFEST_NAMES = frozenset(
 )
 BUILD_DISPATCHER = re.compile(
     COMMAND_START_CONTEXT
-    + WRAPPER_PREFIX
-    + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    + ENV_PREFIX
-    + r"?"
+    # The interleaved prefix layer, for the same reason as
+    # `LOCAL_COMMAND_REFERENCE`: `env sudo make -C build` dispatches the
+    # manifest that `sudo env make` would, and a fixed wrapper-then-`env`
+    # ordering recorded only one of them.
+    + COMMAND_WORD_PREFIX
     + TOOL_PATH_PREFIX
     + r"(?P<dispatcher>" + "|".join(sorted(DISPATCHER_MANIFESTS)) + r")"
     r"(?![A-Za-z0-9_-])(?P<arguments>[^\n;&|]*)"
@@ -1470,10 +1716,9 @@ CD_COMMAND = re.compile(
 )
 PYTHON_MODULE_DISPATCH = re.compile(
     COMMAND_START_CONTEXT
-    + WRAPPER_PREFIX
-    + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    + ENV_PREFIX
-    + r"?"
+    # Interleaved prefixes here too: `env sudo python3 -m ci.build` selects the
+    # same repository module as `sudo python3 -m ci.build`.
+    + COMMAND_WORD_PREFIX
     + TOOL_PATH_PREFIX
     + r"(?P<interpreter>python(?:\d+(?:\.\d+)*)?|pypy\d*)"
     r"(?![A-Za-z0-9_.-])(?P<arguments>[^\n;&|]*)"
@@ -2800,6 +3045,82 @@ def command_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
     return tuple(spans)
 
 
+def flattened_command_substitutions(line: str) -> str:
+    """Rewrite every balanced `$(...)` span as a parenthesis-free placeholder.
+
+    `OPAQUE_EXPANSION` spells its `$(...)` alternative as `\\$\\([^()\\n]*\\)` so
+    the compiled patterns stay linear, but `command_substitution_spans()` — the
+    span logic `scan_variants()` actually substitutes through — balances nested
+    parentheses. A prefilter narrower than the scanner it guards fails open:
+    `$( (printf cross) ) build --target aarch64-unknown-linux-gnu` was dropped
+    before any variant could be produced. Collapsing each balanced span to
+    `$(_)` keeps the word in the same position with the same command start, so
+    the decision still belongs to `scan_variants()` and the prefilter reports
+    nothing on its own. An unterminated span keeps its trailing text so the
+    subcommand behind it can still be seen and fail closed.
+    """
+
+    spans = command_substitution_spans(line)
+    if not spans:
+        return line
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        parts.append(line[cursor:start])
+        raw = line[start:end]
+        parts.append("$(_)" if raw.endswith(")") else f"$(_){raw[2:]}")
+        cursor = end
+    parts.append(line[cursor:])
+    return "".join(parts)
+
+
+def join_multiline_shell_expansions(contents: str) -> str:
+    """Join physical lines that form one opaque executable word.
+
+    A command substitution or backtick pair may open on one physical line and
+    close on another before the subcommand operands continue. The shell treats
+    that construct as one word, so leaving its embedded newlines intact makes
+    every line-local opaque classifier miss the executable/subcommand pair.
+    Only newlines inside the expansion are replaced; unrelated commands on
+    adjacent lines remain separate and cannot be combined into a synthetic
+    dispatch. The caller has already projected inert heredoc bodies away.
+    """
+
+    joined = list(contents)
+    for start, end in command_substitution_spans(contents):
+        for index in range(start, end):
+            if joined[index] in "\r\n":
+                joined[index] = " "
+
+    def escaped(position: int) -> bool:
+        cursor = position
+        while cursor > 0 and contents[cursor - 1] == "\\":
+            cursor -= 1
+        return (position - cursor) % 2 == 1
+
+    cursor = 0
+    while True:
+        opener = contents.find("`", cursor)
+        if opener < 0:
+            break
+        if escaped(opener):
+            cursor = opener + 1
+            continue
+        closer = opener + 1
+        while True:
+            closer = contents.find("`", closer)
+            if closer < 0 or not escaped(closer):
+                break
+            closer += 1
+        if closer < 0:
+            break
+        for index in range(opener, closer + 1):
+            if joined[index] in "\r\n":
+                joined[index] = " "
+        cursor = closer + 1
+    return "".join(joined)
+
+
 def replace_command_substitutions(line: str, *, literal: bool) -> str:
     spans = command_substitution_spans(line)
     if not spans:
@@ -2856,17 +3177,26 @@ def word_splitting_variants(value: str) -> tuple[str, ...]:
         # executable or subcommand out of literal text that is already present.
         return ()
     spans = [match.span() for match in WORD_SPLIT_EXPANSION.finditer(value)]
-    if not spans or len(spans) > MAXIMUM_WORD_SPLIT_EXPANSIONS:
+    if not spans:
         return ()
+
+    all_split_parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        all_split_parts.extend((value[cursor:start], " "))
+        cursor = end
+    all_split_parts.append(value[cursor:])
+    all_split_variant = "".join(all_split_parts)
+
+    if len(spans) > MAXIMUM_WORD_SPLIT_EXPANSIONS:
+        # The cap is only for the one-at-a-time variants. Returning no variants
+        # here would fail open for a line padded with harmless expansions before
+        # a Cross-containing split word, so keep the conservative all-split view.
+        return (all_split_variant,)
+
     variants = [value[:start] + " " + value[end:] for start, end in spans]
     if len(spans) > 1:
-        parts: list[str] = []
-        cursor = 0
-        for start, end in spans:
-            parts.extend((value[cursor:start], " "))
-            cursor = end
-        parts.append(value[cursor:])
-        variants.append("".join(parts))
+        variants.append(all_split_variant)
     return tuple(
         dict.fromkeys(variant for variant in variants if variant != value)
     )
@@ -2881,8 +3211,16 @@ def redirection_token(value: str) -> bool:
 def skip_redirections_and_assignments(
     tokens: tuple[str, ...],
     index: int,
+    *,
+    allow_assignments: bool = True,
 ) -> int:
-    """Skip shell prefixes that may legally precede a command word."""
+    """Skip shell prefixes that may legally precede a command word.
+
+    `allow_assignments` is false once a wrapper has already taken the command
+    name slot. `NAME=value` is an assignment word only while it precedes the
+    command name; after `exec`, `nohup`, or `timeout` it is ordinary argv, and
+    the word behind it is an argument rather than the executable.
+    """
 
     while index < len(tokens):
         token = tokens[index]
@@ -2897,7 +3235,11 @@ def skip_redirections_and_assignments(
         }:
             index += 1
             continue
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token, re.DOTALL):
+        if allow_assignments and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*=.*",
+            token,
+            re.DOTALL,
+        ):
             index += 1
             continue
         if token.isdigit() and index + 1 < len(tokens) and redirection_token(
@@ -3012,9 +3354,45 @@ def rustup_run_operand(tokens: tuple[str, ...], index: int) -> int | None:
     return position
 
 
-def skip_wrapper_prefixes(tokens: tuple[str, ...], index: int) -> tuple[int, bool]:
-    """Unwrap commands that execute their final command operand."""
+# The wrapper words after which `NAME=value` is still an assignment prefix of
+# the command that follows, rather than ordinary argv.
+#
+# `sudo` parses assignment operands of its own. `time` is not an external
+# wrapper at all: it is a shell reserved word that times a *pipeline*, so
+# `time FOO=1 "$cmd" build --target ...` parses as an ordinary simple command
+# with a `FOO=1` assignment prefix and dispatches `$cmd`. Treating `time` like
+# `exec` stopped the walk on `FOO=1` and dropped that dispatch. `env` is handled
+# separately through `skip_env_prefix`.
+#
+# `/usr/bin/time` does exec its operand, but skipping the assignment words for
+# that spelling too only widens the executable slot, so this stays fail-closed.
+ASSIGNMENT_PARSING_WRAPPERS = frozenset({"sudo", "time"})
 
+
+def skip_wrapper_prefixes(
+    tokens: tuple[str, ...],
+    index: int,
+) -> tuple[int, bool, bool]:
+    """Unwrap commands that execute their final command operand.
+
+    Returns the command-word index, whether the prefix dispatches at all, and
+    whether an assignment word is still a legal *assignment* at that index.
+
+    The third element exists because the decision is not local. `exec`,
+    `nohup`, and `timeout` exec their operand directly, so a `NAME=value` after
+    one is ordinary argv and the word behind it is an argument rather than the
+    executable; only `sudo` and the `time` keyword (and `env`, handled
+    separately) leave assignment operands as assignments. Making that call here
+    and letting the caller run one
+    more unconditional assignment-skipping pass simply undid it, so
+    `exec FOO=bar $cmd build` still resolved `$cmd` as the executable and a
+    benign wrapper argv was reported as an opaque Cross dispatch.
+    """
+
+    assignments_allowed = True
+    # Keep this set, `ASSIGNMENT_PARSING_WRAPPERS`, and the regex `WRAPPER_UNIT`
+    # / `SUDO_UNIT` / `TIME_UNIT` spellings in step: the token walk and the
+    # pattern layer must model the same command slots.
     wrappers = {
         "command",
         "exec",
@@ -3044,6 +3422,12 @@ def skip_wrapper_prefixes(tokens: tuple[str, ...], index: int) -> tuple[int, boo
         "--signal",
         "--user",
     }
+    # `-s` is `timeout --signal` in short form, but `sudo -s` runs a shell and
+    # takes no operand, so it is scoped to the wrapper that documents it rather
+    # than added to the shared set. Without it,
+    # `timeout -s TERM 30 target/evil.sh` consumed `TERM` as the mandatory
+    # duration and handed the command slot to `30`.
+    wrapper_option_operands = {"timeout": {"-s"}}
     while index < len(tokens) and (
         tool_name(tokens[index]) in wrappers or tool_name(tokens[index]) == "rustup"
     ):
@@ -3051,32 +3435,59 @@ def skip_wrapper_prefixes(tokens: tuple[str, ...], index: int) -> tuple[int, boo
         if wrapper == "rustup":
             operand = rustup_run_operand(tokens, index)
             if operand is None:
-                return len(tokens), False
-            index = skip_redirections_and_assignments(tokens, operand)
+                return len(tokens), False, False
+            assignments_allowed = False
+            index = skip_redirections_and_assignments(
+                tokens,
+                operand,
+                allow_assignments=False,
+            )
             continue
         index += 1
         if wrapper == "command" and index < len(tokens) and tokens[index] in {
             "-V",
             "-v",
         }:
-            return len(tokens), False
+            return len(tokens), False, False
         while index < len(tokens):
             option = tokens[index]
             if option == "--":
                 index += 1
                 break
-            if option in option_operands:
+            if option in option_operands or option in wrapper_option_operands.get(
+                wrapper,
+                frozenset(),
+            ):
                 index += 2
                 continue
             if option.startswith("-"):
                 index += 1
                 continue
             break
-        if wrapper == "timeout" and index < len(tokens):
+        if wrapper == "timeout":
+            if index >= len(tokens):
+                # The mandatory duration was never on this line, so the next
+                # word is that operand and not the executable. Report it the
+                # way an option that skipped past a missing operand already is
+                # — one past the end — so `timeout --preserve-status \` grants
+                # no command slot while `timeout 30 \` still does.
+                return len(tokens) + 1, True, False
             # The mandatory duration precedes timeout's command operand.
             index += 1
-        index = skip_redirections_and_assignments(tokens, index)
-    return index, True
+        # Only `sudo` and the `time` reserved word leave `NAME=value` as an
+        # assignment; every other wrapper here execs its operand directly, so an
+        # assignment word after one is argv and the word behind it is not a
+        # command name. `time` is a shell keyword that times a *pipeline*, so
+        # the words after it are still parsed as a simple command and its
+        # assignment prefixes remain assignments — the same model `TIME_UNIT`
+        # spells for the regex layer.
+        assignments_allowed = wrapper in ASSIGNMENT_PARSING_WRAPPERS
+        index = skip_redirections_and_assignments(
+            tokens,
+            index,
+            allow_assignments=assignments_allowed,
+        )
+    return index, True, assignments_allowed
 
 
 ENV_SPLIT_STRING_OPTIONS = ("--split-string", "-S")
@@ -3203,17 +3614,45 @@ def command_wrapper_operand(
     return position, None, False
 
 
-def executable_index(tokens: tuple[str, ...], start: int = 0) -> tuple[int, bool]:
-    """Locate a command word after assignments, redirections, and wrappers."""
+def executable_details(
+    tokens: tuple[str, ...],
+    start: int = 0,
+) -> tuple[int, bool, bool]:
+    """Locate a command word and retain its assignment-prefix semantics.
+
+    Each pass after a wrapper layer carries that layer's assignment verdict
+    rather than defaulting back to `allow_assignments=True`. An unconditional
+    pass here re-skipped the very argv words `skip_wrapper_prefixes` had just
+    ruled out, so `exec FOO=bar $cmd build` and `timeout 30 FOO=bar $cmd build`
+    resolved `$cmd` as the executable and reported benign wrapper argv as an
+    opaque Cross dispatch. `env` is the exception in the other direction: it
+    really does consume assignment operands, and `skip_env_prefix` has already
+    done so, so that pass stays permissive.
+    """
 
     index = skip_redirections_and_assignments(tokens, start)
-    index, executes = skip_wrapper_prefixes(tokens, index)
-    index = skip_redirections_and_assignments(tokens, index)
+    index, executes, assignments_allowed = skip_wrapper_prefixes(tokens, index)
+    index = skip_redirections_and_assignments(
+        tokens,
+        index,
+        allow_assignments=assignments_allowed,
+    )
     if index < len(tokens) and tool_name(tokens[index]) == "env":
         index = skip_env_prefix(tokens, index + 1)
         index = skip_redirections_and_assignments(tokens, index)
-        index, executes = skip_wrapper_prefixes(tokens, index)
-        index = skip_redirections_and_assignments(tokens, index)
+        index, executes, assignments_allowed = skip_wrapper_prefixes(tokens, index)
+        index = skip_redirections_and_assignments(
+            tokens,
+            index,
+            allow_assignments=assignments_allowed,
+        )
+    return index, executes, assignments_allowed
+
+
+def executable_index(tokens: tuple[str, ...], start: int = 0) -> tuple[int, bool]:
+    """Locate a command word after assignments, redirections, and wrappers."""
+
+    index, executes, _ = executable_details(tokens, start)
     return index, executes
 
 
@@ -3315,12 +3754,23 @@ def xargs_command_index(tokens: tuple[str, ...], index: int) -> int:
 def command_has_argument(tokens: tuple[str, ...], index: int) -> bool:
     """Return whether an executable has a real operand before shell syntax."""
 
-    if index + 1 >= len(tokens):
-        return False
-    following = tokens[index + 1]
-    return following not in {"&", "&&", ")", ";", ";;", "|", "||", "}"} and (
-        not redirection_token(following)
-    )
+    index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"&", "&&", ")", ";", ";;", "|", "||", "}"}:
+            return False
+        if token.isdigit() and index + 1 < len(tokens) and redirection_token(
+            tokens[index + 1]
+        ):
+            index += 1
+            token = tokens[index]
+        if redirection_token(token):
+            index += 1
+            if index < len(tokens):
+                index += 1
+            continue
+        return True
+    return False
 
 
 def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
@@ -3336,11 +3786,23 @@ def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
     if producer == "echo":
         while arguments and arguments[0] in {"-e", "-E", "-n"}:
             arguments.pop(0)
+        # Shell echo behavior varies and `echo -e` may decode escapes before a
+        # stdin-consuming shell sees the program, so keep escaped output opaque.
+        if any("\\" in argument for argument in arguments):
+            return None
         return " ".join(arguments)
     if producer != "printf" or not arguments:
         return None
     if arguments[0] in {"%s", "%s\\n"}:
+        # The `%s` forms print their operands as data; escaped operands are
+        # still opaque because the scanner does not model producer semantics.
+        if any("\\" in argument for argument in arguments[1:]):
+            return None
         return "".join(arguments[1:])
+    # Literal printf formats decode backslash escapes (`\x63ross` -> `cross`),
+    # so treating an escaped format as readable source would miss execution.
+    if "\\" in arguments[0]:
+        return None
     if "%" not in arguments[0]:
         return arguments[0]
     return None
@@ -3535,6 +3997,27 @@ def shell_invocation_mode(
             force_stdin = True
         position += 1
     return None, False, True
+
+
+def interpreted_operand_is_inline_source(
+    interpreter: str,
+    interpreter_options: str,
+) -> bool:
+    """Return whether a matched interpreted operand is inline program source."""
+
+    executable = tool_name(interpreter.split()[-1])
+    if executable in SHELL_INTERPRETER_NAMES:
+        tokens = shell_tokens(f"{executable}{interpreter_options} __ferrum_operand__")
+        if tokens is None:
+            return False
+        command_program, _, _ = shell_invocation_mode(tokens, 0)
+        return command_program == "__ferrum_operand__"
+    return bool(
+        re.search(
+            r"(?:^|\s)--?(?:c|lc|ec|e|[cC]ommand|[eE]val)(?:\s|$)",
+            interpreter_options,
+        )
+    )
 
 
 def interpolated_inline_source(value: str) -> bool:
@@ -3929,10 +4412,21 @@ def inline_interpreter_has_cross(
                     "inline python program",
                     reject_dynamic_commands=True,
                 )
-                if any(
-                    literal_command_text_has_cross(command) for command in commands
-                ):
-                    return True
+                # Keep the recursion-safe literal command reader here: this
+                # path is itself reached from the shell scanner, so re-entering
+                # the alias/shim-aware top-level reader can recurse through the
+                # same inline program. The process command still owes the same
+                # opaque-stdin policy as every other Python provenance path.
+                # Without the scope, PR comparison (which enables opaque
+                # executable words) could accept an escaped producer because
+                # this narrower reader did not receive that flag, while exact
+                # workflow validation rejected it through its outer scope.
+                with opaque_stdin_program_scope():
+                    if any(
+                        literal_command_text_has_cross(command)
+                        for command in commands
+                    ):
+                        return True
                 # Inline Python one-liners that shell scripts already use to
                 # reshape JSON dispatch no processes at all, so an unresolvable
                 # command only fails closed once the program itself mentions
@@ -4056,6 +4550,35 @@ def shell_argv_dispatch_scope(contents: str):
         yield
     finally:
         _shell_argv_dispatchers = outer
+
+
+_opaque_stdin_fail_closed = False
+
+
+@contextlib.contextmanager
+def opaque_stdin_program_scope():
+    """Fail closed on a stdin program this scanner cannot decode.
+
+    Whether a program handed to a shell on standard input is readable is a
+    property of the *producer*, not of the executable word, so it is decided
+    independently of the opaque-executable substitution. `printf
+    '\\x63ross build --target ...' | bash` writes a Cross command through
+    backslash escapes that `literal_producer_output` deliberately refuses to
+    fold, and the resulting opacity was only rejected while the scan ran with
+    opaque executable checks enabled. Exact-tree validation of reached shell
+    automation enters through `contains_literal_executable_cross`, which runs
+    with those checks off, so the same script was rejected by PR comparison and
+    accepted by `validate_automation_collection`. This scope closes that
+    asymmetry without widening the executable-word analysis.
+    """
+
+    global _opaque_stdin_fail_closed
+    outer = _opaque_stdin_fail_closed
+    _opaque_stdin_fail_closed = True
+    try:
+        yield
+    finally:
+        _opaque_stdin_fail_closed = outer
 
 
 def token_command_has_cross(
@@ -4321,9 +4844,11 @@ def shell_statements_have_cross(
                         depth=depth + 1,
                     ):
                         return True
-                elif include_opaque_shell_executable:
+                elif include_opaque_shell_executable or _opaque_stdin_fail_closed:
                     return True
-            elif opaque and include_opaque_shell_executable:
+            elif opaque and (
+                include_opaque_shell_executable or _opaque_stdin_fail_closed
+            ):
                 return True
     return False
 
@@ -4436,7 +4961,7 @@ def opaque_word_starts_command(
     prefix = line[:start].replace("\\`", "").replace("\\$", "")
     if EXPLICIT_COMMAND_WORD_PREFIX.search(prefix):
         return True
-    return starts_command and not prefix.strip()
+    return starts_command and BARE_COMMAND_WORD_PREFIX.fullmatch(prefix) is not None
 
 
 def opaque_executable_variants(
@@ -4542,18 +5067,36 @@ def opaque_shell_interpolation_variants(
 ) -> tuple[str, ...]:
     """Expose a shell interpolation that can occupy a Cross executable word."""
 
+    shell_interpolation_spans = tuple(
+        match.span() for match in SHELL_INTERPOLATION.finditer(line)
+    )
     # Command substitutions participate in the same word as parameter
     # expansions, so `$(a)${b}` is considered alongside `${a}${b}`.
     spans = tuple(
-        [match.span() for match in SHELL_INTERPOLATION.finditer(line)]
-        + list(command_substitution_spans(line))
+        [*shell_interpolation_spans, *command_substitution_spans(line)]
     )
-    return opaque_executable_variants(
-        line,
-        spans,
-        shell_evaluated=shell_evaluated,
-        starts_command=starts_command,
+    variants = [
+        *opaque_executable_variants(
+            line,
+            spans,
+            shell_evaluated=shell_evaluated,
+            starts_command=starts_command,
+        )
+    ]
+    # A parameter expansion inside `$(...)` can itself be the executable for the
+    # nested shell command (`$("${cmd}" build ...)`). The combined command
+    # substitution span above intentionally treats the whole substitution as one
+    # word for outer-command dispatch, so also test the raw shell interpolation
+    # spans to keep executable slots opened by `$(` visible.
+    variants.extend(
+        opaque_executable_variants(
+            line,
+            shell_interpolation_spans,
+            shell_evaluated=shell_evaluated,
+            starts_command=starts_command,
+        )
     )
+    return tuple(dict.fromkeys(variants))
 
 
 def decode_ansi_c_body(value: str) -> str:
@@ -4804,11 +5347,16 @@ def literal_command_text_has_cross(
 
     logical_text = re.sub(r"\\\r?\n[ \t]*", "", text)
     evaluated = shell_evaluated_lines(logical_text)
+    non_command_starts = shell_non_command_start_lines(logical_text)
     return any(
         has_cross_command_context(variant)
         or (not executable_only and CROSS_ENVIRONMENT.search(variant))
         for index, line in enumerate(logical_text.splitlines())
-        for variant in scan_variants(line, shell_evaluated=index in evaluated)
+        for variant in scan_variants(
+            line,
+            shell_evaluated=index in evaluated,
+            starts_command=index not in non_command_starts,
+        )
     )
 
 
@@ -4946,11 +5494,12 @@ def cross_shim_variants(contents: str) -> tuple[str, ...]:
     for name in shims:
         dispatch = re.compile(
             COMMAND_START_CONTEXT
-            + WRAPPER_PREFIX
             # `PATH="$PWD/bin:$PATH" cr build ...` prepends the shim directory
             # in the same command, so the assignment layer must be consumed
-            # before the shim name like any other executable word.
-            + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+            # before the shim name like any other executable word — and
+            # `env sudo cr build ...` dispatches the shim just as well, so this
+            # uses the shared interleaved layer rather than a fixed ordering.
+            + COMMAND_WORD_PREFIX
             + TOOL_PATH_PREFIX
             + re.escape(name)
             + r"(?![A-Za-z0-9_-])"
@@ -5012,28 +5561,33 @@ def shell_evaluated_lines(contents: str) -> frozenset[int]:
             cursor += 1
         index = cursor
 
-    delimiters: list[str] = []
+    delimiters: list[tuple[str, bool]] = []
     for cursor, line in enumerate(lines):
         if delimiters:
-            if line.strip() == delimiters[0]:
+            delimiter, quoted = delimiters[0]
+            if line.strip() == delimiter:
                 delimiters.pop(0)
             else:
-                evaluated.discard(cursor)
+                if quoted:
+                    evaluated.discard(cursor)
             continue
         delimiters.extend(
-            delimiter for _, delimiter in quote_aware_heredoc_starts(line)
+            (delimiter, quoted)
+            for _, delimiter, quoted in quote_aware_heredoc_start_details(line)
         )
     return frozenset(evaluated)
 
 
-def shell_continuation_lines(contents: str) -> frozenset[int]:
-    """Return the raw lines a backslash continuation joins onto a previous one.
+def shell_non_command_start_lines(contents: str) -> frozenset[int]:
+    """Return raw lines whose start is not a command slot.
 
     A shell reads the logical line a trailing backslash builds, not the source
     line. `$(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)` under
     ``docker buildx imagetools create ... \\`` is that command's last argument,
     so the bare line start that would otherwise let the substitution stand for
-    a whole command is not a command slot at all.
+    a whole command is not a command slot at all. Heredoc body line starts are
+    data passed to the receiving command, even when an unquoted heredoc still
+    evaluates command substitutions and backticks in that body.
 
     Only that bare-line-start allowance is withdrawn, exactly as in
     `shell_evaluated_lines`. An explicit executable slot on the continuation
@@ -5044,12 +5598,109 @@ def shell_continuation_lines(contents: str) -> frozenset[int]:
     a continuation, so `printf 'a\\\\'` does not swallow the next line.
     """
 
-    continuations: set[int] = set()
-    for index, line in enumerate(contents.splitlines()):
+    lines = contents.splitlines()
+    continuations: set[int] = set(heredoc_body_lines(contents))
+    for index, line in enumerate(lines):
         trailing = len(line) - len(line.rstrip("\\"))
         if trailing % 2 == 1:
             continuations.add(index + 1)
     return frozenset(continuations)
+
+
+def heredoc_body_lines(contents: str) -> frozenset[int]:
+    """Return the raw lines that are heredoc body data rather than commands.
+
+    The receiving command reads these lines as its standard input, so a bare
+    line start inside one is never an executable slot. This is deliberately
+    independent of `shell_evaluated_lines`: an *unquoted* heredoc body is still
+    shell-evaluated for `$()` and backticks, so those explicit slots must keep
+    failing closed, while the bare line start must not.
+    """
+
+    body: set[int] = set()
+    delimiters: list[str] = []
+    for cursor, line in enumerate(contents.splitlines()):
+        if delimiters:
+            if line.strip() == delimiters[0]:
+                delimiters.pop(0)
+            else:
+                body.add(cursor)
+            continue
+        delimiters.extend(
+            delimiter for _, delimiter in quote_aware_heredoc_starts(line)
+        )
+    return frozenset(body)
+
+
+def shell_continuation_lines(contents: str) -> frozenset[int]:
+    """Return the raw lines a backslash continuation joins onto a previous one."""
+
+    return shell_non_command_start_lines(contents)
+
+
+def shell_continuation_command_starts(contents: str) -> frozenset[int]:
+    """Return continuation lines whose first word is still executable argv.
+
+    Most backslash continuations make the following raw line an ordinary
+    argument to the previous command, so an opaque word at that raw line's
+    indentation is not allowed to stand for a whole command. Process wrappers
+    are different: `env \\` or `sudo \\` have not consumed the executable operand
+    yet, so the next physical line provides the argv the wrapper dispatches.
+
+    A wrapper-shaped line inside a heredoc body is data the receiving command
+    reads, not a dispatch, so it grants no command start. Without that guard the
+    unquoted-heredoc bodies `shell_evaluated_lines` now keeps evaluated would
+    re-manufacture the bare slot `shell_non_command_start_lines` withdrew.
+    """
+
+    command_starts: set[int] = set()
+    evaluated_lines = shell_evaluated_lines(contents)
+    heredoc_bodies = heredoc_body_lines(contents)
+    lines = contents.splitlines()
+    for index, line in enumerate(lines):
+        trailing = len(line) - len(line.rstrip("\\"))
+        if trailing % 2 != 1 or index not in evaluated_lines:
+            continue
+        if index in heredoc_bodies:
+            continue
+        tokens = shell_tokens(line.rstrip("\\"))
+        if tokens is None:
+            continue
+        position, executes, assignments_allowed = executable_details(tokens)
+        # `position == len(tokens)` means the prefix ended exactly at the line
+        # end, so the next physical line supplies the executable: `env \` and
+        # `sudo \` and `timeout 30 \` all dispatch the word that follows.
+        # `position > len(tokens)` means an option skipped past an operand that
+        # was never on this line, so the following word is that operand rather
+        # than the executable. GNU `env -u NAME` and `sudo -u USER` are the
+        # documented forms; granting `env -u \` a command slot made `$var` on
+        # the next line a whole-command surface when it is the name `-u` unsets,
+        # which is a deterministic false positive rather than a missed dispatch.
+        if not executes or position != len(tokens):
+            continue
+        # The raw continuation scan normally treats a leading `NAME=value` as
+        # a shell assignment and grants the following word the executable slot.
+        # That is correct after `env`, `sudo`, and the `time` reserved word, but
+        # not after wrappers such as `exec`, `nohup`, or `timeout`: there the
+        # assignment-looking word is the wrapper's COMMAND argv itself. The
+        # joined logical-line scan retains the wrapper and handles that command
+        # correctly, so withhold only the synthetic raw-line grant here.
+        following = shell_tokens(lines[index + 1]) if index + 1 < len(lines) else None
+        if following and not assignments_allowed:
+            # Redirections and grouping words may precede the assignment, so
+            # compare the two token walks instead of inspecting only word zero.
+            # A difference means the standalone raw-line scan would skip an
+            # assignment that the continued wrapper treats as argv.
+            with_assignments = skip_redirections_and_assignments(following, 0)
+            without_assignments = skip_redirections_and_assignments(
+                following,
+                0,
+                allow_assignments=False,
+            )
+            if with_assignments != without_assignments:
+                continue
+        command_starts.add(index + 1)
+    return frozenset(command_starts)
 
 
 def block_scalar_body_lines(lines: list[str]) -> frozenset[int]:
@@ -5083,7 +5734,7 @@ def block_scalar_body_lines(lines: list[str]) -> frozenset[int]:
     return frozenset(body)
 
 
-def logical_scan_lines(contents: str) -> tuple[tuple[str, bool], ...]:
+def logical_scan_lines(contents: str) -> tuple[tuple[str, bool, bool], ...]:
     """Return every command line to scan with whether a shell evaluates it.
 
     Alias and shim expansions are synthesized command text rather than source
@@ -5091,13 +5742,14 @@ def logical_scan_lines(contents: str) -> tuple[tuple[str, bool], ...]:
     """
 
     evaluated = shell_evaluated_lines(contents)
+    non_command_starts = shell_non_command_start_lines(contents)
     return (
         *(
-            (line, index in evaluated)
+            (line, index in evaluated, index not in non_command_starts)
             for index, line in enumerate(contents.splitlines())
         ),
-        *((line, True) for line in shell_alias_variants(contents)),
-        *((line, True) for line in cross_shim_variants(contents)),
+        *((line, True, True) for line in shell_alias_variants(contents)),
+        *((line, True, True) for line in cross_shim_variants(contents)),
     )
 
 
@@ -5108,9 +5760,45 @@ def contains_cross_surface(
 ) -> bool:
     """Return whether lexical normalization exposes a Cross-controlled input."""
 
+    continuation_command_starts = shell_continuation_command_starts(contents)
+    raw_lines = contents.splitlines()
+    if any(
+        has_cross_command_context(
+            variant,
+            include_opaque_shell_executable=include_opaque_shell_executable,
+        )
+        or CROSS_ENVIRONMENT.search(variant)
+        for index in continuation_command_starts
+        if index < len(raw_lines)
+        for line in [raw_lines[index]]
+        for variant in scan_variants(
+            line,
+            include_opaque_shell_executable=include_opaque_shell_executable,
+            shell_evaluated=True,
+            starts_command=True,
+        )
+    ):
+        return True
+
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
-    if OPAQUE_INLINE_SHELL.search(logical_contents) or (
-        OPAQUE_ARM_CROSS_EXECUTION.search(logical_contents)
+    # The whole-text searches read the *command* text, the same projection
+    # `contains_direct_trusted_shell_cross_surface`, `unprotected_cross_surfaces`
+    # and `generic_action_cross_surfaces` use. Reading the raw text here made a
+    # job or file that only *writes* a quoted heredoc template holding
+    # `$cmd build --target aarch64-unknown-linux-gnu` Cross-sensitive while the
+    # per-line scanners below withdrew that same body, so the two disagreed and
+    # a benign edit was blocked with no finding behind it. The projection keeps
+    # every genuinely executed body — an interpreter-fed one verbatim, an
+    # unquoted one's substitutions re-emitted, and the whole text raw when a
+    # heredoc is unterminated — so this stays fail-closed.
+    command_contents = automation_command_text(logical_contents)
+    if (
+        OPAQUE_INLINE_SHELL.search(command_contents)
+        or opaque_arm_cross_execution(command_contents)
+        or (
+            include_opaque_shell_executable
+            and contains_opaque_executable_cross(command_contents)
+        )
     ):
         return True
     with shell_argv_dispatch_scope(logical_contents):
@@ -5120,11 +5808,14 @@ def contains_cross_surface(
                 include_opaque_shell_executable=include_opaque_shell_executable,
             )
             or CROSS_ENVIRONMENT.search(variant)
-            for line, shell_evaluated in logical_scan_lines(logical_contents)
+            for line, shell_evaluated, starts_command in logical_scan_lines(
+                logical_contents
+            )
             for variant in scan_variants(
                 line,
                 include_opaque_shell_executable=include_opaque_shell_executable,
                 shell_evaluated=shell_evaluated,
+                starts_command=starts_command,
             )
         )
 
@@ -5145,7 +5836,7 @@ def cross_surface_line_report(
     # Alias and shim expansions follow the source lines and are synthesized
     # rather than located, so they are reported without a line number.
     source_line_count = len(logical_contents.splitlines())
-    for number, (line, shell_evaluated) in enumerate(
+    for number, (line, shell_evaluated, starts_command) in enumerate(
         logical_scan_lines(logical_contents),
         start=1,
     ):
@@ -5153,6 +5844,7 @@ def cross_surface_line_report(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
             shell_evaluated=shell_evaluated,
+            starts_command=starts_command,
         ):
             if has_cross_command_context(
                 variant,
@@ -5673,12 +6365,11 @@ def remote_action_surface_lines(
                     reason = f"input:{cross_input}"
                 continue
             if artifact_transfer and artifact_only_input_line(keys):
-                # An artifact name or path is not an execution argument. These
-                # two SHA-pinned first-party actions only move files between
-                # jobs, so naming the protected target in an artifact name
-                # cannot start a build. Everything else about them, including a
-                # `cross` executable token and every Cross-enabling input key,
-                # is still a surface.
+                # A SHA-pinned download artifact name or path is a selector for an
+                # already-published artifact, not an execution argument or a
+                # publication identity. Upload artifact names and paths are not
+                # matched by this carve-out because they can collide with, or
+                # overwrite, trusted artifact names consumed by release jobs.
                 if reason is None and any(
                     EXPECTED_IMAGE in variant or STANDALONE_CROSS.search(variant)
                     for variant in (text, decoded_yaml_text(text))
@@ -5819,6 +6510,7 @@ def unprotected_cross_surfaces(
     lines = outside.splitlines(keepends=True)
     evaluated_lines = shell_evaluated_lines(outside)
     continuation_lines = shell_continuation_lines(outside)
+    continuation_command_starts = shell_continuation_command_starts(outside)
     jobs_index = next(
         index
         for index, line in enumerate(lines)
@@ -5863,20 +6555,38 @@ def unprotected_cross_surfaces(
             "",
             yaml_command_augmented(block_contents),
         )
-        if OPAQUE_INLINE_SHELL.search(logical_contents) or (
-            OPAQUE_ARM_CROSS_EXECUTION.search(logical_contents)
+        # Both whole-job searches read the *command* text rather than the raw
+        # job body, exactly as `contains_direct_trusted_shell_cross_surface` and
+        # `generic_action_cross_surfaces` already do. Scanning the raw text made
+        # a job that only *writes* a quoted heredoc template holding
+        # `$cmd build --target aarch64-unknown-linux-gnu` Cross-sensitive, even
+        # though the body is data and the per-line scanners below would withdraw
+        # that command slot — a block with no finding behind it, on both
+        # `validate_workflow_collection` and `compare_pr_workflow_collection`.
+        # The projection is not a weakening: it re-emits every substitution an
+        # unquoted body dispatches, keeps an interpreter-fed body verbatim, and
+        # returns the text raw whenever a heredoc is unterminated.
+        job_command_contents = automation_command_text(logical_contents)
+        if (
+            OPAQUE_INLINE_SHELL.search(job_command_contents)
+            or opaque_arm_cross_execution(job_command_contents)
+            or (
+                include_opaque_shell_executable
+                and contains_opaque_executable_cross(job_command_contents)
+            )
         ):
             sensitive_jobs.add(name)
             job_reasons[name] = "opaque inline shell"
             continue
         with shell_argv_dispatch_scope(logical_contents):
-            for logical_line, shell_evaluated in logical_scan_lines(
+            for logical_line, shell_evaluated, starts_command in logical_scan_lines(
                 logical_contents
             ):
                 for variant in scan_variants(
                     logical_line,
                     include_opaque_shell_executable=include_opaque_shell_executable,
                     shell_evaluated=shell_evaluated,
+                    starts_command=starts_command,
                 ):
                     if has_cross_command_context(
                         variant,
@@ -5897,20 +6607,31 @@ def unprotected_cross_surfaces(
         source,
     )
 
+    # The same projection, kept line-indexed so this per-line scan can still
+    # report the source line it matched. `None` means a heredoc never closed, in
+    # which case the narrowing is withdrawn and the raw lines are read exactly as
+    # they were before.
+    projected_lines = opaque_arm_command_line_projection(outside)
     top_level_surfaces: list[str] = []
     for index, line in enumerate(lines):
         line_surfaces: set[str] = set()
         if index in remote_surfaces:
             line_surfaces.add(remote_surfaces[index])
-        if OPAQUE_INLINE_SHELL.search(line) or OPAQUE_ARM_CROSS_EXECUTION.search(
-            line
-        ):
+        command_line_text = (
+            line if projected_lines is None else projected_lines[index]
+        )
+        if OPAQUE_INLINE_SHELL.search(
+            command_line_text
+        ) or opaque_arm_cross_execution(command_line_text):
             line_surfaces.add("opaque-inline-shell")
         for variant in scan_variants(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
             shell_evaluated=index in evaluated_lines,
-            starts_command=index not in continuation_lines,
+            starts_command=(
+                index not in continuation_lines
+                or index in continuation_command_starts
+            ),
         ):
             normalized = re.sub(r"\s+", " ", variant).strip()
             if has_cross_command_context(
@@ -6036,15 +6757,25 @@ def validate_workflow_collection(
         if name in PROTECTED_WORKFLOW_FILENAMES:
             continue
         surface_reasons: dict[str, str] = {}
-        surfaces, failures = generic_workflow_cross_surfaces(
-            contents,
-            f"{source}/{name}",
-            reasons=surface_reasons,
-        )
-        flow_surfaces, flow_failures = flow_normalized_workflow_surfaces(
-            contents,
-            f"{source}/{name}",
-        )
+        # Exact validation runs with opaque *executable* checks off, but an
+        # undecodable stdin program is opaque for every target regardless of the
+        # executable word, so it fails closed here exactly as PR comparison
+        # already does. Without this scope a run body such as
+        # `printf '\x63ross build --target aarch64-unknown-linux-gnu' | bash`
+        # reached `runtime_program_cross_surface` with the include flag false,
+        # `literal_producer_output` returned opaque, and neither the flag nor the
+        # scope was set — so trusted-base validation accepted a Cross execution
+        # that PR comparison rejects.
+        with opaque_stdin_program_scope():
+            surfaces, failures = generic_workflow_cross_surfaces(
+                contents,
+                f"{source}/{name}",
+                reasons=surface_reasons,
+            )
+            flow_surfaces, flow_failures = flow_normalized_workflow_surfaces(
+                contents,
+                f"{source}/{name}",
+            )
         surfaces = tuple(dict.fromkeys([*surfaces, *flow_surfaces]))
         errors.extend(failures)
         errors.extend(flow_failures)
@@ -6143,27 +6874,44 @@ def generic_action_cross_surfaces(
         remote_surfaces, remote_errors = remote_action_surface_lines(contents, name)
     else:
         remote_surfaces, remote_errors = {}, []
+    # The two whole-text searches below read the *command* text rather than the
+    # raw file, exactly as `contains_direct_trusted_shell_cross_surface` does.
+    # Without that parity a proposed script that merely writes `cat <<'EOF'`
+    # with `bash -c "$(render)"` in the body still changed its compared digest
+    # surface and blocked the edit, while the exact-tree scan treated the same
+    # quoted body as inert template data — a block with no finding behind it.
+    # The projection is not a weakening: it re-emits every substitution an
+    # unquoted body dispatches, keeps an interpreter-fed heredoc body verbatim,
+    # and returns the text raw whenever a heredoc is unterminated. The per-line
+    # scan below is unaffected; `logical_scan_lines` already withdraws heredoc
+    # body lines on its own.
+    command_contents = automation_command_text(logical_contents)
     with shell_argv_dispatch_scope(logical_contents):
         sensitive = (
             runtime_sensitive
             or bool(runtime_errors)
             or bool(remote_surfaces)
             or bool(remote_errors)
-            or OPAQUE_INLINE_SHELL.search(logical_contents) is not None
-            or WRAPPED_LITERAL_CROSS.search(logical_contents) is not None
+            or OPAQUE_INLINE_SHELL.search(command_contents) is not None
+            or WRAPPED_LITERAL_CROSS.search(command_contents) is not None
+            or (
+                include_opaque_shell_executable
+                and contains_opaque_executable_cross(command_contents)
+            )
             or any(
                 has_cross_command_context(
                     variant,
                     include_opaque_shell_executable=include_opaque_shell_executable,
                 )
                 or CROSS_ENVIRONMENT.search(variant)
-                for line, shell_evaluated in logical_scan_lines(
+                for line, shell_evaluated, starts_command in logical_scan_lines(
                     logical_contents
                 )
                 for variant in scan_variants(
                     line,
                     include_opaque_shell_executable=include_opaque_shell_executable,
                     shell_evaluated=shell_evaluated,
+                    starts_command=starts_command,
                 )
             )
         )
@@ -6197,13 +6945,111 @@ def contains_literal_executable_cross(contents: str) -> bool:
     with shell_argv_dispatch_scope(logical_contents):
         return any(
             has_cross_command_context(variant) or CROSS_ENVIRONMENT.search(variant)
-            for line, shell_evaluated in logical_scan_lines(logical_contents)
+            for line, shell_evaluated, starts_command in logical_scan_lines(
+                logical_contents
+            )
             for variant in scan_variants(
                 line,
                 include_opaque_shell_executable=False,
                 shell_evaluated=shell_evaluated,
+                starts_command=starts_command,
             )
         )
+
+
+def process_commands_have_cross(commands: list[str]) -> bool:
+    """Scan extracted process commands with opaque stdin fail-closed."""
+
+    # Python process extraction can return a literal shell command whose stdin
+    # producer is intentionally undecodable, e.g. an escaped `printf` piped to
+    # Bash. The command string is readable, but its generated program is not;
+    # use the same scope exact shell-file validation uses so provenance paths do
+    # not silently accept what PR comparison freezes.
+    with opaque_stdin_program_scope():
+        return any(
+            contains_literal_executable_cross(command) for command in commands
+        )
+
+
+def contains_opaque_executable_cross(contents: str) -> bool:
+    """Recognize shell interpolation variants that could execute Cross."""
+
+    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    with shell_argv_dispatch_scope(logical_contents):
+        for line, shell_evaluated, starts_command in logical_scan_lines(
+            logical_contents
+        ):
+            # Flatten nested command substitutions first so the prefilter reads
+            # the same spans `scan_variants` will substitute through.
+            if OPAQUE_EXECUTABLE_WITH_SUBCOMMAND.search(
+                flattened_command_substitutions(line)
+            ) is None:
+                continue
+            literal_variants = set(
+                scan_variants(
+                    line,
+                    include_opaque_shell_executable=False,
+                    shell_evaluated=shell_evaluated,
+                    starts_command=starts_command,
+                )
+            )
+            for variant in scan_variants(
+                line,
+                include_opaque_shell_executable=True,
+                shell_evaluated=shell_evaluated,
+                starts_command=starts_command,
+            ):
+                if variant in literal_variants:
+                    continue
+                if OPAQUE_CROSS_SUBCOMMAND.search(variant) is None:
+                    continue
+                if has_cross_command_context(
+                    variant,
+                    include_opaque_shell_executable=True,
+                ):
+                    return True
+    return False
+
+
+def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
+    """Recognize Cross-sensitive surfaces in trusted shell automation."""
+
+    # An undecodable stdin program is opaque for every target, so the literal
+    # scan fails closed on it here exactly as PR comparison already does.
+    with opaque_stdin_program_scope():
+        literal_surface = contains_literal_executable_cross(contents)
+    # Every raw-text search below reads the *command* text rather than the raw
+    # lines. A reached script that writes a literal template — `cat <<'EOF'`
+    # holding `bash -c "$(render)"` or `/opt/bin/cross build` — is not executing
+    # that text at all, and reporting the quoted body as a generated inline
+    # shell surface blocked otherwise safe automation edits. The narrowing is
+    # not a weakening: `automation_command_text` re-emits every substitution an
+    # *unquoted* body really dispatches, keeps a body an interpreter is fed
+    # (`bash <<'EOF'`) verbatim because that body is the program rather than
+    # data, folds backslash continuations, and returns the program raw whenever
+    # a heredoc is unterminated. Pull-request comparison applies the same
+    # projection, so neither side calls a surface inert that the other blocks.
+    command_text = automation_command_text(contents)
+    return (
+        literal_surface
+        or WRAPPED_LITERAL_CROSS.search(command_text) is not None
+        or OPAQUE_INLINE_SHELL.search(command_text) is not None
+        # An executable word assembled from shell expansions is opaque, so an
+        # ARM64 cross build driven by one fails closed here too.
+        or opaque_arm_cross_execution(command_text)
+        # A variable-resolved executable dispatching a Cargo/Cross subcommand is
+        # opaque for every target, not just the ARM64 one above. It reads the
+        # *projected* command text for the same reason every search beside it
+        # does: scanning the raw contents reintroduced exactly the false
+        # positive the projection removes, because a heredoc template holding
+        # `$cmd build` was still read as an executable opaque Cross command even
+        # though the body is data the script only writes. The projection keeps
+        # every genuinely executed body — an interpreter-fed one verbatim, an
+        # unquoted one's substitutions re-emitted, and the whole program raw
+        # when a heredoc is unterminated — so this stays fail-closed on real
+        # dispatches.
+        or contains_opaque_executable_cross(command_text)
+    )
 
 
 def is_dispatcher_manifest(name: str) -> bool:
@@ -6310,18 +7156,41 @@ def dispatcher_manifest_scripts(name: str, contents: str) -> tuple[str, ...]:
 
 
 def dispatcher_manifest_cross_surface(name: str, contents: str) -> bool:
-    """Return whether a dispatcher manifest recipe can execute Cross."""
+    """Return whether a dispatcher manifest recipe can execute Cross.
+
+    A recipe is shell, so it reaches Cross through exactly the producers a
+    reached shell script does, and it is scanned with exactly the same helper.
+    Enumerating a subset here — literal Cross, wrapped literal Cross and the
+    opaque ARM64 form — left every other trusted-shell surface accepted by
+    exact-tree revalidation while PR comparison froze the same recipe through
+    `generic_action_cross_surfaces(..., include_opaque_shell_executable=True)`.
+    A recipe such as `cmd=$(printf cross); "$cmd" build` is an opaque Cross
+    executable for every target, not only the ARM64 one, and
+    `contains_direct_trusted_shell_cross_surface` is the single definition of
+    that policy.
+    """
 
     return any(
-        contains_literal_executable_cross(script)
-        or WRAPPED_LITERAL_CROSS.search(script)
-        or OPAQUE_ARM_CROSS_EXECUTION.search(re.sub(r"\\\r?\n[ \t]*", "", script))
+        contains_direct_trusted_shell_cross_surface(script)
         for script in dispatcher_manifest_scripts(name, contents)
     )
 
 
-def automation_file_cross_surfaces(name: str, contents: str) -> tuple[str, ...]:
-    """Protect Cross tokens plus opaque Python process-dispatch files."""
+def automation_file_cross_surfaces(
+    name: str,
+    contents: str,
+    interpreters: frozenset[str] = frozenset(),
+) -> tuple[str, ...]:
+    """Protect Cross tokens plus opaque Python process-dispatch files.
+
+    `interpreters` carries the languages the *call sites* named for this file,
+    which is the only evidence a suffixless, shebangless script has. Exact-tree
+    validation already replays that provenance as a union on top of the file's
+    own language; comparison receives it from
+    `reachable_automation_references()` too, so it is applied here in parity
+    rather than discarded. Both sides of a comparison use their own side's
+    provenance, so the surfaces stay symmetric.
+    """
 
     surfaces = list(
         generic_action_cross_surfaces(
@@ -6349,10 +7218,7 @@ def automation_file_cross_surfaces(name: str, contents: str) -> tuple[str, ...]:
         if process_failures:
             digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
             surfaces.append(f"opaque-python-process:{digest}")
-        if any(
-            contains_literal_executable_cross(command)
-            for command in process_commands
-        ):
+        if process_commands_have_cross(process_commands):
             digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
             surfaces.append(f"literal-python-cross:{digest}")
     elif language == "powershell":
@@ -6375,6 +7241,35 @@ def automation_file_cross_surfaces(name: str, contents: str) -> tuple[str, ...]:
     ):
         digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
         surfaces.append(f"opaque-non-python-process:{digest}")
+    # Call-site provenance, applied as a union on top of the file's own
+    # language exactly as exact-tree validation applies it. A proposed
+    # no-shebang `scripts/opaque` reached by `python3 scripts/opaque` is read as
+    # Python here too, so its `subprocess.run(['cross', 'build', ...])` becomes
+    # a compared surface instead of an unread one.
+    if language != "python" and "python" in interpreters:
+        process_commands, process_failures = python_command_scripts(
+            contents,
+            name,
+            reject_dynamic_commands=True,
+        )
+        if process_failures:
+            digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+            surfaces.append(f"opaque-python-process:{digest}")
+        if process_commands_have_cross(process_commands):
+            digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+            surfaces.append(f"literal-python-cross:{digest}")
+    if language != "powershell" and "powershell" in interpreters:
+        powershell_sensitive, powershell_errors = powershell_program_has_cross(
+            contents,
+            name,
+            include_opaque_shell_executable=True,
+        )
+        if powershell_sensitive:
+            digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+            surfaces.append(f"literal-powershell-cross:{digest}")
+        if powershell_errors:
+            digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+            surfaces.append(f"opaque-powershell-process:{digest}")
     return tuple(surfaces)
 
 
@@ -6383,7 +7278,12 @@ def validate_action_collection(actions: dict[str, str], source: str) -> list[str
 
     errors: list[str] = []
     for name, contents in sorted(actions.items()):
-        if generic_action_cross_surfaces(contents, name=name):
+        # Same exact-validation asymmetry as `validate_workflow_collection`: an
+        # undecodable stdin program is opaque whatever the executable word is,
+        # so it fails closed here too rather than only on PR comparison.
+        with opaque_stdin_program_scope():
+            action_surfaces = generic_action_cross_surfaces(contents, name=name)
+        if action_surfaces:
             errors.append(
                 f"{source}/{name} contains an unprotected Cross executable or "
                 "configuration input"
@@ -6585,10 +7485,214 @@ def repository_command_line(line: str) -> str:
     )
 
 
+def heredoc_pipeline_tail(line: str, start: int) -> str:
+    """Return the text after a heredoc opener that is still the same pipeline.
+
+    A heredoc body is standard input to the command it is attached to, so only a
+    pipe belonging to *that* command's pipeline can hand the body to an
+    interpreter. `cat <<'EOF' | bash` does; `cat <<'DOC'; echo safe | python3`
+    does not — the `;` ends the `cat` pipeline, and the later `| python3` reads
+    `echo`'s output while the template stays data `cat` writes. Searching the
+    whole remainder of the line attached that unrelated interpreter to `DOC` and
+    scanned a benign template as an executable program, which blocked ordinary
+    workflow and action edits.
+
+    Truncating at the first *unquoted* command separator keeps every genuine
+    spelling matching: `| bash`, `|& bash`, and `| bash && echo done` are all
+    still inside the pipeline this opener started. `|` and `|&` are pipeline
+    operators rather than separators, so only `;`, `;;`, `&&`, `||`, and a lone
+    `&` end the search.
+
+    Only *outer* separators end the pipeline. A separator written inside a
+    nested command construct belongs to that construct, not to the line:
+    `cat <<'EOF' $(true; true) | bash` still pipes the body into Bash, because
+    the `;` is the substitution's own separator. Tracking quotes alone stopped
+    at that `;`, never reached the outer `| bash`, and let a body that Bash
+    really executes be withdrawn as inert template data. Backticks, process
+    substitutions, subshells and nesting of any depth create the same
+    confusion, so the scan carries a stack of the closers it still owes.
+
+    Nesting and quoting are not independent. A command substitution is still
+    expanded inside a double-quoted word and parses its body in its own quote
+    context, so `cat <<'DOC' 3>"$(printf "%s; true" x)" | bash` pipes the body
+    into Bash: that `;` is literal text inside the substitution's own quoted
+    word. Skipping the opener because a quote was open let the substitution's
+    first quote close the *enclosing* word, so the scan read that literal `;`
+    as an outer boundary, truncated before `| bash`, and withdrew an executed
+    body as data. Each opener therefore saves the quote it interrupted and
+    restores it at its closer.
+
+    Parameter expansion behaves the same way. `${NAME:-word}` is expanded
+    inside a double-quoted word, and its `word` — for `:-`, `:=`, `:?` and
+    `:+` — carries its own nested quoting, so
+    `cat <<'DOC' 3>"${UNSET:-"x; true"}" | bash` also pipes the body into
+    Bash: with `UNSET` absent the redirection just names the ordinary file
+    `x; true`, `cat` still reads the heredoc on stdin, and the outer pipe
+    hands its stdout to Bash. Leaving `${` on the quoted-text shortcut let the
+    expansion word's own quote close the enclosing word and turned that
+    literal `;` into an outer boundary, so it opens a saved-and-restored quote
+    context exactly like `$(`.
+
+    The reset is limited to `$(`, `${` and backticks: inside single quotes
+    nothing expands, and process substitutions and subshell groups are literal
+    inside a double-quoted word, so promoting any of those would let quoted
+    prose open a construct that swallows a real outer separator — the
+    fail-open direction.
+
+    The stack is maintained by this same loop rather than by intersecting the
+    result of a separate span scan: two scanners with independent quote state
+    disagree on which openers are real (a `$(` inside quotes is a span to one
+    and prose to the other), and the disagreement resolves toward truncating
+    early, which is the fail-open direction. One pass keeps quote state and
+    nesting state consistent by construction.
+
+    Unbalanced syntax is resolved fail-closed. An unterminated construct
+    consumes the rest of the line, so the tail is returned whole and a piped
+    interpreter inside it is still found: the body is scanned as a possible
+    program instead of being trusted as data.
+
+    This is the one place that decision is made; both heredoc classifiers call
+    it so they cannot drift apart.
+    """
+
+    tail = line[start:]
+    # Keep only syntax visible at the outer pipeline level. The interpreter
+    # classifier consumes this returned text, so leaving a quoted or nested
+    # `| bash` in it would attach the heredoc to an interpreter that receives
+    # only the nested command's output, not the heredoc body.
+    visible = list(tail)
+    quote: str | None = None
+    escaped = False
+    # Closers still owed by the nested constructs the scan has entered, each
+    # paired with the quote context to restore when that construct closes.
+    # While this is non-empty every separator belongs to a nested command, not
+    # to the pipeline this heredoc opened.
+    pending: list[tuple[str, str | None]] = []
+    index = 0
+    while index < len(tail):
+        character = tail[index]
+        if escaped:
+            visible[index] = " "
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            visible[index] = " "
+            escaped = True
+            index += 1
+            continue
+        # Command substitutions and parameter expansions stay active inside
+        # double quotes and parse their interior in a *fresh* quote context, so
+        # they are recognised before the quoted-text shortcut below. Treating
+        # such an opener as prose let its own first quote close the enclosing
+        # double-quoted word, after which a separator that Bash reads as
+        # literal text inside the construct looked like an outer boundary and
+        # truncated the tail short of the real `| bash`. Only `$(`, `${` and
+        # backticks earn this: single quotes make everything literal, and
+        # neither process substitutions nor subshell groups are expanded inside
+        # a double-quoted word, so none of them may open nesting while a quote
+        # is open.
+        if quote != "'" and (
+            tail.startswith("$(", index)
+            or tail.startswith("${", index)
+            or character == "`"
+        ):
+            if character == "`":
+                visible[index] = " "
+                # Backticks are their own closer, so the same character ends an
+                # open backtick region and otherwise opens one. An unmatched
+                # backtick runs to the end of the line.
+                if pending and pending[-1][0] == "`":
+                    _, quote = pending.pop()
+                else:
+                    pending.append(("`", quote))
+                    quote = None
+                index += 1
+                continue
+            if tail.startswith("${", index):
+                # The `word` of `${NAME:-word}` and friends has its own nested
+                # quoting, so the expansion body is parsed fresh and the
+                # enclosing quote resumes at the matching `}`.
+                pending.append(("}", quote))
+                quote = None
+                visible[index : index + 2] = [" ", " "]
+                index += 2
+                continue
+            # `$((` arithmetic opens `$(` then a bare `(`, so `))` closes both.
+            pending.append((")", quote))
+            quote = None
+            visible[index : index + 2] = [" ", " "]
+            index += 2
+            continue
+        if quote is not None:
+            visible[index] = " "
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in "'\"":
+            visible[index] = " "
+            quote = character
+            index += 1
+            continue
+        if pending and character == pending[-1][0]:
+            visible[index] = " "
+            _, quote = pending.pop()
+            index += 1
+            continue
+        if character == "(" or (
+            character in "<>" and tail.startswith("(", index + 1)
+        ):
+            # A subshell group or a `<(...)`/`>(...)` process substitution.
+            pending.append((")", quote))
+            visible[index] = " "
+            if character in "<>" and index + 1 < len(visible):
+                visible[index + 1] = " "
+            index += 2 if character in "<>" else 1
+            continue
+        if pending:
+            # Inside a nested construct nothing below terminates the pipeline.
+            visible[index] = " "
+            index += 1
+            continue
+        if character == ";":
+            return "".join(visible[:index])
+        if character == "|":
+            if tail.startswith("||", index):
+                return "".join(visible[:index])
+            # `|` and `|&` are pipeline operators: the body still reaches the
+            # stage on their right.
+            index += 2 if tail.startswith("|&", index) else 1
+            continue
+        if character == "&":
+            if tail.startswith("&&", index):
+                return "".join(visible[:index])
+            # `|&` was already consumed above, so a `&` here is the background
+            # operator, which ends this command.
+            return "".join(visible[:index])
+        index += 1
+    if pending or quote is not None or escaped:
+        # Unbalanced syntax is ambiguous, so preserve the previous fail-closed
+        # raw tail rather than masking a possibly outer interpreter pipeline.
+        return tail
+    return "".join(visible)
+
+
 def quote_aware_heredoc_starts(line: str) -> tuple[tuple[int, str], ...]:
     """Find real shell heredoc openers without matching quoted prose."""
 
-    starts: list[tuple[int, str]] = []
+    return tuple(
+        (start, delimiter)
+        for start, delimiter, _ in quote_aware_heredoc_start_details(line)
+    )
+
+
+def quote_aware_heredoc_start_details(
+    line: str,
+) -> tuple[tuple[int, str, bool], ...]:
+    """Find real shell heredoc openers and whether their delimiter is quoted."""
+
+    starts: list[tuple[int, str, bool]] = []
     quote: str | None = None
     # A command substitution re-enters shell context, so quoting resets inside
     # it. `apply_configmap "$ctx" name "$(cat <<YAML` really does open a
@@ -6607,6 +7711,25 @@ def quote_aware_heredoc_starts(line: str) -> tuple[tuple[int, str], ...]:
             index += 1
             continue
         if quote != "'" and line.startswith("$(", index):
+            # ``$((`` starts arithmetic expansion, not command substitution.
+            # ``<<`` inside it is the left-shift operator, so the whole balanced
+            # expansion is skipped rather than just its opener: advancing past
+            # ``$((`` alone still exposed ``echo $((1 <<EOF))`` to the heredoc
+            # scanner, which then read the following real command lines as body
+            # data until a matching ``EOF``. An unbalanced expansion cannot be
+            # resolved, so it falls back to the opener-only advance and keeps
+            # scanning, which can only find more heredocs rather than fewer.
+            if line.startswith("$((", index):
+                cursor = index + 3
+                depth = 2
+                while cursor < len(line) and depth:
+                    if line[cursor] == "(":
+                        depth += 1
+                    elif line[cursor] == ")":
+                        depth -= 1
+                    cursor += 1
+                index = cursor if not depth else index + 3
+                continue
             substitutions.append(quote)
             quote = None
             index += 2
@@ -6633,51 +7756,420 @@ def quote_aware_heredoc_starts(line: str) -> tuple[tuple[int, str], ...]:
             cursor += 1
         while cursor < len(line) and line[cursor] in " \t":
             cursor += 1
-        delimiter_quote = (
-            line[cursor]
-            if cursor < len(line) and line[cursor] in {"'", '"'}
-            else None
-        )
-        if delimiter_quote is not None:
+        # A heredoc delimiter is an ordinary shell word, and the shell suppresses
+        # expansions in the body when *any* character of it is quoted, using the
+        # dequoted word as the terminator. Reading only a wholly quoted word
+        # mis-parsed both `<<E"OF"` (read as the unquoted delimiter `E`, so the
+        # body stayed expandable and the real `EOF` terminator never matched)
+        # and `<<\EOF` (not read as a heredoc at all). Fold the quoting instead
+        # of requiring one spelling.
+        value_parts: list[str] = []
+        delimiter_quoted = False
+        while cursor < len(line):
+            character = line[cursor]
+            if character == "\\" and cursor + 1 < len(line):
+                delimiter_quoted = True
+                value_parts.append(line[cursor + 1])
+                cursor += 2
+                continue
+            if character in {"'", '"'}:
+                closing = line.find(character, cursor + 1)
+                if closing < 0:
+                    break
+                delimiter_quoted = True
+                value_parts.append(line[cursor + 1 : closing])
+                cursor = closing + 1
+                continue
+            if character in " \t;&|<>()":
+                break
+            value_parts.append(character)
             cursor += 1
-        delimiter = re.match(r"[A-Za-z_][A-Za-z0-9_]*", line[cursor:])
-        if delimiter is None:
+        value = "".join(value_parts)
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is None:
             index += 2
             continue
-        value = delimiter.group(0)
-        cursor += len(value)
-        if delimiter_quote is not None:
-            if cursor >= len(line) or line[cursor] != delimiter_quote:
-                index += 2
-                continue
-            cursor += 1
-        starts.append((index, value))
+        starts.append((index, value, delimiter_quoted))
         index = cursor
     return tuple(starts)
+
+
+MAXIMUM_ARITHMETIC_SUBSTITUTION_DEPTH = 8
+
+
+def substitution_interior_lines(interior: str) -> tuple[str, ...]:
+    """Split a substitution interior into the command lines it really runs.
+
+    A newline inside `$(...)` is an ordinary command separator, so an interior
+    that spans physical lines is several commands rather than one. Backslash
+    continuations were already folded by the caller, so every remaining newline
+    genuinely ends a command.
+    """
+
+    return tuple(
+        stripped
+        for stripped in (part.strip() for part in interior.splitlines())
+        if stripped
+    )
+
+
+def heredoc_body_substitution_groups(
+    body: str,
+    depth: int = 0,
+) -> tuple[tuple[str, ...], ...]:
+    """Group an unquoted heredoc body's dispatched lines by substitution.
+
+    Each returned group is the interior of one `$(...)` or backtick pair, which
+    is exactly one subshell. Grouping matters because directory state is shared
+    inside a substitution and discarded at its edge: after a parent `cd
+    scripts`, a substitution holding `cd ..` and then `target/evil.sh` really
+    runs the repository-root script, while a later line outside the
+    substitution is still resolved from `scripts/`. Flattening every interior
+    into independent isolated commands lost the first half of that and let a
+    benign `scripts/target/evil.sh` satisfy the scan instead.
+    """
+
+    if depth > MAXIMUM_ARITHMETIC_SUBSTITUTION_DEPTH:
+        # Pathological nesting is not evidence of safety: hand the remaining
+        # text back as one group of commands so the scan keeps failing closed.
+        return (substitution_interior_lines(body),)
+
+    def escaped(position: int) -> bool:
+        """Whether an odd run of backslashes precedes this substitution opener.
+
+        Inside an *unquoted* heredoc body the shell keeps `\\` special before
+        `$`, `` ` ``, and `\\` itself, so `\\$(bash scripts/unsafe.sh)` is written
+        out as literal text and never runs. Feeding every `$(` span to the
+        command scanner regardless recorded that template as an executed
+        repository edge, which failed exact-tree validation and pull-request
+        comparison over scripts the body only ever writes. An *even* run is
+        literal backslashes followed by a live substitution, so only the odd
+        case is inert.
+        """
+
+        cursor = position
+        while cursor > 0 and body[cursor - 1] == "\\":
+            cursor -= 1
+        return (position - cursor) % 2 == 1
+
+    groups: list[tuple[str, ...]] = []
+    for start, end in command_substitution_spans(body):
+        if escaped(start):
+            continue
+        span = body[start:end]
+        # `$((...))` is arithmetic expansion, not command substitution: see
+        # `heredoc_body_substitution_commands` below for why the interior is
+        # still recursed into.
+        if body.startswith("$((", start) and span.endswith("))"):
+            groups.extend(heredoc_body_substitution_groups(span[3:-2], depth + 1))
+            continue
+        if span.endswith(")"):
+            groups.append(substitution_interior_lines(span[2:-1]))
+    # Backtick substitutions are paired across physical lines, exactly as
+    # `$(...)` above is. The shell does not require a backtick pair to close on
+    # the line it opened on, so an unquoted heredoc body holding
+    # `` `bash scripts/unsafe.sh` `` split over two lines really does run that
+    # script; matching only same-line pairs emitted no substitution group for
+    # it, so the transitive repository edge and every Cross surface inside the
+    # reached script were missed.
+    #
+    # The Markdown-prose concern the line-local reading was written for only
+    # arises for a body whose backticks are *unbalanced within a line*, which is
+    # also the only shape that can hide a real substitution. Reading it as a
+    # substitution is the fail-closed side of that trade: at worst a template is
+    # scanned as commands, whereas the previous reading dropped an executed one.
+    # An unpaired trailing backtick opens nothing and is left alone.
+    cursor = 0
+    while True:
+        opener = body.find("`", cursor)
+        if opener < 0:
+            break
+        # An escaped backtick opens no substitution either, for the same reason
+        # an escaped `$(` does not.
+        if escaped(opener):
+            cursor = opener + 1
+            continue
+        closer = opener + 1
+        while True:
+            closer = body.find("`", closer)
+            if closer < 0 or not escaped(closer):
+                break
+            closer += 1
+        if closer < 0:
+            break
+        groups.append(substitution_interior_lines(body[opener + 1 : closer]))
+        cursor = closer + 1
+    return tuple(group for group in groups if group)
+
+
+def heredoc_body_substitution_commands(
+    body: str,
+    depth: int = 0,
+) -> tuple[str, ...]:
+    """Return the command lines an unquoted heredoc body still executes.
+
+    A heredoc body is data the receiving command reads, but an *unquoted*
+    delimiter leaves the body expandable, so `$()` and backticks in it really do
+    run before the data is written. Only the substitution interior is returned,
+    never the surrounding data line: `cat <<EOF ... $(bash scripts/unsafe.sh)`
+    executes `bash scripts/unsafe.sh`, so that script has to be recorded and
+    scanned, while `key: value` on the same body line stays data and gains no
+    command slot of its own.
+
+    `body` is the whole body rather than one physical line, because a
+    substitution may open on one line and close on a later one. Reading a line
+    at a time saw no balanced substitution on the opener and no command slot on
+    the continuation — which is still heredoc data — so the script that really
+    runs was recorded nowhere.
+
+    `$((...))` is arithmetic expansion, not command substitution: it evaluates
+    an integer expression, so `value=$((scripts/build))` is a division rather
+    than a run and gains no command slot of its own. The shell does still
+    perform command substitution *inside* the expression before evaluating it,
+    so `$(( $(bash scripts/unsafe.sh) + 0 ))` really executes that script, and
+    the grouping helper recurses into the arithmetic interior rather than
+    treating the whole span as dispatch-free. `$( (cmd) )` — the only way to
+    nest a real substitution — is not that spelling and still executes.
+
+    This flattening is for callers that only need the command *text*; the
+    caller that also tracks directory state uses the grouped form so a `cd`
+    inside one substitution reaches the rest of that substitution.
+    """
+
+    return tuple(
+        line
+        for group in heredoc_body_substitution_groups(body, depth)
+        for line in group
+    )
+
+
+def opaque_arm_command_line_projection(contents: str) -> tuple[str, ...] | None:
+    """Project each source line down to the command text that line dispatches.
+
+    One entry per line of `contents`, so a caller that reports per-line surfaces
+    can keep its own line indexes. A withdrawn heredoc body line projects to the
+    empty string; a body an interpreter is fed projects to itself; the
+    substitutions an unquoted body dispatches are attributed to the line that
+    closes the body, because that is where the whole body first becomes known.
+
+    `None` means the projection is withdrawn entirely: an unterminated heredoc
+    would otherwise swallow every remaining line as body data, which is the one
+    way this narrowing could hide a real command, so the caller reads the raw
+    text instead.
+
+    This is the single heredoc classifier behind both
+    `opaque_arm_command_text()` and the per-line workflow scan, so the two
+    cannot drift into disagreeing about what a body is.
+    """
+
+    source_lines = contents.splitlines()
+    projected: list[str] = [""] * len(source_lines)
+    # delimiter, quoted, executable
+    delimiters: list[tuple[str, bool, bool]] = []
+    body_lines: list[str] = []
+
+    def flush_body(index: int) -> None:
+        """Re-emit the finished body's substitutions as command lines.
+
+        The whole body is joined first because a substitution may open on one
+        body line and close on a later one.
+        """
+
+        if body_lines:
+            commands = heredoc_body_substitution_commands("\n".join(body_lines))
+            if commands:
+                projected[index] = "\n".join(commands)
+            body_lines.clear()
+
+    for index, line in enumerate(source_lines):
+        if delimiters:
+            delimiter, quoted, executable = delimiters[0]
+            if line.strip() == delimiter:
+                delimiters.pop(0)
+                flush_body(index)
+                continue
+            if executable:
+                # The body *is* the program the interpreter runs, so its lines
+                # are commands. Emitting them raw is also a superset of the
+                # substitution re-emission an unquoted body would have got.
+                projected[index] = line
+            elif not quoted:
+                body_lines.append(line)
+            continue
+        projected[index] = line
+        delimiters.extend(
+            # `HEREDOC_EXECUTABLE` reads the text ahead of each opener, the same
+            # evidence `executable_heredocs` uses to decide that a heredoc is a
+            # program rather than data. Testing every opener on the line rather
+            # than only the first one can classify more bodies as executable,
+            # never fewer.
+            #
+            # The text *behind* the opener carries the same evidence when the
+            # body is piped into an interpreter: `cat <<'EOF' | bash` runs the
+            # body. Reading only the left side classified it as data and dropped
+            # a real program from the projection.
+            (
+                delimiter,
+                quoted,
+                HEREDOC_EXECUTABLE.search(line[:start]) is not None
+                or HEREDOC_PIPED_INTERPRETER.search(
+                    # Truncated at the first command separator for the same
+                    # reason `executable_heredocs` truncates it: a pipe in a
+                    # later statement never receives this body.
+                    heredoc_pipeline_tail(line, start)
+                )
+                is not None,
+            )
+            for start, delimiter, quoted in quote_aware_heredoc_start_details(line)
+        )
+    if delimiters:
+        return None
+    return tuple(projected)
+
+
+def opaque_arm_command_text(contents: str) -> str:
+    """Return the shell text `OPAQUE_ARM_CROSS_EXECUTION` may read as commands.
+
+    That pattern anchors on a bare line start, so searching a whole program
+    raw makes every heredoc body line an executable slot:
+    `cat <<EOF\\n$cmd build --target aarch64-unknown-linux-gnu\\nEOF` writes
+    data the receiving command reads, and `$cmd ...` is never dispatched. The
+    body lines are therefore withdrawn here exactly as
+    `shell_non_command_start_lines` withdraws them from the variant scanners.
+
+    Fail-closed behavior on real execution edges is preserved rather than
+    weakened. Two edges carry it:
+
+    * An *unquoted* body still expands `$()` and backticks, so each
+      substitution interior is re-emitted as a command line of its own and
+      keeps matching. Only the surrounding data loses its synthetic command
+      start.
+    * A body whose opener hands it to an interpreter — `bash <<'EOF'`,
+      `python3 <<PY` — is not data at all: it is the program that runs. Those
+      bodies are kept verbatim regardless of delimiter quoting, because a
+      quoted delimiter suppresses expansion inside the program without making
+      the program inert. Withdrawing them turned `bash <<'EOF'` holding
+      `bash -c "$(render)"` into template text and accepted an unprotected
+      generated inline shell surface the raw search had rejected.
+    """
+
+    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    projected = opaque_arm_command_line_projection(logical_contents)
+    if projected is None:
+        # An unterminated heredoc would otherwise swallow every remaining line
+        # as body data, which is the one way this narrowing could hide a real
+        # command. Withdraw the whole narrowing instead and read the program
+        # raw, exactly as it was read before body lines were separated out.
+        return logical_contents
+    return "\n".join(projected)
+
+
+def automation_command_text(contents: str) -> str:
+    """Project automation text down to the parts a runner really dispatches.
+
+    One projection, used by every whole-text search so the exact-tree scan and
+    pull-request comparison agree on what counts as a command. A file that only
+    *writes* a quoted heredoc template must read the same to both, or one side
+    reports a surface the other calls inert and an otherwise safe edit is
+    blocked with no finding behind it.
+    """
+
+    return join_multiline_shell_expansions(opaque_arm_command_text(contents))
+
+
+def opaque_arm_cross_execution(contents: str) -> bool:
+    """Apply the ARM opaque classifier to its full executable vocabulary.
+
+    The regex intentionally keeps command substitutions parenthesis-free for
+    linear matching. Flatten balanced nested substitutions before applying it,
+    just as the all-target opaque prefilter does, so `$( (pick-cross) ) build`
+    and a simple `$tool build` reach the same decision boundary.
+    """
+
+    return any(
+        OPAQUE_ARM_CROSS_EXECUTION.search(
+            flattened_command_substitutions(line)
+        )
+        is not None
+        for line in contents.splitlines()
+    )
+
+
+class ShellCommandLine(NamedTuple):
+    """One command line plus whether a subshell isolates its directory state.
+
+    A command substitution inside an unquoted heredoc body runs in a subshell,
+    so a `cd` in it moves that subshell and never the parent. Queuing those
+    interiors as ordinary members of the parent command stream let one rewrite
+    the working directory every later *real* line was resolved against, which
+    recorded and scanned repository paths the shell was never going to run.
+
+    The isolation is per *substitution*, not per line: one subshell may hold
+    several commands, and a `cd` on its first line does reach its later ones.
+    `ends_isolation` marks the last line of one such subshell, which is where
+    the parent's directory is restored. Marking every interior line as its own
+    isolated command instead resolved `cd ..` followed by `target/evil.sh` from
+    the parent directory, so the outside-root script was never reported.
+    """
+
+    text: str
+    isolated: bool = False
+    ends_isolation: bool = False
 
 
 def shell_command_lines(
     contents: str,
     source: str,
-) -> tuple[tuple[str, ...], list[str]]:
+) -> tuple[tuple[ShellCommandLine, ...], list[str]]:
     """Return commands outside heredoc bodies and reject unterminated input."""
 
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
-    commands: list[str] = []
-    heredoc_delimiters: list[str] = []
+    commands: list[ShellCommandLine] = []
+    heredoc_delimiters: list[tuple[str, bool]] = []
+    body_lines: list[str] = []
+
+    def flush_body() -> None:
+        """Queue the finished body's substitutions as isolated commands.
+
+        The body is data, but its substitutions are dispatched, so the interiors
+        are scanned for repository command edges while the data lines
+        themselves are never offered as commands. The whole body is joined
+        first because a substitution may open on one body line and close on a
+        later one; reading a line at a time left the opener unbalanced and the
+        continuation line pure data, so the script that really runs was never
+        recorded. Each *substitution* is queued as one subshell-scoped program,
+        so a `cd` on its first line reaches its own later lines and nothing
+        beyond them: the directory state cannot outlive the substitution.
+        """
+
+        if body_lines:
+            for group in heredoc_body_substitution_groups("\n".join(body_lines)):
+                commands.extend(
+                    ShellCommandLine(interior, True, offset == len(group) - 1)
+                    for offset, interior in enumerate(group)
+                )
+            body_lines.clear()
+
     for line in logical_contents.splitlines():
         if heredoc_delimiters:
-            if line.strip() == heredoc_delimiters[0]:
+            delimiter, quoted = heredoc_delimiters[0]
+            if line.strip() == delimiter:
                 heredoc_delimiters.pop(0)
+                flush_body()
+            elif not quoted:
+                body_lines.append(line)
             continue
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        commands.append(line)
+        commands.append(ShellCommandLine(line))
         heredoc_delimiters.extend(
-            delimiter for _, delimiter in quote_aware_heredoc_starts(line)
+            (delimiter, quoted)
+            for _, delimiter, quoted in quote_aware_heredoc_start_details(line)
         )
+    # An unterminated heredoc is reported below, but its body may still hold a
+    # dispatch, so it is flushed rather than dropped.
+    flush_body()
     errors = (
-        [f"{source} has an unterminated heredoc {heredoc_delimiters[0]!r}"]
+        [f"{source} has an unterminated heredoc {heredoc_delimiters[0][0]!r}"]
         if heredoc_delimiters
         else []
     )
@@ -6751,7 +8243,7 @@ def yaml_command_fields(
             else None
         )
         explicit_indent = (
-            field_indent + int(indent_digit) if indent_digit is not None else None
+            mapping_indent + int(indent_digit) if indent_digit is not None else None
         )
         block: list[str] = []
         index += 1
@@ -7124,40 +8616,56 @@ def executable_heredocs(
     """Return executable heredocs and reject an unterminated program."""
 
     programs: list[tuple[str, str]] = []
-    delimiter: str | None = None
-    interpreter: str | None = None
+    pending: list[tuple[str, str | None]] = []
     body: list[str] = []
     for line in contents.splitlines():
-        if delimiter is not None:
+        if pending:
+            delimiter, interpreter = pending[0]
             if line.strip() == delimiter:
                 if interpreter is not None:
                     programs.append((interpreter, "\n".join(body) + "\n"))
-                delimiter = None
-                interpreter = None
+                pending.pop(0)
                 body = []
-            else:
+            elif interpreter is not None:
                 body.append(line)
             continue
 
         heredocs = quote_aware_heredoc_starts(line)
         if not heredocs:
             continue
-        _, delimiter = heredocs[0]
-        interpreters = [
-            match.group("interpreter")
-            for match in HEREDOC_EXECUTABLE.finditer(line[: heredocs[0][0]])
-        ]
-        if interpreters:
-            executable = tool_name(interpreters[-1])
-            if PYTHON_INTERPRETER.fullmatch(executable):
-                interpreter = "python"
-            elif executable.lower() in {"pwsh", "powershell"}:
-                interpreter = "powershell"
-            else:
-                interpreter = "shell"
+        # Shell reads every heredoc body in opener order. Track the whole queue
+        # instead of keying the command on `heredocs[0]`: with
+        # `cat <<D <<'PY' | python3`, the later `PY` redirection is the program
+        # Python receives, and scanning only `D` misses it completely. Scanning
+        # each heredoc attached to the interpreter is conservative when an
+        # earlier stdin redirection is superseded, and guarantees the effective
+        # final body is never skipped.
+        for start, delimiter in heredocs:
+            # Both sides of the opener are evidence. The piped interpreter is
+            # appended last because it receives the body when both spellings
+            # appear.
+            interpreters = [
+                match.group("interpreter")
+                for match in HEREDOC_EXECUTABLE.finditer(line[:start])
+            ] + [
+                match.group("interpreter")
+                for match in HEREDOC_PIPED_INTERPRETER.finditer(
+                    heredoc_pipeline_tail(line, start)
+                )
+            ]
+            interpreter: str | None = None
+            if interpreters:
+                executable = tool_name(interpreters[-1])
+                if PYTHON_INTERPRETER.fullmatch(executable):
+                    interpreter = "python"
+                elif executable.lower() in {"pwsh", "powershell"}:
+                    interpreter = "powershell"
+                else:
+                    interpreter = "shell"
+            pending.append((delimiter, interpreter))
     errors = (
-        [f"{source} has an unterminated executable heredoc {delimiter!r}"]
-        if delimiter is not None
+        [f"{source} has an unterminated executable heredoc {pending[0][0]!r}"]
+        if pending
         else []
     )
     return tuple(programs), errors
@@ -7567,10 +9075,18 @@ def runtime_program_cross_surface(
     errors: list[str] = []
     for language, program in programs:
         if language == "shell":
-            if shell_program_has_cross(
-                program,
-                include_opaque_shell_executable=include_opaque_shell_executable,
-            ) or OPAQUE_ARM_CROSS_EXECUTION.search(program):
+            command_text = automation_command_text(program)
+            if (
+                shell_program_has_cross(
+                    program,
+                    include_opaque_shell_executable=include_opaque_shell_executable,
+                )
+                or opaque_arm_cross_execution(command_text)
+                or (
+                    include_opaque_shell_executable
+                    and contains_opaque_executable_cross(command_text)
+                )
+            ):
                 sensitive = True
             heredoc_programs, heredoc_failures = executable_heredocs(
                 program,
@@ -7593,7 +9109,7 @@ def runtime_program_cross_surface(
                 reject_dynamic_commands=include_opaque_shell_executable,
             )
             errors.extend(failures)
-            if any(contains_literal_executable_cross(command) for command in commands):
+            if process_commands_have_cross(commands):
                 sensitive = True
             continue
         if language == "powershell":
@@ -7702,6 +9218,7 @@ def automation_command_scripts(
     source: str,
     *,
     workflow_source: bool,
+    interpreter_hint: str | None = None,
 ) -> tuple[list[tuple[str, str]], list[str]]:
     if workflow_source:
         return workflow_run_programs(contents, source)
@@ -7713,8 +9230,26 @@ def automation_command_scripts(
             for script in dispatcher_manifest_scripts(source, contents)
         ], []
     language = automation_language(source, contents)
+    if interpreter_hint is not None:
+        # The interpreter a call site names is what actually executes the file,
+        # so it outranks the file's own suffix and shebang rather than only
+        # filling in for their absence. `sh scripts/poly.py` runs that file as
+        # shell; deferring to the `.py` suffix walked a Python/shell polyglot
+        # only as Python and missed its shell-only repository edges, which let a
+        # pull request start executing an existing Cross-sensitive helper without
+        # changing that helper's compared surface.
+        #
+        # This is a replacement, not a collapse: a file also reached with no
+        # interpreter still owes its own-evidence reading, which the reachability
+        # walk records as a separate bare hint and replays here with
+        # `interpreter_hint=None`.
+        language = interpreter_hint
     if language == "python":
-        commands, errors = python_command_scripts(contents, source)
+        commands, errors = python_command_scripts(
+            contents,
+            source,
+            reject_dynamic_commands=True,
+        )
         return [("shell", command) for command in commands], errors
     if language == "shell":
         return [("shell", contents)], []
@@ -7722,6 +9257,17 @@ def automation_command_scripts(
         return [("powershell", contents)], []
     if language == "unknown" or contents.startswith("#!"):
         return [], [f"{source} has an unsupported executable shebang"]
+    if PurePosixPath(source).suffix == "":
+        # `run: scripts/build` and `./scripts/build` name no interpreter, and a
+        # suffixless file carries no shebang here (a shebang would already have
+        # classified it above), so the kernel reads it as shell — which is
+        # exactly how `validate_automation_collection`'s extensionless branch
+        # scans it for Cross. Traversing it as shell too keeps the two readings
+        # in parity instead of raising "no scannable interpreter" for a file the
+        # very next stage does scan. Dispatcher manifests returned earlier and
+        # an explicit interpreter already set `language`, so both keep their own
+        # behavior.
+        return [("shell", contents)], []
     return [], [f"{source} is executable automation with no scannable interpreter"]
 
 
@@ -7730,7 +9276,8 @@ def local_automation_references(
     source: str,
     *,
     workflow_source: bool,
-) -> tuple[set[str], set[str], list[str]]:
+    interpreter_hint: str | None = None,
+) -> tuple[set[str], set[str], dict[str, set[str | None]], list[str]]:
     """Collect repo scripts and local actions from block and flow YAML alike.
 
     `- {uses: ./evil-action}` and `- {run: ./evil.sh}` declare no key at the
@@ -7739,25 +9286,33 @@ def local_automation_references(
     sources — a shell script has no flow mappings to render.
     """
 
-    references, dispatchers, errors = block_automation_references(
+    references, dispatchers, interpreters, errors = block_automation_references(
         contents,
         source,
         workflow_source=workflow_source,
+        interpreter_hint=interpreter_hint,
     )
     if not workflow_source:
-        return references, dispatchers, errors
+        return references, dispatchers, interpreters, errors
     normalized, mapping, failures = flow_normalized_workflow(contents, source)
     errors.extend(failures)
     if normalized is not None:
-        flow_references, flow_dispatchers, flow_errors = block_automation_references(
+        (
+            flow_references,
+            flow_dispatchers,
+            flow_interpreters,
+            flow_errors,
+        ) = block_automation_references(
             normalized,
             source,
             workflow_source=True,
         )
         references |= flow_references
         dispatchers |= flow_dispatchers
+        for path, kinds in flow_interpreters.items():
+            interpreters.setdefault(path, set()).update(kinds)
         errors.extend(remap_flow_normalized_errors(flow_errors, source, mapping))
-    return references, dispatchers, list(dict.fromkeys(errors))
+    return references, dispatchers, interpreters, list(dict.fromkeys(errors))
 
 
 def block_automation_references(
@@ -7765,11 +9320,13 @@ def block_automation_references(
     source: str,
     *,
     workflow_source: bool,
-) -> tuple[set[str], set[str], list[str]]:
+    interpreter_hint: str | None = None,
+) -> tuple[set[str], set[str], dict[str, set[str | None]], list[str]]:
     """Collect canonical repo scripts and reject unscanned local actions/commands.
 
     Returns the literal script references, the build-dispatcher manifest
-    candidate groups (`"Makefile|makefile|GNUmakefile"`), and any failures.
+    candidate groups (`"Makefile|makefile|GNUmakefile"`), the interpreter kinds
+    each reference was invoked through, and any failures.
 
     Only the exact build outputs in `GENERATED_COMMAND_PATHS` are exempt from
     the scanned automation roots. A generated-looking directory prefix confers
@@ -7780,6 +9337,7 @@ def block_automation_references(
 
     references: set[str] = set()
     dispatcher_groups: set[str] = set()
+    interpreters: dict[str, set[str | None]] = {}
     errors: list[str] = []
     if workflow_source:
         for line_number, line in enumerate(contents.splitlines(), start=1):
@@ -7839,17 +9397,26 @@ def block_automation_references(
         contents,
         source,
         workflow_source=workflow_source,
+        interpreter_hint=interpreter_hint,
     )
     errors.extend(command_failures)
     for initial_program in command_programs:
         pending_programs: list[tuple[str, str]] = [initial_program]
-        command_lines: list[str] = []
+        command_lines: list[ShellCommandLine] = []
         while pending_programs:
             language, program = pending_programs.pop()
             if language == "python":
+                # A Python heredoc reached from a shell script is scanned for
+                # the same reason a `.py` automation file is, so it rejects a
+                # variable process command for the same reason too. Without
+                # this, `python3 <<'PY' ... PY` holding
+                # `cmd = ['python3', 'ci/unsafe.py']; subprocess.run(cmd)` was
+                # neither an error nor a reference, so `ci/unsafe.py` was
+                # executed and never scanned.
                 python_commands, python_failures = python_command_scripts(
                     program,
                     f"{source} executable heredoc",
+                    reject_dynamic_commands=True,
                 )
                 errors.extend(python_failures)
                 pending_programs.extend(
@@ -7862,7 +9429,7 @@ def block_automation_references(
             pending_programs.extend(
                 ("shell", nested_program)
                 for shell_line in shell_lines
-                for nested_program in literal_nested_shell_programs(shell_line)
+                for nested_program in literal_nested_shell_programs(shell_line.text)
             )
             heredoc_programs, heredoc_failures = executable_heredocs(program, source)
             errors.extend(heredoc_failures)
@@ -7870,13 +9437,59 @@ def block_automation_references(
 
         working_directory: str | None = ""
         control_stack: list[str | None] = []
-        for line_number, line in enumerate(command_lines, start=1):
+        # A substitution group runs in a subshell, so its `if`/`else` blocks open
+        # and close entirely inside that group and must not disturb the parent's
+        # control stack. Skipping the control stack for those lines altogether
+        # applied a conditional `cd` unconditionally, so a group holding
+        # `if ...; then` / `cd scripts` / `fi` / `unsafe.sh` resolved the script
+        # under `scripts/` even though the shell may well run the
+        # repository-root one — the wrong file was scanned, or the
+        # outside-the-roots error was avoided. The group therefore keeps a
+        # control stack of its own, with the same open/branch/close model the
+        # parent uses.
+        subshell_control_stack: list[str | None] = []
+        # The parent shell's directory, saved on entry to a subshell-scoped
+        # substitution group and restored when that group ends. `None` means no
+        # such group is open.
+        parent_directory: str | None = None
+        inside_subshell = False
+
+        def apply_control_flow(
+            stack: list[str | None],
+            current: str | None,
+            normalized: str,
+        ) -> str | None:
+            """Reconcile the directory across a branch and its closing keyword.
+
+            A `cd` inside one arm of a conditional only happened on that arm, so
+            a directory that differs from the state the block opened with is
+            unknown once the block branches or closes.
+            """
+
+            if re.search(r"\b(?:else|elif)\b", normalized) and stack:
+                if current != stack[-1]:
+                    current = None
+            closed_controls = len(re.findall(r"\b(?:fi|done|esac)\b", normalized))
+            for _ in range(min(closed_controls, len(stack))):
+                branch_start = stack.pop()
+                current = branch_start if current == branch_start else None
+            return current
+
+        for line_number, command_line in enumerate(command_lines, start=1):
+            line = command_line.text
+            if command_line.isolated and not inside_subshell:
+                parent_directory = working_directory
+                inside_subshell = True
+                subshell_control_stack.clear()
             normalized_line = repository_command_line(line)
             directory_matches = list(CD_COMMAND.finditer(normalized_line))
             opened_controls = len(
                 re.findall(r"\b(?:if|while|until|for|case)\b", normalized_line)
             )
-            control_stack.extend([working_directory] * opened_controls)
+            active_control_stack = (
+                subshell_control_stack if command_line.isolated else control_stack
+            )
+            active_control_stack.extend([working_directory] * opened_controls)
 
             def directory_after(
                 initial: str | None,
@@ -7917,8 +9530,8 @@ def block_automation_references(
 
             for match in LOCAL_COMMAND_REFERENCE.finditer(normalized_line):
                 inline_options = match.group("interpreter_options") or ""
-                if match.group("interpreted") and re.search(
-                    r"(?:^|\s)--?(?:c|lc|ec|e|[cC]ommand|[eE]val)(?:\s|$)",
+                if match.group("interpreted") and interpreted_operand_is_inline_source(
+                    match.group("interpreter") or "",
                     inline_options,
                 ):
                     # The following word is inline source code, not a repository
@@ -7930,6 +9543,38 @@ def block_automation_references(
                     or match.group("direct")
                     or match.group("bare")
                 )
+                # An explicit interpreter names the language of the file it
+                # runs, and that is the only evidence there is when the file
+                # carries neither a suffix nor a shebang. `python3 ci/unsafe`
+                # identifies Python at the call site; recording only the path
+                # discarded it, so the reached file was read as shell and its
+                # `subprocess.run(...)` dispatches were never extracted.
+                # A stdin redirect names the interpreter just as plainly:
+                # `python3 < scripts/driver` is Python running that file.
+                interpreter_word = match.group("interpreter") or match.group(
+                    "redirected_interpreter"
+                )
+                reference_interpreter: str | None = None
+                if interpreter_word:
+                    interpreter_words = tuple(interpreter_word.split())
+                    reference_interpreter = (
+                        "shell"
+                        if interpreter_words[0] in {"source", "."}
+                        else interpreter_kind(interpreter_words)
+                    )
+                    if reference_interpreter is None:
+                        # The edge is real but its language is outside the
+                        # scanners this policy can interpret. Recording it as a
+                        # bare read makes a suffixless Node/Ruby/etc. helper fall
+                        # through to the shell fallback and can miss that
+                        # interpreter's process dispatches. Keep the own-evidence
+                        # read below as defense in depth, but fail closed on the
+                        # unsupported explicit interpreter itself.
+                        errors.append(
+                            f"{source}:{line_number} repository command uses "
+                            f"unsupported explicit interpreter "
+                            f"{interpreter_words[0]!r}"
+                        )
                 if raw_command_path.endswith("/"):
                     continue
                 if repository_path_has_dot_dot(raw_command_path):
@@ -7977,6 +9622,15 @@ def block_automation_references(
                     continue
                 if command_path.startswith(APPROVED_AUTOMATION_ROOTS):
                     references.add(command_path)
+                    # `None` is recorded too, and means "reached with no
+                    # interpreter named". That is a reading in its own right —
+                    # the file's own evidence — and dropping it let a later
+                    # `python3 scripts/poly` edge erase the bare `run:
+                    # scripts/poly` one, so the shell-only edges the bare read
+                    # really executes were never followed.
+                    interpreters.setdefault(command_path, set()).add(
+                        reference_interpreter
+                    )
                 else:
                     errors.append(
                         f"{source}:{line_number} repository command {command_path!r} "
@@ -8121,34 +9775,96 @@ def block_automation_references(
                     for name in names
                 )
                 dispatcher_groups.add("|".join(candidates))
-            working_directory = directory_after(working_directory, directory_matches)
-            if re.search(r"\b(?:else|elif)\b", normalized_line) and control_stack:
-                branch_start = control_stack[-1]
-                if working_directory != branch_start:
-                    working_directory = None
-            closed_controls = len(
-                re.findall(r"\b(?:fi|done|esac)\b", normalized_line)
-            )
-            for _ in range(min(closed_controls, len(control_stack))):
-                branch_start = control_stack.pop()
-                working_directory = (
-                    branch_start
-                    if working_directory == branch_start
-                    else None
+            if command_line.isolated:
+                # A heredoc-body substitution is a subshell. Its own `cd` still
+                # moves it for the rest of the same substitution — `cd ..` then
+                # `target/evil.sh` really runs the repository-root script — so
+                # the directory is carried across the group's lines and handed
+                # back to the parent at the group's end. Its control keywords
+                # never leave the subshell, but they are still control keywords
+                # *within* it, so the group's own stack reconciles them.
+                working_directory = directory_after(
+                    working_directory,
+                    directory_matches,
                 )
-    return references, dispatcher_groups, errors
+                working_directory = apply_control_flow(
+                    subshell_control_stack,
+                    working_directory,
+                    normalized_line,
+                )
+                if command_line.ends_isolation:
+                    working_directory = parent_directory
+                    parent_directory = None
+                    inside_subshell = False
+                    subshell_control_stack.clear()
+                continue
+            working_directory = directory_after(working_directory, directory_matches)
+            working_directory = apply_control_flow(
+                control_stack,
+                working_directory,
+                normalized_line,
+            )
+    return references, dispatcher_groups, interpreters, errors
+
+
+# How many times the reachability walk may re-read files whose interpreter
+# provenance changed. Provenance only accumulates, so a real repository settles
+# in a couple of passes; exceeding this means the walk could not be resolved,
+# which is reported rather than assumed harmless.
+MAXIMUM_INTERPRETER_REVISITS = 512
 
 
 def reachable_automation_references(
     sources: dict[str, str],
     automation: dict[str, str],
     label: str,
-) -> tuple[set[str], list[str]]:
-    """Follow literal repo-script execution edges from workflows and actions."""
+) -> tuple[set[str], dict[str, set[str | None]], list[str]]:
+    """Follow literal repo-script execution edges from workflows and actions.
+
+    The interpreter each edge names is carried alongside the path, so a reached
+    file that has neither a suffix nor a shebang is still read with the language
+    its invocation identified.
+    """
 
     reachable: set[str] = set()
+    interpreters: dict[str, set[str | None]] = {}
     errors: list[str] = []
     pending: list[str] = []
+
+    def record(discovered: dict[str, set[str | None]]) -> None:
+        for path, kinds in discovered.items():
+            interpreters.setdefault(path, set()).update(kinds)
+
+    def hints_for(path: str) -> tuple[str | None, ...]:
+        """Every reading this file has been reached through.
+
+        Not one winning language: a file reached as both Python and shell is
+        genuinely read both ways, and collapsing the provenance to the stricter
+        Python reading skipped the shell one entirely. A Python/shell polyglot
+        can then hide `bash scripts/unsafe.sh` inside a triple-quoted string
+        while `sh scripts/poly` really executes it, and `scripts/unsafe.sh` was
+        never marked reachable. Each recorded kind is walked instead, so the
+        readings are a union and no edge is dropped.
+
+        A bare read — an edge that named no interpreter, recorded as `None` — is
+        one of those readings and is owed alongside any named one. Returning
+        only the named kinds because *some* kind exists dropped it, so a
+        suffixless polyglot reached once as `run: scripts/poly` and once as
+        `python3 scripts/poly` was never read on its own shell evidence, and a
+        proposed workflow could start executing an existing Cross-sensitive
+        helper through that shell-only edge without changing either helper's
+        compared surface.
+
+        With no recorded kind at all there is nothing to replay, so the file is
+        still read once on its own evidence.
+        """
+
+        kinds = interpreters.get(path, set())
+        if not kinds:
+            return (None,)
+        # `None` sorts ahead of every named kind; a mixed set cannot be compared
+        # directly, so the bare reading is keyed rather than compared.
+        return tuple(sorted(kinds, key=lambda kind: (kind is not None, kind or "")))
 
     def follow_dispatchers(groups: set[str], origin: str) -> None:
         """Resolve each dispatch to whichever of its candidate files exists.
@@ -8171,33 +9887,77 @@ def reachable_automation_references(
             )
 
     for name, contents in sorted(sources.items()):
-        references, dispatchers, failures = local_automation_references(
+        references, dispatchers, discovered, failures = local_automation_references(
             contents,
             f"{label}/{name}",
             workflow_source=True,
         )
         errors.extend(failures)
+        record(discovered)
         pending.extend(sorted(references))
         follow_dispatchers(dispatchers, f"{label}/{name}")
 
+    # The hint a file was *read with*, not merely whether it was seen. The
+    # interpreter a call site names is the only evidence a suffixless,
+    # shebangless script has, and it can arrive after that file was already
+    # reached bare: `scripts/a` popped first is read as shell, and a later
+    # `python3 scripts/a` edge changes its language. Skipping on reachability
+    # alone meant the second reading never happened, so the Python
+    # `subprocess.run(['bash', 'scripts/unsafe.sh'])` edges inside it were never
+    # followed. Re-enter whenever a reading is still outstanding instead.
+    #
+    # This terminates: `interpreters[name]` only grows, the readings a file owes
+    # are `hints_for(name)`, a pure function of that set drawn from a fixed
+    # language vocabulary, and each `(file, reading)` pair is performed exactly
+    # once. The explicit cap below is a backstop that fails closed rather than
+    # silently stopping the walk.
+    #
+    # Keyed by file, holding every reading already performed for it, so a file
+    # is re-entered exactly once per newly recorded interpreter.
+    processed: dict[str, set[str | None]] = {}
+    revisits = 0
     while pending:
         name = pending.pop()
-        if name in reachable:
+        completed = processed.setdefault(name, set())
+        outstanding = [hint for hint in hints_for(name) if hint not in completed]
+        if not outstanding:
             continue
+        if completed:
+            revisits += 1
+            if revisits > MAXIMUM_INTERPRETER_REVISITS:
+                errors.append(
+                    f"{label} could not settle interpreter provenance for "
+                    "reached automation files"
+                )
+                break
         reachable.add(name)
         contents = automation.get(name)
         if contents is None:
+            completed.update(outstanding)
             errors.append(f"{label} references missing automation file {name!r}")
             continue
-        references, dispatchers, failures = local_automation_references(
-            contents,
-            f"{label}/{name}",
-            workflow_source=False,
-        )
-        errors.extend(failures)
-        pending.extend(sorted(references - reachable))
-        follow_dispatchers(dispatchers, f"{label}/{name}")
-    return reachable, errors
+        for hint in outstanding:
+            completed.add(hint)
+            (
+                references,
+                dispatchers,
+                discovered,
+                failures,
+            ) = local_automation_references(
+                contents,
+                f"{label}/{name}",
+                workflow_source=False,
+                interpreter_hint=hint,
+            )
+            errors.extend(failures)
+            record(discovered)
+            # Not `references - reachable`: an already-reached path must be
+            # re-queued so the loop above can notice that this edge gave it a
+            # new interpreter. The outstanding-hint set, not the filter, is what
+            # stops the walk.
+            pending.extend(sorted(references))
+            follow_dispatchers(dispatchers, f"{label}/{name}")
+    return reachable, interpreters, list(dict.fromkeys(errors))
 
 
 def validate_automation_collection(
@@ -8210,22 +9970,24 @@ def validate_automation_collection(
         **{f"workflows/{name}": contents for name, contents in workflows.items()},
         **{f"actions/{name}": contents for name, contents in actions.items()},
     }
-    reachable, errors = reachable_automation_references(sources, automation, source)
+    reachable, interpreters, errors = reachable_automation_references(
+        sources,
+        automation,
+        source,
+    )
     for name in sorted(reachable):
         contents = automation.get(name)
         language = automation_language(name, contents) if contents is not None else None
         if (
             contents is not None
-            and language == "shell"
             and (
-                contains_literal_executable_cross(contents)
-                or WRAPPED_LITERAL_CROSS.search(contents)
-                # An executable word assembled from shell expansions is opaque,
-                # so an ARM64 cross build driven by one fails closed here too.
-                or OPAQUE_ARM_CROSS_EXECUTION.search(
-                    re.sub(r"\\\r?\n[ \t]*", "", contents)
+                language == "shell"
+                or (
+                    PurePosixPath(name).suffix == ""
+                    and not is_dispatcher_manifest(name)
                 )
             )
+            and contains_direct_trusted_shell_cross_surface(contents)
         ):
             errors.append(
                 f"{source}/{name} contains an unprotected Cross executable or "
@@ -8257,16 +10019,84 @@ def validate_automation_collection(
             process_commands, process_failures = python_command_scripts(
                 contents,
                 f"{source}/{name}",
+                reject_dynamic_commands=True,
             )
             errors.extend(process_failures)
-            if any(
-                contains_literal_executable_cross(command)
-                for command in process_commands
-            ):
+            if process_commands_have_cross(process_commands):
                 errors.append(
                     f"{source}/{name} contains an unprotected literal Python "
                     "Cross process call"
                 )
+        # A file whose own evidence names no language is still read as shell by
+        # the extensionless branch above. When an invocation identified it as
+        # Python, that reading is additionally performed here rather than
+        # replacing the shell one: the two are a union, so nothing a prior class
+        # already rejected stops being rejected, and `python3 ci/unsafe` no
+        # longer hides `subprocess.run(cmd)` behind a missing suffix.
+        if (
+            contents is not None
+            and language != "python"
+            and "python" in interpreters.get(name, set())
+        ):
+            process_commands, process_failures = python_command_scripts(
+                contents,
+                f"{source}/{name}",
+                reject_dynamic_commands=True,
+            )
+            errors.extend(process_failures)
+            if process_commands_have_cross(process_commands):
+                errors.append(
+                    f"{source}/{name} contains an unprotected literal Python "
+                    "Cross process call"
+                )
+        # The same union for the other non-POSIX interpreter an edge can name.
+        # `pwsh scripts/opaque` records PowerShell provenance, but the
+        # extensionless branch above reads that file as POSIX shell, where
+        # `Start-Process cross -ArgumentList 'build --target ...'` is not a
+        # dispatch at all. Replaying the recorded provenance adds the cmdlet
+        # reading without removing the shell one.
+        if (
+            contents is not None
+            and language != "powershell"
+            and "powershell" in interpreters.get(name, set())
+        ):
+            powershell_sensitive, powershell_errors = powershell_program_has_cross(
+                contents,
+                f"{source}/{name}",
+                include_opaque_shell_executable=False,
+            )
+            errors.extend(powershell_errors)
+            if powershell_sensitive:
+                errors.append(
+                    f"{source}/{name} contains an unprotected PowerShell Cross "
+                    "dispatch"
+                )
+        # And the same union for POSIX shell, which the two branches above left
+        # out. The shell scan ran only when the file's *own* evidence said shell
+        # or it was suffixless, so `run: sh scripts/poly.py` — a file the
+        # reachability walk now records and follows as a shell reading — was
+        # read only as Python here. A polyglot could therefore carry
+        # `cross build --target aarch64-unknown-linux-gnu` down its shell path
+        # and pass exact-tree validation, while PR comparison rejected it:
+        # `automation_file_cross_surfaces` runs the generic shell scan over
+        # every file regardless of language. Replaying the recorded shell
+        # provenance restores that parity, and like the Python and PowerShell
+        # unions it only adds a reading.
+        if (
+            contents is not None
+            and language != "shell"
+            and not (
+                PurePosixPath(name).suffix == ""
+                and not is_dispatcher_manifest(name)
+            )
+            and "shell" in interpreters.get(name, set())
+            and contains_direct_trusted_shell_cross_surface(contents)
+        ):
+            errors.append(
+                f"{source}/{name} contains an unprotected Cross executable or "
+                "generated inline shell surface"
+                + cross_surface_line_report(contents)
+            )
     return errors
 
 
@@ -8292,17 +10122,32 @@ def compare_pr_automation_collection(
         **{f"workflows/{name}": contents for name, contents in proposed_workflows.items()},
         **{f"actions/{name}": contents for name, contents in proposed_actions.items()},
     }
-    _, baseline_errors = reachable_automation_references(
+    _, baseline_interpreters, baseline_errors = reachable_automation_references(
         baseline_sources,
         merge_base_automation,
         f"merge-base {source}",
     )
-    _, proposed_errors = reachable_automation_references(
+    _, proposed_interpreters, proposed_errors = reachable_automation_references(
         proposed_sources,
         proposed_automation,
         f"proposed {source}",
     )
     errors = [*baseline_errors, *proposed_errors]
+
+    def named_interpreters(
+        recorded: dict[str, set[str | None]],
+        name: str,
+    ) -> frozenset[str]:
+        """Drop the bare-read marker, which names no language to replay.
+
+        `None` records that a file was reached with no interpreter, which the
+        reachability walk needs so the file's own-evidence reading is still
+        performed. Surface comparison asks the narrower question of which
+        *additional* languages a call site named, so the marker is removed here
+        rather than being compared as if it were one.
+        """
+
+        return frozenset(kind for kind in recorded.get(name, set()) if kind)
 
     # Compare every file in the narrowly approved automation roots. This also
     # covers scripts selected through an existing trusted variable or sourced
@@ -8311,10 +10156,12 @@ def compare_pr_automation_collection(
         baseline_surfaces = automation_file_cross_surfaces(
             name,
             merge_base_automation.get(name, ""),
+            named_interpreters(baseline_interpreters, name),
         )
         proposed_surfaces = automation_file_cross_surfaces(
             name,
             proposed_automation.get(name, ""),
+            named_interpreters(proposed_interpreters, name),
         )
         if baseline_surfaces != proposed_surfaces:
             errors.append(
@@ -8514,14 +10361,17 @@ def validate_workflow_contract(
             )
 
     surface_reasons: dict[str, str] = {}
-    surfaces, surface_failures = unprotected_cross_surfaces(
-        contents,
-        source,
-        job_name,
-        required_job=True,
-        include_opaque_shell_executable=False,
-        reasons=surface_reasons,
-    )
+    # The protected-workflow scan is an exact validation too, so it takes the
+    # same opaque-stdin fail-closed scope the generic collections take.
+    with opaque_stdin_program_scope():
+        surfaces, surface_failures = unprotected_cross_surfaces(
+            contents,
+            source,
+            job_name,
+            required_job=True,
+            include_opaque_shell_executable=False,
+            reasons=surface_reasons,
+        )
     errors.extend(surface_failures)
     # The protected job is frozen by digest, but the rest of the file is not, so
     # a flow-spelled step elsewhere in it gets the same rescan the generic
@@ -8530,14 +10380,15 @@ def validate_workflow_contract(
     errors.extend(flow_failures)
     if normalized is not None:
         flow_reasons: dict[str, str] = {}
-        flow_surfaces, flow_surface_failures = unprotected_cross_surfaces(
-            normalized,
-            source,
-            job_name,
-            required_job=True,
-            include_opaque_shell_executable=False,
-            reasons=flow_reasons,
-        )
+        with opaque_stdin_program_scope():
+            flow_surfaces, flow_surface_failures = unprotected_cross_surfaces(
+                normalized,
+                source,
+                job_name,
+                required_job=True,
+                include_opaque_shell_executable=False,
+                reasons=flow_reasons,
+            )
         errors.extend(
             remap_flow_normalized_errors(flow_surface_failures, source, mapping)
         )
@@ -8776,6 +10627,206 @@ def self_test() -> list[str]:
     }
     if validate_cross_configuration(valid_cross):
         failures.append("valid complete Cross.toml policy was rejected")
+
+    nested_subshell_cross_forms = {
+        "nested literal subshell": (
+            "( ( cross build --target aarch64-unknown-linux-gnu ) )"
+        ),
+        "function-body subshell": (
+            "f(){( cross build --target aarch64-unknown-linux-gnu );}"
+        ),
+        # Bash requires no blank after a subshell opener. These spellings were
+        # already recognized before nesting support was added, so generalizing
+        # the opener to a repeated group must not start demanding the blank.
+        "unspaced subshell after operator": (
+            "true;(cross build --target aarch64-unknown-linux-gnu)"
+        ),
+        "unspaced nested subshell": (
+            "( (cross build --target aarch64-unknown-linux-gnu) )"
+        ),
+        "unspaced function-body subshell": (
+            "f(){(cross build --target aarch64-unknown-linux-gnu);}"
+        ),
+    }
+    for name, command in nested_subshell_cross_forms.items():
+        if not has_cross_command_context(command):
+            failures.append(f"{name} Cross executable was not recognized")
+
+    nested_opaque_cross = (
+        "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+        "( ( $cmd build --target aarch64-unknown-linux-gnu ) )"
+    )
+    if not OPAQUE_ARM_CROSS_EXECUTION.search(nested_opaque_cross):
+        failures.append("nested opaque Cross executable was not recognized")
+
+    unspaced_opaque_cross = (
+        "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+        "($cmd build --target aarch64-unknown-linux-gnu)"
+    )
+    if not OPAQUE_ARM_CROSS_EXECUTION.search(unspaced_opaque_cross):
+        failures.append(
+            "unspaced opaque Cross executable in a subshell was not recognized"
+        )
+
+    if has_cross_command_context(
+        '{"cross": "build --target aarch64-unknown-linux-gnu"}'
+    ):
+        failures.append("JSON object was mistaken for a Cross executable")
+
+    # Consolidated residual classes share helpers, so one normalization pass can
+    # undo another. These assert the composed behavior, not each fix alone.
+
+    # The env/assignment/wrapper prefixes and the repeated subshell opener were
+    # authored against the same regex without knowledge of each other. Assert
+    # the combined spelling still accepts every prefix on either side of the
+    # opener, spaced or not.
+    wrapper_opaque_cross_forms = {
+        "env-prefixed unspaced subshell": (
+            "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+            "(env -i $cmd build --target aarch64-unknown-linux-gnu)"
+        ),
+        "assignment inside a nested subshell": (
+            "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+            "( (FOO=bar $cmd build --target aarch64-unknown-linux-gnu) )"
+        ),
+        "wrapper inside an unspaced subshell": (
+            "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+            "(sudo $cmd build --target aarch64-unknown-linux-gnu)"
+        ),
+        "negated env wrapper after an operator": (
+            "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+            "true;! env $cmd build --target aarch64-unknown-linux-gnu"
+        ),
+    }
+    for name, command in wrapper_opaque_cross_forms.items():
+        if not OPAQUE_ARM_CROSS_EXECUTION.search(command):
+            failures.append(f"{name} opaque Cross executable was not recognized")
+
+    # Exact workflow/action validation enters with the all-target opaque switch
+    # off, so the ARM classifier itself must cover the complete opaque command
+    # vocabulary rather than relying on the wider PR-comparison pass.
+    arm_opaque_classifier_forms = {
+        "opaque Cargo cross subcommand": (
+            "$tool cross build --target aarch64-unknown-linux-gnu"
+        ),
+        "nested opaque command substitution": (
+            "$( (pick-cross) ) build --target aarch64-unknown-linux-gnu"
+        ),
+        "split opaque toolchain selector": (
+            "$cmd${IFS}+nightly${IFS}build "
+            "--target aarch64-unknown-linux-gnu"
+        ),
+    }
+    for name, command in arm_opaque_classifier_forms.items():
+        if not contains_cross_surface(command):
+            failures.append(f"{name} escaped the exact ARM64 classifier")
+
+    # A substitution word can span physical lines. Only those lines are joined,
+    # so its following subcommand becomes visible without combining unrelated
+    # commands on adjacent lines.
+    for name, command in {
+        "multiline command substitution": (
+            "$(\npick-cross\n) build --target aarch64-unknown-linux-gnu"
+        ),
+        "multiline backtick substitution": (
+            "`\npick-cross\n` build --target aarch64-unknown-linux-gnu"
+        ),
+    }.items():
+        if not contains_cross_surface(command):
+            failures.append(f"{name} escaped the exact ARM64 classifier")
+    if not contains_opaque_executable_cross(
+        automation_command_text(
+            "$(\npick-cross\n) build --target x86_64-unknown-linux-gnu"
+        )
+    ):
+        failures.append(
+            "a multiline opaque executable escaped all-target PR comparison"
+        )
+
+    # The bare-line-start matcher must agree with the explicit one about the
+    # repeated opener, or an assignment-prefixed word in a nested or unspaced
+    # subshell silently stops occupying a command slot.
+    bare_command_slots = {
+        "assignment prefix": "FOO=bar ",
+        "unspaced nested subshell": "((",
+        "assignment inside a subshell": "(FOO=bar ",
+        "wrapper before a subshell": "sudo ((",
+    }
+    for name, prefix in bare_command_slots.items():
+        if BARE_COMMAND_WORD_PREFIX.fullmatch(prefix) is None:
+            failures.append(f"{name} was not read as a bare command slot")
+
+    # An unquoted heredoc body stays shell-evaluated so its `$()` slots fail
+    # closed, but its line starts are data. A wrapper-shaped continuation there
+    # must therefore not hand the following body line the command slot that
+    # withdrawal just removed.
+    # `$block deploy` carries no ARM target, so `OPAQUE_ARM_CROSS_EXECUTION`
+    # cannot reach it and only the bare-command-slot decision is under test.
+    if contains_cross_surface(
+        "cat <<EOF > config.yaml\nenv \\\n$block deploy\nEOF\n",
+        include_opaque_shell_executable=True,
+    ):
+        failures.append(
+            "a wrapper continuation inside a heredoc body invented a command slot"
+        )
+    # The same continuation outside a heredoc still dispatches the next line.
+    if not contains_cross_surface(
+        "env \\\n$block deploy\n",
+        include_opaque_shell_executable=True,
+    ):
+        failures.append("a wrapper continuation command start was not recognized")
+
+    # Word splitting rebuilds the executable word; the subshell opener sequence
+    # then has to still recognize the rebuilt word in an unspaced nested slot.
+    nested_split_command = (
+        "( (cross${IFS}build --target aarch64-unknown-linux-gnu) )"
+    )
+    if not any(
+        has_cross_command_context(variant)
+        for variant in word_splitting_variants(nested_split_command)
+    ):
+        failures.append(
+            "word-split Cross executable in a nested subshell was not recognized"
+        )
+
+    # Above the expansion cap only the all-split view survives, and it must
+    # still land in the nested-subshell executable slot.
+    capped_padding = " ".join(f"x$A{index}" for index in range(16))
+    capped_nested_command = (
+        f": {capped_padding}; "
+        "( (cross${IFS}build --target aarch64-unknown-linux-gnu) )"
+    )
+    if not any(
+        has_cross_command_context(variant)
+        for variant in word_splitting_variants(capped_nested_command)
+    ):
+        failures.append(
+            "capped word-split Cross executable in a nested subshell was not "
+            "recognized"
+        )
+
+    # The same padded line without any Cross literal stays benign: expansion
+    # padding alone must not manufacture a surface.
+    if word_splitting_variants(f": {capped_padding}; echo done"):
+        failures.append("expansion padding alone was treated as a Cross surface")
+
+    # A redirection between an executable and its operand must not make a real
+    # invocation look bare to the operand scanner.
+    redirected_tokens = shell_tokens(
+        "cross >build.log build --target aarch64-unknown-linux-gnu"
+    )
+    if redirected_tokens is None or not command_has_argument(redirected_tokens, 0):
+        failures.append(
+            "a redirection before the Cross operand hid the operand"
+        )
+
+    # The benign control shares that structure but genuinely has no operand, so
+    # the redirection walk must not invent one.
+    bare_redirected_tokens = shell_tokens("cross >build.log")
+    if bare_redirected_tokens is not None and command_has_argument(
+        bare_redirected_tokens, 0
+    ):
+        failures.append("a bare redirected command was given a phantom operand")
 
     cross_bypasses = {
         "global build configuration": {**valid_cross, "build": {"xargo": True}},
@@ -9343,6 +11394,22 @@ pre_build = []
         protected_trigger_hash,
     ):
         failures.append("trusted revalidation allowed an opaque Cross executable")
+    changed_env_wrapped_shell_variable_cross = benign_workflow.replace(
+        "echo unrelated-edit",
+        "|\n          cmd=$(printf '\\143\\162\\157\\163\\163')\n"
+        '          env -i "$cmd" build --target aarch64-unknown-linux-gnu',
+    )
+    if not validate_workflow_contract(
+        changed_env_wrapped_shell_variable_cross,
+        "self-test workflow",
+        "protected-arm",
+        protected_hash,
+        protected_env_hash,
+        protected_trigger_hash,
+    ):
+        failures.append(
+            "trusted revalidation allowed an env-wrapped opaque Cross executable"
+        )
     changed_parenthesized_shell_cross = benign_workflow.replace(
         "echo unrelated-edit",
         "|\n          cmd=$(printf '\\143\\162\\157\\163\\163')\n"
@@ -9515,6 +11582,20 @@ pre_build = []
         "self-test workflow directory",
     ):
         failures.append("benign embedded command substitutions were rejected")
+    opaque_substitution_workflow = safe_extra_workflow.replace(
+        "echo safe",
+        "cmd=$(printf '\\143\\162\\157\\163\\163')\n"
+        '          echo $("${cmd}" build --target aarch64-unknown-linux-gnu)',
+    )
+    if not compare_pr_workflow_collection(
+        {"coverage.yml": safe_extra_workflow},
+        {
+            "coverage.yml": safe_extra_workflow,
+            "attacker.yml": opaque_substitution_workflow,
+        },
+        "self-test workflow directory",
+    ):
+        failures.append("opaque Cross executable in command substitution was not rejected")
     if compare_pr_workflow_collection(
         {"coverage.yml": safe_extra_workflow},
         {
@@ -9662,6 +11743,11 @@ pre_build = []
         ),
         "command-substitution word split": (
             "cross$(printf ' ')build --target aarch64-unknown-linux-gnu"
+        ),
+        "capped word-split padding": (
+            ": x$A0 x$A1 x$A2 x$A3 x$A4 x$A5 x$A6 x$A7 "
+            "x$A8 x$A9 x$A10 x$A11 x$A12 x$A13 x$A14 x$A15; "
+            "cross${IFS}build --target aarch64-unknown-linux-gnu"
         ),
     }
     for label, command in word_splitting_bypasses.items():
@@ -10023,6 +12109,22 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("safe referenced automation was rejected")
+    opaque_cross_automation = {
+        "scripts/safe.sh": (
+            "#!/bin/sh\n"
+            "cmd=$(printf '\\143\\162\\157\\163\\163')\n"
+            '"$cmd" build\n'
+        )
+    }
+    if not validate_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        opaque_cross_automation,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "trusted revalidation allowed an opaque automation Cross executable"
+        )
 
     interpreter_references = {
         "dash": "dash ci/unsafe.sh",
@@ -10038,6 +12140,7 @@ pre_build = []
         "Bun": "bun ci/unsafe.ts",
         "BusyBox shell": "busybox sh ci/unsafe.sh",
         "nested shell interpreter": "sh -c 'dash ci/unsafe.sh'",
+        "extensionless bare executable": "ci/unsafe",
     }
     for interpreter_label, command in interpreter_references.items():
         interpreter_workflow = referenced_workflow.replace(
@@ -10345,6 +12448,22 @@ pre_build = []
     ):
         failures.append("custom repository shell template was not rejected")
 
+    explicit_indent_custom_shell_workflow = referenced_workflow.replace(
+        "      - run: bash scripts/safe.sh\n",
+        "      - run: |2\n"
+        "          cat <<EOF\n"
+        "        shell: ./ci/run-cross.sh {0}\n",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": explicit_indent_custom_shell_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "explicit-indent run block swallowed custom repository shell template"
+        )
+
     dynamic_shell_workflow = referenced_workflow.replace(
         "      - run: bash scripts/safe.sh\n",
         "      - run: echo safe\n"
@@ -10360,7 +12479,7 @@ pre_build = []
 
     indented_block_workflow = referenced_workflow.replace(
         "run: bash scripts/safe.sh",
-        "run: |2-\n        bash ci/arm64.sh",
+        "run: |2-\n          bash ci/arm64.sh",
     )
     if not validate_automation_collection(
         {"ci.yml": indented_block_workflow},
@@ -10778,6 +12897,21 @@ pre_build = []
         f"run(['sh', '-c', 'cross build --target {TARGET}'])\n",
     )
 
+    indirect_python_repository_command = {
+        "scripts/safe.py": (
+            "import subprocess\n"
+            "cmd = ['python3', 'ci/unsafe.py']\n"
+            "subprocess.run(cmd, check=True)\n"
+        ),
+    }
+    if not validate_automation_collection(
+        {"ci.yml": python_workflow},
+        {"setup/action.yml": safe_action},
+        indirect_python_repository_command,
+        "self-test automation directory",
+    ):
+        failures.append("indirect Python repository command was not rejected")
+
     benign_python = {
         "scripts/safe.py": (
             "import subprocess\n"
@@ -10953,6 +13087,22 @@ pre_build = []
         if not surfaces and not errors:
             failures.append(f"{label} in a run block was not protected")
 
+    assignment_prefixed_commands = {
+        "assignment-prefixed composite action input": "FOO=bar ${{ inputs.cmd }}",
+        "assignment-prefixed command substitution": "FOO=bar $(plan)",
+    }
+    for label, body in assignment_prefixed_commands.items():
+        surfaces, errors = generic_workflow_cross_surfaces(
+            run_block_workflow.replace("BODY", body),
+            "self-test assignment-prefixed run block workflow",
+            include_opaque_shell_executable=True,
+        )
+        if not surfaces and not errors:
+            failures.append(f"{label} in a run block was not protected")
+
+    for label, body in assignment_prefixed_commands.items():
+        shell_automation_escapes(label, body)
+
     # The same text inside a block scalar the runner never executes is prose,
     # not a command word, and must leave the file editable.
     prose_block_workflow = (
@@ -10977,15 +13127,15 @@ pre_build = []
         if surfaces or errors:
             failures.append(f"{label} in a prose block scalar was rejected")
 
-    # A heredoc body is data the shell hands to the reader, so an expansion
-    # standing alone there is not a command word either. The `cat` form is the
-    # generated-configuration shape real automation uses.
+    # A heredoc body line start is data the shell hands to the reader, so an
+    # expansion standing alone there is not a command word either. Quoted
+    # heredoc bodies suppress substitution entirely.
     heredoc_data_scripts = {
         "expansion alone in a heredoc body": (
             'cat <<EOF > config.yaml\nkey: value\n$block\nEOF\n'
         ),
         "substitution alone in a heredoc body": (
-            'cat <<EOF > config.yaml\nkey: value\n$(render_block)\nEOF\n'
+            "cat <<'EOF' > config.yaml\nkey: value\n$(render_block)\nEOF\n"
         ),
     }
     for label, body in heredoc_data_scripts.items():
@@ -11014,7 +13164,1239 @@ pre_build = []
         "substitution alone after a heredoc terminator",
         "cat <<EOF > config.yaml\nkey: value\nEOF\n$(plan)",
     )
+    shell_automation_escapes(
+        "substitution slot inside an unquoted heredoc body",
+        "cat <<EOF > config.yaml\nkey: value\n$(${{ inputs.cmd }})\nEOF\n",
+    )
 
+    # Arithmetic expansion uses ``<<`` as a shift operator, not a heredoc
+    # opener. Do not let a fake delimiter hide following executable lines.
+    arithmetic_heredoc_bypass = (
+        'EOF() { :; }\n'
+        'echo "$((1 <<EOF))"\n'
+        '${{ github.event.pull_request.title }}\n'
+        'EOF\n'
+    )
+    if quote_aware_heredoc_starts('echo "$((1 <<EOF))"'):
+        failures.append("arithmetic expansion was parsed as a heredoc opener")
+    arithmetic_workflow = run_block_workflow.replace(
+        "BODY", arithmetic_heredoc_bypass
+    )
+    surfaces, errors = generic_workflow_cross_surfaces(
+        arithmetic_workflow,
+        "self-test arithmetic heredoc workflow",
+        include_opaque_shell_executable=True,
+    )
+    if not surfaces and not errors:
+        failures.append("arithmetic shift expression hid a whole-command expression")
+
+    # The quoted spelling above is decided by the surrounding double quote, not
+    # by the arithmetic handling, so it passed while the *unquoted* expression
+    # still leaked `<<EOF` to the heredoc scanner. Skipping only the `$((`
+    # opener left the shift operator visible; the whole balanced expansion has
+    # to be consumed.
+    if quote_aware_heredoc_starts("echo $((1 <<EOF))"):
+        failures.append(
+            "unquoted arithmetic expansion was parsed as a heredoc opener"
+        )
+    unquoted_arithmetic_bypass = (
+        "EOF() { :; }\n"
+        "echo $((1 <<EOF))\n"
+        "${{ github.event.pull_request.title }}\n"
+        "EOF\n"
+    )
+    surfaces, errors = generic_workflow_cross_surfaces(
+        run_block_workflow.replace("BODY", unquoted_arithmetic_bypass),
+        "self-test unquoted arithmetic heredoc workflow",
+        include_opaque_shell_executable=True,
+    )
+    if not surfaces and not errors:
+        failures.append(
+            "unquoted arithmetic shift expression hid a whole-command expression"
+        )
+    # Consuming the expansion must not consume the rest of the line: a real
+    # heredoc opened after arithmetic on the same line is still a heredoc.
+    if not quote_aware_heredoc_starts("cat $((1 + 2)) <<EOF"):
+        failures.append("arithmetic expansion swallowed a following heredoc opener")
+    # Ordinary arithmetic and redirection stay benign.
+    if quote_aware_heredoc_starts("count=$((count << 2))"):
+        failures.append("an ordinary arithmetic shift was parsed as a heredoc")
+
+    # A shell suppresses body expansion when *any* character of the delimiter is
+    # quoted, and terminates on the dequoted word. Reading only a wholly quoted
+    # delimiter mis-parsed `<<E"OF"` as the unquoted delimiter `E` and did not
+    # read `<<\EOF` as a heredoc at all, so a quoted body could be reported as
+    # executable and the body state could run past the real terminator.
+    for delimiter_line, expected_value, expected_quoted in (
+        ('cat <<E"OF"', "EOF", True),
+        ("cat <<\\EOF", "EOF", True),
+        ("cat <<'EOF'", "EOF", True),
+        ('cat <<"EOF"', "EOF", True),
+        ("cat <<EOF", "EOF", False),
+        ("cat <<-EOF", "EOF", False),
+        ("cat <<EOF > config.yaml", "EOF", False),
+    ):
+        details = quote_aware_heredoc_start_details(delimiter_line)
+        if len(details) != 1:
+            failures.append(
+                f"heredoc delimiter {delimiter_line!r} was not parsed as one opener"
+            )
+            continue
+        _, parsed_value, parsed_quoted = details[0]
+        if parsed_value != expected_value:
+            failures.append(
+                f"heredoc delimiter {delimiter_line!r} parsed as {parsed_value!r}"
+            )
+        if parsed_quoted != expected_quoted:
+            failures.append(
+                f"heredoc delimiter {delimiter_line!r} quoting was misread"
+            )
+
+    # An unquoted heredoc body is data, but it still expands `$()` and
+    # backticks, so a command substitution in it really runs. The substitution
+    # interior has to be discovered as a repository edge while the surrounding
+    # data line gains no command slot of its own.
+    unquoted_body_program = (
+        "cat <<EOF > config.yaml\n"
+        "key: $(bash scripts/unsafe.sh)\n"
+        "EOF\n"
+    )
+    unquoted_body_commands, _ = shell_command_lines(
+        unquoted_body_program,
+        "self-test unquoted heredoc",
+    )
+    unquoted_body_texts = tuple(entry.text for entry in unquoted_body_commands)
+    if "bash scripts/unsafe.sh" not in unquoted_body_texts:
+        failures.append(
+            "an unquoted heredoc body substitution was not scanned as a command"
+        )
+    if any("key:" in text for text in unquoted_body_texts):
+        failures.append(
+            "an unquoted heredoc data line was promoted to a command line"
+        )
+    # A substitution interior runs in a subshell, so it is queued as an isolated
+    # command whose `cd` cannot move the directory later real lines resolve
+    # against, while the surrounding real lines stay non-isolated.
+    if not all(
+        entry.isolated
+        for entry in unquoted_body_commands
+        if "scripts/unsafe.sh" in entry.text
+    ):
+        failures.append(
+            "a heredoc body substitution was not queued as a subshell command"
+        )
+    if any(
+        entry.isolated
+        for entry in unquoted_body_commands
+        if entry.text.startswith("cat ")
+    ):
+        failures.append("a real command line was queued as a subshell command")
+    # Arithmetic expansion dispatches nothing, so it must not become a
+    # pseudo-command, while a genuinely nested substitution still does.
+    if heredoc_body_substitution_commands("value=$((scripts/build))"):
+        failures.append(
+            "an arithmetic expansion in a heredoc body was read as a command"
+        )
+    if not any(
+        "bash scripts/unsafe.sh" in interior
+        for interior in heredoc_body_substitution_commands(
+            "key: $( (bash scripts/unsafe.sh) )"
+        )
+    ):
+        failures.append(
+            "a nested heredoc body substitution was not read as a command"
+        )
+    # Arithmetic expansion evaluates an integer expression, but the shell still
+    # performs the command substitutions *inside* it first, so a repository
+    # script named in an arithmetic operand really executes.
+    if not any(
+        "bash scripts/unsafe.sh" in interior
+        for interior in heredoc_body_substitution_commands(
+            "value=$(( $(bash scripts/unsafe.sh) + 0 ))"
+        )
+    ):
+        failures.append(
+            "a command substitution nested in arithmetic expansion was not "
+            "read as a command"
+        )
+    # The benign control is the same arithmetic spelling with nothing to
+    # dispatch inside it, so it must stay data.
+    if heredoc_body_substitution_commands("value=$(( 1 + 0 ))"):
+        failures.append(
+            "a substitution-free arithmetic expansion was read as a command"
+        )
+    # A heredoc body substitution may open on one line and close on a later
+    # one. Neither physical line carries a balanced substitution, and the
+    # continuation line is heredoc data with no command slot, so the whole body
+    # has to be joined before it is read.
+    multiline_body_commands, multiline_body_errors = shell_command_lines(
+        "cat <<EOF > config.yaml\n"
+        "key: $(\n"
+        "bash scripts/unsafe.sh\n"
+        ")\n"
+        "EOF\n",
+        "self-test multi-line heredoc substitution",
+    )
+    if multiline_body_errors:
+        failures.append(
+            "a terminated multi-line heredoc substitution was reported as an "
+            "unterminated heredoc"
+        )
+    multiline_body_texts = tuple(entry.text for entry in multiline_body_commands)
+    if "bash scripts/unsafe.sh" not in multiline_body_texts:
+        failures.append(
+            "a multi-line heredoc body substitution was not scanned as a command"
+        )
+    if any("key:" in text for text in multiline_body_texts):
+        failures.append(
+            "a multi-line heredoc data line was promoted to a command line"
+        )
+    # The benign control writes the same words across the same lines with no
+    # substitution to dispatch, so none of it becomes a command.
+    inert_body_commands, _ = shell_command_lines(
+        "cat <<EOF > config.yaml\nkey: (\nbash scripts/unsafe.sh\n)\nEOF\n",
+        "self-test inert heredoc data",
+    )
+    if any("scripts/unsafe.sh" in entry.text for entry in inert_body_commands):
+        failures.append("inert heredoc data was promoted to a command line")
+    # A heredoc body line is data, so an opaque ARM64 cross build written into
+    # one is not an execution edge, while the same words in a body substitution
+    # still are.
+    if OPAQUE_ARM_CROSS_EXECUTION.search(
+        opaque_arm_command_text(
+            f"cat <<EOF\n$cmd build --target {TARGET}\nEOF\n"
+        )
+    ):
+        failures.append(
+            "a heredoc data line was read as an opaque ARM64 cross execution"
+        )
+    if not OPAQUE_ARM_CROSS_EXECUTION.search(
+        opaque_arm_command_text(
+            f"cat <<EOF\nkey: $($cmd build --target {TARGET})\nEOF\n"
+        )
+    ):
+        failures.append(
+            "a heredoc body substitution lost its opaque ARM64 cross execution"
+        )
+    if not OPAQUE_ARM_CROSS_EXECUTION.search(
+        opaque_arm_command_text(f"$cmd build --target {TARGET}\n")
+    ):
+        failures.append(
+            "an ordinary opaque ARM64 cross execution stopped being detected"
+        )
+    # A heredoc an interpreter is *fed* is the program that runs, not template
+    # data, so quoting its delimiter suppresses expansion inside the program
+    # without making the program inert. Withdrawing it turned a generated inline
+    # shell surface into accepted text.
+    executable_heredoc_program = "bash <<'EOF'\nbash -c \"$(render)\"\nEOF\n"
+    # The benign control writes the identical body instead of running it.
+    written_heredoc_template = "cat <<'EOF' > out.sh\nbash -c \"$(render)\"\nEOF\n"
+    for label, program, dispatched in (
+        ("executable", executable_heredoc_program, True),
+        ("written", written_heredoc_template, False),
+    ):
+        if (
+            OPAQUE_INLINE_SHELL.search(automation_command_text(program)) is not None
+        ) is not dispatched:
+            failures.append(
+                f"a {label} quoted heredoc body was projected as the wrong kind "
+                "of command text"
+            )
+        # Exact-tree validation and pull-request comparison must agree on that
+        # projection. When only one of them narrowed, a proposed script that
+        # merely writes a template still changed its compared digest surface and
+        # blocked the edit with no finding behind it, and an executable heredoc
+        # was inert to the exact scan while the comparison still saw it.
+        exact_surface = contains_direct_trusted_shell_cross_surface(program)
+        compared_surface = bool(
+            generic_action_cross_surfaces(
+                program,
+                name="scripts/self_test_heredoc.sh",
+                include_opaque_shell_executable=True,
+            )
+        )
+        if exact_surface is not dispatched or compared_surface is not dispatched:
+            failures.append(
+                f"a {label} quoted heredoc body disagreed with the expected "
+                "Cross surface between exact validation and comparison"
+            )
+    # A command substitution in a heredoc body is one subshell, so a `cd` on its
+    # first line reaches its own later lines and nothing past them. Resolving
+    # every interior line from the parent directory let a benign
+    # `scripts/scripts/evil.sh` stand in for the repository-root script the
+    # substitution really runs.
+    substitution_cwd_references, _, _, _ = local_automation_references(
+        "cd scripts\n"
+        "cat <<EOF > config.yaml\n"
+        "key: $(\n"
+        "cd ..\n"
+        "bash scripts/evil.sh\n"
+        ")\n"
+        "EOF\n"
+        "bash sub/other.sh\n",
+        "self-test heredoc substitution directory",
+        workflow_source=False,
+    )
+    if "scripts/evil.sh" not in substitution_cwd_references:
+        failures.append(
+            "a directory change inside one heredoc substitution did not reach "
+            "the rest of that substitution"
+        )
+    # The benign control: the parent shell is still in `scripts/` afterwards, so
+    # the subshell's `cd ..` must not have followed it out.
+    if "scripts/sub/other.sh" not in substitution_cwd_references:
+        failures.append(
+            "a heredoc substitution's directory change escaped its subshell"
+        )
+    # A `cd` inside an `if` block within that same substitution only happened on
+    # the branch that ran, so the directory is unknown once the block closes.
+    # Skipping the control stack for substitution lines applied it
+    # unconditionally, which resolved the script under `scripts/` and either
+    # scanned the wrong file or avoided the outside-the-roots error entirely.
+    (
+        conditional_substitution_references,
+        _,
+        _,
+        conditional_substitution_errors,
+    ) = local_automation_references(
+        "cat <<EOF > config.yaml\n"
+        "key: $(\n"
+        "if [ -f flag ]; then\n"
+        "cd scripts\n"
+        "fi\n"
+        "bash evil.sh\n"
+        ")\n"
+        "EOF\n",
+        "self-test conditional substitution directory",
+        workflow_source=False,
+    )
+    if "scripts/evil.sh" in conditional_substitution_references:
+        failures.append(
+            "a conditional directory change inside a substitution was applied "
+            "unconditionally"
+        )
+    if not any(
+        "ambiguous working-directory state" in error
+        for error in conditional_substitution_errors
+    ):
+        failures.append(
+            "a repository command after a conditional substitution `cd` did not "
+            "fail closed"
+        )
+    # The benign control: the same substitution without the conditional still
+    # resolves the command against the directory it really changed to, so the
+    # control stack has not simply disabled directory tracking in subshells.
+    unconditional_substitution_references, _, _, _ = local_automation_references(
+        "cat <<EOF > config.yaml\n"
+        "key: $(\n"
+        "cd scripts\n"
+        "bash evil.sh\n"
+        ")\n"
+        "EOF\n",
+        "self-test unconditional substitution directory",
+        workflow_source=False,
+    )
+    if "scripts/evil.sh" not in unconditional_substitution_references:
+        failures.append(
+            "an unconditional directory change inside a substitution stopped "
+            "reaching the rest of that substitution"
+        )
+    # `timeout` documents `-s`/`--signal` with a mandatory operand. Consuming
+    # only the flag left its operand standing in for the mandatory duration and
+    # handed the executable slot to the duration instead of the command.
+    for signal_option in ("-s TERM", "--signal TERM", "--signal=TERM", "-sTERM"):
+        if CROSS_COMMAND_CONTEXT.search(
+            f"timeout {signal_option} 30 cross build --target {TARGET}"
+        ) is None:
+            failures.append(
+                f"a Cross dispatch behind 'timeout {signal_option}' lost its "
+                "command slot"
+            )
+        signal_tokens = shell_tokens(f"timeout {signal_option} 30 scripts/evil.sh")
+        if signal_tokens is None:
+            failures.append("a timeout signal command line did not tokenize")
+            continue
+        signal_index, signal_dispatches, _ = skip_wrapper_prefixes(signal_tokens, 0)
+        if not signal_dispatches or signal_index >= len(signal_tokens) or (
+            signal_tokens[signal_index] != "scripts/evil.sh"
+        ):
+            failures.append(
+                f"'timeout {signal_option}' resolved the wrong word as its "
+                "command operand"
+            )
+    # The benign control keeps the same option shape with nothing in a command
+    # slot behind it.
+    if CROSS_COMMAND_CONTEXT.search(
+        f"timeout -s TERM 30 echo cross build --target {TARGET}"
+    ) is not None:
+        failures.append(
+            "a Cross argument behind an echo was read as a timeout command "
+            "operand"
+        )
+    # `NAME=value` is an assignment word only while it precedes the command
+    # name. After a wrapper that execs its operand directly the shell runs the
+    # assignment word itself, so the word behind it is an argument and never a
+    # dispatch.
+    for exec_wrapper in ("exec", "nohup", "timeout 30"):
+        if CROSS_COMMAND_CONTEXT.search(
+            f"{exec_wrapper} FOO=bar cross build --target {TARGET}"
+        ) is not None:
+            failures.append(
+                f"an argv assignment after '{exec_wrapper}' was read as a "
+                "skippable assignment word"
+            )
+    # `env` and `sudo` really do parse assignment operands, and assignments
+    # ahead of any wrapper are still assignments, so every one of these stays a
+    # dispatch.
+    for dispatch_prefix in (
+        "FOO=bar exec",
+        "sudo FOO=bar",
+        "env FOO=1 sudo BAR=2 env",
+        "FOO=bar sudo",
+    ):
+        if CROSS_COMMAND_CONTEXT.search(
+            f"{dispatch_prefix} cross build --target {TARGET}"
+        ) is None:
+            failures.append(
+                f"a literal Cross dispatch behind '{dispatch_prefix}' lost its "
+                "command slot"
+            )
+    for wrapper_line, expected_operand in (
+        ("exec FOO=bar $cmd build", "FOO=bar"),
+        ("sudo FOO=bar $cmd build", "$cmd"),
+        ("time FOO=bar $cmd build", "$cmd"),
+    ):
+        wrapper_tokens = shell_tokens(wrapper_line)
+        if wrapper_tokens is None:
+            failures.append("a wrapper assignment command line did not tokenize")
+            continue
+        wrapper_index, wrapper_dispatches, _ = skip_wrapper_prefixes(
+            wrapper_tokens,
+            0,
+        )
+        if not wrapper_dispatches or wrapper_index >= len(wrapper_tokens) or (
+            wrapper_tokens[wrapper_index] != expected_operand
+        ):
+            failures.append(
+                f"{wrapper_line!r} resolved the wrong word as its command operand"
+            )
+    # A file reached through two interpreters is read both ways. Collapsing the
+    # provenance to the stricter Python reading skipped the shell one, so a
+    # polyglot could hide a shell dispatch that `sh scripts/poly` really runs.
+    polyglot_reachable, _, _ = reachable_automation_references(
+        {
+            "workflows/polyglot.yml": (
+                "jobs:\n"
+                "  build:\n"
+                "    steps:\n"
+                "      - run: python3 scripts/poly\n"
+                "      - run: sh scripts/poly\n"
+            )
+        },
+        {
+            "scripts/poly": "#\nbash scripts/unsafe.sh\n",
+            "scripts/unsafe.sh": "echo safe\n",
+        },
+        "self-test polyglot provenance",
+    )
+    if "scripts/unsafe.sh" not in polyglot_reachable:
+        failures.append(
+            "the shell reading of a dual-provenance automation file was skipped"
+        )
+    # The benign control names only Python, so the shell reading is never owed
+    # and the file behind the commented-out shell line stays unreached.
+    python_only_reachable, _, _ = reachable_automation_references(
+        {
+            "workflows/python_only.yml": (
+                "jobs:\n"
+                "  build:\n"
+                "    steps:\n"
+                "      - run: python3 scripts/poly\n"
+            )
+        },
+        {
+            "scripts/poly": "#\n# bash scripts/unsafe.sh\n",
+            "scripts/unsafe.sh": "echo safe\n",
+        },
+        "self-test single provenance",
+    )
+    if "scripts/unsafe.sh" in python_only_reachable:
+        failures.append(
+            "a commented shell line invented an interpreter provenance edge"
+        )
+    # A bare read is a reading of its own. A file reached once with no
+    # interpreter and once through Python owes both, so the shell-only edge the
+    # bare `run: scripts/poly` really executes stays followed.
+    bare_and_hinted_reachable, _, _ = reachable_automation_references(
+        {
+            "workflows/bare.yml": (
+                "jobs:\n"
+                "  build:\n"
+                "    steps:\n"
+                "      - run: scripts/poly\n"
+                "      - run: python3 scripts/poly\n"
+            )
+        },
+        {
+            "scripts/poly": "#\nbash scripts/unsafe.sh\n",
+            "scripts/unsafe.sh": "echo safe\n",
+        },
+        "self-test bare provenance",
+    )
+    if "scripts/unsafe.sh" not in bare_and_hinted_reachable:
+        failures.append(
+            "an interpreter hint erased the bare reading a file was also "
+            "reached through"
+        )
+    # The interpreter a call site names outranks the file's own suffix, so a
+    # polyglot run as `sh scripts/poly.py` is walked as shell.
+    suffixed_hint_reachable, _, _ = reachable_automation_references(
+        {
+            "workflows/suffixed.yml": (
+                "jobs:\n"
+                "  build:\n"
+                "    steps:\n"
+                "      - run: sh scripts/poly.py\n"
+            )
+        },
+        {
+            "scripts/poly.py": "#\nbash scripts/unsafe.sh\n",
+            "scripts/unsafe.sh": "echo safe\n",
+        },
+        "self-test suffixed hint",
+    )
+    if "scripts/unsafe.sh" not in suffixed_hint_reachable:
+        failures.append(
+            "an explicit interpreter was ignored for a suffixed script, so its "
+            "shell-only edges were skipped"
+        )
+    # The benign control keeps the suffix authoritative when no other
+    # interpreter is named.
+    suffix_only_reachable, _, _ = reachable_automation_references(
+        {
+            "workflows/suffix_only.yml": (
+                "jobs:\n"
+                "  build:\n"
+                "    steps:\n"
+                "      - run: python3 scripts/poly.py\n"
+            )
+        },
+        {
+            "scripts/poly.py": "#\n# bash scripts/unsafe.sh\n",
+            "scripts/unsafe.sh": "echo safe\n",
+        },
+        "self-test suffix only",
+    )
+    if "scripts/unsafe.sh" in suffix_only_reachable:
+        failures.append(
+            "a commented line in a suffixed script invented a shell edge"
+        )
+    # A stdin redirect names the interpreter that runs the file, so the
+    # provenance it carries must be recorded like any other interpreted operand.
+    stdin_match = LOCAL_COMMAND_REFERENCE.search("python3 < scripts/driver")
+    if stdin_match is None or stdin_match.group("redirected_interpreter") != (
+        "python3"
+    ):
+        failures.append(
+            "a redirected stdin script did not capture its interpreter"
+        )
+    _, _, stdin_interpreters, _ = local_automation_references(
+        "jobs:\n"
+        "  build:\n"
+        "    steps:\n"
+        "      - run: python3 < scripts/driver\n",
+        "self-test stdin provenance",
+        workflow_source=True,
+    )
+    if "python" not in stdin_interpreters.get("scripts/driver", set()):
+        failures.append(
+            "a stdin-redirected script recorded no interpreter provenance"
+        )
+    # An explicit interpreter outside the supported shell/Python/PowerShell
+    # set must not collapse to the bare-read marker. A suffixless Node or Ruby
+    # helper would otherwise be read as shell and its real process-dispatch
+    # syntax could pass unseen.
+    for unsupported_program in (
+        "node scripts/opaque",
+        "ruby scripts/opaque",
+    ):
+        _, _, _, unsupported_errors = local_automation_references(
+            f"jobs:\n  build:\n    steps:\n      - run: {unsupported_program}\n",
+            "self-test unsupported interpreter provenance",
+            workflow_source=True,
+        )
+        if not any(
+            "unsupported explicit interpreter" in error
+            for error in unsupported_errors
+        ):
+            failures.append(
+                f"unsupported interpreter edge {unsupported_program!r} was "
+                "recorded as a bare automation read"
+            )
+    # A heredoc piped into an interpreter is program text, not data, so the
+    # projection must keep the body and the generated inline shell surface in it
+    # must still fail closed.
+    piped_program = (
+        "cat <<'EOF' | bash\n"
+        'bash -c "$(render)"\n'
+        "EOF\n"
+    )
+    if 'bash -c "$(render)"' not in automation_command_text(piped_program):
+        failures.append(
+            "a heredoc piped into an interpreter was projected away as data"
+        )
+    if not contains_direct_trusted_shell_cross_surface(piped_program):
+        failures.append(
+            "a generated inline shell surface inside a piped heredoc did not "
+            "fail closed"
+        )
+    # The benign control redirects the same body to a file, where it really is
+    # data the script only writes.
+    written_program = (
+        "cat <<'EOF' > out.txt\n"
+        'bash -c "$(render)"\n'
+        "EOF\n"
+    )
+    if contains_direct_trusted_shell_cross_surface(written_program):
+        failures.append(
+            "a heredoc template written to a file was read as an executed "
+            "inline shell surface"
+        )
+    # The all-target opaque executable check reads the projected command text
+    # too, so a written template holding `$cmd build` is not a dispatch while an
+    # interpreter-fed body holding the same words still is. A non-ARM target
+    # keeps `OPAQUE_ARM_CROSS_EXECUTION` out of the decision.
+    opaque_template = (
+        "cat <<'EOF' > out.txt\n"
+        "$cmd build --target x86_64-unknown-linux-gnu\n"
+        "EOF\n"
+    )
+    if contains_direct_trusted_shell_cross_surface(opaque_template):
+        failures.append(
+            "a heredoc template was reported as an opaque Cross executable"
+        )
+    # The fail-closed direction: an ordinary opaque dispatch carries no heredoc,
+    # so the projection returns it unchanged and the check must still report it.
+    # This is what proves the projection narrowed the false positive above
+    # without disabling the scan behind it.
+    if not contains_direct_trusted_shell_cross_surface(
+        "$cmd build --target x86_64-unknown-linux-gnu\n"
+    ):
+        failures.append(
+            "an opaque Cross executable stopped failing closed once the "
+            "all-target check read projected command text"
+        )
+    # An escaped `$(` in an unquoted heredoc body is literal text the shell
+    # writes out, so it opens no command slot. An even backslash run is a
+    # literal backslash followed by a live substitution and still does.
+    if heredoc_body_substitution_commands(r"\$(bash scripts/unsafe.sh)"):
+        failures.append(
+            "an escaped heredoc substitution was recorded as an executed edge"
+        )
+    if not heredoc_body_substitution_commands("$(bash scripts/unsafe.sh)"):
+        failures.append(
+            "an unquoted heredoc substitution lost its command slot"
+        )
+    if not heredoc_body_substitution_commands(r"\\$(bash scripts/unsafe.sh)"):
+        failures.append(
+            "an escaped backslash suppressed a live heredoc substitution"
+        )
+    if heredoc_body_substitution_commands(r"\`bash scripts/unsafe.sh\`"):
+        failures.append(
+            "an escaped heredoc backtick was recorded as an executed edge"
+        )
+    # A backtick pair is not required to close on the line it opened on, and an
+    # unquoted heredoc body runs the substitution either way. Matching only
+    # same-line pairs emitted no group for a multiline one, so the transitive
+    # repository edge and every Cross surface inside the reached script were
+    # missed.
+    if "bash scripts/unsafe.sh" not in heredoc_body_substitution_commands(
+        "opening=`\nbash scripts/unsafe.sh\n`\n"
+    ):
+        failures.append(
+            "a multiline heredoc backtick substitution lost its command slot"
+        )
+    if "bash scripts/unsafe.sh" not in heredoc_body_substitution_commands(
+        "`bash scripts/unsafe.sh`"
+    ):
+        failures.append(
+            "a same-line heredoc backtick substitution lost its command slot"
+        )
+    # The benign controls: a single unpaired backtick opens no substitution, and
+    # an escaped opener still does not pair across lines.
+    if heredoc_body_substitution_commands("a lone ` backtick\nbash scripts/x.sh\n"):
+        failures.append(
+            "an unpaired heredoc backtick invented a command substitution"
+        )
+    if heredoc_body_substitution_commands("\\`\nbash scripts/unsafe.sh\n`\n"):
+        failures.append(
+            "an escaped backtick opened a multiline heredoc substitution"
+        )
+    # A heredoc body is standard input to the command it is attached to, so only
+    # that command's own pipeline can hand it to an interpreter. Searching the
+    # whole remainder of the opener line attached a later statement's `|
+    # python3` to the template and scanned inert data as an executable program.
+    separated_heredoc_programs, _ = executable_heredocs(
+        "cat <<'DOC'; echo safe | python3\nkey: $cmd build\nDOC\n",
+        "self-test separated heredoc pipeline",
+    )
+    if separated_heredoc_programs:
+        failures.append(
+            "a heredoc template was attached to an interpreter in a later "
+            "statement"
+        )
+    # The benign controls: a genuine pipe into an interpreter, including one
+    # followed by a further command, still classifies the body as a program.
+    for piped_opener, piped_label in (
+        ("cat <<'DOC' | python3\n", "plain"),
+        ("cat <<'DOC' | python3 && echo done\n", "chained"),
+        ("cat <<'DOC' |& python3\n", "stderr-piped"),
+    ):
+        piped_programs, _ = executable_heredocs(
+            f"{piped_opener}key: $cmd build\nDOC\n",
+            f"self-test {piped_label} heredoc pipeline",
+        )
+        if not piped_programs:
+            failures.append(
+                f"a {piped_label} piped heredoc body was not read as a program"
+            )
+    # Multiple heredocs are read in opener order, and the later stdin
+    # redirection is the one the piped interpreter receives. Keying extraction
+    # on only the first delimiter scans `D` and silently drops the real Python
+    # program in `PY`.
+    multiple_piped_programs, _ = executable_heredocs(
+        "cat <<D <<'PY' | python3\n"
+        "safe template\n"
+        "D\n"
+        "subprocess.run(['cross', 'build'])\n"
+        "PY\n",
+        "self-test multiple piped heredocs",
+    )
+    if not any(
+        language == "python" and "subprocess.run" in program
+        for language, program in multiple_piped_programs
+    ):
+        failures.append(
+            "a later heredoc piped into Python was skipped behind the first one"
+        )
+    # A separator inside a nested construct is that construct's own, not the
+    # line's. `$(true; true)` expands to nothing, so `cat` still receives the
+    # heredoc and the outer `| bash` still executes it. Stopping the pipeline
+    # scan at the nested `;` never reached that pipe and withdrew a body Bash
+    # really runs as inert template data.
+    for nested_opener, nested_label in (
+        ("cat <<'DOC' $(true; true) | bash\n", "substitution"),
+        ("cat <<'DOC' `true; true` | bash\n", "backtick"),
+        ("cat <<'DOC' $(echo $(true; true)) | bash\n", "nested substitution"),
+        ("cat <<'DOC' <(true; true) | bash\n", "process substitution"),
+        # Unbalanced syntax resolves toward scanning the body, not trusting it.
+        ("cat <<'DOC' $(true; true | bash\n", "unterminated substitution"),
+    ):
+        nested_programs, _ = executable_heredocs(
+            f"{nested_opener}key: $cmd build\nDOC\n",
+            f"self-test {nested_label} heredoc pipeline",
+        )
+        if not nested_programs:
+            failures.append(
+                f"a heredoc piped past a {nested_label} was not read as a "
+                "program"
+            )
+    # A pipe that exists only inside a balanced nested construct never receives
+    # the heredoc body. The outer tail projection must hide that nested pipe
+    # before the interpreter regex is applied.
+    for nested_only_opener, nested_only_label in (
+        (
+            "cat <<'DOC' $(printf ok | bash); echo done\n",
+            "command substitution",
+        ),
+        ("cat <<'DOC' `printf ok | bash`; echo done\n", "backtick"),
+        ("cat <<'DOC' 'text | bash'; echo done\n", "quoted text"),
+    ):
+        nested_only_programs, _ = executable_heredocs(
+            f"{nested_only_opener}key: value\nDOC\n",
+            f"self-test nested-only {nested_only_label} heredoc pipeline",
+        )
+        if nested_only_programs:
+            failures.append(
+                f"a {nested_only_label} pipe was mistaken for the heredoc's "
+                "outer pipeline"
+            )
+    # The discriminating controls: nesting awareness must not blanket-classify.
+    # An outer separator that *follows* a balanced construct still ends the
+    # pipeline, so the later interpreter never receives this body.
+    for outer_opener, outer_label in (
+        ("cat <<'DOC' $(true); echo safe | python3\n", "substitution"),
+        ("cat <<'DOC' `true` && echo safe | python3\n", "backtick"),
+    ):
+        outer_programs, _ = executable_heredocs(
+            f"{outer_opener}key: $cmd build\nDOC\n",
+            f"self-test post-{outer_label} separator heredoc pipeline",
+        )
+        if outer_programs:
+            failures.append(
+                f"a separator after a {outer_label} did not end the heredoc "
+                "pipeline"
+            )
+    # A command substitution is still expanded inside a double-quoted word and
+    # parses its body in its own quote context. `printf "%s; true"` is one
+    # literal argument, so the `;` is text, `cat` keeps the heredoc on stdin,
+    # and the outer `| bash` runs the body. Reading the substitution's own
+    # quote as the end of the enclosing word made that literal `;` look like an
+    # outer boundary and withdrew an executed body as inert data.
+    for quoted_opener, quoted_label in (
+        (
+            "cat <<'DOC' 3>\"$(printf \"%s; true\" x)\" | bash\n",
+            "double-quoted substitution",
+        ),
+        (
+            "cat <<'DOC' 3>\"`printf \"%s; true\" x`\" | bash\n",
+            "double-quoted backtick",
+        ),
+    ):
+        quoted_programs, _ = executable_heredocs(
+            f"{quoted_opener}key: $cmd build\nDOC\n",
+            f"self-test {quoted_label} heredoc pipeline",
+        )
+        if not quoted_programs:
+            failures.append(
+                f"a heredoc piped past a {quoted_label} was not read as a "
+                "program"
+            )
+    # Parameter expansion is expanded inside a double-quoted word too, and the
+    # `word` of `:-` carries its own nested quoting. With `UNSET` absent the
+    # fd-3 redirection names the ordinary file `x; true`, so `cat` still reads
+    # the heredoc on stdin and the outer `| bash` executes it. Leaving `${` on
+    # the quoted-text shortcut let the expansion word's own quote close the
+    # enclosing word, so that literal `;` read as an outer boundary and
+    # withdrew an executed body as inert data.
+    for parameter_opener, parameter_label in (
+        (
+            "cat <<'DOC' 3>\"${UNSET:-\"x; true\"}\" | bash\n",
+            "double-quoted parameter expansion",
+        ),
+        (
+            "cat <<'DOC' 3>\"${UNSET:-\"$(printf \"%s; true\" x)\"}\" | bash\n",
+            "nested substitution in a parameter word",
+        ),
+        (
+            "cat <<'DOC' 3>\"${UNSET:-\"${INNER:-\"x; true\"}\"}\" | bash\n",
+            "nested parameter expansion",
+        ),
+    ):
+        parameter_programs, _ = executable_heredocs(
+            f"{parameter_opener}key: $cmd build\nDOC\n",
+            f"self-test {parameter_label} heredoc pipeline",
+        )
+        if not parameter_programs:
+            failures.append(
+                f"a heredoc piped past a {parameter_label} was not read as a "
+                "program"
+            )
+    # The discriminating controls for that quote context. Restoring the
+    # enclosing quote must leave a *following* outer separator terminating, and
+    # nothing expands inside single quotes: promoting a quoted `$(`, `${` or
+    # backtick into real nesting would leave an unbalanced closer owed, swallow
+    # the outer separator, and attach a later interpreter to this body.
+    for inert_opener, inert_label in (
+        (
+            "cat <<'DOC' 3>\"$(printf \"%s\" x)\"; echo safe | python3\n",
+            "balanced quoted substitution",
+        ),
+        (
+            "cat <<'DOC' 3>\"${UNSET:-\"x\"}\"; echo safe | python3\n",
+            "balanced quoted parameter expansion",
+        ),
+        ("cat <<'DOC' '$(' ; echo safe | python3\n", "single-quoted `$(`"),
+        ("cat <<'DOC' '${' ; echo safe | python3\n", "single-quoted `${`"),
+        ("cat <<'DOC' '`' ; echo safe | python3\n", "single-quoted backtick"),
+    ):
+        inert_programs, _ = executable_heredocs(
+            f"{inert_opener}key: $cmd build\nDOC\n",
+            f"self-test inert {inert_label} heredoc pipeline",
+        )
+        if inert_programs:
+            failures.append(
+                f"a separator after a {inert_label} did not end the heredoc "
+                "pipeline"
+            )
+    # A wrapper that execs its operand directly leaves `NAME=value` as argv, and
+    # no later pass may skip it back into an assignment word.
+    for argv_line, argv_operand in (
+        ("exec FOO=bar $cmd build", "FOO=bar"),
+        ("timeout 30 FOO=bar $cmd build", "FOO=bar"),
+        ("sudo FOO=bar $cmd build", "$cmd"),
+        ("FOO=bar $cmd build", "$cmd"),
+        # `time` is a shell reserved word that times a *pipeline*, so the words
+        # after it are still a simple command and `FOO=` is still an assignment
+        # prefix of it. Grouping `time` with the exec-their-operand wrappers
+        # stopped the walk on the assignment and dropped the real executable.
+        ("time FOO=bar $cmd build", "$cmd"),
+        ("time FOO= $cmd build", "$cmd"),
+        # The benign controls: `nohup` and `setsid` really do exec their operand,
+        # so their assignment words stay argv.
+        ("nohup FOO=bar $cmd build", "FOO=bar"),
+        ("setsid FOO=bar $cmd build", "FOO=bar"),
+    ):
+        argv_tokens = shell_tokens(argv_line)
+        if argv_tokens is None:
+            failures.append("a wrapper argv command line did not tokenize")
+            continue
+        argv_index, argv_executes = executable_index(argv_tokens)
+        if not argv_executes or argv_index >= len(argv_tokens) or (
+            argv_tokens[argv_index] != argv_operand
+        ):
+            failures.append(
+                f"{argv_line!r} resolved the wrong word as its executable"
+            )
+    # An assignment word may carry an empty value, and every regex layer must
+    # agree with the token model about that.
+    for empty_assignment in (
+        f"FOO= cross build --target {TARGET}",
+        f"env FOO= cross build --target {TARGET}",
+        f"FOO= sudo BAR= cross build --target {TARGET}",
+    ):
+        if CROSS_COMMAND_CONTEXT.search(empty_assignment) is None:
+            failures.append(
+                f"a literal Cross dispatch behind {empty_assignment!r} lost its "
+                "command slot"
+            )
+    # The regex layer must model `time` the same way the token walk does, or an
+    # opaque Cross invocation behind the shell keyword is dropped before any
+    # scanner sees it.
+    for time_prefixed in (
+        f"time FOO= cross build --target {TARGET}",
+        f"time FOO=1 BAR=2 cross build --target {TARGET}",
+        f"time cross build --target {TARGET}",
+    ):
+        if CROSS_COMMAND_CONTEXT.search(time_prefixed) is None:
+            failures.append(
+                f"a literal Cross dispatch behind {time_prefixed!r} lost its "
+                "command slot"
+            )
+    for time_opaque in (
+        'time FOO= "$cmd" build',
+        "time FOO=bar $cmd build",
+    ):
+        if OPAQUE_EXECUTABLE_WITH_SUBCOMMAND.search(time_opaque) is None:
+            failures.append(
+                f"an opaque Cross executable behind {time_opaque!r} escaped the "
+                "prefilter"
+            )
+    if OPAQUE_ARM_CROSS_EXECUTION.search(
+        f'time FOO= "$cmd" build --target {TARGET}'
+    ) is None:
+        failures.append(
+            "an opaque ARM64 Cross build behind the shell `time` keyword was "
+            "not matched"
+        )
+    # The benign control: a wrapper that execs its operand still hands the
+    # command slot to the assignment word, so no opaque dispatch is invented.
+    if OPAQUE_ARM_CROSS_EXECUTION.search(
+        f'nohup FOO= "$cmd" build --target {TARGET}'
+    ) is not None:
+        failures.append(
+            "benign wrapper argv was reported as an opaque ARM64 Cross build"
+        )
+    # An expansion at a command-word boundary is a word *separator* once the
+    # shell splits it, so `$cmd${IFS}build` dispatches `cross build` as plainly
+    # as literal whitespace does. Requiring literal whitespace after the
+    # expansion dropped that dispatch from the ARM64 scan and from the prefilter
+    # that gates the opaque-variant scan alike.
+    for split_opaque in (
+        f"$cmd${{IFS}}build --target {TARGET}",
+        f"$cmd$IFS build --target {TARGET}",
+        f"${{tool}}${{IFS}}+nightly build --target {TARGET}",
+    ):
+        if OPAQUE_ARM_CROSS_EXECUTION.search(split_opaque) is None:
+            failures.append(
+                f"a word-split opaque ARM64 Cross build in {split_opaque!r} was "
+                "not matched"
+            )
+        if OPAQUE_EXECUTABLE_WITH_SUBCOMMAND.search(split_opaque) is None:
+            failures.append(
+                f"a word-split opaque Cross executable in {split_opaque!r} "
+                "escaped the prefilter"
+            )
+    # The end-to-end shape the finding described: the executable is assembled on
+    # one line and split from its subcommand by an expansion on the next.
+    if not contains_direct_trusted_shell_cross_surface(
+        "cmd=$(printf cross)\n"
+        f"$cmd${{IFS}}build --target {TARGET}\n"
+    ):
+        failures.append(
+            "a word-split opaque Cross dispatch passed trusted shell validation"
+        )
+    # The benign controls: a word-split expansion that dispatches no Cargo/Cross
+    # subcommand, and one whose target is not the protected ARM64 triple, must
+    # both stay inert.
+    if OPAQUE_EXECUTABLE_WITH_SUBCOMMAND.search("$cmd${IFS}deploy") is not None:
+        failures.append(
+            "a word-split non-Cargo subcommand was reported as a Cross executable"
+        )
+    if OPAQUE_ARM_CROSS_EXECUTION.search(
+        "$cmd${IFS}build --target x86_64-unknown-linux-gnu"
+    ) is not None:
+        failures.append(
+            "a word-split build for an unprotected target was reported as ARM64"
+        )
+    if OPAQUE_EXECUTABLE_WITH_SUBCOMMAND.search("FOO= $cmd build") is None:
+        failures.append(
+            "an opaque Cross executable behind an empty assignment escaped the "
+            "prefilter"
+        )
+    # The benign control keeps the empty assignment in an argument position,
+    # where it grants no command slot of its own.
+    if OPAQUE_EXECUTABLE_WITH_SUBCOMMAND.search(
+        "echo FOO= is an empty value"
+    ) is not None:
+        failures.append(
+            "an empty assignment in prose was read as an opaque Cross command"
+        )
+    # A nested command substitution is a valid executable word, so the opaque
+    # prefilter must admit the line its scanner can already resolve.
+    if OPAQUE_EXECUTABLE_WITH_SUBCOMMAND.search(
+        flattened_command_substitutions(
+            f"$( (printf cross) ) build --target {TARGET}"
+        )
+    ) is None:
+        failures.append(
+            "the opaque executable prefilter dropped a nested command "
+            "substitution the scanner resolves"
+        )
+    if OPAQUE_EXECUTABLE_WITH_SUBCOMMAND.search(
+        flattened_command_substitutions("echo 'documentation about builds'")
+    ) is not None:
+        failures.append(
+            "the opaque executable prefilter admitted ordinary prose"
+        )
+    # The interleaved wrapper/assignment/`env` layer must record repository
+    # automation in every ordering that really executes it.
+    for interleaved_command in (
+        "env sudo bash scripts/unsafe.sh",
+        "sudo FOO=bar bash scripts/unsafe.sh",
+        "sudo env FOO=bar bash scripts/unsafe.sh",
+    ):
+        if LOCAL_COMMAND_REFERENCE.search(interleaved_command) is None:
+            failures.append(
+                f"interleaved prefix command {interleaved_command!r} was not "
+                "recorded as a repository reference"
+            )
+    if LOCAL_COMMAND_REFERENCE.search("echo bash scripts/unsafe.sh") is not None:
+        failures.append(
+            "a quoted-argument mention became a repository reference"
+        )
+    # An extensionless word is a repository command in every approved automation
+    # root, not only in the conventional layout directories. `.github/scripts/`,
+    # `comparison/`, `tests/k8s/` and `tests/performance/` are scanned roots, so
+    # a script named without `./` or a suffix under any of them is reached.
+    for extensionless_command in (
+        ".github/scripts/build",
+        "comparison/run",
+        "tests/k8s/apply",
+        "tests/performance/bench",
+        "scripts/build",
+    ):
+        if LOCAL_COMMAND_REFERENCE.search(extensionless_command) is None:
+            failures.append(
+                f"extensionless repository command {extensionless_command!r} "
+                "was not recorded as a reference"
+            )
+    # The benign control names the same path in an argument position, where the
+    # shell dispatches nothing and no command slot exists.
+    if LOCAL_COMMAND_REFERENCE.search("echo .github/scripts/build") is not None:
+        failures.append(
+            "an extensionless path in an argument position became a repository "
+            "reference"
+        )
+    # Several wrapper/`env`/assignment layers may interleave before a literal
+    # Cross command, and every ordering dispatches it.
+    for interleaved_cross in (
+        f"env FOO=1 sudo BAR=2 env cross build --target {TARGET}",
+        f"sudo env cross build --target {TARGET}",
+        f"env sudo FOO=1 cross build --target {TARGET}",
+    ):
+        if CROSS_COMMAND_CONTEXT.search(interleaved_cross) is None:
+            failures.append(
+                f"interleaved literal Cross {interleaved_cross!r} lost its "
+                "command context"
+            )
+    # The benign control keeps the identical words in an argument position, so
+    # the interleaved prefix must not manufacture a command slot there.
+    if CROSS_COMMAND_CONTEXT.search(
+        "echo env FOO=1 sudo BAR=2 env cross build"
+    ) is not None:
+        failures.append(
+            "an interleaved prefix in an argument position gained a Cross "
+            "command context"
+        )
+    # `timeout` takes a mandatory duration before its command operand, so the
+    # regex layer withholds the executable slot until that operand is seen,
+    # exactly as `skip_wrapper_prefixes` already does. A dynamic duration is an
+    # operand, never an executable, and reporting it was a false positive.
+    for timeout_line, is_opaque_cross in (
+        (f"timeout --preserve-status $seconds build --target {TARGET}", False),
+        (f"timeout -k 5 $seconds build --target {TARGET}", False),
+        (f"timeout 30 $cmd build --target {TARGET}", True),
+        (f"timeout --preserve-status 30 $cmd build --target {TARGET}", True),
+        (f"timeout -k 5 30 $cmd build --target {TARGET}", True),
+    ):
+        matched = OPAQUE_ARM_CROSS_EXECUTION.search(timeout_line) is not None
+        if matched != is_opaque_cross:
+            failures.append(
+                f"timeout wrapper line {timeout_line!r} matched {matched}, "
+                f"expected {is_opaque_cross}"
+            )
+    for interleaved_dispatch, pattern, label in (
+        ("env sudo make -C build all", BUILD_DISPATCHER, "build dispatcher"),
+        ("sudo FOO=bar make all", BUILD_DISPATCHER, "build dispatcher"),
+        ("env sudo python3 -m ci.build", PYTHON_MODULE_DISPATCH, "python module"),
+    ):
+        if pattern.search(interleaved_dispatch) is None:
+            failures.append(
+                f"interleaved {label} {interleaved_dispatch!r} was not discovered"
+            )
+    # The reference-discovery half of this case is asserted with the other
+    # repository-command fixtures, where `command_reference_result` is in scope.
+
+    # A backslash continuation after a wrapper hands the next line the argv the
+    # wrapper dispatches, but only when the wrapper actually reached the
+    # executable slot. GNU `env -u NAME` and `sudo -u USER` take a separate
+    # operand, so the word after `env -u \` is that operand, not a command.
+    for continuation_body, grants_command_start in (
+        ("env \\\n$var build\n", True),
+        ("sudo \\\n$var build\n", True),
+        ("timeout 30 \\\n$var build\n", True),
+        # `timeout` takes a mandatory duration before its command operand, so a
+        # continuation that has not supplied one yet hands the next line that
+        # duration rather than an executable.
+        ("timeout --preserve-status \\\n$var build\n", False),
+        ("timeout -k 5 \\\n$var build\n", False),
+        ("timeout --preserve-status 30 \\\n$var build\n", True),
+        # `-s`/`--signal` take an operand of their own, so the duration is still
+        # outstanding after one and the next line supplies it rather than an
+        # executable.
+        ("timeout -s TERM \\\n$var build\n", False),
+        ("timeout --signal TERM \\\n$var build\n", False),
+        ("timeout -s TERM 30 \\\n$var build\n", True),
+        ("env -u \\\n$var build\n", False),
+        ("env -C \\\n$var build\n", False),
+        ("sudo -u \\\n$var build\n", False),
+        # Assignment parsing belongs to the wrapper that opened the continued
+        # command. `env` and `sudo` keep it; direct-exec wrappers treat the same
+        # word as their COMMAND argv and grant no later executable slot.
+        ("env \\\nFOO=bar $var build\n", True),
+        ("sudo \\\nFOO=bar $var build\n", True),
+        ("exec \\\nFOO=bar $var build\n", False),
+        ("nohup \\\nFOO=bar $var build\n", False),
+        ("timeout 30 \\\nFOO=bar $var build\n", False),
+        ("timeout 30 \\\n>out FOO=bar $var build\n", False),
+        ("docker buildx imagetools create \\\n$var build\n", False),
+    ):
+        granted = 1 in shell_continuation_command_starts(continuation_body)
+        if granted != grants_command_start:
+            failures.append(
+                f"continuation command start for {continuation_body!r} was "
+                f"{granted}, expected {grants_command_start}"
+            )
+
+    if contains_cross_surface(
+        "timeout 30 \\\nFOO=bar $cmd build --target x86_64-unknown-linux-gnu\n",
+        include_opaque_shell_executable=True,
+    ):
+        failures.append(
+            "a direct-exec wrapper continuation promoted argv behind an "
+            "assignment-looking command"
+        )
+    if not contains_cross_surface(
+        "env \\\nFOO=bar $cmd build --target x86_64-unknown-linux-gnu\n",
+        include_opaque_shell_executable=True,
+    ):
+        failures.append(
+            "an env continuation lost the executable behind its assignment"
+        )
+
+    # `env` and interleaved assignment words are part of the same simple
+    # command, so an opaque word after them occupies the executable slot.
+    for whole_command_prefix, is_command_slot in (
+        ("env ", True),
+        ("FOO=bar sudo ", True),
+        ("sudo FOO=bar env ", True),
+        ("env -u NAME ", True),
+        ("FOO=bar ", True),
+        ("sudo ", True),
+        ("", True),
+        # `timeout`'s mandatory duration, in the whole-command-prefix matcher
+        # too, so this layer and `skip_wrapper_prefixes` agree word for word.
+        ("timeout 30 ", True),
+        ("timeout --preserve-status 30 ", True),
+        ("timeout -k 5 30 ", True),
+        ("timeout ", False),
+        ("timeout --preserve-status ", False),
+        ("timeout -k 5 ", False),
+        # `timeout -s TERM` is the documented separated spelling of `--signal`,
+        # so `TERM` is that option's operand and the duration is still owed.
+        ("timeout -s TERM ", False),
+        ("timeout --signal TERM ", False),
+        ("timeout -s TERM 30 ", True),
+        ("timeout --signal=TERM 30 ", True),
+        ("timeout -sTERM 30 ", True),
+        # An assignment word is an assignment only ahead of the command name.
+        # After a wrapper that execs its operand, the shell runs the assignment
+        # word itself, so no executable slot follows it.
+        ("exec FOO=bar ", False),
+        ("nohup FOO=bar ", False),
+        ("timeout 30 FOO=bar ", False),
+        ("echo ", False),
+        ("cat file ", False),
+        ("command -v ", False),
+    ):
+        matched = BARE_COMMAND_WORD_PREFIX.fullmatch(whole_command_prefix) is not None
+        if matched != is_command_slot:
+            failures.append(
+                f"bare command-word prefix {whole_command_prefix!r} matched "
+                f"{matched}, expected {is_command_slot}"
+            )
+
+    # Cross-interaction: widening the command-word prefix to accept `env` and
+    # narrowing the continuation grant to complete wrappers pull in opposite
+    # directions on the same line shape, and both are evaluated inside a real
+    # `run: |` block scalar, whose body lines stay shell-evaluated. `env \`
+    # still hands the next line the executable slot; `env -u \` leaves an option
+    # operand pending, so the following word is that operand and must not gain a
+    # whole-command slot.
+    for wrapper_continuation, grants_slot in (
+        ("env \\", True),
+        ("sudo \\", True),
+        ("env -u \\", False),
+        ("sudo -u \\", False),
+    ):
+        continuation_workflow = run_block_workflow.replace(
+            "BODY", f"{wrapper_continuation}\n          ${{{{ matrix.cmd }}}}"
+        )
+        granted = shell_continuation_command_starts(continuation_workflow)
+        # `- run: |` is line index 6, so the body's first line — the wrapper
+        # continuation — is index 7 and the line it would grant is index 8.
+        if (8 in granted) != grants_slot:
+            failures.append(
+                f"wrapper continuation {wrapper_continuation!r} in a run block "
+                f"granted {8 in granted}, expected {grants_slot}"
+            )
+
+    # Cross-interaction: the arithmetic skip must not disturb a quoted delimiter
+    # parsed on the same line, and the quoted body must stay non-executable.
+    combined_heredoc_details = quote_aware_heredoc_start_details(
+        'cat $((1 << 2)) <<E"OF"'
+    )
+    if len(combined_heredoc_details) != 1 or combined_heredoc_details[0][1:] != (
+        "EOF",
+        True,
+    ):
+        failures.append(
+            "arithmetic and a partially quoted delimiter were not parsed together"
+        )
+
+    # The extensionless `scripts/` discovery cases are asserted with the other
+    # repository-command fixtures, where `command_reference_result` is in scope.
     # Markdown in a report is not a command slot. A backtick inside a heredoc
     # body is data, and an escaped backtick is literal text even in a real
     # `run:` block, so neither may stand in for a whole command.
@@ -11100,6 +14482,27 @@ pre_build = []
         failures.append(
             "a whole-command substitution after a separator on a continuation "
             "line was not protected"
+        )
+
+    # A continuation after a process wrapper is still executable argv, not a
+    # passive argument: the wrapper dispatches the next word as its command.
+    wrapper_continuation_surfaces, wrapper_continuation_errors = (
+        generic_workflow_cross_surfaces(
+            continuation_workflow.replace(
+                "          docker buildx imagetools create \\\n"
+                "            -t ferrumedge/ferrum-edge:latest \\\n"
+                "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n",
+                "          env \\\n"
+                "          ${{ inputs.cmd }}\n",
+            ),
+            "self-test wrapper continuation workflow",
+            include_opaque_shell_executable=True,
+        )
+    )
+    if not wrapper_continuation_surfaces and not wrapper_continuation_errors:
+        failures.append(
+            "a whole-command substitution after a wrapper continuation was not "
+            "protected"
         )
 
     # A block-scalar body is one string value. Prose in it declares no mapping
@@ -11587,12 +14990,31 @@ pre_build = []
         return surfaces
 
     if artifact_surface(artifact_action, "name", f"binary-{TARGET}"):
-        failures.append("exact ARM64 artifact name was rejected")
+        failures.append("exact ARM64 download artifact name was rejected")
     if artifact_surface(artifact_action, "path", f"downloaded/binary-{TARGET}"):
-        failures.append("exact ARM64 artifact path was rejected")
+        failures.append("exact ARM64 download artifact path was rejected")
+    upload_action = "actions/upload-artifact@" + ("a" * 40)
     for carve_label, carve_uses, carve_key, carve_value in (
-        ("unpinned artifact action", "actions/download-artifact@v8", "name", f"binary-{TARGET}"),
-        ("non-artifact action", "some/other-action@" + ("b" * 40), "name", f"binary-{TARGET}"),
+        (
+            "unpinned artifact action",
+            "actions/download-artifact@v8",
+            "name",
+            f"binary-{TARGET}",
+        ),
+        ("pinned upload artifact name", upload_action, "name", f"binary-{TARGET}"),
+        ("pinned upload artifact path", upload_action, "path", f"fake/{TARGET}"),
+        (
+            "pinned upload artifact pattern",
+            upload_action,
+            "pattern",
+            f"fake/{TARGET}/*",
+        ),
+        (
+            "non-artifact action",
+            "some/other-action@" + ("b" * 40),
+            "name",
+            f"binary-{TARGET}",
+        ),
         ("artifact action Cross token", artifact_action, "name", "cross"),
         ("artifact action Cross image", artifact_action, "name", EXPECTED_IMAGE),
         ("artifact action non-artifact key", artifact_action, "args", TARGET),
@@ -12304,6 +15726,395 @@ pre_build = []
         "literal pipeline shell stdin after shell options",
         f"printf 'cross {arm_target}' | bash --norc",
     )
+    # An undecodable stdin producer must fail closed on both paths. These cases
+    # asserted only PR comparison, which hid that exact-tree validation entered
+    # through `contains_literal_executable_cross` and never reached the stdin
+    # opacity decision, so a merged escaped producer stayed accepted.
+    # `shell_automation_escapes` asserts PR comparison *and* tree validation.
+    for escaped_label, escaped_body in {
+        "escaped printf pipeline shell stdin after shell options": (
+            f"printf '\\x63ross {arm_target}' | bash --norc"
+        ),
+        "escaped echo pipeline shell stdin after shell options": (
+            f"echo -e '\\x63ross {arm_target}' | bash --norc"
+        ),
+        "escaped printf pipeline shell stdin for the ARM64 target": (
+            f"printf '\\x63ross build --target aarch64-unknown-linux-gnu' | bash"
+        ),
+    }.items():
+        shell_automation_escapes(escaped_label, escaped_body)
+    # The same undecodable producer, this time in the *workflow* and *local
+    # action* entry points. Those reach `runtime_program_cross_surface` with
+    # `include_opaque_shell_executable=False`, and the opaque-stdin scope was
+    # only applied inside `contains_direct_trusted_shell_cross_surface`, so
+    # trusted-base validation accepted a Cross execution PR comparison rejects.
+    opaque_stdin_run = (
+        "printf '\\x63ross build --target aarch64-unknown-linux-gnu' | bash"
+    )
+    opaque_stdin_workflow = (
+        "name: Opaque stdin\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        f"      - run: {opaque_stdin_run}\n"
+    )
+    if not validate_workflow_collection(
+        {"opaque_stdin.yml": opaque_stdin_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append(
+            "an undecodable stdin Cross producer passed exact workflow validation"
+        )
+    opaque_stdin_action = (
+        "name: Opaque stdin action\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - shell: bash\n"
+        f"      run: {opaque_stdin_run}\n"
+    )
+    if not validate_action_collection(
+        {"opaque/action.yml": opaque_stdin_action},
+        "self-test action directory",
+    ):
+        failures.append(
+            "an undecodable stdin Cross producer passed exact action validation"
+        )
+    # Python provenance extracts a literal shell command and then re-enters the
+    # shell scanner. That scan owes the same opaque-stdin scope: the process
+    # command is readable while the program generated by its escaped producer
+    # is deliberately not.
+    python_provenance_workflow = {
+        "python.yml": (
+            "jobs:\n"
+            "  build:\n"
+            "    steps:\n"
+            "      - run: python3 scripts/opaque\n"
+        )
+    }
+    opaque_python_process = (
+        "import subprocess\n"
+        r'''subprocess.run("printf '\\x63ross build --target aarch64-unknown-linux-gnu' | bash", shell=True)'''
+        "\n"
+    )
+    if not validate_automation_collection(
+        python_provenance_workflow,
+        {},
+        {"scripts/opaque": opaque_python_process},
+        "self-test Python provenance",
+    ):
+        failures.append(
+            "an opaque stdin producer extracted from Python passed exact "
+            "automation validation"
+        )
+    benign_python_process = (
+        "import subprocess\n"
+        "subprocess.run(\"printf 'echo safe' | bash\", shell=True)\n"
+    )
+    if validate_automation_collection(
+        python_provenance_workflow,
+        {},
+        {"scripts/opaque": benign_python_process},
+        "self-test benign Python provenance",
+    ):
+        failures.append(
+            "a readable benign stdin program extracted from Python failed "
+            "automation validation"
+        )
+    # Inline `python -c` reaches the recursion-safe literal command reader
+    # rather than `process_commands_have_cross`. PR comparison supplies its
+    # opaque-executable policy through an argument, not the global stdin scope,
+    # so dropping that distinction inside the narrower reader used to make the
+    # proposed workflow look insensitive even though trusted-tree validation
+    # rejected the same escaped producer.
+    opaque_inline_python_run = (
+        "python3 -c \"import subprocess; "
+        "subprocess.run('printf \\\"\\\\\\\\x63ross build --target "
+        "aarch64-unknown-linux-gnu\\\" | bash', shell=True)\""
+    )
+    opaque_inline_python_workflow = opaque_stdin_workflow.replace(
+        opaque_stdin_run,
+        opaque_inline_python_run,
+        1,
+    )
+    benign_inline_python_workflow = opaque_stdin_workflow.replace(
+        opaque_stdin_run,
+        "python3 -c \"print('safe')\"",
+        1,
+    )
+    if not compare_pr_workflow_collection(
+        {"inline-python.yml": benign_inline_python_workflow},
+        {"inline-python.yml": opaque_inline_python_workflow},
+        "self-test inline Python workflow",
+    ):
+        failures.append(
+            "an opaque stdin producer extracted from inline Python passed PR "
+            "workflow comparison"
+        )
+    # The benign controls: a producer this scanner *can* decode, and whose
+    # decoded program dispatches nothing, must stay accepted on both entry
+    # points. Failing closed on opacity must not mean failing closed on pipes.
+    for benign_stdin_label, benign_stdin_run in (
+        ("literal", "printf 'echo built' | bash"),
+        ("escaped non-Cross", "printf 'echo \\x62uilt' | bash"),
+    ):
+        if validate_workflow_collection(
+            {
+                "benign_stdin.yml": opaque_stdin_workflow.replace(
+                    opaque_stdin_run,
+                    benign_stdin_run,
+                    1,
+                )
+            },
+            "self-test workflow directory",
+        ):
+            failures.append(
+                f"a benign {benign_stdin_label} stdin producer was rejected by "
+                "workflow validation"
+            )
+        if validate_action_collection(
+            {
+                "benign/action.yml": opaque_stdin_action.replace(
+                    opaque_stdin_run,
+                    benign_stdin_run,
+                    1,
+                )
+            },
+            "self-test action directory",
+        ):
+            failures.append(
+                f"a benign {benign_stdin_label} stdin producer was rejected by "
+                "action validation"
+            )
+
+    # A job that only *writes* a quoted heredoc template is not executing it, so
+    # the whole-job and per-line raw scans must read the projected command text
+    # exactly as every other whole-text search does. Scanning the raw job body
+    # marked the job Cross-sensitive even though the per-line scanners withdraw
+    # the same body, which blocked benign edits with no finding behind them.
+    template_workflow = (
+        "name: Template writer\n"
+        "jobs:\n"
+        "  render:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          cat <<'TEMPLATE' > render.sh\n"
+        f"          $cmd build --target {TARGET}\n"
+        "          TEMPLATE\n"
+    )
+    if validate_workflow_collection(
+        {"template.yml": template_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append(
+            "a job that only writes a quoted heredoc template was reported as "
+            "Cross-sensitive"
+        )
+    if compare_pr_workflow_collection(
+        {"template.yml": template_workflow},
+        {"template.yml": template_workflow.replace("render.sh", "rendered.sh", 1)},
+        "self-test workflow directory",
+    ):
+        failures.append(
+            "an edit to a quoted heredoc template job was blocked with no Cross "
+            "surface behind it"
+        )
+    # The discriminating positive controls: the same body really does execute
+    # when an interpreter is fed it, and an *unquoted* body still dispatches its
+    # substitutions, so neither may be projected away.
+    executable_template_workflow = template_workflow.replace(
+        "cat <<'TEMPLATE' > render.sh",
+        "bash <<'TEMPLATE'",
+        1,
+    )
+    if not validate_workflow_collection(
+        {"executable_template.yml": executable_template_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append(
+            "an interpreter-fed heredoc body holding an opaque ARM64 Cross build "
+            "was not rejected"
+        )
+    unquoted_template_workflow = (
+        "name: Template writer\n"
+        "jobs:\n"
+        "  render:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          cat <<TEMPLATE > render.sh\n"
+        f"          key: $($cmd build --target {TARGET})\n"
+        "          TEMPLATE\n"
+    )
+    if not validate_workflow_collection(
+        {"unquoted_template.yml": unquoted_template_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append(
+            "an unquoted heredoc body substitution dispatching an opaque ARM64 "
+            "Cross build was not rejected"
+        )
+    # The prefilter that gates the opaque variant scan was narrower than the
+    # scanner it guards, so these dispatches were dropped before `scan_variants`
+    # could substitute Cross and fail closed. The target is deliberately not the
+    # ARM64 one, so `OPAQUE_ARM_CROSS_EXECUTION` cannot be what rejects them.
+    non_arm_target = "build --target x86_64-unknown-linux-gnu"
+    for opaque_slot_label, opaque_slot_body in {
+        "assignment-prefixed opaque executable": (
+            f"FOO=1 $cmd {non_arm_target}"
+        ),
+        "env-prefixed opaque executable": f"env $cmd {non_arm_target}",
+        "wrapper and assignment before an opaque executable": (
+            f"FOO=1 sudo $cmd {non_arm_target}"
+        ),
+        "command substitution as the opaque executable": (
+            f"$(pick-cross) {non_arm_target}"
+        ),
+        "opaque executable with a literal cross subcommand": (
+            f"$tool cross {non_arm_target}"
+        ),
+        "opaque executable with a toolchain selector": (
+            f"$tool +nightly {non_arm_target}"
+        ),
+    }.items():
+        shell_automation_escapes(opaque_slot_label, opaque_slot_body)
+
+    # Widening the prefilter must not turn ordinary automation into a Cross
+    # surface. None of these puts an opaque word in the executable slot.
+    benign_opaque_slot_lines = {
+        "expansion in a target operand": (
+            "cargo build --target ${TARGET_TRIPLE} --locked"
+        ),
+        "expansion in an echo argument": 'echo "$cmd build --target x86_64"',
+        "expansion in a JSON value": '{"cross": "$cmd build"}',
+        "expansion after a non-wrapper command": "printf %s $cmd build",
+        "arithmetic expansion before a subcommand": "n=$((1 + 2)) cargo build",
+    }
+    for benign_label, benign_line in benign_opaque_slot_lines.items():
+        if contains_opaque_executable_cross(benign_line):
+            failures.append(f"benign line {benign_label!r} was read as opaque Cross")
+
+    # A dispatcher recipe is shell, so exact-tree revalidation applies the whole
+    # trusted-shell policy to it rather than only the literal and ARM64 forms.
+    # An opaque executable word is a Cross surface for every target, and
+    # enumerating a subset here accepted what PR comparison already freezes.
+    if not dispatcher_manifest_cross_surface(
+        "justfile",
+        "all:\n    $(pick-cross) build --target x86_64-unknown-linux-gnu\n",
+    ):
+        failures.append(
+            "an opaque Cross executable in a dispatcher recipe was not reported "
+            "during exact-tree validation"
+        )
+    # The benign control is an ordinary recipe in the same shape, so unrelated
+    # dispatcher edits stay unfrozen.
+    if dispatcher_manifest_cross_surface(
+        "justfile",
+        "all:\n    cargo build --release\n",
+    ):
+        failures.append(
+            "an ordinary dispatcher recipe was reported as a Cross surface"
+        )
+
+    # A reached script that *writes* a template is not executing it, so inline
+    # shell text inside a quoted heredoc body is inert data and must not freeze
+    # the file that renders it.
+    if contains_direct_trusted_shell_cross_surface(
+        "cat <<'EOF' > render.sh\n" 'bash -c "$(render)"\n' "EOF\n"
+    ):
+        failures.append(
+            "quoted heredoc data was reported as a generated inline shell "
+            "surface"
+        )
+    # The discriminating control puts the identical words on a real command
+    # line, where the inline shell really is generated and must fail closed.
+    if not contains_direct_trusted_shell_cross_surface('bash -c "$(render)"\n'):
+        failures.append("a generated inline shell surface stopped failing closed")
+    # An *unquoted* body still expands, so the same words in one are a real
+    # execution edge and keep failing closed as well.
+    if not contains_direct_trusted_shell_cross_surface(
+        "cat <<EOF > render.sh\n" 'key: $(bash -c "$(render)")\n' "EOF\n"
+    ):
+        failures.append(
+            "an unquoted heredoc body lost its generated inline shell surface"
+        )
+
+    # Interpreter provenance can arrive after a file was already reached. A
+    # suffixless script popped first is read as shell; a later `python3 <path>`
+    # edge changes its language, so it has to be re-read or the process calls
+    # inside it are never followed. `scripts/z-target` sorts after
+    # `scripts/a-referrer`, so the LIFO walk pops the target first and the bare
+    # reading really does happen before the Python edge is discovered.
+    provenance_workflow = (
+        "name: Provenance\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: bash scripts/z-target\n"
+        "      - run: bash scripts/a-referrer\n"
+    )
+    provenance_automation = {
+        "scripts/z-target": (
+            "import subprocess\n"
+            "subprocess.run(['bash', 'scripts/unsafe.sh'])\n"
+        ),
+        "scripts/a-referrer": "python3 scripts/z-target\n",
+        "scripts/unsafe.sh": "#!/bin/sh\necho unsafe\n",
+    }
+    provenance_reachable, _, _ = reachable_automation_references(
+        {"workflows/ci.yml": provenance_workflow},
+        provenance_automation,
+        "self-test interpreter provenance",
+    )
+    if "scripts/unsafe.sh" not in provenance_reachable:
+        failures.append(
+            "a file reached bare before its Python provenance appeared was not "
+            "re-read, so its process dispatch was never followed"
+        )
+    # The benign control keeps the same graph and the same files but removes
+    # the alternate-language edge, so nothing new becomes reachable. This proves
+    # the reachability above comes from the provenance edge rather than from
+    # mere membership in the automation collection.
+    control_reachable, _, _ = reachable_automation_references(
+        {"workflows/ci.yml": provenance_workflow},
+        {**provenance_automation, "scripts/a-referrer": "echo nothing\n"},
+        "self-test interpreter provenance control",
+    )
+    if "scripts/unsafe.sh" in control_reachable:
+        failures.append(
+            "a script became reachable without a real execution edge"
+        )
+
+    # A Python heredoc reached from a shell script is scanned like a `.py`
+    # automation file, so it rejects a variable process command the same way.
+    shell_automation_escapes(
+        "variable process command in a nested Python heredoc",
+        "python3 <<'PY'\n"
+        "import subprocess\n"
+        "cmd = ['python3', 'scripts/unsafe.py']\n"
+        "subprocess.run(cmd)\n"
+        "PY",
+    )
+    # A literal nested heredoc command stays readable and benign.
+    if validate_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        {
+            "scripts/safe.sh": (
+                "#!/bin/sh\n"
+                "python3 <<'PY'\n"
+                "import subprocess\n"
+                "subprocess.run(['echo', 'ok'])\n"
+                "PY\n"
+            )
+        },
+        "self-test automation directory",
+    ):
+        failures.append("a literal nested Python heredoc command was rejected")
+
     shell_automation_escapes(
         "literal here-string shell stdin",
         f"bash <<< 'cross {arm_target}'",
@@ -12343,11 +16154,14 @@ pre_build = []
             logical_benign = re.sub(r"\\\r?\n[ \t]*", "", benign_contents)
             matching_variants = [
                 variant
-                for line, shell_evaluated in logical_scan_lines(logical_benign)
+                for line, shell_evaluated, starts_command in logical_scan_lines(
+                    logical_benign
+                )
                 for variant in scan_variants(
                     line,
                     include_opaque_shell_executable=True,
                     shell_evaluated=shell_evaluated,
+                    starts_command=starts_command,
                 )
                 if has_cross_command_context(
                     variant,
@@ -12461,6 +16275,36 @@ pre_build = []
             "self-test automation directory",
         ):
             failures.append(f"{label} automation edit was not rejected")
+
+    extensionless_interpreted_shell_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "bash scripts/build",
+    )
+    extensionless_interpreted_shell_cross = {
+        "scripts/build": f"cross {arm_target}\n"
+    }
+    if not validate_automation_collection(
+        {"ci.yml": extensionless_interpreted_shell_workflow},
+        {"setup/action.yml": safe_action},
+        extensionless_interpreted_shell_cross,
+        "self-test automation directory",
+    ):
+        failures.append("extensionless interpreted shell Cross was not rejected")
+
+    opaque_inline_shell_cross = {
+        "scripts/safe.sh": (
+            "#!/bin/sh\n"
+            "bash -c \"$(printf '\\143\\162\\157\\163\\163 build "
+            "--target aarch64-unknown-linux-gnu')\"\n"
+        )
+    }
+    if not validate_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        opaque_inline_shell_cross,
+        "self-test automation directory",
+    ):
+        failures.append("opaque inline shell Cross surface was not rejected")
 
     opaque_shell_stdin = {
         "scripts/safe.sh": (
@@ -12796,7 +16640,9 @@ pre_build = []
     ):
         failures.append("a tree with only Python source was rejected")
 
-    def command_reference_result(program: str) -> tuple[set[str], set[str], list[str]]:
+    def command_reference_detail(
+        program: str,
+    ) -> tuple[set[str], set[str], dict[str, set[str | None]], list[str]]:
         return local_automation_references(
             "name: Commands\n"
             "on: [push]\n"
@@ -12808,6 +16654,190 @@ pre_build = []
             + "".join(f"          {line}\n" for line in program.splitlines()),
             "self-test command workflow",
             workflow_source=True,
+        )
+
+    def command_reference_result(program: str) -> tuple[set[str], set[str], list[str]]:
+        references, dispatchers, _, errors = command_reference_detail(program)
+        return references, dispatchers, errors
+
+    # An unquoted heredoc body still expands `$()`, so the substitution really
+    # executes while the data around it is written to the receiving command.
+    # Local discovery skipped every body line, so the executed script was never
+    # recorded and never scanned.
+    unquoted_body_references, _, unquoted_body_errors = command_reference_result(
+        "cat <<EOF > config.yaml\nkey: $(bash scripts/unsafe.sh)\nEOF"
+    )
+    if "scripts/unsafe.sh" not in unquoted_body_references:
+        failures.append(
+            "a command substitution inside an unquoted heredoc body was not "
+            "recorded as a repository reference"
+        )
+    if unquoted_body_errors:
+        failures.append("a benign unquoted heredoc body was rejected")
+    # A quoted delimiter makes the same body literal text, so it records
+    # nothing. The backslash and partially quoted spellings are quoted too.
+    for quoted_body_program in (
+        "cat <<'EOF' > config.yaml\nkey: $(bash scripts/unsafe.sh)\nEOF",
+        "cat <<\\EOF > config.yaml\nkey: $(bash scripts/unsafe.sh)\nEOF",
+        'cat <<E"OF" > config.yaml\nkey: $(bash scripts/unsafe.sh)\nEOF',
+    ):
+        quoted_body_references, _, _ = command_reference_result(quoted_body_program)
+        if "scripts/unsafe.sh" in quoted_body_references:
+            failures.append(
+                "a quoted heredoc body was treated as executable substitution"
+            )
+
+    # An extensionless executable under an approved automation root is a
+    # repository command whether or not it is spelled with `./`. `scripts/` is a
+    # scanned root, so omitting it from the bare-path alternatives left
+    # `run: scripts/build` unscanned.
+    for bare_path_program in (
+        "scripts/build",
+        "./scripts/build",
+        "bash scripts/build",
+    ):
+        bare_references, _, bare_errors = command_reference_result(bare_path_program)
+        if "scripts/build" not in bare_references:
+            failures.append(
+                f"extensionless repository command {bare_path_program!r} was not "
+                "recorded"
+            )
+        if bare_errors:
+            failures.append(
+                f"extensionless repository command {bare_path_program!r} was "
+                "rejected outright"
+            )
+    # A path in an argument position is data the command reads, not a command.
+    argument_references, _, _ = command_reference_result("cat scripts/build")
+    if "scripts/build" in argument_references:
+        failures.append("a path in an argument slot was recorded as a command")
+
+    # An explicit interpreter identifies the language of the file it runs, which
+    # is the only evidence available when that file has neither a suffix nor a
+    # shebang. Recording only the path read `python3 scripts/opaque` as shell.
+    for provenance_program, provenance_path, expected_kinds in (
+        ("python3 scripts/opaque", "scripts/opaque", {"python"}),
+        ("bash scripts/opaque", "scripts/opaque", {"shell"}),
+        ("source scripts/opaque", "scripts/opaque", {"shell"}),
+        (
+            "python3 scripts/opaque\nbash scripts/opaque",
+            "scripts/opaque",
+            {"python", "shell"},
+        ),
+    ):
+        _, _, provenance, _ = command_reference_detail(provenance_program)
+        if provenance.get(provenance_path) != expected_kinds:
+            failures.append(
+                f"interpreter provenance for {provenance_program!r} was "
+                f"{provenance.get(provenance_path)!r}, expected {expected_kinds!r}"
+            )
+    # A bare path names no interpreter, so nothing is invented for it.
+    _, _, bare_provenance, _ = command_reference_detail("./scripts/opaque")
+    if bare_provenance.get("scripts/opaque"):
+        failures.append("a bare path invented an interpreter provenance")
+
+    def interpreted_automation_result(command: str, body: str) -> list[str]:
+        """Validate a tree whose only edge runs an extensionless file."""
+
+        return validate_automation_collection(
+            {
+                "ci.yml": (
+                    "name: Interpreted automation\n"
+                    "jobs:\n"
+                    "  build:\n"
+                    "    runs-on: ubuntu-latest\n"
+                    "    steps:\n"
+                    "      - uses: ./.github/actions/setup\n"
+                    f"      - run: {command}\n"
+                )
+            },
+            {"setup/action.yml": safe_action},
+            {"scripts/opaque": body},
+            "self-test automation directory",
+        )
+
+    # Reading the file with the language its invocation named turns an
+    # unconditional "no scannable interpreter" error into a real scan. Benign
+    # Python behind `python3` is accepted instead of frozen...
+    if interpreted_automation_result(
+        "python3 scripts/opaque",
+        "import subprocess\nsubprocess.run(['echo', 'ok'])\n",
+    ):
+        failures.append(
+            "benign extensionless Python behind an explicit interpreter was rejected"
+        )
+    # ...while everything the Python reader rejects is still rejected. Both of
+    # these were previously reported only as an unscannable-interpreter error,
+    # so they guard the new path against becoming fail-open.
+    if not interpreted_automation_result(
+        "python3 scripts/opaque",
+        "import subprocess\ncmd = ['cross', 'build']\nsubprocess.run(cmd)\n",
+    ):
+        failures.append(
+            "a variable process command in extensionless Python was accepted"
+        )
+    if not interpreted_automation_result(
+        "python3 scripts/opaque",
+        "import subprocess\nsubprocess.run(['cross', 'build', '--target', "
+        f"'{TARGET}'])\n",
+    ):
+        failures.append(
+            "a literal Cross process call in extensionless Python was accepted"
+        )
+    # A shell interpreter keeps the shell reading, so the extensionless shell
+    # scan the earlier residual classes rely on is unchanged.
+    if not interpreted_automation_result(
+        "bash scripts/opaque",
+        f"#\ncross build --target {TARGET}\n",
+    ):
+        failures.append(
+            "Cross in extensionless shell behind an explicit interpreter was accepted"
+        )
+
+    # A file that carries its own `.py` suffix but is invoked through `sh` is
+    # executed by the shell, so the shell reading is the one that runs. Exact
+    # validation ran the shell Cross scan only when the file's *own* language
+    # was shell or it was suffixless, and the provenance-union branches replayed
+    # only Python and PowerShell — so a shell-executed polyglot could carry
+    # `cross build --target ...` down its shell path and pass. PR comparison
+    # never had that gap: `automation_file_cross_surfaces` runs the generic
+    # shell scan over every file regardless of language.
+    def shell_executed_polyglot_result(command: str, body: str) -> list[str]:
+        """Validate a tree whose only edge runs a `.py` file through a shell."""
+
+        return validate_automation_collection(
+            {
+                "ci.yml": (
+                    "name: Shell-executed polyglot\n"
+                    "jobs:\n"
+                    "  build:\n"
+                    "    runs-on: ubuntu-latest\n"
+                    "    steps:\n"
+                    "      - uses: ./.github/actions/setup\n"
+                    f"      - run: {command}\n"
+                )
+            },
+            {"setup/action.yml": safe_action},
+            {"scripts/poly.py": body},
+            "self-test automation directory",
+        )
+
+    # Valid Python whose only statement is a docstring, so the Python reader
+    # finds no process call at all and cannot be what rejects this. Read as
+    # shell, the same bytes put Cross in an executable slot.
+    polyglot_body = f'x = 1\n"""\ncross build --target {TARGET}\n"""\n'
+    for shell_command in ("sh scripts/poly.py", "bash scripts/poly.py"):
+        if not shell_executed_polyglot_result(shell_command, polyglot_body):
+            failures.append(
+                f"a polyglot executed by {shell_command!r} passed exact-tree "
+                "validation with a Cross build on its shell path"
+            )
+    # The benign control: run by Python, those bytes really are an inert
+    # docstring, so the shell reading is never owed and the file stays editable.
+    if shell_executed_polyglot_result("python3 scripts/poly.py", polyglot_body):
+        failures.append(
+            "a Python-executed polyglot was rejected for a Cross command that "
+            "only its unused shell reading dispatches"
         )
 
     # A relative operand is resolved by the shell from wherever it already is,
@@ -13144,7 +17174,7 @@ pre_build = []
         )
 
     def reference_result(steps: str) -> tuple[set[str], set[str], bool]:
-        references, dispatchers, errors = local_automation_references(
+        references, dispatchers, _, errors = local_automation_references(
             reference_workflow(steps),
             "self-test reference workflow",
             workflow_source=True,
@@ -13190,6 +17220,12 @@ pre_build = []
         "      - {run: ./scripts/safe.sh}\n"
     )[0]:
         failures.append("flow-spelled run script was not followed")
+    for shell_errexit in ("bash -e ci/unsafe.sh", "sh -e ci/unsafe.sh"):
+        if not reference_result(f"      - run: {shell_errexit}\n")[2]:
+            failures.append(
+                f"{shell_errexit!r} was accepted as inline source instead of a "
+                "repository script"
+            )
 
     # `defaults: {run: {shell: python}}` selects the same interpreter the block
     # spelling selects, so a non-shell body cannot hide behind it.
