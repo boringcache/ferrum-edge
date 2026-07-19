@@ -34,12 +34,17 @@
 //!
 //! Two bounds constrain that decode, and both reject rather than proceed:
 //!
-//! * **The client must accept identity.** Decoding publishes identity bytes, so
-//!   a client whose `Accept-Encoding` forbids the identity coding
-//!   (`identity;q=0`, or `*;q=0` with no explicit `identity`) cannot be served
-//!   the decoded representation. The gateway does not re-encode, and silently
-//!   handing that client the identity bytes would convert an encoded response it
-//!   *did* accept into one it explicitly refused. See
+//! * **The client must accept identity — when identity is what it would get.**
+//!   Decoding publishes identity bytes, so a client whose `Accept-Encoding`
+//!   forbids the identity coding (`identity;q=0`, or `*;q=0` with no explicit
+//!   `identity`) cannot be served the decoded representation. The gateway does
+//!   not re-encode, and silently handing that client the identity bytes would
+//!   convert an encoded response it *did* accept into one it explicitly refused.
+//!   The refusal is applied only once the decoded bytes are known to be the
+//!   representation that will actually be served — i.e. after the post-decode
+//!   claim holds. A decode whose plaintext WITHDRAWS the claim forwards the
+//!   original encoded bytes untouched, so no downgrade occurs and refusing an
+//!   encoding the client accepted would be a defect, not a protection. See
 //!   [`RepresentationRejection::IdentityCodingUnacceptable`].
 //! * **The operator's size limit still applies.** The decode ceiling is the
 //!   smaller of this module's hard cap and the configured
@@ -107,9 +112,12 @@
 //!   backend answers a bare JSON error/envelope document with no `Content-Type`
 //!   would have been declined, skipping a configured redaction over exactly the
 //!   untyped-JSON class this gate otherwise covers. The discriminator is a total
-//!   parse — the bytes must be exactly a sequence of complete length-prefixed
-//!   frames (or the base64 form a text-mode gRPC-Web client receives) — never a
-//!   prefix sniff, and it cannot collide with JSON in either direction.
+//!   parse against the ONE grammar the client's own representation admits —
+//!   DATA frames for native gRPC, DATA plus an optional final trailer frame for
+//!   gRPC-Web binary, and the base64 of that for gRPC-Web text — never a prefix
+//!   sniff and never the union of all three, and it cannot collide with JSON in
+//!   either direction. Framing that is legal in some other mode is not framing
+//!   here: it stays claimed and fails closed.
 //!
 //!   Because a decode changes which bytes that parse must run over, the claim is
 //!   asked twice: once over the wire bytes to decide whether a decode is owed,
@@ -276,31 +284,16 @@ fn body_policy_claimed(
         .any(|plugin| plugin.enforces_response_body_policy(ctx, content_type, body))
 }
 
-/// Whether a `Content-Encoding` field value names any coding that actually
-/// transforms the octets, i.e. anything other than `identity`.
-///
-/// An empty token is deliberately *not* treated as a transforming coding here:
-/// it is malformed, and [`decode_response_body`] is the one place that decides
-/// what a malformed field means (it rejects). This predicate answers only
-/// "would decoding change the bytes the client sees?".
-fn has_non_identity_coding(encoding: &str) -> bool {
-    encoding
-        .split(',')
-        .map(str::trim)
-        .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
-}
-
 /// Whether a `Content-Encoding` field value must be handed to
 /// [`decode_response_body`] for judgment rather than treated as absent.
 ///
 /// True for anything that is not a list of pure `identity` tokens — which
 /// includes both a real coding (`gzip`) and a MALFORMED one (`,`, `identity,`,
-/// a whitespace-only field). The empty-token case is the reason this exists
-/// separately from [`has_non_identity_coding`]: an empty token changes no octets
-/// (so it is not a "transforming coding" for the identity-acceptability rule)
-/// but it is also not provably `identity`, so a protected response carrying one
-/// must reach the fail-closed malformed-coding rejection instead of being
-/// silently inspected as though the field were absent.
+/// a whitespace-only field). The empty-token case is why the test is "not
+/// provably identity" rather than "names a transforming coding": an empty token
+/// changes no octets, but it is also not provably `identity`, so a protected
+/// response carrying one must reach the fail-closed malformed-coding rejection
+/// instead of being silently inspected as though the field were absent.
 pub(crate) fn content_encoding_requires_decode_judgment(encoding: &str) -> bool {
     !encoding
         .split(',')
@@ -424,12 +417,13 @@ fn origin_content_encoding<'a>(
             .metadata
             .get(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
             .map(String::as_str),
-        // Pass a PRESENT field through whichever codings it names. Filtering on
-        // `has_non_identity_coding` here would drop a malformed list whose only
-        // members are empty (`,` or `identity,`) before `decode_response_body`
-        // could reject it, and the body would then be transformed or forwarded
-        // under representation metadata the gateway never proved — the opposite
-        // of the fail-closed posture. `decode_response_body` is the one place
+        // Pass a PRESENT field through whichever codings it names. Filtering out
+        // anything but a real transforming coding here would drop a malformed
+        // list whose only members are empty (`,` or `identity,`) before
+        // `decode_response_body` could reject it, and the body would then be
+        // transformed or forwarded under representation metadata the gateway
+        // never proved — the opposite of the fail-closed posture. It is the
+        // one place
         // that judges a coding list: it returns `Ok(None)` for an identity-only
         // field (no octets change, nothing to decode) and `MalformedCoding` for
         // an empty token, so `identity` alone still costs nothing here.
@@ -607,27 +601,13 @@ pub(crate) fn evaluate_response_body_policy_posture(
         return ResponseBodyPolicyPosture::Reject(RepresentationRejection::PartialRepresentation);
     }
 
+    let limit = decoded_inspection_limit(ctx);
     let decoded = match origin_content_encoding(ctx, origin, response_headers) {
         None => None,
-        Some(encoding) => {
-            // Refuse before spending the decode: inspecting these bytes means
-            // serving them as identity, and the client said it will not take
-            // identity. The gateway does not re-encode, so there is no
-            // representation that is both inspectable and acceptable, and
-            // silently downgrading the acceptable encoded response the origin
-            // correctly produced is exactly what must not happen. A field that
-            // reduces to identity-only tokens changes no octets, so it is not
-            // subject to this rule.
-            if has_non_identity_coding(encoding) && !identity_coding_is_acceptable(ctx) {
-                return ResponseBodyPolicyPosture::Reject(
-                    RepresentationRejection::IdentityCodingUnacceptable,
-                );
-            }
-            match decode_response_body(encoding, response_body, decoded_inspection_limit(ctx)) {
-                Ok(decoded) => decoded,
-                Err(rejection) => return ResponseBodyPolicyPosture::Reject(rejection),
-            }
-        }
+        Some(encoding) => match decode_response_body(encoding, response_body, limit) {
+            Ok(decoded) => decoded,
+            Err(rejection) => return ResponseBodyPolicyPosture::Reject(rejection),
+        },
     };
 
     let inspected = decoded.as_deref().unwrap_or(response_body);
@@ -647,6 +627,34 @@ pub(crate) fn evaluate_response_body_policy_posture(
     // field rules cannot act on.
     if decoded.is_some() && !body_policy_claimed(plugins, ctx, content_type, inspected) {
         return ResponseBodyPolicyPosture::Unprotected;
+    }
+    // Only NOW is it known that identity bytes are the representation the client
+    // would actually receive, which is the sole thing the refusal is about.
+    //
+    // Asking earlier — before the decode and before the claim was re-asked over
+    // the plaintext — rejected responses that were never going to be downgraded.
+    // A `gzip` body whose plaintext is valid framed RPC withdraws the claim on
+    // the line above and the ORIGINAL encoded bytes go out untouched, so identity
+    // is never served and there is nothing for the client's `identity;q=0` to
+    // refuse; turning that valid RPC reply into a `502` refused an encoding the
+    // client had explicitly accepted.
+    //
+    // `decoded.is_some()` is the exact condition, not an approximation of one:
+    // [`decode_response_body`] answers `None` for a field that reduces to
+    // identity-only tokens (no octets change, so the rule does not apply) and
+    // rejects a malformed one before reaching here, so `Some` means precisely
+    // "a real coding was undone and these plaintext bytes are what gets served".
+    //
+    // Deferring costs nothing that was previously bounded: the decode this now
+    // runs first is the same bounded, ceiling-checked pass every other protected
+    // encoded response already performs, and malformed, unsupported, and
+    // oversized codings still reject above — only the reported reason changes
+    // for a response that is uninspectable AND unacceptable, and both answers
+    // are the same fail-closed replacement.
+    if decoded.is_some() && !identity_coding_is_acceptable(ctx) {
+        return ResponseBodyPolicyPosture::Reject(
+            RepresentationRejection::IdentityCodingUnacceptable,
+        );
     }
     if !document_is_parseable(content_type, inspected) {
         return ResponseBodyPolicyPosture::Reject(RepresentationRejection::UnparseableDocument);

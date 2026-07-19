@@ -80,34 +80,101 @@ pub(crate) const GRPC_FRAME_DATA_COMPRESSED: u8 = 0x01;
 /// gRPC frame flag: gRPC-Web trailer frame with `Compressed-Flag` set.
 pub(crate) const GRPC_FRAME_TRAILER_COMPRESSED: u8 = 0x81;
 
-/// Whether `data` is EXACTLY a non-empty sequence of complete gRPC
-/// length-prefixed frames, with nothing left over.
+/// Which framing grammar a buffered response body is allowed to use.
 ///
-/// This is a total structural parse, not a sniff: every frame must carry a
-/// recognized `Compressed-Flag`/trailer flag byte, declare a length that fits
-/// inside the remaining bytes, and the last frame must end precisely at the end
-/// of the buffer. Truncated, padded, or malformed framing answers `false`.
+/// The three gRPC representations are NOT interchangeable on the wire, and the
+/// buffered representation gate has to judge a body against the one the client
+/// is actually being served rather than against their union:
+///
+/// * **Native gRPC** (`application/grpc`) carries only DATA frames in the body.
+///   Terminal metadata rides in HTTP trailers, so a `0x80`/`0x81` trailer frame
+///   in the body is not native gRPC — accepting one lets a non-RPC byte string
+///   masquerade as framing and skip the fail-closed rejection.
+/// * **gRPC-Web binary** may embed exactly one terminal trailer frame, and the
+///   protocol places it LAST. A trailer followed by more data is malformed.
+/// * **gRPC-Web text** is the base64 encoding of the binary grammar above. Only
+///   a text-mode client receives base64, so base64 is a legal body ONLY there;
+///   treating it as framing on a native or binary request is what let a
+///   base64-of-frames payload bypass the `unparseable_document` rejection.
+///
+/// The gating is one-directional by design. Text mode accepts base64 framing OR
+/// the binary framing it encodes, because the retained text marker records the
+/// CLIENT's representation and does not by itself prove the backend answered in
+/// it — an H3 pass-through deployment retains the marker for error shaping while
+/// dispatching natively, so its buffered body can legitimately still be raw
+/// frames at gate time. Accepting the encoded form there costs nothing (framing
+/// is not a document any field rule could redact) while refusing it would turn
+/// valid RPC replies into `502`s. Native and binary mode, by contrast, have no
+/// path on which base64 is a body they could ever serve, so base64 there stays
+/// an unprovable representation and fails closed.
+///
+/// Chosen from immutable request state by
+/// [`client_grpc_framing_representation`], never from a rewritable header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrpcFramingRepresentation {
+    /// `application/grpc`: DATA frames only, trailers on the wire.
+    Native,
+    /// `application/grpc-web*`: DATA frames plus an optional final trailer frame.
+    WebBinary,
+    /// `application/grpc-web-text*`: base64 of the [`Self::WebBinary`] grammar.
+    WebText,
+}
+
+/// Whether `data` is EXACTLY a non-empty sequence of complete gRPC
+/// length-prefixed frames under `representation`'s grammar, with nothing left
+/// over.
+///
+/// This is a total structural parse, not a sniff: every frame must carry a flag
+/// byte the representation admits, declare a length that fits inside the
+/// remaining bytes, and the last frame must end precisely at the end of the
+/// buffer. Truncated, padded, misordered, or mode-illegal framing answers
+/// `false`, which keeps those bodies CLAIMED so the gate fails closed on them.
 ///
 /// It exists so the buffered representation gate can tell framed gRPC apart from
 /// a bare document when NO `Content-Type` was ever stamped or left on the
 /// response, without falling back to the request flavor alone. The two answers
-/// cannot collide: a valid frame begins with `0x00`, `0x01`, `0x80`, or `0x81`,
-/// none of which can begin a JSON document, so classifying a frame sequence as
-/// framed never costs a redaction a field rule could have applied.
-pub(crate) fn bytes_are_complete_grpc_frames(data: &[u8]) -> bool {
+/// cannot collide: a valid binary frame begins with `0x00`, `0x01`, `0x80`, or
+/// `0x81`, and base64 excludes `{`, `[`, and `"`, so classifying a frame
+/// sequence as framed never costs a redaction a field rule could have applied.
+pub(crate) fn bytes_are_complete_grpc_frames(
+    data: &[u8],
+    representation: GrpcFramingRepresentation,
+) -> bool {
+    match representation {
+        GrpcFramingRepresentation::Native => binary_frames_are_complete(data, false),
+        GrpcFramingRepresentation::WebBinary => binary_frames_are_complete(data, true),
+        // Text mode is the ONLY representation where base64 is a legal body, and
+        // it also still admits the binary framing that base64 encodes — see the
+        // one-directional gating note on [`GrpcFramingRepresentation`].
+        GrpcFramingRepresentation::WebText => {
+            bytes_are_grpc_web_text_frames(data) || binary_frames_are_complete(data, true)
+        }
+    }
+}
+
+/// The binary frame-sequence grammar, parameterized by whether a terminal
+/// trailer frame is legal.
+///
+/// `trailer_frame_allowed` is the whole difference between the native and
+/// gRPC-Web binary representations. When it is set, a trailer frame is accepted
+/// at most once and only as the FINAL frame: `pos` must land exactly on
+/// `data.len()` after it, so `DATA TRAILER DATA` and `TRAILER TRAILER` stay
+/// unframed and therefore claimed.
+fn binary_frames_are_complete(data: &[u8], trailer_frame_allowed: bool) -> bool {
     let mut pos = 0usize;
     let mut frames = 0usize;
     while pos < data.len() {
         if data.len() - pos < 5 {
             return false;
         }
-        if !matches!(
-            data[pos],
-            GRPC_FRAME_DATA
-                | GRPC_FRAME_DATA_COMPRESSED
-                | GRPC_FRAME_TRAILER
-                | GRPC_FRAME_TRAILER_COMPRESSED
-        ) {
+        // One place classifies the flag octet: a byte outside the four the wire
+        // spec defines is not a frame header at all.
+        let is_trailer = match data[pos] {
+            GRPC_FRAME_DATA | GRPC_FRAME_DATA_COMPRESSED => false,
+            GRPC_FRAME_TRAILER | GRPC_FRAME_TRAILER_COMPRESSED => true,
+            _ => return false,
+        };
+        if is_trailer && !trailer_frame_allowed {
             return false;
         }
         let length =
@@ -123,21 +190,31 @@ pub(crate) fn bytes_are_complete_grpc_frames(data: &[u8]) -> bool {
         }
         pos = header_end + length;
         frames += 1;
+        // A trailer frame terminates the message. Anything after it — another
+        // trailer, more data, or trailing padding — is not a body this gateway
+        // can prove is a complete RPC reply.
+        if is_trailer {
+            return pos == data.len();
+        }
     }
     frames > 0
 }
 
 /// Whether `data` is a gRPC-Web **text**-mode body: standard base64 whose decoded
-/// octets are exactly a complete gRPC frame sequence.
+/// octets are exactly a complete gRPC-Web binary frame sequence.
 ///
 /// Text mode base64-encodes the whole framed body, so its wire bytes are ASCII
-/// and [`bytes_are_complete_grpc_frames`] cannot recognize them directly. The
-/// cheap alphabet/length pre-scan runs first so an ordinary JSON document — whose
+/// and [`binary_frames_are_complete`] cannot recognize them directly. The cheap
+/// alphabet/length pre-scan runs first so an ordinary JSON document — whose
 /// leading `{`, `[`, or `"` is outside the base64 alphabet — never reaches the
 /// decoder. As with the binary case there is no collision to worry about: a body
 /// that base64-decodes to valid frames is not a JSON document a field rule could
 /// have redacted.
-pub(crate) fn bytes_are_grpc_web_text_frames(data: &[u8]) -> bool {
+///
+/// Reachable ONLY through [`GrpcFramingRepresentation::WebText`]. A native or
+/// binary gRPC-Web response body is not base64, so base64-shaped bytes there are
+/// an unprovable representation rather than framing.
+fn bytes_are_grpc_web_text_frames(data: &[u8]) -> bool {
     // Standard base64 with padding: a whole number of 4-character groups, and
     // `=` padding only in the final group.
     if data.is_empty() || !data.len().is_multiple_of(4) {
@@ -155,7 +232,7 @@ pub(crate) fn bytes_are_grpc_web_text_frames(data: &[u8]) -> bool {
     }
     BASE64
         .decode(data)
-        .is_ok_and(|decoded| bytes_are_complete_grpc_frames(&decoded))
+        .is_ok_and(|decoded| binary_frames_are_complete(&decoded, true))
 }
 
 /// Returns a header map with `content-type: application/grpc` for gRPC error responses.
@@ -441,6 +518,46 @@ pub(crate) fn retain_client_content_type_for_errors(ctx: &mut RequestContext, co
 
 pub(crate) fn client_uses_grpc_web(ctx: &RequestContext) -> bool {
     ctx.metadata.contains_key(META_GRPC_WEB_ORIGINAL_CT)
+}
+
+/// Which gRPC framing grammar this request's buffered response body may use, or
+/// `None` for traffic that is not gRPC at all.
+///
+/// Decided entirely from immutable request state — the request's HTTP flavor,
+/// the translation marker, and the retained client content type — because every
+/// live header the response carries has already passed through `after_proxy` and
+/// can name whatever a rule rewrote it to.
+///
+/// The ordering is load-bearing, and it is about WHEN the representation gate
+/// runs relative to this plugin's own re-encoding:
+///
+/// * A **translated** gRPC-Web request (`META_GRPC_WEB_MODE` present) reached the
+///   backend as `application/grpc`, so the backend answered in NATIVE framing.
+///   This plugin appends the trailer frame and base64-encodes in
+///   `transform_response_body` — plugin phase 9, AFTER the gate — so at gate time
+///   the bytes are still native, in text mode exactly as in binary mode.
+/// * A **retained-only** gRPC-Web request (`META_GRPC_WEB_ORIGINAL_CT` without
+///   the mode marker) is the pass-through deployment that intentionally omits
+///   this plugin's translation: the backend saw the client's own gRPC-Web type
+///   and answered in that representation, so the retained type — text or binary
+///   — is the grammar of the bytes the gate is looking at.
+/// * Otherwise a native gRPC request answers in native framing, and anything
+///   else is not gRPC and has no framing to preserve.
+pub(crate) fn client_grpc_framing_representation(
+    ctx: &RequestContext,
+) -> Option<GrpcFramingRepresentation> {
+    if request_is_grpc_web_translated(ctx) {
+        return Some(GrpcFramingRepresentation::Native);
+    }
+    if let Some(retained) = retained_response_content_type(ctx) {
+        return Some(if is_grpc_web_text(retained) {
+            GrpcFramingRepresentation::WebText
+        } else {
+            GrpcFramingRepresentation::WebBinary
+        });
+    }
+    ctx.is_native_grpc_request()
+        .then_some(GrpcFramingRepresentation::Native)
 }
 
 pub(crate) fn retained_response_content_type(ctx: &RequestContext) -> Option<&'static str> {

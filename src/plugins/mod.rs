@@ -5974,8 +5974,11 @@ pub trait Plugin: Send + Sync {
     /// JSON field rule can act on) or a bare JSON error/envelope document (which
     /// a configured redaction must still cover), and only the bytes distinguish
     /// them. Implementations must decide structurally — a total parse such as
-    /// [`crate::plugins::grpc_web::bytes_are_complete_grpc_frames`] — never by
-    /// sniffing a prefix.
+    /// [`crate::plugins::grpc_web::bytes_are_complete_grpc_frames`], run against
+    /// the grammar that
+    /// [`crate::plugins::grpc_web::client_grpc_framing_representation`] selects
+    /// for this request rather than the union of every gRPC representation —
+    /// never by sniffing a prefix.
     fn enforces_response_body_policy(
         &self,
         _ctx: &RequestContext,

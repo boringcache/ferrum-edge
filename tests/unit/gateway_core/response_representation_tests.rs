@@ -3209,9 +3209,25 @@ async fn untyped_unframed_unparseable_body_on_a_grpc_route_fails_closed() {
     }
 }
 
-/// The control the fix must not break: VALID untyped framing on the same route
-/// is still passed through untouched, across every frame shape the wire allows —
-/// multiple frames, a `Compressed-Flag` payload, and a gRPC-Web trailer frame.
+/// The two request shapes for which base64 is NOT a servable body: native gRPC
+/// and a gRPC-Web binary client.
+///
+/// Text mode is deliberately absent — it is the one representation whose client
+/// does receive base64, and it is the control the gating must not break.
+fn binary_framed_grpc_route_shapes() -> [(HttpFlavor, Option<&'static str>); 2] {
+    [
+        (HttpFlavor::Grpc, None),
+        (HttpFlavor::Plain, Some("application/grpc-web+proto")),
+    ]
+}
+
+/// The control the fix must not break: VALID untyped DATA framing is still
+/// passed through untouched, across every data-frame shape the wire allows —
+/// a single frame, a `Compressed-Flag` payload, and multiple frames.
+///
+/// Trailer frames are NOT in this list: they are legal in gRPC-Web and illegal
+/// in native gRPC, so they are asserted per representation below rather than
+/// against the union of both.
 #[tokio::test]
 async fn untyped_valid_grpc_framing_is_still_passed_through() {
     let mut compressed_frame = grpc_frame(b"\x08\x01");
@@ -3220,15 +3236,7 @@ async fn untyped_valid_grpc_framing_is_still_passed_through() {
     let mut multi_frame = grpc_frame(br#"{"secret":"hunter2"}"#);
     multi_frame.extend_from_slice(&grpc_frame(b"\x08\x02"));
 
-    let mut data_then_trailer = grpc_frame(b"\x08\x01");
-    data_then_trailer.extend_from_slice(&grpc_trailer_frame(b"grpc-status: 0\r\n"));
-
-    let bodies = [
-        grpc_frame(b"\x08\x01"),
-        compressed_frame,
-        multi_frame,
-        data_then_trailer,
-    ];
+    let bodies = [grpc_frame(b"\x08\x01"), compressed_frame, multi_frame];
 
     for (flavor, retained) in untyped_grpc_route_shapes() {
         for expected in &bodies {
@@ -3407,4 +3415,323 @@ async fn grpc_route_json_replacement_keeps_completed_gateway_decorators() {
         }
         assert_secret_not_forwarded(&body);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The framing grammar is chosen by the client's REPRESENTATION, not by the
+// union of every gRPC flavor.
+//
+// The three gRPC representations are not interchangeable on the wire:
+//
+// * native gRPC carries DATA frames only, with terminal metadata in HTTP
+//   trailers;
+// * gRPC-Web binary may embed exactly one trailer frame, and it must be LAST;
+// * gRPC-Web text is the base64 of that binary grammar, and only a text-mode
+//   client ever receives base64.
+//
+// Accepting all three grammars for every flavor was a fail-open: a byte string
+// that is framing in SOME other mode is not framing for this client, and
+// excusing it skipped the fail-closed `unparseable_document` rejection that the
+// gate exists to make. Every case below drives the real buffered body phase
+// through `transform_buffered_response_body_with_deadline_full_for_test`.
+// ---------------------------------------------------------------------------
+
+/// A DATA frame followed by a terminal gRPC-Web trailer frame — legal in
+/// gRPC-Web, illegal in native gRPC.
+fn data_then_trailer() -> Vec<u8> {
+    let mut body = grpc_frame(b"\x08\x01");
+    body.extend_from_slice(&grpc_trailer_frame(b"grpc-status: 0\r\n"));
+    body
+}
+
+/// Standard base64 of `data_then_trailer()`: exactly what a text-mode gRPC-Web
+/// client receives, and exactly what a native or binary client never does.
+fn base64_framed_body() -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .encode(data_then_trailer())
+        .into_bytes()
+}
+
+/// Native gRPC puts terminal metadata in HTTP trailers, so a `0x80`/`0x81`
+/// trailer frame in the BODY is not native framing. Treating it as framing let a
+/// non-RPC byte string decline the claim and be forwarded with the configured
+/// redaction silently skipped.
+#[tokio::test]
+async fn native_grpc_rejects_a_body_trailer_frame() {
+    let mut compressed_trailer = grpc_trailer_frame(b"grpc-status: 0\r\n");
+    compressed_trailer[0] = 0x81;
+
+    let bodies = [
+        ("data then trailer", data_then_trailer()),
+        ("trailer only", grpc_trailer_frame(b"grpc-status: 0\r\n")),
+        ("compressed trailer", compressed_trailer),
+    ];
+
+    for (case, body) in bodies {
+        let (replaced, _, reason, forwarded) =
+            run_untyped_grpc_route_transform(HttpFlavor::Grpc, None, HashMap::new(), body.clone())
+                .await;
+
+        // A native gRPC rejection is shaped as an RPC error and stays `200`,
+        // signalling through `grpc-status`, so `replaced` plus the reason is the
+        // fail-closed evidence.
+        assert!(replaced, "{case}: a body trailer frame is not native framing");
+        assert_eq!(reason.as_deref(), Some("unparseable_document"), "{case}");
+        assert_ne!(forwarded, body, "{case}: original bytes must not be served");
+    }
+}
+
+/// The other side of the same rule: gRPC-Web binary MAY carry a terminal trailer
+/// frame, and that legal body must still pass through untouched.
+#[tokio::test]
+async fn grpc_web_binary_accepts_a_legal_terminal_trailer_frame() {
+    let bodies = [
+        ("data then trailer", data_then_trailer()),
+        ("trailers-only reply", grpc_trailer_frame(b"grpc-status: 5\r\n")),
+    ];
+
+    for (case, expected) in bodies {
+        let (replaced, status, reason, body) = run_untyped_grpc_route_transform(
+            HttpFlavor::Plain,
+            Some("application/grpc-web+proto"),
+            HashMap::new(),
+            expected.clone(),
+        )
+        .await;
+
+        assert!(!replaced, "{case}: a legal gRPC-Web body must not be claimed");
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(reason, None, "{case}");
+        assert_eq!(body, expected, "{case}: the frames pass through intact");
+    }
+}
+
+/// A trailer frame terminates the message. Anything after it — more data, or a
+/// second trailer — is malformed ordering, so the body stays CLAIMED and fails
+/// closed rather than being excused as framing.
+#[tokio::test]
+async fn grpc_web_trailer_followed_by_more_data_stays_claimed() {
+    let mut trailer_then_data = grpc_trailer_frame(b"grpc-status: 0\r\n");
+    trailer_then_data.extend_from_slice(&grpc_frame(b"\x08\x01"));
+
+    let mut two_trailers = grpc_trailer_frame(b"grpc-status: 0\r\n");
+    two_trailers.extend_from_slice(&grpc_trailer_frame(b"grpc-status: 0\r\n"));
+
+    for (case, body) in [
+        ("trailer then data", trailer_then_data),
+        ("two trailers", two_trailers),
+    ] {
+        let (replaced, _, reason, forwarded) = run_untyped_grpc_route_transform(
+            HttpFlavor::Plain,
+            Some("application/grpc-web+proto"),
+            HashMap::new(),
+            body.clone(),
+        )
+        .await;
+
+        assert!(replaced, "{case}: misordered framing is not a proven body");
+        assert_eq!(reason.as_deref(), Some("unparseable_document"), "{case}");
+        assert_ne!(forwarded, body, "{case}: original bytes must not be served");
+    }
+}
+
+/// The finding's core case: base64 is a legal response body ONLY for a text-mode
+/// gRPC-Web client. A native or binary client that receives base64-of-frames is
+/// receiving something it cannot decode, and parsing it as framing let those
+/// bytes decline the claim and bypass the fail-closed rejection.
+#[tokio::test]
+async fn base64_framing_is_not_excused_outside_grpc_web_text_mode() {
+    for (flavor, retained) in binary_framed_grpc_route_shapes() {
+        let body = base64_framed_body();
+        let (replaced, _, reason, forwarded) =
+            run_untyped_grpc_route_transform(flavor, retained, HashMap::new(), body.clone()).await;
+
+        let case = format!("{flavor:?}/{retained:?}");
+        assert!(replaced, "{case}: base64 is not this client's representation");
+        assert_eq!(reason.as_deref(), Some("unparseable_document"), "{case}");
+        assert_ne!(forwarded, body, "{case}: original bytes must not be served");
+    }
+}
+
+/// The control that keeps the fix from being a blanket ban: the SAME bytes on a
+/// text-mode gRPC-Web request are that client's representation and still pass
+/// through untouched.
+#[tokio::test]
+async fn base64_framing_is_still_accepted_in_grpc_web_text_mode() {
+    let expected = base64_framed_body();
+    let (replaced, status, reason, body) = run_untyped_grpc_route_transform(
+        HttpFlavor::Plain,
+        Some("application/grpc-web-text+proto"),
+        HashMap::new(),
+        expected.clone(),
+    )
+    .await;
+
+    assert!(!replaced, "text mode must still recognize its own body");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_eq!(body, expected);
+}
+
+/// The gating is deliberately ONE-directional, and this pins that: text mode
+/// also accepts the raw binary framing base64 encodes.
+///
+/// The retained text marker records the CLIENT's representation, not proof that
+/// the backend answered in it — an H3 pass-through deployment retains it for
+/// error shaping while dispatching natively, so raw frames at gate time are a
+/// real shape. Accepting them costs no redaction (framing is not a document a
+/// field rule could act on) while refusing them would `502` valid RPC replies.
+/// Native and binary mode get no such latitude for base64: they have no path on
+/// which base64 is a body they could serve.
+#[tokio::test]
+async fn text_mode_also_accepts_the_binary_framing_base64_encodes() {
+    let expected = data_then_trailer();
+    let (replaced, status, reason, body) = run_untyped_grpc_route_transform(
+        HttpFlavor::Plain,
+        Some("application/grpc-web-text+proto"),
+        HashMap::new(),
+        expected.clone(),
+    )
+    .await;
+
+    assert!(!replaced, "raw framing under a text marker is still framing");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_eq!(body, expected);
+}
+
+// ---------------------------------------------------------------------------
+// `identity;q=0` is refused only when identity is what would actually be served.
+//
+// The refusal exists so the gateway never downgrades an encoded response the
+// client accepted into an identity one it explicitly refused. That can only
+// happen when the decoded bytes are INSTALLED — i.e. when the post-decode claim
+// still holds. When the plaintext turns out to be valid framed RPC the claim
+// withdraws, the decoded bytes are dropped, and the ORIGINAL encoded body is
+// forwarded untouched: identity is never served, so refusing it turned a valid
+// RPC reply into a `502` while protecting nothing.
+// ---------------------------------------------------------------------------
+
+/// Drive the real buffered body phase for a gRPC-flavored request that carries
+/// both a client `Accept-Encoding` and an encoded, untyped response.
+async fn run_untyped_grpc_route_with_accept_encoding(
+    flavor: HttpFlavor,
+    retained_grpc_web_content_type: Option<&str>,
+    accept_encoding: &str,
+    body: Vec<u8>,
+) -> (bool, u16, Option<String>, Vec<u8>, HashMap<String, String>) {
+    let plugins = redacting_plugins();
+    let mut ctx = ctx_with_client_accept_encoding(Some(accept_encoding));
+    set_request_http_flavor_for_test(&mut ctx, flavor);
+    if let Some(content_type) = retained_grpc_web_content_type {
+        retain_grpc_web_client_content_type_for_test(&mut ctx, content_type);
+    }
+
+    let mut status = 200;
+    let mut headers = HashMap::from([("content-encoding".to_string(), "gzip".to_string())]);
+    let mut body = body;
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
+    (replaced, status, reason, body, headers)
+}
+
+/// The finding: an encoded framed RPC reply whose client sent `identity;q=0`.
+/// The decode is owed to decide the claim, the plaintext is valid framing so the
+/// claim withdraws, and the client receives the encoded bytes it accepted.
+#[tokio::test]
+async fn encoded_framed_rpc_is_forwarded_when_the_client_forbids_identity() {
+    for (flavor, retained) in binary_framed_grpc_route_shapes() {
+        let encoded = gzip(&data_then_trailer_for(flavor));
+        let (replaced, status, reason, body, headers) = run_untyped_grpc_route_with_accept_encoding(
+            flavor,
+            retained,
+            "gzip, identity;q=0",
+            encoded.clone(),
+        )
+        .await;
+
+        let case = format!("{flavor:?}/{retained:?}");
+        assert!(!replaced, "{case}: a valid RPC reply must not become a 502");
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(reason, None, "{case}: identity is never served here");
+        assert_eq!(
+            body, encoded,
+            "{case}: the accepted encoded representation is forwarded untouched"
+        );
+        assert_eq!(
+            headers.get("content-encoding").map(String::as_str),
+            Some("gzip"),
+            "{case}: nothing was installed, so the coding still describes the body"
+        );
+    }
+}
+
+/// The frame sequence that is legal for `flavor`'s representation: native gRPC
+/// takes data frames only, gRPC-Web may terminate with a trailer frame.
+fn data_then_trailer_for(flavor: HttpFlavor) -> Vec<u8> {
+    if flavor == HttpFlavor::Grpc {
+        grpc_frame(b"\x08\x01")
+    } else {
+        data_then_trailer()
+    }
+}
+
+/// The control that proves the deferral did not delete the refusal: the same
+/// client, the same coding, but a plaintext that is a claimed JSON document. The
+/// decoded bytes WOULD be installed and served as identity, so the response is
+/// still rejected fail-closed and the secret never reaches the client.
+#[tokio::test]
+async fn encoded_json_is_still_refused_when_identity_would_be_served() {
+    for (flavor, retained) in binary_framed_grpc_route_shapes() {
+        let encoded = gzip(br#"{"secret":"hunter2","keep":1}"#);
+        let (replaced, _, reason, body, _) = run_untyped_grpc_route_with_accept_encoding(
+            flavor,
+            retained,
+            "gzip, identity;q=0",
+            encoded.clone(),
+        )
+        .await;
+
+        let case = format!("{flavor:?}/{retained:?}");
+        assert!(replaced, "{case}: identity would actually be served here");
+        assert_eq!(
+            reason.as_deref(),
+            Some("identity_coding_unacceptable"),
+            "{case}"
+        );
+        assert_ne!(body, encoded, "{case}: the original must not be forwarded");
+        assert_secret_not_forwarded(&body);
+    }
+}
+
+/// A malformed coding is still judged BEFORE acceptability, so deferring the
+/// refusal did not open a hole: an undecodable body is rejected regardless of
+/// what the client would or would not accept.
+#[tokio::test]
+async fn malformed_coding_still_fails_closed_under_an_identity_refusal() {
+    let (replaced, _, reason, body, _) = run_untyped_grpc_route_with_accept_encoding(
+        HttpFlavor::Grpc,
+        None,
+        "gzip, identity;q=0",
+        b"not a gzip stream at all".to_vec(),
+    )
+    .await;
+
+    // As elsewhere, a native gRPC rejection is shaped as an RPC error rather
+    // than an HTTP status, so `replaced` plus the reason is the evidence.
+    assert!(replaced, "an undecodable body is never forwarded");
+    assert_eq!(reason.as_deref(), Some("malformed_content_coding"));
+    assert_ne!(body, b"not a gzip stream at all".to_vec());
 }

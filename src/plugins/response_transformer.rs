@@ -528,22 +528,30 @@ impl ResponseTransformer {
 /// operator believed it had. `response_transformer` otherwise treats an absent
 /// type as JSON precisely so that class stays covered.
 ///
-/// The bytes settle it, and they settle it by a TOTAL PARSE rather than a sniff:
-/// [`super::grpc_web::bytes_are_complete_grpc_frames`] accepts only a byte string
-/// that is exactly a sequence of complete length-prefixed frames, and
-/// [`super::grpc_web::bytes_are_grpc_web_text_frames`] the base64 form a
-/// text-mode gRPC-Web client receives. Neither can collide with a JSON document:
-/// a frame's first octet is a `Compressed-Flag`/trailer flag (`0x00`, `0x01`,
-/// `0x80`, `0x81`) and base64 excludes `{`, `[`, and `"`. So valid framing is
-/// never claimed and spuriously rejected as an unparseable document, and a bare
-/// document is never waved through unredacted — the two failure directions this
-/// predicate has to keep apart.
+/// The bytes settle it, and they settle it by a TOTAL PARSE — never a sniff —
+/// against the ONE grammar the client's representation actually admits.
+/// [`super::grpc_web::client_grpc_framing_representation`] picks that grammar
+/// from immutable request state, and
+/// [`super::grpc_web::bytes_are_complete_grpc_frames`] then accepts only a byte
+/// string that is exactly a sequence of complete frames legal in it: DATA frames
+/// for native gRPC, DATA plus an optional FINAL trailer frame for gRPC-Web
+/// binary, and the base64 of that for gRPC-Web text. Testing the union of all
+/// three instead was the bypass — base64 text that decodes to frames on a native
+/// or binary request, or a body trailer frame on a native one, is not a
+/// representation those clients can receive, and excusing it as framing skipped
+/// the fail-closed rejection the gate exists to make.
 ///
-/// Malformed or truncated framing is not "framed" and therefore stays claimed;
-/// it then fails the gate's JSON parse and is rejected. That is the documented
-/// fail-closed posture — the gateway cannot prove a redaction applied to bytes it
-/// cannot parse, and truncated frames are not a servable complete representation
-/// either.
+/// No grammar can collide with a JSON document: a frame's first octet is a
+/// `Compressed-Flag`/trailer flag (`0x00`, `0x01`, `0x80`, `0x81`) and base64
+/// excludes `{`, `[`, and `"`. So valid framing is never claimed and spuriously
+/// rejected as an unparseable document, and a bare document is never waved
+/// through unredacted — the two failure directions this predicate keeps apart.
+///
+/// Malformed, truncated, or mode-illegal framing is not "framed" and therefore
+/// stays claimed; it then fails the gate's JSON parse and is rejected. That is
+/// the documented fail-closed posture — the gateway cannot prove a redaction
+/// applied to bytes it cannot parse, and a truncated frame sequence or a trailer
+/// with data after it is not a servable complete representation either.
 fn framed_grpc_request_without_proven_media_type(
     ctx: &RequestContext,
     response_content_type: Option<&str>,
@@ -566,12 +574,16 @@ fn framed_grpc_request_without_proven_media_type(
     if response_content_type.is_some() {
         return false;
     }
-    let grpc_flavor = ctx.is_native_grpc_request()
-        || super::grpc_web::client_uses_grpc_web(ctx)
-        || super::grpc_web::request_is_grpc_web_translated(ctx);
-    grpc_flavor
-        && (super::grpc_web::bytes_are_complete_grpc_frames(response_body)
-            || super::grpc_web::bytes_are_grpc_web_text_frames(response_body))
+    // The request's representation selects the grammar; the bytes then have to
+    // satisfy exactly that one. Asking the union of all three grammars was the
+    // gap: base64 is a legal body only for a text-mode gRPC-Web client, and a
+    // body trailer frame only for a gRPC-Web one, so accepting either on a
+    // native gRPC request let a non-RPC byte string pass as framing and skip the
+    // fail-closed `unparseable_document` rejection.
+    let Some(representation) = super::grpc_web::client_grpc_framing_representation(ctx) else {
+        return false;
+    };
+    super::grpc_web::bytes_are_complete_grpc_frames(response_body, representation)
 }
 
 #[async_trait]
