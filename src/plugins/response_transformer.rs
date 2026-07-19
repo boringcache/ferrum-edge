@@ -634,15 +634,33 @@ impl Plugin for ResponseTransformer {
         ctx: &RequestContext,
         response_content_type: Option<&str>,
     ) -> bool {
-        // Claim exactly the responses `transform_response_body` would actually
+        // Claim exactly the responses the transform phase would actually
         // rewrite, so the shared representation gate fails closed on those and
-        // leaves every other response alone. The three declines below are the
+        // leaves every other response alone. The declines below are the
         // plugin's own documented no-ops, not inspection failures:
         //   * no configured `body_rules` — there is no body policy at all;
         //   * the RTDS kill-switch disabled this scope, mirroring the early
-        //     `return None` in `transform_response_body`;
-        //   * SSE, which `should_buffer_response_body` keeps out of the buffered
-        //     path entirely, so no transform ever runs over it.
+        //     `return None` in `transform_response_body`.
+        //
+        // SSE is NOT among them, and its absence is load-bearing.
+        // `should_buffer_response_body` declines to buffer an
+        // `Accept: text/event-stream` request, but that is only *this* plugin's
+        // vote: any other response-body plugin can force the buffer, and the
+        // lifecycle then runs `transform_response_body_with_context` over the
+        // result no matter what this predicate said. Declining SSE here while
+        // the transform still ran was exactly that asymmetry — the gate answered
+        // `Unprotected`, and an encoded, `206`, or unparseable body reached the
+        // transform, returned `None`, and was forwarded with a configured
+        // redaction silently skipped.
+        //
+        // Claiming it is also the direction that keeps working traffic working.
+        // A buffered SSE-accepting request whose response is a complete JSON
+        // document is fully inspectable and its redaction applies today; the
+        // media-type condition below already declines a response that genuinely
+        // IS `text/event-stream`, because that is not a JSON content type. So the
+        // only responses this widening newly claims are the ones the transform
+        // was already being run over.
+        //
         // The media-type condition mirrors `transform_response_body` EXACTLY,
         // and that symmetry is the whole point: this predicate must claim every
         // response the transform would actually rewrite, or the gate declines to
@@ -683,10 +701,11 @@ impl Plugin for ResponseTransformer {
         // decline over to the pre-hook evidence — the pristine stamped media
         // type, and the request's immutable gRPC/gRPC-Web flavor when none was
         // stamped — so stripping or relabelling the header cannot smuggle frames
-        // onto the untyped branch.
+        // onto the untyped branch. `transform_response_body_with_context` applies
+        // the identical predicate, which is what keeps this decline symmetric
+        // rather than reopening the gap the SSE decline had.
         !self.body_rules.is_empty()
             && self.rules_enabled()
-            && !super::utils::sse::is_sse_request(ctx)
             && !framed_grpc_request_without_proven_media_type(ctx, response_content_type)
             && response_content_type.is_none_or(|ct| {
                 body_transform::is_json_content_type(ct)
@@ -770,6 +789,60 @@ impl Plugin for ResponseTransformer {
         true
     }
 
+    /// The context-aware entry point, and the one the buffered lifecycle always
+    /// calls.
+    ///
+    /// It exists solely to carry the one decline that needs `ctx` — framed gRPC
+    /// on pre-hook evidence — over from
+    /// [`Plugin::enforces_response_body_policy`], because the shared
+    /// representation gate's guarantee is a SYMMETRY between the two, not a
+    /// property of either alone. The gate rejects an uninspectable
+    /// representation only for responses the claim predicate claims; the
+    /// lifecycle then runs this transform over *every* buffered response
+    /// regardless of what the gate concluded. Any condition that appears in the
+    /// claim and not here is therefore a hole: the response is admitted as
+    /// `Unprotected`, and the transform still runs on encoded, partial, or
+    /// unparseable bytes and returns `None` for them — the exact
+    /// `None`-conflation the gate exists to close.
+    ///
+    /// The decline is reachable: a framed gRPC response whose live
+    /// `Content-Type` an `after_proxy` header rule stripped or relabelled passes
+    /// the media-type test in [`Plugin::transform_response_body`] on the
+    /// untyped/JSON branch, so only the pre-hook evidence declines it.
+    ///
+    /// Declining here rather than widening the claim to match is the correct
+    /// direction, and it costs no redaction: the pristine stamped media type (or,
+    /// unstamped, the request's immutable gRPC flavor) is proof that these bytes
+    /// are length-prefixed FRAMES, which can never parse as the bare document a
+    /// JSON field rule acts on. `apply_body_rules` would have returned `None` for
+    /// them anyway — the explicit decline only makes that provable at the
+    /// predicate instead of incidental to the parser. Claiming them instead would
+    /// send every valid RPC reply on a mixed HTTP/gRPC proxy into the gate's
+    /// `unparseable_document` rejection.
+    ///
+    /// SSE is deliberately NOT declined here. It is handled in the opposite
+    /// direction — by *removing* it from the claim predicate — because a
+    /// buffered SSE-accepting request whose response is an ordinary complete
+    /// JSON document is fully inspectable, and its redaction works today. See
+    /// [`Plugin::enforces_response_body_policy`].
+    async fn transform_response_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        if framed_grpc_request_without_proven_media_type(ctx, content_type) {
+            return None;
+        }
+        self.transform_response_body(body, content_type, response_headers)
+            .await
+    }
+
+    /// The context-free transform. Every buffered call site reaches this through
+    /// [`Plugin::transform_response_body_with_context`] above, which applies the
+    /// `ctx`-dependent half of the claim symmetry first; this method carries the
+    /// half that needs only the media type.
     async fn transform_response_body(
         &self,
         body: &[u8],

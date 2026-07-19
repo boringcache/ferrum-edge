@@ -19,7 +19,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use ferrum_edge::_test_support::{
-    apply_synthetic_response_body_hooks_for_test,
+    apply_synthetic_response_body_hooks_for_test, clone_log_metadata_for_test,
     discard_grpc_application_trailers_after_body_rewrite_for_test,
     finalize_selected_buffered_grpc_terminal_response_for_test,
     representation_rejection_reason_for_test, retain_grpc_web_client_content_type_for_test,
@@ -2124,6 +2124,25 @@ async fn invalid_qvalues_are_malformed_rather_than_an_identity_refusal() {
         "gzip, identity;q=inf",
         "gzip, identity;q=NaN",
         "gzip, *;q=5",
+        // Float-parseable zeros that are NOT `qvalue`s. `f32::parse` accepts a
+        // strictly larger language than RFC 9110 §12.4.2, so each of these
+        // yields floating-point zero while matching no production of the
+        // grammar. A numeric-only test read them as an explicit refusal.
+        "gzip, identity;q=0e0",
+        "gzip, identity;q=.0",
+        "gzip, identity;q=0.0000",
+        "gzip, *;q=0e0",
+        "gzip, *;q=.0",
+        "gzip, *;q=0.0000",
+        // Same class, other spellings outside the grammar.
+        "gzip, identity;q=00",
+        "gzip, identity;q=0.0e0",
+        "gzip, identity;q=0x0",
+        "gzip, identity;q=000.0",
+        // `1[.0*3("0")]` is a maximal preference, never a refusal — including
+        // the forms that are themselves malformed.
+        "gzip, identity;q=1.0000",
+        "gzip, identity;q=1e0",
     ] {
         let encoded = gzip(br#"{"secret":"hunter2","keep":1}"#);
         let (replaced, status, reason, body, headers) =
@@ -2151,9 +2170,13 @@ async fn valid_zero_weights_still_express_an_identity_refusal() {
     for accept_encoding in [
         "gzip, identity;q=0",
         "gzip, identity;q=0.0",
+        "gzip, identity;q=0.00",
         "gzip, identity;q=0.000",
+        // `0[.0*3DIGIT]` permits an empty fractional part after the point.
+        "gzip, identity;q=0.",
         "gzip, *;q=0",
         "gzip, *;q=0.000",
+        "gzip, *;q=0.",
     ] {
         let encoded = gzip(br#"{"secret":"hunter2","keep":1}"#);
         let (replaced, status, reason, _, _) =
@@ -2458,5 +2481,419 @@ async fn grpc_web_request_with_a_genuine_json_response_is_still_redacted() {
     assert!(
         String::from_utf8_lossy(&body).contains("keep"),
         "the body is still transformed, not passed through"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Claim and transform must be SYMMETRIC on every buffered path.
+//
+// The gate's guarantee is a relationship between two predicates, not a property
+// of either alone: `enforces_response_body_policy` decides whether an
+// uninspectable representation is REJECTED, while the lifecycle runs
+// `transform_response_body_with_context` over every buffered response
+// regardless. A condition present in one and absent from the other is a hole —
+// the gate answers `Unprotected`, the transform still runs, and an encoded,
+// partial, or unparseable body returns `None` and is forwarded with the
+// configured redaction silently skipped.
+//
+// SSE was such a condition. `should_buffer_response_body` declines to buffer an
+// `Accept: text/event-stream` request, but that is only this plugin's buffering
+// vote: any other response-body plugin can force the buffer, and the transform
+// then runs anyway. The claim no longer declines SSE, so those buffered cases
+// are gated like any other.
+// ---------------------------------------------------------------------------
+
+/// Drive the buffered transform phase for a request carrying client headers —
+/// the shape another response-body plugin's buffering decision produces, which
+/// `should_buffer_response_body` alone never reaches.
+async fn run_backend_transform_with_request_headers(
+    request_headers: &[(&str, &str)],
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+) -> (
+    bool,
+    bool,
+    u16,
+    HashMap<String, String>,
+    Vec<u8>,
+    Option<String>,
+) {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    for (name, value) in request_headers {
+        ctx.headers
+            .insert((*name).to_string(), (*value).to_string());
+    }
+    let mut status = status;
+    let mut headers = headers;
+    let mut body = body;
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    let (replaced, transformed) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
+    (replaced, transformed, status, headers, body, reason)
+}
+
+/// The bypass itself: an SSE-accepting request whose response another plugin
+/// buffered, carrying a `gzip` body a JSON field rule cannot parse. Before the
+/// claim covered SSE, the gate answered `Unprotected`, the transform returned
+/// `None` on the compressed bytes, and the protected field was forwarded intact.
+#[tokio::test]
+async fn sse_accepting_request_with_encoded_body_is_decoded_and_redacted() {
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let encoded = gzip(br#"{"secret":"hunter2","keep":1}"#);
+
+    let (replaced, _, status, headers, body, reason) = run_backend_transform_with_request_headers(
+        &[("accept", "text/event-stream")],
+        200,
+        headers,
+        encoded,
+    )
+    .await;
+
+    assert!(!replaced, "a decodable JSON document is servable");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert!(
+        !headers.contains_key("content-encoding"),
+        "the gate published identity bytes"
+    );
+    assert_secret_not_forwarded(&body);
+    assert!(String::from_utf8_lossy(&body).contains("keep"));
+}
+
+/// The fail-closed half of the same widening: representations the transform
+/// genuinely cannot inspect now reject for an SSE-accepting request too, instead
+/// of being forwarded with the redaction skipped.
+#[tokio::test]
+async fn sse_accepting_request_with_uninspectable_body_fails_closed() {
+    // (status, extra response header, body, expected rejection reason)
+    let cases: [(u16, Option<(&str, &str)>, &[u8], &str); 4] = [
+        (206, None, br#"{"secret":"hunter2"}"#, "partial_representation"),
+        (226, None, br#"{"secret":"hunter2"}"#, "partial_representation"),
+        (
+            200,
+            Some(("content-encoding", "zstd")),
+            br#"{"secret":"hunter2"}"#,
+            "unsupported_content_coding",
+        ),
+        (200, None, b"not json at all", "unparseable_document"),
+    ];
+
+    for (status, extra_header, body, expected_reason) in cases {
+        let mut headers = json_headers();
+        if let Some((name, value)) = extra_header {
+            headers.insert(name.to_string(), value.to_string());
+        }
+
+        let (replaced, _, status, _, body, reason) = run_backend_transform_with_request_headers(
+            &[("accept", "text/event-stream")],
+            status,
+            headers,
+            body.to_vec(),
+        )
+        .await;
+
+        assert!(replaced, "{expected_reason}: must not be forwarded");
+        assert_eq!(status, 502, "{expected_reason}: is unservable");
+        assert_eq!(
+            reason.as_deref(),
+            Some(expected_reason),
+            "{expected_reason}: must reach its own rejection branch"
+        );
+        assert_secret_not_forwarded(&body);
+    }
+}
+
+/// An ordinary buffered JSON response for an SSE-accepting request is still
+/// redacted exactly as before. Widening the claim must not have changed the
+/// working case it was already covering.
+#[tokio::test]
+async fn sse_accepting_request_with_plain_json_response_is_still_redacted() {
+    let body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+
+    let (replaced, transformed, status, _, body, reason) =
+        run_backend_transform_with_request_headers(
+            &[("accept", "text/event-stream")],
+            200,
+            json_headers(),
+            body,
+        )
+        .await;
+
+    assert!(!replaced);
+    assert!(transformed, "the body rule must still apply");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_secret_not_forwarded(&body);
+}
+
+/// The guard on the widening: a response that genuinely IS an event stream is
+/// still not claimed, because `text/event-stream` is not a JSON media type. A
+/// buffered SSE payload must keep passing through rather than becoming a 502.
+#[tokio::test]
+async fn actual_event_stream_response_is_never_claimed() {
+    let stream = b"data: {\"secret\":\"hunter2\"}\n\ndata: [DONE]\n\n".to_vec();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+
+    let (replaced, transformed, status, _, body, reason) =
+        run_backend_transform_with_request_headers(
+            &[("accept", "text/event-stream")],
+            200,
+            headers,
+            stream.clone(),
+        )
+        .await;
+
+    assert!(!replaced, "an event stream must not be rejected");
+    assert!(!transformed, "an event stream is outside the document model");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_eq!(body, stream, "the stream bytes must survive untouched");
+}
+
+/// The framed-gRPC half of the symmetry, in the direction that keeps working
+/// traffic working: the claim declines framed gRPC on pre-hook evidence, and
+/// `transform_response_body_with_context` now applies the identical predicate,
+/// so the transform provably rewrites nothing the gate declined to inspect.
+///
+/// The body here is a bare JSON document carrying the rule's target key under a
+/// pristine framed-gRPC stamp. That input is deliberate and it is the ONLY shape
+/// on which the two predicates can visibly disagree: the rule would rewrite it,
+/// so an unchanged body proves the transform declined rather than merely failing
+/// to parse. It is also a state a conforming backend cannot produce — the
+/// pristine `application/grpc+json` stamp is proof the bytes are length-prefixed
+/// frames, which is why declining costs no real redaction. A genuinely framed
+/// body is covered by `relabelled_framed_grpc_responses_are_not_claimed_as_json`.
+#[tokio::test]
+async fn relabelled_framed_grpc_declines_in_the_transform_too() {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Grpc);
+
+    let mut status = 200;
+    let document = br#"{"secret":"unreachable-state","keep":1}"#.to_vec();
+    let mut body = document.clone();
+
+    // The backend's own type is framed gRPC, so the snapshot records framing.
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    // An `after_proxy` header rule then relabels it onto the JSON branch.
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let (replaced, transformed) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(!replaced, "a declined response is never rejected");
+    assert!(
+        !transformed,
+        "the transform must decline exactly what the claim declined"
+    );
+    assert_eq!(status, 200);
+    assert_eq!(representation_rejection_reason_for_test(&ctx), None);
+    assert_eq!(body, document, "declined bytes pass through unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// Gateway-generated bytes must not inherit the REPLACED backend's provenance.
+//
+// The gate switches its own reads on `RepresentationOrigin`, but the per-plugin
+// claim predicates it consults receive only `&RequestContext` and cannot tell a
+// live snapshot from a stale one. `response_transformer` reads the pristine
+// stamped media type that way, so a backend that answered framed gRPC could make
+// the claim decline a gateway-authored JSON rejection that had already replaced
+// it — admitting encoded, partial, or unparseable replacement bytes as
+// `Unprotected` while the transform still ran over the live body.
+//
+// The snapshot is therefore discarded when the bytes stop being the backend's.
+// ---------------------------------------------------------------------------
+
+/// Stamp a framed-gRPC, encoded, fragment backend response, then publish
+/// gateway-authored bytes in its place.
+///
+/// The request itself is an ordinary HTTP one (a mixed HTTP/gRPC proxy), so the
+/// PRISTINE STAMP is the sole source of the framed-gRPC decline — which is
+/// exactly the stale evidence under test. Keeping the request flavor plain also
+/// keeps the rejection in its JSON `502` shape rather than the trailers-only
+/// gRPC shape, so the assertions read the representation decision directly.
+async fn run_gateway_generated_after_framed_grpc_backend(
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+) -> (bool, u16, Vec<u8>, Option<String>) {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+
+    // The backend response was framed gRPC, gzip-encoded, and a range fragment.
+    let mut backend_headers = HashMap::new();
+    backend_headers.insert(
+        "content-type".to_string(),
+        "application/grpc+json".to_string(),
+    );
+    backend_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    backend_headers.insert("content-range".to_string(), "bytes 0-19/512".to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, 206, &backend_headers);
+
+    // `on_response_body` then replaced it with gateway-authored bytes.
+    let mut status = status;
+    let mut headers = headers;
+    let mut body = body;
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        true,
+    )
+    .await;
+    let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
+    (replaced, status, body, reason)
+}
+
+/// The finding: a stale framed-gRPC stamp must not suppress the claim over
+/// gateway-generated bytes, leaving unparseable replacement bytes ungated.
+#[tokio::test]
+async fn gateway_generated_bytes_are_claimed_despite_a_stale_framed_grpc_stamp() {
+    let (replaced, status, body, reason) = run_gateway_generated_after_framed_grpc_backend(
+        200,
+        json_headers(),
+        b"not json at all".to_vec(),
+    )
+    .await;
+
+    assert!(
+        replaced,
+        "the replacement bytes are unparseable and must fail closed"
+    );
+    assert_eq!(status, 502);
+    assert_eq!(reason.as_deref(), Some("unparseable_document"));
+    assert_secret_not_forwarded(&body);
+}
+
+/// The control for the case above: discarding the snapshot must not start
+/// rejecting legitimate gateway rejections. The same stale framed-gRPC, `gzip`,
+/// `206` snapshot sits on the context, and a gateway-authored `403` JSON body
+/// must still be served — inspected on its OWN live headers, so the configured
+/// rule runs over it rather than the gate decoding bytes that were never encoded
+/// or failing it as the replaced backend's fragment.
+#[tokio::test]
+async fn gateway_generated_bytes_are_not_judged_against_the_replaced_snapshot() {
+    let (replaced, status, body, reason) = run_gateway_generated_after_framed_grpc_backend(
+        403,
+        json_headers(),
+        br#"{"secret":"hunter2","keep":1}"#.to_vec(),
+    )
+    .await;
+
+    assert!(!replaced, "a gateway rejection must survive the gate");
+    assert_eq!(status, 403, "the rejection status must survive");
+    assert_eq!(
+        reason, None,
+        "the replaced backend's representation is no longer under inspection"
+    );
+    assert_secret_not_forwarded(&body);
+    assert!(
+        String::from_utf8_lossy(&body).contains("keep"),
+        "the claim applies to the gateway bytes, so the rule ran over them"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle-only representation markers are not transaction-log metadata.
+//
+// `ferrum:origin_fragment_response` is the gate's own evidence, stamped on every
+// 206/226 and on any 2xx carrying range/delta metadata. Like the other origin
+// stamps it is lifecycle bookkeeping, and must never surface in a transaction
+// summary or make `observability.emit_metadata: false` ineffective.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn origin_fragment_marker_is_stripped_from_transaction_metadata() {
+    // Every response shape that stamps the marker, per `original_response_is_fragment`.
+    let cases: [(u16, Option<(&str, &str)>); 4] = [
+        (206, None),
+        (226, None),
+        (200, Some(("content-range", "bytes 0-19/512"))),
+        (200, Some(("im", "vcdiff"))),
+    ];
+
+    for (status, extra_header) in cases {
+        let mut ctx = make_ctx();
+        let mut headers = json_headers();
+        if let Some((name, value)) = extra_header {
+            headers.insert(name.to_string(), value.to_string());
+        }
+        stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+        let case = format!("{status}/{extra_header:?}");
+        assert!(
+            ctx.metadata.contains_key("ferrum:origin_fragment_response"),
+            "{case}: the gate must have stamped its fragment evidence"
+        );
+
+        let metadata = clone_log_metadata_for_test(&ctx);
+
+        assert!(
+            !metadata.contains_key("ferrum:origin_fragment_response"),
+            "{case}: the lifecycle marker must not reach a transaction summary"
+        );
+        // The stamp survives in the live context for later plugin phases —
+        // redaction happens at projection, never by mutating the request.
+        assert!(
+            ctx.metadata.contains_key("ferrum:origin_fragment_response"),
+            "{case}: in-memory metadata must stay intact for later phases"
+        );
+    }
+}
+
+/// No internal `ferrum:` origin-response stamp may reach a transaction summary.
+/// This is the general form of the rule, so a marker added later cannot leak by
+/// simply being forgotten in the projection.
+#[test]
+fn no_internal_origin_response_stamp_reaches_transaction_metadata() {
+    let mut ctx = make_ctx();
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-range".to_string(), "bytes 0-19/512".to_string());
+    headers.insert("content-length".to_string(), "128".to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, 206, &headers);
+
+    let metadata = clone_log_metadata_for_test(&ctx);
+
+    let leaked: Vec<&String> = metadata
+        .keys()
+        .filter(|key| {
+            key.starts_with("ferrum:original_response") || key.starts_with("ferrum:origin_")
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "internal origin-response stamps leaked into transaction metadata: {leaked:?}"
     );
 }

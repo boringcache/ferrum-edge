@@ -1603,6 +1603,19 @@ pub mod _test_support {
         .await
     }
 
+    /// Build the log metadata a transaction summary is rendered from, exactly as
+    /// every logger sink does.
+    ///
+    /// This is the production projection (`clone_log_metadata`), not a
+    /// re-implementation, so a test asserting that an internal lifecycle marker
+    /// is absent is asserting on the same redaction pass the operator's
+    /// transaction logs go through.
+    pub fn clone_log_metadata_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> HashMap<String, String> {
+        crate::proxy::clone_log_metadata(ctx)
+    }
+
     /// The low-cardinality reason the shared representation gate rejected this
     /// response, or `None` when it was never rejected.
     pub fn representation_rejection_reason_for_test(

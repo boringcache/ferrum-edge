@@ -80,6 +80,14 @@
 //!   for SSE on a route that answers with ordinary JSON. Closing that requires
 //!   deciding on the response media type instead of the request's, plus a
 //!   streaming-side enforcement point — tracked separately.
+//!
+//!   The gap is exactly that narrow: it is about a response that never buffers.
+//!   Once anything else *does* buffer such a request's response, the claim
+//!   predicate covers it like any other, because the transform runs over it like
+//!   any other. `response_transformer` therefore does NOT decline SSE in
+//!   `enforces_response_body_policy` — only in `should_buffer_response_body`,
+//!   which is its buffering vote rather than its policy claim. A response that
+//!   genuinely is `text/event-stream` still falls out on media type.
 //! * **Framed gRPC.** `application/grpc+json` and the gRPC-Web `+json` variants
 //!   end in `+json`, but carry length-prefixed frames rather than a bare
 //!   document, so no JSON field rule can act on them. `response_transformer`
@@ -282,27 +290,44 @@ pub(crate) fn content_encoding_requires_decode_judgment(encoding: &str) -> bool 
 /// Whether a `q=` parameter value is a syntactically valid weight of exactly
 /// zero, i.e. an explicit refusal.
 ///
-/// RFC 9110 §12.4.2 defines `qvalue` as `0[.0*3]` or `1[.0*3]`, so the only
-/// values that carry meaning here are finite and within `0..=1`. Anything else —
-/// a negative weight (`q=-1`), an out-of-range one (`q=5`), a non-finite one
-/// (`q=inf`, `q=NaN`), or a sign-prefixed zero (`q=-0`, `q=+0`) — is malformed.
+/// RFC 9110 §12.4.2 defines the grammar exactly:
 ///
-/// Malformed must NOT collapse onto "zero": this predicate's only power is to
-/// turn an otherwise-servable response into a `502`, so reading a parse the
-/// gateway could not validate as an explicit refusal would reject live traffic
-/// from a client or intermediary that merely emitted an invalid parameter. The
-/// sign check is explicit because `"-0"` parses to `-0.0`, which both compares
-/// equal to zero and lies inside `0..=1` — the numeric tests alone would let a
-/// malformed value back through as a refusal. The range test carries the
-/// finiteness requirement on its own: `NaN` and both infinities fail
-/// `contains`, and inside `0..=1` a `q <= 0.0` can only be zero.
+/// ```text
+/// qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )
+/// ```
+///
+/// This validates that SHAPE rather than parsing a float, because the two are
+/// not the same language. `f32::parse` accepts a strictly larger set —
+/// `0e0`, `.0`, `0.0000`, `0_`-free scientific and arbitrary-precision decimal
+/// forms all parse to floating-point zero while none of them is a `qvalue`. A
+/// float-based test therefore reads a syntactically invalid parameter as an
+/// explicit refusal, and this predicate's ONLY power is to turn an
+/// otherwise-servable response into a `502`. Rejecting live traffic because a
+/// client or intermediary emitted an unparseable weight protects nothing, so
+/// malformed must stay on the acceptable side — the grammar check is what keeps
+/// it there.
+///
+/// Only the `"0"` production can be a zero weight. `"1"` is a maximal
+/// preference, and every other leading character (`-`, `+`, `.`, a digit, a
+/// letter) is outside the grammar. Within the `"0"` production the fractional
+/// part is at most three digits, and the weight is zero exactly when every one
+/// of them is `0` — so `0`, `0.`, `0.0`, `0.00`, and `0.000` refuse, while
+/// `0.001` does not and `0.0000` is malformed rather than a refusal.
 fn qvalue_is_explicit_zero(value: &str) -> bool {
-    if value.starts_with(['-', '+']) {
+    // Only the `0[.0*3DIGIT]` production can carry a zero weight; `1[.0*3("0")]`
+    // is a maximal preference and anything else is outside the grammar.
+    let Some(fraction) = value.strip_prefix('0') else {
         return false;
-    }
-    value
-        .parse::<f32>()
-        .is_ok_and(|q| (0.0..=1.0).contains(&q) && q <= 0.0)
+    };
+    let digits = match fraction.strip_prefix('.') {
+        // A bare `0` with no decimal point.
+        None => return fraction.is_empty(),
+        Some(digits) => digits,
+    };
+    // `0*3DIGIT`, and zero exactly when every digit present is `0`. Testing for
+    // `'0'` rather than `is_ascii_digit()` covers both conditions at once: a
+    // non-digit is not `'0'`, and a nonzero digit is a real (nonzero) weight.
+    digits.len() <= 3 && digits.bytes().all(|digit| digit == b'0')
 }
 
 /// Whether the client will accept identity-coded (uncompressed) bytes.
@@ -316,11 +341,13 @@ fn qvalue_is_explicit_zero(value: &str) -> bool {
 /// A malformed qvalue is read as acceptable rather than forbidden. This
 /// predicate can only ever turn an otherwise-servable response into an error,
 /// so inferring "the client refuses identity" from a field the gateway could not
-/// parse would break live traffic to protect nothing. Only a syntactically valid
-/// weight — a finite value in `0..=1`, per the RFC 9110 §12.4.2 `qvalue` rule —
-/// can express a refusal, and the refusal is `q=0`. A negative, out-of-range, or
+/// validate would break live traffic to protect nothing. Only a value matching
+/// the RFC 9110 §12.4.2 `qvalue` grammar can express a refusal, and the refusal
+/// is `q=0` (see [`qvalue_is_explicit_zero`]). A negative, out-of-range, or
 /// non-finite parameter (`identity;q=-1`, `*;q=-1`, `q=5`, `q=inf`) is malformed,
-/// not a zero weight, and must not be read as one.
+/// and so is anything that is merely *float-parseable* as zero without matching
+/// the grammar (`q=0e0`, `q=.0`, `q=0.0000`). None of those is a zero weight, and
+/// none may be read as one.
 fn identity_coding_is_acceptable(ctx: &RequestContext) -> bool {
     // Read the pristine pre-hook snapshot first. Neither later source can be
     // trusted on its own: `request_transformer` (priority 3000) can remove or
