@@ -5134,6 +5134,21 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Return the node-local `.mmdb` path this instance was built from together
+    /// with the validated snapshot it currently holds, or `None` when it holds
+    /// no snapshot.
+    ///
+    /// The DP node-local refresh path uses this cold-path hook to carry a
+    /// last-known-good snapshot across a transient file outage. Retention is
+    /// keyed on the path so a configuration that repoints `db_path` never
+    /// inherits the previous file's data. Ordinary plugins retain the default.
+    #[doc(hidden)]
+    fn country_mmdb_retained_load(
+        &self,
+    ) -> Option<(&str, Arc<crate::config::types::CountryMmdbSnapshot>)> {
+        None
+    }
+
     /// Return the non-empty correlation header owned by this instance, or
     /// `None` when it owns no correlation header. Plugin-cache admission trims
     /// and ASCII-case-folds claims before rejecting empty, deployment-owned

@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::types::{
-    BackendScheme, CountryMmdbLoadSession, GatewayConfig, MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES,
-    PluginScope,
+    BackendScheme, CountryMmdbLoadSession, CountryMmdbSnapshot, GatewayConfig,
+    MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES, PluginScope,
 };
 use tracing::{error, warn};
 
@@ -390,6 +390,11 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn country_mmdb_snapshot(&self) -> Option<&crate::config::types::CountryMmdbSnapshot> {
         self.inner.country_mmdb_snapshot()
+    }
+    fn country_mmdb_retained_load(
+        &self,
+    ) -> Option<(&str, Arc<crate::config::types::CountryMmdbSnapshot>)> {
+        self.inner.country_mmdb_retained_load()
     }
     fn correlation_id_header_name(&self) -> Option<&str> {
         self.inner.correlation_id_header_name()
@@ -1149,6 +1154,28 @@ struct CountryMmdbPluginId {
 }
 
 type CountryMmdbPluginInstanceMap = HashMap<CountryMmdbPluginId, Arc<dyn Plugin>>;
+
+/// Collect the live generation's validated MMDB snapshots, keyed by the
+/// `db_path` each was loaded from, so a DP node-local refresh can fall back on
+/// a last-known-good snapshot for a path that is temporarily unreadable on this
+/// node.
+///
+/// Keying on the path — not on the plugin id — is what keeps retention safe:
+/// the replacement instance is still constructed from the *incoming* config, so
+/// a concurrent change to `allow_countries`, `deny_countries`, `inject_headers`,
+/// or `on_lookup_failure` takes effect normally, and a config that repoints
+/// `db_path` finds no retained entry and falls back as documented. Instances
+/// sharing a path already share one snapshot, so collisions are identical.
+fn retained_country_mmdb_snapshots(
+    current: &PluginCacheInner,
+) -> HashMap<std::path::PathBuf, Arc<CountryMmdbSnapshot>> {
+    current
+        .country_mmdb_instances
+        .values()
+        .filter_map(|plugin| plugin.country_mmdb_retained_load())
+        .map(|(db_path, snapshot)| (std::path::PathBuf::from(db_path.trim()), snapshot))
+        .collect()
+}
 
 fn country_mmdb_plugin_id(plugin_config: &PluginConfig) -> CountryMmdbPluginId {
     CountryMmdbPluginId {
@@ -3643,7 +3670,10 @@ impl PluginCache {
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
         let country_mmdb_load_session = match country_mmdb_load_mode {
             CountryMmdbLoadMode::NodeLocalRefresh if !paths.is_empty() => {
-                CountryMmdbLoadSession::for_node_local_refresh(&paths)?
+                CountryMmdbLoadSession::for_node_local_refresh(
+                    &paths,
+                    retained_country_mmdb_snapshots(current),
+                )?
             }
             CountryMmdbLoadMode::PreloadedOnly => CountryMmdbLoadSession::claim_preloaded(&paths)?,
             CountryMmdbLoadMode::Standard | CountryMmdbLoadMode::NodeLocalRefresh => {
@@ -3679,7 +3709,10 @@ impl PluginCache {
             return Ok(None);
         }
         let country_mmdb_load_session = if force_node_local_refresh {
-            CountryMmdbLoadSession::for_node_local_refresh(&paths)?
+            CountryMmdbLoadSession::for_node_local_refresh(
+                &paths,
+                retained_country_mmdb_snapshots(current),
+            )?
         } else {
             CountryMmdbLoadSession::claim(&paths)?
         };
@@ -3759,6 +3792,13 @@ impl PluginCache {
                     &mut tcp_connection_throttle_instances,
                 ) {
                     Ok(Some(plugin)) => {
+                        // The replacement always comes from the incoming
+                        // config. When its node-local file was temporarily
+                        // unreadable the load session has already substituted
+                        // the live generation's last-known-good snapshot, so
+                        // the instance carries current policy over retained
+                        // data rather than preserving a stale instance
+                        // wholesale.
                         forced_country_mmdb_instances.insert(id.clone(), plugin);
                     }
                     Ok(None) => {}
