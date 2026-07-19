@@ -60,11 +60,11 @@ trigger — credits come and go); update the briefs if stale.
 Every prompt must also PIN THE WORKER'S ROLE explicitly (the briefs repeat it, but the
 prompt is what survives a partial brief read):
 "YOU are the implementer: write, commit, and push the changes yourself in this session.
-Do NOT invoke agent-dispatch skills from your environment (opus-agents,
-.agents/skills/*/scripts/dispatch-agent.sh, claude CLI workers) and do NOT spawn nested
-workers." The repo intentionally ships the mirror skill `.agents/skills/opus-agents/`
-(codex→Claude dispatch, for when the USER asks codex to delegate); without this pin a
-codex worker can pattern-match fix-round vocabulary onto that skill and silently delegate
+Do NOT invoke agent-dispatch skills from your environment (opus-agents, fable-agents,
+grok-agents, .agents/skills/*/scripts/dispatch-agent.sh, claude CLI workers) and do NOT
+spawn nested workers." The repo intentionally ships mirror skills under `.agents/skills/`
+(codex→Claude/Grok dispatch, for when the USER asks codex to delegate); without this pin a
+codex worker can pattern-match fix-round vocabulary onto those skills and silently delegate
 the implementation to a different model at a different effort than the user chose.
 
 Then append the mode block:
