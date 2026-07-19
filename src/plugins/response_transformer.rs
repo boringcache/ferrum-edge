@@ -601,10 +601,26 @@ impl Plugin for ResponseTransformer {
         // affects proxies that configured a body redaction *and* have a backend
         // that omits `Content-Type` — an operator-visible backend defect, not
         // ordinary traffic.
+        //
+        // Framed gRPC is the one media-type family excluded on top of that,
+        // because `application/grpc+json` (and the gRPC-Web `+json` variants)
+        // end in `+json` and so satisfy `is_json_content_type` while carrying
+        // length-prefixed FRAMES rather than a bare JSON document. This is not a
+        // narrowing of the untyped-JSON claim above: `transform_response_body`
+        // declines the same family, so the transform provably rewrites nothing
+        // there and the claim stays exactly as wide as the enforcer. Claiming it
+        // anyway would send every valid gRPC JSON response on a mixed HTTP/gRPC
+        // proxy into the gate's `unparseable_document` rejection — turning
+        // working traffic into 502s while protecting nothing, since a frame
+        // (whose first byte is the 0x00/0x01 compressed flag) can never parse as
+        // a JSON document for a field rule to act on in the first place.
         !self.body_rules.is_empty()
             && self.rules_enabled()
             && !super::utils::sse::is_sse_request(ctx)
-            && response_content_type.is_none_or(body_transform::is_json_content_type)
+            && response_content_type.is_none_or(|ct| {
+                body_transform::is_json_content_type(ct)
+                    && !body_transform::is_framed_grpc_content_type(ct)
+            })
     }
 
     async fn after_proxy(
@@ -692,8 +708,15 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return None;
         }
+        // Framed gRPC is declined explicitly rather than left to fail inside
+        // `apply_body_rules`. Both routes return `None`, but only the explicit
+        // decline makes the media-type condition here symmetric with
+        // `enforces_response_body_policy` by construction, so the claim
+        // predicate and the enforcer cannot drift apart on the `+json` gRPC
+        // types that satisfy `is_json_content_type`.
         if let Some(ct) = content_type
-            && !body_transform::is_json_content_type(ct)
+            && (!body_transform::is_json_content_type(ct)
+                || body_transform::is_framed_grpc_content_type(ct))
         {
             return None;
         }

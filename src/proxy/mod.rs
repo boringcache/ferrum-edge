@@ -17370,6 +17370,9 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    // Carry the operator's response-body ceiling so the buffered representation
+    // gate bounds its decompression by the same limit the wire path enforces.
+    ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
     let mut request_scheme = if is_tls { "https" } else { "http" };
     ctx.request_is_secure = is_tls;
     ctx.metadata.insert(

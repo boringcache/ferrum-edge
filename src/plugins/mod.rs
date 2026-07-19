@@ -1898,6 +1898,18 @@ pub struct RequestContext {
     /// sole buffered representation continues to the backend.
     pub request_body_sha256: Option<[u8; 32]>,
     pub request_body_sha512: Option<[u8; 64]>,
+    /// The operator's configured response-body ceiling
+    /// (`FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`), `0` meaning unlimited.
+    ///
+    /// Carried on the context because the buffered representation gate
+    /// ([`crate::plugins::response_representation`]) decompresses on the
+    /// response path and must not let a decode exceed the same bound the wire
+    /// path enforces: a small compressed body that passes the wire check could
+    /// otherwise inflate past the operator's limit and be forwarded as the
+    /// larger identity representation. Set from `ProxyState` by the H1/H2 and
+    /// H3 request handlers; a default-constructed context leaves it `0`, which
+    /// falls back to the gate's own hard ceiling.
+    pub max_response_body_size_bytes: usize,
     /// Shared counter for request body bytes received from the client,
     /// populated by proxy body handlers and read by the summary builders.
     ///
@@ -2171,6 +2183,7 @@ impl RequestContext {
             request_body_bytes: None,
             request_body_sha256: None,
             request_body_sha512: None,
+            max_response_body_size_bytes: 0,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
             mesh_route_dispatch_reject_unmatched: false,
@@ -2791,6 +2804,7 @@ impl RequestContext {
             request_body_bytes: None,
             request_body_sha256: None,
             request_body_sha512: None,
+            max_response_body_size_bytes: self.max_response_body_size_bytes,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             is_early_data: self.is_early_data,
             mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,

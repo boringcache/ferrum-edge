@@ -32,6 +32,21 @@
 //!   pre-transform phase; anything that cannot be reduced to one complete,
 //!   parseable document is **rejected**, never forwarded.
 //!
+//! Two bounds constrain that decode, and both reject rather than proceed:
+//!
+//! * **The client must accept identity.** Decoding publishes identity bytes, so
+//!   a client whose `Accept-Encoding` forbids the identity coding
+//!   (`identity;q=0`, or `*;q=0` with no explicit `identity`) cannot be served
+//!   the decoded representation. The gateway does not re-encode, and silently
+//!   handing that client the identity bytes would convert an encoded response it
+//!   *did* accept into one it explicitly refused. See
+//!   [`RepresentationRejection::IdentityCodingUnacceptable`].
+//! * **The operator's size limit still applies.** The decode ceiling is the
+//!   smaller of this module's hard cap and the configured
+//!   `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, so inflating past the operator's
+//!   bound is not something enabling a body policy can buy. See
+//!   [`decoded_inspection_limit`].
+//!
 //! Rejection — not relabeling — is the answer for partial and delta
 //! representations. The gateway does not fetch the remaining ranges or apply
 //! the delta, so it cannot produce the complete resource; presenting a rewritten
@@ -65,6 +80,13 @@
 //!   for SSE on a route that answers with ordinary JSON. Closing that requires
 //!   deciding on the response media type instead of the request's, plus a
 //!   streaming-side enforcement point — tracked separately.
+//! * **Framed gRPC.** `application/grpc+json` and the gRPC-Web `+json` variants
+//!   end in `+json`, but carry length-prefixed frames rather than a bare
+//!   document, so no JSON field rule can act on them. `response_transformer`
+//!   declines that whole media-type family in both its claim predicate and its
+//!   transform, which keeps a mixed HTTP/gRPC proxy's valid gRPC responses out
+//!   of this gate entirely instead of failing them as unparseable. Redacting
+//!   inside gRPC frames would need a frame-aware body policy.
 //! * **Backend-chosen media type.** A backend that *mislabels* a JSON payload
 //!   `text/plain` or `application/octet-stream` is not claimed by a JSON body
 //!   policy, here or in the transform itself. Content-type sniffing or an
@@ -93,6 +115,9 @@ use super::utils::body_transform::is_json_content_type;
 /// cap is rejected rather than materialized. Matches the ceiling
 /// `ai_semantic_firewall` already applies to response inspection so a single
 /// response cannot be inspectable to one guardrail and uninspectable to another.
+///
+/// This is a ceiling, not *the* limit: [`decoded_inspection_limit`] narrows it
+/// to the operator's configured response-body bound whenever that is smaller.
 pub(crate) const MAX_DECODED_RESPONSE_INSPECTION_BYTES: usize = 10 * 1024 * 1024;
 
 /// Maximum number of stacked content codings decoded for one response.
@@ -101,6 +126,27 @@ pub(crate) const MAX_DECODED_RESPONSE_INSPECTION_BYTES: usize = 10 * 1024 * 1024
 /// separate bounded decode pass, so an unbounded list is itself an amplification
 /// vector; a legitimate origin does not stack more than a couple.
 pub(crate) const MAX_STACKED_RESPONSE_CODINGS: usize = 4;
+
+/// The effective decode ceiling for this request.
+///
+/// A decode installs identity bytes that the client actually receives, so it
+/// must respect the operator's `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` exactly as
+/// the streaming and buffered wire paths do. Without this, a deployment that
+/// caps responses below the hard ceiling could be handed a small compressed
+/// JSON body that passes every wire-size check, inflate it here up to
+/// [`MAX_DECODED_RESPONSE_INSPECTION_BYTES`], and forward the larger identity
+/// representation with a `Content-Length` above the configured bound — the
+/// operator's memory and size limit silently relaxed by the very feature that
+/// was supposed to tighten inspection.
+///
+/// `0` is the project-wide "unlimited" spelling for the configured limit, and
+/// the hard ceiling still applies to it; otherwise the smaller of the two wins.
+fn decoded_inspection_limit(ctx: &RequestContext) -> usize {
+    match ctx.max_response_body_size_bytes {
+        0 => MAX_DECODED_RESPONSE_INSPECTION_BYTES,
+        configured => configured.min(MAX_DECODED_RESPONSE_INSPECTION_BYTES),
+    }
+}
 
 /// Where the buffered bytes under inspection came from.
 ///
@@ -143,6 +189,11 @@ pub(crate) enum RepresentationRejection {
     /// A backend response reached the body phase without a pre-`after_proxy`
     /// snapshot, so its original encoding and range state cannot be proven.
     UnprovenOriginState,
+    /// Inspecting the body requires decoding it to identity, but the client's
+    /// `Accept-Encoding` forbids the identity coding. The gateway will not
+    /// serve a representation the client explicitly refused, and it does not
+    /// re-encode, so neither the encoded nor the decoded bytes are servable.
+    IdentityCodingUnacceptable,
 }
 
 impl RepresentationRejection {
@@ -158,6 +209,7 @@ impl RepresentationRejection {
             Self::PartialRepresentation => "partial_representation",
             Self::UnparseableDocument => "unparseable_document",
             Self::UnprovenOriginState => "unproven_origin_state",
+            Self::IdentityCodingUnacceptable => "identity_coding_unacceptable",
         }
     }
 }
@@ -188,6 +240,68 @@ fn body_policy_claimed(
         .any(|plugin| plugin.enforces_response_body_policy(ctx, content_type))
 }
 
+/// Whether a `Content-Encoding` field value names any coding that actually
+/// transforms the octets, i.e. anything other than `identity`.
+///
+/// An empty token is deliberately *not* treated as a transforming coding here:
+/// it is malformed, and [`decode_response_body`] is the one place that decides
+/// what a malformed field means (it rejects). This predicate answers only
+/// "would decoding change the bytes the client sees?".
+fn has_non_identity_coding(encoding: &str) -> bool {
+    encoding
+        .split(',')
+        .map(str::trim)
+        .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
+}
+
+/// Whether the client will accept identity-coded (uncompressed) bytes.
+///
+/// RFC 9110 §12.5.3: an absent `Accept-Encoding` places no constraint, an empty
+/// field value means only `identity` is acceptable, and identity becomes
+/// unacceptable only through an explicit `identity;q=0` or a `*;q=0` with no
+/// explicit non-zero `identity`. The most specific match wins, so an explicit
+/// `identity` entry settles the question regardless of any wildcard.
+///
+/// A malformed qvalue is read as acceptable rather than forbidden. This
+/// predicate can only ever turn an otherwise-servable response into an error,
+/// so inferring "the client refuses identity" from a field the gateway could not
+/// parse would break live traffic to protect nothing.
+fn identity_coding_is_acceptable(ctx: &RequestContext) -> bool {
+    // Prefer the pre-strip snapshot: `compression`'s `remove_accept_encoding`
+    // deletes the header from the `before_proxy` map, which IS `ctx.headers`
+    // (taken and restored around the hook), so by this phase `ctx.headers` may
+    // no longer describe what the client negotiated.
+    let Some(accept_encoding) = ctx
+        .metadata
+        .get(crate::plugins::compression::REQUEST_ACCEPT_ENCODING_METADATA_KEY)
+        .or_else(|| ctx.headers.get("accept-encoding"))
+    else {
+        return true;
+    };
+
+    let mut wildcard_forbids_identity = false;
+    for entry in accept_encoding.split(',') {
+        let mut parts = entry.split(';');
+        let coding = parts.next().unwrap_or("").trim();
+        if coding.is_empty() {
+            continue;
+        }
+        let q_is_zero = parts.any(|param| {
+            param
+                .split_once('=')
+                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+                .is_some_and(|(_, value)| value.trim().parse::<f32>().is_ok_and(|q| q <= 0.0))
+        });
+        if coding.eq_ignore_ascii_case("identity") {
+            return !q_is_zero;
+        }
+        if coding == "*" {
+            wildcard_forbids_identity = q_is_zero;
+        }
+    }
+    !wildcard_forbids_identity
+}
+
 /// The origin's non-identity `Content-Encoding`, from the pristine snapshot for
 /// a backend response and from the live map for gateway-generated bytes.
 fn origin_content_encoding<'a>(
@@ -203,12 +317,7 @@ fn origin_content_encoding<'a>(
         RepresentationOrigin::GatewayGenerated => response_headers
             .get("content-encoding")
             .map(String::as_str)
-            .filter(|encoding| {
-                encoding
-                    .split(',')
-                    .map(str::trim)
-                    .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
-            }),
+            .filter(|encoding| has_non_identity_coding(encoding)),
     }
 }
 
@@ -291,9 +400,13 @@ fn decode_one_coding(
 /// token is malformed rather than absent, and is rejected — a present-but-empty
 /// coding cannot be proven to describe identity-coded bytes. `None` means the
 /// field reduced to identity-only tokens and no client-visible bytes changed.
+///
+/// `limit` bounds every intermediate pass, not just the final output, so a
+/// stacked encoding cannot exceed the caller's ceiling partway through.
 fn decode_response_body(
     encoding: &str,
     body: &[u8],
+    limit: usize,
 ) -> Result<Option<Vec<u8>>, RepresentationRejection> {
     let codings: Vec<&str> = encoding
         .split(',')
@@ -313,7 +426,7 @@ fn decode_response_body(
     let mut current = body.to_vec();
     for coding in codings.into_iter().rev() {
         let lowered = coding.to_ascii_lowercase();
-        current = decode_one_coding(&lowered, &current, MAX_DECODED_RESPONSE_INSPECTION_BYTES)?;
+        current = decode_one_coding(&lowered, &current, limit)?;
     }
     Ok(Some(current))
 }
@@ -377,10 +490,25 @@ pub(crate) fn evaluate_response_body_policy_posture(
 
     let decoded = match origin_content_encoding(ctx, origin, response_headers) {
         None => None,
-        Some(encoding) => match decode_response_body(encoding, response_body) {
-            Ok(decoded) => decoded,
-            Err(rejection) => return ResponseBodyPolicyPosture::Reject(rejection),
-        },
+        Some(encoding) => {
+            // Refuse before spending the decode: inspecting these bytes means
+            // serving them as identity, and the client said it will not take
+            // identity. The gateway does not re-encode, so there is no
+            // representation that is both inspectable and acceptable, and
+            // silently downgrading the acceptable encoded response the origin
+            // correctly produced is exactly what must not happen. A field that
+            // reduces to identity-only tokens changes no octets, so it is not
+            // subject to this rule.
+            if has_non_identity_coding(encoding) && !identity_coding_is_acceptable(ctx) {
+                return ResponseBodyPolicyPosture::Reject(
+                    RepresentationRejection::IdentityCodingUnacceptable,
+                );
+            }
+            match decode_response_body(encoding, response_body, decoded_inspection_limit(ctx)) {
+                Ok(decoded) => decoded,
+                Err(rejection) => return ResponseBodyPolicyPosture::Reject(rejection),
+            }
+        }
     };
 
     let inspected = decoded.as_deref().unwrap_or(response_body);

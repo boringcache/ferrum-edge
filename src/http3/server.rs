@@ -1062,6 +1062,9 @@ async fn handle_h3_request(
 
     // Build request context (client_ip resolved below after headers are parsed)
     let mut ctx = RequestContext::new(socket_ip.to_owned(), method.clone(), path.clone());
+    // Carry the operator's response-body ceiling so the buffered representation
+    // gate bounds its decompression by the same limit the wire path enforces.
+    ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
     let mut request_scheme = "https";
     ctx.request_is_secure = true;
     ctx.metadata

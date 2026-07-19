@@ -1646,3 +1646,330 @@ async fn backend_bytes_under_the_same_snapshot_are_still_rejected() {
     );
     assert_secret_not_forwarded(&body);
 }
+
+// ---------------------------------------------------------------------------
+// Framed gRPC media types are outside the policy's document model.
+//
+// `application/grpc+json` and the gRPC-Web `+json` variants end in `+json`, so
+// a naive JSON media-type test claims them — but their bytes are length-
+// prefixed frames, never a bare document. Claiming them would send every valid
+// gRPC JSON response on a mixed HTTP/gRPC proxy into `unparseable_document`.
+// ---------------------------------------------------------------------------
+
+/// One length-prefixed gRPC frame: compressed flag, 4-byte big-endian length,
+/// then the message. Byte 0 is the flag, which is why a frame can never parse
+/// as a JSON document.
+fn grpc_frame(message: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(5 + message.len());
+    framed.push(0);
+    framed.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    framed.extend_from_slice(message);
+    framed
+}
+
+async fn run_with_content_type(
+    content_type: &str,
+    body: Vec<u8>,
+) -> (bool, u16, Option<String>, Vec<u8>) {
+    let headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+    let (replaced, _, status, _, body, reason) = run_backend_transform(200, headers, body).await;
+    (replaced, status, reason, body)
+}
+
+#[tokio::test]
+async fn framed_grpc_json_response_is_passed_through_not_rejected() {
+    for content_type in [
+        "application/grpc+json",
+        "application/grpc-web+json",
+        "application/grpc-web-text+json",
+        "application/grpc+json; charset=utf-8",
+        "APPLICATION/GRPC+JSON",
+    ] {
+        let framed = grpc_frame(br#"{"keep":1}"#);
+        let (replaced, status, reason, body) =
+            run_with_content_type(content_type, framed.clone()).await;
+
+        assert!(!replaced, "`{content_type}` must not be claimed");
+        assert_eq!(status, 200, "`{content_type}` must pass through");
+        assert_eq!(reason, None, "`{content_type}` must not reject");
+        assert_eq!(body, framed, "`{content_type}` bytes must survive");
+    }
+}
+
+#[tokio::test]
+async fn native_grpc_response_is_passed_through_not_rejected() {
+    let framed = grpc_frame(b"\x08\x01");
+    let (replaced, status, reason, body) =
+        run_with_content_type("application/grpc", framed.clone()).await;
+
+    assert!(!replaced);
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_eq!(body, framed);
+}
+
+/// Non-regression for the earlier P1 fix: an ABSENT `Content-Type` must still be
+/// claimed and inspected, because the transform treats it as JSON. Excluding
+/// framed gRPC must not have narrowed that.
+#[tokio::test]
+async fn untyped_json_response_is_still_claimed_and_redacted() {
+    let body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+    let (replaced, transformed, status, _, body, reason) =
+        run_backend_transform(200, HashMap::new(), body).await;
+
+    assert!(!replaced, "untyped parseable JSON is servable");
+    assert!(transformed, "the body rule must still apply");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_secret_not_forwarded(&body);
+}
+
+/// The other half of that P1 fix: an untyped body that is NOT parseable JSON
+/// still fails closed. A framed-gRPC exclusion keyed off `Content-Type` cannot
+/// reach this case, since there is no `Content-Type` to match.
+#[tokio::test]
+async fn untyped_unparseable_response_still_fails_closed() {
+    let body = b"not json at all".to_vec();
+    let (replaced, _, status, _, body, reason) =
+        run_backend_transform(200, HashMap::new(), body).await;
+
+    assert!(replaced);
+    assert_eq!(status, 502);
+    assert_eq!(reason.as_deref(), Some("unparseable_document"));
+    assert_secret_not_forwarded(&body);
+}
+
+/// An ordinary vendor `+json` type is NOT gRPC and must stay claimed.
+#[tokio::test]
+async fn vendor_json_media_type_is_still_claimed_and_redacted() {
+    let body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+    let (replaced, status, reason, body) =
+        run_with_content_type("application/vnd.acme.v2+json", body).await;
+
+    assert!(!replaced);
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_secret_not_forwarded(&body);
+}
+
+// ---------------------------------------------------------------------------
+// Identity coding acceptability.
+//
+// Decoding publishes identity bytes. A client that sent `identity;q=0` refused
+// exactly that representation, and the gateway does not re-encode — so the
+// encoded response must be rejected, never silently downgraded.
+// ---------------------------------------------------------------------------
+
+fn gzip_json_headers() -> HashMap<String, String> {
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers
+}
+
+/// Drive the transform phase with a client `Accept-Encoding` on the context.
+async fn run_with_accept_encoding(
+    accept_encoding: Option<&str>,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+) -> (bool, u16, Option<String>, Vec<u8>, HashMap<String, String>) {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    if let Some(value) = accept_encoding {
+        ctx.headers.insert("accept-encoding".to_string(), value.to_string());
+    }
+    let mut status = 200;
+    let mut headers = headers;
+    let mut body = body;
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
+    (replaced, status, reason, body, headers)
+}
+
+#[tokio::test]
+async fn encoded_body_is_rejected_when_client_forbids_identity() {
+    for accept_encoding in [
+        "gzip, identity;q=0",
+        "gzip;q=1.0, identity;q=0.0",
+        "gzip, identity;q=0, br",
+        "gzip, *;q=0",
+        "gzip, identity ; q=0",
+        "gzip, IDENTITY;Q=0",
+    ] {
+        let encoded = gzip(br#"{"secret":"hunter2","keep":1}"#);
+        let (replaced, status, reason, body, _) =
+            run_with_accept_encoding(Some(accept_encoding), gzip_json_headers(), encoded).await;
+
+        assert!(replaced, "`{accept_encoding}` forbids identity");
+        assert_eq!(status, 502, "`{accept_encoding}` is unservable");
+        assert_eq!(
+            reason.as_deref(),
+            Some("identity_coding_unacceptable"),
+            "`{accept_encoding}` must report acceptability"
+        );
+        assert_secret_not_forwarded(&body);
+    }
+}
+
+#[tokio::test]
+async fn encoded_body_is_decoded_when_identity_is_acceptable() {
+    for accept_encoding in [
+        None,
+        Some("gzip"),
+        Some("gzip, identity"),
+        Some("gzip, identity;q=0.1"),
+        // An explicit non-zero `identity` outranks a `*;q=0` wildcard.
+        Some("gzip, *;q=0, identity;q=1"),
+        // A malformed qvalue must not be read as a refusal.
+        Some("gzip, identity;q=bogus"),
+        // An empty field value means identity, and only identity, is fine.
+        Some(""),
+    ] {
+        let encoded = gzip(br#"{"secret":"hunter2","keep":1}"#);
+        let (replaced, status, reason, body, headers) =
+            run_with_accept_encoding(accept_encoding, gzip_json_headers(), encoded).await;
+
+        assert!(!replaced, "`{accept_encoding:?}` accepts identity");
+        assert_eq!(status, 200, "`{accept_encoding:?}` is servable");
+        assert_eq!(reason, None, "`{accept_encoding:?}` is servable");
+        assert!(!headers.contains_key("content-encoding"));
+        assert_secret_not_forwarded(&body);
+        assert!(String::from_utf8_lossy(&body).contains("keep"));
+    }
+}
+
+/// `identity;q=0` only matters when a decode would actually change the octets.
+/// An unencoded response is already identity and is unaffected.
+#[tokio::test]
+async fn identity_refusal_does_not_affect_unencoded_responses() {
+    let body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+    let (replaced, status, reason, body, _) =
+        run_with_accept_encoding(Some("gzip, identity;q=0"), json_headers(), body).await;
+
+    assert!(!replaced, "an identity body is unchanged by decoding");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_secret_not_forwarded(&body);
+}
+
+/// An unclaimed response is never inspected, so a client that forbids identity
+/// still gets its encoded bytes through untouched.
+#[tokio::test]
+async fn identity_refusal_does_not_reject_unclaimed_responses() {
+    let headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+    let encoded = gzip(b"plain text body");
+    let (replaced, status, reason, body, headers) =
+        run_with_accept_encoding(Some("gzip, identity;q=0"), headers, encoded.clone()).await;
+
+    assert!(!replaced, "a non-JSON response is not claimed");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_eq!(body, encoded, "unclaimed bytes pass through");
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The operator's configured response-body limit bounds the decode.
+//
+// A small compressed body can pass every wire-size check and then inflate past
+// `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` during inspection. Enabling a body
+// policy must not buy a larger effective ceiling.
+// ---------------------------------------------------------------------------
+
+/// Drive the transform phase with the operator's configured response-body limit
+/// on the context, exactly as the H1/H2 and H3 handlers set it from `ProxyState`.
+async fn run_with_response_limit(
+    max_response_body_size_bytes: usize,
+    body: Vec<u8>,
+) -> (bool, u16, Option<String>, Vec<u8>) {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    ctx.max_response_body_size_bytes = max_response_body_size_bytes;
+    let mut headers = gzip_json_headers();
+    let mut status = 200;
+    let mut body = body;
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
+    (replaced, status, reason, body)
+}
+
+/// A highly compressible JSON document whose decoded size far exceeds a small
+/// configured limit while its compressed size stays trivially under it.
+fn inflating_json(padding_len: usize) -> Vec<u8> {
+    let padding = "A".repeat(padding_len);
+    format!(r#"{{"secret":"hunter2","pad":"{padding}"}}"#).into_bytes()
+}
+
+#[tokio::test]
+async fn decode_is_rejected_when_it_exceeds_the_configured_response_limit() {
+    let plaintext = inflating_json(64 * 1024);
+    let compressed = gzip(&plaintext);
+    let limit = 8 * 1024;
+
+    assert!(compressed.len() < limit, "wire size must pass");
+    assert!(plaintext.len() > limit, "decoded size must exceed");
+
+    let (replaced, status, reason, body) = run_with_response_limit(limit, compressed).await;
+
+    assert!(replaced, "a decode past the limit is unservable");
+    assert_eq!(status, 502);
+    assert_eq!(reason.as_deref(), Some("decoded_body_too_large"));
+    assert_secret_not_forwarded(&body);
+}
+
+#[tokio::test]
+async fn decode_within_the_configured_response_limit_still_succeeds() {
+    let plaintext = inflating_json(1024);
+    let compressed = gzip(&plaintext);
+    let limit = 64 * 1024;
+
+    assert!(plaintext.len() < limit);
+
+    let (replaced, status, reason, body) = run_with_response_limit(limit, compressed).await;
+
+    assert!(!replaced, "a decode inside the limit is servable");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_secret_not_forwarded(&body);
+    assert!(String::from_utf8_lossy(&body).contains("pad"));
+}
+
+/// `0` is the project-wide "unlimited" spelling, and must fall back to the
+/// module's hard ceiling rather than rejecting every decode.
+#[tokio::test]
+async fn unlimited_configured_response_limit_falls_back_to_hard_ceiling() {
+    let plaintext = inflating_json(64 * 1024);
+    let compressed = gzip(&plaintext);
+
+    let (replaced, status, reason, body) = run_with_response_limit(0, compressed).await;
+
+    assert!(!replaced, "`0` means unlimited, not zero-length");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_secret_not_forwarded(&body);
+}

@@ -62,6 +62,15 @@ const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 const REQUEST_NO_TRANSFORM_METADATA_KEY: &str = "compression:request_no_transform";
 const RESPONSE_ALGORITHM_METADATA_KEY: &str = "compression:algorithm";
 
+/// The client's original `Accept-Encoding`, saved in `before_proxy` before
+/// `remove_accept_encoding` can strip it from the backend-bound request.
+///
+/// Response-side readers must prefer this over `ctx.headers["accept-encoding"]`:
+/// the `before_proxy` header map *is* `ctx.headers` (taken and restored around
+/// the hook), so a strip here is visible to every later phase, and only this
+/// snapshot still describes what the client actually negotiated.
+pub(crate) const REQUEST_ACCEPT_ENCODING_METADATA_KEY: &str = "compression:accept_encoding";
+
 struct CompressionConfig {
     /// Enabled algorithms in server-preference order (used to break q-value ties).
     algorithms: Vec<Algorithm>,
@@ -747,7 +756,7 @@ impl Plugin for CompressionPlugin {
         if !has_request_no_transform {
             if let Some(ae) = headers.get("accept-encoding") {
                 ctx.metadata
-                    .insert("compression:accept_encoding".to_string(), ae.clone());
+                    .insert(REQUEST_ACCEPT_ENCODING_METADATA_KEY.to_string(), ae.clone());
             }
 
             // Strip Accept-Encoding from the backend request so the backend
@@ -924,7 +933,7 @@ impl Plugin for CompressionPlugin {
         // Select algorithm based on client's Accept-Encoding.
         let accept_encoding = ctx
             .metadata
-            .get("compression:accept_encoding")
+            .get(REQUEST_ACCEPT_ENCODING_METADATA_KEY)
             .or_else(|| ctx.headers.get("accept-encoding"));
 
         let algorithm = match accept_encoding.and_then(|ae| self.select_algorithm(ae)) {
