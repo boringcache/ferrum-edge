@@ -1101,7 +1101,10 @@ pub async fn serve(
     if !admin_https_enabled
         && (env_config.admin_tls_cert_path.is_some() || env_config.admin_tls_key_path.is_some())
     {
-        info!("FERRUM_ADMIN_HTTPS_PORT=0 — admin HTTPS listener disabled");
+        info!(
+            "{} — admin HTTPS listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
+        );
     }
 
     // Listener handles (proxy/admin HTTP/HTTPS/H3) — `join()` waits on
@@ -1132,7 +1135,8 @@ pub async fn serve(
         let h = tokio::spawn(async move {
             info!(
                 "Starting admin HTTP listener on {}",
-                crate::secrets::report_env_field(
+                crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTP_PORT",
                     &admin_http_addr.to_string()
                 )
@@ -1151,7 +1155,10 @@ pub async fn serve(
         handles.push(("Admin HTTP listener".to_string(), h));
         startup_signals.push(("Admin HTTP listener".to_string(), started_rx));
     } else {
-        info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
+        info!(
+            "{} — plaintext admin HTTP listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0")
+        );
     }
 
     // ── Admin HTTPS listener ─────────────────────────────────────────────
@@ -1189,10 +1196,11 @@ pub async fn serve(
             let h = tokio::spawn(async move {
                 info!(
                     "Starting admin HTTPS listener on {}",
-                    crate::secrets::report_env_field(
-                        "FERRUM_ADMIN_HTTPS_PORT",
-                        &admin_https_addr.to_string()
-                    )
+                    crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    "FERRUM_ADMIN_HTTPS_PORT",
+                    &admin_https_addr.to_string()
+                )
                 );
                 let result = if let Some(slot) = admin_tls_slot {
                     admin::start_admin_listener_with_dynamic_tls_and_signal(
@@ -1220,13 +1228,17 @@ pub async fn serve(
             handles.push(("Admin HTTPS listener".to_string(), h));
             startup_signals.push(("Admin HTTPS listener".to_string(), started_rx));
         } else {
-            info!("FERRUM_ADMIN_HTTPS_PORT=0 — admin HTTPS listener disabled");
+            info!(
+                "{} — admin HTTPS listener disabled",
+                crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
+            );
         }
     }
     if env_config.admin_http_port == 0 && bound.admin_http.is_none() && bound.admin_https.is_none()
     {
         warn!(
-            "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and admin HTTPS is not configured or disabled. The admin API is unreachable."
+            "No admin API listeners are active — {} and admin HTTPS is not configured or disabled. The admin API is unreachable.",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0")
         );
     }
 
@@ -1251,7 +1263,11 @@ pub async fn serve(
         let h = tokio::spawn(async move {
             info!(
                 "Starting HTTP proxy listener on {}",
-                crate::secrets::report_env_field("FERRUM_PROXY_HTTP_PORT", &http_addr.to_string())
+                crate::secrets::report_listener_addr(
+                    "FERRUM_PROXY_BIND_ADDRESS",
+                    "FERRUM_PROXY_HTTP_PORT",
+                    &http_addr.to_string()
+                )
             );
             proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
@@ -1266,7 +1282,10 @@ pub async fn serve(
         handles.push(("HTTP proxy listener".to_string(), h));
         startup_signals.push(("HTTP proxy listener".to_string(), started_rx));
     } else {
-        info!("FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled");
+        info!(
+            "{} — plaintext HTTP proxy listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_PROXY_HTTP_PORT", "0")
+        );
     }
 
     // ── Proxy HTTPS listener (TLS) ───────────────────────────────────────
@@ -1295,10 +1314,11 @@ pub async fn serve(
             let h = tokio::spawn(async move {
                 info!(
                     "Starting HTTPS proxy listener on {}",
-                    crate::secrets::report_env_field(
-                        "FERRUM_PROXY_HTTPS_PORT",
-                        &https_addr.to_string()
-                    )
+                    crate::secrets::report_listener_addr(
+                    "FERRUM_PROXY_BIND_ADDRESS",
+                    "FERRUM_PROXY_HTTPS_PORT",
+                    &https_addr.to_string()
+                )
                 );
                 let result = if let Some(slot) = reload_slot {
                     proxy::start_proxy_listener_with_dynamic_tls_and_signal(
@@ -1324,7 +1344,10 @@ pub async fn serve(
             handles.push(("HTTPS proxy listener".to_string(), h));
             startup_signals.push(("HTTPS proxy listener".to_string(), started_rx));
         } else {
-            info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTPS proxy listener disabled");
+            info!(
+                "{} — HTTPS proxy listener disabled",
+                crate::secrets::report_env_assignment("FERRUM_PROXY_HTTPS_PORT", "0")
+            );
         }
     } else {
         info!("TLS not configured - HTTPS listener disabled");
@@ -1342,7 +1365,8 @@ pub async fn serve(
             || (env_config.proxy_https_port == 0 && bound.proxy_https.is_none()))
     {
         warn!(
-            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and HTTPS is not configured or disabled. Only stream proxies (TCP/UDP) will serve traffic."
+            "No HTTP or HTTPS proxy listeners are active — {} and HTTPS is not configured or disabled. Only stream proxies (TCP/UDP) will serve traffic.",
+            crate::secrets::report_env_assignment("FERRUM_PROXY_HTTP_PORT", "0")
         );
     }
 
@@ -1373,10 +1397,11 @@ pub async fn serve(
                 let h = tokio::spawn(async move {
                     info!(
                         "Starting HTTP/3 (QUIC) proxy listener on {}",
-                        crate::secrets::report_env_field(
-                            "FERRUM_PROXY_HTTPS_PORT",
-                            &h3_addr.to_string()
-                        )
+                        crate::secrets::report_listener_addr(
+                    "FERRUM_PROXY_BIND_ADDRESS",
+                    "FERRUM_PROXY_HTTPS_PORT",
+                    &h3_addr.to_string()
+                )
                     );
                     crate::http3::server::start_http3_listener_with_signal(
                         h3_addr,
@@ -1399,7 +1424,10 @@ pub async fn serve(
                 startup_signals.push(("HTTP/3 proxy listener".to_string(), started_rx));
                 h3_listener_started = true;
             } else {
-                info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTP/3 proxy listener disabled");
+                info!(
+                    "{} — HTTP/3 proxy listener disabled",
+                    crate::secrets::report_env_assignment("FERRUM_PROXY_HTTPS_PORT", "0")
+                );
             }
         } else {
             error!("HTTP/3 requires TLS configuration - HTTP/3 listener disabled");

@@ -2671,15 +2671,22 @@ impl EnvConfig {
             .is_some_and(|raw| raw.trim() == "0")
         {
             tracing::warn!(
-                "FERRUM_DB_POLL_INTERVAL=0 is clamped to 1 second; set a positive interval to avoid this implicit floor"
+                "{} is clamped to 1 second; set a positive interval to avoid this implicit floor",
+                crate::secrets::report_env_assignment("FERRUM_DB_POLL_INTERVAL", "0")
             );
         }
         let db_rejected_delta_backoff_max_seconds = if db_rejected_delta_backoff_max_seconds
             < db_rejected_delta_backoff_initial_seconds
         {
             tracing::warn!(
-                configured_initial = db_rejected_delta_backoff_initial_seconds,
-                configured_max = db_rejected_delta_backoff_max_seconds,
+                configured_initial = %crate::secrets::report_env_field(
+                    "FERRUM_DB_REJECTED_DELTA_BACKOFF_INITIAL_SECONDS",
+                    &db_rejected_delta_backoff_initial_seconds.to_string()
+                ),
+                configured_max = %crate::secrets::report_env_field(
+                    "FERRUM_DB_REJECTED_DELTA_BACKOFF_MAX_SECONDS",
+                    &db_rejected_delta_backoff_max_seconds.to_string()
+                ),
                 "FERRUM_DB_REJECTED_DELTA_BACKOFF_MAX_SECONDS is below the initial backoff; clamped to the initial value"
             );
             db_rejected_delta_backoff_initial_seconds
@@ -2692,7 +2699,10 @@ impl EnvConfig {
         let db_pool_statement_timeout_seconds =
             if db_pool_statement_timeout_seconds > MAX_STATEMENT_TIMEOUT_SECONDS {
                 tracing::warn!(
-                    configured = db_pool_statement_timeout_seconds,
+                    configured = %crate::secrets::report_env_field(
+                        "FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS",
+                        &db_pool_statement_timeout_seconds.to_string()
+                    ),
                     clamped = MAX_STATEMENT_TIMEOUT_SECONDS,
                     max = MAX_STATEMENT_TIMEOUT_SECONDS,
                     "FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS exceeds maximum, clamped"
@@ -3100,9 +3110,15 @@ impl EnvConfig {
             );
             if raw > http3_coalesce_max_bytes {
                 tracing::warn!(
-                    "FERRUM_HTTP3_COALESCE_MIN_BYTES={} exceeds FERRUM_HTTP3_COALESCE_MAX_BYTES={}; clamping MIN to MAX",
-                    raw,
-                    http3_coalesce_max_bytes,
+                    "{} exceeds {}; clamping MIN to MAX",
+                    crate::secrets::report_env_assignment(
+                        "FERRUM_HTTP3_COALESCE_MIN_BYTES",
+                        &raw.to_string()
+                    ),
+                    crate::secrets::report_env_assignment(
+                        "FERRUM_HTTP3_COALESCE_MAX_BYTES",
+                        &http3_coalesce_max_bytes.to_string()
+                    ),
                 );
             }
             clamped
@@ -4656,14 +4672,20 @@ impl EnvConfig {
         // Validate bind addresses are valid IP addresses
         if self.proxy_bind_address.parse::<std::net::IpAddr>().is_err() {
             return Err(format!(
-                "Invalid FERRUM_PROXY_BIND_ADDRESS '{}'. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
-                self.proxy_bind_address
+                "Invalid FERRUM_PROXY_BIND_ADDRESS {}. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
+                crate::secrets::quoted_env_value(
+                    "FERRUM_PROXY_BIND_ADDRESS",
+                    &self.proxy_bind_address
+                )
             ));
         }
         if self.admin_bind_address.parse::<std::net::IpAddr>().is_err() {
             return Err(format!(
-                "Invalid FERRUM_ADMIN_BIND_ADDRESS '{}'. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
-                self.admin_bind_address
+                "Invalid FERRUM_ADMIN_BIND_ADDRESS {}. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
+                crate::secrets::quoted_env_value(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    &self.admin_bind_address
+                )
             ));
         }
 
@@ -4754,14 +4776,28 @@ impl EnvConfig {
         if self.overload_fd_pressure_threshold == self.overload_fd_critical_threshold {
             return Err(format!(
                 "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD ({})",
-                self.overload_fd_pressure_threshold, self.overload_fd_critical_threshold
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD",
+                    &self.overload_fd_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD",
+                    &self.overload_fd_critical_threshold.to_string()
+                )
             ));
         }
         if self.overload_fd_pressure_threshold > self.overload_fd_critical_threshold {
+            // Key-tied: `1.0` renders as `1`, below the derived-candidate minimum.
             tracing::warn!(
-                pressure = self.overload_fd_pressure_threshold,
-                critical = self.overload_fd_critical_threshold,
-                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD; swapping to correct ordering"
+                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD ({}) is greater than FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD ({}); swapping to correct ordering",
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD",
+                    &self.overload_fd_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD",
+                    &self.overload_fd_critical_threshold.to_string()
+                )
             );
             std::mem::swap(
                 &mut self.overload_fd_pressure_threshold,
@@ -4771,14 +4807,27 @@ impl EnvConfig {
         if self.overload_conn_pressure_threshold == self.overload_conn_critical_threshold {
             return Err(format!(
                 "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD ({})",
-                self.overload_conn_pressure_threshold, self.overload_conn_critical_threshold
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD",
+                    &self.overload_conn_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD",
+                    &self.overload_conn_critical_threshold.to_string()
+                )
             ));
         }
         if self.overload_conn_pressure_threshold > self.overload_conn_critical_threshold {
             tracing::warn!(
-                pressure = self.overload_conn_pressure_threshold,
-                critical = self.overload_conn_critical_threshold,
-                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD; swapping to correct ordering"
+                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD ({}) is greater than FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD ({}); swapping to correct ordering",
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD",
+                    &self.overload_conn_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD",
+                    &self.overload_conn_critical_threshold.to_string()
+                )
             );
             std::mem::swap(
                 &mut self.overload_conn_pressure_threshold,
@@ -4788,14 +4837,27 @@ impl EnvConfig {
         if self.overload_req_pressure_threshold == self.overload_req_critical_threshold {
             return Err(format!(
                 "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD ({}) must be less than FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD ({})",
-                self.overload_req_pressure_threshold, self.overload_req_critical_threshold
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD",
+                    &self.overload_req_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD",
+                    &self.overload_req_critical_threshold.to_string()
+                )
             ));
         }
         if self.overload_req_pressure_threshold > self.overload_req_critical_threshold {
             tracing::warn!(
-                pressure = self.overload_req_pressure_threshold,
-                critical = self.overload_req_critical_threshold,
-                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD is greater than FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD; swapping to correct ordering"
+                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD ({}) is greater than FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD ({}); swapping to correct ordering",
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD",
+                    &self.overload_req_pressure_threshold.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD",
+                    &self.overload_req_critical_threshold.to_string()
+                )
             );
             std::mem::swap(
                 &mut self.overload_req_pressure_threshold,
@@ -4808,8 +4870,14 @@ impl EnvConfig {
             tracing::warn!(
                 "WARNING: FERRUM_DB_POOL_MIN_CONNECTIONS ({}) exceeds FERRUM_DB_POOL_MAX_CONNECTIONS ({}). \
                  The pool will clamp min to max, wasting the higher setting.",
-                self.db_pool_min_connections,
-                self.db_pool_max_connections
+                crate::secrets::report_env_field(
+                    "FERRUM_DB_POOL_MIN_CONNECTIONS",
+                    &self.db_pool_min_connections.to_string()
+                ),
+                crate::secrets::report_env_field(
+                    "FERRUM_DB_POOL_MAX_CONNECTIONS",
+                    &self.db_pool_max_connections.to_string()
+                )
             );
         }
 

@@ -10,8 +10,8 @@
 use crate::unit::env_lock::ENV_LOCK;
 use ferrum_edge::secrets::{
     EXTERNAL_SECRET_PLACEHOLDER, WITHHELD_LOG_RECORD, is_external_secret_key, quoted_env_value,
-    record_external_secret_keys, redact_external_secret_values, report_env_field,
-    withheld_log_record,
+    record_external_secret_keys, redact_external_secret_values, report_env_assignment,
+    report_env_field, report_env_fields, report_listener_addr, withheld_log_record,
 };
 use std::sync::Once;
 
@@ -199,7 +199,23 @@ const SHORT_PORT_KEY: &str = "FERRUM_REDACTION_FIXTURE_SHORT_PORT";
 const SHORT_PORT_VALUE: &str = "071";
 const SHORT_PORT_RENDERED: &str = "71";
 
-const FIXTURES: [(&str, &str); 23] = [
+/// An overload-style float whose canonical `Display` is one byte (`1e0` → `1`).
+/// The derived scalar is below the derived-candidate minimum, so threshold
+/// diagnostics must withhold key-tied rather than relying on the length filter.
+/// Spelled `1e0` rather than `1.0` so the exact candidate is less likely to
+/// collide with ordinary JSON floats in unrelated unit-test records.
+const SHORT_FLOAT_KEY: &str = "FERRUM_REDACTION_FIXTURE_SHORT_FLOAT";
+const SHORT_FLOAT_VALUE: &str = "1e0";
+const SHORT_FLOAT_RENDERED: &str = "1";
+
+/// A bind-address spelling that parses to a different socket rendering
+/// (`0:0:0:0:0:0:0:1` → `[::1]:…`). Listener diagnostics must key-tie the bind
+/// variable as well as the port, or the normalized address leaks when only the
+/// port key is checked.
+const SHORT_BIND_KEY: &str = "FERRUM_REDACTION_FIXTURE_SHORT_BIND";
+const SHORT_BIND_VALUE: &str = "0:0:0:0:0:0:0:1";
+
+const FIXTURES: [(&str, &str); 25] = [
     (PLAIN_KEY, PLAIN_VALUE),
     (LIST_KEY, LIST_VALUE),
     (CASE_KEY, CASE_VALUE),
@@ -223,6 +239,8 @@ const FIXTURES: [(&str, &str); 23] = [
     (SHORT_CASE_KEY, SHORT_CASE_VALUE),
     (PADDED_SHORT_KEY, PADDED_SHORT_VALUE),
     (SHORT_PORT_KEY, SHORT_PORT_VALUE),
+    (SHORT_FLOAT_KEY, SHORT_FLOAT_VALUE),
+    (SHORT_BIND_KEY, SHORT_BIND_VALUE),
 ];
 
 static RECORDED: Once = Once::new();
@@ -429,6 +447,78 @@ fn withholds_short_canonical_port_by_key() {
         report_env_field("FERRUM_ADMIN_HTTP_PORT", SHORT_PORT_RENDERED),
         SHORT_PORT_RENDERED,
         "a non-external port key must keep its diagnostic"
+    );
+}
+
+/// Disabled-listener lines re-render a parsed port as `0`. That one-byte form
+/// is not a global candidate; [`report_env_assignment`] withholds by key.
+#[test]
+fn withholds_disabled_listener_zero_by_assignment() {
+    arm_redaction();
+    assert_eq!(
+        redact_external_secret_values("0"),
+        "0",
+        "precondition: canonical zero must not be a global candidate"
+    );
+    assert_eq!(
+        report_env_assignment(SHORT_PORT_KEY, "0"),
+        format!("{SHORT_PORT_KEY}={EXTERNAL_SECRET_PLACEHOLDER}")
+    );
+    assert_eq!(
+        report_env_assignment("FERRUM_PROXY_HTTP_PORT", "0"),
+        "FERRUM_PROXY_HTTP_PORT=0",
+        "ordinary non-external disabled-port diagnostics must stay readable"
+    );
+}
+
+/// `FERRUM_OVERLOAD_*_FILE=1.0` formats as `1`. The textual pass drops that
+/// derived form; key-tied reporting must not.
+#[test]
+fn withholds_short_canonical_float_by_key() {
+    arm_redaction();
+    assert_eq!(
+        redact_external_secret_values(SHORT_FLOAT_RENDERED),
+        SHORT_FLOAT_RENDERED,
+        "precondition: {SHORT_FLOAT_RENDERED} must not be a global candidate"
+    );
+    assert!(
+        redact_external_secret_values(SHORT_FLOAT_VALUE).contains(EXTERNAL_SECRET_PLACEHOLDER),
+        "the materialized float spelling must still redact"
+    );
+    assert_eq!(
+        report_env_field(SHORT_FLOAT_KEY, SHORT_FLOAT_RENDERED),
+        EXTERNAL_SECRET_PLACEHOLDER
+    );
+}
+
+/// A composed listener address must withhold when the *bind* key was external,
+/// even if the port key was not — otherwise a normalized `[::1]:port` leaks.
+#[test]
+fn withholds_listener_addr_when_bind_key_is_external() {
+    arm_redaction();
+    let rendered = "[::1]:8080";
+    assert_eq!(
+        report_listener_addr(SHORT_BIND_KEY, "FERRUM_PROXY_HTTP_PORT", rendered),
+        EXTERNAL_SECRET_PLACEHOLDER,
+        "externally sourced bind address must withhold the composed socket"
+    );
+    assert_eq!(
+        report_env_fields(&[SHORT_BIND_KEY, "FERRUM_PROXY_HTTP_PORT"], rendered),
+        EXTERNAL_SECRET_PLACEHOLDER
+    );
+    // Port-only external still withholds (existing contract).
+    assert_eq!(
+        report_listener_addr("FERRUM_PROXY_BIND_ADDRESS", SHORT_PORT_KEY, "0.0.0.0:71"),
+        EXTERNAL_SECRET_PLACEHOLDER
+    );
+    // Neither external → ordinary diagnostic kept.
+    assert_eq!(
+        report_listener_addr(
+            "FERRUM_PROXY_BIND_ADDRESS",
+            "FERRUM_PROXY_HTTP_PORT",
+            "0.0.0.0:8080"
+        ),
+        "0.0.0.0:8080"
     );
 }
 

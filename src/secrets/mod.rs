@@ -127,14 +127,48 @@ pub fn is_external_secret_key(key: &str) -> bool {
 /// startup listen/port lines that print a parsed integer or `SocketAddr`
 /// (`080` / ` 80` → `80`). That canonical scalar is often below
 /// [`RedactionPlan::MIN_DERIVED_CANDIDATE_LEN`], so the textual pass cannot
-/// cover it without globally arming every two-digit string. A new
-/// value-bearing startup line that re-renders a typed value must go through
-/// here and name the variable it came from.
+/// cover it without globally arming every two-digit string. The same applies to
+/// a disabled-listener `=0`, an overload threshold logged as `1` from `1.0`,
+/// and a logging-clamp `supplied`/`applied` field — those sites must name the
+/// variable rather than relying on the length filter. A new value-bearing
+/// startup line that re-renders a typed value must go through here (or
+/// [`report_env_fields`] when more than one variable contributed) and name the
+/// variable(s) it came from.
 pub fn report_env_field(env_key: &str, rendered: &str) -> String {
-    if is_external_secret_key(env_key) {
+    report_env_fields(&[env_key], rendered)
+}
+
+/// Like [`report_env_field`], but withholds when **any** of `env_keys` was
+/// externally resolved.
+///
+/// Use this for a composed rendering that depends on more than one variable —
+/// notably a listener `SocketAddr` built from a bind-address key and a port
+/// key. Key-tying only the port leaves a normalized bind address
+/// (`FERRUM_PROXY_BIND_ADDRESS_FILE=0:0:0:0:0:0:0:1` → `[::1]:…`) visible,
+/// because that form matches neither the materialized value nor a derived
+/// candidate the length filter would keep.
+pub fn report_env_fields(env_keys: &[&str], rendered: &str) -> String {
+    if env_keys.iter().any(|key| is_external_secret_key(key)) {
         return EXTERNAL_SECRET_PLACEHOLDER.to_string();
     }
     redact_external_secret_values(rendered)
+}
+
+/// Format `KEY=value` for a startup/validate diagnostic, withholding the value
+/// when `env_key` was externally resolved.
+///
+/// Disabled-listener lines historically hard-coded `FERRUM_PROXY_HTTP_PORT=0`.
+/// When the port was externally sourced as `000` (or any other spelling that
+/// parses to zero), that `0` is a short canonical rendering the textual
+/// redactor deliberately does not admit — so the assignment must be key-tied.
+pub fn report_env_assignment(env_key: &str, rendered: &str) -> String {
+    format!("{env_key}={}", report_env_field(env_key, rendered))
+}
+
+/// Render a listener address that depends on both a bind-address variable and a
+/// port variable. Withholds when either key was externally resolved.
+pub fn report_listener_addr(bind_key: &str, port_key: &str, rendered: &str) -> String {
+    report_env_fields(&[bind_key, port_key], rendered)
 }
 
 /// Render the `'…'`-quoted echo of a value a hand-written validator produced by
@@ -882,9 +916,9 @@ impl RedactionPlan {
     /// a padded one-character value, a short list segment, or a short
     /// canonical port `080`/` 80` → `80`) is the only rendering an operator
     /// sees and the textual pass cannot cover it. Those sites withhold
-    /// **key-tied** instead — [`report_env_field`],
-    /// `config::env_config_macro::invalid_env_value`, and
-    /// `config::env_config::OperatingMode::resolve` — which is exact on
+    /// **key-tied** instead — [`report_env_field`] / [`report_env_fields`] /
+    /// [`report_env_assignment`], `config::env_config_macro::invalid_env_value`,
+    /// and `config::env_config::OperatingMode::resolve` — which is exact on
     /// provenance and does not depend on length at all. A new hand-written
     /// validator that re-renders a value must do the same rather than rely on
     /// widening this filter.

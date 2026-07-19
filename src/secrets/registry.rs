@@ -384,6 +384,20 @@ fn timeout_error(key: &str, backend_name: &str, timeout: Duration) -> String {
     )
 }
 
+/// Timeout while constructing a cloud provider client before any secret fetch.
+///
+/// Deterministic and reference-free: client/credential discovery can stall on
+/// ADC or instance-metadata without ever touching a source reference, so the
+/// message names only the backend and the configured bound.
+#[cfg(any(feature = "secrets-aws", feature = "secrets-gcp"))]
+fn client_init_timeout_error(backend_name: &str, timeout: Duration) -> String {
+    format!(
+        "Timeout initializing {} client after {}s",
+        backend_name,
+        timeout.as_secs()
+    )
+}
+
 #[cfg(any(
     feature = "secrets-vault",
     feature = "secrets-aws",
@@ -1078,7 +1092,12 @@ impl SecretBackend for AwsBackend {
         secrets: &[PendingSecret],
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
-        let client = aws::AwsClientWrapper::new().await;
+        // Credential-chain discovery is async and can stall on instance
+        // metadata the same way GCP ADC can; bound it with the same timeout
+        // used for each subsequent fetch (one construction, not per secret).
+        let client = tokio::time::timeout(timeout, aws::AwsClientWrapper::new())
+            .await
+            .map_err(|_| client_init_timeout_error(self.display_name(), timeout))?;
         resolve_many_concurrent(
             secrets,
             timeout,
@@ -1130,7 +1149,13 @@ impl SecretBackend for GcpBackend {
         // environment only, so building this client cannot prime
         // `CONF_FILE_CACHE` before a `FERRUM_CONF_PATH_FILE` has been
         // materialized. See `gcp::endpoint_override_from_env`.
-        let client = gcp::GcpClientWrapper::new_for_startup().await?;
+        //
+        // ADC / metadata-service discovery runs *before* per-fetch timeouts
+        // in `resolve_many_concurrent`, so bound client construction with the
+        // same configured timeout (once per provider batch, not per secret).
+        let client = tokio::time::timeout(timeout, gcp::GcpClientWrapper::new_for_startup())
+            .await
+            .map_err(|_| client_init_timeout_error(self.display_name(), timeout))??;
         resolve_many_concurrent(
             secrets,
             timeout,
@@ -1194,6 +1219,21 @@ impl SecretBackend for AzureBackend {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::time::Duration;
+
+    #[cfg(any(feature = "secrets-aws", feature = "secrets-gcp"))]
+    #[test]
+    fn client_init_timeout_error_is_deterministic_and_reference_free() {
+        let err = client_init_timeout_error("GCP Secret Manager", Duration::from_secs(7));
+        assert_eq!(err, "Timeout initializing GCP Secret Manager client after 7s");
+        assert!(
+            !err.contains("projects/")
+                && !err.contains("secrets/")
+                && !err.contains("://")
+                && !err.contains('/'),
+            "client-init timeout must not echo source references: {err}"
+        );
+    }
 
     #[test]
     fn match_suffix_file() {

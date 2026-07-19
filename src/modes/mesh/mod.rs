@@ -10506,7 +10506,8 @@ fn start_mesh_admin_listeners(
         handles.push(tokio::spawn(async move {
             info!(
                 "Starting mesh admin HTTP listener on {}",
-                crate::secrets::report_env_field(
+                crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTP_PORT",
                     &admin_http_addr.to_string()
                 )
@@ -10533,13 +10534,19 @@ fn start_mesh_admin_listeners(
         }));
         startup_signals.push(("Mesh admin HTTP listener".to_string(), started_rx));
     } else {
-        info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext mesh admin HTTP listener disabled");
+        info!(
+            "{} — plaintext mesh admin HTTP listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0")
+        );
     }
 
     // Admin HTTPS listener (only if TLS is configured and the port is not
     // disabled — port 0 is the repository-wide disable sentinel).
     if env_config.admin_https_port == 0 {
-        info!("FERRUM_ADMIN_HTTPS_PORT=0 — mesh admin HTTPS listener disabled");
+        info!(
+            "{} — mesh admin HTTPS listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
+        );
     } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
         &env_config.admin_tls_cert_path,
         &env_config.admin_tls_key_path,
@@ -10577,7 +10584,8 @@ fn start_mesh_admin_listeners(
         handles.push(tokio::spawn(async move {
             info!(
                 "Starting mesh admin HTTPS listener on {}",
-                crate::secrets::report_env_field(
+                crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
                     "FERRUM_ADMIN_HTTPS_PORT",
                     &admin_https_addr.to_string()
                 )
@@ -10621,7 +10629,9 @@ fn start_mesh_admin_listeners(
 
     if env_config.admin_http_port == 0 && !env_config.admin_https_listener_enabled() {
         warn!(
-            "No mesh admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and admin HTTPS not configured or FERRUM_ADMIN_HTTPS_PORT=0. The admin API is unreachable."
+            "No mesh admin API listeners are active — {} and admin HTTPS not configured or {}. The admin API is unreachable.",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0"),
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
         );
     }
 
