@@ -1,8 +1,15 @@
 # Ferrum Edge Opus continuation brief
 
 Resume the existing worktree and branch named in the dispatch prompt. Follow all rules in
-`agent-brief.md`, especially isolation, host discipline, exact review-trigger cadence, final
-reporting, and the prohibition on merging.
+`agent-brief.md`, especially isolation, direct implementation, host discipline, exact
+review-trigger cadence, final reporting, and the prohibition on merging.
+
+## Implement directly
+
+Write, commit, and push the changes yourself in this session. Do not invoke any agent-dispatch
+skill or script, including `sol-agents`, `opus-agents`, `fable-agents`, `grok-agents`,
+`.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not
+spawn nested workers. The orchestrator selected this model and reasoning effort deliberately.
 
 ## Reconstruct state before editing
 

@@ -88,8 +88,8 @@ Every prompt must contain this role instruction even though the briefs repeat it
 
 ```text
 YOU are the implementer. Write, commit, and push the changes yourself in this session. Do not
-invoke agent-dispatch skills or scripts (including sol-agents, opus-agents, or any
-.agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
+invoke agent-dispatch skills or scripts (including sol-agents, opus-agents, fable-agents,
+grok-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 
 This prevents a worker from replacing the selected model or effort through nested delegation.

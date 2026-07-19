@@ -5,11 +5,16 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
-    '                         [--name NAME]' >&2
+    '                         [--effort medium|high|xhigh|max]' \
+    '                         [--name NAME]' \
+    '' \
+    'Note: --effort is accepted for CLI parity with sibling agent skills but is' \
+    'ignored. The Cursor Grok harness has no effort tiers; model is always grok-4.5.' >&2
 }
 
 worktree=''
 prompt_file=''
+effort=''
 name=''
 
 while (($#)); do
@@ -32,6 +37,15 @@ while (($#)); do
       prompt_file=${2-}
       shift 2
       ;;
+    --effort)
+      if (($# < 2)); then
+        printf 'Missing value for --effort\n' >&2
+        usage
+        exit 2
+      fi
+      effort=${2-}
+      shift 2
+      ;;
     --name)
       if (($# < 2)); then
         printf 'Missing value for --name\n' >&2
@@ -52,6 +66,20 @@ while (($#)); do
       ;;
   esac
 done
+
+if [[ -n "$effort" ]]; then
+  case "$effort" in
+    medium|high|xhigh|max)
+      printf '[grok-agents] ignoring --effort %s: Cursor Grok has no effort tiers\n' \
+        "$effort" >&2
+      ;;
+    *)
+      printf 'Invalid effort: %s\n' "$effort" >&2
+      usage
+      exit 2
+      ;;
+  esac
+fi
 
 if [[ "$worktree" != /* || ! -d "$worktree" ]]; then
   printf 'Worktree must be an existing absolute directory: %s\n' "${worktree:-<empty>}" >&2
@@ -121,6 +149,10 @@ launch_args=(
   --worktree "$physical_worktree"
   --prompt-file "$prompt_file"
 )
+
+if [[ -n "$effort" ]]; then
+  launch_args+=(--effort "$effort")
+fi
 
 if [[ -n "$name" ]]; then
   launch_args+=(--name "$name")

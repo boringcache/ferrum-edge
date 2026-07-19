@@ -59,9 +59,12 @@ one long-lived execution session:
   --prompt-file <ABS_PROMPT_FILE>
 ```
 
-The launcher pins `grok-4.5`, verifies the worktree root, loads `CURSOR_API_KEY` from the
-environment or Conductor keychain, and executes through Conductor's bundled Node runtime and
-`@cursor/sdk`. Delete the temporary prompt after the worker exits.
+`--effort medium|high|xhigh|max` is accepted for CLI parity with sibling skills but is ignored —
+the Cursor Grok harness has no effort tiers. Do not claim an effort level was applied.
+
+The launcher pins `grok-4.5` with no model params, verifies the worktree root, loads
+`CURSOR_API_KEY` from the environment or Conductor keychain, and executes through Conductor's
+bundled Node runtime and `@cursor/sdk`. Delete the temporary prompt after the worker exits.
 
 Start each worker in its own long-lived execution session and retain its exact session handle or
 PID. Prefer one tool call per worker so completions and failures remain attributable. Never wrap

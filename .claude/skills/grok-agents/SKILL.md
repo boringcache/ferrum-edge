@@ -25,8 +25,11 @@ prompt file outside the repo, then launch:
   --prompt-file <ABS_PROMPT_FILE>
 ```
 
+`--effort medium|high|xhigh|max` is accepted for CLI parity with sibling skills but is ignored —
+the Cursor Grok harness has no effort tiers. Do not claim an effort level was applied.
+
 Non-negotiables:
-- The launcher pins **`grok-4.5`** through Conductor's bundled Node + `@cursor/sdk`.
+- The launcher pins **`grok-4.5`** (no model params) through Conductor's bundled Node + `@cursor/sdk`.
 - `CURSOR_API_KEY` must be available (env or Conductor provider keychain). Do not print it.
 - Run each dispatch as a **background / long-lived task**; prefer one task per agent.
 - **Parallel cap: 7** unless the user sets a lower limit.
@@ -40,10 +43,8 @@ Every prompt starts with:
 <ABS_REPO>/.agents/skills/grok-agents/references/agent-brief.md and follow them`
 (fix/shepherd — give BOTH absolute paths).
 
-Copies of the briefs also live next to this Claude skill for quick reference:
-[agent-brief.md](agent-brief.md) and [continuation-brief.md](continuation-brief.md). Prefer the
-`.agents/skills/grok-agents/references/` paths in dispatched prompts so workers share one source
-of truth with Codex/GPT orchestrators.
+Use only those `.agents/skills/grok-agents/references/` paths so Claude and Codex/GPT
+orchestrators share one source of truth.
 
 Every prompt must also PIN THE WORKER'S ROLE:
 "YOU are the implementer: write, commit, and push the changes yourself in this session.

@@ -12,6 +12,8 @@
  * Args:
  *   --worktree ABS_PATH
  *   --prompt-file ABS_PATH
+ *   --effort medium|high|xhigh|max  accepted for sibling-skill CLI parity; ignored
+ *                                   (Cursor Grok has no effort tiers)
  *   --name optional agent name
  */
 
@@ -26,34 +28,45 @@ function usage(exitCode = 2) {
   process.stderr.write(
     [
       "Usage: run-cursor-agent.mjs --worktree ABS_PATH --prompt-file ABS_PATH",
-      "                            [--name NAME]",
+      "                            [--effort medium|high|xhigh|max] [--name NAME]",
+      "",
+      "Note: --effort is accepted for CLI parity with sibling agent skills but is",
+      "ignored. The Cursor Grok harness has no effort tiers; model is always grok-4.5.",
       "",
     ].join("\n"),
   );
   process.exit(exitCode);
 }
 
+function requireValue(flag, value) {
+  if (value === undefined || value === "" || value.startsWith("-")) {
+    process.stderr.write(`Missing value for ${flag}\n`);
+    usage(2);
+  }
+  return value;
+}
+
 function parseArgs(argv) {
   const out = {
     worktree: "",
     promptFile: "",
+    effort: "",
     name: "",
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    const next = argv[i + 1];
     switch (arg) {
       case "--worktree":
-        out.worktree = next ?? "";
-        i += 1;
+        out.worktree = requireValue(arg, argv[++i]);
         break;
       case "--prompt-file":
-        out.promptFile = next ?? "";
-        i += 1;
+        out.promptFile = requireValue(arg, argv[++i]);
+        break;
+      case "--effort":
+        out.effort = requireValue(arg, argv[++i]);
         break;
       case "--name":
-        out.name = next ?? "";
-        i += 1;
+        out.name = requireValue(arg, argv[++i]);
         break;
       case "-h":
       case "--help":
@@ -94,6 +107,27 @@ function loadCursorSdk() {
   return require("@cursor/sdk");
 }
 
+function assertAbsolutePath(kind, value, check) {
+  if (!path.isAbsolute(value)) {
+    throw new Error(`${kind} must be an existing absolute ${check}: ${value}`);
+  }
+  let st;
+  try {
+    st = fs.statSync(value);
+  } catch (err) {
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") {
+      throw new Error(`${kind} must be an existing absolute ${check}: ${value}`);
+    }
+    throw err;
+  }
+  if (check === "directory" && !st.isDirectory()) {
+    throw new Error(`${kind} must be an existing absolute directory: ${value}`);
+  }
+  if (check === "file" && !st.isFile()) {
+    throw new Error(`${kind} must be an existing absolute file: ${value}`);
+  }
+}
+
 function textFromContent(content) {
   if (typeof content === "string") {
     return content;
@@ -128,12 +162,24 @@ async function main() {
   if (!args.worktree || !args.promptFile) {
     usage(2);
   }
-  if (!path.isAbsolute(args.worktree) || !fs.statSync(args.worktree).isDirectory()) {
-    throw new Error(`Worktree must be an existing absolute directory: ${args.worktree}`);
+  if (args.effort) {
+    switch (args.effort) {
+      case "medium":
+      case "high":
+      case "xhigh":
+      case "max":
+        process.stderr.write(
+          `[grok-agents] ignoring --effort ${args.effort}: Cursor Grok has no effort tiers\n`,
+        );
+        break;
+      default:
+        process.stderr.write(`Invalid effort: ${args.effort}\n`);
+        usage(2);
+    }
   }
-  if (!path.isAbsolute(args.promptFile) || !fs.statSync(args.promptFile).isFile()) {
-    throw new Error(`Prompt file must be an existing absolute file: ${args.promptFile}`);
-  }
+
+  assertAbsolutePath("Worktree", args.worktree, "directory");
+  assertAbsolutePath("Prompt file", args.promptFile, "file");
 
   const apiKey = process.env.CURSOR_API_KEY?.trim();
   if (!apiKey) {
@@ -167,6 +213,9 @@ async function main() {
     },
   });
 
+  let sawStreamError = false;
+  let streamErrorMessage = "";
+
   try {
     const run = await agent.send(prompt, { model });
     process.stderr.write(`[grok-agents] run started id=${run.id}\n`);
@@ -188,9 +237,9 @@ async function main() {
           process.stderr.write(`[grok-agents:tool] ${toolName} error\n`);
         }
       } else if (event.type === "status" && event.status === "ERROR") {
-        process.stderr.write(
-          `[grok-agents] status error: ${event.message ?? "Cursor agent failed"}\n`,
-        );
+        sawStreamError = true;
+        streamErrorMessage = event.message ?? "Cursor agent failed";
+        process.stderr.write(`[grok-agents] status error: ${streamErrorMessage}\n`);
       }
     }
 
@@ -200,6 +249,9 @@ async function main() {
       `[grok-agents] run finished status=${status} model=${run.model?.id ?? model.id}\n`,
     );
 
+    if (sawStreamError) {
+      throw new Error(streamErrorMessage || "Cursor Grok agent reported a stream ERROR");
+    }
     if (status === "error") {
       throw new Error(run.result ?? result?.result ?? "Cursor Grok agent failed");
     }
@@ -207,12 +259,17 @@ async function main() {
       throw new Error("Cursor Grok agent was cancelled");
     }
   } finally {
-    agent.close();
+    try {
+      agent.close();
+    } catch (closeErr) {
+      const message = closeErr instanceof Error ? closeErr.message : String(closeErr);
+      process.stderr.write(`[grok-agents] agent.close() failed: ${message}\n`);
+    }
   }
 }
 
 main().catch((err) => {
   const message = err instanceof Error ? err.message : String(err);
   process.stderr.write(`[grok-agents] ${message}\n`);
-  process.exit(1);
+  process.exitCode = 1;
 });
