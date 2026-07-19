@@ -4542,18 +4542,36 @@ def opaque_shell_interpolation_variants(
 ) -> tuple[str, ...]:
     """Expose a shell interpolation that can occupy a Cross executable word."""
 
+    shell_interpolation_spans = tuple(
+        match.span() for match in SHELL_INTERPOLATION.finditer(line)
+    )
     # Command substitutions participate in the same word as parameter
     # expansions, so `$(a)${b}` is considered alongside `${a}${b}`.
     spans = tuple(
-        [match.span() for match in SHELL_INTERPOLATION.finditer(line)]
-        + list(command_substitution_spans(line))
+        [*shell_interpolation_spans, *command_substitution_spans(line)]
     )
-    return opaque_executable_variants(
-        line,
-        spans,
-        shell_evaluated=shell_evaluated,
-        starts_command=starts_command,
+    variants = [
+        *opaque_executable_variants(
+            line,
+            spans,
+            shell_evaluated=shell_evaluated,
+            starts_command=starts_command,
+        )
+    ]
+    # A parameter expansion inside `$(...)` can itself be the executable for the
+    # nested shell command (`$("${cmd}" build ...)`). The combined command
+    # substitution span above intentionally treats the whole substitution as one
+    # word for outer-command dispatch, so also test the raw shell interpolation
+    # spans to keep executable slots opened by `$(` visible.
+    variants.extend(
+        opaque_executable_variants(
+            line,
+            shell_interpolation_spans,
+            shell_evaluated=shell_evaluated,
+            starts_command=starts_command,
+        )
     )
+    return tuple(dict.fromkeys(variants))
 
 
 def decode_ansi_c_body(value: str) -> str:
@@ -9515,6 +9533,20 @@ pre_build = []
         "self-test workflow directory",
     ):
         failures.append("benign embedded command substitutions were rejected")
+    opaque_substitution_workflow = safe_extra_workflow.replace(
+        "echo safe",
+        "cmd=$(printf '\\143\\162\\157\\163\\163')\n"
+        '          echo $("${cmd}" build --target aarch64-unknown-linux-gnu)',
+    )
+    if not compare_pr_workflow_collection(
+        {"coverage.yml": safe_extra_workflow},
+        {
+            "coverage.yml": safe_extra_workflow,
+            "attacker.yml": opaque_substitution_workflow,
+        },
+        "self-test workflow directory",
+    ):
+        failures.append("opaque Cross executable in command substitution was not rejected")
     if compare_pr_workflow_collection(
         {"coverage.yml": safe_extra_workflow},
         {
