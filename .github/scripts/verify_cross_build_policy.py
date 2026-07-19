@@ -822,6 +822,7 @@ CI_MAIN_PUBLISH_GATE_JOB = r"""  main-publish-gate:
       actions: read
     steps:
       - name: Wait for dedicated release checks
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -951,6 +952,15 @@ PUBLISH_EXACT_JOB_CONTRACTS = {
     "CI workflow": {
         "main-publish-gate": CI_MAIN_PUBLISH_GATE_JOB,
     },
+}
+
+# Workflow-level run defaults are inherited by every publishing shell step. A
+# custom default such as a shell wrapper ending in `|| true` could change the
+# failure semantics of otherwise frozen jobs, so protected publication
+# workflows must keep this mapping absent.
+PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS = {
+    "CI workflow": ("defaults",),
+    "release workflow": ("defaults",),
 }
 
 # The publication-control fields that gate the protected ARM64 artifacts are
@@ -2917,6 +2927,19 @@ def digest_artifact_ownership_errors(contents: str, source: str) -> list[str]:
 def validate_publish_control_contract(contents: str, source: str) -> list[str]:
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
     errors: list[str] = []
+    for key_name in PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS.get(source, ()):
+        block, failures = extract_top_level_block(
+            contents,
+            source,
+            key_name,
+            required=False,
+        )
+        errors.extend(failures)
+        if not failures and block is not None:
+            errors.append(
+                f"{source} must not define top-level {key_name!r}; protected "
+                "publication jobs may not inherit workflow run defaults"
+            )
     for job_name, expected in PUBLISH_EXACT_JOB_CONTRACTS.get(source, {}).items():
         actual, failures = extract_job_block(
             contents,
@@ -2981,6 +3004,27 @@ def compare_pr_publish_control_contract(
 ) -> list[str]:
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
     errors: list[str] = []
+    for key_name in PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS.get(source, ()):
+        baseline, baseline_failures = extract_top_level_block(
+            merge_base_contents,
+            f"merge-base {source}",
+            key_name,
+            required=False,
+        )
+        proposed, proposed_failures = extract_top_level_block(
+            proposed_contents,
+            f"proposed {source}",
+            key_name,
+            required=False,
+        )
+        errors.extend(baseline_failures)
+        errors.extend(proposed_failures)
+        if not baseline_failures and not proposed_failures:
+            if baseline != proposed:
+                errors.append(
+                    f"{source} top-level {key_name!r} cannot be changed by a "
+                    "pull request because protected publication jobs inherit it"
+                )
     for job_name in PUBLISH_EXACT_JOB_CONTRACTS.get(source, {}):
         baseline, baseline_failures = extract_job_block(
             merge_base_contents,
@@ -17796,6 +17840,10 @@ pre_build = []
             "    runs-on: ubuntu-latest\n",
             "    runs-on: ubuntu-latest\n    continue-on-error: true\n",
         ),
+        "publish gate shell changed": (
+            "        shell: bash\n",
+            "        shell: python\n",
+        ),
         "publish gate retry weakened": (
             "              for attempt in 1 2 3; do\n",
             "              for attempt in 1; do\n",
@@ -17814,6 +17862,25 @@ pre_build = []
             "CI workflow",
         ):
             failures.append(f"{label} was allowed by the merge-base comparison")
+
+    inherited_run_defaults = publish_workflow.replace(
+        "jobs:\n",
+        "defaults:\n  run:\n    shell: python\njobs:\n",
+        1,
+    )
+    if not validate_publish_control_contract(
+        inherited_run_defaults,
+        "CI workflow",
+    ):
+        failures.append("inherited publication run defaults were not rejected")
+    if not compare_pr_publish_control_contract(
+        publish_workflow,
+        inherited_run_defaults,
+        "CI workflow",
+    ):
+        failures.append(
+            "inherited publication run defaults were allowed by the comparison"
+        )
 
     # The Docker jobs never name the ARM64 artifact literally, so repointing the
     # `linux/arm64` matrix row or rewriting either consuming step would publish

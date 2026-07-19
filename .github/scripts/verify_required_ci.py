@@ -138,7 +138,7 @@ MAIN_PUBLISH_WORKFLOWS = {
 # Cross verifier independently freezes this complete job, so changing either
 # the implementation or this diagnostic digest requires a trusted-base update.
 MAIN_PUBLISH_GATE_SHA256 = (
-    "940043d915ff213230b679ca3ea9b1165c06dbc757b26b9473494f841f5220df"
+    "51d93dead7e8337df4cd85a8c034d11436ee8d1935d8e6b2e58509c5e7da8fb4"
 )
 
 
