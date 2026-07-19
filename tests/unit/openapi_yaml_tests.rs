@@ -934,8 +934,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     );
     let built_in_enum = json!(["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"]);
     assert_eq!(
-        spec["components"]["schemas"]["BuiltInCredentialType"]["enum"],
-        built_in_enum,
+        spec["components"]["schemas"]["BuiltInCredentialType"]["enum"], built_in_enum,
         "BuiltInCredentialType must match ALLOWED_CREDENTIAL_TYPES"
     );
     for operation in ["put", "post"] {
@@ -1037,12 +1036,7 @@ fn consumer_update_surface_accepts_redaction_placeholders_and_reserves_them() {
     // real keyauth input and backup schemas to exclude the placeholder
     // explicitly. Redacted/update-marker alternatives keep accepting it.
     for real_keyauth in ["KeyAuthCredential", "KeyAuthCredentialBackup"] {
-        assert_component_validity(
-            &spec,
-            real_keyauth,
-            &json!({"key": "[REDACTED]"}),
-            false,
-        );
+        assert_component_validity(&spec, real_keyauth, &json!({"key": "[REDACTED]"}), false);
         assert_eq!(
             spec["components"]["schemas"][real_keyauth]["properties"]["key"]["not"]["const"],
             json!("[REDACTED]"),
