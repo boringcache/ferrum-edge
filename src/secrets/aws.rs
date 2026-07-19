@@ -59,29 +59,26 @@ async fn fetch_with_client(
         .await
         .map_err(|e| format!("Failed to fetch {} from AWS Secrets Manager: {}", key, e))?;
 
+    // Errors name the base key and the failure class only — the secret id/ARN
+    // and JSON field are the source reference and are treated as sensitive.
+    // The registry additionally redacts any residual occurrence echoed back by
+    // the SDK error itself. The `serde_json` detail is dropped here because it
+    // quotes the surrounding document, which is the secret material.
     let secret_string = resp
         .secret_string()
-        .ok_or_else(|| {
-            format!(
-                "AWS secret '{}' for {} is binary (not a string secret)",
-                secret_id, key
-            )
-        })?
+        .ok_or_else(|| format!("AWS secret for {} is binary (not a string secret)", key))?
         .to_string();
 
     match json_key {
         Some(jk) => {
-            let parsed: serde_json::Value = serde_json::from_str(&secret_string).map_err(|e| {
+            let parsed: serde_json::Value = serde_json::from_str(&secret_string).map_err(|_| {
                 format!(
-                    "AWS secret '{}' for {} is not valid JSON (needed for #{}): {}",
-                    secret_id, key, jk, e
+                    "AWS secret for {} is not valid JSON (needed for the #<json_key> suffix)",
+                    key
                 )
             })?;
             let field = parsed.get(jk).ok_or_else(|| {
-                format!(
-                    "AWS secret '{}' does not contain key '{}' for {}",
-                    secret_id, jk, key
-                )
+                format!("AWS secret for {} does not contain the requested key", key)
             })?;
             // Use the string value directly if available, otherwise convert
             // non-string JSON values (numbers, booleans) to their string form.

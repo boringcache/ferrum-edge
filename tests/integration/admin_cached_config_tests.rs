@@ -1379,10 +1379,6 @@ async fn malformed_pagination_is_ignored_by_non_paginated_routes() {
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    let (status, body, _) = admin_get(&base_url, "/namespaces?limit=abc", &token).await;
-    assert_eq!(status, 200, "namespaces must ignore limit: {body:?}");
-    assert!(body.is_array());
-
     let (status, body, _) = admin_get(&base_url, "/backup?limit=abc", &token).await;
     assert_eq!(status, 200, "backup must ignore limit: {body:?}");
     assert_eq!(body["counts"]["proxies"], 5);
@@ -1390,6 +1386,165 @@ async fn malformed_pagination_is_ignored_by_non_paginated_routes() {
     let (status, body, _) = admin_get(&base_url, "/cluster?offset=-1", &token).await;
     assert_eq!(status, 200, "cluster must ignore offset: {body:?}");
     assert_eq!(body["mode"], "test");
+}
+
+// ---- /namespaces pagination tests ----
+
+/// Admin state backed by a real (SQLite) database seeded with one upstream
+/// per namespace, so `GET /namespaces` takes the database-paginated path
+/// instead of the cached-config fallback.
+async fn create_seeded_db_admin_state(
+    tc: &TestConfig,
+    db_url: &str,
+    namespaces: &[&str],
+) -> AdminState {
+    let store = ferrum_edge::config::db_loader::DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        db_url,
+        ferrum_edge::config::db_loader::DbPoolConfig::default(),
+    )
+    .await
+    .expect("connect sqlite store");
+    for namespace in namespaces {
+        sqlx::query("INSERT INTO upstreams (id, namespace, name, targets) VALUES (?, ?, ?, '[]')")
+            .bind(format!("{namespace}-upstream"))
+            .bind(namespace)
+            .bind(format!("{namespace}-name"))
+            .execute(&store.pool())
+            .await
+            .unwrap();
+    }
+    AdminState {
+        db: Some(Arc::new(store)),
+        jwt_manager: create_test_jwt_manager(tc),
+        metrics_auth: Default::default(),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        admin_audit_enabled: false,
+        admin_require_namespace_claim: false,
+        startup_ready: None,
+        serving_degraded: None,
+        serving_listener_failures: None,
+        db_available: None,
+        config_rejected: None,
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
+        admin_tls_handshake_timeout_seconds: 10,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    }
+}
+
+fn namespaces_db_url(dir: &tempfile::TempDir) -> String {
+    let db_path = dir.path().join("namespaces.db");
+    format!("sqlite:{}?mode=rwc", db_path.to_string_lossy())
+}
+
+#[tokio::test]
+async fn test_list_namespaces_returns_paginated_envelope() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_url = namespaces_db_url(&temp_dir);
+    let state = create_seeded_db_admin_state(&tc, &db_url, &["zeta", "alpha", "middle"]).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/namespaces", &token).await;
+    assert_eq!(status, 200);
+    let data = body["data"].as_array().expect("namespaces data array");
+    let names: Vec<&str> = data.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(names, ["alpha", "middle", "zeta"]);
+    assert_eq!(body["pagination"]["offset"], 0);
+    assert_eq!(body["pagination"]["limit"], 100);
+    assert_eq!(body["pagination"]["total"], 3);
+}
+
+#[tokio::test]
+async fn test_list_namespaces_with_pagination() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_url = namespaces_db_url(&temp_dir);
+    let state = create_seeded_db_admin_state(&tc, &db_url, &["zeta", "alpha", "middle"]).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/namespaces?limit=2&offset=2", &token).await;
+    assert_eq!(status, 200);
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0], "zeta");
+    assert_eq!(body["pagination"]["offset"], 2);
+    assert_eq!(body["pagination"]["limit"], 2);
+    assert_eq!(body["pagination"]["total"], 3);
+
+    // An offset beyond the total is a valid empty page, not an error.
+    let (status, body, _) = admin_get(&base_url, "/namespaces?offset=100&limit=10", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert_eq!(body["pagination"]["total"], 3);
+
+    // `0` keeps the documented "server default" meaning.
+    let (status, body, _) = admin_get(&base_url, "/namespaces?limit=0", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["pagination"]["limit"], 100);
+    assert_eq!(body["data"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn test_list_namespaces_malformed_pagination_rejected() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_url = namespaces_db_url(&temp_dir);
+    let state = create_seeded_db_admin_state(&tc, &db_url, &["alpha"]).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/namespaces?limit=abc", &token).await;
+    assert_eq!(status, 400, "malformed limit must be rejected: {body:?}");
+
+    let (status, body, _) = admin_get(&base_url, "/namespaces?offset=-1", &token).await;
+    assert_eq!(status, 400, "negative offset must be rejected: {body:?}");
+}
+
+#[tokio::test]
+async fn test_list_namespaces_cached_config_branch_paginates_in_memory() {
+    let tc = TestConfig::default();
+    let mut config = create_pagination_test_config();
+    config.known_namespaces = vec![
+        "ferrum".to_string(),
+        "prod".to_string(),
+        "staging".to_string(),
+    ];
+    let mut state = create_pagination_admin_state(&tc);
+    state.cached_config = Some(Arc::new(ArcSwap::new(Arc::new(config))));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/namespaces?limit=2", &token).await;
+    assert_eq!(status, 200);
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+    assert_eq!(body["pagination"]["limit"], 2);
+    assert_eq!(body["pagination"]["total"], 3);
+
+    let (status, body, _) = admin_get(&base_url, "/namespaces?limit=abc", &token).await;
+    assert_eq!(
+        status, 400,
+        "the cached-config branch shares the route's pagination contract: {body:?}"
+    );
 }
 
 #[tokio::test]

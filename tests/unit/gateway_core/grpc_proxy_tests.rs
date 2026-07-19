@@ -1353,6 +1353,116 @@ fn buffered_policy_state_preserves_body_transform_validator_removal() {
     );
 }
 
+/// Drive the production ordering of the buffered gRPC rewrite phase for a
+/// policy-owned header whose name the backend supplied ONLY as an application
+/// trailer. Recording later mutations must happen before the stale
+/// compatibility-view trailer is retired; the reverse order makes the discard
+/// look like an intentional later removal and silently drops the gateway value.
+#[test]
+fn policy_header_survives_trailer_retirement_after_body_rewrite() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": { "X-Security-Policy": "gateway-enforced" }
+        }))
+        .unwrap(),
+    );
+    let backend_headers = HashMap::new();
+    let mut wire_trailers = grpc_map(&[
+        ("x-security-policy", "backend-trailer-value"),
+        ("grpc-status", "0"),
+    ]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &wire_trailers);
+    assert_eq!(
+        plugin_view.get("x-security-policy").map(String::as_str),
+        Some("backend-trailer-value"),
+        "a trailer-only key is merged into the buffered hook view"
+    );
+
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
+    policy.apply_initial_response_header_policy(&mut plugin_view);
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+
+    // Production ordering: record genuine transform edits, then retire the
+    // stale compatibility-view trailer copies.
+    policy_state.record_later_response_header_mutations(&mut plugin_view);
+    grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+        &mut plugin_view,
+        &mut wire_trailers,
+        &shadowed,
+    );
+
+    let mut final_initial_headers = backend_headers.clone();
+    policy_state.apply_to_initial_headers(&mut final_initial_headers);
+    assert_eq!(
+        final_initial_headers
+            .get("x-security-policy")
+            .map(String::as_str),
+        Some("gateway-enforced"),
+        "the configured policy value must remain in initial HEADERS even when \
+         the backend supplied the same name only as an application trailer"
+    );
+    assert!(
+        !wire_trailers.contains_key("x-security-policy"),
+        "the stale application-trailer copy must still be retired"
+    );
+    assert_eq!(
+        wire_trailers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "reserved terminal metadata stays on the terminal channel"
+    );
+}
+
+/// The ordering fix must not resurrect a header a body transform genuinely
+/// removed, even when the backend also sent that name as an application trailer.
+#[test]
+fn body_transform_removal_beats_policy_when_backend_sent_a_trailer_copy() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": { "X-Security-Policy": "gateway-enforced" }
+        }))
+        .unwrap(),
+    );
+    let backend_headers = HashMap::new();
+    let mut wire_trailers = grpc_map(&[("x-security-policy", "backend-trailer-value")]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &wire_trailers);
+
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
+    policy.apply_initial_response_header_policy(&mut plugin_view);
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+
+    // A body transform intentionally drops the policy-owned header.
+    plugin_view.remove("x-security-policy");
+    policy_state.record_later_response_header_mutations(&mut plugin_view);
+    grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+        &mut plugin_view,
+        &mut wire_trailers,
+        &shadowed,
+    );
+
+    let mut final_initial_headers = backend_headers.clone();
+    policy_state.apply_to_initial_headers(&mut final_initial_headers);
+    assert!(
+        !final_initial_headers.contains_key("x-security-policy"),
+        "an intentional later removal stays authoritative and is not restored"
+    );
+    assert!(
+        !wire_trailers.contains_key("x-security-policy"),
+        "the application-trailer copy is retired alongside the removal"
+    );
+}
+
 #[test]
 fn buffered_policy_overlay_preserves_transform_owned_content_length() {
     let policy: Arc<dyn Plugin> = Arc::new(

@@ -409,7 +409,7 @@ fn build_tls_connector(
         let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
         let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
             .map_err(|e| format!("ws_logging: failed to load CA bundle: {e}"))?;
-        let source_id = ca_material.source_id.clone();
+        let source_id = ca_material.display_source_id.clone();
         let mut cursor = std::io::Cursor::new(ca_material.bytes.expose_secret());
         for cert in rustls_pemfile::certs(&mut cursor).flatten() {
             root_store.add(cert).map_err(|e| {

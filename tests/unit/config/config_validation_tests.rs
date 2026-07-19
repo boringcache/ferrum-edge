@@ -493,8 +493,9 @@ fn test_redact_consumer_object_format_basicauth_omitted() {
 }
 
 #[test]
-fn test_redact_consumer_entry_without_target_field_unchanged() {
-    // If a jwt entry doesn't have a "secret" key, it's left alone
+fn test_redact_consumer_legacy_jwt_entry_is_canonicalized() {
+    // Legacy JWT fields are never echoed into the closed ordinary-response
+    // projection, even when the old entry has no secret field.
     let mut consumer = make_consumer("c1", "alice");
     consumer.credentials.insert(
         "jwt".into(),
@@ -503,12 +504,26 @@ fn test_redact_consumer_entry_without_target_field_unchanged() {
     let redacted = redact_consumer_credentials(&consumer);
     let jwt = redacted.credentials.get("jwt").unwrap();
     let entry = jwt[0].as_object().unwrap();
-    assert_eq!(entry.get("algorithm").unwrap().as_str().unwrap(), "HS256");
-    assert_eq!(
-        entry.get("issuer").unwrap().as_str().unwrap(),
-        "example.com"
+    assert_eq!(entry.len(), 1);
+    assert_eq!(entry.get("secret"), Some(&serde_json::json!("[REDACTED]")));
+    assert!(!entry.contains_key("algorithm"));
+    assert!(!entry.contains_key("issuer"));
+}
+
+#[test]
+fn test_redact_consumer_omits_unknown_credential_values() {
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "custom_auth".into(),
+        serde_json::json!([{
+            "api_token": "must-not-cross-the-ordinary-response-boundary",
+            "metadata": {"nested_secret": "also-must-not-cross"}
+        }]),
     );
-    assert!(entry.get("secret").is_none());
+
+    let redacted = redact_consumer_credentials(&consumer);
+    assert!(!redacted.credentials.contains_key("custom_auth"));
+    assert!(consumer.credentials.contains_key("custom_auth"));
 }
 
 #[test]

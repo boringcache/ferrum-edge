@@ -4501,15 +4501,13 @@ impl AdminResource for Consumer {
     }
 
     fn prepare_for_update(&mut self, existing: &Self) {
-        // Ordinary Consumer responses omit Basic credentials entirely. Preserve
-        // them when a client round-trips that response through PUT; explicit
-        // credential replacement and deletion use the credential endpoints.
-        if !self.credentials.contains_key("basicauth")
-            && let Some(basic_credentials) = existing.credentials.get("basicauth")
-        {
-            self.credentials
-                .insert("basicauth".to_string(), basic_credentials.clone());
-        }
+        // Ordinary Consumer responses are a closed credential projection, so a
+        // read-modify-write PUT of such a response cannot express the state it
+        // was never shown. Restore what the projection hides — Basic and
+        // unknown/custom credential types omitted entirely, and known secrets
+        // returned as the `[REDACTED]` placeholder. Explicit replacement and
+        // deletion use the credential endpoints.
+        crate::config::types::preserve_response_hidden_consumer_credentials(self, existing);
     }
 
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {

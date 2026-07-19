@@ -36,10 +36,3 @@ Resume procedure, in order:
 5. Then continue the normal loop: verify each unresolved codex finding in code, fix or rebut
    with evidence, fmt, commit, push, post exactly ONE `@codex review` summarizing dispositions,
    wait/poll, repeat until codex is clean AND CI is green. Report final state.
-
-## REVIEW BOT STATUS (updated 2026-07-10, later)
-Codex credits are RESTORED — the default review trigger is `@codex review` again
-(bot login `chatgpt-codex-connector`; clean verdict = "Didn't find any major issues").
-Reviews from the Claude GitHub app (`@claude review`, login `claude`) may also exist in a
-PR's history — treat BOTH bots' threads as review state; resolve/rebut findings from either.
-One trigger per round, only after pushing.

@@ -126,23 +126,22 @@ async fn fetch_with_credential(
         azure_security_keyvault_secrets::SecretClient::new(&vault_url, credential.clone(), None)
             .map_err(|e| format!("Failed to create Azure Key Vault client for {}: {}", key, e))?;
 
-    let response = client.get_secret(&secret_name, None).await.map_err(|e| {
-        format!(
-            "Failed to get Azure secret '{}' for {}: {}",
-            secret_name, key, e
-        )
-    })?;
+    // Errors name the base key and the failure class only — the vault URL and
+    // secret name are the source reference and are treated as sensitive. The
+    // registry additionally redacts any residual occurrence echoed back by the
+    // SDK error itself.
+    let response = client
+        .get_secret(&secret_name, None)
+        .await
+        .map_err(|e| format!("Failed to get Azure secret for {}: {}", key, e))?;
 
-    let secret = response.into_model().map_err(|e| {
-        format!(
-            "Failed to parse Azure secret '{}' for {}: {}",
-            secret_name, key, e
-        )
-    })?;
+    let secret = response
+        .into_model()
+        .map_err(|e| format!("Failed to parse Azure secret for {}: {}", key, e))?;
 
     secret
         .value
-        .ok_or_else(|| format!("Azure secret '{}' for {} has no value", secret_name, key))
+        .ok_or_else(|| format!("Azure secret for {} has no value", key))
 }
 
 /// A [`TokenCredential`] backed by a fixed, pre-acquired bearer token.

@@ -69,24 +69,28 @@ async fn fetch_with_client(
     let parts: Vec<&str> = path.splitn(3, '/').collect();
     if parts.len() < 3 || parts[1] != "data" {
         return Err(format!(
-            "Invalid Vault KV v2 reference for {}: '{}'. \
+            "Invalid Vault KV v2 reference for {}. \
              Expected format: <mount>/data/<path>#<json_key>",
-            key, reference
+            key
         ));
     }
     let mount = parts[0];
     let secret_path = parts[2];
 
+    // Errors name the base key and the failure class only. The Vault path and
+    // JSON field are part of the source reference, which is as sensitive as the
+    // value it points at; the registry additionally redacts any residual
+    // occurrence that leaks out of `vaultrs` itself.
     let secret: std::collections::HashMap<String, String> =
         vaultrs::kv2::read(client, mount, secret_path)
             .await
-            .map_err(|e| format!("Failed to read {} from Vault path '{}': {}", key, path, e))?;
+            .map_err(|e| format!("Failed to read {} from Vault: {}", key, e))?;
 
     match json_key {
         Some(jk) => secret.get(jk).cloned().ok_or_else(|| {
             format!(
-                "Vault secret at '{}' does not contain key '{}' for {}",
-                path, jk, key
+                "Vault secret for {} does not contain the requested key",
+                key
             )
         }),
         None => {
@@ -94,9 +98,8 @@ async fn fetch_with_client(
             // non-deterministic results from HashMap iteration order.
             if secret.len() != 1 {
                 return Err(format!(
-                    "Vault secret at '{}' for {} contains {} keys — \
+                    "Vault secret for {} contains {} keys — \
                      specify which key to use with #<json_key> suffix",
-                    path,
                     key,
                     secret.len()
                 ));
@@ -104,7 +107,7 @@ async fn fetch_with_client(
             secret
                 .into_values()
                 .next()
-                .ok_or_else(|| format!("Vault secret at '{}' is empty for {}", path, key))
+                .ok_or_else(|| format!("Vault secret for {} is empty", key))
         }
     }
 }

@@ -312,6 +312,12 @@ fn buffered_h3_deadline_replacements_keep_grpc_web_wire_flavor() {
     assert!(replacement.contains("replace_buffered_h3_response_with_grpc_deadline("));
 }
 
+// Buffered response-body policy enforcement across encoded, partial, and
+// non-parseable representations is covered behaviorally — by driving the real
+// shared transform phase with a real `response_transformer` — in
+// `gateway_core::response_representation_tests`. Source-text assertions were
+// removed: they passed while the runtime still forwarded protected bytes.
+
 #[test]
 fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");

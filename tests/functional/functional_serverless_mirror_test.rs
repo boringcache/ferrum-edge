@@ -529,24 +529,21 @@ upstreams: []
         .send()
         .await
         .expect("partial response request failed");
-    assert_eq!(partial.status().as_u16(), 206);
-    assert_eq!(
-        partial
-            .headers()
-            .get("content-range")
-            .and_then(|value| value.to_str().ok()),
-        Some("bytes 0-51/100")
-    );
-    assert_eq!(
-        partial
-            .headers()
-            .get("etag")
-            .and_then(|value| value.to_str().ok()),
-        Some("\"partial-v1\"")
-    );
+    // This proxy configures a `response_transformer` body rule over JSON, so the
+    // shared representation gate claims every JSON response here — including this
+    // `206`. The gateway cannot fetch the remaining ranges, so it cannot prove the
+    // configured rule applied to the complete resource: the fragment is rejected
+    // rather than forwarded with the rule silently unapplied. Forwarding it is the
+    // bypass GHSA-62h9-7rm5-7vqm describes, and the fragment's own range/validator
+    // metadata must not survive onto the replacement response.
+    assert_eq!(partial.status().as_u16(), 502);
+    assert!(!partial.headers().contains_key("content-range"));
+    assert!(!partial.headers().contains_key("etag"));
     let partial_body = partial.text().await.unwrap();
-    assert!(partial_body.contains("serverless-function"));
-    assert!(!partial_body.contains("gateway-rewritten"));
+    assert!(
+        !partial_body.contains("serverless-function"),
+        "the uninspectable fragment body must not reach the client: {partial_body}"
+    );
     assert_eq!(function_invocations.load(Ordering::SeqCst), 4);
 
     let delta = client
@@ -554,31 +551,17 @@ upstreams: []
         .send()
         .await
         .expect("delta response request failed");
-    assert_eq!(delta.status().as_u16(), 226);
-    assert_eq!(
-        delta
-            .headers()
-            .get("im")
-            .and_then(|value| value.to_str().ok()),
-        Some("diffe")
-    );
-    assert_eq!(
-        delta
-            .headers()
-            .get("delta-base")
-            .and_then(|value| value.to_str().ok()),
-        Some("\"delta-v1\"")
-    );
-    assert_eq!(
-        delta
-            .headers()
-            .get("etag")
-            .and_then(|value| value.to_str().ok()),
-        Some("\"delta-v2\"")
-    );
+    // Same contract for a `226` delta: the gateway does not apply the delta, so it
+    // cannot produce the complete resource the configured rule was written for.
+    assert_eq!(delta.status().as_u16(), 502);
+    assert!(!delta.headers().contains_key("im"));
+    assert!(!delta.headers().contains_key("delta-base"));
+    assert!(!delta.headers().contains_key("etag"));
     let delta_body = delta.text().await.unwrap();
-    assert!(delta_body.contains("serverless-function"));
-    assert!(!delta_body.contains("gateway-rewritten"));
+    assert!(
+        !delta_body.contains("serverless-function"),
+        "the uninspectable delta body must not reach the client: {delta_body}"
+    );
     assert_eq!(function_invocations.load(Ordering::SeqCst), 5);
 
     let governed_partial = client
@@ -604,6 +587,12 @@ upstreams: []
     let governed_delta_body = governed_delta.text().await.unwrap();
     assert!(!governed_delta_body.contains("sk-SECRET123"));
     assert_eq!(function_invocations.load(Ordering::SeqCst), 7);
+
+    // Unprotected fragment pass-through (a `206`/`226` no configured body policy
+    // claims) is proven in `tests/unit/gateway_core/response_representation_tests.rs`
+    // rather than here: every plugin on this proxy is a governing one, and
+    // `ai_response_guard` independently fails closed on a non-JSON body, so this
+    // proxy cannot express an unclaimed response.
 
     let _ = gw.kill();
     let _ = gw.wait();

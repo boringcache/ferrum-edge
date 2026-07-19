@@ -1256,25 +1256,36 @@ pub fn load_dtls_certificate(
     let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert).map_err(|e| {
         anyhow::anyhow!(
             "Failed to load DTLS cert {}: {}",
-            cert_source.source_id(),
+            cert_source.redacted_source_id(),
             e
         )
     })?;
     let key_material = load_material_blocking(&key_source, MaterialKind::Key).map_err(|e| {
-        anyhow::anyhow!("Failed to load DTLS key {}: {}", key_source.source_id(), e)
+        anyhow::anyhow!(
+            "Failed to load DTLS key {}: {}",
+            key_source.redacted_source_id(),
+            e
+        )
     })?;
 
     // Parse PEM to DER
     let mut cert_reader = cert_material.bytes.expose_secret();
     let cert_der = rustls_pemfile::certs(&mut cert_reader)
         .next()
-        .ok_or_else(|| anyhow::anyhow!("No certificate found in {}", cert_material.source_id))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No certificate found in {}",
+                cert_material.display_source_id
+            )
+        })?
         .map_err(|e| anyhow::anyhow!("Failed to parse certificate PEM: {}", e))?;
 
     let mut key_reader = key_material.bytes.expose_secret();
     let key_der = rustls_pemfile::private_key(&mut key_reader)
         .map_err(|e| anyhow::anyhow!("Failed to parse private key PEM: {}", e))?
-        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_material.source_id))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("No private key found in {}", key_material.display_source_id)
+        })?;
 
     // SAFETY: dimpl::DtlsCertificate stores `private_key` as plain Vec<u8>
     // without zeroize-on-drop. Unlike the kTLS path (which uses
@@ -1290,8 +1301,13 @@ pub fn load_dtls_certificate(
 /// Load a rustls root store from a PEM file.
 pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore, anyhow::Error> {
     let source = CertSource::parse(pem_path, MaterialKind::CaBundle);
-    let material = load_material_blocking(&source, MaterialKind::CaBundle)
-        .map_err(|e| anyhow::anyhow!("Failed to load PEM source {}: {}", source.source_id(), e))?;
+    let material = load_material_blocking(&source, MaterialKind::CaBundle).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load PEM source {}: {}",
+            source.redacted_source_id(),
+            e
+        )
+    })?;
     let mut certs = Vec::new();
     let mut parse_errors = 0usize;
     let mut reader = material.bytes.expose_secret();
@@ -1301,7 +1317,7 @@ pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore,
             Err(err) => {
                 parse_errors += 1;
                 tracing::warn!(
-                    pem_path = %material.source_id,
+                    pem_path = %material.display_source_id,
                     error = %err,
                     "Skipping unparsable certificate while loading DTLS CA bundle"
                 );
@@ -1313,7 +1329,7 @@ pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore,
     if added == 0 {
         return Err(anyhow::anyhow!(
             "No valid certificates found in DTLS CA file {} (ignored: {}, parse_errors: {})",
-            material.source_id,
+            material.display_source_id,
             ignored,
             parse_errors
         ));
