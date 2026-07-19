@@ -293,6 +293,20 @@ pub(crate) const STRONG_ETAG_RESPONSE_METADATA_KEY: &str = "ferrum:strong_etag_r
 pub(crate) const ORIGINAL_RESPONSE_METADATA_STAMPED_KEY: &str =
     "ferrum:original_response_metadata_stamped";
 
+/// The original backend response `Content-Type`, captured before any
+/// `after_proxy` hook could rewrite it.
+///
+/// The representation gate decides which body policy claims a response from the
+/// media type, and it runs after `after_proxy`. A header rule that removes or
+/// relabels a framed gRPC response's `Content-Type` would otherwise push it onto
+/// the untyped/JSON branch, where a JSON body policy claims its length-prefixed
+/// frames, fails to parse them as a bare document, and replaces a valid RPC
+/// reply with a `502`. Reading the media type from this snapshot — the same
+/// discipline already applied to encoding and range/delta state — is what keeps
+/// that relabel from changing which policy claims the bytes.
+pub(crate) const ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY: &str =
+    "ferrum:original_response_content_type";
+
 /// Parsed `Content-Length` from the original backend response. Body transforms
 /// use this snapshot when a later gateway plugin (notably `compression`)
 /// removes the wire header before the buffered-body phase.
@@ -383,6 +397,38 @@ pub(crate) fn content_encoding_declares_non_identity(value: &str) -> bool {
 }
 
 pub(crate) fn stamp_original_request_metadata(ctx: &mut RequestContext) {
+    // Capture the client's original `Accept-Encoding` before any `before_proxy`
+    // hook can rewrite it. `request_transformer` (priority 3000) can remove or
+    // replace the header before `compression` (priority 4050) takes its own
+    // snapshot, and `compression` then strips it from the backend request, so
+    // neither the live header map nor compression's metadata still proves what
+    // the client negotiated by the time the buffered representation gate asks.
+    // An explicit `identity;q=0` erased here would let a protected encoded
+    // response be decoded and served in a representation the client refused.
+    //
+    // Multiple field-lines are folded with `, ` exactly as the list-header
+    // grammar defines, so a split `Accept-Encoding` cannot hide a member. The
+    // raw map is authoritative and available here (`set_raw_headers` runs
+    // immediately before this call); the materialized map is the fallback for
+    // paths that already consumed the raw headers.
+    //
+    // A present-but-EMPTY field value is recorded as such rather than collapsed
+    // onto "absent": RFC 9110 §12.5.3 gives them different meanings (an empty
+    // field admits only `identity`, an absent one places no constraint), so the
+    // snapshot must preserve the distinction even though both currently accept
+    // identity.
+    let original_accept_encoding = {
+        let raw: Vec<&str> = ctx.raw_header_values("accept-encoding").collect();
+        if raw.is_empty() {
+            ctx.headers.get("accept-encoding").cloned()
+        } else {
+            Some(raw.join(", "))
+        }
+    };
+    if let Some(original_accept_encoding) = original_accept_encoding {
+        ctx.set_original_accept_encoding(original_accept_encoding);
+    }
+
     let raw_has_no_transform = ctx
         .raw_header_values("cache-control")
         .any(|value| cache_control_has_directive(value, "no-transform"));
@@ -424,6 +470,14 @@ pub(crate) fn stamp_original_response_metadata(
         "true".to_string(),
     );
     ctx.metadata
+        .remove(ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY);
+    if let Some(content_type) = response_headers.get("content-type") {
+        ctx.metadata.insert(
+            ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
+            content_type.clone(),
+        );
+    }
+    ctx.metadata
         .remove(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY);
     if let Some(content_length) = response_headers
         .get("content-length")
@@ -435,12 +489,21 @@ pub(crate) fn stamp_original_response_metadata(
         );
     }
     ctx.metadata.remove(ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
-    if let Some(encoding) = response_headers.get("content-encoding").filter(|encoding| {
-        encoding
-            .split(',')
-            .map(str::trim)
-            .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
-    }) {
+    // A field that is not a list of pure `identity` tokens is stamped, so the
+    // representation gate can judge it. That deliberately includes a MALFORMED
+    // list (`,`, `identity,`): an empty token cannot be proven to describe
+    // identity-coded bytes, and skipping the stamp would let a protected
+    // response be inspected as though it carried no coding at all. Pure
+    // `identity` stays unstamped, so no consumer of this key sees an
+    // unencoded response as encoded.
+    if let Some(encoding) = response_headers
+        .get("content-encoding")
+        .filter(|encoding| {
+            crate::plugins::response_representation::content_encoding_requires_decode_judgment(
+                encoding.as_str(),
+            )
+        })
+    {
         ctx.metadata.insert(
             ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
             encoding.clone(),
@@ -2674,6 +2737,7 @@ pub(crate) fn effective_request_body_limit(
 pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove("request_body");
     metadata.remove(ORIGINAL_RESPONSE_METADATA_STAMPED_KEY);
+    metadata.remove(ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY);
     metadata.remove(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY);
     metadata.remove(ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
     // ai_tool_governor uses these request-scoped markers to select the

@@ -1559,6 +1559,17 @@ pub mod _test_support {
         );
     }
 
+    /// Run the proxy's real request-init stamp over a context whose raw wire
+    /// headers are already set, exactly as the H1/H2 and H3 handlers do
+    /// immediately after `set_raw_headers` and before any `before_proxy` hook.
+    ///
+    /// Tests drive the production snapshotter rather than a setter so the
+    /// pristine `Accept-Encoding` a test asserts on is the one the gateway would
+    /// actually have captured.
+    pub fn stamp_original_request_metadata_for_test(ctx: &mut crate::plugins::RequestContext) {
+        crate::proxy::stamp_original_request_metadata(ctx);
+    }
+
     pub fn retain_grpc_web_client_content_type_for_test(
         ctx: &mut crate::plugins::RequestContext,
         content_type: &str,

@@ -481,6 +481,68 @@ impl ResponseTransformer {
     }
 }
 
+/// Whether these bytes are framed gRPC that the LIVE response `Content-Type` no
+/// longer admits to describing.
+///
+/// The representation gate reads `content-type` from the live header map, which
+/// `after_proxy` has already had a chance to rewrite. A header rule that removes
+/// or relabels a framed gRPC response's type would otherwise land it on the
+/// untyped/JSON branch of the claim predicate: the gate would then hand
+/// length-prefixed frames to a JSON field rule, fail to parse them as a bare
+/// document, and answer `unparseable_document` — a `502` replacing a valid RPC
+/// reply on a mixed HTTP/gRPC proxy.
+///
+/// Two independent pieces of pre-hook evidence answer it, and neither can be
+/// relabelled mid-pipeline:
+///
+/// * The **pristine media type** stamped by
+///   [`crate::proxy::stamp_original_response_metadata`] before any `after_proxy`
+///   hook ran. If the backend's own `Content-Type` was framed gRPC, it stays
+///   framed no matter what the live header says now. This is the same
+///   snapshot-over-live-map discipline the gate already applies to content
+///   coding and range/delta state.
+/// * The **request's immutable flavor** — `is_native_grpc_request` (fixed before
+///   any hook) and the separately retained gRPC-Web representation, the pair the
+///   rejection shaper already trusts to pick the client's error flavor. This
+///   covers the case where no media type was ever stamped, so the snapshot
+///   cannot speak: a gRPC/gRPC-Web request's response is framed regardless.
+///
+/// Deliberately NOT a decline: a gRPC-Web request whose backend genuinely
+/// answered with a bare `application/json` document. The pristine type proves
+/// that body is not framed, a field rule can act on it, and the transform does
+/// rewrite it — so it stays claimed and the redaction still applies. Keying the
+/// decline off the request flavor alone would have silently dropped that
+/// redaction, which is the wrong direction for a fail-closed gate.
+///
+/// Likewise NOT a decline: an ordinary HTTP request with an absent or vendor
+/// `+json` response `Content-Type`. That claim is the earlier absent-type fix and
+/// is untouched here — this predicate only fires for gRPC/gRPC-Web traffic.
+fn framed_grpc_request_without_proven_media_type(
+    ctx: &RequestContext,
+    response_content_type: Option<&str>,
+) -> bool {
+    let pristine_content_type = ctx
+        .metadata
+        .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
+        .map(String::as_str);
+
+    if let Some(pristine) = pristine_content_type {
+        // The backend's own type is authoritative over any later rewrite.
+        return body_transform::is_framed_grpc_content_type(pristine);
+    }
+
+    // No stamped type to consult. Fall back to the request's immutable flavor,
+    // but only when the live header does not already prove a non-framed
+    // representation — a `Content-Type` the gate would decline on its own needs
+    // no help, and one naming a real document type is evidence in its own right.
+    if response_content_type.is_some() {
+        return false;
+    }
+    ctx.is_native_grpc_request()
+        || super::grpc_web::client_uses_grpc_web(ctx)
+        || super::grpc_web::request_is_grpc_web_translated(ctx)
+}
+
 #[async_trait]
 impl Plugin for ResponseTransformer {
     fn name(&self) -> &str {
@@ -614,9 +676,18 @@ impl Plugin for ResponseTransformer {
         // working traffic into 502s while protecting nothing, since a frame
         // (whose first byte is the 0x00/0x01 compressed flag) can never parse as
         // a JSON document for a field rule to act on in the first place.
+        //
+        // That media-type test alone is not enough, because it reads the LIVE
+        // header, which `after_proxy` has already had a chance to rewrite.
+        // `framed_grpc_request_without_proven_media_type` carries the same
+        // decline over to the pre-hook evidence — the pristine stamped media
+        // type, and the request's immutable gRPC/gRPC-Web flavor when none was
+        // stamped — so stripping or relabelling the header cannot smuggle frames
+        // onto the untyped branch.
         !self.body_rules.is_empty()
             && self.rules_enabled()
             && !super::utils::sse::is_sse_request(ctx)
+            && !framed_grpc_request_without_proven_media_type(ctx, response_content_type)
             && response_content_type.is_none_or(|ct| {
                 body_transform::is_json_content_type(ct)
                     && !body_transform::is_framed_grpc_content_type(ct)

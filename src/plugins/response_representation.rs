@@ -85,8 +85,15 @@
 //!   document, so no JSON field rule can act on them. `response_transformer`
 //!   declines that whole media-type family in both its claim predicate and its
 //!   transform, which keeps a mixed HTTP/gRPC proxy's valid gRPC responses out
-//!   of this gate entirely instead of failing them as unparseable. Redacting
-//!   inside gRPC frames would need a frame-aware body policy.
+//!   of this gate entirely instead of failing them as unparseable. That decline
+//!   is made on pre-`after_proxy` evidence, not only on the live response
+//!   `Content-Type`: the pristine stamped media type answers first, and the
+//!   request's immutable gRPC flavor plus the retained gRPC-Web representation
+//!   answer when the backend stamped no type at all. So a header rule that
+//!   strips or relabels that header cannot push a framed response onto the
+//!   untyped-JSON branch and have its frames rejected as an unparseable
+//!   document. Redacting inside gRPC frames would need a frame-aware body
+//!   policy.
 //! * **Backend-chosen media type.** A backend that *mislabels* a JSON payload
 //!   `text/plain` or `application/octet-stream` is not claimed by a JSON body
 //!   policy, here or in the transform itself. Content-type sniffing or an
@@ -254,6 +261,50 @@ fn has_non_identity_coding(encoding: &str) -> bool {
         .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
 }
 
+/// Whether a `Content-Encoding` field value must be handed to
+/// [`decode_response_body`] for judgment rather than treated as absent.
+///
+/// True for anything that is not a list of pure `identity` tokens — which
+/// includes both a real coding (`gzip`) and a MALFORMED one (`,`, `identity,`,
+/// a whitespace-only field). The empty-token case is the reason this exists
+/// separately from [`has_non_identity_coding`]: an empty token changes no octets
+/// (so it is not a "transforming coding" for the identity-acceptability rule)
+/// but it is also not provably `identity`, so a protected response carrying one
+/// must reach the fail-closed malformed-coding rejection instead of being
+/// silently inspected as though the field were absent.
+pub(crate) fn content_encoding_requires_decode_judgment(encoding: &str) -> bool {
+    !encoding
+        .split(',')
+        .map(str::trim)
+        .all(|token| token.eq_ignore_ascii_case("identity"))
+}
+
+/// Whether a `q=` parameter value is a syntactically valid weight of exactly
+/// zero, i.e. an explicit refusal.
+///
+/// RFC 9110 §12.4.2 defines `qvalue` as `0[.0*3]` or `1[.0*3]`, so the only
+/// values that carry meaning here are finite and within `0..=1`. Anything else —
+/// a negative weight (`q=-1`), an out-of-range one (`q=5`), a non-finite one
+/// (`q=inf`, `q=NaN`), or a sign-prefixed zero (`q=-0`, `q=+0`) — is malformed.
+///
+/// Malformed must NOT collapse onto "zero": this predicate's only power is to
+/// turn an otherwise-servable response into a `502`, so reading a parse the
+/// gateway could not validate as an explicit refusal would reject live traffic
+/// from a client or intermediary that merely emitted an invalid parameter. The
+/// sign check is explicit because `"-0"` parses to `-0.0`, which both compares
+/// equal to zero and lies inside `0..=1` — the numeric tests alone would let a
+/// malformed value back through as a refusal. The range test carries the
+/// finiteness requirement on its own: `NaN` and both infinities fail
+/// `contains`, and inside `0..=1` a `q <= 0.0` can only be zero.
+fn qvalue_is_explicit_zero(value: &str) -> bool {
+    if value.starts_with(['-', '+']) {
+        return false;
+    }
+    value
+        .parse::<f32>()
+        .is_ok_and(|q| (0.0..=1.0).contains(&q) && q <= 0.0)
+}
+
 /// Whether the client will accept identity-coded (uncompressed) bytes.
 ///
 /// RFC 9110 §12.5.3: an absent `Accept-Encoding` places no constraint, an empty
@@ -265,16 +316,27 @@ fn has_non_identity_coding(encoding: &str) -> bool {
 /// A malformed qvalue is read as acceptable rather than forbidden. This
 /// predicate can only ever turn an otherwise-servable response into an error,
 /// so inferring "the client refuses identity" from a field the gateway could not
-/// parse would break live traffic to protect nothing.
+/// parse would break live traffic to protect nothing. Only a syntactically valid
+/// weight — a finite value in `0..=1`, per the RFC 9110 §12.4.2 `qvalue` rule —
+/// can express a refusal, and the refusal is `q=0`. A negative, out-of-range, or
+/// non-finite parameter (`identity;q=-1`, `*;q=-1`, `q=5`, `q=inf`) is malformed,
+/// not a zero weight, and must not be read as one.
 fn identity_coding_is_acceptable(ctx: &RequestContext) -> bool {
-    // Prefer the pre-strip snapshot: `compression`'s `remove_accept_encoding`
-    // deletes the header from the `before_proxy` map, which IS `ctx.headers`
-    // (taken and restored around the hook), so by this phase `ctx.headers` may
-    // no longer describe what the client negotiated.
+    // Read the pristine pre-hook snapshot first. Neither later source can be
+    // trusted on its own: `request_transformer` (priority 3000) can remove or
+    // rewrite `Accept-Encoding` before `compression` (priority 4050) records its
+    // own copy, and `compression`'s `remove_accept_encoding` then deletes the
+    // header from the `before_proxy` map, which IS `ctx.headers` (taken and
+    // restored around the hook). Both later sources remain as fallbacks for
+    // direct plugin callers that never ran the proxy's request-init stamp.
     let Some(accept_encoding) = ctx
-        .metadata
-        .get(crate::plugins::compression::REQUEST_ACCEPT_ENCODING_METADATA_KEY)
-        .or_else(|| ctx.headers.get("accept-encoding"))
+        .original_accept_encoding()
+        .or_else(|| {
+            ctx.metadata
+                .get(crate::plugins::compression::REQUEST_ACCEPT_ENCODING_METADATA_KEY)
+                .map(String::as_str)
+        })
+        .or_else(|| ctx.headers.get("accept-encoding").map(String::as_str))
     else {
         return true;
     };
@@ -290,7 +352,7 @@ fn identity_coding_is_acceptable(ctx: &RequestContext) -> bool {
             param
                 .split_once('=')
                 .filter(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
-                .is_some_and(|(_, value)| value.trim().parse::<f32>().is_ok_and(|q| q <= 0.0))
+                .is_some_and(|(_, value)| qvalue_is_explicit_zero(value.trim()))
         });
         if coding.eq_ignore_ascii_case("identity") {
             return !q_is_zero;
@@ -314,10 +376,19 @@ fn origin_content_encoding<'a>(
             .metadata
             .get(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
             .map(String::as_str),
+        // Pass a PRESENT field through whichever codings it names. Filtering on
+        // `has_non_identity_coding` here would drop a malformed list whose only
+        // members are empty (`,` or `identity,`) before `decode_response_body`
+        // could reject it, and the body would then be transformed or forwarded
+        // under representation metadata the gateway never proved — the opposite
+        // of the fail-closed posture. `decode_response_body` is the one place
+        // that judges a coding list: it returns `Ok(None)` for an identity-only
+        // field (no octets change, nothing to decode) and `MalformedCoding` for
+        // an empty token, so `identity` alone still costs nothing here.
         RepresentationOrigin::GatewayGenerated => response_headers
             .get("content-encoding")
             .map(String::as_str)
-            .filter(|encoding| has_non_identity_coding(encoding)),
+            .filter(|encoding| content_encoding_requires_decode_judgment(encoding)),
     }
 }
 

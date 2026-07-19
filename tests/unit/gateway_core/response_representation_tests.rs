@@ -25,13 +25,14 @@ use ferrum_edge::_test_support::{
     representation_rejection_reason_for_test, retain_grpc_web_client_content_type_for_test,
     run_after_proxy_hooks_for_test, set_grpc_deadline_budget_for_test,
     set_original_response_content_encoding_for_test, set_request_http_flavor_for_test,
-    stamp_original_response_metadata_for_test,
+    stamp_original_request_metadata_for_test, stamp_original_response_metadata_for_test,
     transform_buffered_response_body_with_deadline_and_policy_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::HttpFlavor;
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, RequestContext, response_transformer::ResponseTransformer,
+    Plugin, PluginResult, RequestContext, request_transformer::RequestTransformer,
+    response_transformer::ResponseTransformer,
 };
 use serde_json::json;
 
@@ -1766,6 +1767,24 @@ fn gzip_json_headers() -> HashMap<String, String> {
     headers
 }
 
+/// Build a context whose pristine `Accept-Encoding` snapshot was captured by
+/// the real production stamp from real raw wire headers — the same sequence the
+/// H1/H2 and H3 handlers run at request init, before any `before_proxy` hook.
+fn ctx_with_client_accept_encoding(accept_encoding: Option<&str>) -> RequestContext {
+    let mut ctx = make_ctx();
+    let mut raw = http::HeaderMap::new();
+    if let Some(value) = accept_encoding {
+        raw.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_str(value).expect("accept-encoding must be a valid header"),
+        );
+    }
+    ctx.set_raw_headers(raw);
+    stamp_original_request_metadata_for_test(&mut ctx);
+    ctx.materialize_headers();
+    ctx
+}
+
 /// Drive the transform phase with a client `Accept-Encoding` on the context.
 async fn run_with_accept_encoding(
     accept_encoding: Option<&str>,
@@ -1773,11 +1792,7 @@ async fn run_with_accept_encoding(
     body: Vec<u8>,
 ) -> (bool, u16, Option<String>, Vec<u8>, HashMap<String, String>) {
     let plugins = redacting_plugins();
-    let mut ctx = make_ctx();
-    if let Some(value) = accept_encoding {
-        ctx.headers
-            .insert("accept-encoding".to_string(), value.to_string());
-    }
+    let mut ctx = ctx_with_client_accept_encoding(accept_encoding);
     let mut status = 200;
     let mut headers = headers;
     let mut body = body;
@@ -1973,4 +1988,460 @@ async fn unlimited_configured_response_limit_falls_back_to_hard_ceiling() {
     assert_eq!(status, 200);
     assert_eq!(reason, None);
     assert_secret_not_forwarded(&body);
+}
+
+// ---------------------------------------------------------------------------
+// The identity refusal is read from a PRE-HOOK snapshot.
+//
+// `request_transformer` (priority 3000) runs before `compression` (priority
+// 4050) and can remove or rewrite `Accept-Encoding`. If the gate consulted only
+// the post-hook header map or compression's later metadata copy, an explicit
+// `identity;q=0` would be erased and a protected encoded response would be
+// decoded and served in the representation the client refused.
+// ---------------------------------------------------------------------------
+
+/// A `request_transformer` that removes the client's `Accept-Encoding` in
+/// `before_proxy`, i.e. the ordering Codex described.
+fn accept_encoding_removing_request_transformer() -> RequestTransformer {
+    RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "header", "key": "Accept-Encoding"}
+        ]
+    }))
+    .expect("request_transformer config must be valid")
+}
+
+/// A `request_transformer` that REWRITES `Accept-Encoding` to a value with no
+/// refusal in it — the rewrite half of the same bypass.
+fn accept_encoding_rewriting_request_transformer() -> RequestTransformer {
+    RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "header", "key": "Accept-Encoding", "value": "gzip"}
+        ]
+    }))
+    .expect("request_transformer config must be valid")
+}
+
+/// Drive the real request hook over the context, then the real buffered
+/// transform phase, exactly in the production order.
+async fn run_with_request_hook_then_encoded_response(
+    accept_encoding: &str,
+    request_transformer: RequestTransformer,
+) -> (bool, u16, Option<String>, Vec<u8>) {
+    let mut ctx = ctx_with_client_accept_encoding(Some(accept_encoding));
+
+    // `before_proxy` receives the live header map, as the proxy passes it.
+    let mut request_headers = ctx.headers.clone();
+    request_transformer
+        .before_proxy(&mut ctx, &mut request_headers)
+        .await;
+    ctx.headers = request_headers;
+
+    let plugins = redacting_plugins();
+    let mut headers = gzip_json_headers();
+    let mut status = 200;
+    let mut body = gzip(br#"{"secret":"hunter2","keep":1}"#);
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
+    (replaced, status, reason, body)
+}
+
+#[tokio::test]
+async fn request_hook_removing_accept_encoding_cannot_erase_the_identity_refusal() {
+    let (replaced, status, reason, body) = run_with_request_hook_then_encoded_response(
+        "gzip, identity;q=0",
+        accept_encoding_removing_request_transformer(),
+    )
+    .await;
+
+    assert!(replaced, "the client still refused identity");
+    assert_eq!(status, 502);
+    assert_eq!(reason.as_deref(), Some("identity_coding_unacceptable"));
+    assert_secret_not_forwarded(&body);
+}
+
+#[tokio::test]
+async fn request_hook_rewriting_accept_encoding_cannot_erase_the_identity_refusal() {
+    let (replaced, status, reason, body) = run_with_request_hook_then_encoded_response(
+        "gzip, identity;q=0",
+        accept_encoding_rewriting_request_transformer(),
+    )
+    .await;
+
+    assert!(replaced, "the client still refused identity");
+    assert_eq!(status, 502);
+    assert_eq!(reason.as_deref(), Some("identity_coding_unacceptable"));
+    assert_secret_not_forwarded(&body);
+}
+
+/// The snapshot must not invent a refusal either: a client that accepted
+/// identity is still served its decoded, redacted body after the same hooks.
+#[tokio::test]
+async fn request_hook_rewrite_does_not_invent_an_identity_refusal() {
+    let (replaced, status, reason, body) = run_with_request_hook_then_encoded_response(
+        "gzip, identity",
+        accept_encoding_removing_request_transformer(),
+    )
+    .await;
+
+    assert!(!replaced, "the client accepted identity");
+    assert_eq!(status, 200);
+    assert_eq!(reason, None);
+    assert_secret_not_forwarded(&body);
+    assert!(String::from_utf8_lossy(&body).contains("keep"));
+}
+
+// ---------------------------------------------------------------------------
+// Only a syntactically valid weight expresses a refusal.
+//
+// RFC 9110 §12.4.2 defines `qvalue` as `0[.0*3]` / `1[.0*3]`. A negative,
+// out-of-range, or non-finite parameter is MALFORMED, not a zero weight, and
+// this predicate can only ever turn a servable response into a 502 — so
+// malformed must stay on the acceptable side.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn invalid_qvalues_are_malformed_rather_than_an_identity_refusal() {
+    for accept_encoding in [
+        // Negative weights: the case Codex raised.
+        "gzip, identity;q=-1",
+        "gzip, *;q=-1",
+        "gzip, identity;q=-0.5",
+        "gzip, identity;q=-0",
+        // Signed zero and out-of-range / non-finite weights.
+        "gzip, identity;q=+0",
+        "gzip, identity;q=5",
+        "gzip, identity;q=inf",
+        "gzip, identity;q=NaN",
+        "gzip, *;q=5",
+    ] {
+        let encoded = gzip(br#"{"secret":"hunter2","keep":1}"#);
+        let (replaced, status, reason, body, headers) =
+            run_with_accept_encoding(Some(accept_encoding), gzip_json_headers(), encoded).await;
+
+        assert!(
+            !replaced,
+            "`{accept_encoding}` is malformed, not a refusal — it must not 502"
+        );
+        assert_eq!(status, 200, "`{accept_encoding}` stays servable");
+        assert_eq!(reason, None, "`{accept_encoding}` must not be rejected");
+        assert!(
+            !headers.contains_key("content-encoding"),
+            "`{accept_encoding}` is served decoded"
+        );
+        assert_secret_not_forwarded(&body);
+        assert!(String::from_utf8_lossy(&body).contains("keep"));
+    }
+}
+
+/// The valid-weight boundary still refuses, so widening the parse did not
+/// weaken the refusal path itself.
+#[tokio::test]
+async fn valid_zero_weights_still_express_an_identity_refusal() {
+    for accept_encoding in [
+        "gzip, identity;q=0",
+        "gzip, identity;q=0.0",
+        "gzip, identity;q=0.000",
+        "gzip, *;q=0",
+        "gzip, *;q=0.000",
+    ] {
+        let encoded = gzip(br#"{"secret":"hunter2","keep":1}"#);
+        let (replaced, status, reason, _, _) =
+            run_with_accept_encoding(Some(accept_encoding), gzip_json_headers(), encoded).await;
+
+        assert!(replaced, "`{accept_encoding}` refuses identity");
+        assert_eq!(status, 502, "`{accept_encoding}` is unservable");
+        assert_eq!(
+            reason.as_deref(),
+            Some("identity_coding_unacceptable"),
+            "`{accept_encoding}` must report acceptability"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A present-but-empty coding token is malformed, and must reach the
+// fail-closed malformed-coding rejection on BOTH provenances rather than being
+// filtered away as though the field were absent.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_backend_coding_tokens_are_rejected_as_malformed() {
+    for content_encoding in [",", "identity,", ",identity", " , ", "identity, ,"] {
+        let mut headers = json_headers();
+        headers.insert("content-encoding".to_string(), content_encoding.to_string());
+        let body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+
+        let (replaced, _, status, _, body, reason) = run_backend_transform(200, headers, body).await;
+
+        assert!(
+            replaced,
+            "`{content_encoding}` is malformed and must not be forwarded"
+        );
+        assert_eq!(status, 502, "`{content_encoding}` is unservable");
+        assert_eq!(
+            reason.as_deref(),
+            Some("malformed_content_coding"),
+            "`{content_encoding}` must reach the malformed-coding branch"
+        );
+        assert_secret_not_forwarded(&body);
+    }
+}
+
+/// `identity` alone is not malformed and must not be made to look encoded, so
+/// it neither triggers a decode nor a rejection.
+#[tokio::test]
+async fn identity_only_codings_are_neither_decoded_nor_rejected() {
+    for content_encoding in ["identity", "identity, identity", " identity "] {
+        let mut headers = json_headers();
+        headers.insert("content-encoding".to_string(), content_encoding.to_string());
+        let body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+
+        let (_, _, status, headers, body, reason) = run_backend_transform(200, headers, body).await;
+
+        assert_eq!(status, 200, "`{content_encoding}` is servable");
+        assert_eq!(reason, None, "`{content_encoding}` is not a rejection");
+        assert_eq!(
+            headers.get("content-encoding").map(String::as_str),
+            Some(content_encoding),
+            "an identity-only field must not be stripped as though decoding occurred"
+        );
+        assert_secret_not_forwarded(&body);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Framed gRPC is declined on PRE-HOOK evidence, not on the live response
+// `Content-Type`.
+//
+// The gate reads `content-type` after `after_proxy`, so a header rule that
+// removes or rewrites a gRPC response's type would otherwise land it on the
+// untyped-JSON branch — and `response_transformer` would claim its
+// length-prefixed frames, fail to parse them as a bare document, and replace a
+// valid RPC reply with `unparseable_document`.
+//
+// The pristine stamped media type answers first; the request's immutable gRPC
+// flavor and the retained gRPC-Web representation answer when the backend
+// stamped no type at all.
+// ---------------------------------------------------------------------------
+
+/// Drive the buffered transform phase over a framed response, stamping the
+/// backend's ORIGINAL `Content-Type` first and only then applying the relabel,
+/// which is the real production ordering: the snapshot is taken before
+/// `after_proxy`, and the header rule rewrites the live map afterwards.
+///
+/// `backend_content_type` is what the backend actually sent (`None` models a
+/// backend that omitted it); `relabelled_content_type` is what the live map says
+/// by the time the gate reads it (`None` models an outright removal).
+async fn run_framed_response_with_relabelled_content_type(
+    flavor: HttpFlavor,
+    retained_grpc_web_content_type: Option<&str>,
+    backend_content_type: Option<&str>,
+    relabelled_content_type: Option<&str>,
+) -> (bool, u16, Option<String>, Vec<u8>) {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    set_request_http_flavor_for_test(&mut ctx, flavor);
+    if let Some(content_type) = retained_grpc_web_content_type {
+        retain_grpc_web_client_content_type_for_test(&mut ctx, content_type);
+    }
+
+    let mut status = 200;
+    let mut body = grpc_frame(br#"{"secret":"hunter2","keep":1}"#);
+
+    // The pristine snapshot sees the backend's own headers.
+    let mut headers = HashMap::new();
+    if let Some(content_type) = backend_content_type {
+        headers.insert("content-type".to_string(), content_type.to_string());
+    }
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    // An `after_proxy` header rule then removes or rewrites the live type.
+    headers.remove("content-type");
+    if let Some(content_type) = relabelled_content_type {
+        headers.insert("content-type".to_string(), content_type.to_string());
+    }
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
+    (replaced, status, reason, body)
+}
+
+#[tokio::test]
+async fn relabelled_framed_grpc_responses_are_not_claimed_as_json() {
+    // (request flavor, retained gRPC-Web type, backend type, relabelled type)
+    let cases: [(HttpFlavor, Option<&str>, Option<&str>, Option<&str>); 10] = [
+        // --- The pristine snapshot proves the framing. ---
+        // Native gRPC whose response type was removed outright by `after_proxy`.
+        (HttpFlavor::Grpc, None, Some("application/grpc+proto"), None),
+        // Native gRPC relabelled to a plain JSON type.
+        (
+            HttpFlavor::Grpc,
+            None,
+            Some("application/grpc+proto"),
+            Some("application/json"),
+        ),
+        // Native gRPC `+json` relabelled to a vendor `+json` type.
+        (
+            HttpFlavor::Grpc,
+            None,
+            Some("application/grpc+json"),
+            Some("application/vnd.acme+json"),
+        ),
+        // gRPC-Web binary, type removed after the snapshot.
+        (
+            HttpFlavor::Plain,
+            Some("application/grpc-web+proto"),
+            Some("application/grpc-web+proto"),
+            None,
+        ),
+        // gRPC-Web text, relabelled to plain JSON.
+        (
+            HttpFlavor::Plain,
+            Some("application/grpc-web-text+proto"),
+            Some("application/grpc-web-text+proto"),
+            Some("application/json"),
+        ),
+        // gRPC-Web `+json`, relabelled to a vendor `+json` type.
+        (
+            HttpFlavor::Plain,
+            Some("application/grpc-web+json"),
+            Some("application/grpc-web+json"),
+            Some("application/vnd.acme+json"),
+        ),
+        // --- No type was ever stamped, so the request flavor answers. ---
+        // Native gRPC backend that omitted `Content-Type` entirely.
+        (HttpFlavor::Grpc, None, None, None),
+        // gRPC-Web binary, no backend type at all.
+        (
+            HttpFlavor::Plain,
+            Some("application/grpc-web+proto"),
+            None,
+            None,
+        ),
+        // gRPC-Web text, no backend type at all.
+        (
+            HttpFlavor::Plain,
+            Some("application/grpc-web-text+proto"),
+            None,
+            None,
+        ),
+        // Native gRPC over an H3/extended path that also omitted the type.
+        (HttpFlavor::Grpc, Some("application/grpc-web+proto"), None, None),
+    ];
+
+    for (flavor, retained, backend_content_type, relabelled) in cases {
+        let expected = grpc_frame(br#"{"secret":"hunter2","keep":1}"#);
+        let (replaced, status, reason, body) = run_framed_response_with_relabelled_content_type(
+            flavor,
+            retained,
+            backend_content_type,
+            relabelled,
+        )
+        .await;
+
+        let case = format!("{flavor:?}/{retained:?}/{backend_content_type:?}/{relabelled:?}");
+        assert!(
+            !replaced,
+            "{case}: a framed gRPC response must not be claimed or rejected"
+        );
+        assert_eq!(status, 200, "{case}: a valid RPC reply stays a 200");
+        assert_eq!(
+            reason, None,
+            "{case}: frames must never reach `unparseable_document`"
+        );
+        assert_eq!(body, expected, "{case}: the frames pass through intact");
+    }
+}
+
+/// Non-regression for the earlier absent-`Content-Type` fix: an ordinary HTTP
+/// request whose response omits `Content-Type` is still claimed and redacted.
+/// Declining framed gRPC must key off the REQUEST, not exempt untyped
+/// responses generally.
+#[tokio::test]
+async fn untyped_ordinary_http_json_is_still_claimed_and_redacted() {
+    let body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+    let (_, _, status, _, body, reason) = run_backend_transform(200, HashMap::new(), body).await;
+
+    assert_eq!(status, 200, "an ordinary untyped JSON body is servable");
+    assert_eq!(reason, None);
+    assert_secret_not_forwarded(&body);
+    assert!(
+        String::from_utf8_lossy(&body).contains("keep"),
+        "the untyped body is still transformed, not passed through"
+    );
+}
+
+/// And an ordinary untyped response that is NOT parseable JSON still fails
+/// closed, so the flavor-based decline did not widen into the untyped branch.
+#[tokio::test]
+async fn untyped_ordinary_http_non_json_is_still_rejected() {
+    let body = b"\x00\x00\x00\x00\x05hello".to_vec();
+    let (replaced, _, status, _, body, reason) =
+        run_backend_transform(200, HashMap::new(), body).await;
+
+    assert!(replaced, "an unparseable untyped body is not forwarded");
+    assert_eq!(status, 502);
+    assert_eq!(reason.as_deref(), Some("unparseable_document"));
+    assert_secret_not_forwarded(&body);
+}
+
+/// The decline is keyed on proven FRAMING, not on the request being gRPC-Web.
+/// A gRPC-Web request whose backend genuinely answered with a bare JSON
+/// document is still claimed and still redacted — keying off the request flavor
+/// alone would have silently dropped that redaction, which is the wrong
+/// direction for a fail-closed gate.
+#[tokio::test]
+async fn grpc_web_request_with_a_genuine_json_response_is_still_redacted() {
+    let plugins = redacting_plugins();
+    let mut ctx = make_ctx();
+    retain_grpc_web_client_content_type_for_test(&mut ctx, "application/grpc-web+proto");
+
+    let mut status = 200;
+    let mut headers = json_headers();
+    let mut body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(!replaced, "a real JSON document is servable");
+    assert_eq!(status, 200);
+    assert_eq!(
+        representation_rejection_reason_for_test(&ctx),
+        None,
+        "a bare JSON document is not framed and must not be declined"
+    );
+    assert_secret_not_forwarded(&body);
+    assert!(
+        String::from_utf8_lossy(&body).contains("keep"),
+        "the body is still transformed, not passed through"
+    );
 }

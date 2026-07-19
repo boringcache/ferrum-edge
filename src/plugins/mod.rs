@@ -1685,6 +1685,22 @@ pub struct RequestContext {
     /// request headers. Fault rejection shaping consults this fixed value so a
     /// transformer cannot add or remove native-gRPC semantics mid-pipeline.
     request_http_flavor: HttpFlavor,
+    /// The client's original `Accept-Encoding` field value, captured with the
+    /// raw wire headers before any `before_proxy` hook runs.
+    ///
+    /// The representation gate decides whether it may publish decoded identity
+    /// bytes from what the CLIENT negotiated, and by the time it runs the
+    /// header map no longer describes that: `request_transformer` (priority
+    /// 3000) can remove or rewrite `Accept-Encoding` before `compression`
+    /// (priority 4050) ever takes its own snapshot, and `compression` itself
+    /// strips the header for the backend request. Both would erase an explicit
+    /// `identity;q=0` and let a protected encoded response be decoded and served
+    /// as a representation the client refused.
+    ///
+    /// Kept as a private write-once field rather than in `ctx.metadata` so no
+    /// plugin can rewrite or delete the evidence it records. Set exactly once,
+    /// at request init, by [`crate::proxy::stamp_original_request_metadata`].
+    original_accept_encoding: Option<String>,
     /// Whether client-visible rejection responses for this request cross a
     /// WebSocket handshake boundary. Set once after request-flavor detection so
     /// the shared reject finalizer can remove transport-owned handshake fields
@@ -2137,6 +2153,7 @@ impl RequestContext {
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
+            original_accept_encoding: None,
             websocket_response_boundary: false,
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
@@ -2745,6 +2762,7 @@ impl RequestContext {
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: self.request_http_flavor,
+            original_accept_encoding: self.original_accept_encoding.clone(),
             websocket_response_boundary: self.websocket_response_boundary,
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
@@ -2857,6 +2875,25 @@ impl RequestContext {
 
     pub(crate) fn is_native_grpc_request(&self) -> bool {
         matches!(self.request_http_flavor, HttpFlavor::Grpc)
+    }
+
+    /// Record the client's original `Accept-Encoding` once, at request init.
+    ///
+    /// Write-once by construction: a later caller — a plugin reaching this
+    /// through any in-crate path, or a second stamp on a retried dispatch —
+    /// cannot replace the value the client actually sent. An absent header is
+    /// left absent, because "the client sent nothing" and "the client sent an
+    /// empty field" are different negotiations (RFC 9110 §12.5.3).
+    pub(crate) fn set_original_accept_encoding(&mut self, value: String) {
+        if self.original_accept_encoding.is_none() {
+            self.original_accept_encoding = Some(value);
+        }
+    }
+
+    /// The client's original `Accept-Encoding`, or `None` when the request
+    /// carried none (or reached a direct plugin caller that never stamped).
+    pub(crate) fn original_accept_encoding(&self) -> Option<&str> {
+        self.original_accept_encoding.as_deref()
     }
 
     pub(crate) fn has_websocket_response_boundary(&self) -> bool {
