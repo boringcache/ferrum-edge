@@ -554,18 +554,16 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   value sets, and a prior step or job output can be set to the ARM64 target,
   so an unknown value fails closed whenever the same input already declares a
   `--target` argument. Ordinary credential and context inputs carry no target
-  argument and stay editable. One narrow exception
-  exists so release downloads can be isolated to exact artifact names, which
-  necessarily name the protected target: for `actions/download-artifact`
-  **pinned to a full commit SHA**, the target string in an artifact
-  `name`/`path`/`pattern` input is not a surface,
+  argument and stay editable. One narrow exception exists so release downloads
+  can be isolated to exact artifact names, which necessarily name the protected
+  target: for `actions/download-artifact` **pinned to a full commit SHA**, the
+  target string in an artifact `name`/`path`/`pattern` input is not a surface,
   because the action only selects an already-published artifact for the current
-  job and cannot start a build. `actions/upload-artifact` names and paths
-  remain protected surfaces because they control the artifact identity consumed
-  by later publishing jobs. That carve-out accepts the block and flow spellings
-  of the same YAML
-  (`with: {name: ...}`) equally, and applies only when every key on the line is
-  one of those closed artifact inputs. The
+  job and cannot start a build. `actions/upload-artifact` names and paths remain
+  protected surfaces because they control the artifact identity consumed by
+  later publishing jobs. That carve-out accepts the block and flow spellings of
+  the same YAML (`with: {name: ...}`) equally, and applies only when every key
+  on the line is one of those closed artifact inputs. The
   Cross image, a `cross` executable token, every Cross-enabling input key, any
   other input key, an unpinned reference, and any other action are all still
   surfaces; self-test fixtures assert each of those boundaries.
