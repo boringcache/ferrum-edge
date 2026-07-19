@@ -580,9 +580,9 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   closed. Shell, Python, Perl, PHP, R, JavaScript/TypeScript, PowerShell, awk,
   and BusyBox script launchers are recognized when resolving repository paths.
   Only shell, Python, and PowerShell file bodies have language-aware transitive
-  readers; an explicit unsupported interpreter for a suffixless repository
-  helper therefore fails closed instead of being downgraded to a bare shell
-  reading.
+  readers; an explicit unsupported interpreter for any repository helper
+  therefore fails closed instead of relying on a suffix or being downgraded to
+  a bare shell reading.
   Inline interpreter source is dispatched the same way: a `run:` step that
   hands a program to Python (`-c`), PowerShell (`-Command`, any unambiguous
   prefix), Node, Deno, Bun, Perl, Ruby, PHP, Lua, R, Julia, Elixir, Groovy,

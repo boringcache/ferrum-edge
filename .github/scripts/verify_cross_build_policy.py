@@ -1362,6 +1362,12 @@ OPAQUE_EXPANSION = (
 # two matched words, so this cannot invent a subcommand where the source has no
 # boundary at all.
 OPAQUE_WORD_SEPARATOR = rf"(?:\s+|{OPAQUE_EXPANSION}\s*)"
+# Both opaque classifiers deliberately retain `$(` as a standalone command-start
+# context even though their current production callers flatten balanced command
+# substitutions to `$(_)` first. The redundant alternative keeps direct
+# classifier assertions, and any future unflattened caller, from silently using
+# a narrower command-start vocabulary; it cannot widen a decision after the
+# production flattening step.
 OPAQUE_ARM_CROSS_EXECUTION = re.compile(
     # The brace context keeps `\s*(?=\()` so a `{(` group opener still counts
     # while the `{"cross": ...}` JSON benign control stays excluded, and the
