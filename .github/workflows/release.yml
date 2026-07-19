@@ -147,12 +147,6 @@ jobs:
             asset_name: ferrum-edge-linux-x86_64
             cni_asset_name: ferrum-cni-linux-x86_64
 
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact_name: ferrum-edge
-            asset_name: ferrum-edge-linux-aarch64
-            cni_asset_name: ferrum-cni-linux-aarch64
-
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: ferrum-edge
@@ -192,9 +186,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          fi
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
@@ -242,23 +233,7 @@ jobs:
           }
           $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
-      - name: Install cross (for Linux ARM)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install cross
-
-      - name: Build release binary (cross)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cross build --features cloud-secrets --release --target ${{ matrix.target }}
-        env:
-          RUSTC_WRAPPER: ""
-          RUSTFLAGS: ""
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-
-      - name: Build release binary (cargo)
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
+      - name: Build release binary
         run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}
 
       - name: Create release assets directory
@@ -293,6 +268,85 @@ jobs:
           name: release-binaries-${{ matrix.target }}
           path: release-assets/
 
+  build-release-arm64-cross:
+    name: Build (ferrum-edge-linux-aarch64)
+    needs: validate-release-sha
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust and the ARM64 target
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install checksum-verified Cross 0.2.5
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cross@0.2.5
+          fallback: none
+
+      - name: Revalidate the complete trusted Cross input boundary
+        run: |
+          python3 -I .github/scripts/verify_cross_build_policy.py \
+            --config Cross.toml \
+            --cargo-config Cargo.toml \
+            --ci-workflow .github/workflows/ci.yml \
+            --release-workflow .github/workflows/release.yml
+
+      - name: Build release binary with a fixed empty Cross environment
+        run: |
+          set -euo pipefail
+          test -x /home/runner/.cargo/bin/cross
+          clean_path=/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          clean_hostname="$(/bin/hostname)"
+          env -i \
+            HOME=/home/runner \
+            USER=runner \
+            HOSTNAME="$clean_hostname" \
+            PATH="$clean_path" \
+            CARGO_HOME=/home/runner/.cargo \
+            RUSTUP_HOME=/home/runner/.rustup \
+            CARGO_TERM_COLOR=always \
+            TERM=xterm \
+            CI=true \
+            RUSTC_WRAPPER= \
+            RUSTFLAGS= \
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+            CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+            CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+            AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+            /home/runner/.cargo/bin/cross build \
+              --features cloud-secrets \
+              --release \
+              --target aarch64-unknown-linux-gnu
+
+      - name: Create release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp target/aarch64-unknown-linux-gnu/release/ferrum-edge release-assets/ferrum-edge-linux-aarch64
+          cp target/aarch64-unknown-linux-gnu/release/ferrum-cni release-assets/ferrum-cni-linux-aarch64
+          cd release-assets
+          for asset in *; do
+            sha256sum "$asset" > "$asset.sha256"
+            cat "$asset.sha256"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-binaries-aarch64-unknown-linux-gnu
+          path: release-assets/
+
   create-release:
     name: Create GitHub Release
     # Wait for BOTH manifests: the release notes advertise the `:<tag>` default
@@ -301,25 +355,89 @@ jobs:
     # were never pushed. Both `docker-manifest` and `docker-ebpf-manifest` run
     # unconditionally on every `v*` tag (no `if:`/path filters), so this keeps the
     # default release path intact.
-    needs: [build-release-binaries, docker-manifest, docker-ebpf-manifest]
+    needs: [build-release-binaries, build-release-arm64-cross, docker-manifest, docker-ebpf-manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
-      - name: Download all artifacts
+      # Download exactly the five trusted build artifacts by name. A wildcard
+      # pattern would also accept any other artifact whose name happened to
+      # start with the same prefix, so an unrelated job could contribute files
+      # to a published release.
+      - name: Download native release binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          path: downloaded-artifacts
-          pattern: release-binaries-*
+          name: release-binaries-x86_64-unknown-linux-gnu
+          path: downloaded-artifacts/release-binaries-x86_64-unknown-linux-gnu
+
+      - name: Download protected ARM64 release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-binaries-aarch64-unknown-linux-gnu
+          path: downloaded-artifacts/release-binaries-aarch64-unknown-linux-gnu
+
+      - name: Download macOS x86_64 release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-binaries-x86_64-apple-darwin
+          path: downloaded-artifacts/release-binaries-x86_64-apple-darwin
+
+      - name: Download macOS aarch64 release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-binaries-aarch64-apple-darwin
+          path: downloaded-artifacts/release-binaries-aarch64-apple-darwin
+
+      - name: Download Windows release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-binaries-x86_64-pc-windows-msvc
+          path: downloaded-artifacts/release-binaries-x86_64-pc-windows-msvc
 
       - name: Prepare release assets
         run: |
+          set -euo pipefail
           mkdir -p release-assets
-          find downloaded-artifacts -type f -exec cp {} release-assets/ \;
+          # The closed, auditable published asset set. Each entry names one
+          # exact trusted artifact directory and one exact file inside it, so a
+          # colliding or extra upload can neither add nor replace an asset.
+          copy_trusted_asset() {
+            if [ ! -f "downloaded-artifacts/$1" ] || [ -L "downloaded-artifacts/$1" ]; then
+              echo "::error::missing trusted release asset $1" >&2
+              exit 1
+            fi
+            cp "downloaded-artifacts/$1" "release-assets/$2"
+            echo "$2" >> "$RUNNER_TEMP/expected-assets"
+          }
+          : > "$RUNNER_TEMP/expected-assets"
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64 ferrum-edge-linux-x86_64
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64.sha256 ferrum-edge-linux-x86_64.sha256
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64 ferrum-cni-linux-x86_64
+          copy_trusted_asset release-binaries-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64.sha256 ferrum-cni-linux-x86_64.sha256
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64 ferrum-edge-linux-aarch64
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64.sha256 ferrum-edge-linux-aarch64.sha256
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64 ferrum-cni-linux-aarch64
+          copy_trusted_asset release-binaries-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64.sha256 ferrum-cni-linux-aarch64.sha256
+          copy_trusted_asset release-binaries-x86_64-apple-darwin/ferrum-edge-macos-x86_64 ferrum-edge-macos-x86_64
+          copy_trusted_asset release-binaries-x86_64-apple-darwin/ferrum-edge-macos-x86_64.sha256 ferrum-edge-macos-x86_64.sha256
+          copy_trusted_asset release-binaries-aarch64-apple-darwin/ferrum-edge-macos-aarch64 ferrum-edge-macos-aarch64
+          copy_trusted_asset release-binaries-aarch64-apple-darwin/ferrum-edge-macos-aarch64.sha256 ferrum-edge-macos-aarch64.sha256
+          copy_trusted_asset release-binaries-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe ferrum-edge-windows-x86_64.exe
+          copy_trusted_asset release-binaries-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe.sha256 ferrum-edge-windows-x86_64.exe.sha256
+          # Publishing must be exactly the trusted set, never whatever the
+          # download happened to produce.
+          LC_ALL=C sort -o "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/expected-assets"
+          ls -A release-assets | LC_ALL=C sort > "$RUNNER_TEMP/published-assets"
+          if ! diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/published-assets"; then
+            echo "::error::published release asset set drifted from the trusted set" >&2
+            exit 1
+          fi
+          cd release-assets
+          sha256sum -c ./*.sha256
+          cd ..
           ls -la release-assets/
-
       - name: Generate release notes
         id: release_notes
         env:
@@ -417,7 +535,7 @@ jobs:
 
   docker:
     name: Docker (${{ matrix.platform }})
-    needs: build-release-binaries
+    needs: [build-release-binaries, build-release-arm64-cross]
     runs-on: ubuntu-latest
     permissions:
       contents: read
