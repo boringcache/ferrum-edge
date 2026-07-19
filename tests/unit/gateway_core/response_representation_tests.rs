@@ -2287,10 +2287,19 @@ async fn run_framed_response_with_relabelled_content_type(
     (replaced, status, reason, body)
 }
 
+/// One relabelling case: the request flavor, the retained gRPC-Web type, the
+/// backend's own `Content-Type`, and the type `after_proxy` relabelled it to.
+type RelabelledCase = (
+    HttpFlavor,
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
 #[tokio::test]
 async fn relabelled_framed_grpc_responses_are_not_claimed_as_json() {
     // (request flavor, retained gRPC-Web type, backend type, relabelled type)
-    let cases: [(HttpFlavor, Option<&str>, Option<&str>, Option<&str>); 10] = [
+    let cases: [RelabelledCase; 10] = [
         // --- The pristine snapshot proves the framing. ---
         // Native gRPC whose response type was removed outright by `after_proxy`.
         (HttpFlavor::Grpc, None, Some("application/grpc+proto"), None),
