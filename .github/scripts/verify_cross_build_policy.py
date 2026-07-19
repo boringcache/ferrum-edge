@@ -3854,7 +3854,8 @@ def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
         # still opaque because the scanner does not model producer semantics.
         if any("\\" in argument for argument in arguments[1:]):
             return None
-        return "".join(arguments[1:])
+        separator = "\n" if arguments[0] == "%s\\n" else ""
+        return separator.join(arguments[1:])
     # A conversion can splice later operands into the program. Only the exact
     # `%s` forms above are modeled; mixing conversions with escapes stays opaque
     # so `printf '\x63%s' 'ross ...'` cannot be accepted as inert source.
@@ -16307,6 +16308,10 @@ pre_build = []
     for benign_stdin_label, benign_stdin_run in (
         ("literal", "printf 'echo built' | bash"),
         ("escaped non-Cross", "printf 'echo \\x62uilt' | bash"),
+        (
+            "repeated newline-delimited literals",
+            "printf '%s\\n' 'echo safe' 'echo built' | bash",
+        ),
     ):
         benign_workflow_errors = validate_workflow_collection(
             {
@@ -16345,6 +16350,10 @@ pre_build = []
     shell_automation_escapes(
         "printf conversion splicing a Cross executable",
         f"printf '\\x63%s' 'ross {arm_target}' | bash",
+    )
+    shell_automation_escapes(
+        "repeated printf format exposing a later Cross command",
+        f"printf '%s\\n' 'echo safe' 'cross {arm_target}' | bash",
     )
 
     # A job that only *writes* a quoted heredoc template is not executing it, so
