@@ -7342,9 +7342,12 @@ fn is_redaction_placeholder_entry(entry: &serde_json::Value, field: &str) -> boo
 /// 1. A stored credential type the ordinary projection does not emit at all —
 ///    `basicauth`, every unknown/custom type, and an `mtls_auth` map whose
 ///    entries the projection all filtered out — is copied from `existing` when
-///    the request omits it, because the client was never shown it. A type the
-///    projection does emit is still deleted by omission, so that contract is
-///    unchanged. Explicit removal of a hidden type uses
+///    the request omits it, because the client was never shown it. When an
+///    `mtls_auth` projection contains only the visible subset of stored entries,
+///    submitting that exact projection restores the original map too; an
+///    actually edited value still replaces it. A type the projection does emit
+///    is still deleted by omission, so that contract is unchanged. Explicit
+///    removal of a hidden type uses
 ///    `DELETE /consumers/{id}/credentials/{cred_type}`, which is authoritative
 ///    for them.
 /// 2. `keyauth`/`jwt`/`hmac_auth` entries submitted as the exact
@@ -7368,6 +7371,26 @@ pub fn preserve_response_hidden_consumer_credentials(updated: &mut Consumer, exi
                 .credentials
                 .insert(cred_type.clone(), stored.clone());
         }
+    }
+
+    // mTLS identities are visible, but malformed legacy entries and every
+    // non-identity field are filtered from the ordinary response. If the
+    // submitted value is byte-for-byte the projection the server emitted,
+    // restore the stored value so an unrelated Consumer edit cannot silently
+    // delete that hidden state. Validation may then reject legacy-invalid data,
+    // which is deliberately fail-closed; a caller that supplies any different
+    // mTLS value is making an express replacement and keeps that value.
+    let submitted_mtls_is_exact_projection = updated
+        .credentials
+        .get("mtls_auth")
+        .zip(projected.credentials.get("mtls_auth"))
+        .is_some_and(|(submitted, visible)| submitted == visible);
+    if submitted_mtls_is_exact_projection
+        && let Some(stored_mtls) = existing.credentials.get("mtls_auth")
+    {
+        updated
+            .credentials
+            .insert("mtls_auth".to_string(), stored_mtls.clone());
     }
 
     for &(cred_type, field) in REDACTED_CREDENTIAL_SECRET_FIELDS {

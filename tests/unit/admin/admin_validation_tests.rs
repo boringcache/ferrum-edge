@@ -1349,3 +1349,56 @@ fn test_consumer_update_preserves_credentials_the_projection_filtered_out() {
         stored.credentials.get("mtls_auth")
     );
 }
+
+/// A partially visible mTLS map is just as lossy as one the projection omits
+/// entirely. An unchanged response round-trip must restore the filtered rows,
+/// while an edited mTLS value remains an intentional wholesale replacement.
+#[test]
+fn test_consumer_update_preserves_partially_filtered_mtls_credentials() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "mtls_auth".to_string(),
+        json!([
+            {"identity": "spiffe://visible"},
+            {"identity": "   ", "legacy_private_field": "must-survive"}
+        ]),
+    );
+    let stored = make_consumer(credentials);
+
+    let projected = ferrum_edge::config::types::redact_consumer_credentials(&stored);
+    assert_eq!(
+        projected.credentials["mtls_auth"],
+        json!([{"identity": "spiffe://visible"}])
+    );
+
+    let mut round_tripped = projected.clone();
+    round_tripped.acl_groups = vec!["editors".to_string()];
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut round_tripped,
+        &stored,
+    );
+    assert_eq!(
+        round_tripped.credentials.get("mtls_auth"),
+        stored.credentials.get("mtls_auth"),
+        "an unchanged projection must not delete its filtered mTLS entries"
+    );
+    assert!(
+        round_tripped.validate_fields().is_err(),
+        "legacy-invalid hidden state must fail closed instead of being deleted"
+    );
+
+    let mut replacement = projected;
+    replacement.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "spiffe://replacement"}]),
+    );
+    ferrum_edge::config::types::preserve_response_hidden_consumer_credentials(
+        &mut replacement,
+        &stored,
+    );
+    assert_eq!(
+        replacement.credentials["mtls_auth"],
+        json!([{"identity": "spiffe://replacement"}]),
+        "an edited mTLS value must remain an intentional replacement"
+    );
+}
