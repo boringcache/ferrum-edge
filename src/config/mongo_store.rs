@@ -8998,6 +8998,30 @@ mod inner {
             self.list_namespaces().await
         }
 
+        async fn list_namespaces_paginated(
+            &self,
+            limit: i64,
+            offset: i64,
+        ) -> Result<PaginatedResult<String>, anyhow::Error> {
+            // MongoDB has no cross-collection union, so the distinct merge
+            // stays in memory; namespace cardinality is operator-controlled
+            // and bounded, and the page slice keeps the wire contract shared
+            // with the SQL backends (ascending name order, exact total).
+            let all = self.list_namespaces().await?;
+            let total = all.len() as i64;
+            let items = match usize::try_from(offset) {
+                Ok(offset) => all
+                    .into_iter()
+                    .skip(offset)
+                    .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                    .collect(),
+                // A backend-safe offset can exceed `usize` on a 32-bit target;
+                // that is a valid request beyond the collection — empty page.
+                Err(_) => Vec::new(),
+            };
+            Ok(PaginatedResult { items, total })
+        }
+
         // -------------------------------------------------------------------
         // ApiSpec operations — admin-only.
         //

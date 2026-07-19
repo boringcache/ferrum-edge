@@ -193,6 +193,38 @@ fn admin_pagination_schema_matches_runtime_bounds_and_coercion() {
         api_spec_response["properties"]["total"]["minimum"],
         json!(0)
     );
+
+    // GET /namespaces consumes the shared pagination contract: the shared
+    // offset/limit parameters by reference and the data/pagination envelope.
+    let namespaces_parameters = spec
+        .pointer("/paths/~1namespaces/get/parameters")
+        .and_then(serde_json::Value::as_array)
+        .expect("namespaces parameter array");
+    for shared in ["PaginationOffset", "PaginationLimit"] {
+        let expected_ref = format!("#/components/parameters/{shared}");
+        assert!(
+            namespaces_parameters.iter().any(|parameter| parameter
+                .get("$ref")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_ref.as_str())),
+            "GET /namespaces must reference the shared {shared} parameter"
+        );
+    }
+    let namespaces_response = spec
+        .pointer("/paths/~1namespaces/get/responses/200/content/application~1json/schema")
+        .expect("namespaces 200 schema");
+    assert_eq!(
+        namespaces_response["required"],
+        json!(["data", "pagination"])
+    );
+    assert_eq!(
+        namespaces_response["properties"]["pagination"]["$ref"],
+        json!("#/components/schemas/Pagination")
+    );
+    assert_eq!(
+        namespaces_response["properties"]["data"]["items"]["type"],
+        json!("string")
+    );
 }
 
 #[test]

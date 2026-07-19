@@ -450,7 +450,7 @@ async fn test_namespaces_distinct_sorted() {
         .expect("GET /namespaces failed");
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.expect("JSON body");
-    let arr = body.as_array().expect("namespaces is an array");
+    let arr = body["data"].as_array().expect("namespaces data array");
 
     let names: Vec<String> = arr
         .iter()

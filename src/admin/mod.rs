@@ -946,7 +946,9 @@ fn paginated_get_list_route_role(method: &Method, segments: &[&str]) -> Option<O
         return None;
     }
     match segments {
-        ["proxies"] | ["consumers"] | ["upstreams"] | ["plugins", "config"] => Some(None),
+        ["proxies"] | ["consumers"] | ["upstreams"] | ["plugins", "config"] | ["namespaces"] => {
+            Some(None)
+        }
         ["audit"] => Some(Some(AdminRole::Admin)),
         ["admin", "tls", "inventory"]
         | ["admin", "tls", "events"]
@@ -1952,7 +1954,10 @@ pub async fn handle_admin_request(
         }
 
         // Namespaces
-        (Method::GET, ["namespaces"]) => handle_list_namespaces(&state).await,
+        (Method::GET, ["namespaces"]) => {
+            let pagination = route_pagination!();
+            handle_list_namespaces(&state, &pagination).await
+        }
 
         // Metrics
         (Method::GET, ["metrics", "runtime"]) => handle_metrics_runtime(&state).await,
@@ -7276,10 +7281,19 @@ async fn handle_audit_list(
 
 // ---- Namespaces ----
 
-async fn handle_list_namespaces(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle_list_namespaces(
+    state: &AdminState,
+    pagination: &PaginationParams,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
-        match db.list_namespaces().await {
-            Ok(namespaces) => Ok(json_response(StatusCode::OK, &json!(namespaces))),
+        match db
+            .list_namespaces_paginated(pagination.query_limit_i64(), pagination.query_offset_i64())
+            .await
+        {
+            Ok(result) => Ok(json_response(
+                StatusCode::OK,
+                &paginate_db_response(&result.items, result.total, pagination),
+            )),
             Err(e) => Ok(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &db_error_response(&e),
@@ -7289,12 +7303,12 @@ async fn handle_list_namespaces(state: &AdminState) -> Result<Response<Full<Byte
         // File mode: return namespaces captured at load time (before namespace filtering)
         Ok(json_response(
             StatusCode::OK,
-            &json!(config.known_namespaces),
+            &paginate_response(&config.known_namespaces, pagination),
         ))
     } else {
         Ok(json_response(
             StatusCode::OK,
-            &json!([crate::config::types::DEFAULT_NAMESPACE]),
+            &paginate_response(&[crate::config::types::DEFAULT_NAMESPACE], pagination),
         ))
     }
 }
