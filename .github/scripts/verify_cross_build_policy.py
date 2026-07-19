@@ -1001,38 +1001,63 @@ WRAPPER_OPTION = (
 # alternative made the duration optional. A benign dynamic-duration line was
 # therefore reported as an opaque Cross executable. Model the operand here so
 # both halves of the analysis agree.
-# `-k`/`--kill-after` take a separate operand of their own. The generic dash
+# `-k`/`--kill-after` and `-s`/`--signal` each take a separate operand of their
+# own. `timeout --help` documents both, and notes that an option's mandatory
+# long-form argument is mandatory for the short spelling too. The generic dash
 # form would otherwise consume the flag alone and let its operand be mistaken
-# for the mandatory duration, so it is excluded there and spelled with its
-# operand here. `-k5` keeps the generic form because that word is self
-# contained.
+# for the mandatory duration: `timeout -s TERM 30 target/evil.sh` would read
+# `TERM` as the duration and put `30` in the executable slot, hiding the script
+# that really runs. Both are therefore excluded from the generic alternative and
+# spelled with their operands here. `-k5`/`-sTERM` keep the generic form because
+# those words are self contained.
 TIMEOUT_OPTION = (
     r"(?:--(?=\s)|"
-    r"(?:-k|--kill-after)(?:=[^\s]+|\s+[^\s]+)|"
-    r"(?!-k(?![A-Za-z0-9-])|--kill-after(?![A-Za-z0-9-]))"
+    r"(?:-k|--kill-after|-s|--signal)(?:=[^\s]+|\s+[^\s]+)|"
+    r"(?!-k(?![A-Za-z0-9-])|--kill-after(?![A-Za-z0-9-])|"
+    r"-s(?![A-Za-z0-9-])|--signal(?![A-Za-z0-9-]))"
     r"--?[A-Za-z0-9][A-Za-z0-9-]*(?:=[^\s]+)?)"
 )
 # The duration may be literal (`30`, `1.5m`) or expanded (`$seconds`), but it is
 # never an option word, so `(?!-)` stops an option from standing in for it and
 # handing the executable slot back to the option's own operand.
 TIMEOUT_UNIT = rf"(?:{TOOL_PATH_PREFIX}timeout(?:\s+{TIMEOUT_OPTION})*\s+(?!-)[^\s]+\s+)"
+ASSIGNMENT_WORD = r"[A-Za-z_][A-Za-z0-9_]*=[^\s]+"
 # `command -v`/`-V` only looks a name up and prints it; it does not execute the
 # operand, so it must not open an executable slot.
+# `sudo` is spelled separately below because it is the one wrapper that parses
+# `NAME=value` operands of its own; the rest exec their operand directly.
 WRAPPER_UNIT = (
     rf"(?:{TIMEOUT_UNIT}|{TOOL_PATH_PREFIX}(?!command\s+-[vV]\b)"
-    r"(?:command|exec|nohup|sudo|time|stdbuf|nice|ionice|setsid)"
+    r"(?:command|exec|nohup|time|stdbuf|nice|ionice|setsid)"
     rf"(?:\s+{WRAPPER_OPTION})*\s+)"
 )
-# The words that may stand between a command slot and the executable, in any
-# order. `env $cmd`, `FOO=bar sudo $cmd`, and `sudo FOO=bar env $cmd` all
-# dispatch the expanded word, so a layer that fixes wrappers before assignment
-# words and omits `env` entirely leaves real dispatches without a command slot.
-# Every alternative consumes at least one word, so repeating the whole layer
-# cannot match empty and stays a strict superset of the wrapper-then-assignment
-# spelling it replaces.
+# `sudo VAR=value cmd` really does dispatch `cmd`: sudo consumes the assignment
+# words itself. `env` does the same through `ENV_OPTION`. No other wrapper does.
+SUDO_UNIT = (
+    rf"(?:{TOOL_PATH_PREFIX}sudo(?:\s+{WRAPPER_OPTION})*"
+    rf"(?:\s+{ASSIGNMENT_WORD})*\s+)"
+)
+# The words that may stand between a command slot and the executable. `env
+# $cmd`, `FOO=bar sudo $cmd`, and `sudo FOO=bar env $cmd` all dispatch the
+# expanded word, so a layer that fixes wrappers before assignment words and
+# omits `env` entirely leaves real dispatches without a command slot.
+#
+# Assignment words are *not* part of the interleaved layer, though: in a shell
+# `NAME=value` is an assignment only while it precedes the command name. After
+# `exec`, `nohup`, `timeout`, or any other wrapper that execs its operand
+# directly, `NAME=value` is ordinary argv and the following word is never
+# dispatched — `exec FOO=bar $cmd build --target ...` asks the shell to run
+# `FOO=bar` and pass `$cmd` as an argument. Treating those as skippable reported
+# benign automation as an opaque Cross dispatch. Leading assignments are
+# therefore matched once, up front, and the wrappers that genuinely accept
+# assignment operands (`env`, `sudo`) carry them inside their own units.
+#
+# Every alternative in the repeated group consumes at least one word, so the
+# layer cannot match empty, and the leading group is anchored ahead of it rather
+# than interleaved with it, so there is exactly one way to match a given prefix.
 COMMAND_WORD_PREFIX = (
-    rf"(?:{WRAPPER_UNIT}|{ENV_PREFIX}|"
-    r"[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+    rf"(?:{ASSIGNMENT_WORD}\s+)*"
+    rf"(?:{WRAPPER_UNIT}|{ENV_PREFIX}|{SUDO_UNIT})*"
 )
 # Every Cross spelling shares one command-start prefix, including the
 # `cargo install cross` form. Anchoring that form keeps benign prose such as
@@ -1050,14 +1075,18 @@ CROSS_EXECUTABLE = (
 # single optional `env` inside `CROSS_EXECUTABLE`, could not describe more than
 # one wrapper/`env` layer: `env FOO=1 sudo BAR=2 env cross build --target ...`
 # is a real literal Cross dispatch that stopped matching at the second `env`.
-# `COMMAND_WORD_PREFIX` accepts wrappers, `env`, and assignment words in any
-# order and every alternative consumes a whole word, so this stays a strict
-# superset of the spelling it replaces without admitting data or argument
-# positions.
+# `COMMAND_WORD_PREFIX` accepts wrappers and `env` in any order, plus the
+# assignment words each position really allows, and every alternative consumes a
+# whole word, so this stays a superset of the spelling it replaces on real shell
+# without admitting data or argument positions.
+# The leading assignment words live inside `COMMAND_WORD_PREFIX` now, so they
+# are not repeated here: a second `(?:NAME=value\s+)*` group ahead of the
+# subshell openers would give the same text two parses. The only spelling that
+# loses is `FOO=bar (cross build ...)`, which is a shell syntax error — an
+# assignment prefix introduces a simple command, never a subshell.
 CROSS_COMMAND_CONTEXT = re.compile(
     COMMAND_START_CONTEXT
-    + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    r"(?:\(\s*)*"
+    + r"(?:\(\s*)*"
     + COMMAND_WORD_PREFIX
     + CROSS_EXECUTABLE
 )
@@ -3064,8 +3093,16 @@ def redirection_token(value: str) -> bool:
 def skip_redirections_and_assignments(
     tokens: tuple[str, ...],
     index: int,
+    *,
+    allow_assignments: bool = True,
 ) -> int:
-    """Skip shell prefixes that may legally precede a command word."""
+    """Skip shell prefixes that may legally precede a command word.
+
+    `allow_assignments` is false once a wrapper has already taken the command
+    name slot. `NAME=value` is an assignment word only while it precedes the
+    command name; after `exec`, `nohup`, or `timeout` it is ordinary argv, and
+    the word behind it is an argument rather than the executable.
+    """
 
     while index < len(tokens):
         token = tokens[index]
@@ -3080,7 +3117,11 @@ def skip_redirections_and_assignments(
         }:
             index += 1
             continue
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token, re.DOTALL):
+        if allow_assignments and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*=.*",
+            token,
+            re.DOTALL,
+        ):
             index += 1
             continue
         if token.isdigit() and index + 1 < len(tokens) and redirection_token(
@@ -3227,6 +3268,12 @@ def skip_wrapper_prefixes(tokens: tuple[str, ...], index: int) -> tuple[int, boo
         "--signal",
         "--user",
     }
+    # `-s` is `timeout --signal` in short form, but `sudo -s` runs a shell and
+    # takes no operand, so it is scoped to the wrapper that documents it rather
+    # than added to the shared set. Without it,
+    # `timeout -s TERM 30 target/evil.sh` consumed `TERM` as the mandatory
+    # duration and handed the command slot to `30`.
+    wrapper_option_operands = {"timeout": {"-s"}}
     while index < len(tokens) and (
         tool_name(tokens[index]) in wrappers or tool_name(tokens[index]) == "rustup"
     ):
@@ -3235,7 +3282,11 @@ def skip_wrapper_prefixes(tokens: tuple[str, ...], index: int) -> tuple[int, boo
             operand = rustup_run_operand(tokens, index)
             if operand is None:
                 return len(tokens), False
-            index = skip_redirections_and_assignments(tokens, operand)
+            index = skip_redirections_and_assignments(
+                tokens,
+                operand,
+                allow_assignments=False,
+            )
             continue
         index += 1
         if wrapper == "command" and index < len(tokens) and tokens[index] in {
@@ -3248,7 +3299,10 @@ def skip_wrapper_prefixes(tokens: tuple[str, ...], index: int) -> tuple[int, boo
             if option == "--":
                 index += 1
                 break
-            if option in option_operands:
+            if option in option_operands or option in wrapper_option_operands.get(
+                wrapper,
+                frozenset(),
+            ):
                 index += 2
                 continue
             if option.startswith("-"):
@@ -3265,7 +3319,14 @@ def skip_wrapper_prefixes(tokens: tuple[str, ...], index: int) -> tuple[int, boo
                 return len(tokens) + 1, True
             # The mandatory duration precedes timeout's command operand.
             index += 1
-        index = skip_redirections_and_assignments(tokens, index)
+        # Only `sudo` parses `NAME=value` operands of its own; every other
+        # wrapper here execs its operand directly, so an assignment word after
+        # one is argv and the word behind it is not a command name.
+        index = skip_redirections_and_assignments(
+            tokens,
+            index,
+            allow_assignments=(wrapper == "sudo"),
+        )
     return index, True
 
 
@@ -6541,14 +6602,26 @@ def generic_action_cross_surfaces(
         remote_surfaces, remote_errors = remote_action_surface_lines(contents, name)
     else:
         remote_surfaces, remote_errors = {}, []
+    # The two whole-text searches below read the *command* text rather than the
+    # raw file, exactly as `contains_direct_trusted_shell_cross_surface` does.
+    # Without that parity a proposed script that merely writes `cat <<'EOF'`
+    # with `bash -c "$(render)"` in the body still changed its compared digest
+    # surface and blocked the edit, while the exact-tree scan treated the same
+    # quoted body as inert template data — a block with no finding behind it.
+    # The projection is not a weakening: it re-emits every substitution an
+    # unquoted body dispatches, keeps an interpreter-fed heredoc body verbatim,
+    # and returns the text raw whenever a heredoc is unterminated. The per-line
+    # scan below is unaffected; `logical_scan_lines` already withdraws heredoc
+    # body lines on its own.
+    command_contents = automation_command_text(logical_contents)
     with shell_argv_dispatch_scope(logical_contents):
         sensitive = (
             runtime_sensitive
             or bool(runtime_errors)
             or bool(remote_surfaces)
             or bool(remote_errors)
-            or OPAQUE_INLINE_SHELL.search(logical_contents) is not None
-            or WRAPPED_LITERAL_CROSS.search(logical_contents) is not None
+            or OPAQUE_INLINE_SHELL.search(command_contents) is not None
+            or WRAPPED_LITERAL_CROSS.search(command_contents) is not None
             or any(
                 has_cross_command_context(
                     variant,
@@ -6660,10 +6733,13 @@ def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
     # holding `bash -c "$(render)"` or `/opt/bin/cross build` — is not executing
     # that text at all, and reporting the quoted body as a generated inline
     # shell surface blocked otherwise safe automation edits. The narrowing is
-    # not a weakening: `opaque_arm_command_text` re-emits every substitution an
-    # *unquoted* body really dispatches, folds backslash continuations, and
-    # returns the program raw whenever a heredoc is unterminated.
-    command_text = opaque_arm_command_text(contents)
+    # not a weakening: `automation_command_text` re-emits every substitution an
+    # *unquoted* body really dispatches, keeps a body an interpreter is fed
+    # (`bash <<'EOF'`) verbatim because that body is the program rather than
+    # data, folds backslash continuations, and returns the program raw whenever
+    # a heredoc is unterminated. Pull-request comparison applies the same
+    # projection, so neither side calls a surface inert that the other blocks.
+    command_text = automation_command_text(contents)
     return (
         literal_surface
         or WRAPPED_LITERAL_CROSS.search(command_text) is not None
@@ -7245,6 +7321,47 @@ def substitution_interior_lines(interior: str) -> tuple[str, ...]:
     )
 
 
+def heredoc_body_substitution_groups(
+    body: str,
+    depth: int = 0,
+) -> tuple[tuple[str, ...], ...]:
+    """Group an unquoted heredoc body's dispatched lines by substitution.
+
+    Each returned group is the interior of one `$(...)` or backtick pair, which
+    is exactly one subshell. Grouping matters because directory state is shared
+    inside a substitution and discarded at its edge: after a parent `cd
+    scripts`, a substitution holding `cd ..` and then `target/evil.sh` really
+    runs the repository-root script, while a later line outside the
+    substitution is still resolved from `scripts/`. Flattening every interior
+    into independent isolated commands lost the first half of that and let a
+    benign `scripts/target/evil.sh` satisfy the scan instead.
+    """
+
+    if depth > MAXIMUM_ARITHMETIC_SUBSTITUTION_DEPTH:
+        # Pathological nesting is not evidence of safety: hand the remaining
+        # text back as one group of commands so the scan keeps failing closed.
+        return (substitution_interior_lines(body),)
+    groups: list[tuple[str, ...]] = []
+    for start, end in command_substitution_spans(body):
+        span = body[start:end]
+        # `$((...))` is arithmetic expansion, not command substitution: see
+        # `heredoc_body_substitution_commands` below for why the interior is
+        # still recursed into.
+        if body.startswith("$((", start) and span.endswith("))"):
+            groups.extend(heredoc_body_substitution_groups(span[3:-2], depth + 1))
+            continue
+        if span.endswith(")"):
+            groups.append(substitution_interior_lines(span[2:-1]))
+    # Backtick substitutions stay line-local. A backtick pair spanning physical
+    # lines cannot be told apart from the Markdown a documentation heredoc
+    # writes, and pairing across lines would invent command lines out of inert
+    # prose. `$(...)` above is unambiguous, so the multi-line case is carried
+    # there.
+    for match in re.finditer(r"`([^`\n]*)`", body):
+        groups.append(substitution_interior_lines(match.group(1)))
+    return tuple(group for group in groups if group)
+
+
 def heredoc_body_substitution_commands(
     body: str,
     depth: int = 0,
@@ -7264,40 +7381,26 @@ def heredoc_body_substitution_commands(
     at a time saw no balanced substitution on the opener and no command slot on
     the continuation — which is still heredoc data — so the script that really
     runs was recorded nowhere.
+
+    `$((...))` is arithmetic expansion, not command substitution: it evaluates
+    an integer expression, so `value=$((scripts/build))` is a division rather
+    than a run and gains no command slot of its own. The shell does still
+    perform command substitution *inside* the expression before evaluating it,
+    so `$(( $(bash scripts/unsafe.sh) + 0 ))` really executes that script, and
+    the grouping helper recurses into the arithmetic interior rather than
+    treating the whole span as dispatch-free. `$( (cmd) )` — the only way to
+    nest a real substitution — is not that spelling and still executes.
+
+    This flattening is for callers that only need the command *text*; the
+    caller that also tracks directory state uses the grouped form so a `cd`
+    inside one substitution reaches the rest of that substitution.
     """
 
-    if depth > MAXIMUM_ARITHMETIC_SUBSTITUTION_DEPTH:
-        # Pathological nesting is not evidence of safety: hand the remaining
-        # text back as commands so the scan keeps failing closed.
-        return substitution_interior_lines(body)
-    interiors: list[str] = []
-    for start, end in command_substitution_spans(body):
-        span = body[start:end]
-        # `$((...))` is arithmetic expansion, not command substitution: it
-        # evaluates an integer expression, so `value=$((scripts/build))` is a
-        # division rather than a run and gains no command slot of its own.
-        # The shell does still perform command substitution *inside* the
-        # expression before evaluating it, so `$(( $(bash scripts/unsafe.sh) +
-        # 0 ))` really executes that script. Recurse into the arithmetic
-        # interior rather than treating the whole span as dispatch-free; only
-        # the arithmetic operators around it stay data. `$( (cmd) )` — the only
-        # way to nest a real substitution — is not this spelling and still
-        # executes below.
-        if body.startswith("$((", start) and span.endswith("))"):
-            interiors.extend(
-                heredoc_body_substitution_commands(span[3:-2], depth + 1)
-            )
-            continue
-        if span.endswith(")"):
-            interiors.extend(substitution_interior_lines(span[2:-1]))
-    # Backtick substitutions stay line-local. A backtick pair spanning physical
-    # lines cannot be told apart from the Markdown a documentation heredoc
-    # writes, and pairing across lines would invent command lines out of inert
-    # prose. `$(...)` above is unambiguous, so the multi-line case is carried
-    # there.
-    for match in re.finditer(r"`([^`\n]*)`", body):
-        interiors.extend(substitution_interior_lines(match.group(1)))
-    return tuple(interiors)
+    return tuple(
+        line
+        for group in heredoc_body_substitution_groups(body, depth)
+        for line in group
+    )
 
 
 def opaque_arm_command_text(contents: str) -> str:
@@ -7311,14 +7414,25 @@ def opaque_arm_command_text(contents: str) -> str:
     `shell_non_command_start_lines` withdraws them from the variant scanners.
 
     Fail-closed behavior on real execution edges is preserved rather than
-    weakened: an *unquoted* body still expands `$()` and backticks, so each
-    substitution interior is re-emitted as a command line of its own and keeps
-    matching. Only the surrounding data loses its synthetic command start.
+    weakened. Two edges carry it:
+
+    * An *unquoted* body still expands `$()` and backticks, so each
+      substitution interior is re-emitted as a command line of its own and
+      keeps matching. Only the surrounding data loses its synthetic command
+      start.
+    * A body whose opener hands it to an interpreter — `bash <<'EOF'`,
+      `python3 <<PY` — is not data at all: it is the program that runs. Those
+      bodies are kept verbatim regardless of delimiter quoting, because a
+      quoted delimiter suppresses expansion inside the program without making
+      the program inert. Withdrawing them turned `bash <<'EOF'` holding
+      `bash -c "$(render)"` into template text and accepted an unprotected
+      generated inline shell surface the raw search had rejected.
     """
 
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
     lines: list[str] = []
-    delimiters: list[tuple[str, bool]] = []
+    # delimiter, quoted, executable
+    delimiters: list[tuple[str, bool, bool]] = []
     body_lines: list[str] = []
 
     def flush_body() -> None:
@@ -7336,19 +7450,29 @@ def opaque_arm_command_text(contents: str) -> str:
 
     for line in logical_contents.splitlines():
         if delimiters:
-            delimiter, quoted = delimiters[0]
+            delimiter, quoted, executable = delimiters[0]
             if line.strip() == delimiter:
                 delimiters.pop(0)
                 flush_body()
                 lines.append("")
                 continue
-            if not quoted:
+            if executable:
+                # The body *is* the program the interpreter runs, so its lines
+                # are commands. Emitting them raw is also a superset of the
+                # substitution re-emission an unquoted body would have got.
+                lines.append(line)
+            elif not quoted:
                 body_lines.append(line)
             continue
         lines.append(line)
         delimiters.extend(
-            (delimiter, quoted)
-            for _, delimiter, quoted in quote_aware_heredoc_start_details(line)
+            # `HEREDOC_EXECUTABLE` reads the text ahead of each opener, the same
+            # evidence `executable_heredocs` uses to decide that a heredoc is a
+            # program rather than data. Testing every opener on the line rather
+            # than only the first one can classify more bodies as executable,
+            # never fewer.
+            (delimiter, quoted, HEREDOC_EXECUTABLE.search(line[:start]) is not None)
+            for start, delimiter, quoted in quote_aware_heredoc_start_details(line)
         )
     if delimiters:
         # An unterminated heredoc would otherwise swallow every remaining line
@@ -7359,6 +7483,19 @@ def opaque_arm_command_text(contents: str) -> str:
     return "\n".join(lines)
 
 
+def automation_command_text(contents: str) -> str:
+    """Project automation text down to the parts a runner really dispatches.
+
+    One projection, used by every whole-text search so the exact-tree scan and
+    pull-request comparison agree on what counts as a command. A file that only
+    *writes* a quoted heredoc template must read the same to both, or one side
+    reports a surface the other calls inert and an otherwise safe edit is
+    blocked with no finding behind it.
+    """
+
+    return opaque_arm_command_text(contents)
+
+
 class ShellCommandLine(NamedTuple):
     """One command line plus whether a subshell isolates its directory state.
 
@@ -7367,10 +7504,18 @@ class ShellCommandLine(NamedTuple):
     interiors as ordinary members of the parent command stream let one rewrite
     the working directory every later *real* line was resolved against, which
     recorded and scanned repository paths the shell was never going to run.
+
+    The isolation is per *substitution*, not per line: one subshell may hold
+    several commands, and a `cd` on its first line does reach its later ones.
+    `ends_isolation` marks the last line of one such subshell, which is where
+    the parent's directory is restored. Marking every interior line as its own
+    isolated command instead resolved `cd ..` followed by `target/evil.sh` from
+    the parent directory, so the outside-root script was never reported.
     """
 
     text: str
     isolated: bool = False
+    ends_isolation: bool = False
 
 
 def shell_command_lines(
@@ -7393,17 +7538,17 @@ def shell_command_lines(
         first because a substitution may open on one body line and close on a
         later one; reading a line at a time left the opener unbalanced and the
         continuation line pure data, so the script that really runs was never
-        recorded. Each interior is queued as its own subshell-scoped program so
-        its directory state cannot outlive it.
+        recorded. Each *substitution* is queued as one subshell-scoped program,
+        so a `cd` on its first line reaches its own later lines and nothing
+        beyond them: the directory state cannot outlive the substitution.
         """
 
         if body_lines:
-            commands.extend(
-                ShellCommandLine(interior, True)
-                for interior in heredoc_body_substitution_commands(
-                    "\n".join(body_lines)
+            for group in heredoc_body_substitution_groups("\n".join(body_lines)):
+                commands.extend(
+                    ShellCommandLine(interior, True, offset == len(group) - 1)
+                    for offset, interior in enumerate(group)
                 )
-            )
             body_lines.clear()
 
     for line in logical_contents.splitlines():
@@ -8665,8 +8810,16 @@ def block_automation_references(
 
         working_directory: str | None = ""
         control_stack: list[str | None] = []
+        # The parent shell's directory, saved on entry to a subshell-scoped
+        # substitution group and restored when that group ends. `None` means no
+        # such group is open.
+        parent_directory: str | None = None
+        inside_subshell = False
         for line_number, command_line in enumerate(command_lines, start=1):
             line = command_line.text
+            if command_line.isolated and not inside_subshell:
+                parent_directory = working_directory
+                inside_subshell = True
             normalized_line = repository_command_line(line)
             directory_matches = list(CD_COMMAND.finditer(normalized_line))
             opened_controls = len(
@@ -8938,10 +9091,20 @@ def block_automation_references(
                 )
                 dispatcher_groups.add("|".join(candidates))
             if command_line.isolated:
-                # A heredoc-body substitution is a subshell: the references it
-                # dispatches are recorded above against the directory it
-                # inherited, but neither its `cd` nor its control keywords can
-                # follow the parent shell onto the next line.
+                # A heredoc-body substitution is a subshell. Its own `cd` still
+                # moves it for the rest of the same substitution — `cd ..` then
+                # `target/evil.sh` really runs the repository-root script — so
+                # the directory is carried across the group's lines and handed
+                # back to the parent at the group's end. Its control keywords
+                # never leave the subshell at all.
+                working_directory = directory_after(
+                    working_directory,
+                    directory_matches,
+                )
+                if command_line.ends_isolation:
+                    working_directory = parent_directory
+                    parent_directory = None
+                    inside_subshell = False
                 continue
             working_directory = directory_after(working_directory, directory_matches)
             if re.search(r"\b(?:else|elif)\b", normalized_line) and control_stack:
@@ -8989,15 +9152,23 @@ def reachable_automation_references(
         for path, kinds in discovered.items():
             interpreters.setdefault(path, set()).update(kinds)
 
-    def hint_for(path: str) -> str | None:
+    def hints_for(path: str) -> tuple[str | None, ...]:
+        """Every reading this file has been reached through.
+
+        Not one winning language: a file reached as both Python and shell is
+        genuinely read both ways, and collapsing the provenance to the stricter
+        Python reading skipped the shell one entirely. A Python/shell polyglot
+        can then hide `bash scripts/unsafe.sh` inside a triple-quoted string
+        while `sh scripts/poly` really executes it, and `scripts/unsafe.sh` was
+        never marked reachable. Each recorded kind is walked instead, so the
+        readings are a union and no edge is dropped.
+
+        With no recorded kind there is nothing to replay, so the file is read
+        once on its own evidence.
+        """
+
         kinds = interpreters.get(path, set())
-        # Python is the stricter reading: it rejects a variable process command
-        # outright, so prefer it whenever an edge named it.
-        if "python" in kinds:
-            return "python"
-        if len(kinds) == 1:
-            return next(iter(kinds))
-        return None
+        return tuple(sorted(kinds)) if kinds else (None,)
 
     def follow_dispatchers(groups: set[str], origin: str) -> None:
         """Resolve each dispatch to whichever of its candidate files exists.
@@ -9037,21 +9208,25 @@ def reachable_automation_references(
     # `python3 scripts/a` edge changes its language. Skipping on reachability
     # alone meant the second reading never happened, so the Python
     # `subprocess.run(['bash', 'scripts/unsafe.sh'])` edges inside it were never
-    # followed. Re-enter whenever the hint changes instead.
+    # followed. Re-enter whenever a reading is still outstanding instead.
     #
-    # This terminates: `interpreters[name]` only grows, `hint_for` is a pure
-    # function of that set, and it takes at most the values
-    # empty -> single-language -> ambiguous -> "python", so a file is re-read a
-    # bounded number of times. The explicit cap below is a backstop that fails
-    # closed rather than silently stopping the walk.
-    processed: dict[str, str | None] = {}
+    # This terminates: `interpreters[name]` only grows, the readings a file owes
+    # are `hints_for(name)`, a pure function of that set drawn from a fixed
+    # language vocabulary, and each `(file, reading)` pair is performed exactly
+    # once. The explicit cap below is a backstop that fails closed rather than
+    # silently stopping the walk.
+    #
+    # Keyed by file, holding every reading already performed for it, so a file
+    # is re-entered exactly once per newly recorded interpreter.
+    processed: dict[str, set[str | None]] = {}
     revisits = 0
     while pending:
         name = pending.pop()
-        hint = hint_for(name)
-        if name in processed and processed[name] == hint:
+        completed = processed.setdefault(name, set())
+        outstanding = [hint for hint in hints_for(name) if hint not in completed]
+        if not outstanding:
             continue
-        if name in processed:
+        if completed:
             revisits += 1
             if revisits > MAXIMUM_INTERPRETER_REVISITS:
                 errors.append(
@@ -9059,25 +9234,33 @@ def reachable_automation_references(
                     "reached automation files"
                 )
                 break
-        processed[name] = hint
         reachable.add(name)
         contents = automation.get(name)
         if contents is None:
+            completed.update(outstanding)
             errors.append(f"{label} references missing automation file {name!r}")
             continue
-        references, dispatchers, discovered, failures = local_automation_references(
-            contents,
-            f"{label}/{name}",
-            workflow_source=False,
-            interpreter_hint=hint,
-        )
-        errors.extend(failures)
-        record(discovered)
-        # Not `references - reachable`: an already-reached path must be re-queued
-        # so the loop above can notice that this edge gave it a new interpreter.
-        # The hint comparison, not the filter, is what stops the walk.
-        pending.extend(sorted(references))
-        follow_dispatchers(dispatchers, f"{label}/{name}")
+        for hint in outstanding:
+            completed.add(hint)
+            (
+                references,
+                dispatchers,
+                discovered,
+                failures,
+            ) = local_automation_references(
+                contents,
+                f"{label}/{name}",
+                workflow_source=False,
+                interpreter_hint=hint,
+            )
+            errors.extend(failures)
+            record(discovered)
+            # Not `references - reachable`: an already-reached path must be
+            # re-queued so the loop above can notice that this edge gave it a
+            # new interpreter. The outstanding-hint set, not the filter, is what
+            # stops the walk.
+            pending.extend(sorted(references))
+            follow_dispatchers(dispatchers, f"{label}/{name}")
     return reachable, interpreters, list(dict.fromkeys(errors))
 
 
@@ -12425,6 +12608,189 @@ pre_build = []
         failures.append(
             "an ordinary opaque ARM64 cross execution stopped being detected"
         )
+    # A heredoc an interpreter is *fed* is the program that runs, not template
+    # data, so quoting its delimiter suppresses expansion inside the program
+    # without making the program inert. Withdrawing it turned a generated inline
+    # shell surface into accepted text.
+    executable_heredoc_program = "bash <<'EOF'\nbash -c \"$(render)\"\nEOF\n"
+    # The benign control writes the identical body instead of running it.
+    written_heredoc_template = "cat <<'EOF' > out.sh\nbash -c \"$(render)\"\nEOF\n"
+    for label, program, dispatched in (
+        ("executable", executable_heredoc_program, True),
+        ("written", written_heredoc_template, False),
+    ):
+        if (
+            OPAQUE_INLINE_SHELL.search(automation_command_text(program)) is not None
+        ) is not dispatched:
+            failures.append(
+                f"a {label} quoted heredoc body was projected as the wrong kind "
+                "of command text"
+            )
+        # Exact-tree validation and pull-request comparison must agree on that
+        # projection. When only one of them narrowed, a proposed script that
+        # merely writes a template still changed its compared digest surface and
+        # blocked the edit with no finding behind it, and an executable heredoc
+        # was inert to the exact scan while the comparison still saw it.
+        exact_surface = contains_direct_trusted_shell_cross_surface(program)
+        compared_surface = bool(
+            generic_action_cross_surfaces(
+                program,
+                name="scripts/self_test_heredoc.sh",
+                include_opaque_shell_executable=True,
+            )
+        )
+        if exact_surface is not dispatched or compared_surface is not dispatched:
+            failures.append(
+                f"a {label} quoted heredoc body disagreed with the expected "
+                "Cross surface between exact validation and comparison"
+            )
+    # A command substitution in a heredoc body is one subshell, so a `cd` on its
+    # first line reaches its own later lines and nothing past them. Resolving
+    # every interior line from the parent directory let a benign
+    # `scripts/scripts/evil.sh` stand in for the repository-root script the
+    # substitution really runs.
+    substitution_cwd_references, _, _, _ = local_automation_references(
+        "cd scripts\n"
+        "cat <<EOF > config.yaml\n"
+        "key: $(\n"
+        "cd ..\n"
+        "bash scripts/evil.sh\n"
+        ")\n"
+        "EOF\n"
+        "bash sub/other.sh\n",
+        "self-test heredoc substitution directory",
+        workflow_source=False,
+    )
+    if "scripts/evil.sh" not in substitution_cwd_references:
+        failures.append(
+            "a directory change inside one heredoc substitution did not reach "
+            "the rest of that substitution"
+        )
+    # The benign control: the parent shell is still in `scripts/` afterwards, so
+    # the subshell's `cd ..` must not have followed it out.
+    if "scripts/sub/other.sh" not in substitution_cwd_references:
+        failures.append(
+            "a heredoc substitution's directory change escaped its subshell"
+        )
+    # `timeout` documents `-s`/`--signal` with a mandatory operand. Consuming
+    # only the flag left its operand standing in for the mandatory duration and
+    # handed the executable slot to the duration instead of the command.
+    for signal_option in ("-s TERM", "--signal TERM", "--signal=TERM", "-sTERM"):
+        if CROSS_COMMAND_CONTEXT.search(
+            f"timeout {signal_option} 30 cross build --target {TARGET}"
+        ) is None:
+            failures.append(
+                f"a Cross dispatch behind 'timeout {signal_option}' lost its "
+                "command slot"
+            )
+        signal_tokens = shell_tokens(f"timeout {signal_option} 30 scripts/evil.sh")
+        if signal_tokens is None:
+            failures.append("a timeout signal command line did not tokenize")
+            continue
+        signal_index, signal_dispatches = skip_wrapper_prefixes(signal_tokens, 0)
+        if not signal_dispatches or signal_index >= len(signal_tokens) or (
+            signal_tokens[signal_index] != "scripts/evil.sh"
+        ):
+            failures.append(
+                f"'timeout {signal_option}' resolved the wrong word as its "
+                "command operand"
+            )
+    # The benign control keeps the same option shape with nothing in a command
+    # slot behind it.
+    if CROSS_COMMAND_CONTEXT.search(
+        f"timeout -s TERM 30 echo cross build --target {TARGET}"
+    ) is not None:
+        failures.append(
+            "a Cross argument behind an echo was read as a timeout command "
+            "operand"
+        )
+    # `NAME=value` is an assignment word only while it precedes the command
+    # name. After a wrapper that execs its operand directly the shell runs the
+    # assignment word itself, so the word behind it is an argument and never a
+    # dispatch.
+    for exec_wrapper in ("exec", "nohup", "timeout 30"):
+        if CROSS_COMMAND_CONTEXT.search(
+            f"{exec_wrapper} FOO=bar cross build --target {TARGET}"
+        ) is not None:
+            failures.append(
+                f"an argv assignment after '{exec_wrapper}' was read as a "
+                "skippable assignment word"
+            )
+    # `env` and `sudo` really do parse assignment operands, and assignments
+    # ahead of any wrapper are still assignments, so every one of these stays a
+    # dispatch.
+    for dispatch_prefix in (
+        "FOO=bar exec",
+        "sudo FOO=bar",
+        "env FOO=1 sudo BAR=2 env",
+        "FOO=bar sudo",
+    ):
+        if CROSS_COMMAND_CONTEXT.search(
+            f"{dispatch_prefix} cross build --target {TARGET}"
+        ) is None:
+            failures.append(
+                f"a literal Cross dispatch behind '{dispatch_prefix}' lost its "
+                "command slot"
+            )
+    for wrapper_line, expected_operand in (
+        ("exec FOO=bar $cmd build", "FOO=bar"),
+        ("sudo FOO=bar $cmd build", "$cmd"),
+    ):
+        wrapper_tokens = shell_tokens(wrapper_line)
+        if wrapper_tokens is None:
+            failures.append("a wrapper assignment command line did not tokenize")
+            continue
+        wrapper_index, wrapper_dispatches = skip_wrapper_prefixes(wrapper_tokens, 0)
+        if not wrapper_dispatches or wrapper_index >= len(wrapper_tokens) or (
+            wrapper_tokens[wrapper_index] != expected_operand
+        ):
+            failures.append(
+                f"{wrapper_line!r} resolved the wrong word as its command operand"
+            )
+    # A file reached through two interpreters is read both ways. Collapsing the
+    # provenance to the stricter Python reading skipped the shell one, so a
+    # polyglot could hide a shell dispatch that `sh scripts/poly` really runs.
+    polyglot_reachable, _, _ = reachable_automation_references(
+        {
+            "workflows/polyglot.yml": (
+                "jobs:\n"
+                "  build:\n"
+                "    steps:\n"
+                "      - run: python3 scripts/poly\n"
+                "      - run: sh scripts/poly\n"
+            )
+        },
+        {
+            "scripts/poly": "#\nbash scripts/unsafe.sh\n",
+            "scripts/unsafe.sh": "echo safe\n",
+        },
+        "self-test polyglot provenance",
+    )
+    if "scripts/unsafe.sh" not in polyglot_reachable:
+        failures.append(
+            "the shell reading of a dual-provenance automation file was skipped"
+        )
+    # The benign control names only Python, so the shell reading is never owed
+    # and the file behind the commented-out shell line stays unreached.
+    python_only_reachable, _, _ = reachable_automation_references(
+        {
+            "workflows/python_only.yml": (
+                "jobs:\n"
+                "  build:\n"
+                "    steps:\n"
+                "      - run: python3 scripts/poly\n"
+            )
+        },
+        {
+            "scripts/poly": "#\n# bash scripts/unsafe.sh\n",
+            "scripts/unsafe.sh": "echo safe\n",
+        },
+        "self-test single provenance",
+    )
+    if "scripts/unsafe.sh" in python_only_reachable:
+        failures.append(
+            "a commented shell line invented an interpreter provenance edge"
+        )
     # A nested command substitution is a valid executable word, so the opaque
     # prefilter must admit the line its scanner can already resolve.
     if OPAQUE_EXECUTABLE_WITH_SUBCOMMAND.search(
@@ -12545,6 +12911,12 @@ pre_build = []
         ("timeout --preserve-status \\\n$var build\n", False),
         ("timeout -k 5 \\\n$var build\n", False),
         ("timeout --preserve-status 30 \\\n$var build\n", True),
+        # `-s`/`--signal` take an operand of their own, so the duration is still
+        # outstanding after one and the next line supplies it rather than an
+        # executable.
+        ("timeout -s TERM \\\n$var build\n", False),
+        ("timeout --signal TERM \\\n$var build\n", False),
+        ("timeout -s TERM 30 \\\n$var build\n", True),
         ("env -u \\\n$var build\n", False),
         ("env -C \\\n$var build\n", False),
         ("sudo -u \\\n$var build\n", False),
@@ -12575,6 +12947,19 @@ pre_build = []
         ("timeout ", False),
         ("timeout --preserve-status ", False),
         ("timeout -k 5 ", False),
+        # `timeout -s TERM` is the documented separated spelling of `--signal`,
+        # so `TERM` is that option's operand and the duration is still owed.
+        ("timeout -s TERM ", False),
+        ("timeout --signal TERM ", False),
+        ("timeout -s TERM 30 ", True),
+        ("timeout --signal=TERM 30 ", True),
+        ("timeout -sTERM 30 ", True),
+        # An assignment word is an assignment only ahead of the command name.
+        # After a wrapper that execs its operand, the shell runs the assignment
+        # word itself, so no executable slot follows it.
+        ("exec FOO=bar ", False),
+        ("nohup FOO=bar ", False),
+        ("timeout 30 FOO=bar ", False),
         ("echo ", False),
         ("cat file ", False),
         ("command -v ", False),
