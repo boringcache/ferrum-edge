@@ -104,8 +104,11 @@ pub const CREDENTIAL_REDACTION_PLACEHOLDER: &str = "[REDACTED]";
 /// Known credential types whose secret field the ordinary Consumer response
 /// projection replaces with [`CREDENTIAL_REDACTION_PLACEHOLDER`], paired with
 /// that field name.
-pub const REDACTED_CREDENTIAL_SECRET_FIELDS: &[(&str, &str)] =
-    &[("keyauth", "key"), ("jwt", "secret"), ("hmac_auth", "secret")];
+pub const REDACTED_CREDENTIAL_SECRET_FIELDS: &[(&str, &str)] = &[
+    ("keyauth", "key"),
+    ("jwt", "secret"),
+    ("hmac_auth", "secret"),
+];
 
 // Current ISO 3166-1 alpha-2 assignments plus XK, the user-assigned Kosovo
 // code emitted by MaxMind country-capable products. Keeping this list in the
@@ -7206,7 +7209,9 @@ pub fn preserve_response_hidden_consumer_credentials(updated: &mut Consumer, exi
         if !projected.credentials.contains_key(cred_type)
             && !updated.credentials.contains_key(cred_type)
         {
-            updated.credentials.insert(cred_type.clone(), stored.clone());
+            updated
+                .credentials
+                .insert(cred_type.clone(), stored.clone());
         }
     }
 
