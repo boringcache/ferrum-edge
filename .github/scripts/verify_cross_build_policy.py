@@ -3840,8 +3840,13 @@ def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
     if any(dynamic_shell_word(argument) for argument in arguments):
         return None
     if producer == "echo":
-        while arguments and arguments[0] in {"-e", "-E", "-n"}:
+        while arguments and re.fullmatch(r"-[eEn]+", arguments[0]):
             arguments.pop(0)
+        if arguments and arguments[0].startswith("-"):
+            # Echo option handling varies between implementations. Once an
+            # option-like word falls outside the bounded -e/-E/-n vocabulary
+            # above, the bytes reaching stdin are not portable.
+            return None
         # Shell echo behavior varies and `echo -e` may decode escapes before a
         # stdin-consuming shell sees the program, so keep escaped output opaque.
         if any("\\" in argument for argument in arguments):
@@ -3849,6 +3854,10 @@ def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
         return " ".join(arguments)
     if producer != "printf" or not arguments:
         return None
+    if arguments[0] == "--":
+        arguments.pop(0)
+        if not arguments:
+            return None
     if arguments[0] in {"%s", "%s\\n"}:
         # The `%s` forms print their operands as data; escaped operands are
         # still opaque because the scanner does not model producer semantics.
@@ -16308,6 +16317,8 @@ pre_build = []
     for benign_stdin_label, benign_stdin_run in (
         ("literal", "printf 'echo built' | bash"),
         ("escaped non-Cross", "printf 'echo \\x62uilt' | bash"),
+        ("printf option terminator", "printf -- 'echo built' | bash"),
+        ("combined echo options", "echo -ne 'echo built' | bash"),
         (
             "repeated newline-delimited literals",
             "printf '%s\\n' 'echo safe' 'echo built' | bash",
@@ -16354,6 +16365,14 @@ pre_build = []
     shell_automation_escapes(
         "repeated printf format exposing a later Cross command",
         f"printf '%s\\n' 'echo safe' 'cross {arm_target}' | bash",
+    )
+    shell_automation_escapes(
+        "printf option terminator exposing a Cross command",
+        f"printf -- '%s\\n' 'cross {arm_target}' | bash",
+    )
+    shell_automation_escapes(
+        "combined echo options exposing a Cross command",
+        f"echo -ne 'cross {arm_target}' | bash",
     )
 
     # A job that only *writes* a quoted heredoc template is not executing it, so
