@@ -4215,8 +4215,8 @@ async fn translated_grpc_web_valid_native_framing_is_still_re_encoded() {
 /// `min_content_length` is lowered so the small bodies here are genuinely
 /// compressible; the control below proves the configuration really does compress.
 fn redacting_plugins_with_compression() -> Vec<Arc<dyn Plugin>> {
-    let compression = CompressionPlugin::new(&json!({"min_content_length": 1}))
-        .expect("compression config");
+    let compression =
+        CompressionPlugin::new(&json!({"min_content_length": 1})).expect("compression config");
     let mut plugins = redacting_plugins();
     plugins.push(Arc::new(compression));
     plugins
