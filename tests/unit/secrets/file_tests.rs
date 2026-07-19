@@ -64,6 +64,9 @@ fn read_secret_error_for_whitespace_only_file() {
 
 #[test]
 fn resolve_ref_returns_none_when_not_set() {
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     assert!(resolve_ref("FERRUM_TEST_SECRET_NOT_SET_XYZ_99999").is_none());
 }
 
