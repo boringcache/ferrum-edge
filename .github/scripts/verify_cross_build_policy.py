@@ -7433,7 +7433,11 @@ def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
         # code without putting a Cross word in the surrounding shell command.
         # Reuse their token model here so reached trusted shell scripts enforce
         # the same boundary as workflow `run:` fields.
-        or shell_inline_interpreter_has_cross(command_text)
+        or any(
+            shell_inline_interpreter_has_cross(line)
+            for line, shell_evaluated, _ in logical_scan_lines(command_text)
+            if shell_evaluated
+        )
         or WRAPPED_LITERAL_CROSS.search(command_text) is not None
         or OPAQUE_INLINE_SHELL.search(command_text) is not None
         # An executable word assembled from shell expansions is opaque, so an
@@ -14721,6 +14725,7 @@ pre_build = []
     # executable surface and must fail closed before the heredoc is mistaken
     # for ordinary data.
     evaluated_stdin = (
+        "echo safe\n"
         "ruby -e 'eval(STDIN.read)' <<'RUBY'\n"
         "system('cross build')\n"
         "RUBY\n"
