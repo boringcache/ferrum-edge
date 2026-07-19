@@ -68,8 +68,7 @@ fn redact_source_reference(error: String, reference: &str) -> String {
 
         if rest.starts_with(REDACTED_REFERENCE)
             && !candidates.iter().any(|candidate| {
-                candidate.len() >= REDACTED_REFERENCE.len()
-                    && rest.starts_with(candidate.as_str())
+                candidate.len() >= REDACTED_REFERENCE.len() && rest.starts_with(candidate.as_str())
             })
         {
             out.push_str(REDACTED_REFERENCE);

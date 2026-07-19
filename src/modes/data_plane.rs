@@ -401,10 +401,7 @@ pub async fn run(
         let http_handle = tokio::spawn(async move {
             info!(
                 "Starting HTTP proxy listener on {}",
-                crate::secrets::report_env_field(
-                    "FERRUM_PROXY_HTTP_PORT",
-                    &http_addr.to_string()
-                )
+                crate::secrets::report_env_field("FERRUM_PROXY_HTTP_PORT", &http_addr.to_string())
             );
             if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
