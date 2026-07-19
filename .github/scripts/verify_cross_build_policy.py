@@ -9814,7 +9814,7 @@ def reachable_automation_references(
     errors: list[str] = []
     pending: list[str] = []
 
-    def record(discovered: dict[str, set[str]]) -> None:
+    def record(discovered: dict[str, set[str | None]]) -> None:
         for path, kinds in discovered.items():
             interpreters.setdefault(path, set()).update(kinds)
 
@@ -14380,8 +14380,9 @@ pre_build = []
 
     # The extensionless `scripts/` discovery cases are asserted with the other
     # repository-command fixtures, where `command_reference_result` is in scope.
-    # heredoc body is data, and an escaped backtick is literal text even in a
-    # real `run:` block, so neither may stand in for a whole command.
+    # Markdown in a report is not a command slot. A backtick inside a heredoc
+    # body is data, and an escaped backtick is literal text even in a real
+    # `run:` block, so neither may stand in for a whole command.
     markdown_workflow = (
         "name: Report\n"
         "on: [push]\n"

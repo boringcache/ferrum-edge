@@ -423,11 +423,15 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   stays editable. Substituting a whole command needs both a line a shell
   evaluates and a slot on it. A raw line scan also reads a workflow's non-`run`
   block scalars and a script's heredoc bodies. Prose block scalars and quoted
-  heredoc bodies are not shell-evaluated, so no slot on them counts: an
-  expression inside a `prompt: |` block or a `python3 <<'PYEOF'` body is data the
-  runner never dispatches, backticks there being Markdown rather than
-  substitutions. Unquoted heredoc bodies are data at line start, but the shell
-  still evaluates command-substitution slots while constructing their input, so
+  heredoc bodies attached to data-writing commands are not shell-evaluated, so
+  no slot on them counts: an expression inside a `prompt: |` block or a
+  `cat <<'EOF'` configuration body is data the runner never dispatches,
+  backticks there being Markdown rather than substitutions. An interpreter-fed
+  heredoc is different: quoting its delimiter suppresses expansion by the outer
+  shell, but `python3 <<'PYEOF'` still executes the body as Python, so the body
+  is extracted and rescanned in that language. Unquoted heredoc bodies are data
+  at line start, but the shell still evaluates command-substitution slots while
+  constructing their input, so
   `$()` and backticks there fail closed — and, for the same reason, a
   substitution in such a body is followed as a repository execution edge:
   `cat <<EOF ... $(bash scripts/unsafe.sh) ... EOF` really runs that script, so
