@@ -1445,6 +1445,41 @@ pub(crate) fn refresh_grpc_status_metadata(
     metadata.insert("grpc_status".to_string(), status.to_string());
 }
 
+/// [`refresh_grpc_status_metadata`] for a buffered response whose terminal
+/// metadata may ride in the BODY rather than in either map.
+///
+/// gRPC-Web carries `grpc-status`/`grpc-message` in a body trailer frame, and
+/// the gateway-authored terminal responses that use it — the representation
+/// gate's `unparseable_document` refusal, the deadline replacement, and a
+/// finalized body rejection — clear the wire trailers and strip the terminal
+/// fields from the initial header block on purpose, because that is the shape
+/// the client must see. Both maps are therefore legitimately silent, and the
+/// plain refresh would read that silence as "the hooks removed the status" and
+/// overwrite the status the replacement just recorded with the synthesized
+/// `UNKNOWN(2)` — reporting `2` in logs, transaction summaries, and the
+/// Prometheus status bucket for a fail-closed `INTERNAL(13)` error the client
+/// actually received.
+///
+/// So when the terminal metadata is body-framed and neither map names a status,
+/// an already-recorded status stands. A status present in either map is still
+/// authoritative and still refreshes, so a genuine post-hook edit is never
+/// ignored, and a request with no recorded status at all still falls back to
+/// `UNKNOWN`.
+pub(crate) fn refresh_grpc_status_metadata_with_body_framed_terminal(
+    metadata: &mut HashMap<String, String>,
+    trailers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+    terminal_metadata_is_body_framed: bool,
+) {
+    if terminal_metadata_is_body_framed
+        && grpc_status_from_maps(trailers, headers).is_none()
+        && metadata.contains_key("grpc_status")
+    {
+        return;
+    }
+    refresh_grpc_status_metadata(metadata, trailers, headers);
+}
+
 /// Effective request-body cap for the sidecar mesh-mTLS dispatch path (issue
 /// #2003 codex r1-3): gRPC-flavored uploads — native `application/grpc` or
 /// gRPC-Web translated to it by the `grpc_web` plugin; both are wire-native
@@ -1581,6 +1616,47 @@ impl GrpcTerminalMetadataSnapshot {
             }
         }
     }
+}
+
+/// Select gateway-authored terminal metadata after a buffered response is
+/// replaced and retire every stale backend trailer in one transition.
+///
+/// Callers pass the replacement header view after it has been normalized into
+/// the client's gRPC flavor. Capturing before split finalization is essential:
+/// non-empty backend responses otherwise have no pristine Trailers-Only
+/// snapshot, and finalization correctly strips an unsourced `grpc-status` from
+/// initial HEADERS.
+pub fn select_buffered_grpc_terminal_response(
+    response_headers: &HashMap<String, String>,
+    response_trailers: &mut HashMap<String, String>,
+    authoritative_terminal_metadata: &mut Option<GrpcTerminalMetadataSnapshot>,
+) {
+    *authoritative_terminal_metadata =
+        Some(GrpcTerminalMetadataSnapshot::from_headers(response_headers));
+    response_trailers.clear();
+}
+
+/// Discard application trailers after buffered response bytes are rewritten,
+/// while retaining the reserved gRPC terminal status on its wire channel.
+///
+/// Buffered hooks see a merged header/trailer compatibility map. Removing only
+/// the wire trailer map would accidentally promote trailer-only application
+/// metadata into initial HEADERS, so this also removes those compatibility
+/// copies. A key that the backend supplied in both channels remains as its real
+/// initial header; only its trailing copy is retired. `grpc-status`,
+/// `grpc-message`, and status details survive because they describe RPC
+/// completion, not the discarded byte representation.
+pub fn discard_grpc_application_trailers_after_body_rewrite(
+    response_headers: &mut HashMap<String, String>,
+    response_trailers: &mut HashMap<String, String>,
+    header_shadowed_trailer_keys: &HashSet<String>,
+) {
+    response_headers.retain(|name, _| {
+        is_reserved_grpc_terminal_metadata(name)
+            || !response_trailers.contains_key(name)
+            || header_shadowed_trailer_keys.contains(name)
+    });
+    response_trailers.retain(|name, _| is_reserved_grpc_terminal_metadata(name));
 }
 
 /// Build the merged header+trailer view buffered gRPC response-hook plugins run

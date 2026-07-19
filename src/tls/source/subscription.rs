@@ -188,8 +188,12 @@ fn source_poll_interval(
                 Ok(interval) => Some(interval),
                 Err(details) => {
                     warn!(
-                        source_id = %uri.source_id(),
-                        poll = %raw,
+                        source_id = %uri.redacted_source_id(),
+                        // The option is part of the same configured URI as the
+                        // identifier above, so it is withheld on the same
+                        // provenance test. `details` is a fixed classification
+                        // string and stays actionable either way.
+                        poll = %uri.redacted_option_value(raw),
                         details = %details,
                         "Invalid TLS material source poll interval; using default"
                     );
@@ -267,7 +271,19 @@ pub fn material_set_fingerprint(
         );
         entries.push(MaterialFingerprintEntry {
             label: watched.label,
-            source_id: material.source_id,
+            // Identity, taken from the *configured* source, never from the
+            // materialized value. `MaterializedMaterial::display_source_id` is
+            // redacted at the producer, so every `vault://` reference renders
+            // identically there; using it here would make two distinct
+            // provider references compare equal whenever their bytes and
+            // version match, and `MaterialSetFingerprint` equality is the
+            // rotation predicate. A configured source change would then evade
+            // reload/rebuild detection, and `tls::events` — which derives
+            // `cert_id`, `source_id`, and source-id filtering from this entry —
+            // would collapse distinct sources onto one event identity. This is
+            // also the same rendering `events::event_material_from_source`
+            // uses for the not-yet-loaded case, so the two event paths agree.
+            source_id: watched.source.source_id(),
             fingerprint: material.fingerprint,
             version: material.version,
             source_kind: material.source_kind,

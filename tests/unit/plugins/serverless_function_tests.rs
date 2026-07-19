@@ -3,12 +3,16 @@ use ferrum_edge::plugins::serverless_function::{ServerlessFunction, redact_serve
 use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, priority};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use super::plugin_utils::create_test_context;
 
 /// Mutex to serialize tests that touch process-global env vars.
-static ENV_MUTEX: Mutex<()> = Mutex::new(());
+///
+/// This is the single process-wide lock, not a file-private one. These tests
+/// write `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_DEFAULT_REGION`, which
+/// the AWS secret-backend tests in `unit::secrets::aws_tests` read through the
+/// SDK's credential chain, so the two suites must serialize against each other.
+use crate::unit::env_lock::ENV_LOCK as ENV_MUTEX;
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -350,7 +354,9 @@ fn test_aws_rejects_invalid_ignored_function_url() {
 
 #[test]
 fn test_aws_missing_region_rejects() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // SAFETY: serialized by ENV_MUTEX — no concurrent env var access
     unsafe {
         remove_all_aws_env_vars();
@@ -369,7 +375,9 @@ fn test_aws_missing_region_rejects() {
 
 #[test]
 fn test_aws_missing_access_key_rejects() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     unsafe {
         remove_all_aws_env_vars();
     }
@@ -387,7 +395,9 @@ fn test_aws_missing_access_key_rejects() {
 
 #[test]
 fn test_aws_missing_secret_key_rejects() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     unsafe {
         remove_all_aws_env_vars();
     }
@@ -405,7 +415,9 @@ fn test_aws_missing_secret_key_rejects() {
 
 #[test]
 fn test_aws_missing_function_name_rejects() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     unsafe {
         remove_all_aws_env_vars();
     }
@@ -2909,7 +2921,9 @@ unsafe fn remove_all_aws_env_vars() {
 
 #[test]
 fn test_aws_falls_back_to_env_vars() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     unsafe {
         remove_all_aws_env_vars();
         std::env::set_var("AWS_DEFAULT_REGION", "ap-southeast-1");
@@ -2934,7 +2948,9 @@ fn test_aws_falls_back_to_env_vars() {
 
 #[test]
 fn test_aws_config_overrides_env_vars() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     unsafe {
         remove_all_aws_env_vars();
         std::env::set_var("AWS_DEFAULT_REGION", "eu-west-1");
@@ -2968,7 +2984,9 @@ fn test_aws_config_overrides_env_vars() {
 
 #[test]
 fn test_aws_region_falls_back_to_aws_region_env() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     unsafe {
         remove_all_aws_env_vars();
         std::env::set_var("AWS_REGION", "ca-central-1");
@@ -2993,7 +3011,9 @@ fn test_aws_region_falls_back_to_aws_region_env() {
 
 #[test]
 fn test_azure_function_key_falls_back_to_env() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     unsafe {
         std::env::set_var("AZURE_FUNCTIONS_KEY", "env-azure-key");
     }
@@ -3015,7 +3035,9 @@ fn test_azure_function_key_falls_back_to_env() {
 
 #[test]
 fn test_gcp_bearer_token_falls_back_to_env() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     unsafe {
         std::env::set_var("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN", "ya29.env-token");
     }

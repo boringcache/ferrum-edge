@@ -18,6 +18,8 @@ use crossbeam_queue::ArrayQueue;
 use serde::Serialize;
 use tracing_subscriber::fmt::MakeWriter;
 
+use crate::secrets::LogRecordSource;
+
 const FAILURE_NOTICE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -303,7 +305,10 @@ impl SinkState {
         let notice = format!(
             "{{\"level\":\"ERROR\",\"target\":\"ferrum_edge::logging\",\"message\":\"stdout log sink failure\",\"operation\":\"{operation}\",\"error_kind\":\"{error_kind}\"}}\n"
         );
-        let _ = fallback.try_write_bytes(notice.as_bytes());
+        // A fixed literal carrying the fmt layer's own root envelope, so it is
+        // submitted as one: its `level`/`target`/`message` keys are structural
+        // here, unlike the same spellings in an access record.
+        let _ = fallback.write_bytes_from(notice.as_bytes(), LogRecordSource::TracingEnvelope);
     }
 
     fn snapshot(&self) -> SinkSnapshot {
@@ -424,7 +429,11 @@ impl NonBlockingSink {
         &self,
         value: &T,
     ) -> Result<EnqueueResult, serde_json::Error> {
-        let mut record = match RecordWriter::reserved(self, false) {
+        // Access records: no tracing envelope, so no key in them is structural.
+        // `log_schema` puts operator strings at the root (`rename:`,
+        // `static_fields:`, flattened `metadata`), which is precisely where the
+        // envelope names would otherwise be waved through.
+        let mut record = match RecordWriter::reserved(self, false, LogRecordSource::Dynamic) {
             Ok(record) => record,
             Err(outcome) => return Ok(outcome),
         };
@@ -443,8 +452,19 @@ impl NonBlockingSink {
         Ok(record.submit())
     }
 
+    /// Enqueue pre-serialized bytes from an unidentified producer.
+    ///
+    /// Treated as [`LogRecordSource::Dynamic`]: a caller handing over opaque
+    /// bytes cannot vouch that any key in them is tracing-envelope structure.
+    /// This stays the only public byte entrypoint so that provenance cannot be
+    /// asserted from outside; `write_bytes_from` is deliberately not exposed.
+    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn try_write_bytes(&self, bytes: &[u8]) -> EnqueueResult {
-        let mut record = match RecordWriter::reserved(self, false) {
+        self.write_bytes_from(bytes, LogRecordSource::Dynamic)
+    }
+
+    fn write_bytes_from(&self, bytes: &[u8], source: LogRecordSource) -> EnqueueResult {
+        let mut record = match RecordWriter::reserved(self, false, source) {
             Ok(record) => record,
             Err(outcome) => return outcome,
         };
@@ -457,7 +477,8 @@ impl NonBlockingSink {
     }
 
     fn tracing_writer(&self) -> RecordWriter {
-        match RecordWriter::reserved(self, true) {
+        // The only producer that genuinely carries the fmt layer's envelope.
+        match RecordWriter::reserved(self, true, LogRecordSource::TracingEnvelope) {
             Ok(writer) => writer,
             Err(_) => RecordWriter::discarding(self.clone()),
         }
@@ -487,10 +508,18 @@ pub struct RecordWriter {
     reserved_bytes: usize,
     oversized: bool,
     auto_submit: bool,
+    /// Which producer opened this record. Carried to `submit()` so the
+    /// structural redactor knows whether the tracing envelope applies; see
+    /// `secrets::LogRecordSource`.
+    source: LogRecordSource,
 }
 
 impl RecordWriter {
-    fn reserved(sink: &NonBlockingSink, auto_submit: bool) -> Result<Self, EnqueueResult> {
+    fn reserved(
+        sink: &NonBlockingSink,
+        auto_submit: bool,
+        source: LogRecordSource,
+    ) -> Result<Self, EnqueueResult> {
         sink.state.try_reserve()?;
         let initial_capacity = sink.state.options.max_record_bytes.min(1_024);
         Ok(Self {
@@ -500,6 +529,7 @@ impl RecordWriter {
             reserved_bytes: sink.state.options.max_record_bytes,
             oversized: false,
             auto_submit,
+            source,
         })
     }
 
@@ -511,6 +541,8 @@ impl RecordWriter {
             reserved_bytes: 0,
             oversized: false,
             auto_submit: false,
+            // Never submitted, so the value is inert; the conservative one.
+            source: LogRecordSource::Dynamic,
         }
     }
 
@@ -540,6 +572,38 @@ impl RecordWriter {
             return EnqueueResult::Saturated;
         }
         if self.oversized {
+            self.discard_oversized();
+            return EnqueueResult::RecordTooLarge;
+        }
+
+        // Emission boundary for externally resolved secret values. This is the
+        // one place a tracing record exists as complete bytes before it leaves
+        // the process, so it is where a `warn!`/`info!` emitted *during*
+        // config parsing — which never passes through a returned `Result` and
+        // so is untouched by the sanitizers on the `validate`/`run` error
+        // paths — stops echoing a value fetched from `_FILE`/`_VAULT`/`_AWS`/
+        // `_AZURE`/`_GCP`. Costs one relaxed atomic load when no external
+        // secret was resolved, which is every process that does not use them.
+        //
+        // Every producer that reaches here emits a JSON document (the fmt
+        // layer is `.json()`, access records go through `try_write_json`, and
+        // the failure notice above is a JSON literal), and the redactor treats
+        // it as one: it rewrites values and dynamic keys, never JSON syntax,
+        // and withholds a record it cannot parse. A resolved value has no
+        // minimum length, so a flat text substitution here would let a
+        // one-character secret rewrite the record's own delimiters.
+        //
+        // `self.source` is why a key is judged by provenance rather than
+        // spelling: `filename` is the fmt layer's structural field *and* a name
+        // `log_schema` can hand an access record, and the bytes alone cannot
+        // tell those apart.
+        crate::secrets::redact_log_record(&mut self.bytes, self.source);
+        if self.bytes.len() > self.sink.state.options.max_record_bytes {
+            // Substitution can grow a record past the admission bound. Drop it
+            // through the existing oversized path (counted in
+            // `oversized_dropped`) rather than enqueueing a payload the byte
+            // reservation did not cover: losing one diagnostic is acceptable,
+            // breaking the reservation invariant or printing the secret is not.
             self.discard_oversized();
             return EnqueueResult::RecordTooLarge;
         }

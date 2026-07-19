@@ -202,8 +202,16 @@ impl InventoryEntryBuilder {
             }
         };
 
+        // The *resolved* scheme replaces the configured one (a bare path
+        // resolves to `file`), but the identifier stays the configured
+        // `source.source_id()` set above. It must not be overwritten with
+        // `material.display_source_id`: that value is redacted at the producer,
+        // so every `vault://` entry would report the same identifier and the
+        // inventory would stop distinguishing sources an operator configured
+        // separately. Nothing here needs a redacted rendering — the identifier
+        // is the operator's own configured string, on an authenticated admin
+        // surface, and it is what `used_by` correlation is read against.
         entry.source.kind = material.source_kind.as_str().to_string();
-        entry.source.identifier = material.source_id;
         entry.source.version = material.version;
 
         match self.kind {

@@ -1,15 +1,19 @@
 //! Tests for the secret resolution system (env + file backends).
 //!
 //! These tests mutate process-global environment variables, so they MUST run
-//! serially. We use the same ENV_LOCK pattern as env_config_tests.
+//! serially against every other env-touching test in the `unit_tests` binary —
+//! not merely against each other. They therefore acquire the single
+//! process-wide [`crate::unit::env_lock::ENV_LOCK`], the same mutex the config,
+//! CLI, identity, and redaction suites take. A file-private mutex would leave
+//! `set_var` here racing a `getenv` there, which is exactly what Rust 2024's
+//! unsafe-env contract forbids.
 
 use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_secret};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::Mutex;
 use tempfile::NamedTempFile;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+use crate::unit::env_lock::ENV_LOCK;
 
 /// Helper to set env vars, run an async closure, then clean them up.
 fn with_env_vars_async<F, Fut>(vars: &[(&str, &str)], f: F)
@@ -17,7 +21,9 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for (k, v) in vars {
         // SAFETY: We hold a mutex preventing concurrent access.
         unsafe {
@@ -164,6 +170,185 @@ fn test_resolve_all_env_secrets_resolves_multiple_file_sources() {
     );
 }
 
+/// `resolve_all_env_secrets` discovers sources by iterating `std::env::vars()`
+/// into a `HashMap`, so without an explicit sort the resolved vectors — and the
+/// `Loaded <KEY> from <provider>` lines `validate` prints from them — can
+/// reorder between processes on identical input.
+///
+/// The three sources are staged in deliberately non-alphabetical order, and the
+/// assertions are on the exact sequence, not on set membership. Results are
+/// filtered to this test's own prefix so an unrelated `FERRUM_*_FILE` in the
+/// runner environment cannot make the assertion vacuous or flaky.
+#[test]
+fn test_resolve_all_env_secrets_orders_results_by_base_key() {
+    let mut tmp_c = NamedTempFile::new().unwrap();
+    let mut tmp_a = NamedTempFile::new().unwrap();
+    let mut tmp_b = NamedTempFile::new().unwrap();
+    writeln!(tmp_c, "order-charlie").unwrap();
+    writeln!(tmp_a, "order-alpha").unwrap();
+    writeln!(tmp_b, "order-bravo").unwrap();
+    let path_c = tmp_c.path().to_str().unwrap().to_string();
+    let path_a = tmp_a.path().to_str().unwrap().to_string();
+    let path_b = tmp_b.path().to_str().unwrap().to_string();
+
+    with_env_vars_async(
+        &[
+            ("FERRUM_TEST_SECRET_ORDER_C_FILE", &path_c),
+            ("FERRUM_TEST_SECRET_ORDER_A_FILE", &path_a),
+            ("FERRUM_TEST_SECRET_ORDER_B_FILE", &path_b),
+        ],
+        || async {
+            let resolved = resolve_all_env_secrets().await.unwrap();
+
+            let vars: Vec<(String, String)> = resolved
+                .vars
+                .into_iter()
+                .filter(|(key, _)| key.starts_with("FERRUM_TEST_SECRET_ORDER_"))
+                .collect();
+            assert_eq!(
+                vars,
+                vec![
+                    (
+                        "FERRUM_TEST_SECRET_ORDER_A".to_string(),
+                        "order-alpha".to_string()
+                    ),
+                    (
+                        "FERRUM_TEST_SECRET_ORDER_B".to_string(),
+                        "order-bravo".to_string()
+                    ),
+                    (
+                        "FERRUM_TEST_SECRET_ORDER_C".to_string(),
+                        "order-charlie".to_string()
+                    ),
+                ],
+                "resolved vars must be ordered by base key"
+            );
+
+            let loaded: Vec<(String, &'static str)> = resolved
+                .loaded_sources
+                .into_iter()
+                .filter(|(key, _)| key.starts_with("FERRUM_TEST_SECRET_ORDER_"))
+                .collect();
+            assert_eq!(
+                loaded,
+                vec![
+                    ("FERRUM_TEST_SECRET_ORDER_A".to_string(), "file"),
+                    ("FERRUM_TEST_SECRET_ORDER_B".to_string(), "file"),
+                    ("FERRUM_TEST_SECRET_ORDER_C".to_string(), "file"),
+                ],
+                "reported secret sources must be ordered by base key"
+            );
+
+            let source_keys: Vec<String> = resolved
+                .source_keys_to_remove
+                .into_iter()
+                .filter(|key| key.starts_with("FERRUM_TEST_SECRET_ORDER_"))
+                .collect();
+            assert_eq!(
+                source_keys,
+                vec![
+                    "FERRUM_TEST_SECRET_ORDER_A_FILE".to_string(),
+                    "FERRUM_TEST_SECRET_ORDER_B_FILE".to_string(),
+                    "FERRUM_TEST_SECRET_ORDER_C_FILE".to_string(),
+                ],
+                "suffixed source keys must be ordered by base key"
+            );
+        },
+    );
+}
+
+/// A source reference is as sensitive as the value it points at, so a failed
+/// A resolved value containing a NUL byte must fail as an ordinary, sanitized
+/// resolution error.
+///
+/// Process environment values cannot contain NUL: `std::env::set_var` panics on
+/// one. Startup resolution now runs before any settings are parsed, so a
+/// `_FILE` source pointing at binary material would abort `validate` outright —
+/// no exit code, no diagnostic — instead of reporting the bad local secret that
+/// `validate` exists to catch. The value itself is never named.
+#[test]
+fn test_resolve_all_env_secrets_rejects_nul_in_resolved_value() {
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(b"nul-sentinel-prefix\0nul-sentinel-suffix")
+        .unwrap();
+    file.flush().unwrap();
+
+    with_env_vars_async(
+        &[("FERRUM_TEST_SECRET_NUL_FILE", file.path().to_str().unwrap())],
+        || async {
+            let err = match resolve_all_env_secrets().await {
+                Ok(_) => panic!("expected a NUL-containing resolved value to fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("FERRUM_TEST_SECRET_NUL") && err.contains("NUL byte"),
+                "error must name the base key and the failure class: {err}"
+            );
+            assert!(
+                !err.contains("nul-sentinel-prefix") && !err.contains("nul-sentinel-suffix"),
+                "error must not disclose the resolved value: {err}"
+            );
+        },
+    );
+}
+
+/// `_FILE` fetch must name the variable and the `io::Error` reason but not the
+/// path.
+#[test]
+fn test_resolve_all_env_secrets_file_error_omits_source_reference() {
+    let missing_path = "/nonexistent/ferrum-secret-source-reference-sentinel/value";
+
+    with_env_vars_async(
+        &[("FERRUM_TEST_SECRET_REDACT_FILE", missing_path)],
+        || async {
+            let err = match resolve_all_env_secrets().await {
+                Ok(_) => panic!("expected an unreadable _FILE source to fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("Failed to read FERRUM_TEST_SECRET_REDACT_FILE"),
+                "error must stay actionable at base-key level: {err}"
+            );
+            assert!(
+                !err.contains(missing_path)
+                    && !err.contains("ferrum-secret-source-reference-sentinel"),
+                "error must not disclose the source reference: {err}"
+            );
+        },
+    );
+}
+
+/// The same contract for a provider-shaped failure. An unparseable Vault
+/// reference fails during reference parsing, so this needs no live Vault — only
+/// the client env vars the wrapper requires before it gets that far.
+#[cfg(feature = "secrets-vault")]
+#[test]
+fn test_resolve_all_env_secrets_vault_error_omits_source_reference() {
+    let reference = "ferrum-vault-source-reference-sentinel";
+
+    with_env_vars_async(
+        &[
+            ("VAULT_ADDR", "http://127.0.0.1:1"),
+            ("VAULT_TOKEN", "test-token"),
+            ("FERRUM_TEST_SECRET_VAULT_REDACT_VAULT", reference),
+        ],
+        || async {
+            let err = match resolve_all_env_secrets().await {
+                Ok(_) => panic!("expected an invalid Vault reference to fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("FERRUM_TEST_SECRET_VAULT_REDACT"),
+                "error must stay actionable at base-key level: {err}"
+            );
+            assert!(
+                !err.contains(reference),
+                "error must not disclose the source reference: {err}"
+            );
+        },
+    );
+}
+
 #[test]
 fn test_resolve_all_env_secrets_ignores_non_secret_file_suffix_config() {
     with_env_vars_async(
@@ -257,6 +442,161 @@ fn test_resolve_all_env_secrets_rejects_unsupported_cloud_suffixes() {
                 assert!(result.is_ok());
             }
         },
+    );
+}
+
+#[test]
+fn test_resolve_all_env_secrets_ignores_empty_cloud_suffixes() {
+    with_env_vars_async(
+        &[
+            ("FERRUM_TEST_SECRET_EMPTY_VAULT", ""),
+            ("FERRUM_TEST_SECRET_EMPTY_AWS", ""),
+            ("FERRUM_TEST_SECRET_EMPTY_AZURE", ""),
+            ("FERRUM_TEST_SECRET_EMPTY_GCP", ""),
+        ],
+        || async {
+            let resolved = resolve_all_env_secrets()
+                .await
+                .expect("empty cloud suffixes must be treated as unset");
+            assert!(resolved.vars.is_empty());
+            assert!(resolved.source_keys_to_remove.is_empty());
+            assert!(resolved.loaded_sources.is_empty());
+        },
+    );
+}
+
+/// Unsupported-suffix discovery iterates `std::env::vars()`, whose order varies
+/// between processes, so returning on the first sighting would let two runs on
+/// an identical environment blame a different variable. Failures are collected
+/// and sorted, and the lexicographically first key is reported.
+///
+/// Only meaningful in a build without the cloud features — with them compiled
+/// in there is no unsupported suffix to order.
+#[cfg(not(any(
+    feature = "secrets-aws",
+    feature = "secrets-gcp",
+    feature = "secrets-azure"
+)))]
+#[test]
+fn test_resolve_all_env_secrets_reports_first_unsupported_suffix_deterministically() {
+    with_env_vars_async(
+        &[
+            // Staged in reverse of the expected order.
+            ("FERRUM_TEST_SECRET_ZULU_UNSUPPORTED_GCP", "projects/x/y"),
+            ("FERRUM_TEST_SECRET_ALPHA_UNSUPPORTED_AWS", "arn:aws:x"),
+            ("FERRUM_TEST_SECRET_MIKE_UNSUPPORTED_AZURE", "https://v/s/n"),
+        ],
+        || async {
+            let err = match resolve_all_env_secrets().await {
+                Ok(_) => panic!("expected unsupported cloud suffixes to fail"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("FERRUM_TEST_SECRET_ALPHA_UNSUPPORTED_AWS"),
+                "the lexicographically first offending key must be reported, got: {err}"
+            );
+            assert!(
+                !err.contains("FERRUM_TEST_SECRET_MIKE_UNSUPPORTED_AZURE")
+                    && !err.contains("FERRUM_TEST_SECRET_ZULU_UNSUPPORTED_GCP"),
+                "only the first offending key is reported, got: {err}"
+            );
+        },
+    );
+}
+
+/// A `_FILE` source can point at a FIFO with no writer, where the read blocks
+/// uninterruptibly. `tokio::time::timeout` around a `spawn_blocking` handle
+/// returns on schedule but does not stop the blocking task, and **dropping the
+/// runtime then waits for the blocking pool** — so the timeout was honored and
+/// the process hung anyway at runtime teardown. That made `validate`
+/// non-hermetic for exactly the bad local source it exists to catch.
+///
+/// This test must not be able to hang CI itself, so the whole resolve — runtime
+/// build, `block_on`, *and the runtime drop* — happens on a worker thread that
+/// the test body joins with a bounded `recv_timeout`. A regression fails the
+/// test loudly instead of parking the suite.
+///
+/// The env vars are set and left in place for the worker (which only reads
+/// them) and are cleared after the bounded wait; `ENV_LOCK` is held throughout.
+#[cfg(unix)]
+#[test]
+fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const FETCH_TIMEOUT_SECS: u64 = 2;
+    // Generous multiple of the fetch timeout: enough that a slow runner cannot
+    // flake, far below anything that looks like a hang.
+    const WATCHDOG: Duration = Duration::from_secs(30);
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("blocked-secret");
+    let created = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !created {
+        eprintln!("skipping: mkfifo unavailable");
+        return;
+    }
+
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: ENV_LOCK is held for the whole test, including the worker thread.
+    unsafe {
+        std::env::set_var("FERRUM_TEST_SECRET_BLOCKED_FILE", &fifo);
+        // Read from the environment only — startup resolution deliberately does
+        // not consult `ferrum.conf`, so no settings file is needed here.
+        std::env::set_var(
+            "FERRUM_SECRET_FETCH_TIMEOUT_SECONDS",
+            FETCH_TIMEOUT_SECS.to_string(),
+        );
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(resolve_all_env_secrets())
+            // `rt` is dropped here. With a `spawn_blocking` read this is where
+            // the process parks forever; the send below would never happen.
+        };
+        let _ = sender.send((result, started.elapsed()));
+    });
+
+    let received = receiver.recv_timeout(WATCHDOG);
+
+    // SAFETY: ENV_LOCK is still held.
+    unsafe {
+        std::env::remove_var("FERRUM_TEST_SECRET_BLOCKED_FILE");
+        std::env::remove_var("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS");
+    }
+
+    let (result, elapsed) = received.expect(
+        "resolution and runtime teardown must complete; a blocked _FILE read \
+         must not be waited on",
+    );
+    let err = match result {
+        Ok(_) => panic!("a FIFO with no writer must not resolve"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("Timeout resolving FERRUM_TEST_SECRET_BLOCKED"),
+        "expected a fetch timeout naming the base key, got: {err}"
+    );
+    assert!(
+        !err.contains(fifo.to_str().unwrap()),
+        "the source reference must not be disclosed, got: {err}"
+    );
+    assert!(
+        elapsed < WATCHDOG,
+        "resolution must be bounded by the fetch timeout, took {elapsed:?}"
     );
 }
 

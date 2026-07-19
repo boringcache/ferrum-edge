@@ -4019,7 +4019,8 @@ fn normalize_from_openai_compatible(resp: &Value) -> Result<(Value, TokenCounts)
                 "ai_federation: OpenAI-compatible choices[{index}] has neither text content, tool calls, nor refusal"
             ));
         }
-        if (finish_reason == "tool_calls") != !tool_calls.is_empty() {
+        let has_tool_calls = !tool_calls.is_empty();
+        if (finish_reason == "tool_calls") != has_tool_calls {
             return Err(format!(
                 "ai_federation: OpenAI-compatible choices[{index}] tool calls and finish_reason disagree"
             ));
@@ -4249,7 +4250,8 @@ fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenC
         );
     }
 
-    if (stop_reason == "tool_use") != !tool_calls.is_empty() {
+    let has_tool_calls = !tool_calls.is_empty();
+    if (stop_reason == "tool_use") != has_tool_calls {
         return Err(
             "ai_federation: Anthropic tool_use content and stop_reason disagree".to_string(),
         );
@@ -4588,7 +4590,8 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
     }
 
     let stop_reason = required_non_empty_string(resp, "stopReason", "Bedrock response")?;
-    if (stop_reason == "tool_use") != !tool_calls.is_empty() {
+    let has_tool_calls = !tool_calls.is_empty();
+    if (stop_reason == "tool_use") != has_tool_calls {
         return Err("ai_federation: Bedrock toolUse content and stopReason disagree".to_string());
     }
     let finish_reason = match stop_reason {
@@ -4681,7 +4684,8 @@ fn normalize_from_cohere(resp: &Value, model: &str) -> Result<(Value, TokenCount
     }
 
     let native_finish_reason = required_non_empty_string(resp, "finish_reason", "Cohere response")?;
-    if (native_finish_reason == "TOOL_CALL") != !tool_calls.is_empty() {
+    let has_tool_calls = !tool_calls.is_empty();
+    if (native_finish_reason == "TOOL_CALL") != has_tool_calls {
         return Err("ai_federation: Cohere tool calls and finish_reason disagree".to_string());
     }
     let finish_reason = match native_finish_reason {

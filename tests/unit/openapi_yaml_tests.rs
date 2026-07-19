@@ -193,6 +193,38 @@ fn admin_pagination_schema_matches_runtime_bounds_and_coercion() {
         api_spec_response["properties"]["total"]["minimum"],
         json!(0)
     );
+
+    // GET /namespaces consumes the shared pagination contract: the shared
+    // offset/limit parameters by reference and the data/pagination envelope.
+    let namespaces_parameters = spec
+        .pointer("/paths/~1namespaces/get/parameters")
+        .and_then(serde_json::Value::as_array)
+        .expect("namespaces parameter array");
+    for shared in ["PaginationOffset", "PaginationLimit"] {
+        let expected_ref = format!("#/components/parameters/{shared}");
+        assert!(
+            namespaces_parameters.iter().any(|parameter| parameter
+                .get("$ref")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_ref.as_str())),
+            "GET /namespaces must reference the shared {shared} parameter"
+        );
+    }
+    let namespaces_response = spec
+        .pointer("/paths/~1namespaces/get/responses/200/content/application~1json/schema")
+        .expect("namespaces 200 schema");
+    assert_eq!(
+        namespaces_response["required"],
+        json!(["data", "pagination"])
+    );
+    assert_eq!(
+        namespaces_response["properties"]["pagination"]["$ref"],
+        json!("#/components/schemas/Pagination")
+    );
+    assert_eq!(
+        namespaces_response["properties"]["data"]["items"]["type"],
+        json!("string")
+    );
 }
 
 #[test]
@@ -282,7 +314,16 @@ fn typed_component_properties_match_serde_field_inventories() {
     }
 
     check!(Proxy, "Proxy");
-    check!(Consumer, "Consumer");
+    // `Consumer` is an allOf composition over `ConsumerBase` plus the
+    // surface-specific credentials map; the serde field inventory is checked
+    // against the flat base schema, and the credentials wiring is covered by
+    // `consumer_credential_surface_schemas_match_runtime_redaction` below.
+    check!(
+        Consumer,
+        "ConsumerBase",
+        rust_only = ["credentials"],
+        schema_only = []
+    );
     check!(PluginConfig, "PluginConfig");
     check!(PluginAssociation, "PluginAssociation");
     check!(Upstream, "Upstream");
@@ -408,11 +449,10 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
     let admin_docs = include_str!("../../docs/admin_api.md");
     assert!(admin_docs.contains(basic_roundtrip_contract));
 
-    let consumer_credentials =
-        &spec["components"]["schemas"]["Consumer"]["properties"]["credentials"];
+    let consumer_credentials = &spec["components"]["schemas"]["ConsumerCredentialsRedacted"];
     let credentials_description = consumer_credentials["description"]
         .as_str()
-        .expect("Consumer credentials description");
+        .expect("ConsumerCredentialsRedacted description");
     assert!(credentials_description.contains("responses omit `basicauth` entirely"));
 
     let password_hash =
@@ -445,6 +485,681 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
         spec["paths"]["/batch"]["post"]["responses"]["500"]["$ref"],
         "#/components/responses/InternalServerError"
     );
+}
+
+#[test]
+fn consumer_credential_surface_schemas_match_runtime_redaction() {
+    use ferrum_edge::config::types::{Consumer, redact_consumer_credentials};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let password_hash = format!("hmac_sha256:{}", "a".repeat(64));
+    let jwt_secret = "j".repeat(32);
+    let hmac_secret = "h".repeat(32);
+    let stored_consumer = json!({
+        "id": "consumer-1",
+        "username": "alice",
+        "namespace": "ferrum",
+        "custom_id": "ext-123",
+        "credentials": {
+            "keyauth": [{"key": "live-api-key"}],
+            "basicauth": [{"password_hash": password_hash}],
+            "jwt": [{"secret": jwt_secret}],
+            "hmac_auth": [{"secret": hmac_secret}],
+            "mtls_auth": [{"identity": "client.example.com"}],
+            "custom_auth": [{
+                "api_token": "custom-secret-must-only-appear-in-backup",
+                "metadata": {"nested_secret": "also-backup-only"}
+            }]
+        },
+        "acl_groups": ["engineering"],
+        "created_at": "2026-01-02T03:04:05Z",
+        "updated_at": "2026-01-02T03:04:05Z"
+    });
+    let consumer: Consumer =
+        serde_json::from_value(stored_consumer).expect("stored consumer deserializes");
+
+    // The runtime redacted output must validate against the ordinary Consumer
+    // surface and carry the exact placeholders the schema encodes.
+    let redacted = serde_json::to_value(redact_consumer_credentials(&consumer))
+        .expect("redacted consumer serializes");
+    let redacted_credentials = &redacted["credentials"];
+    assert!(redacted_credentials.get("basicauth").is_none());
+    for (cred_type, field) in [
+        ("keyauth", "key"),
+        ("jwt", "secret"),
+        ("hmac_auth", "secret"),
+    ] {
+        assert_eq!(
+            redacted_credentials[cred_type][0][field],
+            json!("[REDACTED]"),
+            "{cred_type} entries must carry the exact redaction placeholder"
+        );
+    }
+    assert_eq!(
+        redacted_credentials["mtls_auth"][0]["identity"],
+        json!("client.example.com"),
+        "non-secret mtls identity stays visible"
+    );
+    assert!(
+        redacted_credentials.get("custom_auth").is_none(),
+        "ordinary responses must omit unknown/custom credential values"
+    );
+    assert!(
+        !redacted
+            .to_string()
+            .contains("custom-secret-must-only-appear-in-backup")
+    );
+    assert_component_validity(&spec, "Consumer", &redacted, true);
+
+    // Legacy known entries are projected to their exact safe response shape:
+    // extra JWT fields are dropped and the secret is replaced, so historical
+    // stored data cannot violate the closed response schema or disclose values.
+    let legacy_consumer: Consumer = serde_json::from_value(json!({
+        "username": "legacy",
+        "credentials": {
+            "jwt": [{
+                "secret": "legacy-secret-that-must-not-escape",
+                "algorithm": "HS256",
+                "private_metadata": {"recovery_token": "must-not-escape"}
+            }]
+        }
+    }))
+    .expect("legacy Consumer shape still deserializes from generic stored credentials");
+    let legacy_redacted = serde_json::to_value(redact_consumer_credentials(&legacy_consumer))
+        .expect("legacy redacted Consumer serializes");
+    assert_eq!(
+        legacy_redacted["credentials"]["jwt"],
+        json!([{"secret": "[REDACTED]"}])
+    );
+    assert!(!legacy_redacted.to_string().contains("must-not-escape"));
+    assert_component_validity(&spec, "Consumer", &legacy_redacted, true);
+
+    // The unredacted stored shape must not validate against the redacted
+    // surface: `basicauth` is forbidden and the placeholders are exact.
+    let stored_value = serde_json::to_value(&consumer).expect("stored consumer serializes");
+    assert_component_validity(&spec, "Consumer", &stored_value, false);
+
+    // The backup surface accepts the canonical stored values; the restore
+    // surface additionally accepts plaintext passwords.
+    assert_component_validity(&spec, "ConsumerBackup", &stored_value, true);
+    assert_component_validity(&spec, "ConsumerRestore", &stored_value, true);
+    assert!(
+        stored_value["credentials"]["custom_auth"][0]["api_token"]
+            .as_str()
+            .is_some(),
+        "backup serialization must preserve custom credentials"
+    );
+    let plaintext_basic = json!({
+        "username": "alice",
+        "credentials": {"basicauth": [{"password": "correct horse battery staple"}]}
+    });
+    assert_component_validity(&spec, "ConsumerRestore", &plaintext_basic, true);
+    assert_component_validity(&spec, "ConsumerBackup", &plaintext_basic, false);
+
+    // The request surface accepts canonical credential input and rejects
+    // shapes the runtime validation also rejects (unknown entry fields,
+    // ambiguous basic auth fields, missing secret material) as well as the
+    // redaction placeholders for length-bounded secret types.
+    let valid_create = json!({
+        "username": "alice",
+        "credentials": {
+            "keyauth": [{"key": "live-api-key"}],
+            "basicauth": [{"password": "correct horse battery staple"}],
+            "jwt": [{"secret": jwt_secret}],
+            "hmac_auth": [{"secret": hmac_secret}],
+            "mtls_auth": [{"identity": "client.example.com"}]
+        }
+    });
+    assert_component_validity(&spec, "ConsumerCreate", &valid_create, true);
+    let custom_credential_input = json!({
+        "username": "custom-client",
+        "credentials": {
+            "custom_auth": [{"api_token": "write-and-backup-contract-remains-unredacted"}]
+        }
+    });
+    for surface in ["ConsumerCreate", "ConsumerBackup", "ConsumerRestore"] {
+        assert_component_validity(&spec, surface, &custom_credential_input, true);
+    }
+    assert_component_validity(&spec, "Consumer", &custom_credential_input, false);
+
+    // Consumer JWT credentials have exactly one supported algorithm/key form:
+    // an HS256 shared secret. The input, backup, and restore surfaces all
+    // accept that canonical form, while the ordinary response accepts only
+    // the runtime's exact redaction placeholder.
+    let jwt_input = json!({"secret": jwt_secret});
+    let jwt_redacted = json!({"secret": "[REDACTED]"});
+    let valid_runtime_jwt: Consumer = serde_json::from_value(json!({
+        "username": "alice",
+        "credentials": {"jwt": [jwt_input]}
+    }))
+    .expect("valid JWT Consumer deserializes");
+    assert!(
+        valid_runtime_jwt.validate_fields().is_ok(),
+        "the positive OpenAPI JWT form must pass runtime validation"
+    );
+    for component in ["JwtCredential", "JwtCredentialBackup"] {
+        assert_component_validity(&spec, component, &jwt_input, true);
+        assert_component_validity(&spec, component, &jwt_redacted, false);
+    }
+    assert_component_validity(&spec, "JwtCredentialRedacted", &jwt_redacted, true);
+    assert_component_validity(&spec, "JwtCredentialRedacted", &jwt_input, false);
+    for surface in ["ConsumerCreate", "ConsumerBackup", "ConsumerRestore"] {
+        assert_component_validity(
+            &spec,
+            surface,
+            &json!({"username": "alice", "credentials": {"jwt": [jwt_input]}}),
+            true,
+        );
+    }
+    assert_component_validity(
+        &spec,
+        "Consumer",
+        &json!({"username": "alice", "credentials": {"jwt": [jwt_redacted]}}),
+        true,
+    );
+    for supported_secret in [
+        "🔐".repeat(32),
+        "j".repeat(4096),
+        format!("{}\t\n\r", "j".repeat(32)),
+    ] {
+        let supported = json!({"secret": supported_secret});
+        let supported_runtime_jwt: Consumer = serde_json::from_value(json!({
+            "username": "alice",
+            "credentials": {"jwt": [supported]}
+        }))
+        .expect("supported JWT Consumer deserializes");
+        assert!(supported_runtime_jwt.validate_fields().is_ok());
+        assert_component_validity(&spec, "JwtCredential", &supported, true);
+        assert_component_validity(&spec, "JwtCredentialBackup", &supported, true);
+    }
+
+    // Every credential maximum uses JSON Schema/Rust Unicode character
+    // semantics, not UTF-8 byte length. The known non-JWT input and backup
+    // components must accept 4096 multibyte characters and reject 4097.
+    for (component, field) in [
+        ("BasicAuthCredential", "password"),
+        ("KeyAuthCredential", "key"),
+        ("KeyAuthCredentialBackup", "key"),
+        ("HmacAuthCredential", "secret"),
+        ("HmacAuthCredentialBackup", "secret"),
+        ("MtlsAuthCredential", "identity"),
+    ] {
+        assert_component_validity(&spec, component, &json!({(field): "🔐".repeat(4096)}), true);
+        assert_component_validity(
+            &spec,
+            component,
+            &json!({(field): "🔐".repeat(4097)}),
+            false,
+        );
+    }
+    for (component, field) in [
+        ("KeyAuthCredential", "key"),
+        ("KeyAuthCredentialBackup", "key"),
+        ("MtlsAuthCredential", "identity"),
+    ] {
+        assert_component_validity(
+            &spec,
+            component,
+            &json!({(field): format!("valid-value{}", '\u{0001}')}),
+            false,
+        );
+    }
+    for component in ["HmacAuthCredential", "HmacAuthCredentialBackup"] {
+        assert_component_validity(
+            &spec,
+            component,
+            &json!({"secret": format!("{}{}", "h".repeat(31), " ".repeat(64))}),
+            false,
+        );
+        assert_component_validity(
+            &spec,
+            component,
+            &json!({"secret": format!("{}{}", "h".repeat(32), '\u{0001}')}),
+            false,
+        );
+    }
+    let hmac_backup_description = spec["components"]["schemas"]["HmacAuthCredentialBackup"]
+        ["properties"]["secret"]["description"]
+        .as_str()
+        .expect("HmacAuthCredentialBackup.secret description");
+    assert!(hmac_backup_description.contains("at least 32 non-whitespace characters"));
+
+    // Algorithm selectors and asymmetric/JWKS key material are not Consumer
+    // JWT credential forms. jwt_auth always verifies HS256 with `secret`;
+    // RSA/EC/JWKS verification belongs to the separate jwks_auth plugin.
+    for unsupported in [
+        json!({}),
+        json!({"secret": null}),
+        json!({"secret": 42}),
+        json!({"secret": "short"}),
+        json!({"secret": "🔐".repeat(31)}),
+        json!({"secret": format!("{}{}", "j".repeat(32), '\u{0001}')}),
+        json!({"secret": "j".repeat(4097)}),
+        json!({"secret": "j".repeat(32), "algorithm": "HS256"}),
+        json!({
+            "secret": "j".repeat(32),
+            "algorithm": "RS256",
+            "public_key": "pem"
+        }),
+        json!({"secret": "j".repeat(32), "jwks": {"keys": []}}),
+        json!({
+            "secret": "j".repeat(32),
+            "jwks_uri": "https://issuer.example/jwks.json"
+        }),
+    ] {
+        let invalid_runtime_jwt: Consumer = serde_json::from_value(json!({
+            "username": "alice",
+            "credentials": {"jwt": [unsupported]}
+        }))
+        .expect("unsupported JWT Consumer still deserializes into the generic credential model");
+        assert!(
+            invalid_runtime_jwt.validate_fields().is_err(),
+            "an unsupported OpenAPI JWT form must also fail runtime validation: {unsupported}"
+        );
+        for component in [
+            "JwtCredential",
+            "JwtCredentialBackup",
+            "JwtCredentialRedacted",
+        ] {
+            assert_component_validity(&spec, component, &unsupported, false);
+        }
+        for surface in [
+            "ConsumerCreate",
+            "ConsumerBackup",
+            "ConsumerRestore",
+            "Consumer",
+        ] {
+            assert_component_validity(
+                &spec,
+                surface,
+                &json!({"username": "alice", "credentials": {"jwt": [unsupported]}}),
+                false,
+            );
+        }
+    }
+
+    for (component, instance) in [
+        (
+            "ConsumerCreate",
+            json!({"username": "alice", "credentials": {"basicauth": [{"username": "alice"}]}}),
+        ),
+        (
+            "ConsumerCreate",
+            json!({"username": "alice", "credentials": {"basicauth": [{"password": "x", "password_hash": password_hash}]}}),
+        ),
+        (
+            "ConsumerCreate",
+            json!({"username": "alice", "credentials": {"basicauth": [{"password": "s3cret", "username": "alice"}]}}),
+        ),
+        (
+            "ConsumerCreate",
+            json!({"username": "alice", "credentials": {"jwt": [{"secret": "[REDACTED]"}]}}),
+        ),
+        (
+            "ConsumerCreate",
+            json!({"username": "alice", "credentials": {"hmac_auth": [{"secret": "[REDACTED]"}]}}),
+        ),
+        (
+            "ConsumerBackup",
+            json!({"username": "alice", "credentials": {"jwt": [{"secret": "[REDACTED]"}]}}),
+        ),
+        (
+            "ConsumerBackup",
+            json!({"username": "alice", "credentials": {"basicauth": [{"password_hash": "hmac_sha256:deadbeef"}]}}),
+        ),
+        (
+            "ConsumerRestore",
+            json!({"username": "alice", "credentials": {"hmac_auth": [{"secret": "short"}]}}),
+        ),
+    ] {
+        assert_component_validity(&spec, component, &instance, false);
+    }
+
+    // The redacted surface forbids `basicauth` outright.
+    assert_eq!(
+        spec.pointer("/components/schemas/ConsumerCredentialsRedacted/properties/basicauth"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/ConsumerCredentialsRedacted/additionalProperties"),
+        Some(&json!(false))
+    );
+
+    // Response and backup credential schemas never mark fields writeOnly, and
+    // the redacted placeholder constants match the runtime-emitted marker.
+    for component in [
+        "ConsumerCredentialsRedacted",
+        "ConsumerCredentialsBackup",
+        "ConsumerCredentialsRestore",
+        "KeyAuthCredentialRedacted",
+        "JwtCredentialRedacted",
+        "HmacAuthCredentialRedacted",
+        "KeyAuthCredentialBackup",
+        "JwtCredentialBackup",
+        "HmacAuthCredentialBackup",
+        "BasicAuthCredentialStored",
+    ] {
+        let definition = &spec["components"]["schemas"][component];
+        assert!(definition.is_object(), "{component} must exist");
+        assert!(
+            !definition.to_string().contains("writeOnly"),
+            "{component} is a response/backup surface and must not mark fields writeOnly"
+        );
+    }
+    for (component, field) in [
+        ("KeyAuthCredentialRedacted", "key"),
+        ("JwtCredentialRedacted", "secret"),
+        ("HmacAuthCredentialRedacted", "secret"),
+    ] {
+        assert_eq!(
+            spec["components"]["schemas"][component]["properties"][field]["const"],
+            json!("[REDACTED]"),
+            "{component}.{field} must encode the exact runtime placeholder"
+        );
+    }
+
+    // Each Consumer surface composes ConsumerBase with its own credentials map.
+    for (surface, credentials_schema) in [
+        ("Consumer", "ConsumerCredentialsRedacted"),
+        ("ConsumerCreate", "ConsumerCredentialsInput"),
+        ("ConsumerUpdate", "ConsumerCredentialsUpdateInput"),
+        ("ConsumerBackup", "ConsumerCredentialsBackup"),
+        ("ConsumerRestore", "ConsumerCredentialsRestore"),
+    ] {
+        let all_of = spec["components"]["schemas"][surface]["allOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{surface} composes its credentials map via allOf"));
+        assert_eq!(
+            all_of[0]["$ref"],
+            json!("#/components/schemas/ConsumerBase"),
+            "{surface} must compose ConsumerBase"
+        );
+        assert_eq!(
+            all_of[1]["properties"]["credentials"]["$ref"],
+            json!(format!("#/components/schemas/{credentials_schema}")),
+            "{surface} must wire {credentials_schema}"
+        );
+        assert_eq!(
+            spec["components"]["schemas"][surface]["unevaluatedProperties"], false,
+            "{surface} must mirror Consumer's deny_unknown_fields contract"
+        );
+        // Closed request/response/backup/restore surfaces must reject unknown
+        // top-level fields the same way runtime `Consumer` serde does.
+        for unknown_payload in [
+            json!({"username": "alice", "unknown_top_level": true}),
+            json!({"username": "alice", "unexpected": 1}),
+        ] {
+            assert_component_validity(&spec, surface, &unknown_payload, false);
+            let serde_unknown = serde_json::from_value::<Consumer>(unknown_payload.clone());
+            assert!(
+                serde_unknown.is_err(),
+                "Consumer serde must reject unknown fields for {unknown_payload}"
+            );
+        }
+    }
+
+    let credential_input = &spec["components"]["schemas"]["ConsumerCredentialInput"];
+    assert!(credential_input.get("discriminator").is_none());
+    assert!(
+        credential_input["description"]
+            .as_str()
+            .expect("ConsumerCredentialInput description")
+            .contains("cannot condition a request-body schema on a path parameter")
+    );
+
+    // Every operation references the correct surface schema.
+    let paths = &spec["paths"];
+    assert_eq!(
+        paths["/consumers"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+            ["data"]["items"]["$ref"],
+        json!("#/components/schemas/Consumer")
+    );
+    assert_eq!(
+        paths["/consumers"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/ConsumerCreate")
+    );
+    assert_eq!(
+        paths["/consumers"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/Consumer")
+    );
+    let consumer_id = &paths["/consumers/{id}"];
+    assert_eq!(
+        consumer_id["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/Consumer")
+    );
+    assert_eq!(
+        consumer_id["put"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/ConsumerUpdate"),
+        "PUT must use the update surface that also accepts `[REDACTED]` round-trip entries"
+    );
+    assert_eq!(
+        consumer_id["put"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/Consumer")
+    );
+    let credentials = &paths["/consumers/{consumer_id}/credentials/{cred_type}"];
+    let put_body = &credentials["put"]["requestBody"]["content"]["application/json"]["schema"];
+    assert_eq!(
+        put_body["oneOf"][0]["$ref"],
+        json!("#/components/schemas/ConsumerCredentialInput")
+    );
+    assert_eq!(
+        put_body["oneOf"][1]["items"]["$ref"],
+        json!("#/components/schemas/ConsumerCredentialInput")
+    );
+    assert_eq!(
+        credentials["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/ConsumerCredentialInput")
+    );
+    // PUT/POST advertise only built-in credential types; DELETE stays broad so
+    // path-safe custom types remain removable. Path-level parameters must not
+    // also declare `cred_type` (that would conflict with the per-operation
+    // overrides).
+    assert!(
+        credentials["parameters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|parameter| parameter["name"] != "cred_type"),
+        "shared path parameters must not declare cred_type when operations override it"
+    );
+    let built_in_enum = json!(["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"]);
+    assert_eq!(
+        spec["components"]["schemas"]["BuiltInCredentialType"]["enum"], built_in_enum,
+        "BuiltInCredentialType must match ALLOWED_CREDENTIAL_TYPES"
+    );
+    for operation in ["put", "post"] {
+        assert_eq!(
+            credentials[operation]["parameters"][0]["name"],
+            json!("cred_type"),
+            "credential {operation} must override cred_type"
+        );
+        assert_eq!(
+            credentials[operation]["parameters"][0]["schema"]["$ref"],
+            json!("#/components/schemas/BuiltInCredentialType"),
+            "credential {operation} must advertise only built-in types"
+        );
+        assert_eq!(
+            credentials[operation]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            json!("#/components/schemas/Consumer"),
+            "credential {operation} returns the redacted Consumer surface"
+        );
+    }
+    assert_eq!(
+        credentials["delete"]["parameters"][0]["schema"]["$ref"],
+        json!("#/components/schemas/CredentialTypeName"),
+        "credential DELETE must keep the broader path-safe CredentialTypeName"
+    );
+    assert_eq!(
+        paths["/consumers/{consumer_id}/credentials/{cred_type}/{index}"]["parameters"]
+            .as_array()
+            .expect("indexed credential path parameters")
+            .iter()
+            .find(|parameter| parameter["name"] == "cred_type")
+            .expect("indexed credential path declares cred_type")["schema"]["$ref"],
+        json!("#/components/schemas/BuiltInCredentialType"),
+        "indexed credential DELETE is built-in-only, matching runtime"
+    );
+    assert_eq!(
+        paths["/consumers/{consumer_id}/credentials/{cred_type}/{index}"]["delete"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["$ref"],
+        json!("#/components/schemas/Consumer")
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/BatchCreateRequest/properties/consumers/items/$ref"),
+        Some(&json!("#/components/schemas/ConsumerCreate"))
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/BackupResponse/properties/consumers/items/$ref"),
+        Some(&json!("#/components/schemas/ConsumerBackup"))
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/RestoreRequest/properties/consumers/items/$ref"),
+        Some(&json!("#/components/schemas/ConsumerRestore"))
+    );
+}
+
+/// The documented read-modify-write flow tells a client it may PUT back a
+/// `Consumer` response it never held the secrets for, so the PUT request schema
+/// must accept the exact `[REDACTED]` projection the server emits while create,
+/// batch, and restore stay strict. `[REDACTED]` is simultaneously reserved as a
+/// stored value, and credential type keys must stay path-safe so every stored
+/// type remains addressable by the DELETE credential route.
+#[test]
+fn consumer_update_surface_accepts_redaction_placeholders_and_reserves_them() {
+    use ferrum_edge::config::types::Consumer;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let jwt_secret = "j".repeat(32);
+    let hmac_secret = "h".repeat(32);
+    let redacted_response_body = json!({
+        "username": "alice",
+        "credentials": {
+            "keyauth": [{"key": "[REDACTED]"}],
+            "jwt": [{"secret": "[REDACTED]"}],
+            "hmac_auth": [{"secret": "[REDACTED]"}],
+            "mtls_auth": [{"identity": "client.example.com"}]
+        }
+    });
+    // The server's own redacted response is a valid update body, and is still
+    // rejected by the strict create/batch and restore surfaces.
+    assert_component_validity(&spec, "ConsumerUpdate", &redacted_response_body, true);
+    for strict in ["ConsumerCreate", "ConsumerRestore", "ConsumerBackup"] {
+        assert_component_validity(&spec, strict, &redacted_response_body, false);
+    }
+
+    // Real values still validate on the update surface, so rotation by PUT is
+    // expressible in the same schema.
+    let real_values = json!({
+        "username": "alice",
+        "credentials": {
+            "keyauth": [{"key": "live-api-key"}],
+            "jwt": [{"secret": jwt_secret}],
+            "hmac_auth": [{"secret": hmac_secret}]
+        }
+    });
+    assert_component_validity(&spec, "ConsumerUpdate", &real_values, true);
+    assert_component_validity(&spec, "ConsumerCreate", &real_values, true);
+
+    // The two `oneOf` branches must stay mutually exclusive, which requires
+    // real keyauth input and backup schemas to exclude the placeholder
+    // explicitly. Redacted/update-marker alternatives keep accepting it.
+    for real_keyauth in ["KeyAuthCredential", "KeyAuthCredentialBackup"] {
+        assert_component_validity(&spec, real_keyauth, &json!({"key": "[REDACTED]"}), false);
+        assert_eq!(
+            spec["components"]["schemas"][real_keyauth]["properties"]["key"]["not"]["const"],
+            json!("[REDACTED]"),
+            "{real_keyauth}.key must reserve the redaction marker"
+        );
+    }
+    for update in [
+        "KeyAuthCredentialUpdate",
+        "JwtCredentialUpdate",
+        "HmacAuthCredentialUpdate",
+    ] {
+        let field = if update.starts_with("KeyAuth") {
+            "key"
+        } else {
+            "secret"
+        };
+        assert_component_validity(&spec, update, &json!({(field): "[REDACTED]"}), true);
+    }
+    assert_component_validity(
+        &spec,
+        "KeyAuthCredentialRedacted",
+        &json!({"key": "[REDACTED]"}),
+        true,
+    );
+
+    // `[REDACTED]` is reserved at runtime on every write surface, including the
+    // update surface, which only accepts it as a marker the server replaces
+    // before validation, and restore/backup payloads that carry real keys.
+    let placeholder_consumer: Consumer = serde_json::from_value(json!({
+        "username": "alice",
+        "credentials": {"keyauth": [{"key": "[REDACTED]"}]}
+    }))
+    .expect("placeholder Consumer deserializes");
+    let errors = placeholder_consumer
+        .validate_fields()
+        .expect_err("the reserved redaction placeholder is not a storable key");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("reserved redaction placeholder")),
+        "expected a reserved-placeholder rejection, got {errors:?}"
+    );
+    assert_component_validity(
+        &spec,
+        "ConsumerRestore",
+        &json!({
+            "username": "alice",
+            "credentials": {"keyauth": [{"key": "[REDACTED]"}]}
+        }),
+        false,
+    );
+
+    // Credential type keys are one path-safe URI segment on every input
+    // surface, so a hidden custom type cannot be created at an address the
+    // DELETE credential route cannot express.
+    for unsafe_key in [
+        "custom/auth",
+        "custom%2Fauth",
+        "",
+        "custom auth",
+        "custom.auth",
+        "..",
+    ] {
+        let instance = json!({
+            "username": "alice",
+            "credentials": {(unsafe_key): [{"token": "value"}]}
+        });
+        for surface in ["ConsumerCreate", "ConsumerUpdate", "ConsumerRestore"] {
+            assert_component_validity(&spec, surface, &instance, false);
+        }
+        let consumer: Consumer =
+            serde_json::from_value(instance).expect("Consumer with a custom key deserializes");
+        assert!(
+            consumer.validate_fields().is_err(),
+            "runtime must reject the non-path-safe credential type {unsafe_key:?}"
+        );
+    }
+
+    // A previously valid, path-safe custom type keeps working end to end.
+    let custom = json!({
+        "username": "alice",
+        "credentials": {"custom_auth-2": [{"api_token": "opaque-value"}]}
+    });
+    for surface in ["ConsumerCreate", "ConsumerUpdate", "ConsumerRestore"] {
+        assert_component_validity(&spec, surface, &custom, true);
+    }
+    let custom_consumer: Consumer =
+        serde_json::from_value(custom).expect("custom-credential Consumer deserializes");
+    custom_consumer
+        .validate_fields()
+        .expect("a path-safe custom credential type stays valid");
 }
 
 fn normalized_path_template(path: &str) -> String {

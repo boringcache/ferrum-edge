@@ -211,13 +211,13 @@ start_mysql() {
 
 wait_for_healthy() {
     local container="$1"
-    local check_cmd="$2"
+    shift
     local elapsed=0
 
     log "Waiting for $container to become healthy (timeout: ${HEALTH_TIMEOUT}s) ..."
 
     while (( elapsed < HEALTH_TIMEOUT )); do
-        if docker exec "$container" sh -c "$check_cmd" &>/dev/null; then
+        if docker exec "$container" "$@" &>/dev/null; then
             log "$container is ready (${elapsed}s)."
             return 0
         fi
@@ -236,10 +236,10 @@ wait_for_containers() {
     local mysql_ok=0
 
     wait_for_healthy "$PG_CONTAINER" \
-        "pg_isready -U $DB_USER -d $DB_NAME" || pg_ok=1
+        pg_isready -U "$DB_USER" -d "$DB_NAME" || pg_ok=1
 
     wait_for_healthy "$MYSQL_CONTAINER" \
-        "mysqladmin ping -u root -p$DB_PASSWORD" || mysql_ok=1
+        mysqladmin ping -u root "-p$DB_PASSWORD" || mysql_ok=1
 
     if (( pg_ok != 0 || mysql_ok != 0 )); then
         die "One or more containers failed to start. Run '$0 --cleanup' to remove them."

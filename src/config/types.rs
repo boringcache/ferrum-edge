@@ -15,7 +15,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
 
@@ -98,6 +98,84 @@ pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
 pub const MIN_JWT_SECRET_LENGTH: usize = 32;
 /// Minimum length for hmac_auth shared secrets.
 pub const MIN_HMAC_SECRET_LENGTH: usize = 32;
+/// Placeholder substituted for secret credential values in ordinary Consumer
+/// responses and audit diffs.
+pub const CREDENTIAL_REDACTION_PLACEHOLDER: &str = "[REDACTED]";
+/// Known credential types whose secret field the ordinary Consumer response
+/// projection replaces with [`CREDENTIAL_REDACTION_PLACEHOLDER`], paired with
+/// that field name.
+pub const REDACTED_CREDENTIAL_SECRET_FIELDS: &[(&str, &str)] = &[
+    ("keyauth", "key"),
+    ("jwt", "secret"),
+    ("hmac_auth", "secret"),
+];
+/// Maximum length of a credential type key.
+pub const MAX_CREDENTIAL_TYPE_LENGTH: usize = 64;
+/// Credential types whose entries must contain exactly one field, paired with
+/// that field name. A row written before that contract was enforced can still
+/// carry extra ignored fields, so any path that re-validates such an entry has
+/// to reduce it to the canonical field first.
+pub const SINGLE_FIELD_CREDENTIAL_TYPES: &[(&str, &str)] = &[
+    ("jwt", "secret"),
+    ("hmac_auth", "secret"),
+    ("mtls_auth", "identity"),
+];
+
+/// The single canonical field of `cred_type`, when it has one.
+fn single_credential_field(cred_type: &str) -> Option<&'static str> {
+    SINGLE_FIELD_CREDENTIAL_TYPES
+        .iter()
+        .find(|(known, _)| *known == cred_type)
+        .map(|(_, field)| *field)
+}
+
+/// Reduces a credential entry to its single canonical `field`.
+///
+/// Entries without a string at `field` are returned untouched so genuinely
+/// unrepresentable data surfaces at validation instead of being silently
+/// rewritten.
+fn canonical_single_field_entry(entry: &serde_json::Value, field: &str) -> serde_json::Value {
+    match entry.get(field).and_then(serde_json::Value::as_str) {
+        Some(value) => serde_json::json!({ (field): value }),
+        None => entry.clone(),
+    }
+}
+
+fn is_path_safe_credential_type_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Validates a credential type key.
+///
+/// Credential type keys are addressable URI path segments: every stored type
+/// must stay removable through
+/// `DELETE /consumers/{consumer_id}/credentials/{cred_type}`, and the admin
+/// router matches that route by splitting the raw request path on `/` without
+/// percent-decoding. A key containing `/`, `%`, a control byte, or any other
+/// reserved or non-literal URI character would therefore become unreachable
+/// once stored. Restricting keys to one path-safe token at this single write
+/// and restore boundary — which create, update, batch, and restore all pass
+/// through — keeps that guarantee without per-route filtering. Every built-in
+/// credential type already satisfies the rule.
+fn validate_credential_type_name(cred_type: &str) -> Result<(), String> {
+    if cred_type.is_empty() {
+        return Err("credential type must not be empty".to_string());
+    }
+    let length = cred_type.chars().count();
+    if length > MAX_CREDENTIAL_TYPE_LENGTH {
+        return Err(format!(
+            "credential type must not exceed {} characters (got {})",
+            MAX_CREDENTIAL_TYPE_LENGTH, length
+        ));
+    }
+    if !cred_type.chars().all(is_path_safe_credential_type_char) {
+        return Err(format!(
+            "credential type '{}' must be ASCII letters, digits, underscores, or hyphens",
+            cred_type
+        ));
+    }
+    Ok(())
+}
 
 // Current ISO 3166-1 alpha-2 assignments plus XK, the user-assigned Kosovo
 // code emitted by MaxMind country-capable products. Keeping this list in the
@@ -190,8 +268,8 @@ fn basic_auth_credential_error(
     if let Some(password) = credential.get("password") {
         return match password.as_str() {
             Some("") => Some("password must not be empty"),
-            Some(password) if password.len() > MAX_CREDENTIAL_VALUE_LENGTH => {
-                Some("password must not exceed 4096 bytes")
+            Some(password) if password.chars().count() > MAX_CREDENTIAL_VALUE_LENGTH => {
+                Some("password must not exceed 4096 characters")
             }
             Some(password) if contains_control_chars(password) => {
                 Some("password must not contain control characters")
@@ -4827,7 +4905,7 @@ pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String
             return Err(format!(
                 "{}: failed to load certificate source '{}': {}",
                 field_name,
-                source.source_id(),
+                source.redacted_source_id(),
                 e
             ));
         }
@@ -4838,7 +4916,7 @@ pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String
     if certs.is_empty() {
         return Err(format!(
             "{}: no valid PEM certificates found in '{}'",
-            field_name, material.source_id
+            field_name, material.display_source_id
         ));
     }
     Ok(())
@@ -4865,7 +4943,7 @@ pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String>
             return Err(format!(
                 "{}: failed to load key source '{}': {}",
                 field_name,
-                source.source_id(),
+                source.redacted_source_id(),
                 e
             ));
         }
@@ -4874,13 +4952,13 @@ pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String>
         .map_err(|e| {
             format!(
                 "{}: failed to parse private key from '{}': {}",
-                field_name, material.source_id, e
+                field_name, material.display_source_id, e
             )
         })?;
     if key.is_none() {
         return Err(format!(
             "{}: no valid private keys found in '{}'",
-            field_name, material.source_id
+            field_name, material.display_source_id
         ));
     }
     Ok(())
@@ -5355,6 +5433,13 @@ pub(crate) struct CountryMmdbLoadSession {
     state: Mutex<CountryMmdbLoadSessionState>,
     refresh_country_mmdb_plugins: bool,
     allow_synchronous_load: bool,
+    /// Last-known-good snapshots from the live plugin-cache generation, keyed
+    /// by the `db_path` each was loaded from. Only a node-local refresh
+    /// populates this: it is the one path where the configuration source (CP)
+    /// deliberately skipped node-local validation, so a file that is merely
+    /// *temporarily* unavailable on this node must not silently downgrade an
+    /// already-enforcing geo instance to its `on_lookup_failure` fallback.
+    retained_snapshots: HashMap<PathBuf, Arc<CountryMmdbSnapshot>>,
 }
 
 impl Default for CountryMmdbLoadSession {
@@ -5363,6 +5448,7 @@ impl Default for CountryMmdbLoadSession {
             state: Mutex::new(CountryMmdbLoadSessionState::default()),
             refresh_country_mmdb_plugins: false,
             allow_synchronous_load: true,
+            retained_snapshots: HashMap::new(),
         }
     }
 }
@@ -5388,6 +5474,7 @@ impl CountryMmdbLoadSession {
             state: Mutex::new(state),
             refresh_country_mmdb_plugins,
             allow_synchronous_load: true,
+            retained_snapshots: HashMap::new(),
         })
     }
 
@@ -5405,9 +5492,22 @@ impl CountryMmdbLoadSession {
     /// matching handoff is still consumed, but its absence must not suppress
     /// the refresh: each path is loaded directly under the same aggregate
     /// budget before the replacement cache generation can publish.
-    pub(crate) fn for_node_local_refresh(paths: &HashSet<PathBuf>) -> Result<Self, String> {
+    ///
+    /// `retained_snapshots` carries the live generation's already-validated
+    /// snapshots keyed by `db_path`. A path that is temporarily unreadable on
+    /// this node falls back to its retained snapshot instead of producing a
+    /// reader-less instance, so an enforcing geo gate survives a transient file
+    /// outage. A *readable but invalid* file still rejects the generation, and
+    /// a path with no retained entry — a first load, or a `db_path` the
+    /// configuration just repointed — keeps the documented
+    /// `on_lookup_failure` fallback.
+    pub(crate) fn for_node_local_refresh(
+        paths: &HashSet<PathBuf>,
+        retained_snapshots: HashMap<PathBuf, Arc<CountryMmdbSnapshot>>,
+    ) -> Result<Self, String> {
         let mut session = Self::claim(paths)?;
         session.refresh_country_mmdb_plugins = true;
+        session.retained_snapshots = retained_snapshots;
         Ok(session)
     }
 
@@ -5429,8 +5529,11 @@ impl CountryMmdbLoadSession {
         if let Some(snapshot) = state.snapshots.get(&path_key) {
             return Ok(Arc::clone(snapshot));
         }
-        if let Some(error) = state.failures.get(&path_key) {
-            return Err(error.clone());
+        if let Some(error) = state.failures.get(&path_key).cloned() {
+            return match self.retain_last_known_good(&mut state, &path_key, path, &error) {
+                Some(snapshot) => Ok(snapshot),
+                None => Err(error),
+            };
         }
         if !self.allow_synchronous_load {
             return Err(CountryMmdbLoadError::Invalid(format!(
@@ -5438,11 +5541,56 @@ impl CountryMmdbLoadSession {
             )));
         }
 
-        let loaded =
-            load_validated_country_mmdb_inner(path, None, Some(&mut state.aggregate_budget))?;
+        let loaded = match load_validated_country_mmdb_inner(
+            path,
+            None,
+            Some(&mut state.aggregate_budget),
+        ) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return match self.retain_last_known_good(&mut state, &path_key, path, &error) {
+                    Some(snapshot) => Ok(snapshot),
+                    None => Err(error),
+                };
+            }
+        };
         Ok(Arc::clone(
             state.snapshots.entry(path_key).or_insert(loaded),
         ))
+    }
+
+    /// Substitute the live generation's snapshot for a path that is
+    /// *temporarily unavailable* on this node, memoizing it so every geo
+    /// instance sharing the path resolves identically within one build and the
+    /// operator warning is emitted at most once per path per refresh.
+    ///
+    /// Returns `None` — leaving the caller to propagate the original error —
+    /// for a `CountryMmdbLoadError::Invalid`, which is a readable but corrupt,
+    /// wrong-type, or budget-exceeding database and must still reject the
+    /// generation, and for any path with no retained snapshot.
+    fn retain_last_known_good(
+        &self,
+        state: &mut CountryMmdbLoadSessionState,
+        path_key: &Path,
+        path: &str,
+        error: &CountryMmdbLoadError,
+    ) -> Option<Arc<CountryMmdbSnapshot>> {
+        if !matches!(error, CountryMmdbLoadError::Unavailable(_)) {
+            return None;
+        }
+        let retained = self.retained_snapshots.get(path_key)?;
+        tracing::warn!(
+            db_path = %path,
+            error = %error,
+            plugin = "geo_restriction",
+            retained_snapshot_bytes = retained.size_bytes(),
+            "MaxMind database temporarily unavailable during node-local refresh; retaining the last known good snapshot so geo enforcement is not downgraded to the on_lookup_failure fallback"
+        );
+        let snapshot = Arc::clone(retained);
+        state
+            .snapshots
+            .insert(path_key.to_path_buf(), Arc::clone(&snapshot));
+        Some(snapshot)
     }
 }
 
@@ -6885,7 +7033,7 @@ impl Consumer {
 
         // Validate individual credential values.
         for (cred_type, cred_value) in &self.credentials {
-            if let Err(e) = validate_string_field("credential type", cred_type, 64) {
+            if let Err(e) = validate_credential_type_name(cred_type) {
                 errors.push(e);
             }
             // Collect array entries to validate. Non-object elements are
@@ -6971,6 +7119,28 @@ impl Consumer {
                 {
                     errors.push(format!("{} {}", prefix, error));
                 }
+                if cred_type == "jwt" {
+                    if obj.len() != 1 || !obj.contains_key("secret") {
+                        errors.push(format!(
+                            "{} must contain exactly one field named 'secret'",
+                            prefix
+                        ));
+                    }
+                    match obj.get("secret") {
+                        Some(serde_json::Value::String(secret))
+                            if secret.chars().count() >= MIN_JWT_SECRET_LENGTH => {}
+                        Some(serde_json::Value::String(secret)) => {
+                            errors.push(format!(
+                                "{}.secret must be at least {} characters (got {})",
+                                prefix,
+                                MIN_JWT_SECRET_LENGTH,
+                                secret.chars().count()
+                            ));
+                        }
+                        Some(_) => errors.push(format!("{}.secret must be a string", prefix)),
+                        None => {}
+                    }
+                }
                 if cred_type == "keyauth" {
                     match obj.get("key") {
                         Some(serde_json::Value::String(key)) if !key.trim().is_empty() => {}
@@ -6981,30 +7151,37 @@ impl Consumer {
                         None => errors.push(format!("{}.key is required", prefix)),
                     }
                 }
+                // `[REDACTED]` is reserved: whole-Consumer update treats it as
+                // the round-trip sentinel for a secret the ordinary response
+                // never disclosed, so it must never be storable as a live
+                // credential value. Rejecting it here covers create, batch,
+                // restore, the dedicated credential endpoints, and any update
+                // placeholder left unmatched by a stored entry.
+                for &(known_type, field) in REDACTED_CREDENTIAL_SECRET_FIELDS {
+                    if known_type != cred_type.as_str() {
+                        continue;
+                    }
+                    let value = obj.get(field).and_then(serde_json::Value::as_str);
+                    if value == Some(CREDENTIAL_REDACTION_PLACEHOLDER) {
+                        errors.push(format!(
+                            "{}.{} must not be the reserved redaction placeholder",
+                            prefix, field
+                        ));
+                    }
+                }
                 for (key, val) in *obj {
                     if let Some(s) = val.as_str() {
-                        if s.len() > MAX_CREDENTIAL_VALUE_LENGTH {
+                        let value_length = s.chars().count();
+                        if value_length > MAX_CREDENTIAL_VALUE_LENGTH {
                             errors.push(format!(
                                 "{}.{} must not exceed {} characters (got {})",
-                                prefix,
-                                key,
-                                MAX_CREDENTIAL_VALUE_LENGTH,
-                                s.len()
+                                prefix, key, MAX_CREDENTIAL_VALUE_LENGTH, value_length
                             ));
                         }
                         if contains_control_chars(s) {
                             errors.push(format!(
                                 "{}.{} must not contain control characters",
                                 prefix, key
-                            ));
-                        }
-                        if cred_type == "jwt" && key == "secret" && s.len() < MIN_JWT_SECRET_LENGTH
-                        {
-                            errors.push(format!(
-                                "{}.secret must be at least {} characters (got {})",
-                                prefix,
-                                MIN_JWT_SECRET_LENGTH,
-                                s.len()
                             ));
                         }
                     }
@@ -7062,36 +7239,68 @@ fn record_consumer_identity<'a>(
 pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     let mut redacted = consumer.clone();
 
-    fn redact_field(cred_value: &mut serde_json::Value, field: &str) {
-        match cred_value {
-            serde_json::Value::Array(arr) => {
-                for entry in arr {
-                    if let Some(obj) = entry.as_object_mut()
-                        && obj.contains_key(field)
-                    {
-                        obj.insert(field.to_string(), serde_json::json!("[REDACTED]"));
-                    }
-                }
-            }
-            serde_json::Value::Object(obj) if obj.contains_key(field) => {
-                obj.insert(field.to_string(), serde_json::json!("[REDACTED]"));
-            }
-            _ => {}
+    fn entry_objects(
+        credential_value: &serde_json::Value,
+    ) -> Vec<&serde_json::Map<String, serde_json::Value>> {
+        match credential_value {
+            serde_json::Value::Array(entries) => entries
+                .iter()
+                .filter_map(serde_json::Value::as_object)
+                .collect(),
+            serde_json::Value::Object(object) => vec![object],
+            _ => Vec::new(),
         }
     }
 
-    // Basic credentials have a strict request/backup schema. Omit the entire
-    // credential type from ordinary Consumer responses so those responses do
-    // not expose values or return a pattern-invalid redaction placeholder.
-    redacted.credentials.remove("basicauth");
-    if let Some(hmac) = redacted.credentials.get_mut("hmac_auth") {
-        redact_field(hmac, "secret");
+    fn secret_placeholders(
+        credential_value: &serde_json::Value,
+        field: &str,
+    ) -> Option<serde_json::Value> {
+        let entries: Vec<_> = entry_objects(credential_value)
+            .into_iter()
+            .map(|_| serde_json::json!({(field): CREDENTIAL_REDACTION_PLACEHOLDER}))
+            .collect();
+        (!entries.is_empty()).then(|| serde_json::Value::Array(entries))
     }
-    if let Some(jwt) = redacted.credentials.get_mut("jwt") {
-        redact_field(jwt, "secret");
+
+    fn visible_mtls_identities(credential_value: &serde_json::Value) -> Option<serde_json::Value> {
+        let entries: Vec<_> = entry_objects(credential_value)
+            .into_iter()
+            .filter_map(|entry| entry.get("identity").and_then(serde_json::Value::as_str))
+            .filter(|identity| {
+                !identity.trim().is_empty()
+                    && identity.chars().count() <= MAX_CREDENTIAL_VALUE_LENGTH
+                    && !contains_control_chars(identity)
+            })
+            .map(|identity| serde_json::json!({"identity": identity}))
+            .collect();
+        (!entries.is_empty()).then(|| serde_json::Value::Array(entries))
     }
-    if let Some(key) = redacted.credentials.get_mut("keyauth") {
-        redact_field(key, "key");
+
+    // Ordinary responses are a deliberately closed projection. Rebuild the
+    // credential map from known, explicitly safe fields so legacy extra fields
+    // and unknown/custom credential values cannot cross the management
+    // boundary. Input, persistence, backup, and restore retain the original
+    // credential map; this projection affects ordinary responses and audit
+    // events only.
+    redacted.credentials.clear();
+    for &(cred_type, field) in REDACTED_CREDENTIAL_SECRET_FIELDS {
+        if let Some(entries) = consumer
+            .credentials
+            .get(cred_type)
+            .and_then(|value| secret_placeholders(value, field))
+        {
+            redacted.credentials.insert(cred_type.to_string(), entries);
+        }
+    }
+    if let Some(entries) = consumer
+        .credentials
+        .get("mtls_auth")
+        .and_then(visible_mtls_identities)
+    {
+        redacted
+            .credentials
+            .insert("mtls_auth".to_string(), entries);
     }
 
     redacted
@@ -7104,11 +7313,161 @@ pub fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
         // changed, but must not disclose values, entry fields, or even the
         // stored credential shape/cardinality. A single stable marker keeps
         // the mutation visible without creating a credential side channel.
-        redacted
-            .credentials
-            .insert("basicauth".to_string(), serde_json::json!("[REDACTED]"));
+        redacted.credentials.insert(
+            "basicauth".to_string(),
+            serde_json::json!(CREDENTIAL_REDACTION_PLACEHOLDER),
+        );
     }
     redacted
+}
+
+/// Whether `entry` is exactly the redaction projection of one credential entry
+/// of `cred_type`, i.e. a lone `field` set to
+/// [`CREDENTIAL_REDACTION_PLACEHOLDER`].
+fn is_redaction_placeholder_entry(entry: &serde_json::Value, field: &str) -> bool {
+    entry.as_object().is_some_and(|object| {
+        object.len() == 1
+            && object.get(field).and_then(serde_json::Value::as_str)
+                == Some(CREDENTIAL_REDACTION_PLACEHOLDER)
+    })
+}
+
+/// Restores the credential state a whole-Consumer update cannot express.
+///
+/// Ordinary Consumer responses are a closed projection, so a read-modify-write
+/// client that GETs a Consumer, edits a scalar field, and PUTs the body back
+/// never sends the credential state it was not shown. Two rewrites are needed
+/// so that flow stays non-destructive:
+///
+/// 1. A stored credential type the ordinary projection does not emit at all —
+///    `basicauth`, every unknown/custom type, and an `mtls_auth` map whose
+///    entries the projection all filtered out — is copied from `existing` when
+///    the request omits it, because the client was never shown it. When an
+///    `mtls_auth` projection contains only the visible subset of stored entries,
+///    submitting that exact projection restores the original map too; an
+///    actually edited value still replaces it. A type the projection does emit
+///    is still deleted by omission, so that contract is unchanged. Explicit
+///    removal of a hidden type uses
+///    `DELETE /consumers/{id}/credentials/{cred_type}`, which is authoritative
+///    for them.
+/// 2. `keyauth`/`jwt`/`hmac_auth` entries submitted as the exact
+///    [`CREDENTIAL_REDACTION_PLACEHOLDER`] projection are restored positionally
+///    from the stored entry at the same index, so a round-tripped response
+///    cannot overwrite a live API key or shared secret with the placeholder
+///    string. Entries carrying real values are left untouched, so rotation
+///    through this path still works.
+///
+/// Credential types the request does send are otherwise replaced wholesale, so
+/// deleting a projected known type by omission keeps working.
+pub fn preserve_response_hidden_consumer_credentials(updated: &mut Consumer, existing: &Consumer) {
+    // Ask the projection itself which types a client could have seen, so this
+    // stays correct by construction if the projection changes.
+    let projected = redact_consumer_credentials(existing);
+    for (cred_type, stored) in &existing.credentials {
+        if !projected.credentials.contains_key(cred_type)
+            && !updated.credentials.contains_key(cred_type)
+        {
+            updated
+                .credentials
+                .insert(cred_type.clone(), stored.clone());
+        }
+    }
+
+    // mTLS identities are visible, but malformed legacy entries and every
+    // non-identity field are filtered from the ordinary response. If the
+    // submitted value is byte-for-byte the projection the server emitted,
+    // restore the stored value so an unrelated Consumer edit cannot silently
+    // delete that hidden state. Validation may then reject legacy-invalid data,
+    // which is deliberately fail-closed; a caller that supplies any different
+    // mTLS value is making an express replacement and keeps that value.
+    let submitted_mtls_is_exact_projection = updated
+        .credentials
+        .get("mtls_auth")
+        .zip(projected.credentials.get("mtls_auth"))
+        .is_some_and(|(submitted, visible)| submitted == visible);
+    if submitted_mtls_is_exact_projection
+        && let Some(stored_mtls) = existing.credentials.get("mtls_auth")
+    {
+        updated
+            .credentials
+            .insert("mtls_auth".to_string(), stored_mtls.clone());
+    }
+
+    for &(cred_type, field) in REDACTED_CREDENTIAL_SECRET_FIELDS {
+        // The projection emits one entry per stored entry, in order, for both
+        // the array form and the legacy single-object form, so stored entries
+        // are indexed the same way here.
+        let stored_entries: Vec<&serde_json::Value> = match existing.credentials.get(cred_type) {
+            Some(serde_json::Value::Array(entries)) => entries.iter().collect(),
+            Some(entry @ serde_json::Value::Object(_)) => vec![entry],
+            _ => continue,
+        };
+        let Some(submitted_entries) = updated
+            .credentials
+            .get_mut(cred_type)
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for (index, entry) in submitted_entries.iter_mut().enumerate() {
+            if is_redaction_placeholder_entry(entry, field)
+                && let Some(stored_entry) = stored_entries.get(index)
+            {
+                // Restoring an exactly-one-field type verbatim would reintroduce
+                // legacy selectors such as a `jwt` `algorithm`, which the
+                // current contract rejects, so an unrelated Consumer edit would
+                // fail on data the client was never shown. Restore the canonical
+                // field only — the same value the runtime uses and the same
+                // shape `GET /backup` exports. Types without a single-field rule
+                // (`keyauth`) keep every stored field.
+                *entry = match single_credential_field(cred_type) {
+                    Some(canonical_field) => {
+                        canonical_single_field_entry(stored_entry, canonical_field)
+                    }
+                    None => (*stored_entry).clone(),
+                };
+            }
+        }
+    }
+}
+
+/// Canonicalizes a Consumer for `GET /backup` export.
+///
+/// Backups carry unredacted stored credentials so `POST /restore` can recreate
+/// them faithfully. Exactly-one-field credential types — `jwt` and `hmac_auth`
+/// (`secret`) and `mtls_auth` (`identity`) — can still hold rows written before
+/// that contract was enforced, carrying ignored extra fields such as a `jwt`
+/// `algorithm`, which restore now rejects. Reducing those entries to their
+/// canonical field keeps a backup taken from a deployed database restorable,
+/// which is also the shape `ConsumerBackup` already documents.
+///
+/// `POST /restore` also requires every credential value to be an array of
+/// objects, so a value still stored in the legacy single-object form is wrapped
+/// in a one-element array here rather than exported in a shape restore rejects.
+///
+/// The rewrite is deliberately narrow: it never mutates the stored Consumer,
+/// keeps every rotation entry in order, leaves entries without a string value at
+/// the canonical field untouched so genuinely unrepresentable data surfaces at
+/// restore instead of being silently dropped, and copies every credential type
+/// without a single-field rule — `basicauth`, `keyauth`, and unknown/custom
+/// maps — through with its fields intact.
+pub fn canonicalize_consumer_credentials_for_backup(consumer: &Consumer) -> Consumer {
+    let mut canonical = consumer.clone();
+    for (cred_type, value) in canonical.credentials.iter_mut() {
+        if value.is_object() {
+            let legacy_single_entry = value.clone();
+            *value = serde_json::Value::Array(vec![legacy_single_entry]);
+        }
+        let Some(field) = single_credential_field(cred_type) else {
+            continue;
+        };
+        if let serde_json::Value::Array(entries) = value {
+            for entry in entries.iter_mut() {
+                *entry = canonical_single_field_entry(entry, field);
+            }
+        }
+    }
+    canonical
 }
 
 pub(crate) fn hash_consumer_secrets(

@@ -2754,6 +2754,10 @@ where
                     initial_response_header_policy_plugins,
                 )
                 .await;
+                // Set once an `on_response_body` hook replaces the backend
+                // response with a gateway-authored rejection; from that point the
+                // buffered bytes are the gateway's own.
+                let mut response_body_rejected = false;
                 for plugin in plugins {
                     let result = plugin
                         .on_response_body(ctx, response_status, &response_headers, &response_body)
@@ -2771,12 +2775,39 @@ where
                                 &mut response_body,
                             )
                             .await;
+                            response_body_rejected = true;
                             break;
                         }
                     }
                 }
 
-                if crate::plugins::response_body_rewrite_allowed(response_status) {
+                // Shared representation gate — identical to H1/H2 and native H3.
+                // An H3 client bridged to an H1/H2 backend must not receive a
+                // protected representation this gateway could not inspect just
+                // because the frontend protocol differs.
+                let grpc_web_response_content_type =
+                    crate::plugins::grpc_web::retained_response_content_type(ctx);
+                let admission = crate::proxy::admit_buffered_response_body_transforms(
+                    plugins,
+                    ctx,
+                    crate::proxy::buffered_response_representation_origin(response_body_rejected),
+                    &mut response_status,
+                    &mut response_headers,
+                    &mut response_body,
+                    grpc_web_response_content_type,
+                    crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                        initial_response_header_policy_plugins,
+                    ),
+                    true,
+                )
+                .await;
+                if matches!(
+                    admission,
+                    crate::proxy::BufferedTransformAdmission::Proceed {
+                        rewrite_allowed: true,
+                        ..
+                    }
+                ) {
                     for plugin in plugins {
                         if let Some(transformed) = plugin
                             .transform_response_body_with_context(
@@ -4376,11 +4407,33 @@ where
                     &resp.headers,
                     &resp.trailers,
                 );
-            let pristine_trailers_only_terminal_metadata = (resp.body.is_empty()
+            let mut authoritative_trailers_only_terminal_metadata = (resp.body.is_empty()
                 && resp.trailers.is_empty())
             .then(|| {
                 crate::proxy::grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&resp.headers)
             });
+            // A gRPC-Web client's terminal metadata rides in the BODY trailer
+            // frame, and the gateway-authored replacements below empty the
+            // header/trailer maps of `grpc-status` on purpose because that is the
+            // shape the client must receive. Track when that happened so the
+            // metadata refresh does not read the emptied maps as a hook-removed
+            // status and overwrite the status the replacement recorded with the
+            // synthesized UNKNOWN(2). Same rule, same reason, as the buffered
+            // H1/H2 gRPC path in `proxy::handle_proxy_request`.
+            let client_terminal_metadata_is_body_framed =
+                crate::plugins::grpc_web::client_uses_grpc_web(ctx);
+            let mut terminal_metadata_is_body_framed = false;
+            // Capture original response invariants before `after_proxy` rewrites
+            // the header view below, exactly as `dispatch_plain` and the native
+            // H3 path do. `resp.headers` is the untouched backend initial header
+            // map, so the shared representation gate can prove this response's
+            // original content coding and range/delta state instead of reading a
+            // header map a hook may already have rewritten.
+            crate::http3::server::stamp_h3_original_response_metadata(
+                ctx,
+                resp.status,
+                &resp.headers,
+            );
             ctx.begin_buffered_initial_response_header_policy(
                 initial_response_header_policy_names,
                 &resp.headers,
@@ -4503,8 +4556,34 @@ where
             )
             .await
             {
-                response_trailers.clear();
+                if ctx.gateway_deadline_response_selected() {
+                    crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                        &plugin_response_headers,
+                        &mut response_trailers,
+                        &mut authoritative_trailers_only_terminal_metadata,
+                    );
+                    terminal_metadata_is_body_framed |= client_terminal_metadata_is_body_framed;
+                } else {
+                    // Same ordering contract as the transform phase below: the
+                    // decode-only normalize rewrite must not let the trailer
+                    // retirement masquerade as a policy-owned header removal.
+                    if let Some(policy_state) =
+                        buffered_initial_response_header_policy_state.as_mut()
+                    {
+                        Arc::make_mut(policy_state)
+                            .record_later_response_header_mutations(&mut plugin_response_headers);
+                    }
+                    crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+                        &mut plugin_response_headers,
+                        &mut response_trailers,
+                        &header_shadowed_trailer_keys,
+                    );
+                }
             }
+            // Set once an `on_response_body` hook replaces the backend response
+            // with a gateway-authored rejection; from that point the buffered
+            // bytes are the gateway's own.
+            let mut response_body_rejected = false;
             for plugin in plugins.iter() {
                 let result = match crate::plugins::await_grpc_deadline(
                     ctx.grpc_deadline_at(),
@@ -4541,7 +4620,13 @@ where
                             &mut response_trailers,
                         )
                         .await;
+                        crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                            &plugin_response_headers,
+                            &mut response_trailers,
+                            &mut authoritative_trailers_only_terminal_metadata,
+                        );
                         buffered_initial_response_header_policy_state = None;
+                        response_body_rejected = true;
                         break;
                     }
                 }
@@ -4554,7 +4639,53 @@ where
             // while the wire trailers stay separate for the split H3 wire shape.
             // content-length updates land on the view and flow into the wire
             // headers after reconciliation below.
-            if crate::plugins::response_body_rewrite_allowed(response_status) {
+            //
+            // The shared representation gate runs first, on the same merged view
+            // the transforms see. A rejection here replaces the response, so the
+            // backend trailers no longer describe the bytes being sent and are
+            // dropped — the same rule the deadline replacement below follows.
+            let grpc_web_response_content_type =
+                crate::plugins::grpc_web::retained_response_content_type(ctx);
+            let admission = crate::proxy::admit_buffered_response_body_transforms(
+                plugins,
+                ctx,
+                crate::proxy::buffered_response_representation_origin(response_body_rejected),
+                &mut response_status,
+                &mut plugin_response_headers,
+                &mut response_body,
+                grpc_web_response_content_type,
+                crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                    initial_response_header_policy_plugins,
+                ),
+                true,
+            )
+            .await;
+            if matches!(
+                admission,
+                crate::proxy::BufferedTransformAdmission::Rejected
+            ) {
+                crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                    &plugin_response_headers,
+                    &mut response_trailers,
+                    &mut authoritative_trailers_only_terminal_metadata,
+                );
+                buffered_initial_response_header_policy_state = None;
+                terminal_metadata_is_body_framed |= grpc_web_response_content_type.is_some();
+            }
+            let mut representation_rewritten = matches!(
+                admission,
+                crate::proxy::BufferedTransformAdmission::Proceed {
+                    representation_rewritten: true,
+                    ..
+                }
+            );
+            if matches!(
+                admission,
+                crate::proxy::BufferedTransformAdmission::Proceed {
+                    rewrite_allowed: true,
+                    ..
+                }
+            ) {
                 for plugin in plugins.iter() {
                     let transformed = match crate::plugins::await_grpc_deadline(
                         ctx.grpc_deadline_at(),
@@ -4577,6 +4708,13 @@ where
                                 &mut response_trailers,
                                 initial_response_header_policy_plugins,
                             );
+                            crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                                &plugin_response_headers,
+                                &mut response_trailers,
+                                &mut authoritative_trailers_only_terminal_metadata,
+                            );
+                            terminal_metadata_is_body_framed |=
+                                client_terminal_metadata_is_body_framed;
                             break;
                         }
                     };
@@ -4589,6 +4727,7 @@ where
                             ctx,
                             &mut plugin_response_headers,
                         );
+                        representation_rewritten = true;
                     }
                     ctx.record_deadline_response_header_plugin(
                         plugin.as_ref(),
@@ -4596,9 +4735,20 @@ where
                     );
                 }
             }
+            // Mirror the main buffered gRPC path: record genuine transform-phase
+            // edits before retiring stale compatibility-view trailers, so a
+            // policy-owned initial header the backend also sent as a trailer is
+            // not mistaken for a later intentional removal.
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
                 Arc::make_mut(policy_state)
                     .record_later_response_header_mutations(&mut plugin_response_headers);
+            }
+            if representation_rewritten {
+                crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+                    &mut plugin_response_headers,
+                    &mut response_trailers,
+                    &header_shadowed_trailer_keys,
+                );
             }
             for plugin in plugins.iter() {
                 let result = match crate::plugins::await_grpc_deadline(
@@ -4636,6 +4786,11 @@ where
                             &mut response_trailers,
                         )
                         .await;
+                        crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                            &plugin_response_headers,
+                            &mut response_trailers,
+                            &mut authoritative_trailers_only_terminal_metadata,
+                        );
                         buffered_initial_response_header_policy_state = None;
                         break;
                     }
@@ -4666,15 +4821,16 @@ where
             );
             // Admission retains the pristine backend status; transaction
             // metadata follows the post-hook status that the H3 client sees.
-            crate::proxy::grpc_proxy::refresh_grpc_status_metadata(
+            crate::proxy::grpc_proxy::refresh_grpc_status_metadata_with_body_framed_terminal(
                 &mut ctx.metadata,
                 &response_trailers,
                 &plugin_response_headers,
+                terminal_metadata_is_body_framed,
             );
             let mut response_headers = plugin_response_headers;
             let authoritative_terminal_metadata =
                 if response_body.is_empty() && response_trailers.is_empty() {
-                    pristine_trailers_only_terminal_metadata.as_ref()
+                    authoritative_trailers_only_terminal_metadata.as_ref()
                 } else {
                     None
                 };

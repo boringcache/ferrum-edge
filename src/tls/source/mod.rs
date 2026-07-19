@@ -100,6 +100,21 @@ impl SourceScheme {
             Self::Pkcs11 => "pkcs11",
         }
     }
+
+    /// True when this scheme addresses an external secret provider, so its
+    /// identifier is a *secret source reference* rather than ordinary local
+    /// configuration.
+    ///
+    /// These are the four schemes whose identifier is a Vault path, an ARN or
+    /// secret name, a Key Vault URL, or a GCP secret resource name — the exact
+    /// class `secrets::registry::redact_source_reference` already withholds
+    /// from backend error text. `file`/`k8s`/`acme`/`managed`/`pkcs11`
+    /// identifiers are operator-authored local configuration that appears in
+    /// the settings file and is needed verbatim to act on a diagnostic, so they
+    /// are deliberately not included.
+    pub fn is_secret_provider(self) -> bool {
+        matches!(self, Self::Vault | Self::Aws | Self::Azure | Self::Gcp)
+    }
 }
 
 /// Redacted string wrapper for inline PEM material.
@@ -146,12 +161,42 @@ impl fmt::Debug for SecretBytes {
 }
 
 /// Parsed typed source URI.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Eq)]
 pub struct CertSourceUri {
     pub scheme: SourceScheme,
     pub identifier: String,
     pub kind: MaterialKind,
     pub options: BTreeMap<String, String>,
+    /// The complete configured string this URI was parsed from, before the
+    /// query was split off. **Provenance only** — never an identity, never
+    /// operator-facing.
+    ///
+    /// [`Self::redacted_option_value`] has to ask whether *this whole value* was
+    /// externally materialized, and nothing else on this struct can answer that.
+    /// `parse` drops the query before [`Self::source_id`] reconstructs
+    /// the identity, so for a source resolved as `file://x?poll=p` the id is
+    /// `file://x` — a strict prefix of what was resolved, equal to no resolved
+    /// value. Asking `secrets::is_external_secret_value` about the id therefore
+    /// answers `false` on genuinely secret material and the option gets printed.
+    ///
+    /// Excluded from [`PartialEq`] deliberately. `CertSource` equality reaches
+    /// `subscription::MaterialFingerprintEntry`, whose `Eq` **is** the rotation
+    /// predicate, and identity there is the *parsed* source —
+    /// scheme/identifier/kind/options. Two spellings that parse to the same
+    /// source are the same source; letting a raw-text difference compare unequal
+    /// would report a rotation that never happened.
+    raw: String,
+}
+
+impl PartialEq for CertSourceUri {
+    /// Compares the *parsed* source, not the text it was written as — see
+    /// the `raw` field.
+    fn eq(&self, other: &Self) -> bool {
+        self.scheme == other.scheme
+            && self.identifier == other.identifier
+            && self.kind == other.kind
+            && self.options == other.options
+    }
 }
 
 impl fmt::Debug for CertSourceUri {
@@ -184,13 +229,105 @@ impl CertSourceUri {
             identifier,
             kind,
             options,
+            raw: raw.to_string(),
         })
     }
 
     pub fn source_id(&self) -> String {
         format!("{}://{}", self.scheme.as_str(), self.identifier)
     }
+
+    /// [`Self::source_id`] with a secret provider's identifier withheld — the
+    /// form that is safe to put in an operator-facing error or log record.
+    ///
+    /// [`Self::source_id`] is an *identity*: it keys TLS inventory entries and
+    /// event filters (`tls::events`), so it must stay distinguishing and is not
+    /// redacted in place. But it is also what the `MaterialError` variants
+    /// interpolate, and their `Display` reaches `validate` output and startup
+    /// logs. For a `vault://`/`aws://`/`azure://`/`gcp://` source that means the
+    /// full secret path, ARN, or Key Vault URL was printed even though the
+    /// backend's own error detail beside it had already been scrubbed by
+    /// `secrets::registry::redact_source_reference` — the reference leaked
+    /// through the wrapper instead of through the detail.
+    ///
+    /// The scheme is retained rather than dropped: it is a bounded, fixed-set
+    /// label that tells an operator which provider to go look at, and it
+    /// discloses nothing the configuration does not already state. Only the
+    /// identifier is withheld.
+    pub fn redacted_source_id(&self) -> String {
+        if self.scheme.is_secret_provider() {
+            format!("{}://{}", self.scheme.as_str(), REDACTED_IDENTIFIER)
+        } else {
+            self.source_id()
+        }
+    }
+
+    /// Render one of this URI's query-option values for an operator-facing
+    /// diagnostic, withholding it when the URI it came from is secret material.
+    ///
+    /// [`Self::redacted_source_id`] withholds the *identifier*, but the query
+    /// string is part of the same configured value, and an option logged beside
+    /// the redacted identifier re-disclosed a slice of what was just withheld:
+    /// `vault://secret/data/cert?poll=<token>` printed `<token>` verbatim.
+    ///
+    /// The textual backstop cannot reach it. `secrets::redact_external_secret_values`
+    /// matches a candidate *inside* a message, and here the containment is
+    /// inverted — the printed option is a **substring of** the resolved URI, so
+    /// the URI candidate never matches it. Deriving each query value into its own
+    /// candidate was rejected for the reason
+    /// [`RedactionPlan::MIN_DERIVED_CANDIDATE_LEN`][min] gives: arming short,
+    /// arbitrary option values process-wide shreds unrelated output.
+    ///
+    /// Two provenance tests, matching the two ways the value can be secret:
+    ///
+    /// 1. A secret-provider scheme (`vault`/`aws`/`azure`/`gcp`) — the whole URI
+    ///    is a secret reference, so its options are too. Same classifier as
+    ///    [`Self::redacted_source_id`], so identifier and options cannot diverge.
+    ///    This test is independent of the second and is applied first: a
+    ///    provider URI withholds its options whether or not it was itself
+    ///    externally materialized.
+    /// 2. The complete configured URI was externally materialized
+    ///    ([`crate::secrets::is_external_secret_value`]) — a `file://` source
+    ///    resolved from `FERRUM_FRONTEND_TLS_CERT_SOURCE_FILE` is
+    ///    operator-authored in shape but secret in provenance, and its
+    ///    `source_id` is otherwise printed verbatim.
+    ///
+    /// The second test is against the `raw` field, the string as configured, and
+    /// asks for **whole-value equality** — not whether a candidate occurs
+    /// somewhere inside the parsed identity. Both halves of that matter:
+    ///
+    /// * [`Self::source_id`] is the wrong input. `parse` strips the
+    ///   query before it is reconstructed, so a source resolved as
+    ///   `file://x?poll=p` yields `file://x` — a strict prefix of the secret
+    ///   that equals no resolved value and contains no whole candidate (the
+    ///   one-byte identifier is below `MIN_DERIVED_CANDIDATE_LEN`). The raw
+    ///   `poll` option would then be logged despite coming from the secret.
+    /// * Containment is the wrong question. Any unrelated resolved value that
+    ///   happens to appear inside a locally configured identifier would answer
+    ///   `true` — coincidence, not origin — and would withhold an ordinary local
+    ///   diagnostic the operator needs.
+    ///
+    /// Equality needs no minimum length and arms nothing process-wide, so a
+    /// one- or two-byte identifier and option are covered exactly.
+    ///
+    /// Otherwise the value is returned unchanged: `file`/`k8s`/`acme`/`managed`/
+    /// `pkcs11` sources that were configured locally are ordinary operator input,
+    /// and a malformed option there must stay diagnosable.
+    ///
+    /// [min]: crate::secrets
+    pub fn redacted_option_value(&self, rendered: &str) -> String {
+        if self.scheme.is_secret_provider() || crate::secrets::is_external_secret_value(&self.raw) {
+            return crate::secrets::EXTERNAL_SECRET_PLACEHOLDER.to_string();
+        }
+        // The option is not itself secret-derived, but the text may still quote
+        // some *other* resolved variable's value verbatim. A no-op in a process
+        // that resolved no external secrets.
+        crate::secrets::redact_external_secret_values(rendered)
+    }
 }
+
+/// Substituted for a secret provider's identifier in operator-facing output.
+const REDACTED_IDENTIFIER: &str = "<redacted source reference>";
 
 fn parse_options(query: &str) -> BTreeMap<String, String> {
     url::form_urlencoded::parse(query.as_bytes())
@@ -236,6 +373,15 @@ impl CertSource {
             Self::Path(path) => path.display().to_string(),
             Self::InlinePem(_) => "inline-pem:<redacted>".to_string(),
             Self::Uri(uri) => uri.source_id(),
+        }
+    }
+
+    /// [`Self::source_id`] safe for operator-facing output — see
+    /// [`CertSourceUri::redacted_source_id`]. Non-URI sources are unchanged.
+    pub fn redacted_source_id(&self) -> String {
+        match self {
+            Self::Uri(uri) => uri.redacted_source_id(),
+            other => other.source_id(),
         }
     }
 
@@ -347,7 +493,25 @@ pub struct MaterializedMaterial {
     pub version: Option<String>,
     pub fetched_at: SystemTime,
     pub source_kind: SourceScheme,
-    pub source_id: String,
+    /// **Operator-facing label only. Never an identity.**
+    ///
+    /// This is the redacted rendering of the source the material came from
+    /// (`CertSource::redacted_source_id`): for a `vault://`/`aws://`/`azure://`/
+    /// `gcp://` source it is the provider label with the identifier withheld, so
+    /// two *different* references under one provider render identically. It is
+    /// named `display_` rather than `source_id` precisely so that nothing can
+    /// use it for equality, keying, filtering, or rotation detection by
+    /// accident — every producer of this struct stamps a redacted value, and a
+    /// consumer that needs to tell two sources apart must go back to the
+    /// `CertSource` and call [`CertSource::source_id`].
+    ///
+    /// It exists as a field rather than being re-derived at each print site
+    /// because it is interpolated into PEM-parse and verifier-construction
+    /// failures across `tls::mod`, `tls::backend`, `dtls`, `identity::file_loader`,
+    /// `config::types`, `config::mongo_store`, `ldap_auth`, `tcp_logging`,
+    /// `ws_logging`, `soap_ws_security`, `spec_expose`, `http_client`, and
+    /// `modes::mesh` — one producer is the only enforceable point.
+    pub display_source_id: String,
     pub kind: MaterialKind,
 }
 
@@ -359,17 +523,20 @@ impl fmt::Debug for MaterializedMaterial {
             .field("version", &self.version)
             .field("fetched_at", &self.fetched_at)
             .field("source_kind", &self.source_kind)
-            .field("source_id", &self.source_id)
+            // Redacted by construction — see the field's own documentation.
+            .field("display_source_id", &self.display_source_id)
             .field("kind", &self.kind)
             .finish()
     }
 }
 
 impl MaterializedMaterial {
+    /// `display_source_id` must already be redacted; callers pass
+    /// [`CertSource::redacted_source_id`] or an equivalent non-secret label.
     pub fn from_bytes(
         bytes: Vec<u8>,
         source_kind: SourceScheme,
-        source_id: String,
+        display_source_id: String,
         kind: MaterialKind,
         version: Option<String>,
     ) -> Self {
@@ -381,7 +548,7 @@ impl MaterializedMaterial {
             version,
             fetched_at: SystemTime::now(),
             source_kind,
-            source_id,
+            display_source_id,
             kind,
         }
     }
@@ -418,7 +585,7 @@ pub fn load_material_blocking(
         CertSource::Uri(uri) if uri.scheme == SourceScheme::File => {
             let path =
                 uri_file_path(&uri.identifier).ok_or_else(|| MaterialError::InvalidSource {
-                    source_id: uri.source_id(),
+                    source_id: uri.redacted_source_id(),
                     details: "file URI has no path".to_string(),
                 })?;
             load_file_material(Path::new(&path), uri.kind)
@@ -474,7 +641,16 @@ fn load_secret_material(
         });
     }
 
-    let source_id = uri.source_id();
+    // Provider-only, never the Vault path / ARN / Key Vault URL. This is both
+    // the error wrapper's `source_id` and the materialized value's, because the
+    // latter is interpolated into PEM-parse and verifier-construction failures
+    // all over the tree (`tls::mod`, `identity::file_loader`, `ldap_auth`,
+    // `tcp_logging`, `ws_logging`, `soap_ws_security`, `spec_expose`,
+    // `http_client`, `mongo_store`, `modes::mesh`) — one producer is the only
+    // place this can be enforced. `resolved.source` is the registry's
+    // `<provider>:<identifier>` rendering and carries the reference too, so it
+    // is deliberately not used here.
+    let source_id = uri.redacted_source_id();
     let scheme = uri.scheme;
     let identifier = uri.identifier.clone();
     let key = format!("TLS {} material", uri.kind.as_str());
@@ -487,7 +663,7 @@ fn load_secret_material(
     Ok(MaterializedMaterial::from_bytes(
         resolved.value.into_bytes(),
         scheme,
-        resolved.source,
+        source_id,
         if uri.kind == MaterialKind::Unknown {
             fallback_kind
         } else {
@@ -540,19 +716,22 @@ fn load_managed_material(
         uri.kind
     };
     let store = crate::tls::managed::global_store().map_err(|details| MaterialError::Secret {
-        source_id: uri.source_id(),
+        source_id: uri.redacted_source_id(),
         details,
     })?;
     let material =
         store
             .material(&uri.identifier, kind)
             .map_err(|error| MaterialError::InvalidSource {
-                source_id: uri.source_id(),
+                source_id: uri.redacted_source_id(),
                 details: error.to_string(),
             })?;
     Ok(MaterializedMaterial::from_bytes(
         material.bytes,
         SourceScheme::Managed,
+        // `managed::ManagedMaterial`, not a `MaterializedMaterial`. `managed`
+        // is not a secret-provider scheme, so its id is local configuration and
+        // is already safe as a display label.
         material.source_id,
         material.kind,
         material.version,
@@ -570,19 +749,21 @@ fn load_acme_material(
     };
     let store =
         crate::tls::acme::global_certificate_store().map_err(|details| MaterialError::Secret {
-            source_id: uri.source_id(),
+            source_id: uri.redacted_source_id(),
             details,
         })?;
     let material =
         store
             .material(&uri.identifier, kind)
             .map_err(|error| MaterialError::InvalidSource {
-                source_id: uri.source_id(),
+                source_id: uri.redacted_source_id(),
                 details: error.to_string(),
             })?;
     Ok(MaterializedMaterial::from_bytes(
         material.bytes,
         SourceScheme::Acme,
+        // `acme::AcmeMaterial`, not a `MaterializedMaterial` — see the managed
+        // loader above for why this id is already safe to display.
         material.source_id,
         material.kind,
         material.version,
@@ -851,7 +1032,7 @@ impl MaterialLoader for FileLoader {
 
     async fn load(&self, uri: &CertSourceUri) -> Result<MaterializedMaterial, MaterialError> {
         let path = uri_file_path(&uri.identifier).ok_or_else(|| MaterialError::InvalidSource {
-            source_id: uri.source_id(),
+            source_id: uri.redacted_source_id(),
             details: "file URI has no path".to_string(),
         })?;
         load_file_material(Path::new(&path), uri.kind)
@@ -876,7 +1057,7 @@ impl InlineLoader {
         match source {
             CertSource::InlinePem(_) => load_material_blocking(source, kind),
             other => Err(MaterialError::InvalidSource {
-                source_id: other.source_id(),
+                source_id: other.redacted_source_id(),
                 details: "InlineLoader only accepts inline PEM sources".to_string(),
             }),
         }

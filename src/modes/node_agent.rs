@@ -681,7 +681,11 @@ async fn start_node_agent_admin_listeners(
     let handle = tokio::spawn(async move {
         info!(
             "Starting node_agent admin HTTP listener on {}",
-            admin_http_addr
+            crate::secrets::report_listener_addr(
+                "FERRUM_ADMIN_BIND_ADDRESS",
+                "FERRUM_ADMIN_HTTP_PORT",
+                &admin_http_addr.to_string()
+            )
         );
         if let Err(err) = admin::start_admin_listener_with_tls_and_signal(
             admin_http_addr,
@@ -754,8 +758,8 @@ fn decide_admin_bind_address(
 ) -> Result<std::net::SocketAddr, anyhow::Error> {
     let configured_ip: std::net::IpAddr = configured_bind.parse().map_err(|_| {
         anyhow::anyhow!(
-            "Invalid FERRUM_ADMIN_BIND_ADDRESS '{}' (expected a valid IP address)",
-            configured_bind
+            "Invalid FERRUM_ADMIN_BIND_ADDRESS {} (expected a valid IP address)",
+            crate::secrets::quoted_env_value("FERRUM_ADMIN_BIND_ADDRESS", configured_bind)
         )
     })?;
 

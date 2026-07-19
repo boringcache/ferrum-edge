@@ -165,8 +165,9 @@ impl CaBackend {
             "spire" | "spire_agent" | "spire-agent" => Ok(Self::SpireAgent),
             "none" | "" => Ok(Self::None),
             other => Err(format!(
-                "unknown FERRUM_MESH_CA_BACKEND '{other}'; \
-                 expected one of: internal, spire, none"
+                "unknown FERRUM_MESH_CA_BACKEND {}; \
+                 expected one of: internal, spire, none",
+                crate::secrets::quoted_env_value("FERRUM_MESH_CA_BACKEND", other)
             )),
         }
     }
