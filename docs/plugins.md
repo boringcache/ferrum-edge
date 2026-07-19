@@ -2198,6 +2198,8 @@ Database full loads carry an explicit purpose. Runtime loads validate node-local
 
 **CP/DP deployment note:** In control plane / data plane deployments, the `.mmdb` file only needs to exist on the **data plane** nodes where proxy traffic is handled. The control plane accepts `geo_restriction` plugin configs via the admin API without requiring the file locally. If the `.mmdb` file is missing on a data plane node at startup, the plugin degrades gracefully — all GeoIP lookups fall back to the `on_lookup_failure` policy (default: `allow`) until the file is deployed and the config is reloaded. Other proxies and plugins are unaffected.
 
+A node that has **already loaded a valid snapshot** is treated differently from that first-load case. Because the control plane deliberately skips node-local file validation, a DP full snapshot forces a node-local refresh, and a file that is only *temporarily* unreadable at that moment (an in-progress database swap, a transient mount or permission fault) would otherwise downgrade an actively enforcing geo gate to its `on_lookup_failure` fallback. Instead the refresh retains the last known good snapshot for that `db_path` and logs a warning naming the path, the load error, and the retained snapshot size. Retention is keyed on `db_path`, and the plugin instance is always rebuilt from the **incoming** configuration: a concurrent change to `allow_countries`, `deny_countries`, `inject_headers`, or `on_lookup_failure` takes effect immediately over the retained data, and a configuration that repoints `db_path` never inherits the previous file's snapshot — it follows the ordinary first-load fallback for the new path. A readable but corrupt, wrong-product, or over-budget file still rejects the new plugin generation and is never retained around.
+
 **Behavior by mode:**
 
 | Mode | MMDB dependency behavior at startup/reload |
@@ -2205,7 +2207,7 @@ Database full loads carry an explicit purpose. Runtime loads validate node-local
 | **File** | An absent, unreadable, or invalid file is fatal — the gateway refuses to publish the config. |
 | **Database** | Warning logged for an absent/unreadable file; plugin degrades to `on_lookup_failure`. Readable invalid files are rejected during plugin construction. |
 | **Control Plane** | Strict plugin structure is validated, but the CP does not open the node-local path because it does not proxy traffic. |
-| **Data Plane** | Warning logged for an absent/unreadable node-local file and the plugin degrades to `on_lookup_failure`; a readable invalid file rejects the new plugin generation. |
+| **Data Plane** | Warning logged for an absent/unreadable node-local file and the plugin degrades to `on_lookup_failure`; a readable invalid file rejects the new plugin generation. On a forced node-local refresh, an instance that already holds a valid snapshot for the same `db_path` retains it instead of degrading, while still applying the incoming geo policy. |
 
 > **Note:** Ferrum Edge does not ship or bundle any GeoIP database. Operators are responsible for obtaining a MaxMind GeoIP2 or GeoLite2 `.mmdb` file, accepting MaxMind's license terms, and managing updates. GeoLite2 (free) requires a [MaxMind account](https://www.maxmind.com/en/geolite2/signup) and is subject to the [GeoLite2 EULA](https://www.maxmind.com/en/geolite2/eula). MaxMind publishes weekly database updates.
 
