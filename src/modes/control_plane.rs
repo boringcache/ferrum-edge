@@ -948,6 +948,7 @@ pub async fn run(
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
         metrics_auth: metrics_auth.clone(),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: Some(dp_registry.clone()),
         mesh_registry: Some(mesh_registry.clone()),
         cp_connection_state: None,
