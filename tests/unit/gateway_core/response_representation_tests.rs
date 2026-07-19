@@ -2579,8 +2579,18 @@ async fn sse_accepting_request_with_encoded_body_is_decoded_and_redacted() {
 async fn sse_accepting_request_with_uninspectable_body_fails_closed() {
     // (status, extra response header, body, expected rejection reason)
     let cases: [(u16, Option<(&str, &str)>, &[u8], &str); 4] = [
-        (206, None, br#"{"secret":"hunter2"}"#, "partial_representation"),
-        (226, None, br#"{"secret":"hunter2"}"#, "partial_representation"),
+        (
+            206,
+            None,
+            br#"{"secret":"hunter2"}"#,
+            "partial_representation",
+        ),
+        (
+            226,
+            None,
+            br#"{"secret":"hunter2"}"#,
+            "partial_representation",
+        ),
         (
             200,
             Some(("content-encoding", "zstd")),
@@ -2657,7 +2667,10 @@ async fn actual_event_stream_response_is_never_claimed() {
         .await;
 
     assert!(!replaced, "an event stream must not be rejected");
-    assert!(!transformed, "an event stream is outside the document model");
+    assert!(
+        !transformed,
+        "an event stream is outside the document model"
+    );
     assert_eq!(status, 200);
     assert_eq!(reason, None);
     assert_eq!(body, stream, "the stream bytes must survive untouched");
