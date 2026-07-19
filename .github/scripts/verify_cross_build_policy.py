@@ -9126,6 +9126,65 @@ def self_test() -> list[str]:
     # Consolidated residual classes share helpers, so one normalization pass can
     # undo another. These assert the composed behavior, not each fix alone.
 
+    # The env/assignment/wrapper prefixes and the repeated subshell opener were
+    # authored against the same regex without knowledge of each other. Assert
+    # the combined spelling still accepts every prefix on either side of the
+    # opener, spaced or not.
+    wrapper_opaque_cross_forms = {
+        "env-prefixed unspaced subshell": (
+            "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+            "(env -i $cmd build --target aarch64-unknown-linux-gnu)"
+        ),
+        "assignment inside a nested subshell": (
+            "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+            "( (FOO=bar $cmd build --target aarch64-unknown-linux-gnu) )"
+        ),
+        "wrapper inside an unspaced subshell": (
+            "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+            "(sudo $cmd build --target aarch64-unknown-linux-gnu)"
+        ),
+        "negated env wrapper after an operator": (
+            "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+            "true;! env $cmd build --target aarch64-unknown-linux-gnu"
+        ),
+    }
+    for name, command in wrapper_opaque_cross_forms.items():
+        if not OPAQUE_ARM_CROSS_EXECUTION.search(command):
+            failures.append(f"{name} opaque Cross executable was not recognized")
+
+    # The bare-line-start matcher must agree with the explicit one about the
+    # repeated opener, or an assignment-prefixed word in a nested or unspaced
+    # subshell silently stops occupying a command slot.
+    bare_command_slots = {
+        "assignment prefix": "FOO=bar ",
+        "unspaced nested subshell": "((",
+        "assignment inside a subshell": "(FOO=bar ",
+        "wrapper before a subshell": "sudo ((",
+    }
+    for name, prefix in bare_command_slots.items():
+        if BARE_COMMAND_WORD_PREFIX.fullmatch(prefix) is None:
+            failures.append(f"{name} was not read as a bare command slot")
+
+    # An unquoted heredoc body stays shell-evaluated so its `$()` slots fail
+    # closed, but its line starts are data. A wrapper-shaped continuation there
+    # must therefore not hand the following body line the command slot that
+    # withdrawal just removed.
+    # `$block deploy` carries no ARM target, so `OPAQUE_ARM_CROSS_EXECUTION`
+    # cannot reach it and only the bare-command-slot decision is under test.
+    if contains_cross_surface(
+        "cat <<EOF > config.yaml\nenv \\\n$block deploy\nEOF\n",
+        include_opaque_shell_executable=True,
+    ):
+        failures.append(
+            "a wrapper continuation inside a heredoc body invented a command slot"
+        )
+    # The same continuation outside a heredoc still dispatches the next line.
+    if not contains_cross_surface(
+        "env \\\n$block deploy\n",
+        include_opaque_shell_executable=True,
+    ):
+        failures.append("a wrapper continuation command start was not recognized")
+
     # Word splitting rebuilds the executable word; the subshell opener sequence
     # then has to still recognize the rebuilt word in an unspaced nested slot.
     nested_split_command = (

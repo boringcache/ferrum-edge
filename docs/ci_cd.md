@@ -437,7 +437,19 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   'ferrumedge/ferrum-edge@sha256:%s ' *)` under `docker buildx imagetools create
   ... \` is that command's last argument — so only the bare-line-start allowance
   is withdrawn there; an explicit slot on the continuation line still counts, and
-  the joined logical line is scanned in its own right.
+  the joined logical line is scanned in its own right. A wrapper continuation
+  (`env \`, `sudo \`) is the exception that restores the next line's slot,
+  because the wrapper has not consumed its executable operand yet — but not
+  inside a heredoc body, where the receiving command reads that text as input
+  rather than dispatching it.
+  Leading words that precede the executable without being it do not close the
+  slot: a negation (`! cmd`), assignment words (`FOO=bar $cmd`), process
+  wrappers, `env` and its options, and any number of spaced or unspaced subshell
+  openers (`(`, `((`, `( (`) may all sit between the command start and an opaque
+  executable word, in any combination and on either side of the opener. An
+  executable assembled from expansions that then dispatches a Cargo or Cross
+  subcommand (`"$cmd" build`) is opaque for every target, not only the protected
+  ARM64 one, so it fails closed in trusted-automation revalidation as well.
   A block-scalar body is one string value rather than YAML structure, so prose in
   an action input declares no mapping key, alias, or merge key: `--allowedTools
   "Bash(gh pr comment:*)"` inside a `claude_args: |` body is not a `comment:` key
@@ -491,7 +503,13 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   operand. An interpreter that reads its program from stdin is dispatched the
   same way as a shell that does, so `python3 <<< '<source>'` and
   `python3 < <(printf '<source>')` are inspected in the interpreter's own
-  language instead of only in POSIX shell.
+  language instead of only in POSIX shell. Only an *unescaped* literal producer
+  is folded into readable source: `echo` behavior varies between shells and
+  `printf` decodes backslash escapes in its format, so `printf '\x63ross ...' |
+  bash` and `echo -e '\x63ross ...' | bash` would otherwise be read as harmless
+  text while the receiving shell runs Cross. A backslash anywhere in an `echo`
+  operand, in a `%s` operand, or in a literal `printf` format therefore leaves
+  the produced program opaque, which fails closed.
   A `shell: pwsh`/`powershell` body, a PowerShell `-Command` operand, a
   PowerShell heredoc, and a `SHELL ["pwsh", ...]` Dockerfile selection are
   parsed as PowerShell rather than as POSIX shell: `Start-Process`,
@@ -609,6 +627,17 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   `$(shell ...)` and other make functions, stays opaque and keeps failing
   closed. Detection stays anchored to command positions, so prose or a
   comment mentioning `cargo install cross` does not freeze unrelated edits.
+  An automation file needs no recognized extension to be executable. A reference
+  under a conventional tool directory (`ci/`, `bin/`, `build/`, `tool`, `tools/`,
+  `dev/`, `hack/`) is followed as a repository command even when the name
+  carries no suffix, and a reached file that is extensionless — and is not a
+  build-dispatcher manifest — is revalidated as shell rather than skipped for
+  having no detectable language. Those two halves are what close the edge: the
+  first makes `ci/unsafe` discoverable, the second makes `scripts/build`
+  scannable once discovered. Python automation reached this way has dynamic
+  process commands rejected rather than silently dropped, so an argv assembled
+  into a variable (`cmd = ['python3', 'ci/unsafe.py']; subprocess.run(cmd)`)
+  fails closed instead of reading as an unresolvable literal.
   Cross-sensitive jobs, local-action files, and
   reachable scripts are represented by full digests, while unrelated workflow,
   action, and script additions or edits remain permitted. The isolated jobs use
