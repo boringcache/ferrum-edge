@@ -5412,8 +5412,28 @@ def scan_variants(
         variants.append(with_literal_defaults)
 
     for match in re.finditer(r'"(?:[^"\\]|\\.)*"', line):
+        # JSON/YAML double-quoted scalars are standalone tokens. A shell can
+        # instead concatenate quote segments into one word, and a command
+        # substitution inside an outer double quote parses its own quotes in a
+        # fresh context. The flat regex then pairs the outer opener with an
+        # inner quote (`VALUE="$(python - "$arg" ...)"`) and decoding that
+        # non-scalar fragment removes only half of the shell quoting. The
+        # malformed variant can turn a resolved heredoc into opaque stdin.
+        before = line[match.start() - 1] if match.start() else ""
+        after = line[match.end()] if match.end() < len(line) else ""
+        if before and not before.isspace() and before not in "[{(:,":
+            continue
+        if after and not after.isspace() and after not in "]},:;|&#":
+            continue
+        quoted = match.group()
+        if any(
+            quoted[start:end].startswith("$(")
+            and not quoted[start:end].endswith(")")
+            for start, end in command_substitution_spans(quoted)
+        ):
+            continue
         try:
-            decoded = json.loads(match.group())
+            decoded = json.loads(quoted)
         except json.JSONDecodeError:
             continue
         if isinstance(decoded, str):
@@ -13769,6 +13789,29 @@ pre_build = []
                 f"a {label} quoted heredoc body disagreed with the expected "
                 "Cross surface between exact validation and comparison"
             )
+    # A non-shell heredoc inside a captured command substitution is executable
+    # by Python, but the substitution's result is assignment data. Flat
+    # double-quote decoding must not pair the outer quote with Python's inner
+    # argument quote and deform the resolved heredoc into an opaque stdin shell.
+    benign_python_capture = (
+        "#!/bin/sh\n"
+        "header=\"$(python3 - \"$JWT_KID\" <<'PY'\n"
+        "print('safe')\n"
+        "PY\n"
+        ")\"\n"
+    )
+    if contains_direct_trusted_shell_cross_surface(benign_python_capture):
+        failures.append(
+            "a benign Python heredoc captured into an assignment was read as "
+            "an opaque shell"
+        )
+    if automation_file_cross_surfaces(
+        "scripts/benign-python-capture.sh",
+        benign_python_capture,
+    ):
+        failures.append(
+            "a benign Python heredoc capture changed the compared Cross surface"
+        )
     # A command substitution in a heredoc body is one subshell, so a `cd` on its
     # first line reaches its own later lines and nothing past them. Resolving
     # every interior line from the parent directory let a benign
