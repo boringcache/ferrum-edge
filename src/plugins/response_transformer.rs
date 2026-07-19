@@ -820,11 +820,12 @@ impl Plugin for ResponseTransformer {
     /// send every valid RPC reply on a mixed HTTP/gRPC proxy into the gate's
     /// `unparseable_document` rejection.
     ///
-    /// SSE is deliberately NOT declined here. It is handled in the opposite
-    /// direction — by *removing* it from the claim predicate — because a
-    /// buffered SSE-accepting request whose response is an ordinary complete
-    /// JSON document is fully inspectable, and its redaction works today. See
-    /// [`Plugin::enforces_response_body_policy`].
+    /// SSE is deliberately NOT declined here. The opposite half of the fix
+    /// removed the SSE-specific *decline* from the claim predicate — widening
+    /// the claim for already-buffered ordinary JSON on an SSE-accepting request
+    /// — because that response is fully inspectable and its redaction works
+    /// today. A genuine `text/event-stream` response remains unclaimed via the
+    /// media-type condition. See [`Plugin::enforces_response_body_policy`].
     async fn transform_response_body_with_context(
         &self,
         ctx: &mut RequestContext,
