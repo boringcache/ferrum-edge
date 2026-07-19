@@ -1343,7 +1343,15 @@ HEREDOC_PIPED_INTERPRETER = re.compile(
     r"pypy[0-9]*|pwsh|powershell)\b"
 )
 OPAQUE_INLINE_SHELL = re.compile(
-    r"(?:\b(?:bash|sh)\s+-c\s+[^\n]*\$\(|"
+    # A double-quoted or unquoted `-c` operand is assembled by the outer shell,
+    # so a substitution can change the program text before the nested shell
+    # parses it. A single-quoted operand is already a complete literal program:
+    # substitutions inside it belong to the nested shell and are scanned there
+    # as ordinary command/argument positions instead of making the whole script
+    # opaque.
+    r"(?:\b(?:bash|sh)\s+-c\s+(?:"
+    r'"(?:[^"\\]|\\.)*\$\('
+    r"|(?:\\.|[^\s'\"\\])*\$\()|"
     r"\beval\s+[^\n]*\$\(|"
     r"(?:\bsource|(?<!\S)\.)\s+<\()"
 )
@@ -4730,8 +4738,20 @@ def token_command_has_cross(
         if opaque:
             return include_opaque_shell_executable
         if program is not None:
-            if dynamic_shell_word(program):
-                return include_opaque_shell_executable
+            # A literal `sh -c '...'` program can contain substitutions without
+            # being generated code: the nested shell parses that source first,
+            # then expands an argument such as `echo $(render)`. Inspect opaque
+            # words in their *nested* command slots and keep scanning the known
+            # program for literal Cross commands. The outer-shell case where a
+            # double-quoted/unquoted substitution assembles the `-c` operand is
+            # separately rejected by `OPAQUE_INLINE_SHELL` while quote
+            # provenance is still available.
+            if dynamic_shell_word(program) and opaque_shell_interpolation_variants(
+                program,
+                shell_evaluated=True,
+                starts_command=True,
+            ):
+                return True
             return shell_program_has_cross(
                 program,
                 include_opaque_shell_executable=include_opaque_shell_executable,
@@ -13812,6 +13832,37 @@ pre_build = []
         failures.append(
             "a benign Python heredoc capture changed the compared Cross surface"
         )
+    # A single-quoted `sh -c` operand is literal nested-shell source. Ordinary
+    # substitutions in argument positions are not generated program text, but
+    # a literal or opaque Cross executable inside that same nested source still
+    # must be found.
+    benign_nested_shell = "sh -c 'out=$(printf safe); echo \"$out\"' sh\n"
+    if contains_direct_trusted_shell_cross_surface(benign_nested_shell) or (
+        generic_action_cross_surfaces(
+            benign_nested_shell,
+            name="scripts/benign-nested-shell.sh",
+            include_opaque_shell_executable=True,
+        )
+    ):
+        failures.append(
+            "a literal single-quoted nested shell with a benign substitution "
+            "was reported as generated code"
+        )
+    for nested_label, nested_program in (
+        (
+            "literal",
+            f"sh -c 'echo $(printf safe); cross build --target {TARGET}'\n",
+        ),
+        (
+            "opaque",
+            f"sh -c '$cmd build --target {TARGET}'\n",
+        ),
+    ):
+        if not contains_direct_trusted_shell_cross_surface(nested_program):
+            failures.append(
+                f"a {nested_label} Cross executable inside a literal nested "
+                "shell stopped failing closed"
+            )
     # A command substitution in a heredoc body is one subshell, so a `cd` on its
     # first line reaches its own later lines and nothing past them. Resolving
     # every interior line from the parent directory let a benign
