@@ -4795,9 +4795,20 @@ def shell_program_has_cross(
         return include_opaque_shell_executable and bool(
             STANDALONE_CROSS.search(value) or CROSS_ENVIRONMENT.search(value)
         )
-    yaml_shell_field = bool(tokens and tokens[0] == "shell:")
-    if tokens and tokens[0] in {"run:", "shell:"}:
-        tokens = tokens[1:]
+    # Inline YAML sequence steps carry a list marker in front of the command
+    # key (`- run: ...`).  Treat that marker as YAML syntax, not as the shell
+    # executable.  Leaving it attached made a readable producer such as
+    # `printf 'echo safe' | bash` look opaque because the producer segment
+    # started with `- run:` instead of `printf`.
+    yaml_key_index = 1 if len(tokens) > 1 and tokens[0] == "-" else 0
+    yaml_shell_field = bool(
+        len(tokens) > yaml_key_index and tokens[yaml_key_index] == "shell:"
+    )
+    if (
+        len(tokens) > yaml_key_index
+        and tokens[yaml_key_index] in {"run:", "shell:"}
+    ):
+        tokens = tokens[yaml_key_index + 1 :]
 
     global _shell_assigned_names
     global _shell_argv_dispatchers
@@ -5918,9 +5929,9 @@ def contains_cross_surface(
     # `$cmd build --target aarch64-unknown-linux-gnu` Cross-sensitive while the
     # per-line scanners below withdrew that same body, so the two disagreed and
     # a benign edit was blocked with no finding behind it. The projection keeps
-    # every genuinely executed body — an interpreter-fed one verbatim, an
-    # unquoted one's substitutions re-emitted, and the whole text raw when a
-    # heredoc is unterminated — so this stays fail-closed.
+    # every genuinely executed POSIX-shell body verbatim, re-emits substitutions
+    # from every unquoted body, and returns the whole text raw when a heredoc is
+    # unterminated. Other interpreter bodies use their dedicated scanners.
     command_contents = automation_command_text(logical_contents)
     if (
         OPAQUE_INLINE_SHELL.search(command_contents)
@@ -6003,6 +6014,33 @@ def cross_surface_line_report(
                         else "expanded command text"
                     )
                     return f" ({where}: {line.strip()[:160]!r})"
+    # The command projection joins only newlines inside a multiline shell
+    # expansion. A resulting executable/subcommand pair has no single source
+    # line to name, but reporting the projected command is still materially
+    # better than a digest-only rejection.
+    command_contents = automation_command_text(logical_contents)
+    with opaque_stdin_program_scope():
+        for line, shell_evaluated, starts_command in logical_scan_lines(
+            command_contents
+        ):
+            if (
+                OPAQUE_INLINE_SHELL.search(line)
+                or WRAPPED_LITERAL_CROSS.search(line)
+                or opaque_arm_cross_execution(line)
+                or contains_opaque_executable_cross(line)
+            ):
+                return f" (projected command text: {line.strip()[:160]!r})"
+            for variant in scan_variants(
+                line,
+                include_opaque_shell_executable=include_opaque_shell_executable,
+                shell_evaluated=shell_evaluated,
+                starts_command=starts_command,
+            ):
+                if has_cross_command_context(
+                    variant,
+                    include_opaque_shell_executable=include_opaque_shell_executable,
+                ) or CROSS_ENVIRONMENT.search(variant):
+                    return f" (projected command text: {line.strip()[:160]!r})"
     return ""
 
 
@@ -6711,8 +6749,9 @@ def unprotected_cross_surfaces(
         # that command slot — a block with no finding behind it, on both
         # `validate_workflow_collection` and `compare_pr_workflow_collection`.
         # The projection is not a weakening: it re-emits every substitution an
-        # unquoted body dispatches, keeps an interpreter-fed body verbatim, and
-        # returns the text raw whenever a heredoc is unterminated.
+        # unquoted body dispatches, keeps a POSIX-shell-fed body verbatim, and
+        # returns the text raw whenever a heredoc is unterminated. Other
+        # interpreter bodies are covered by the runtime scan above.
         job_command_contents = automation_command_text(logical_contents)
         if (
             OPAQUE_INLINE_SHELL.search(job_command_contents)
@@ -7028,10 +7067,10 @@ def generic_action_cross_surfaces(
     # surface and blocked the edit, while the exact-tree scan treated the same
     # quoted body as inert template data — a block with no finding behind it.
     # The projection is not a weakening: it re-emits every substitution an
-    # unquoted body dispatches, keeps an interpreter-fed heredoc body verbatim,
-    # and returns the text raw whenever a heredoc is unterminated. The per-line
-    # scan below is unaffected; `logical_scan_lines` already withdraws heredoc
-    # body lines on its own.
+    # unquoted body dispatches, keeps a POSIX-shell-fed heredoc body verbatim,
+    # and returns the text raw whenever a heredoc is unterminated. Other
+    # interpreter bodies use `runtime_program_cross_surface`; the per-line scan
+    # below is unaffected because `logical_scan_lines` withdraws heredoc bodies.
     command_contents = automation_command_text(logical_contents)
     with shell_argv_dispatch_scope(logical_contents):
         sensitive = (
@@ -7169,9 +7208,20 @@ def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
     # scan fails closed on it here exactly as PR comparison already does. Read
     # the projected command text so a quoted heredoc that merely writes a
     # template is not tokenized as if its body ran; executable heredocs and
-    # unquoted substitutions are already retained by the projection.
+    # unquoted substitutions and POSIX-shell heredoc bodies are retained by the
+    # projection; non-shell executable bodies are scanned below by their real
+    # interpreter.
     with opaque_stdin_program_scope():
         literal_surface = contains_literal_executable_cross(command_text)
+    heredoc_programs, heredoc_failures = executable_heredocs(
+        contents,
+        "trusted shell automation",
+    )
+    heredoc_sensitive, heredoc_runtime_failures = runtime_program_cross_surface(
+        list(heredoc_programs),
+        "trusted shell automation executable heredoc",
+        include_opaque_shell_executable=True,
+    )
     # Every raw-text search below reads the *command* text rather than the raw
     # lines. A reached script that writes a literal template — `cat <<'EOF'`
     # holding `bash -c "$(render)"` or `/opt/bin/cross build` — is not executing
@@ -7185,6 +7235,9 @@ def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
     # projection, so neither side calls a surface inert that the other blocks.
     return (
         literal_surface
+        or bool(heredoc_failures)
+        or bool(heredoc_runtime_failures)
+        or heredoc_sensitive
         or WRAPPED_LITERAL_CROSS.search(command_text) is not None
         or OPAQUE_INLINE_SHELL.search(command_text) is not None
         # An executable word assembled from shell expansions is opaque, so an
@@ -7197,10 +7250,9 @@ def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
         # positive the projection removes, because a heredoc template holding
         # `$cmd build` was still read as an executable opaque Cross command even
         # though the body is data the script only writes. The projection keeps
-        # every genuinely executed body — an interpreter-fed one verbatim, an
-        # unquoted one's substitutions re-emitted, and the whole program raw
-        # when a heredoc is unterminated — so this stays fail-closed on real
-        # dispatches.
+        # POSIX-shell-fed bodies verbatim, re-emits substitutions from every
+        # unquoted body, and returns the whole program raw when a heredoc is
+        # unterminated; other interpreters are scanned separately above.
         or contains_opaque_executable_cross(command_text)
     )
 
@@ -7345,23 +7397,52 @@ def automation_file_cross_surfaces(
     provenance, so the surfaces stay symmetric.
     """
 
-    surfaces = list(
-        generic_action_cross_surfaces(
-            # A makefile's raw text is not shell text; expanding its variables
-            # first keeps `$(MAKE) -C sub all` from reading as an opaque
-            # command substitution in an executable slot.
-            make_expanded_manifest(name, contents),
-            name=name,
+    language = automation_language(name, contents)
+    # A known Python or PowerShell file is not POSIX shell text. Its dedicated
+    # interpreter scanner below is authoritative unless a call site also runs
+    # it through a shell, in which case provenance deliberately adds that
+    # second reading. Scanning Python source as shell made benign calls such as
+    # `run(['bash'], input='cargo test')` into synthetic shell syntax and froze
+    # an otherwise empty Cross surface.
+    shell_reading = language not in {"python", "powershell"} or (
+        "shell" in interpreters
+    )
+    surfaces = (
+        list(
+            generic_action_cross_surfaces(
+                # A makefile's raw text is not shell text; expanding its variables
+                # first keeps `$(MAKE) -C sub all` from reading as an opaque
+                # command substitution in an executable slot.
+                make_expanded_manifest(name, contents),
+                name=name,
+                include_opaque_shell_executable=True,
+            )
+        )
+        if shell_reading
+        else []
+    )
+    heredoc_shell_reading = (
+        language == "shell"
+        or "shell" in interpreters
+        or PurePosixPath(name).suffix == ""
+        or is_dispatcher_manifest(name)
+    )
+    if heredoc_shell_reading:
+        heredoc_programs, heredoc_failures = executable_heredocs(contents, name)
+        heredoc_sensitive, heredoc_runtime_failures = runtime_program_cross_surface(
+            list(heredoc_programs),
+            f"{name} executable heredoc",
             include_opaque_shell_executable=True,
         )
-    )
+        if heredoc_failures or heredoc_runtime_failures or heredoc_sensitive:
+            digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+            surfaces.append(f"executable-heredoc-cross:{digest}")
     if is_dispatcher_manifest(name) and dispatcher_manifest_cross_surface(
         name,
         contents,
     ):
         digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
         surfaces.append(f"dispatcher-manifest-cross:{digest}")
-    language = automation_language(name, contents)
     if language == "python":
         process_commands, process_failures = python_command_scripts(
             contents,
@@ -8095,14 +8176,39 @@ def heredoc_body_substitution_commands(
     )
 
 
+def executable_heredoc_language(line: str, start: int) -> str | None:
+    """Classify the interpreter that receives one heredoc body, if any."""
+
+    # Both sides of the opener are evidence. The piped interpreter is appended
+    # last because it receives the body when both spellings appear.
+    interpreters = [
+        match.group("interpreter")
+        for match in HEREDOC_EXECUTABLE.finditer(line[:start])
+    ] + [
+        match.group("interpreter")
+        for match in HEREDOC_PIPED_INTERPRETER.finditer(
+            heredoc_pipeline_tail(line, start)
+        )
+    ]
+    if not interpreters:
+        return None
+    executable = tool_name(interpreters[-1])
+    if PYTHON_INTERPRETER.fullmatch(executable):
+        return "python"
+    if executable.lower() in {"pwsh", "powershell"}:
+        return "powershell"
+    return "shell"
+
+
 def opaque_arm_command_line_projection(contents: str) -> tuple[str, ...] | None:
     """Project each source line down to the command text that line dispatches.
 
     One entry per line of `contents`, so a caller that reports per-line surfaces
     can keep its own line indexes. A withdrawn heredoc body line projects to the
-    empty string; a body an interpreter is fed projects to itself; the
-    substitutions an unquoted body dispatches are attributed to the line that
-    closes the body, because that is where the whole body first becomes known.
+    empty string; a body fed to a POSIX shell projects to itself; non-shell
+    executable bodies are left to their interpreter scanner. The substitutions
+    an unquoted body dispatches are attributed to the line that closes the body,
+    because that is where the whole body first becomes known.
 
     `None` means the projection is withdrawn entirely: an unterminated heredoc
     would otherwise swallow every remaining line as body data, which is the one
@@ -8116,8 +8222,8 @@ def opaque_arm_command_line_projection(contents: str) -> tuple[str, ...] | None:
 
     source_lines = contents.splitlines()
     projected: list[str] = [""] * len(source_lines)
-    # delimiter, quoted, executable
-    delimiters: list[tuple[str, bool, bool]] = []
+    # delimiter, quoted, interpreter language
+    delimiters: list[tuple[str, bool, str | None]] = []
     body_lines: list[str] = []
 
     def flush_body(index: int) -> None:
@@ -8138,7 +8244,7 @@ def opaque_arm_command_line_projection(contents: str) -> tuple[str, ...] | None:
 
     for index, line in enumerate(source_lines):
         if delimiters:
-            delimiter, quoted, executable = delimiters[0]
+            delimiter, quoted, interpreter = delimiters[0]
             if line.strip() == delimiter:
                 delimiters.pop(0)
                 # The terminator is syntax, not body data. Preserve it so the
@@ -8146,12 +8252,16 @@ def opaque_arm_command_line_projection(contents: str) -> tuple[str, ...] | None:
                 projected[index] = line
                 flush_body(index)
                 continue
-            if executable:
-                # The body *is* the program the interpreter runs, so its lines
-                # are commands. Emitting them raw is also a superset of the
-                # substitution re-emission an unquoted body would have got.
+            if interpreter == "shell":
+                # The body is a POSIX-shell program, so these are shell command
+                # lines. Non-shell executable bodies are scanned by their real
+                # interpreter through `executable_heredocs()`; treating Python
+                # or PowerShell source as POSIX shell invents command slots.
                 projected[index] = line
             elif not quoted:
+                # The outer shell still evaluates substitutions in every
+                # unquoted heredoc, including a body later consumed by Python
+                # or PowerShell, so retain those substitution commands alone.
                 body_lines.append(line)
             continue
         projected[index] = line
@@ -8166,18 +8276,7 @@ def opaque_arm_command_line_projection(contents: str) -> tuple[str, ...] | None:
             # body is piped into an interpreter: `cat <<'EOF' | bash` runs the
             # body. Reading only the left side classified it as data and dropped
             # a real program from the projection.
-            (
-                delimiter,
-                quoted,
-                HEREDOC_EXECUTABLE.search(line[:start]) is not None
-                or HEREDOC_PIPED_INTERPRETER.search(
-                    # Truncated at the first command separator for the same
-                    # reason `executable_heredocs` truncates it: a pipe in a
-                    # later statement never receives this body.
-                    heredoc_pipeline_tail(line, start)
-                )
-                is not None,
-            )
+            (delimiter, quoted, executable_heredoc_language(line, start))
             for start, delimiter, quoted in quote_aware_heredoc_start_details(line)
         )
     if delimiters:
@@ -8202,13 +8301,13 @@ def opaque_arm_command_text(contents: str) -> str:
       substitution interior is re-emitted as a command line of its own and
       keeps matching. Only the surrounding data loses its synthetic command
       start.
-    * A body whose opener hands it to an interpreter — `bash <<'EOF'`,
-      `python3 <<PY` — is not data at all: it is the program that runs. Those
-      bodies are kept verbatim regardless of delimiter quoting, because a
-      quoted delimiter suppresses expansion inside the program without making
-      the program inert. Withdrawing them turned `bash <<'EOF'` holding
-      `bash -c "$(render)"` into template text and accepted an unprotected
-      generated inline shell surface the raw search had rejected.
+    * A body handed to a POSIX shell — `bash <<'EOF'` — is itself shell command
+      text and stays verbatim regardless of delimiter quoting. Python and
+      PowerShell bodies are intentionally omitted from this POSIX projection
+      and scanned by their real interpreter through `executable_heredocs()`;
+      treating that source as shell invents executable slots. A quoted
+      delimiter suppresses outer-shell expansion without making the nested
+      interpreter program inert.
     """
 
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
@@ -8800,27 +8899,7 @@ def executable_heredocs(
         # earlier stdin redirection is superseded, and guarantees the effective
         # final body is never skipped.
         for start, delimiter in heredocs:
-            # Both sides of the opener are evidence. The piped interpreter is
-            # appended last because it receives the body when both spellings
-            # appear.
-            interpreters = [
-                match.group("interpreter")
-                for match in HEREDOC_EXECUTABLE.finditer(line[:start])
-            ] + [
-                match.group("interpreter")
-                for match in HEREDOC_PIPED_INTERPRETER.finditer(
-                    heredoc_pipeline_tail(line, start)
-                )
-            ]
-            interpreter: str | None = None
-            if interpreters:
-                executable = tool_name(interpreters[-1])
-                if PYTHON_INTERPRETER.fullmatch(executable):
-                    interpreter = "python"
-                elif executable.lower() in {"pwsh", "powershell"}:
-                    interpreter = "powershell"
-                else:
-                    interpreter = "shell"
+            interpreter = executable_heredoc_language(line, start)
             pending.append((delimiter, interpreter))
     errors = (
         [f"{source} has an unterminated executable heredoc {pending[0][0]!r}"]
@@ -16348,22 +16427,36 @@ pre_build = []
         "subprocess.run(cmd)\n"
         "PY",
     )
-    # A literal nested heredoc command stays readable and benign.
+    # A literal nested heredoc command stays readable and benign on exact-tree
+    # validation and on the symmetric PR surface comparison.
+    benign_nested_python_automation = {
+        "scripts/safe.sh": (
+            "#!/bin/sh\n"
+            "python3 <<'PY'\n"
+            "import subprocess\n"
+            "subprocess.run(['echo', 'ok'])\n"
+            "PY\n"
+        )
+    }
     if validate_automation_collection(
         {"ci.yml": referenced_workflow},
         {"setup/action.yml": safe_action},
-        {
-            "scripts/safe.sh": (
-                "#!/bin/sh\n"
-                "python3 <<'PY'\n"
-                "import subprocess\n"
-                "subprocess.run(['echo', 'ok'])\n"
-                "PY\n"
-            )
-        },
+        benign_nested_python_automation,
         "self-test automation directory",
     ):
         failures.append("a literal nested Python heredoc command was rejected")
+    if compare_pr_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        benign_nested_python_automation,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "a literal nested Python heredoc command was rejected by PR comparison"
+        )
 
     shell_automation_escapes(
         "literal here-string shell stdin",
