@@ -68,7 +68,23 @@ fn mode_matches_any(mode: &OperatingMode, candidates: &[&str]) -> bool {
     candidates.contains(&current)
 }
 
+/// Render a typed-parse failure for one environment variable.
+///
+/// This is the single boundary every `EnvValue::parse_env` implementation goes
+/// through, so it is where an externally resolved value stops being echoed. A
+/// variable materialized from `_FILE`/`_VAULT`/`_AWS`/`_AZURE`/`_GCP` holds
+/// secret material, and a malformed one (`FERRUM_DB_PORT_FILE` pointing at a
+/// password, say) would otherwise print that material verbatim as
+/// `Invalid FERRUM_DB_PORT value '<secret>'`. The key and the expected shape
+/// are the actionable parts and are kept; only the value is withheld, and only
+/// for keys known to have come from an external source.
 fn invalid_env_value(key: &str, raw: &str, expected: &str) -> String {
+    if crate::secrets::is_external_secret_key(key) {
+        return format!(
+            "Invalid {key} value {}. Expected {expected}",
+            crate::secrets::EXTERNAL_SECRET_PLACEHOLDER
+        );
+    }
     format!("Invalid {key} value '{raw}'. Expected {expected}")
 }
 
@@ -171,11 +187,15 @@ impl EnvValue for Vec<String> {
 impl EnvValue for HashMap<String, String> {
     fn parse_env(raw: &str, key: &str) -> Result<Self, String> {
         serde_json::from_str(raw).map_err(|err| {
-            format!(
-                "{}: {}",
-                invalid_env_value(key, raw, "a JSON object of string values"),
-                err
-            )
+            let invalid = invalid_env_value(key, raw, "a JSON object of string values");
+            // `serde_json` quotes the offending region of the document, which
+            // for an externally resolved variable is the secret itself. Drop
+            // the parser detail in that case and keep the key + expected shape.
+            if crate::secrets::is_external_secret_key(key) {
+                invalid
+            } else {
+                format!("{}: {}", invalid, err)
+            }
         })
     }
 }

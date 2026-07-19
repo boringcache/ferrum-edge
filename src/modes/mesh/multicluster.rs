@@ -1390,9 +1390,16 @@ pub(crate) fn parse_remote_discovery_credentials(
         // per-remote entry cannot mint tokens with a trivially weak key — and the
         // failure surfaces here at parse time, not later at the remote CP.
         if secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+            // `reference` is a JSON object key parsed *out of* the variable, so
+            // no whole-value or segment candidate covers it at any length —
+            // and the variable is credential material by definition.
             return Err(format!(
-                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS reference '{reference}' secret must be at \
+                "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS reference {} secret must be at \
                  least {} characters (matching FERRUM_CP_DP_GRPC_JWT_SECRET); got {}",
+                crate::secrets::quoted_env_value(
+                    "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS",
+                    reference.trim()
+                ),
                 crate::config::types::MIN_JWT_SECRET_LENGTH,
                 secret.len()
             ));

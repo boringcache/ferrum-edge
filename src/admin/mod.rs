@@ -394,10 +394,12 @@ pub async fn start_admin_listener_with_dynamic_tls_and_signal(
 /// Production callers go through [`start_admin_listener_with_tls_and_signal`],
 /// which binds internally and signals startup readiness.
 ///
-/// `file::serve` (the in-process gateway entry point) also calls this
-/// directly when a `ServeOptions::admin_http` / `admin_https` listener is
-/// supplied, so the in-process harness shares one accept loop with the
-/// binary path.
+/// `file::serve` (the in-process gateway entry point) calls this for a
+/// supplied `ServeOptions::admin_http` listener, and for
+/// `ServeOptions::admin_https` when frontend TLS live reload did not prepare
+/// a hot-swap slot. When a slot is present, file mode uses
+/// [`serve_admin_on_listener_with_dynamic_tls`] instead so cert rotation
+/// reaches the caller-owned HTTPS socket.
 pub async fn serve_admin_on_listener(
     listener: TcpListener,
     state: AdminState,
@@ -504,6 +506,12 @@ pub async fn serve_admin_on_listener(
 /// from a shared `ArcSwap` slot on every new connection, allowing the
 /// frontend TLS file-watch task to atomically swap in a rotated cert/key
 /// pair without restarting the listener.
+///
+/// Used by the env-bound admin HTTPS path (via
+/// [`start_admin_listener_with_dynamic_tls_and_signal`]) and by
+/// `file::serve` when a caller-owned `ServeOptions::admin_https` socket is
+/// served with live reload enabled — both paths share this accept loop so
+/// cert rotation is not limited to process-bound listeners.
 ///
 /// In-flight admin connections keep their original `ServerConfig` (rustls
 /// consults the config only during the handshake; swapping it does not tear
@@ -938,7 +946,9 @@ fn paginated_get_list_route_role(method: &Method, segments: &[&str]) -> Option<O
         return None;
     }
     match segments {
-        ["proxies"] | ["consumers"] | ["upstreams"] | ["plugins", "config"] => Some(None),
+        ["proxies"] | ["consumers"] | ["upstreams"] | ["plugins", "config"] | ["namespaces"] => {
+            Some(None)
+        }
         ["audit"] => Some(Some(AdminRole::Admin)),
         ["admin", "tls", "inventory"]
         | ["admin", "tls", "events"]
@@ -1944,7 +1954,10 @@ pub async fn handle_admin_request(
         }
 
         // Namespaces
-        (Method::GET, ["namespaces"]) => handle_list_namespaces(&state).await,
+        (Method::GET, ["namespaces"]) => {
+            let pagination = route_pagination!();
+            handle_list_namespaces(&state, &pagination).await
+        }
 
         // Metrics
         (Method::GET, ["metrics", "runtime"]) => handle_metrics_runtime(&state).await,
@@ -7292,10 +7305,19 @@ async fn handle_audit_list(
 
 // ---- Namespaces ----
 
-async fn handle_list_namespaces(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle_list_namespaces(
+    state: &AdminState,
+    pagination: &PaginationParams,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
-        match db.list_namespaces().await {
-            Ok(namespaces) => Ok(json_response(StatusCode::OK, &json!(namespaces))),
+        match db
+            .list_namespaces_paginated(pagination.query_limit_i64(), pagination.query_offset_i64())
+            .await
+        {
+            Ok(result) => Ok(json_response(
+                StatusCode::OK,
+                &paginate_db_response(&result.items, result.total, pagination),
+            )),
             Err(e) => Ok(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &db_error_response(&e),
@@ -7305,12 +7327,12 @@ async fn handle_list_namespaces(state: &AdminState) -> Result<Response<Full<Byte
         // File mode: return namespaces captured at load time (before namespace filtering)
         Ok(json_response(
             StatusCode::OK,
-            &json!(config.known_namespaces),
+            &paginate_response(&config.known_namespaces, pagination),
         ))
     } else {
         Ok(json_response(
             StatusCode::OK,
-            &json!([crate::config::types::DEFAULT_NAMESPACE]),
+            &paginate_response(&[crate::config::types::DEFAULT_NAMESPACE], pagination),
         ))
     }
 }

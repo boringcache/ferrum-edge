@@ -4393,22 +4393,35 @@ paths:
   /namespaces:
     get:
       operationId: listNamespaces
-      summary: List all namespaces
+      summary: List namespaces (paginated)
       description: |
-        Returns a list of all distinct namespaces present in the configuration.
-        In database mode, queries the database directly. In file mode, returns
-        the namespaces captured at file load time (before namespace filtering).
+        Returns the distinct namespaces present in the configuration as a
+        paginated envelope with `data` and `pagination` fields, ordered
+        ascending by namespace name. In database mode, queries the database
+        directly. In file mode, returns the namespaces captured at file load
+        time (before namespace filtering).
       tags: [Namespaces]
+      parameters:
+        - $ref: "#/components/parameters/PaginationOffset"
+        - $ref: "#/components/parameters/PaginationLimit"
       responses:
         "200":
-          description: List of namespace strings
+          description: Paginated namespace strings
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  type: string
-                example: ["ferrum", "staging", "production"]
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: string
+                    example: ["ferrum", "production", "staging"]
+                  pagination:
+                    $ref: "#/components/schemas/Pagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":

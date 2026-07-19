@@ -6,6 +6,7 @@ mod env_tests;
 mod file_tests;
 #[cfg(feature = "secrets-gcp")]
 mod gcp_tests;
+mod redaction_tests;
 mod resolve_tests;
 #[cfg(feature = "secrets-vault")]
 mod vault_tests;

@@ -176,7 +176,7 @@ impl PluginTlsPosture {
         };
 
         let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-        let source_id = source.source_id();
+        let source_id = source.redacted_source_id();
         let ca_material = match load_material_blocking(&source, MaterialKind::CaBundle) {
             Ok(ca_material) => ca_material,
             Err(error) => {
@@ -187,10 +187,10 @@ impl PluginTlsPosture {
         match reqwest::Certificate::from_pem_bundle(ca_material.bytes.expose_secret()) {
             Ok(certs) if !certs.is_empty() => Self::CustomCaBundle(certs),
             Ok(_) => Self::fail_closed(
-                ca_material.source_id,
+                ca_material.display_source_id,
                 "CA bundle did not contain any PEM certificates".to_string(),
             ),
-            Err(error) => Self::fail_closed(ca_material.source_id, error.to_string()),
+            Err(error) => Self::fail_closed(ca_material.display_source_id, error.to_string()),
         }
     }
 

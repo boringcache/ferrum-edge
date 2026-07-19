@@ -6441,6 +6441,79 @@ impl DatabaseStore {
         Ok(namespaces)
     }
 
+    /// List distinct namespaces with database-level LIMIT/OFFSET pagination.
+    pub async fn list_namespaces_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<String>, anyhow::Error> {
+        let admin_read = self.admin_read_pool();
+        let source = admin_read.source;
+        match self
+            .list_namespaces_paginated_from_pool(limit, offset, &admin_read.pool)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if source == AdminReadSource::ReadReplica => {
+                self.mark_read_replica_unavailable("list_namespaces_paginated", &error);
+                warn!(
+                    "Read replica admin query failed; retrying list_namespaces_paginated against primary"
+                );
+                let primary_pool = self.pool();
+                let retry = self
+                    .list_namespaces_paginated_from_pool(limit, offset, &primary_pool)
+                    .await;
+                if retry.is_ok() {
+                    info!("Admin read fallback to primary succeeded for list_namespaces_paginated");
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_namespaces_paginated_from_pool(
+        &self,
+        limit: i64,
+        offset: i64,
+        pool: &AnyPool,
+    ) -> Result<PaginatedResult<String>, anyhow::Error> {
+        let start = Instant::now();
+        // The union subquery keeps one deterministic ordering for both the
+        // count and the page so `total` and the returned slice cannot drift
+        // apart across the four resource tables.
+        let count_sql = "SELECT COUNT(*) AS cnt FROM (\
+                         SELECT DISTINCT namespace FROM proxies \
+                         UNION SELECT DISTINCT namespace FROM consumers \
+                         UNION SELECT DISTINCT namespace FROM plugin_configs \
+                         UNION SELECT DISTINCT namespace FROM upstreams\
+                         ) AS ferrum_namespaces";
+        let count_row = sqlx::query(count_sql).fetch_one(pool).await?;
+        let total: i64 = count_row.try_get("cnt")?;
+
+        let page_sql = "SELECT DISTINCT namespace FROM proxies \
+                        UNION SELECT DISTINCT namespace FROM consumers \
+                        UNION SELECT DISTINCT namespace FROM plugin_configs \
+                        UNION SELECT DISTINCT namespace FROM upstreams \
+                        ORDER BY 1 LIMIT ? OFFSET ?";
+        let rows: Vec<AnyRow> = sqlx::query(&self.q(page_sql))
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?;
+        let mut namespaces = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Ok(ns) = row.try_get::<String, _>("namespace") {
+                namespaces.push(ns);
+            }
+        }
+        self.check_slow_query("list_namespaces_paginated", start);
+        Ok(PaginatedResult {
+            items: namespaces,
+            total,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // ApiSpec operations — admin-only, never called from the hot proxy path.
     //
@@ -8654,6 +8727,14 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn list_namespaces_authoritative(&self) -> Result<Vec<String>, anyhow::Error> {
         DatabaseStore::list_namespaces_authoritative(self).await
+    }
+
+    async fn list_namespaces_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<String>, anyhow::Error> {
+        DatabaseStore::list_namespaces_paginated(self, limit, offset).await
     }
 
     async fn submit_api_spec_bundle(

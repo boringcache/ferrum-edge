@@ -40,10 +40,14 @@ pub async fn run(
         "status" => show_db_status(&env_config).await,
         "config" => run_config_migration(&env_config, dry_run),
         _ => {
-            error!("Unknown migrate action: {}", action);
+            // `migrate_action` is lowercased at parse time, so both renderings
+            // are transformed forms; withhold by key rather than relying on the
+            // length-bounded textual pass.
+            let shown = crate::secrets::quoted_env_value("FERRUM_MIGRATE_ACTION", action);
+            error!("Unknown migrate action: {}", shown);
             anyhow::bail!(
-                "Invalid FERRUM_MIGRATE_ACTION '{}'. Expected: up, status, config",
-                action
+                "Invalid FERRUM_MIGRATE_ACTION {}. Expected: up, status, config",
+                shown
             );
         }
     }

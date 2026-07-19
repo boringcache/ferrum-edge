@@ -591,6 +591,54 @@ fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
     assert!(finalizer.contains("\"grpc-message\","));
 }
 
+/// The H1/H2 handler must RETAIN the gRPC-Web representation it just classified,
+/// exactly as the H3 frontend does.
+///
+/// Without it the marker existed only when the `grpc_web` translator plugin was
+/// configured, so an H1/H2 pass-through deployment (the backend speaks gRPC-Web
+/// itself, the translator is deliberately absent) left
+/// `client_grpc_framing_representation` with nothing to read. A backend that
+/// omitted `Content-Type` — or a response hook that stripped it — then reached
+/// the buffered representation gate as untyped JSON, and valid gRPC-Web frames
+/// were replaced with a `502` whenever a response body rule was configured.
+///
+/// The retention must come from the WebSocket-safe strict classification and run
+/// before routing, so it records the client's immutable inbound representation
+/// rather than anything a hook could rewrite.
+#[test]
+fn test_h1_h2_retains_the_classified_grpc_web_representation_before_routing() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let handler = source
+        .find("async fn handle_proxy_request_inner(")
+        .map(|start| &source[start..])
+        .expect("H1/H2 request handler must remain present");
+
+    const RETENTION_CALL: &str =
+        "crate::plugins::grpc_web::retain_client_content_type_for_errors(&mut ctx, content_type);";
+
+    let classification = handler
+        .find("let grpc_web_response_content_type = if flavor == HttpFlavor::WebSocket")
+        .expect("WebSocket-safe gRPC-Web classification must remain present");
+    let retention = handler
+        .find(RETENTION_CALL)
+        .expect("H1/H2 must retain the classified client gRPC-Web representation");
+    let routed = handler
+        .find("ctx.matched_proxy = Some(Arc::clone(&proxy));")
+        .expect("route selection must remain present");
+
+    assert!(
+        classification < retention && retention < routed,
+        "retention must consume the strict classification and precede routing"
+    );
+
+    // Parity with the H3 frontend, which is where this retention originated.
+    let h3 = include_str!("../../../src/http3/server.rs");
+    assert!(
+        h3.contains(RETENTION_CALL),
+        "the H3 frontend must keep retaining the same way"
+    );
+}
+
 #[test]
 fn test_backend_path_bound_retries_preflight_before_backoff() {
     let source = include_str!("../../../src/proxy/mod.rs");

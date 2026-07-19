@@ -6,15 +6,24 @@ use ferrum_edge::cli::{
     resolve_settings_path, resolve_spec_path,
 };
 use std::path::Path;
-use std::sync::Mutex;
 use tempfile::TempDir;
 
-/// Serialize env-var-mutating tests to avoid races.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+/// Serialize env-var-mutating tests against *every* other env-touching test in
+/// the `unit_tests` binary, not just the ones in this file. A file-private
+/// mutex only orders this module against itself, which is not what
+/// `std::env::set_var`'s Rust 2024 safety contract requires: it is a data race
+/// against any concurrent `getenv` anywhere in the process, and the secrets and
+/// config suites read the same `FERRUM_*` variables these tests write.
+use crate::unit::env_lock::ENV_LOCK;
 
 /// Helper to set env vars, run a closure, then clean them up.
 fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-    let _guard = ENV_LOCK.lock().unwrap();
+    // Poison-tolerant: the lock now spans the whole binary, so one panicking
+    // env test elsewhere must not cascade into unrelated failures here. It
+    // guards no invariant of its own — only mutual exclusion.
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for (k, v) in vars {
         unsafe { std::env::set_var(k, v) };
     }
@@ -26,7 +35,12 @@ fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
 
 /// Helper to temporarily unset env vars, run a closure, then restore.
 fn without_env_vars<F: FnOnce()>(vars: &[&str], f: F) {
-    let _guard = ENV_LOCK.lock().unwrap();
+    // Poison-tolerant: the lock now spans the whole binary, so one panicking
+    // env test elsewhere must not cascade into unrelated failures here. It
+    // guards no invariant of its own — only mutual exclusion.
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let saved: Vec<(&str, Option<String>)> =
         vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
     for k in vars {
@@ -390,8 +404,23 @@ fn test_apply_run_overrides_no_verbose_does_not_set_log_level() {
     );
 }
 
+/// Point `FERRUM_CONF_PATH` at a path that does not exist, so `ConfFile::load()`
+/// inside `infer_file_mode()` yields an empty settings file.
+///
+/// Without this the inference tests would consult whatever `./ferrum.conf` the
+/// test process happens to sit next to, which is the repository's own operator
+/// template — a file that could start declaring `FERRUM_MODE` at any time.
+fn pin_absent_conf_file(temp_dir: &TempDir) {
+    let missing = temp_dir.path().join("no-such-ferrum.conf");
+    assert!(!missing.exists());
+    unsafe { std::env::set_var("FERRUM_CONF_PATH", &missing) };
+}
+
+/// Mode inference is no longer part of `apply_*_overrides`; it is a separate,
+/// explicitly-ordered step that `main()` runs *after* startup secret
+/// resolution. See `cli::infer_file_mode`.
 #[test]
-fn test_apply_run_overrides_spec_infers_file_mode() {
+fn test_infer_file_mode_from_spec_path() {
     without_env_vars(
         &[
             "FERRUM_MODE",
@@ -400,6 +429,8 @@ fn test_apply_run_overrides_spec_infers_file_mode() {
             "FERRUM_FILE_CONFIG_PATH",
         ],
         || {
+            let temp_dir = TempDir::new().unwrap();
+            pin_absent_conf_file(&temp_dir);
             let args = RunArgs {
                 settings: None,
                 spec: Some("/tmp/some-spec.yaml".into()),
@@ -407,11 +438,20 @@ fn test_apply_run_overrides_spec_infers_file_mode() {
                 verbose: 0,
             };
             ferrum_edge::cli::apply_run_overrides(&args);
-            assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
             assert_eq!(
                 std::env::var("FERRUM_FILE_CONFIG_PATH").unwrap(),
                 "/tmp/some-spec.yaml"
             );
+            // Applying overrides alone must NOT materialize a mode: doing so
+            // before secret resolution is what created a synthetic second
+            // source for a `FERRUM_MODE_*` deployment.
+            assert!(
+                std::env::var("FERRUM_MODE").is_err(),
+                "overrides must not synthesize a mode before secret resolution"
+            );
+
+            ferrum_edge::cli::infer_file_mode();
+            assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
             unsafe {
                 std::env::remove_var("FERRUM_MODE");
                 std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
@@ -430,6 +470,8 @@ fn test_apply_run_overrides_explicit_mode_not_overridden_by_spec() {
             "FERRUM_FILE_CONFIG_PATH",
         ],
         || {
+            let temp_dir = TempDir::new().unwrap();
+            pin_absent_conf_file(&temp_dir);
             let args = RunArgs {
                 settings: None,
                 spec: Some("/tmp/spec.yaml".into()),
@@ -437,8 +479,97 @@ fn test_apply_run_overrides_explicit_mode_not_overridden_by_spec() {
                 verbose: 0,
             };
             ferrum_edge::cli::apply_run_overrides(&args);
+            ferrum_edge::cli::infer_file_mode();
             // Mode should remain "database", not inferred to "file"
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "database");
+            unsafe {
+                std::env::remove_var("FERRUM_MODE");
+                std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
+            };
+        },
+    );
+}
+
+/// A mode already present in the environment — which is where startup secret
+/// resolution materializes `FERRUM_MODE_FILE`/`_VAULT`/`_AWS`/`_AZURE`/`_GCP`
+/// before this runs — is an explicit env source and outranks the smart default,
+/// even with a spec path configured.
+#[test]
+fn test_infer_file_mode_yields_to_resolved_mode_env_var() {
+    without_env_vars(
+        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        || {
+            let temp_dir = TempDir::new().unwrap();
+            pin_absent_conf_file(&temp_dir);
+            unsafe {
+                std::env::set_var("FERRUM_MODE", "database");
+                std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml");
+            }
+
+            ferrum_edge::cli::infer_file_mode();
+
+            assert_eq!(
+                std::env::var("FERRUM_MODE").unwrap(),
+                "database",
+                "an externally resolved FERRUM_MODE must not be downgraded to the smart default"
+            );
+            unsafe {
+                std::env::remove_var("FERRUM_MODE");
+                std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
+            };
+        },
+    );
+}
+
+/// `ferrum.conf` sits above smart defaults in `CLI > env > conf file > smart
+/// defaults > hardcoded`. Materializing `FERRUM_MODE=file` as an env var would
+/// invert that, because `EnvConfig` gives the environment precedence over the
+/// settings file.
+#[test]
+fn test_infer_file_mode_yields_to_conf_file_mode() {
+    without_env_vars(
+        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        || {
+            let temp_dir = TempDir::new().unwrap();
+            let conf_path = temp_dir.path().join("ferrum.conf");
+            std::fs::write(&conf_path, "FERRUM_MODE = database\n").unwrap();
+            unsafe {
+                std::env::set_var("FERRUM_CONF_PATH", &conf_path);
+                std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml");
+            }
+
+            ferrum_edge::cli::infer_file_mode();
+
+            assert!(
+                std::env::var("FERRUM_MODE").is_err(),
+                "a configured conf-file mode must not be overridden by the file-mode smart default"
+            );
+            unsafe {
+                std::env::remove_var("FERRUM_MODE");
+                std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
+            };
+        },
+    );
+}
+
+/// A blank `FERRUM_MODE` in the settings file is not a configured mode, so the
+/// smart default still applies rather than falling through to a parse error.
+#[test]
+fn test_infer_file_mode_treats_blank_conf_mode_as_unset() {
+    without_env_vars(
+        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        || {
+            let temp_dir = TempDir::new().unwrap();
+            let conf_path = temp_dir.path().join("ferrum.conf");
+            std::fs::write(&conf_path, "FERRUM_MODE = \"\"\n").unwrap();
+            unsafe {
+                std::env::set_var("FERRUM_CONF_PATH", &conf_path);
+                std::env::set_var("FERRUM_FILE_CONFIG_PATH", "/tmp/spec.yaml");
+            }
+
+            ferrum_edge::cli::infer_file_mode();
+
+            assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
             unsafe {
                 std::env::remove_var("FERRUM_MODE");
                 std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
@@ -454,6 +585,8 @@ fn test_apply_validate_overrides_sets_spec_path() {
     without_env_vars(
         &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
         || {
+            let temp_dir = TempDir::new().unwrap();
+            pin_absent_conf_file(&temp_dir);
             let args = ValidateArgs {
                 settings: None,
                 spec: Some("/etc/ferrum/config.yaml".into()),
@@ -463,6 +596,7 @@ fn test_apply_validate_overrides_sets_spec_path() {
                 std::env::var("FERRUM_FILE_CONFIG_PATH").unwrap(),
                 "/etc/ferrum/config.yaml"
             );
+            ferrum_edge::cli::infer_file_mode();
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
             unsafe {
                 std::env::remove_var("FERRUM_FILE_CONFIG_PATH");

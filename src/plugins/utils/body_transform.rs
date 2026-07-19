@@ -713,6 +713,29 @@ pub fn is_json_content_type(content_type: &str) -> bool {
         || ascii_ends_with_ignore_case(media_type, "+json")
 }
 
+/// Check if a content-type header value carries length-prefixed gRPC framing.
+///
+/// Covers native gRPC (`application/grpc`, `application/grpc+proto`,
+/// `application/grpc+json`) and gRPC-Web (`application/grpc-web*`,
+/// `application/grpc-web-text*`, including their `+json` variants). Every one of
+/// them carries *frames* — a 1-byte compressed flag, a 4-byte big-endian length,
+/// then the message — not a bare document.
+///
+/// This matters to any body policy that keys off [`is_json_content_type`]: a
+/// `+json` gRPC media type ends in `+json` and so looks like a plain JSON
+/// document, when the bytes on the wire are frames no JSON-document rule can
+/// parse or rewrite. The composition to use is therefore
+/// `is_json_content_type(ct) && !is_framed_grpc_content_type(ct)`.
+///
+/// Delegates to the canonical, delimiter-aware classifiers already used by the
+/// H1/H2/H3 dispatch path and the `grpc_web` plugin, so this cannot drift from
+/// them (and, unlike a bare `application/grpc` prefix test, does not misread
+/// `application/grpcfoo` as gRPC). Allocation-free.
+pub fn is_framed_grpc_content_type(content_type: &str) -> bool {
+    crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
+        || crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+}
+
 /// Check if a response Content-Type is Server-Sent Events.
 ///
 /// ASCII case-insensitive and allocation-free. A substring (not exact

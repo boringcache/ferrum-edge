@@ -1414,7 +1414,7 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
     let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
     let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
         .map_err(|e| format!("ldap_auth: failed to load CA bundle: {e}"))?;
-    let source_id = ca_material.source_id.clone();
+    let source_id = ca_material.display_source_id.clone();
 
     // Parse only X.509 entries; tolerate other PEM blocks (private keys, etc.)
     // by ignoring them, but log them so operators can spot malformed bundles.

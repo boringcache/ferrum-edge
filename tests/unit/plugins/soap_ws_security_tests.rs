@@ -205,6 +205,118 @@ fn test_x509_no_trusted_certs_is_error() {
     assert!(result.err().unwrap().contains("no trusted_certs"));
 }
 
+/// Material that loads successfully and then fails to parse, whose configured
+/// source string is *not* its safe display label.
+///
+/// `CertSource::parse` routes anything starting with `-----BEGIN ` to
+/// `CertSource::InlinePem`, which always materializes (no filesystem, no
+/// provider feature) and stamps `display_source_id` as the fixed
+/// `inline-pem:<redacted>`. That makes it the one source kind that reaches the
+/// post-fetch decode/parse errors hermetically *and* has a configured string
+/// worth withholding — here a sentinel standing in for the private material a
+/// real inline blob would carry. A `vault://`/`aws://` source has the same
+/// identity/display split but cannot reach these arms without its backend
+/// feature compiled in.
+const MALFORMED_INLINE_PEM: &str =
+    "-----BEGIN CERTIFICATE-----\nSOAP-INLINE-SOURCE-SENTINEL\n-----END CERTIFICATE-----\n";
+
+/// The plugin's operator-facing label for the fixture above.
+const INLINE_PEM_DISPLAY: &str = "inline-pem:<redacted>";
+
+/// A successful fetch followed by a failed PEM decode must name the material by
+/// its redacted display label, never by the configured source.
+///
+/// The UTF-8 arm already did this; the decode/parse/key arms interpolated the
+/// raw configured string, so a `vault://…` path — or, as here, inline private
+/// material — was disclosed on exactly the paths most likely to fire.
+#[test]
+fn test_x509_malformed_pem_error_withholds_configured_source() {
+    let config = json!({
+        "timestamp": { "require": false },
+        "x509_signature": {
+            "enabled": true,
+            "trusted_certs": [MALFORMED_INLINE_PEM]
+        }
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("malformed PEM must fail");
+    assert!(
+        err.contains("failed to decode PEM"),
+        "must fail on the decode arm, not an earlier one: {err}"
+    );
+    assert!(
+        !err.contains("SOAP-INLINE-SOURCE-SENTINEL"),
+        "the configured source must not be echoed: {err}"
+    );
+    assert!(
+        err.contains(INLINE_PEM_DISPLAY),
+        "the redacted display label must identify the material: {err}"
+    );
+}
+
+/// The SAML `trusted_signing_certs` loop carries the same rule.
+#[test]
+fn test_saml_malformed_pem_error_withholds_configured_source() {
+    let config = json!({
+        "timestamp": { "require": false },
+        "saml": {
+            "enabled": true,
+            "trusted_issuers": ["urn:test:idp"],
+            "trusted_signing_certs": [MALFORMED_INLINE_PEM],
+            "allowed_algorithms": ["rsa-sha256"]
+        }
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("malformed PEM must fail");
+    assert!(
+        err.contains("failed to decode PEM"),
+        "must fail on the SAML decode arm: {err}"
+    );
+    assert!(
+        !err.contains("SOAP-INLINE-SOURCE-SENTINEL"),
+        "the configured source must not be echoed: {err}"
+    );
+    assert!(
+        err.contains(INLINE_PEM_DISPLAY),
+        "the redacted display label must identify the material: {err}"
+    );
+}
+
+/// Past the PEM decode: a well-formed PEM envelope whose body is not a valid
+/// X.509 certificate reaches the `X509Certificate::from_der` arm, which was the
+/// second of the three raw-source interpolations.
+#[test]
+fn test_x509_unparsable_cert_error_withholds_configured_source() {
+    // Valid base64 inside a valid envelope, so `extract_pem_der` succeeds and
+    // the DER parse is what fails.
+    let source = "-----BEGIN CERTIFICATE-----\nU09BUC1ERVItU0VOVElORUw=\n\
+                  -----END CERTIFICATE-----\n";
+    let config = json!({
+        "timestamp": { "require": false },
+        "x509_signature": {
+            "enabled": true,
+            "trusted_certs": [source]
+        }
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("unparsable cert must fail");
+    assert!(
+        err.contains("failed to parse X.509 cert"),
+        "must fail on the DER-parse arm: {err}"
+    );
+    assert!(
+        !err.contains("U09BUC1ERVItU0VOVElORUw"),
+        "the configured source must not be echoed: {err}"
+    );
+    assert!(
+        err.contains(INLINE_PEM_DISPLAY),
+        "the redacted display label must identify the material: {err}"
+    );
+}
+
 #[test]
 fn test_saml_no_issuers_is_error() {
     let config = json!({

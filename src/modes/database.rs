@@ -1463,7 +1463,14 @@ pub async fn run(
         let http_shutdown = shutdown_tx.subscribe();
         let (http_started_tx, http_started_rx) = tokio::sync::oneshot::channel();
         let http_handle = tokio::spawn(async move {
-            info!("Starting HTTP proxy listener on {}", http_addr);
+            info!(
+                "Starting HTTP proxy listener on {}",
+                crate::secrets::report_listener_addr(
+                    "FERRUM_PROXY_BIND_ADDRESS",
+                    "FERRUM_PROXY_HTTP_PORT",
+                    &http_addr.to_string()
+                )
+            );
             proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
                 http_state,
@@ -1477,13 +1484,19 @@ pub async fn run(
         handles.push(("HTTP proxy listener".to_string(), http_handle));
         startup_signals.push(("HTTP proxy listener".to_string(), http_started_rx));
     } else {
-        info!("FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled");
+        info!(
+            "{} — plaintext HTTP proxy listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_PROXY_HTTP_PORT", "0")
+        );
     }
 
     // HTTPS listener (only if TLS is configured)
     if let Some(tls_config) = tls_config.clone() {
         if env_config.proxy_https_port == 0 {
-            info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTPS proxy listener disabled");
+            info!(
+                "{} — HTTPS proxy listener disabled",
+                crate::secrets::report_env_assignment("FERRUM_PROXY_HTTPS_PORT", "0")
+            );
         } else {
             let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
             let https_state = proxy_state.clone();
@@ -1493,7 +1506,14 @@ pub async fn run(
                 .as_ref()
                 .and_then(|h| h.slot.clone());
             let https_handle = tokio::spawn(async move {
-                info!("Starting HTTPS proxy listener on {}", https_addr);
+                info!(
+                    "Starting HTTPS proxy listener on {}",
+                    crate::secrets::report_listener_addr(
+                        "FERRUM_PROXY_BIND_ADDRESS",
+                        "FERRUM_PROXY_HTTPS_PORT",
+                        &https_addr.to_string()
+                    )
+                );
                 let result = if let Some(slot) = reload_slot {
                     proxy::start_proxy_listener_with_dynamic_tls_and_signal(
                         https_addr,
@@ -1527,7 +1547,10 @@ pub async fn run(
     if env_config.enable_http3 {
         if let Some(tls_config) = tls_config.clone() {
             if env_config.proxy_https_port == 0 {
-                info!("FERRUM_PROXY_HTTPS_PORT=0 — HTTP/3 proxy listener disabled");
+                info!(
+                    "{} — HTTP/3 proxy listener disabled",
+                    crate::secrets::report_env_assignment("FERRUM_PROXY_HTTPS_PORT", "0")
+                );
             } else {
                 let h3_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
                 let h3_state = proxy_state.clone();
@@ -1542,7 +1565,14 @@ pub async fn run(
                     proxy_frontend_reload_handles.as_ref(),
                 );
                 let h3_handle = tokio::spawn(async move {
-                    info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
+                    info!(
+                        "Starting HTTP/3 (QUIC) proxy listener on {}",
+                        crate::secrets::report_listener_addr(
+                            "FERRUM_PROXY_BIND_ADDRESS",
+                            "FERRUM_PROXY_HTTPS_PORT",
+                            &h3_addr.to_string()
+                        )
+                    );
                     crate::http3::server::start_http3_listener_with_signal(
                         h3_addr,
                         h3_state,
@@ -1571,7 +1601,8 @@ pub async fn run(
     if env_config.proxy_http_port == 0 && (tls_config.is_none() || env_config.proxy_https_port == 0)
     {
         warn!(
-            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and HTTPS is not configured or disabled. Only stream proxies (TCP/UDP) will serve traffic."
+            "No HTTP or HTTPS proxy listeners are active — {} and HTTPS is not configured or disabled. Only stream proxies (TCP/UDP) will serve traffic.",
+            crate::secrets::report_env_assignment("FERRUM_PROXY_HTTP_PORT", "0")
         );
     }
 
@@ -1668,7 +1699,14 @@ pub async fn run(
         let (admin_started_tx, admin_started_rx) = tokio::sync::oneshot::channel();
         let admin_http_limiter = admin_conn_limiter.clone();
         let admin_http_handle = tokio::spawn(async move {
-            info!("Starting Admin HTTP listener on {}", admin_http_addr);
+            info!(
+                "Starting Admin HTTP listener on {}",
+                crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    "FERRUM_ADMIN_HTTP_PORT",
+                    &admin_http_addr.to_string()
+                )
+            );
             admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 admin_state,
@@ -1683,125 +1721,134 @@ pub async fn run(
         handles.push(("Admin HTTP listener".to_string(), admin_http_handle));
         startup_signals.push(("Admin HTTP listener".to_string(), admin_started_rx));
     } else {
-        info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
+        info!(
+            "{} — plaintext admin HTTP listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0")
+        );
     }
 
-    // Admin HTTPS listener (only if TLS is configured)
-    if let (Some(admin_cert_path), Some(admin_key_path)) = (
+    // Admin HTTPS listener (only if TLS is configured and the port is not
+    // disabled — port 0 is the repository-wide disable sentinel).
+    if env_config.admin_https_port == 0 {
+        info!(
+            "{} — admin HTTPS listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
+        );
+    } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
         &env_config.admin_tls_cert_path,
         &env_config.admin_tls_key_path,
     ) {
-        if env_config.admin_https_port == 0 {
-            info!("FERRUM_ADMIN_HTTPS_PORT=0 — admin HTTPS listener disabled");
-        } else {
-            let admin_https_addr: SocketAddr =
-                env_config.admin_socket_addr(env_config.admin_https_port);
-            let admin_https_shutdown = shutdown_tx.subscribe();
+        let admin_https_addr: SocketAddr =
+            env_config.admin_socket_addr(env_config.admin_https_port);
+        let admin_https_shutdown = shutdown_tx.subscribe();
 
-            // Load admin TLS configuration
-            let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-            let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
-                admin_cert_path,
-                admin_key_path,
-                admin_client_ca_bundle,
-                env_config.admin_tls_ocsp_response_source.as_deref(),
-                env_config.admin_tls_no_verify,
-                &tls_policy,
-                env_config.tls_cert_expiry_warning_days,
-                &crls,
-            ) {
-                Ok(config) => {
-                    if admin_client_ca_bundle.is_some() {
-                        info!(
-                            "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
-                        );
-                    } else if env_config.admin_tls_no_verify {
-                        warn!(
-                            "Admin TLS configuration loaded with certificate verification DISABLED (testing mode)"
-                        );
-                    } else {
-                        info!(
-                            "Admin TLS configuration loaded without client certificate verification (HTTPS available)"
-                        );
-                    }
-                    config
-                }
-                Err(e) => {
-                    let startup_err = anyhow::anyhow!("Invalid admin TLS configuration: {}", e);
-                    error!("Failed to load admin TLS configuration: {}", e);
-                    if let Err(listener_err) = shutdown_database_runtime_tasks(
-                        &shutdown_tx,
-                        &proxy_state,
-                        handles,
-                        background_handles,
-                    )
-                    .await
-                    {
-                        return Err(
-                            listener_err.context(format!("Gateway startup failed: {startup_err}"))
-                        );
-                    }
-                    return Err(startup_err);
-                }
-            };
-
-            // Wire opt-in admin frontend TLS live reload (no early-data / no
-            // kTLS — admin doesn't apply those opt-ins).
-            let mut admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
-                admin_tls_config.clone(),
-                &env_config,
-                &tls_policy,
-                &crls,
-                Some(shutdown_tx.subscribe()),
-            );
-            if admin_reload_handles.watcher_handle.is_some() {
-                info!("Frontend TLS live reload enabled for admin HTTPS");
-            }
-            if let Some(handle) = admin_reload_handles.watcher_handle.take() {
-                background_handles.push(handle);
-            }
-            let admin_tls_slot = admin_reload_handles.slot.clone();
-
-            let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
-            let admin_https_limiter = admin_conn_limiter.clone();
-            let admin_https_handle = tokio::spawn(async move {
-                info!("Starting Admin HTTPS listener on {}", admin_https_addr);
-                let result = if let Some(slot) = admin_tls_slot {
-                    admin::start_admin_listener_with_dynamic_tls_and_signal(
-                        admin_https_addr,
-                        admin_state_for_https,
-                        admin_https_shutdown,
-                        slot,
-                        Some(admin_https_started_tx),
-                        admin_https_limiter,
-                    )
-                    .await
+        // Load admin TLS configuration
+        let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
+        let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
+            admin_cert_path,
+            admin_key_path,
+            admin_client_ca_bundle,
+            env_config.admin_tls_ocsp_response_source.as_deref(),
+            env_config.admin_tls_no_verify,
+            &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            &crls,
+        ) {
+            Ok(config) => {
+                if admin_client_ca_bundle.is_some() {
+                    info!(
+                        "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
+                    );
+                } else if env_config.admin_tls_no_verify {
+                    warn!(
+                        "Admin TLS configuration loaded with certificate verification DISABLED (testing mode)"
+                    );
                 } else {
-                    admin::start_admin_listener_with_tls_and_signal(
-                        admin_https_addr,
-                        admin_state_for_https,
-                        admin_https_shutdown,
-                        Some(admin_tls_config),
-                        Some(admin_https_started_tx),
-                        admin_https_limiter,
-                    )
-                    .await
-                };
-                result.context("Admin HTTPS listener failed")
-            });
-            handles.push(("Admin HTTPS listener".to_string(), admin_https_handle));
-            startup_signals.push(("Admin HTTPS listener".to_string(), admin_https_started_rx));
+                    info!(
+                        "Admin TLS configuration loaded without client certificate verification (HTTPS available)"
+                    );
+                }
+                config
+            }
+            Err(e) => {
+                let startup_err = anyhow::anyhow!("Invalid admin TLS configuration: {}", e);
+                error!("Failed to load admin TLS configuration: {}", e);
+                if let Err(listener_err) = shutdown_database_runtime_tasks(
+                    &shutdown_tx,
+                    &proxy_state,
+                    handles,
+                    background_handles,
+                )
+                .await
+                {
+                    return Err(
+                        listener_err.context(format!("Gateway startup failed: {startup_err}"))
+                    );
+                }
+                return Err(startup_err);
+            }
+        };
+
+        // Wire opt-in admin frontend TLS live reload (no early-data / no
+        // kTLS — admin doesn't apply those opt-ins).
+        let mut admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
+            admin_tls_config.clone(),
+            &env_config,
+            &tls_policy,
+            &crls,
+            Some(shutdown_tx.subscribe()),
+        );
+        if admin_reload_handles.watcher_handle.is_some() {
+            info!("Frontend TLS live reload enabled for admin HTTPS");
         }
+        if let Some(handle) = admin_reload_handles.watcher_handle.take() {
+            background_handles.push(handle);
+        }
+        let admin_tls_slot = admin_reload_handles.slot.clone();
+
+        let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
+        let admin_https_limiter = admin_conn_limiter.clone();
+        let admin_https_handle = tokio::spawn(async move {
+            info!(
+                "Starting Admin HTTPS listener on {}",
+                crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    "FERRUM_ADMIN_HTTPS_PORT",
+                    &admin_https_addr.to_string()
+                )
+            );
+            let result = if let Some(slot) = admin_tls_slot {
+                admin::start_admin_listener_with_dynamic_tls_and_signal(
+                    admin_https_addr,
+                    admin_state_for_https,
+                    admin_https_shutdown,
+                    slot,
+                    Some(admin_https_started_tx),
+                    admin_https_limiter,
+                )
+                .await
+            } else {
+                admin::start_admin_listener_with_tls_and_signal(
+                    admin_https_addr,
+                    admin_state_for_https,
+                    admin_https_shutdown,
+                    Some(admin_tls_config),
+                    Some(admin_https_started_tx),
+                    admin_https_limiter,
+                )
+                .await
+            };
+            result.context("Admin HTTPS listener failed")
+        });
+        handles.push(("Admin HTTPS listener".to_string(), admin_https_handle));
+        startup_signals.push(("Admin HTTPS listener".to_string(), admin_https_started_rx));
     } else {
         info!("Admin TLS not configured - HTTPS listener disabled");
     }
-    if env_config.admin_http_port == 0
-        && !(env_config.admin_tls_cert_path.is_some()
-            && env_config.admin_tls_key_path.is_some()
-            && env_config.admin_https_port != 0)
-    {
+    if env_config.admin_http_port == 0 && !env_config.admin_https_listener_enabled() {
         warn!(
-            "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and admin HTTPS is not configured or disabled. The admin API is unreachable."
+            "No admin API listeners are active — {} and admin HTTPS is not configured or disabled. The admin API is unreachable.",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0")
         );
     }
 

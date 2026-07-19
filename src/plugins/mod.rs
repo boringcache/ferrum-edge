@@ -84,6 +84,7 @@ pub mod request_termination;
 pub mod request_transformer;
 pub mod response_caching;
 pub mod response_mock;
+pub(crate) mod response_representation;
 pub mod response_size_limiting;
 pub mod response_transformer;
 pub mod security_headers;
@@ -297,12 +298,50 @@ fn is_transform_invalidated_response_header(name: &str) -> bool {
 /// representation. A `226 IM Used` body is a delta whose interpretation
 /// depends on `IM` and `Delta-Base`. Rewriting either body while removing its
 /// representation metadata would leave the unchanged status incoherent. Keep
-/// both response forms untouched. Inspection hooks still run; enforcing
-/// plugins whose findings require a rewrite must reject instead of reporting a
-/// redaction that cannot be applied. All protocol paths and the
-/// provider/protocol normalization phase consult this shared gate.
+/// both response forms untouched.
+///
+/// # Layering
+///
+/// This is the *presentation* rule, and it is the second half of one decision,
+/// not a competing one. The shared representation gate
+/// ([`response_representation`]) runs first on every buffered path and answers
+/// the security question — whether a configured body policy claims these bytes:
+///
+/// * A claimed fragment never reaches this predicate. The gate rejects it
+///   ([`response_representation::RepresentationRejection::PartialRepresentation`]),
+///   because the gateway cannot reconstruct the complete resource and must not
+///   present a rewritten slice as one.
+/// * An unclaimed fragment reaches this predicate, which keeps it untouched so
+///   presentation transforms (compression, gRPC-Web framing) cannot rewrite a
+///   body the unchanged status no longer describes.
+///
+/// So a `206` is never both silently forwarded past a configured redaction and
+/// never relabeled as a complete `200`. Plugins additionally consult this
+/// predicate for their own behavior on fragments; that use is unchanged.
 pub(crate) fn response_body_rewrite_allowed(response_status: u16) -> bool {
     !matches!(response_status, 206 | 226)
+}
+
+/// Drop every response header that describes the *previous* bytes.
+///
+/// Validators (`ETag`, `Last-Modified`), digests/checksums (`Digest`,
+/// `Content-Digest`, `Content-MD5`, vendor checksum families), content-bound
+/// signatures, and range/delta metadata are all bound to a specific octet
+/// sequence. Once the gateway changes the client-visible bytes, keeping them
+/// would hand the client a validator for a representation it never receives —
+/// corrupting cache revalidation and integrity checks.
+///
+/// This is deliberately shared rather than inlined: **every** point that changes
+/// the client-visible bytes must invalidate identically. Today that is a
+/// permitted body rewrite ([`finalize_response_body_transformation`]) and a
+/// representation decode
+/// ([`response_representation::install_decoded_response_body`]) — including a
+/// decode whose transform phase then matches no rule, which still replaces
+/// encoded bytes with identity bytes and so still invalidates.
+pub(crate) fn invalidate_content_bound_response_headers(
+    response_headers: &mut HashMap<String, String>,
+) {
+    response_headers.retain(|name, _| !is_transform_invalidated_response_header(name));
 }
 
 /// Finalize one successful buffered response-body transformation.
@@ -313,13 +352,16 @@ pub(crate) fn response_body_rewrite_allowed(response_status: u16) -> bool {
 /// so an individual transformer cannot accidentally leave stale metadata. The
 /// plugin-specific hook runs afterward and may attach metadata it recomputed
 /// for the new representation. Returning `None` from the transform skips this
-/// function, preserving untouched response semantics.
+/// function, preserving untouched response semantics — except that a
+/// representation *decode* invalidates at the decode itself (see
+/// [`invalidate_content_bound_response_headers`]), because it has already
+/// changed the client-visible octets whether or not a rule then matches.
 pub(crate) fn finalize_response_body_transformation(
     plugin: &dyn Plugin,
     ctx: &mut RequestContext,
     response_headers: &mut HashMap<String, String>,
 ) {
-    response_headers.retain(|name, _| !is_transform_invalidated_response_header(name));
+    invalidate_content_bound_response_headers(response_headers);
     plugin.on_response_body_transformed(ctx, response_headers);
 }
 
@@ -1643,6 +1685,22 @@ pub struct RequestContext {
     /// request headers. Fault rejection shaping consults this fixed value so a
     /// transformer cannot add or remove native-gRPC semantics mid-pipeline.
     request_http_flavor: HttpFlavor,
+    /// The client's original `Accept-Encoding` field value, captured with the
+    /// raw wire headers before any `before_proxy` hook runs.
+    ///
+    /// The representation gate decides whether it may publish decoded identity
+    /// bytes from what the CLIENT negotiated, and by the time it runs the
+    /// header map no longer describes that: `request_transformer` (priority
+    /// 3000) can remove or rewrite `Accept-Encoding` before `compression`
+    /// (priority 4050) ever takes its own snapshot, and `compression` itself
+    /// strips the header for the backend request. Both would erase an explicit
+    /// `identity;q=0` and let a protected encoded response be decoded and served
+    /// as a representation the client refused.
+    ///
+    /// Kept as a private write-once field rather than in `ctx.metadata` so no
+    /// plugin can rewrite or delete the evidence it records. Set exactly once,
+    /// at request init, by [`crate::proxy::stamp_original_request_metadata`].
+    original_accept_encoding: Option<String>,
     /// Whether client-visible rejection responses for this request cross a
     /// WebSocket handshake boundary. Set once after request-flavor detection so
     /// the shared reject finalizer can remove transport-owned handshake fields
@@ -1856,6 +1914,18 @@ pub struct RequestContext {
     /// sole buffered representation continues to the backend.
     pub request_body_sha256: Option<[u8; 32]>,
     pub request_body_sha512: Option<[u8; 64]>,
+    /// The operator's configured response-body ceiling
+    /// (`FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`), `0` meaning unlimited.
+    ///
+    /// Carried on the context because the buffered representation gate
+    /// ([`crate::plugins::response_representation`]) decompresses on the
+    /// response path and must not let a decode exceed the same bound the wire
+    /// path enforces: a small compressed body that passes the wire check could
+    /// otherwise inflate past the operator's limit and be forwarded as the
+    /// larger identity representation. Set from `ProxyState` by the H1/H2 and
+    /// H3 request handlers; a default-constructed context leaves it `0`, which
+    /// falls back to the gate's own hard ceiling.
+    pub max_response_body_size_bytes: usize,
     /// Shared counter for request body bytes received from the client,
     /// populated by proxy body handlers and read by the summary builders.
     ///
@@ -2083,6 +2153,7 @@ impl RequestContext {
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
+            original_accept_encoding: None,
             websocket_response_boundary: false,
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
@@ -2129,6 +2200,7 @@ impl RequestContext {
             request_body_bytes: None,
             request_body_sha256: None,
             request_body_sha512: None,
+            max_response_body_size_bytes: 0,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
             mesh_route_dispatch_reject_unmatched: false,
@@ -2392,6 +2464,23 @@ impl RequestContext {
             });
     }
 
+    /// Capture pristine backend headers for any later gateway-authored
+    /// replacement, even when the request has no RPC deadline.
+    ///
+    /// Representation-policy rejection is the non-deadline caller: it must
+    /// shed backend representation metadata while retaining only mutations
+    /// made by completed trusted response hooks. This is deliberately separate
+    /// from [`Self::begin_buffered_deadline_response_header_provenance`] so the
+    /// ordinary deadline allocation gate remains unchanged.
+    pub(crate) fn begin_buffered_replacement_response_header_provenance(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        self.buffered_deadline_response_header_provenance = Some(Arc::new(
+            BufferedDeadlineResponseHeaderProvenance::backend_response(response_headers),
+        ));
+    }
+
     pub(crate) fn ensure_buffered_deadline_response_header_provenance(
         &mut self,
         response_headers: &HashMap<String, String>,
@@ -2481,11 +2570,12 @@ impl RequestContext {
         }
     }
 
-    /// Whether backend/gateway deadline-response provenance is being tracked for
-    /// this request. Trusted response hooks whose owned-name set must be
+    /// Whether backend/gateway terminal-replacement provenance is being tracked
+    /// for this request. Trusted response hooks whose owned-name set must be
     /// COMPUTED (e.g. `response_transformer` accumulating fired `update` /
     /// `rename` / `add` keys) consult this first so that work is skipped
-    /// entirely on the common path with no absolute RPC deadline. Hooks that
+    /// entirely on the common path with neither an absolute RPC deadline nor a
+    /// configured body policy that may reject. Hooks that
     /// own a fixed name can call
     /// [`Self::record_deadline_owned_response_headers`] with a borrowed static
     /// slice unconditionally — it allocates nothing and returns immediately
@@ -2549,8 +2639,9 @@ impl RequestContext {
     /// [`BufferedDeadlineResponseHeaderProvenance::retire_backend_authored_elements`].
     ///
     /// `name` must already be canonical (lowercase). Like the sibling recorders
-    /// this returns immediately when no deadline provenance is being tracked,
-    /// and it borrows the authored elements rather than cloning them.
+    /// this returns immediately when no terminal-replacement provenance is
+    /// being tracked, and it borrows the authored elements rather than cloning
+    /// them.
     pub(crate) fn record_deadline_authored_response_header_elements(
         &mut self,
         name: &str,
@@ -2671,6 +2762,7 @@ impl RequestContext {
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: self.request_http_flavor,
+            original_accept_encoding: self.original_accept_encoding.clone(),
             websocket_response_boundary: self.websocket_response_boundary,
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
@@ -2730,6 +2822,7 @@ impl RequestContext {
             request_body_bytes: None,
             request_body_sha256: None,
             request_body_sha512: None,
+            max_response_body_size_bytes: self.max_response_body_size_bytes,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             is_early_data: self.is_early_data,
             mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,
@@ -2782,6 +2875,25 @@ impl RequestContext {
 
     pub(crate) fn is_native_grpc_request(&self) -> bool {
         matches!(self.request_http_flavor, HttpFlavor::Grpc)
+    }
+
+    /// Record the client's original `Accept-Encoding` once, at request init.
+    ///
+    /// Write-once by construction: a later caller — a plugin reaching this
+    /// through any in-crate path, or a second stamp on a retried dispatch —
+    /// cannot replace the value the client actually sent. An absent header is
+    /// left absent, because "the client sent nothing" and "the client sent an
+    /// empty field" are different negotiations (RFC 9110 §12.5.3).
+    pub(crate) fn set_original_accept_encoding(&mut self, value: String) {
+        if self.original_accept_encoding.is_none() {
+            self.original_accept_encoding = Some(value);
+        }
+    }
+
+    /// The client's original `Accept-Encoding`, or `None` when the request
+    /// carried none (or reached a direct plugin caller that never stamped).
+    pub(crate) fn original_accept_encoding(&self) -> Option<&str> {
+        self.original_accept_encoding.as_deref()
     }
 
     pub(crate) fn has_websocket_response_boundary(&self) -> bool {
@@ -5832,6 +5944,67 @@ pub trait Plugin: Send + Sync {
     ) -> Option<Vec<u8>> {
         self.transform_response_body(body, content_type, response_headers)
             .await
+    }
+
+    /// Whether this plugin has a configured body policy that claims authority
+    /// over this response's bytes.
+    ///
+    /// Returning `true` is a security claim, not a capability advertisement: it
+    /// asserts that the operator configured this plugin to rewrite or redact
+    /// bodies like this one, so the gateway must not serve the response unless
+    /// the policy was genuinely applied. The shared representation gate
+    /// (`response_representation`) uses this to decide whether an encoded,
+    /// partial, or non-parseable representation is an ordinary pass-through or a
+    /// fail-closed rejection.
+    ///
+    /// Return `false` whenever the configured policy would decline this response
+    /// anyway (no rules configured, a runtime kill-switch disabled the scope, or
+    /// the media type is outside the policy's document model). Claiming a
+    /// response the policy would not have touched converts benign traffic into
+    /// errors; failing to claim one it would have touched reopens the bypass.
+    ///
+    /// `response_content_type` is the live `Content-Type`, matching what
+    /// [`Plugin::transform_response_body_with_context`] will receive.
+    ///
+    /// `response_body` is the byte string the enforcer will actually be handed —
+    /// the decoded identity representation once the gate has decoded one, the
+    /// wire bytes otherwise. It is supplied because media type and request
+    /// flavor are not always sufficient evidence: a gRPC/gRPC-Web request whose
+    /// response carries NO `Content-Type` at all is either framed gRPC (which no
+    /// JSON field rule can act on) or a bare JSON error/envelope document (which
+    /// a configured redaction must still cover), and only the bytes distinguish
+    /// them. Implementations must decide structurally — a total parse such as
+    /// [`crate::plugins::grpc_web::bytes_are_complete_grpc_frames`], run against
+    /// the grammar that
+    /// [`crate::plugins::grpc_web::client_grpc_framing_representation`] selects
+    /// for this request rather than the union of every gRPC representation —
+    /// never by sniffing a prefix.
+    fn enforces_response_body_policy(
+        &self,
+        _ctx: &RequestContext,
+        _response_content_type: Option<&str>,
+        _response_body: &[u8],
+    ) -> bool {
+        false
+    }
+
+    /// Whether this plugin may make [`Plugin::enforces_response_body_policy`]
+    /// return `true` for the current request.
+    ///
+    /// The response lifecycle consults this before `after_proxy`, when neither
+    /// the final live `Content-Type` nor the response body is known, to decide
+    /// whether it must retain gateway-header provenance for a possible
+    /// representation rejection. It is therefore a CAPABILITY question and must
+    /// OVER-approximate: answering `false` for a request whose claim later turns
+    /// out to be `true` means the rejection sheds gateway decorators (CORS,
+    /// security, correlation headers) that had already been applied.
+    ///
+    /// The default probes the untyped, empty-bodied response shape, which is an
+    /// under-approximation for any plugin whose claim depends on the media type
+    /// or the bytes. Such plugins MUST override this predicate with one that
+    /// depends only on configuration and request state.
+    fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        self.enforces_response_body_policy(ctx, None, &[])
     }
 
     /// Whether this plugin's response inspection just determined that its

@@ -245,22 +245,39 @@ impl SoapWsSecurity {
             let pem_str = std::str::from_utf8(material.bytes.expose_secret()).map_err(|e| {
                 format!(
                     "soap_ws_security: trusted cert '{}' is not valid UTF-8: {}",
-                    material.source_id, e
+                    material.display_source_id, e
                 )
             })?;
 
-            let der_bytes = extract_pem_der(pem_str)
-                .ok_or_else(|| format!("soap_ws_security: failed to decode PEM from '{}'", path))?;
+            // Every failure past a *successful* fetch names the material by its
+            // redacted `display_source_id`, never the configured `path`. A
+            // `vault://`/`aws://`/`azure://`/`gcp://` source carries its
+            // identifier in that path, and a PEM/X.509/RSA parse failure is
+            // reachable by an operator who can see the error but not the
+            // secret store — so interpolating `path` here would disclose the
+            // provider reference on exactly the paths most likely to fire.
+            // This matches `MaterializedMaterial::display_source_id`'s stated
+            // contract, which names this module as one of its call sites.
+            let der_bytes = extract_pem_der(pem_str).ok_or_else(|| {
+                format!(
+                    "soap_ws_security: failed to decode PEM from '{}'",
+                    material.display_source_id
+                )
+            })?;
 
             let (_, cert) = X509Certificate::from_der(&der_bytes).map_err(|e| {
                 format!(
                     "soap_ws_security: failed to parse X.509 cert '{}': {}",
-                    path, e
+                    material.display_source_id, e
                 )
             })?;
 
-            let public_key_der = load_rsa_public_key_from_cert(&cert)
-                .map_err(|e| format!("soap_ws_security: trusted cert '{}' {}", path, e))?;
+            let public_key_der = load_rsa_public_key_from_cert(&cert).map_err(|e| {
+                format!(
+                    "soap_ws_security: trusted cert '{}' {}",
+                    material.display_source_id, e
+                )
+            })?;
 
             let fingerprint = digest::digest(&digest::SHA256, &der_bytes)
                 .as_ref()
@@ -375,28 +392,31 @@ impl SoapWsSecurity {
             let pem_str = std::str::from_utf8(material.bytes.expose_secret()).map_err(|e| {
                 format!(
                     "soap_ws_security: SAML trusted signing cert '{}' is not valid UTF-8: {}",
-                    material.source_id, e
+                    material.display_source_id, e
                 )
             })?;
 
+            // Same rule as the WS-Security X.509 loop above: past a successful
+            // fetch the material is named only by its redacted
+            // `display_source_id`.
             let der_bytes = extract_pem_der(pem_str).ok_or_else(|| {
                 format!(
                     "soap_ws_security: failed to decode PEM from SAML trusted signing cert '{}'",
-                    path
+                    material.display_source_id
                 )
             })?;
 
             let (_, cert) = X509Certificate::from_der(&der_bytes).map_err(|e| {
                 format!(
                     "soap_ws_security: failed to parse SAML trusted signing cert '{}': {}",
-                    path, e
+                    material.display_source_id, e
                 )
             })?;
 
             let public_key_der = load_rsa_public_key_from_cert(&cert).map_err(|e| {
                 format!(
                     "soap_ws_security: SAML trusted signing cert '{}' {}",
-                    path, e
+                    material.display_source_id, e
                 )
             })?;
             let fingerprint = digest::digest(&digest::SHA256, &der_bytes)

@@ -156,6 +156,32 @@ impl TestGateway {
         wait_for_health_inner(self.admin_port, timeout).await
     }
 
+    /// Poll the admin `/health` endpoint until it reports `"ready": true`.
+    ///
+    /// Every serving mode binds the admin HTTP listener *before* the rest of
+    /// startup (admin HTTPS setup, the CP gRPC bind, `wait_for_start_signals`),
+    /// so a bare TCP accept — or any check that tolerates a non-2xx `/health` —
+    /// does not prove startup completed. `ready` is stored only after that
+    /// barrier. `/health` currently also answers `503` until then, which makes
+    /// [`wait_for_health`](Self::wait_for_health) a readiness barrier too; this
+    /// method asserts the flag itself, so a test that depends on full startup
+    /// stays correct independently of that status-code policy.
+    pub async fn wait_for_ready(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        wait_for_ready_inner(self.admin_port, timeout).await
+    }
+
+    /// Whether the gateway subprocess is still running. `false` once it has
+    /// exited, or if the child was already shut down / taken by the caller.
+    pub fn is_running(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
+
     /// Poll an authenticated admin endpoint until the configured JWT is
     /// accepted. This keeps parallel functional tests from mistaking another
     /// gateway's unauthenticated `/health` response for this child process.
@@ -240,6 +266,42 @@ impl TestGateway {
             combined.push_str(&stdout);
         }
         Ok(combined)
+    }
+
+    /// Poll [`read_combined_captured_output`](Self::read_combined_captured_output)
+    /// until `predicate` matches, then return that snapshot. On timeout (or a
+    /// persistent read error) the last result is returned so the caller can
+    /// assert on it and print the output it actually saw.
+    ///
+    /// The gateway logs through an async `NonBlockingSink`, so a line the child
+    /// has already emitted may not have reached the capture file yet — a
+    /// readiness or exit barrier does not imply the log worker drained. Polling
+    /// is strictly safer than a one-shot read: it can only turn a flush-race
+    /// miss into a hit, never a hit into a miss. If the line is never emitted,
+    /// the predicate stays false and the caller fails exactly as before.
+    ///
+    /// Requires [`TestGatewayBuilder::capture_output`]; without it both capture
+    /// files are absent, the snapshot is always empty, and the predicate never
+    /// matches.
+    pub async fn wait_for_captured_output<F>(
+        &self,
+        predicate: F,
+        timeout: Duration,
+    ) -> Result<String, std::io::Error>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let snapshot = self.read_combined_captured_output();
+            let matched = snapshot
+                .as_ref()
+                .is_ok_and(|output| predicate(output.as_str()));
+            if matched || Instant::now() >= deadline {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -760,6 +822,11 @@ impl TestGatewayBuilder {
             db_url,
             config_path,
             env,
+            // Keep the harness temp dir alive for as long as callers hold this
+            // result: `db_url` / `config_path` (and the captured log files we
+            // already read) live inside it. Dropping it here would make those
+            // public diagnostics point at already-deleted paths.
+            _temp_dir: temp_dir,
         })
     }
 }
@@ -772,6 +839,9 @@ pub struct FailedGatewayStart {
     pub db_url: Option<String>,
     pub config_path: Option<PathBuf>,
     env: HashMap<String, String>,
+    /// Retains the spawn temp dir so `db_url` / `config_path` stay valid while
+    /// this result is inspected. Not part of the public diagnostic surface.
+    _temp_dir: TempDir,
 }
 
 impl FailedGatewayStart {
@@ -954,7 +1024,7 @@ fn resolve_db(db: &DbType, temp: &TempDir) -> (String, String) {
 /// Bind an ephemeral port, then drop the listener. Not race-free — the
 /// caller must retry if the gateway binds fail. This is what the
 /// `max_attempts` loop in [`TestGatewayBuilder::spawn`] exists for.
-async fn ephemeral_port() -> Result<u16, std::io::Error> {
+pub async fn ephemeral_port() -> Result<u16, std::io::Error> {
     let l = TcpListener::bind("127.0.0.1:0").await?;
     let port = l.local_addr()?.port();
     drop(l);
@@ -965,6 +1035,58 @@ async fn wait_for_health_inner(
     admin_port: u16,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_health_target(admin_port, timeout, HealthWaitTarget::SuccessfulResponse).await
+}
+
+async fn wait_for_ready_inner(
+    admin_port: u16,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_health_target(admin_port, timeout, HealthWaitTarget::ReadyFlag).await
+}
+
+#[derive(Clone, Copy)]
+enum HealthWaitTarget {
+    SuccessfulResponse,
+    ReadyFlag,
+}
+
+impl HealthWaitTarget {
+    fn timeout_description(self) -> &'static str {
+        match self {
+            Self::SuccessfulResponse => "become ready",
+            Self::ReadyFlag => "report ready",
+        }
+    }
+
+    async fn evaluate(self, response: reqwest::Response) -> Result<(), String> {
+        match self {
+            Self::SuccessfulResponse if response.status().is_success() => Ok(()),
+            Self::SuccessfulResponse => Err(format!("HTTP {}", response.status())),
+            Self::ReadyFlag => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                // `ready` is part of the unauthenticated `/health` tier
+                // (status + ready), so no admin JWT is needed here.
+                let ready = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| value.get("ready").and_then(|ready| ready.as_bool()))
+                    .unwrap_or(false);
+                if status.is_success() && ready {
+                    Ok(())
+                } else {
+                    Err(format!("HTTP {}: {}", status, body))
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_health_target(
+    admin_port: u16,
+    timeout: Duration,
+    target: HealthWaitTarget,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let health_url = format!("http://127.0.0.1:{}/health", admin_port);
     let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
     let deadline = Instant::now() + timeout;
@@ -972,22 +1094,22 @@ async fn wait_for_health_inner(
     loop {
         if Instant::now() >= deadline {
             return Err(format!(
-                "gateway admin /health did not become ready on port {} within {:?} (last observation: {})",
-                admin_port, timeout, last_observation
+                "gateway admin /health did not {} on port {} within {:?} (last observation: {})",
+                target.timeout_description(),
+                admin_port,
+                timeout,
+                last_observation
             )
             .into());
         }
         match client.get(&health_url).send().await {
-            Ok(r) if r.status().is_success() => return Ok(()),
-            Ok(r) => {
-                last_observation = format!("HTTP {}", r.status());
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Err(err) => {
-                last_observation = err.to_string();
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
+            Ok(response) => match target.evaluate(response).await {
+                Ok(()) => return Ok(()),
+                Err(observation) => last_observation = observation,
+            },
+            Err(err) => last_observation = err.to_string(),
         }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
