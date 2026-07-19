@@ -1173,7 +1173,14 @@ async fn functional_cli_validate_external_mode_source_beats_file_inference() {
     cmd.env("FERRUM_MODE_FILE", mode_pointer.to_str().unwrap())
         .env("FERRUM_FILE_CONFIG_PATH", spec_path.to_str().unwrap())
         .env("FERRUM_DB_TYPE", "sqlite")
-        .env("FERRUM_DB_URL", "sqlite::memory:");
+        .env("FERRUM_DB_URL", "sqlite::memory:")
+        // Database mode also requires an admin JWT secret of >= 32 bytes.
+        // Supplied as a bare env value, not a suffixed source, so it stays out
+        // of the external-resolution surface this test is about.
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "fixture-admin-jwt-secret-not-a-real-credential",
+        );
 
     let output = cmd
         .stdout(Stdio::piped())
@@ -1215,6 +1222,11 @@ async fn functional_cli_validate_external_mode_source_beats_file_inference() {
 #[ignore]
 #[tokio::test]
 async fn functional_cli_validate_does_not_echo_externally_sourced_mode() {
+    // Database mode requires an admin JWT secret of >= 32 bytes. It is a bare
+    // env value rather than a suffixed source, so it adds nothing to the
+    // redaction plan this test inspects.
+    const ADMIN_SECRET: &str = "fixture-admin-jwt-secret-not-a-real-credential";
+
     let temp_dir = TempDir::new().unwrap();
 
     let mode_pointer = temp_dir.path().join("mode-source");
@@ -1223,7 +1235,8 @@ async fn functional_cli_validate_does_not_echo_externally_sourced_mode() {
     let mut cmd = hermetic_validate_command(&temp_dir, &[]);
     cmd.env("FERRUM_MODE_FILE", mode_pointer.to_str().unwrap())
         .env("FERRUM_DB_TYPE", "sqlite")
-        .env("FERRUM_DB_URL", "sqlite::memory:");
+        .env("FERRUM_DB_URL", "sqlite::memory:")
+        .env("FERRUM_ADMIN_JWT_SECRET", ADMIN_SECRET);
 
     let output = cmd
         .stdout(Stdio::piped())
@@ -1255,6 +1268,11 @@ async fn functional_cli_validate_does_not_echo_externally_sourced_mode() {
         stdout.contains("Validation passed."),
         "withholding the value must not cost the validation result: {stdout}"
     );
+    // The fixture's own credential must not ride along in the report either.
+    assert!(
+        !stdout.contains(ADMIN_SECRET) && !stderr.contains(ADMIN_SECRET),
+        "the admin JWT secret must never be reported: stdout={stdout}, stderr={stderr}"
+    );
 }
 
 /// A mode configured in `ferrum.conf` outranks the file-mode smart default.
@@ -1280,7 +1298,10 @@ async fn functional_cli_validate_conf_mode_beats_external_spec_inference() {
     let conf_path = temp_dir.path().join("configured-mode.conf");
     std::fs::write(
         &conf_path,
-        "FERRUM_MODE = database\nFERRUM_DB_TYPE = sqlite\nFERRUM_DB_URL = sqlite::memory:\n",
+        // The admin JWT secret is required in database mode and comes from the
+        // same settings file whose precedence this test is about.
+        "FERRUM_MODE = database\nFERRUM_DB_TYPE = sqlite\nFERRUM_DB_URL = sqlite::memory:\n\
+         FERRUM_ADMIN_JWT_SECRET = fixture-admin-jwt-secret-not-a-real-credential\n",
     )
     .unwrap();
 
