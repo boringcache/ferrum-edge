@@ -774,6 +774,22 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
         self.inner.requires_replay_response_body_transform(ctx)
     }
+    fn enforces_response_body_policy(
+        &self,
+        ctx: &RequestContext,
+        response_content_type: Option<&str>,
+        response_body: &[u8],
+    ) -> bool {
+        // Must forward: falling back to the trait default (`false`) would make a
+        // priority-overridden body policy invisible to the shared representation
+        // gate, reopening the encoded/partial bypass for exactly the proxies that
+        // reorder their plugins.
+        self.inner
+            .enforces_response_body_policy(ctx, response_content_type, response_body)
+    }
+    fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        self.inner.may_enforce_response_body_policy(ctx)
+    }
     fn on_response_body_transformed(
         &self,
         ctx: &mut RequestContext,

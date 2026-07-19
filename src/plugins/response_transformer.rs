@@ -41,6 +41,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use tracing::debug;
 
+use super::response_representation::effective_response_media_type;
 use super::utils::body_transform::{self, BodyRule};
 use super::utils::route_header_transform::{
     RouteHeaderTransformOp, RouteHeaderTransformRule, apply_route_header_transforms,
@@ -481,6 +482,142 @@ impl ResponseTransformer {
     }
 }
 
+/// Whether these bytes are framed gRPC that the LIVE response `Content-Type` no
+/// longer admits to describing.
+///
+/// The representation gate reads `content-type` from the live header map, which
+/// `after_proxy` has already had a chance to rewrite. A header rule that removes
+/// or relabels a framed gRPC response's type would otherwise land it on the
+/// untyped/JSON branch of the claim predicate: the gate would then hand
+/// length-prefixed frames to a JSON field rule, fail to parse them as a bare
+/// document, and answer `unparseable_document` — a `502` replacing a valid RPC
+/// reply on a mixed HTTP/gRPC proxy.
+///
+/// Two independent pieces of pre-hook evidence answer it, and neither can be
+/// relabelled mid-pipeline:
+///
+/// * The **pristine media type** stamped by
+///   [`crate::proxy::stamp_original_response_metadata`] before any `after_proxy`
+///   hook ran. If the backend's own `Content-Type` was framed gRPC, it stays
+///   framed no matter what the live header says now. This is the same
+///   snapshot-over-live-map discipline the gate already applies to content
+///   coding and range/delta state.
+/// * The **request's immutable flavor** — `is_native_grpc_request` (fixed before
+///   any hook) and the separately retained gRPC-Web representation, the pair the
+///   rejection shaper already trusts to pick the client's error flavor. This
+///   covers the case where no media type was ever stamped, so the snapshot
+///   cannot speak. The flavor only SELECTS the grammar there; the bytes then
+///   have to satisfy it in full — see "the untyped case is decided on the
+///   BYTES" below. A live type present without a pristine one does not settle
+///   it either: `after_proxy` can add or relabel a type on a response the
+///   backend sent untyped, so that label describes nothing the backend proved.
+///
+/// Deliberately NOT a decline: a gRPC-Web request whose backend genuinely
+/// answered with a bare `application/json` document. The pristine type proves
+/// that body is not framed, a field rule can act on it, and the transform does
+/// rewrite it — so it stays claimed and the redaction still applies. Keying the
+/// decline off the request flavor alone would have silently dropped that
+/// redaction, which is the wrong direction for a fail-closed gate.
+///
+/// Likewise NOT a decline: an ordinary HTTP request with an absent or vendor
+/// `+json` response `Content-Type`. That claim is the earlier absent-type fix and
+/// is untouched here — this predicate only fires for gRPC/gRPC-Web traffic.
+///
+/// # The untyped case is decided on the BYTES, not the flavor
+///
+/// When neither the snapshot nor the live map names a type, the request flavor
+/// alone cannot answer, and treating it as proof of framing was a fail-OPEN: a
+/// mixed gRPC route whose backend returns a bare JSON error/envelope document
+/// with no `Content-Type` would be declined by both this predicate and the
+/// transform, so a configured redaction over that document never ran while the
+/// operator believed it had. `response_transformer` otherwise treats an absent
+/// type as JSON precisely so that class stays covered.
+///
+/// The bytes settle it, and they settle it by a TOTAL PARSE — never a sniff —
+/// against the ONE grammar the client's representation actually admits.
+/// [`super::grpc_web::client_grpc_framing_representation`] picks that grammar
+/// from immutable request state, and
+/// [`super::grpc_web::bytes_are_complete_grpc_frames`] then accepts only a byte
+/// string that is exactly a sequence of complete frames legal in it: DATA frames
+/// for native gRPC, DATA plus an optional FINAL trailer frame for gRPC-Web
+/// binary, and the base64 of that for gRPC-Web text. Testing the union of all
+/// three instead was the bypass — base64 text that decodes to frames on a native
+/// or binary request, or a body trailer frame on a native one, is not a
+/// representation those clients can receive, and excusing it as framing skipped
+/// the fail-closed rejection the gate exists to make.
+///
+/// No grammar can collide with a JSON document: a frame's first octet is a
+/// `Compressed-Flag`/trailer flag (`0x00`, `0x01`, `0x80`, `0x81`) and base64
+/// excludes `{`, `[`, and `"`. So valid framing is never claimed and spuriously
+/// rejected as an unparseable document, and a bare document is never waved
+/// through unredacted — the two failure directions this predicate keeps apart.
+///
+/// Malformed, truncated, or mode-illegal framing is not "framed" and therefore
+/// stays claimed; it then fails the gate's JSON parse and is rejected. That is
+/// the documented fail-closed posture — the gateway cannot prove a redaction
+/// applied to bytes it cannot parse, and a truncated frame sequence or a trailer
+/// with data after it is not a servable complete representation either.
+fn framed_grpc_request_without_proven_media_type(
+    ctx: &RequestContext,
+    response_body: &[u8],
+) -> bool {
+    let pristine_content_type = ctx
+        .metadata
+        .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
+        .map(String::as_str);
+
+    if let Some(pristine) = pristine_content_type {
+        // The backend's own type is authoritative over any later rewrite.
+        return body_transform::is_framed_grpc_content_type(pristine);
+    }
+
+    // No stamped type to consult, so the BYTES decide — including when a live
+    // `Content-Type` is present.
+    //
+    // The live map cannot stand in for the missing snapshot here: an
+    // `after_proxy` hook is free to ADD or relabel a type on a response the
+    // backend sent untyped, and `application/json` invented by such a hook is
+    // not evidence about bytes the backend never described. Returning early on
+    // any live type let that hook-authored label claim a complete gRPC/gRPC-Web
+    // frame sequence as a JSON document, which the gate then failed to parse and
+    // replaced with a `502 unparseable_document` — a valid RPC reply destroyed
+    // by a header rule. A PRISTINE type still wins outright above; only the
+    // unproven post-hook label yields to a total frame parse.
+    //
+    // Deciding it on a total parse is what keeps this from re-opening the
+    // earlier fail-open: bytes that are not exactly complete frames stay
+    // claimed, so a genuine JSON document under a hook-added (or hook-removed)
+    // type is redacted exactly as before. The request's representation selects
+    // the grammar and the bytes must satisfy exactly that one. Asking the union
+    // of all three grammars was the other gap: base64 is a legal body only for a
+    // text-mode gRPC-Web client, and a body trailer frame only for a gRPC-Web
+    // one, so accepting either on a native gRPC request let a non-RPC byte
+    // string pass as framing and skip the fail-closed rejection.
+    let Some(representation) = super::grpc_web::client_grpc_framing_representation(ctx) else {
+        return false;
+    };
+    super::grpc_web::bytes_are_complete_grpc_frames(response_body, representation)
+}
+
+/// Whether the response's media type admits this plugin's JSON body rules.
+///
+/// Mirrors the media-type half of [`Plugin::transform_response_body`] exactly,
+/// but over the RESOLVED type rather than the raw live header: a framed gRPC
+/// label that neither the pristine snapshot nor a total frame parse supports is
+/// an `after_proxy`/translation artifact, not a description of these bytes, and
+/// must not decline them. See
+/// [`super::response_representation::effective_response_media_type`].
+fn media_type_admits_body_rules(
+    ctx: &RequestContext,
+    response_content_type: Option<&str>,
+    response_body: &[u8],
+) -> bool {
+    let media_type = effective_response_media_type(ctx, response_content_type, response_body);
+    media_type.is_none_or(|ct| {
+        body_transform::is_json_content_type(ct) && !body_transform::is_framed_grpc_content_type(ct)
+    })
+}
+
 #[async_trait]
 impl Plugin for ResponseTransformer {
     fn name(&self) -> &str {
@@ -567,6 +704,140 @@ impl Plugin for ResponseTransformer {
             && !super::utils::sse::is_sse_request(ctx)
     }
 
+    fn enforces_response_body_policy(
+        &self,
+        ctx: &RequestContext,
+        response_content_type: Option<&str>,
+        response_body: &[u8],
+    ) -> bool {
+        // Claim exactly the responses the transform phase would actually
+        // rewrite, so the shared representation gate fails closed on those and
+        // leaves every other response alone. The declines below are the
+        // plugin's own documented no-ops, not inspection failures:
+        //   * no configured `body_rules` — there is no body policy at all;
+        //   * the RTDS kill-switch disabled this scope, mirroring the early
+        //     `return None` in `transform_response_body`.
+        //
+        // SSE is NOT among them, and its absence is load-bearing.
+        // `should_buffer_response_body` declines to buffer an
+        // `Accept: text/event-stream` request, but that is only *this* plugin's
+        // vote: any other response-body plugin can force the buffer, and the
+        // lifecycle then runs `transform_response_body_with_context` over the
+        // result no matter what this predicate said. Declining SSE here while
+        // the transform still ran was exactly that asymmetry — the gate answered
+        // `Unprotected`, and an encoded, `206`, or unparseable body reached the
+        // transform, returned `None`, and was forwarded with a configured
+        // redaction silently skipped.
+        //
+        // Claiming it is also the direction that keeps working traffic working.
+        // A buffered SSE-accepting request whose response is a complete JSON
+        // document is fully inspectable and its redaction applies today; the
+        // media-type condition below already declines a response that genuinely
+        // IS `text/event-stream`, because that is not a JSON content type. So the
+        // only responses this widening newly claims are the ones the transform
+        // was already being run over.
+        //
+        // The media-type condition mirrors `transform_response_body` EXACTLY,
+        // and that symmetry is the whole point: this predicate must claim every
+        // response the transform would actually rewrite, or the gate declines to
+        // inspect bytes the enforcer then fails to parse — which is the very
+        // `None`-conflation bypass the gate exists to close.
+        //
+        // So an ABSENT `Content-Type` is claimed, because the transform treats
+        // it as JSON (`if let Some(ct) = content_type && !is_json => None`, i.e.
+        // `None` falls through to `apply_body_rules`). Declining it here while
+        // the enforcer accepts it would let an untyped `gzip`/`206`/malformed
+        // response carry a protected field straight past a configured redaction.
+        // A non-JSON type stays a documented decline, matching the same early
+        // return in the transform.
+        //
+        // Consequence, accepted deliberately: an untyped response that is not
+        // parseable JSON is now rejected rather than forwarded when a body
+        // policy is configured. That is the fail-closed direction, and it only
+        // affects proxies that configured a body redaction *and* have a backend
+        // that omits `Content-Type` — an operator-visible backend defect, not
+        // ordinary traffic.
+        //
+        // Framed gRPC is the one media-type family excluded on top of that,
+        // because `application/grpc+json` (and the gRPC-Web `+json` variants)
+        // end in `+json` and so satisfy `is_json_content_type` while carrying
+        // length-prefixed FRAMES rather than a bare JSON document. This is not a
+        // narrowing of the untyped-JSON claim above: `transform_response_body`
+        // declines the same family, so the transform provably rewrites nothing
+        // there and the claim stays exactly as wide as the enforcer. Claiming it
+        // anyway would send every valid gRPC JSON response on a mixed HTTP/gRPC
+        // proxy into the gate's `unparseable_document` rejection — turning
+        // working traffic into 502s while protecting nothing, since a frame
+        // (whose first byte is the 0x00/0x01 compressed flag) can never parse as
+        // a JSON document for a field rule to act on in the first place.
+        //
+        // That media-type test alone is not enough, because it reads the LIVE
+        // header, which `after_proxy` has already had a chance to rewrite.
+        // `framed_grpc_request_without_proven_media_type` carries the same
+        // decline over to the pre-hook evidence — the pristine stamped media
+        // type, and the request's immutable gRPC/gRPC-Web flavor when none was
+        // stamped — so stripping or relabelling the header cannot smuggle frames
+        // onto the untyped branch. `transform_response_body_with_context` applies
+        // the identical predicate, which is what keeps this decline symmetric
+        // rather than reopening the gap the SSE decline had. When NOTHING named a
+        // type, that helper decides on the response bytes rather than the request
+        // flavor, so an untyped bare JSON error/envelope on a mixed gRPC route
+        // stays claimed and redacted instead of being waved through as framing.
+        //
+        // The live media-type test must then not undo that answer, which is why
+        // it runs over `effective_response_media_type` rather than the raw
+        // header. The main gRPC path RELABELS the live map: `grpc_web`'s
+        // `after_proxy` stamps `application/grpc-web*` on every translated
+        // response before this gate runs. Applying the framed-media-type decline
+        // to that label AFTER the byte parse had already answered "not framed"
+        // put the fail-open straight back — an untyped backend's malformed frames
+        // or bare JSON error came back unclaimed and were forwarded and
+        // re-wrapped by the phase-9 re-encode with the redaction skipped. The
+        // resolver drops only a framed label that neither the pristine snapshot
+        // nor a total frame parse supports, so the byte parse OVERRIDES the
+        // relabelling instead of being overridden by it, while a pristine framed
+        // type and genuinely framed bytes both still decline.
+        !self.body_rules.is_empty()
+            && self.rules_enabled()
+            && !framed_grpc_request_without_proven_media_type(ctx, response_body)
+            && media_type_admits_body_rules(ctx, response_content_type, response_body)
+    }
+
+    /// The pre-`after_proxy` capability probe, deliberately WIDER than the claim.
+    ///
+    /// The lifecycle asks this before any response hook has run, to decide
+    /// whether to retain terminal-replacement provenance for a representation
+    /// rejection. Neither of the two inputs the claim actually turns on is
+    /// available yet: the live `Content-Type` has not been finalized and the body
+    /// has not been read. The trait default therefore probes the claim with
+    /// `(None, &[])`, i.e. it asks the *untyped, empty-body* question and hopes
+    /// the answer generalizes.
+    ///
+    /// It did not. While the untyped branch of
+    /// `framed_grpc_request_without_proven_media_type` keyed on the request
+    /// flavor alone, that probe answered "framed" for every gRPC/gRPC-Web request
+    /// and the claim came back `false`. On a mixed gRPC route whose backend then
+    /// answered with a real bare `application/json` document, the claim predicate
+    /// DID claim it, an encoded/partial/unparseable body WAS replaced, and the
+    /// rejection path had no provenance to restore from: it dropped the
+    /// decorators completed gateway hooks had already applied (CORS, security,
+    /// correlation headers) while clearing backend fields. The same response on
+    /// an HTTP route kept them, so the gRPC flavor silently got a weaker error.
+    ///
+    /// Deciding that branch on the bytes happens to make the default probe
+    /// answer correctly today — an empty probe body is not a frame sequence — but
+    /// relying on that is relying on a coincidence between a capability question
+    /// and a claim evaluated over evidence this predicate does not have. The
+    /// override consults only configuration and request-scoped overlay state,
+    /// which is exactly the set of conditions that cannot change between the
+    /// probe and the claim, so the two cannot diverge again as the claim's
+    /// evidence grows. Answering `true` costs one provenance-mode selection and
+    /// no request-path allocation; answering `false` too eagerly costs
+    /// correctness, so this predicate errs wide by construction.
+    fn may_enforce_response_body_policy(&self, _ctx: &RequestContext) -> bool {
+        !self.body_rules.is_empty() && self.rules_enabled()
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -576,8 +847,8 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return PluginResult::Continue;
         }
-        // Collect fired whole-value writes only when a deadline rebuild could
-        // consult them, keeping the common path allocation-free.
+        // Collect fired whole-value writes only when a terminal replacement
+        // rebuild could consult them, keeping the common path allocation-free.
         let track_owned = ctx.has_buffered_deadline_response_header_provenance();
         let mut fired_write_keys: Vec<String> = Vec::new();
         self.apply_static_header_rules(
@@ -643,6 +914,74 @@ impl Plugin for ResponseTransformer {
         true
     }
 
+    /// The context-aware entry point, and the one the buffered lifecycle always
+    /// calls.
+    ///
+    /// It exists solely to carry the one decline that needs `ctx` — framed gRPC
+    /// on pre-hook evidence — over from
+    /// [`Plugin::enforces_response_body_policy`], because the shared
+    /// representation gate's guarantee is a SYMMETRY between the two, not a
+    /// property of either alone. The gate rejects an uninspectable
+    /// representation only for responses the claim predicate claims; the
+    /// lifecycle then runs this transform over *every* buffered response
+    /// regardless of what the gate concluded. Any condition that appears in the
+    /// claim and not here is therefore a hole: the response is admitted as
+    /// `Unprotected`, and the transform still runs on encoded, partial, or
+    /// unparseable bytes and returns `None` for them — the exact
+    /// `None`-conflation the gate exists to close.
+    ///
+    /// The decline is reachable: a framed gRPC response whose live
+    /// `Content-Type` an `after_proxy` header rule stripped or relabelled passes
+    /// the media-type test in [`Plugin::transform_response_body`] on the
+    /// untyped/JSON branch, so only the pre-hook evidence declines it.
+    ///
+    /// Declining here rather than widening the claim to match is the correct
+    /// direction, and it costs no redaction: the pristine stamped media type (or,
+    /// unstamped, a total parse of the bytes as complete length-prefixed frames)
+    /// is proof that these bytes are FRAMES, which can never parse as the bare
+    /// document a JSON field rule acts on. `apply_body_rules` would have returned
+    /// `None` for them anyway — the explicit decline only makes that provable at
+    /// the predicate instead of incidental to the parser. Claiming them instead
+    /// would send every valid RPC reply on a mixed HTTP/gRPC proxy into the
+    /// gate's `unparseable_document` rejection.
+    ///
+    /// `body` is passed through for exactly that untyped case. It is the same
+    /// byte string the claim predicate was asked about — the gate re-asks the
+    /// claim over the decoded bytes before enforcing, so both sides see one
+    /// representation and the symmetry holds after a decode as well as before.
+    ///
+    /// SSE is deliberately NOT declined here. The opposite half of the fix
+    /// removed the SSE-specific *decline* from the claim predicate — widening
+    /// the claim for already-buffered ordinary JSON on an SSE-accepting request
+    /// — because that response is fully inspectable and its redaction works
+    /// today. A genuine `text/event-stream` response remains unclaimed via the
+    /// media-type condition. See [`Plugin::enforces_response_body_policy`].
+    async fn transform_response_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        if framed_grpc_request_without_proven_media_type(ctx, body) {
+            return None;
+        }
+        // Same resolution the claim predicate applies, for the same reason and
+        // over the same bytes: an unproven post-hook/translation-added framed
+        // gRPC label must not make the enforcer decline what the claim just
+        // claimed. Dropping it here restores the untyped branch, so
+        // `apply_body_rules` actually runs — and a body that is not a parseable
+        // document still returns `None` into the gate's fail-closed rejection
+        // instead of being forwarded unredacted.
+        let content_type = effective_response_media_type(ctx, content_type, body);
+        self.transform_response_body(body, content_type, response_headers)
+            .await
+    }
+
+    /// The context-free transform. Every buffered call site reaches this through
+    /// [`Plugin::transform_response_body_with_context`] above, which applies the
+    /// `ctx`-dependent half of the claim symmetry first; this method carries the
+    /// half that needs only the media type.
     async fn transform_response_body(
         &self,
         body: &[u8],
@@ -652,8 +991,15 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return None;
         }
+        // Framed gRPC is declined explicitly rather than left to fail inside
+        // `apply_body_rules`. Both routes return `None`, but only the explicit
+        // decline makes the media-type condition here symmetric with
+        // `enforces_response_body_policy` by construction, so the claim
+        // predicate and the enforcer cannot drift apart on the `+json` gRPC
+        // types that satisfy `is_json_content_type`.
         if let Some(ct) = content_type
-            && !body_transform::is_json_content_type(ct)
+            && (!body_transform::is_json_content_type(ct)
+                || body_transform::is_framed_grpc_content_type(ct))
         {
             return None;
         }
