@@ -739,14 +739,8 @@ fn test_redact_multiple_credential_types() {
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
 
     assert!(!redacted.credentials.contains_key("basicauth"));
-    assert_eq!(
-        redacted.credentials["hmac_auth"][0]["secret"],
-        "[REDACTED]"
-    );
-    assert_eq!(
-        redacted.credentials["keyauth"][0]["key"],
-        "[REDACTED]"
-    );
+    assert_eq!(redacted.credentials["hmac_auth"][0]["secret"], "[REDACTED]");
+    assert_eq!(redacted.credentials["keyauth"][0]["key"], "[REDACTED]");
 }
 
 #[test]

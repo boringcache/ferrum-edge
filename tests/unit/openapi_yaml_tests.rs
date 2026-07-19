@@ -455,7 +455,11 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         redacted_credentials.get("custom_auth").is_none(),
         "ordinary responses must omit unknown/custom credential values"
     );
-    assert!(!redacted.to_string().contains("custom-secret-must-only-appear-in-backup"));
+    assert!(
+        !redacted
+            .to_string()
+            .contains("custom-secret-must-only-appear-in-backup")
+    );
     assert_component_validity(&spec, "Consumer", &redacted, true);
 
     // Legacy known entries are projected to their exact safe response shape:
@@ -591,12 +595,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         ("HmacAuthCredentialBackup", "secret"),
         ("MtlsAuthCredential", "identity"),
     ] {
-        assert_component_validity(
-            &spec,
-            component,
-            &json!({(field): "🔐".repeat(4096)}),
-            true,
-        );
+        assert_component_validity(&spec, component, &json!({(field): "🔐".repeat(4096)}), true);
         assert_component_validity(
             &spec,
             component,
@@ -791,8 +790,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
             "{surface} must wire {credentials_schema}"
         );
         assert_eq!(
-            spec["components"]["schemas"][surface]["unevaluatedProperties"],
-            false,
+            spec["components"]["schemas"][surface]["unevaluatedProperties"], false,
             "{surface} must mirror Consumer's deny_unknown_fields contract"
         );
         assert_component_validity(
@@ -802,10 +800,12 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
             false,
         );
     }
-    let serde_unknown = serde_json::from_value::<Consumer>(
-        json!({"username": "alice", "unknown_top_level": true}),
+    let serde_unknown =
+        serde_json::from_value::<Consumer>(json!({"username": "alice", "unknown_top_level": true}));
+    assert!(
+        serde_unknown.is_err(),
+        "Consumer serde must reject unknown fields"
     );
-    assert!(serde_unknown.is_err(), "Consumer serde must reject unknown fields");
 
     let credential_input = &spec["components"]["schemas"]["ConsumerCredentialInput"];
     assert!(credential_input.get("discriminator").is_none());

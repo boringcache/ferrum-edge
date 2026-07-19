@@ -7077,9 +7077,10 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
         credential_value: &serde_json::Value,
     ) -> Vec<&serde_json::Map<String, serde_json::Value>> {
         match credential_value {
-            serde_json::Value::Array(entries) => {
-                entries.iter().filter_map(serde_json::Value::as_object).collect()
-            }
+            serde_json::Value::Array(entries) => entries
+                .iter()
+                .filter_map(serde_json::Value::as_object)
+                .collect(),
             serde_json::Value::Object(object) => vec![object],
             _ => Vec::new(),
         }
@@ -7096,9 +7097,7 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
         (!entries.is_empty()).then(|| serde_json::Value::Array(entries))
     }
 
-    fn visible_mtls_identities(
-        credential_value: &serde_json::Value,
-    ) -> Option<serde_json::Value> {
+    fn visible_mtls_identities(credential_value: &serde_json::Value) -> Option<serde_json::Value> {
         let entries: Vec<_> = entry_objects(credential_value)
             .into_iter()
             .filter_map(|entry| entry.get("identity").and_then(serde_json::Value::as_str))
