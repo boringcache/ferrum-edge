@@ -4621,9 +4621,11 @@ def inline_interpreter_has_cross(
     return False
 
 
-def shell_inline_interpreter_has_cross(value: str) -> bool:
+def shell_inline_interpreter_has_cross(value: str, depth: int = 0) -> bool:
     """Inspect only recognized inline interpreters in trusted shell text."""
 
+    if depth > 8:
+        return True
     tokens = shell_tokens(value)
     if tokens is None:
         return False
@@ -4632,6 +4634,25 @@ def shell_inline_interpreter_has_cross(value: str) -> bool:
         index, executes = executable_index(expanded)
         if not executes or index >= len(expanded):
             continue
+        command = tool_name(expanded[index])
+        if command in SHELL_INTERPRETER_NAMES:
+            shell_index = index
+            if command == "busybox":
+                if (
+                    index + 1 >= len(expanded)
+                    or tool_name(expanded[index + 1])
+                    not in BUSYBOX_SHELL_APPLETS
+                ):
+                    continue
+                shell_index += 1
+            program, opaque, _ = shell_invocation_mode(expanded, shell_index)
+            if opaque:
+                return True
+            if program is not None and shell_inline_interpreter_has_cross(
+                program,
+                depth + 1,
+            ):
+                return True
         inline = inline_interpreter_programs(expanded, index)
         if inline is None:
             continue
@@ -14724,14 +14745,22 @@ pre_build = []
     # operand contains no Cross word itself. The dynamic evaluator is an opaque
     # executable surface and must fail closed before the heredoc is mistaken
     # for ordinary data.
-    evaluated_stdin = (
-        "echo safe\n"
-        "ruby -e 'eval(STDIN.read)' <<'RUBY'\n"
-        "system('cross build')\n"
-        "RUBY\n"
-    )
-    if not contains_direct_trusted_shell_cross_surface(evaluated_stdin):
-        failures.append("a foreign inline evaluator hid an executable heredoc")
+    evaluated_stdin_programs = {
+        "foreign inline evaluator": (
+            "echo safe\n"
+            "ruby -e 'eval(STDIN.read)' <<'RUBY'\n"
+            "system('cross build')\n"
+            "RUBY\n"
+        ),
+        "nested foreign inline evaluator": (
+            "bash -c 'echo safe; ruby -e \"eval(STDIN.read)\"' sh <<'RUBY'\n"
+            "system('cross build')\n"
+            "RUBY\n"
+        ),
+    }
+    for evaluator_label, evaluated_stdin in evaluated_stdin_programs.items():
+        if not contains_direct_trusted_shell_cross_surface(evaluated_stdin):
+            failures.append(f"a {evaluator_label} hid an executable heredoc")
 
     for stdin_program, stdin_label in (
         (
