@@ -2572,13 +2572,22 @@ async fn sse_accepting_request_with_encoded_body_is_decoded_and_redacted() {
     assert!(String::from_utf8_lossy(&body).contains("keep"));
 }
 
+/// One fail-closed SSE case: status, optional extra response header, body, and
+/// the expected rejection reason.
+type SseUninspectableCase = (
+    u16,
+    Option<(&'static str, &'static str)>,
+    &'static [u8],
+    &'static str,
+);
+
 /// The fail-closed half of the same widening: representations the transform
 /// genuinely cannot inspect now reject for an SSE-accepting request too, instead
 /// of being forwarded with the redaction skipped.
 #[tokio::test]
 async fn sse_accepting_request_with_uninspectable_body_fails_closed() {
     // (status, extra response header, body, expected rejection reason)
-    let cases: [(u16, Option<(&str, &str)>, &[u8], &str); 4] = [
+    let cases: [SseUninspectableCase; 4] = [
         (
             206,
             None,
