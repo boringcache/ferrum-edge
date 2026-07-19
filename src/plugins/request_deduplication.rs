@@ -247,12 +247,45 @@ enum CompletionSkipReason {
 /// The values are hashed identities or opaque owner tokens, but they still do
 /// not belong in public transaction metadata. `RequestContext` holds at most
 /// one entry per deduplication instance attached to the matched proxy.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct RequestDeduplicationRequestState {
     key: String,
     fingerprint: String,
     local_inflight_owner_token: String,
     redis_lock_token: Option<String>,
+}
+
+impl fmt::Debug for RequestDeduplicationRequestState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Do not delegate to any field or nested formatter. New fields stay
+        // omitted by default until their diagnostic representation is reviewed.
+        f.debug_struct("RequestDeduplicationRequestState")
+            .field("key", &"<redacted>")
+            .field("fingerprint", &"<redacted>")
+            .field("local_inflight_owner_token", &"<redacted>")
+            .field("redis_lock_token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn set_request_state_for_test(
+    plugin: &RequestDeduplication,
+    ctx: &mut RequestContext,
+    key: &str,
+    fingerprint: &str,
+    local_inflight_owner_token: &str,
+    redis_lock_token: Option<&str>,
+) {
+    ctx.request_deduplication_states.insert(
+        plugin.instance_id,
+        RequestDeduplicationRequestState {
+            key: key.to_string(),
+            fingerprint: fingerprint.to_string(),
+            local_inflight_owner_token: local_inflight_owner_token.to_string(),
+            redis_lock_token: redis_lock_token.map(str::to_string),
+        },
+    );
 }
 
 static NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
