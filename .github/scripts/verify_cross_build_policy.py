@@ -947,11 +947,12 @@ CASE_ARM_CONTEXT = r"(?:\bin|;;)\s+\(?\s*[^\s;&|()]+(?:\s*\|\s*[^\s;&|()]+)*\)\s
 # executable slot. A bare `(` is deliberately still not a context: a real
 # subshell is covered by the opener sequence that follows each context, whereas
 # a bare `(` also appears literally inside quoted prose.
-# That opener sequence is `(?:\(\s*)*`, not `(?:\(\s+)*`: bash needs no blank
-# after a subshell opener, so `; (cross build ...` and `( (cross build ...` are
-# both real executable slots. Requiring the blank would repeat the single-`(`
-# slot the pre-nesting `(?:\(\s*)?` spelling already covered, turning a
-# generalization into a fail-open narrowing.
+# A single subshell opener needs no following blank (`(cross build ...)`), but
+# two adjacent openers are Bash arithmetic syntax rather than two subshells.
+# Nested subshell tokens therefore require whitespace between every opener
+# except the final one: `( (cross build ... ) )` is executable shell, while
+# `(( $(echo 1) ))` is an arithmetic command and must not manufacture an opaque
+# executable slot for the substitution inside it.
 # `$(`, a backtick, and `<(`/`>(` are unambiguous executable slots, so an
 # assignment such as `out=$(cross build ...)` is one.
 # Every context except a bare line start names the executable slot explicitly,
@@ -968,6 +969,7 @@ COMMAND_START_CONTEXT = (
     rf"(?:^\s*|{EXPLICIT_COMMAND_START_CONTEXT})"
     r"(?:!\s*)?"
 )
+SUBSHELL_OPENERS = r"(?:\(\s+)*(?:\(\s*)?"
 # A shell assignment word may carry an empty value: `FOO= cross build` and
 # `env FOO= cross build` are both valid command prefixes, and the token model
 # already treats them as assignments (`NAME=.*`). Requiring at least one
@@ -1110,7 +1112,8 @@ CROSS_EXECUTABLE = (
 # assignment prefix introduces a simple command, never a subshell.
 CROSS_COMMAND_CONTEXT = re.compile(
     COMMAND_START_CONTEXT
-    + r"(?:\(\s*)*"
+    + SUBSHELL_OPENERS
+    + r"(?:!\s*)?"
     + COMMAND_WORD_PREFIX
     + CROSS_EXECUTABLE
 )
@@ -1119,8 +1122,10 @@ CROSS_COMMAND_CONTEXT = re.compile(
 EXPLICIT_COMMAND_WORD_PREFIX = re.compile(
     rf"(?:{EXPLICIT_COMMAND_START_CONTEXT})"
     r"(?:!\s*)?"
+    + SUBSHELL_OPENERS
+    + r"(?:!\s*)?"
     + COMMAND_WORD_PREFIX
-    + r"(?:\(\s*)*$"
+    + r"$"
 )
 # The bare-line-start form is valid only after the caller has already established
 # that the line is shell-evaluated. Leading assignment words are still part of
@@ -1132,11 +1137,10 @@ EXPLICIT_COMMAND_WORD_PREFIX = re.compile(
 BARE_COMMAND_WORD_PREFIX = re.compile(
     r"^\s*"
     r"(?:!\s*)?"
+    + SUBSHELL_OPENERS
+    + r"(?:!\s*)?"
     + COMMAND_WORD_PREFIX
-    # `(?:\(\s*)*`, not `(?:\(\s*)?`, for the same reason as the explicit
-    # matcher above: a nested or unspaced subshell opener is still a command
-    # slot, so `((cmd build ...` must not fall out of the bare-start allowance.
-    + r"(?:\(\s*)*$"
+    + r"$"
 )
 WRAPPED_LITERAL_CROSS = re.compile(
     r"(?:\b(?:bash|sh)\s+-c\s+['\"][^'\"]*\bcross\s+|"
@@ -1371,16 +1375,13 @@ OPAQUE_WORD_SEPARATOR = rf"(?:\s+|{OPAQUE_EXPANSION}\s*)"
 OPAQUE_ARM_CROSS_EXECUTION = re.compile(
     # The brace context keeps `\s*(?=\()` so a `{(` group opener still counts
     # while the `{"cross": ...}` JSON benign control stays excluded, and the
-    # subshell opener stays `(?:\(\s*)*` rather than `(?:\(\s*)?` so nested and
-    # unspaced openers both match. Negation, assignment words, process wrappers
-    # and `env` may appear either side of that opener, so both positions are
-    # accepted; every group can match empty, so this is a strict superset.
+    # subshell opener uses `SUBSHELL_OPENERS`, so a valid nested spelling keeps
+    # matching without treating Bash arithmetic `(( ... ))` as two subshells.
     r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{(?:\s+|\s*(?=\())|\$\(\s*|`\s*|"
     r"[<>]\(\s*|\b(?:if|elif|while|until|then|do|else)\s+)"
     r"(?:!\s*)?"
-    rf"(?:{ASSIGNMENT_VALUE}\s+)*"
-    r"(?:\(\s*)*"
-    r"(?:!\s*)?"
+    + SUBSHELL_OPENERS
+    + r"(?:!\s*)?"
     # The same interleaved layer `OPAQUE_EXECUTABLE_WITH_SUBCOMMAND` — the
     # prefilter that guards this scan — already uses. A scanner narrower than
     # its own prefilter cannot be reached for the orderings the prefilter
@@ -1415,14 +1416,11 @@ OPAQUE_EXECUTABLE_WITH_SUBCOMMAND = re.compile(
     r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{(?:\s+|\s*(?=\())|\$\(\s*|`\s*|"
     r"[<>]\(\s*|\b(?:if|elif|while|until|then|do|else)\s+)"
     r"(?:!\s*)?"
-    # Assignment words only before the subshell opener and the full interleaved
-    # layer after it, exactly as `OPAQUE_ARM_CROSS_EXECUTION` is built. Both
-    # positions can match empty and assignments belong to the layer as well, so
-    # every ordering is still reachable while the two layers stay unambiguous
-    # enough to bound backtracking on a long non-matching line.
-    rf"(?:{ASSIGNMENT_VALUE}\s+)*"
-    r"(?:\(\s*)*"
-    r"(?:!\s*)?"
+    # A subshell opens before the simple command's assignments and wrappers.
+    # Keeping that grammar also excludes arithmetic `(( ... ))` from the
+    # executable-slot prefilter.
+    + SUBSHELL_OPENERS
+    + r"(?:!\s*)?"
     + COMMAND_WORD_PREFIX
     + r"['\"]?"
     rf"(?:[A-Za-z]*{OPAQUE_EXPANSION}['\"]?)+[A-Za-z]*['\"]?"
@@ -3773,6 +3771,56 @@ def command_has_argument(tokens: tuple[str, ...], index: int) -> bool:
     return False
 
 
+def decode_printf_format_literal(value: str) -> str | None:
+    """Decode the bounded backslash vocabulary of a literal printf format."""
+
+    decoded: list[str] = []
+    simple = {
+        "\\": "\\",
+        "a": "\a",
+        "b": "\b",
+        "e": "\x1b",
+        "E": "\x1b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+    }
+    cursor = 0
+    while cursor < len(value):
+        if value[cursor] != "\\":
+            decoded.append(value[cursor])
+            cursor += 1
+            continue
+        if cursor + 1 >= len(value):
+            return None
+        cursor += 1
+        escape = value[cursor]
+        if escape in simple:
+            decoded.append(simple[escape])
+            cursor += 1
+            continue
+        if escape == "x":
+            end = cursor + 1
+            while (
+                end < len(value)
+                and end < cursor + 3
+                and value[end] in "0123456789abcdefABCDEF"
+            ):
+                end += 1
+            if end == cursor + 1:
+                return None
+            decoded.append(chr(int(value[cursor + 1 : end], 16)))
+            cursor = end
+            continue
+        # Octal, Unicode, `\c`, and implementation-specific escapes vary in
+        # spelling or semantics between printf implementations. They remain
+        # opaque instead of being decoded optimistically.
+        return None
+    return "".join(decoded)
+
+
 def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
     """Fold the bounded literal producers used to feed a shell on stdin."""
 
@@ -3799,13 +3847,18 @@ def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
         if any("\\" in argument for argument in arguments[1:]):
             return None
         return "".join(arguments[1:])
-    # Literal printf formats decode backslash escapes (`\x63ross` -> `cross`),
-    # so treating an escaped format as readable source would miss execution.
-    if "\\" in arguments[0]:
+    # A conversion can splice later operands into the program. Only the exact
+    # `%s` forms above are modeled; mixing conversions with escapes stays opaque
+    # so `printf '\x63%s' 'ross ...'` cannot be accepted as inert source.
+    if "%" in arguments[0]:
         return None
-    if "%" not in arguments[0]:
-        return arguments[0]
-    return None
+    # Literal formats are decidable without executing them. Decode the bounded,
+    # implementation-independent escape subset so `\x63ross` is scanned as
+    # `cross`, while a benign `\x62uilt` control is accepted and every unknown
+    # escape stays opaque.
+    if "\\" in arguments[0]:
+        return decode_printf_format_literal(arguments[0])
+    return arguments[0]
 
 
 def interpreter_stdin_language(
@@ -3877,6 +3930,16 @@ def shell_stdin_program(
         language = stdin_language
 
     arguments = segment[index + 1 :]
+    if any(
+        argument.startswith("<<") and not argument.startswith("<<<")
+        for argument in arguments
+    ):
+        # A heredoc is not opaque stdin: `executable_heredocs()` resolves its
+        # delimiter, body, and interpreter and recursively scans that exact
+        # program. Treating the opener as an unknown pipe input first rejected
+        # every benign Python/shell heredoc before the body reader could decide
+        # it, including the trusted CI planner's literal Python block.
+        return None, None, False
     for position, token in enumerate(arguments):
         if token == "<<<":
             if position + 1 >= len(arguments):
@@ -4877,6 +4940,66 @@ def strip_shell_comment(value: str) -> str:
     return value
 
 
+def shell_quote_at(value: str, position: int) -> str | None:
+    """Return the shell-data quote enclosing one source position.
+
+    Command substitutions and backticks remain executable inside double quotes
+    and parse their interiors with a fresh quote context. Preserve and restore
+    the interrupted quote at each closer so a repository command inside
+    `"$(...; scripts/check)"` is not mistaken for quoted data, while a path-like
+    fragment in an ordinary quoted regex remains inert.
+    """
+
+    quote: str | None = None
+    escaped = False
+    pending: list[tuple[str, str | None]] = []
+    index = 0
+    while index < position:
+        character = value[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote != "'" and (value.startswith("$(", index) or character == "`"):
+            if character == "`":
+                if pending and pending[-1][0] == "`":
+                    _, quote = pending.pop()
+                else:
+                    pending.append(("`", quote))
+                    quote = None
+                index += 1
+                continue
+            pending.append((")", quote))
+            quote = None
+            index += 2
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in "'\"":
+            quote = character
+            index += 1
+            continue
+        if pending and character == pending[-1][0]:
+            _, quote = pending.pop()
+            index += 1
+            continue
+        if character == "(" or (
+            character in "<>" and value.startswith("(", index + 1)
+        ):
+            pending.append((")", quote))
+            index += 2 if character in "<>" else 1
+            continue
+        index += 1
+    return quote
+
+
 def has_cross_command_context(
     candidate: str,
     *,
@@ -5292,6 +5415,13 @@ def scan_variants(
         for variant in variants
         for expanded in brace_expansion_variants(variant)
     ]
+    if not starts_command:
+        # The source line is data or a continuation operand at its left edge.
+        # Prefixing an inert command preserves every explicit nested command
+        # context (`$(`, backticks, a pipeline operator, and so on) while
+        # preventing the token model from treating the raw left edge as a fresh
+        # executable slot merely because it receives one line at a time.
+        expanded_variants = [f": {variant}" for variant in expanded_variants]
     return tuple(dict.fromkeys(expanded_variants))
 
 
@@ -6985,39 +7115,46 @@ def contains_opaque_executable_cross(contents: str) -> bool:
                 flattened_command_substitutions(line)
             ) is None:
                 continue
-            literal_variants = set(
-                scan_variants(
-                    line,
+            # Inspect the variants introduced specifically by an opaque shell
+            # executable, then pass those candidates through the ordinary
+            # normalization layers. Subtracting a complete non-opaque scan was
+            # unsound because command substitutions participate in the ARM
+            # completion scan too: the exact same `cross build` candidate then
+            # appeared in both sets and a whole multiline substitution escaped
+            # the all-target comparison.
+            opaque_variants = opaque_shell_interpolation_variants(
+                line,
+                shell_evaluated=shell_evaluated,
+                starts_command=starts_command,
+            )
+            for opaque_variant in opaque_variants:
+                for variant in scan_variants(
+                    opaque_variant,
                     include_opaque_shell_executable=False,
                     shell_evaluated=shell_evaluated,
                     starts_command=starts_command,
-                )
-            )
-            for variant in scan_variants(
-                line,
-                include_opaque_shell_executable=True,
-                shell_evaluated=shell_evaluated,
-                starts_command=starts_command,
-            ):
-                if variant in literal_variants:
-                    continue
-                if OPAQUE_CROSS_SUBCOMMAND.search(variant) is None:
-                    continue
-                if has_cross_command_context(
-                    variant,
-                    include_opaque_shell_executable=True,
                 ):
-                    return True
+                    if OPAQUE_CROSS_SUBCOMMAND.search(variant) is None:
+                        continue
+                    if has_cross_command_context(
+                        variant,
+                        include_opaque_shell_executable=True,
+                    ):
+                        return True
     return False
 
 
 def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
     """Recognize Cross-sensitive surfaces in trusted shell automation."""
 
+    command_text = automation_command_text(contents)
     # An undecodable stdin program is opaque for every target, so the literal
-    # scan fails closed on it here exactly as PR comparison already does.
+    # scan fails closed on it here exactly as PR comparison already does. Read
+    # the projected command text so a quoted heredoc that merely writes a
+    # template is not tokenized as if its body ran; executable heredocs and
+    # unquoted substitutions are already retained by the projection.
     with opaque_stdin_program_scope():
-        literal_surface = contains_literal_executable_cross(contents)
+        literal_surface = contains_literal_executable_cross(command_text)
     # Every raw-text search below reads the *command* text rather than the raw
     # lines. A reached script that writes a literal template — `cat <<'EOF'`
     # holding `bash -c "$(render)"` or `/opt/bin/cross build` — is not executing
@@ -7029,7 +7166,6 @@ def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
     # data, folds backslash continuations, and returns the program raw whenever
     # a heredoc is unterminated. Pull-request comparison applies the same
     # projection, so neither side calls a surface inert that the other blocks.
-    command_text = automation_command_text(contents)
     return (
         literal_surface
         or WRAPPED_LITERAL_CROSS.search(command_text) is not None
@@ -8739,6 +8875,49 @@ def shell_argv_reads_stdin_program(words: tuple[str, ...]) -> bool:
     return True
 
 
+def bounded_partial_python_argv(
+    elements: list[str | None],
+) -> tuple[str, ...] | None:
+    """Resolve the one reviewed argv shape whose data operand is computed.
+
+    A dynamic argv element is normally an opaque process command: interpreters,
+    wrappers, and dispatchers can select another executable through later
+    operands. The coverage gate has a narrower shape. Its executable,
+    subcommand, disabling of external diff and text-conversion helpers,
+    end-of-options marker, path separator, and path are all fixed; only Git's
+    revision expression is computed. That value cannot change argv[0] or become
+    an option after the literal `--end-of-options`, so retain it as data instead
+    of treating the whole process command as unknowable.
+    """
+
+    if (
+        len(elements) == 9
+        and elements[:6]
+        == [
+            "git",
+            "diff",
+            "--unified=0",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--end-of-options",
+        ]
+        and elements[6] is None
+        and elements[7:] == ["--", "src/plugins"]
+    ):
+        return (
+            "git",
+            "diff",
+            "--unified=0",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--end-of-options",
+            "${OPAQUE_REVISION}",
+            "--",
+            "src/plugins",
+        )
+    return None
+
+
 def python_command_scripts(
     contents: str,
     source: str,
@@ -9003,6 +9182,27 @@ def python_command_scripts(
                         element for element in elements if element is not None
                     )
                     command_text = " ".join(command_words)
+                else:
+                    shell_keyword = next(
+                        (
+                            keyword.value
+                            for keyword in node.keywords
+                            if keyword.arg == "shell"
+                        ),
+                        None,
+                    )
+                    shell_disabled = shell_keyword is None or (
+                        isinstance(shell_keyword, ast.Constant)
+                        and shell_keyword.value is False
+                    )
+                    bounded_argv = (
+                        bounded_partial_python_argv(elements)
+                        if shell_disabled
+                        else None
+                    )
+                    if bounded_argv is not None:
+                        command_words = bounded_argv
+                        command_text = " ".join(command_words)
             elif command_text is not None and not re.search(r"\s", command_text):
                 command_words = (command_text,)
 
@@ -9078,7 +9278,7 @@ def runtime_program_cross_surface(
             command_text = automation_command_text(program)
             if (
                 shell_program_has_cross(
-                    program,
+                    command_text,
                     include_opaque_shell_executable=include_opaque_shell_executable,
                 )
                 or opaque_arm_cross_execution(command_text)
@@ -9529,6 +9729,21 @@ def block_automation_references(
                 )
 
             for match in LOCAL_COMMAND_REFERENCE.finditer(normalized_line):
+                enclosing_quote = shell_quote_at(normalized_line, match.start())
+                if enclosing_quote is not None and not (
+                    enclosing_quote == '"'
+                    and (
+                        normalized_line.startswith("$(", match.start())
+                        or normalized_line.startswith("`", match.start())
+                    )
+                ):
+                    # Shell-looking separators inside a quoted regex/string are
+                    # data. The old raw regex treated the `|tests/...` fragment
+                    # of a grep pattern as a new pipeline command and queued a
+                    # nonexistent directory as executable automation. Command
+                    # substitutions remain active inside double quotes and are
+                    # explicitly retained above.
+                    continue
                 inline_options = match.group("interpreter_options") or ""
                 if match.group("interpreted") and interpreted_operand_is_inline_source(
                     match.group("interpreter") or "",
@@ -10744,13 +10959,15 @@ def self_test() -> list[str]:
         )
 
     # The bare-line-start matcher must agree with the explicit one about the
-    # repeated opener, or an assignment-prefixed word in a nested or unspaced
-    # subshell silently stops occupying a command slot.
+    # repeated opener, or an assignment-prefixed word in a nested subshell,
+    # silently stops occupying a command slot. Adjacent `((` is deliberately
+    # absent because Bash parses it as arithmetic, not nested subshells.
     bare_command_slots = {
         "assignment prefix": "FOO=bar ",
-        "unspaced nested subshell": "((",
+        "nested subshell": "( (",
         "assignment inside a subshell": "(FOO=bar ",
-        "wrapper before a subshell": "sudo ((",
+        "negation inside a subshell": "( ! ",
+        "wrapper inside a subshell": "(sudo ",
     }
     for name, prefix in bare_command_slots.items():
         if BARE_COMMAND_WORD_PREFIX.fullmatch(prefix) is None:
@@ -15888,6 +16105,14 @@ pre_build = []
                 "action validation"
             )
 
+    # A format conversion can join a decoded fragment to a later operand. It is
+    # not the same bounded producer as a literal escape-only format and must
+    # keep failing closed.
+    shell_automation_escapes(
+        "printf conversion splicing a Cross executable",
+        f"printf '\\x63%s' 'ross {arm_target}' | bash",
+    )
+
     # A job that only *writes* a quoted heredoc template is not executing it, so
     # the whole-job and per-line raw scans must read the projected command text
     # exactly as every other whole-text search does. Scanning the raw job body
@@ -16224,6 +16449,39 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("benign Python alias/stdin automation was rejected")
+
+    # The coverage helper's fixed Git diff argv keeps only its revision
+    # expression dynamic and places it after an end-of-options marker. That
+    # reviewed data slot is readable, while an otherwise similar dynamic argv
+    # remains opaque rather than widening the exception to arbitrary tools.
+    bounded_commands, bounded_errors = python_command_scripts(
+        "import subprocess\n"
+        "revision_range = 'origin/main...HEAD'\n"
+        "subprocess.run([\n"
+        "    'git', 'diff', '--unified=0', '--no-ext-diff',\n"
+        "    '--no-textconv', '--end-of-options', revision_range,\n"
+        "    '--', 'src/plugins',\n"
+        "])\n",
+        "self-test bounded Git argv",
+        reject_dynamic_commands=True,
+    )
+    if bounded_errors or not any(
+        "${OPAQUE_REVISION}" in command for command in bounded_commands
+    ):
+        failures.append(
+            "the bounded Git revision argv was not retained as a data-only "
+            f"process operand: errors={bounded_errors!r}, "
+            f"commands={bounded_commands!r}"
+        )
+    _, arbitrary_dynamic_errors = python_command_scripts(
+        "import subprocess\n"
+        "argument = 'safe'\n"
+        "subprocess.run(['echo', argument])\n",
+        "self-test arbitrary dynamic argv",
+        reject_dynamic_commands=True,
+    )
+    if not arbitrary_dynamic_errors:
+        failures.append("an arbitrary dynamic process argv was accepted")
 
     extensionless_workflow = referenced_workflow.replace(
         "bash scripts/safe.sh",
@@ -16660,6 +16918,33 @@ pre_build = []
         references, dispatchers, _, errors = command_reference_detail(program)
         return references, dispatchers, errors
 
+    # A path-shaped alternative inside a quoted grep regex is data, not a
+    # pipeline command. Conversely, commands inside a double-quoted command
+    # substitution parse in their own quote context and remain reachable.
+    quoted_regex_references, _, quoted_regex_errors = command_reference_result(
+        "grep -Eq '^(src/plugins/mod\\.rs|tests/performance/mesh/Cargo\\.toml)$' "
+        "<<<\"$changed_files\""
+    )
+    if "tests/performance/mesh" in quoted_regex_references or quoted_regex_errors:
+        failures.append(
+            "a quoted repository-path regex was read as executable automation: "
+            f"references={sorted(quoted_regex_references)!r}, "
+            f"errors={quoted_regex_errors!r}"
+        )
+    quoted_substitution_references, _, quoted_substitution_errors = (
+        command_reference_result('value="$(echo safe; bash scripts/unsafe.sh)"')
+    )
+    if (
+        "scripts/unsafe.sh" not in quoted_substitution_references
+        or quoted_substitution_errors
+    ):
+        failures.append(
+            "a repository command inside a double-quoted command substitution "
+            "was not retained: "
+            f"references={sorted(quoted_substitution_references)!r}, "
+            f"errors={quoted_substitution_errors!r}"
+        )
+
     # An unquoted heredoc body still expands `$()`, so the substitution really
     # executes while the data around it is written to the receiving command.
     # Local discovery skipped every body line, so the executed script was never
@@ -16733,7 +17018,9 @@ pre_build = []
             )
     # A bare path names no interpreter, so nothing is invented for it.
     _, _, bare_provenance, _ = command_reference_detail("./scripts/opaque")
-    if bare_provenance.get("scripts/opaque"):
+    if any(
+        kind is not None for kind in bare_provenance.get("scripts/opaque", set())
+    ):
         failures.append("a bare path invented an interpreter provenance")
 
     def interpreted_automation_result(command: str, body: str) -> list[str]:
