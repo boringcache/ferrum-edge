@@ -681,7 +681,10 @@ async fn start_node_agent_admin_listeners(
     let handle = tokio::spawn(async move {
         info!(
             "Starting node_agent admin HTTP listener on {}",
-            admin_http_addr
+            crate::secrets::report_env_field(
+                "FERRUM_ADMIN_HTTP_PORT",
+                &admin_http_addr.to_string()
+            )
         );
         if let Err(err) = admin::start_admin_listener_with_tls_and_signal(
             admin_http_addr,

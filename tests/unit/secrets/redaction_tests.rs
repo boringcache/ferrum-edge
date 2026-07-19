@@ -10,7 +10,8 @@
 use crate::unit::env_lock::ENV_LOCK;
 use ferrum_edge::secrets::{
     EXTERNAL_SECRET_PLACEHOLDER, WITHHELD_LOG_RECORD, is_external_secret_key, quoted_env_value,
-    record_external_secret_keys, redact_external_secret_values, withheld_log_record,
+    record_external_secret_keys, redact_external_secret_values, report_env_field,
+    withheld_log_record,
 };
 use std::sync::Once;
 
@@ -183,7 +184,15 @@ const SHORT_CASE_VALUE: &str = "Db";
 const PADDED_SHORT_KEY: &str = "FERRUM_REDACTION_FIXTURE_PADDED_SHORT";
 const PADDED_SHORT_VALUE: &str = "  w  ";
 
-const FIXTURES: [(&str, &str); 22] = [
+/// An externally sourced port whose canonical `Display` is below the derived
+/// minimum: `080` materializes as three bytes (armed exactly) while parsed
+/// listeners log `80`. Admitting `80` process-wide would shred every diagnostic
+/// that mentions an HTTP port, so listen/port sites withhold key-tied instead.
+const SHORT_PORT_KEY: &str = "FERRUM_REDACTION_FIXTURE_SHORT_PORT";
+const SHORT_PORT_VALUE: &str = "080";
+const SHORT_PORT_RENDERED: &str = "80";
+
+const FIXTURES: [(&str, &str); 23] = [
     (PLAIN_KEY, PLAIN_VALUE),
     (LIST_KEY, LIST_VALUE),
     (CASE_KEY, CASE_VALUE),
@@ -206,6 +215,7 @@ const FIXTURES: [(&str, &str); 22] = [
     (METADATA_KEY_TWO_KEY, METADATA_KEY_TWO_VALUE),
     (SHORT_CASE_KEY, SHORT_CASE_VALUE),
     (PADDED_SHORT_KEY, PADDED_SHORT_VALUE),
+    (SHORT_PORT_KEY, SHORT_PORT_VALUE),
 ];
 
 static RECORDED: Once = Once::new();
@@ -373,6 +383,44 @@ fn withheld_transformed_value_is_not_quoted() {
     assert!(
         !shown.starts_with('\'') && !shown.ends_with('\''),
         "withheld value must not be wrapped in quotes: {shown}"
+    );
+}
+
+/// A short canonical port is not a global candidate; listen/port sites withhold
+/// it key-tied through [`report_env_field`].
+///
+/// This is the admin/proxy-port leak the P2 named: `FERRUM_ADMIN_HTTP_PORT_FILE`
+/// holding `080` or ` 80` is re-rendered as `80` in startup logs, a form the
+/// length filter drops. Widening the candidate set to admit `80` would shred
+/// unrelated diagnostics, so the fix is provenance-exact withholding.
+#[test]
+fn withholds_short_canonical_port_by_key() {
+    arm_redaction();
+    // Non-vacuity: the textual pass genuinely cannot cover the canonical form.
+    assert_eq!(
+        redact_external_secret_values(SHORT_PORT_RENDERED),
+        SHORT_PORT_RENDERED,
+        "precondition: {SHORT_PORT_RENDERED} must not be a global candidate"
+    );
+    // Exact materialized value still is.
+    assert!(
+        redact_external_secret_values(SHORT_PORT_VALUE).contains(EXTERNAL_SECRET_PLACEHOLDER),
+        "the padded/zero-prefixed value as materialized must still redact"
+    );
+    let shown = report_env_field(SHORT_PORT_KEY, SHORT_PORT_RENDERED);
+    assert_eq!(
+        shown, EXTERNAL_SECRET_PLACEHOLDER,
+        "an externally resolved port key must withhold every rendering"
+    );
+    // Listener logs render a SocketAddr; the whole address is withheld by key.
+    assert_eq!(
+        report_env_field(SHORT_PORT_KEY, "0.0.0.0:80"),
+        EXTERNAL_SECRET_PLACEHOLDER
+    );
+    assert_eq!(
+        report_env_field("FERRUM_ADMIN_HTTP_PORT", SHORT_PORT_RENDERED),
+        SHORT_PORT_RENDERED,
+        "a non-external port key must keep its diagnostic"
     );
 }
 

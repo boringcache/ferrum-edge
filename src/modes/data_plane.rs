@@ -399,7 +399,13 @@ pub async fn run(
         let http_startup_ready = startup_ready.clone();
         let http_serving_degraded = serving_degraded.clone();
         let http_handle = tokio::spawn(async move {
-            info!("Starting HTTP proxy listener on {}", http_addr);
+            info!(
+                "Starting HTTP proxy listener on {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_PROXY_HTTP_PORT",
+                    &http_addr.to_string()
+                )
+            );
             if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
                 http_state,
@@ -435,7 +441,13 @@ pub async fn run(
         let https_startup_ready = startup_ready.clone();
         let https_serving_degraded = serving_degraded.clone();
         let https_handle = tokio::spawn(async move {
-            info!("Starting HTTPS proxy listener on {}", https_addr);
+            info!(
+                "Starting HTTPS proxy listener on {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_PROXY_HTTPS_PORT",
+                    &https_addr.to_string()
+                )
+            );
             if let Err(e) = proxy::start_proxy_listener_with_dynamic_tls_and_signal(
                 https_addr,
                 https_state,
@@ -486,7 +498,13 @@ pub async fn run(
             let h3_startup_ready = startup_ready.clone();
             let h3_serving_degraded = serving_degraded.clone();
             let h3_handle = tokio::spawn(async move {
-                info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
+                info!(
+                    "Starting HTTP/3 (QUIC) proxy listener on {}",
+                    crate::secrets::report_env_field(
+                        "FERRUM_PROXY_HTTPS_PORT",
+                        &h3_addr.to_string()
+                    )
+                );
                 if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
                     h3_addr,
                     h3_state,
@@ -585,7 +603,13 @@ pub async fn run(
         let admin_http_startup_ready = startup_ready.clone();
         let admin_http_serving_degraded = serving_degraded.clone();
         let admin_http_handle = tokio::spawn(async move {
-            info!("Starting Admin HTTP listener on {}", admin_http_addr);
+            info!(
+                "Starting Admin HTTP listener on {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_ADMIN_HTTP_PORT",
+                    &admin_http_addr.to_string()
+                )
+            );
             // The admin listener is one of the DP's own operational inputs (its
             // port comes from env, not CP-pushed config), so a bind failure is
             // the operator's misconfiguration and is fatal at startup via the
@@ -679,7 +703,13 @@ pub async fn run(
         let admin_https_serving_degraded = serving_degraded.clone();
 
         let admin_https_handle = tokio::spawn(async move {
-            info!("Starting Admin HTTPS listener on {}", admin_https_addr);
+            info!(
+                "Starting Admin HTTPS listener on {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_ADMIN_HTTPS_PORT",
+                    &admin_https_addr.to_string()
+                )
+            );
             // Bind failure is fatal at startup (start signal); a post-startup
             // serve error flips readiness to not-ready. Same rationale as the
             // plaintext admin listener above.

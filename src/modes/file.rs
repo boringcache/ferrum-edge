@@ -491,13 +491,19 @@ pub async fn run(
     if env_config.proxy_https_port != 8443 {
         info!(
             "Custom HTTPS port configured: {}",
-            env_config.proxy_https_port
+            crate::secrets::report_env_field(
+                "FERRUM_PROXY_HTTPS_PORT",
+                &env_config.proxy_https_port.to_string()
+            )
         );
     }
     if env_config.admin_https_port != 9443 {
         info!(
             "Custom admin HTTPS port configured: {}",
-            env_config.admin_https_port
+            crate::secrets::report_env_field(
+                "FERRUM_ADMIN_HTTPS_PORT",
+                &env_config.admin_https_port.to_string()
+            )
         );
     }
     if env_config.admin_tls_cert_path.is_some() || env_config.admin_tls_key_path.is_some() {
@@ -1124,7 +1130,13 @@ pub async fn serve(
         let lim = admin_conn_limiter.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let h = tokio::spawn(async move {
-            info!("Starting admin HTTP listener on {}", admin_http_addr);
+            info!(
+                "Starting admin HTTP listener on {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_ADMIN_HTTP_PORT",
+                    &admin_http_addr.to_string()
+                )
+            );
             admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 st,
@@ -1175,7 +1187,13 @@ pub async fn serve(
             let lim = admin_conn_limiter.clone();
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let h = tokio::spawn(async move {
-                info!("Starting admin HTTPS listener on {}", admin_https_addr);
+                info!(
+                    "Starting admin HTTPS listener on {}",
+                    crate::secrets::report_env_field(
+                        "FERRUM_ADMIN_HTTPS_PORT",
+                        &admin_https_addr.to_string()
+                    )
+                );
                 let result = if let Some(slot) = admin_tls_slot {
                     admin::start_admin_listener_with_dynamic_tls_and_signal(
                         admin_https_addr,
@@ -1231,7 +1249,13 @@ pub async fn serve(
         let sh = shutdown_tx.subscribe();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let h = tokio::spawn(async move {
-            info!("Starting HTTP proxy listener on {}", http_addr);
+            info!(
+                "Starting HTTP proxy listener on {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_PROXY_HTTP_PORT",
+                    &http_addr.to_string()
+                )
+            );
             proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
                 st,
@@ -1272,7 +1296,13 @@ pub async fn serve(
                 .and_then(|h| h.slot.clone());
             let cfg = Some(tls_cfg_arc.clone());
             let h = tokio::spawn(async move {
-                info!("Starting HTTPS proxy listener on {}", https_addr);
+                info!(
+                    "Starting HTTPS proxy listener on {}",
+                    crate::secrets::report_env_field(
+                        "FERRUM_PROXY_HTTPS_PORT",
+                        &https_addr.to_string()
+                    )
+                );
                 let result = if let Some(slot) = reload_slot {
                     proxy::start_proxy_listener_with_dynamic_tls_and_signal(
                         https_addr,
@@ -1344,7 +1374,13 @@ pub async fn serve(
                     proxy_frontend_reload_handles.as_ref(),
                 );
                 let h = tokio::spawn(async move {
-                    info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
+                    info!(
+                        "Starting HTTP/3 (QUIC) proxy listener on {}",
+                        crate::secrets::report_env_field(
+                            "FERRUM_PROXY_HTTPS_PORT",
+                            &h3_addr.to_string()
+                        )
+                    );
                     crate::http3::server::start_http3_listener_with_signal(
                         h3_addr,
                         st,

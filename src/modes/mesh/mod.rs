@@ -10504,7 +10504,13 @@ fn start_mesh_admin_listeners(
         let admin_serving_degraded = serving_degraded.clone();
         let admin_failures = serving_listener_failures.clone();
         handles.push(tokio::spawn(async move {
-            info!("Starting mesh admin HTTP listener on {}", admin_http_addr);
+            info!(
+                "Starting mesh admin HTTP listener on {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_ADMIN_HTTP_PORT",
+                    &admin_http_addr.to_string()
+                )
+            );
             if let Err(err) = admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 admin_state,
@@ -10569,7 +10575,13 @@ fn start_mesh_admin_listeners(
         let admin_serving_degraded = serving_degraded.clone();
         let admin_failures = serving_listener_failures.clone();
         handles.push(tokio::spawn(async move {
-            info!("Starting mesh admin HTTPS listener on {}", admin_https_addr);
+            info!(
+                "Starting mesh admin HTTPS listener on {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_ADMIN_HTTPS_PORT",
+                    &admin_https_addr.to_string()
+                )
+            );
             let result = if let Some(slot) = admin_tls_slot {
                 admin::start_admin_listener_with_dynamic_tls_and_signal(
                     admin_https_addr,

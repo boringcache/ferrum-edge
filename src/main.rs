@@ -766,7 +766,14 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                  IPs may connect, but operator bearer tokens still traverse cleartext on this \
                  port. Prefer admin over TLS (FERRUM_ADMIN_TLS_CERT_PATH / \
                  FERRUM_ADMIN_TLS_KEY_PATH) and disable plaintext with FERRUM_ADMIN_HTTP_PORT=0.",
-                env_config.admin_http_port, env_config.admin_bind_address
+                secrets::report_env_field(
+                    "FERRUM_ADMIN_HTTP_PORT",
+                    &env_config.admin_http_port.to_string()
+                ),
+                secrets::report_env_field(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    &env_config.admin_bind_address
+                )
             );
         }
         AdminHttpExposure::ReachableUnrestricted => {

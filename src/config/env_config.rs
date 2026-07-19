@@ -3737,8 +3737,14 @@ impl EnvConfig {
              and FERRUM_ADMIN_TLS_KEY_PATH, then FERRUM_ADMIN_HTTP_PORT=0; \
              or (4) for local development only — FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true.",
             mode = self.mode,
-            port = self.admin_http_port,
-            bind = self.admin_bind_address,
+            port = crate::secrets::report_env_field(
+                "FERRUM_ADMIN_HTTP_PORT",
+                &self.admin_http_port.to_string()
+            ),
+            bind = crate::secrets::report_env_field(
+                "FERRUM_ADMIN_BIND_ADDRESS",
+                &self.admin_bind_address
+            ),
         ))
     }
 

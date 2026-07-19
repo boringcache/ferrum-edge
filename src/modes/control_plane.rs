@@ -972,7 +972,13 @@ pub async fn run(
         let admin_http_startup_ready = startup_ready.clone();
         let admin_http_serving_degraded = serving_degraded.clone();
         Some(tokio::spawn(async move {
-            info!("Starting Admin HTTP listener on {}", admin_http_addr);
+            info!(
+                "Starting Admin HTTP listener on {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_ADMIN_HTTP_PORT",
+                    &admin_http_addr.to_string()
+                )
+            );
             if let Err(e) = admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 admin_state,
@@ -1064,7 +1070,13 @@ pub async fn run(
         let admin_https_serving_degraded = serving_degraded.clone();
 
         Some(tokio::spawn(async move {
-            info!("Starting Admin HTTPS listener on {}", admin_https_addr);
+            info!(
+                "Starting Admin HTTPS listener on {}",
+                crate::secrets::report_env_field(
+                    "FERRUM_ADMIN_HTTPS_PORT",
+                    &admin_https_addr.to_string()
+                )
+            );
             let result = if let Some(slot) = admin_tls_slot {
                 admin::start_admin_listener_with_dynamic_tls_and_signal(
                     admin_https_addr,

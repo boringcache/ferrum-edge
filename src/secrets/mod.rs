@@ -119,11 +119,15 @@ pub fn is_external_secret_key(key: &str) -> bool {
 /// field that interpolates some *other* externally resolved variable's value
 /// verbatim.
 ///
-/// Both disclosure surfaces that re-render a typed config value use this: the
+/// Disclosure surfaces that re-render a typed config value use this: the
 /// `validate` report's `Mode:` line (`cli::report_field`, a `println!` the
-/// tracing boundary never sees) and `run`'s `Operating mode:` record in
+/// tracing boundary never sees), `run`'s `Operating mode:` record in
 /// `main.rs` (which *does* reach [`redact_log_record`], but where the structural
-/// redactor cannot match the re-rendered form for the reason above). A new
+/// redactor cannot match the re-rendered form for the reason above), and
+/// startup listen/port lines that print a parsed integer or `SocketAddr`
+/// (`080` / ` 80` → `80`). That canonical scalar is often below
+/// [`RedactionPlan::MIN_DERIVED_CANDIDATE_LEN`], so the textual pass cannot
+/// cover it without globally arming every two-digit string. A new
 /// value-bearing startup line that re-renders a typed value must go through
 /// here and name the variable it came from.
 pub fn report_env_field(env_key: &str, rendered: &str) -> String {
@@ -875,9 +879,10 @@ impl RedactionPlan {
     ///
     /// The cost is real and is paid elsewhere: a whole-value transformation
     /// below the minimum (`FERRUM_MODE_FILE=DB` lowercased to `db`, `trim()` of
-    /// a padded one-character value, a short list segment) is the only
-    /// rendering an operator sees and the textual pass cannot cover it. Those
-    /// sites withhold **key-tied** instead — [`report_env_field`],
+    /// a padded one-character value, a short list segment, or a short
+    /// canonical port `080`/` 80` → `80`) is the only rendering an operator
+    /// sees and the textual pass cannot cover it. Those sites withhold
+    /// **key-tied** instead — [`report_env_field`],
     /// `config::env_config_macro::invalid_env_value`, and
     /// `config::env_config::OperatingMode::resolve` — which is exact on
     /// provenance and does not depend on length at all. A new hand-written

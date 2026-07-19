@@ -45,7 +45,7 @@ const REDACTED_REFERENCE: &str = "<redacted source reference>";
 /// cannot leak through the rewrite. Very short candidates are left alone: they
 /// carry no meaningful location and replacing a one- or two-character substring
 /// would corrupt unrelated text.
-fn redact_source_reference(mut error: String, reference: &str) -> String {
+fn redact_source_reference(error: String, reference: &str) -> String {
     const MIN_REDACTABLE_REFERENCE_LEN: usize = 3;
 
     let mut candidates = source_reference_candidates(reference);
@@ -53,12 +53,47 @@ fn redact_source_reference(mut error: String, reference: &str) -> String {
     candidates.dedup();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.len()));
 
-    for candidate in candidates {
-        if candidate.len() >= MIN_REDACTABLE_REFERENCE_LEN && error.contains(&candidate) {
-            error = error.replace(&candidate, REDACTED_REFERENCE);
+    // Single left-to-right pass over the *original* error. A `replace()` loop
+    // over the running message re-scans text it just inserted: a reference
+    // like `source#field` yields candidates `source#field` and `source`, so
+    // after the full reference becomes `<redacted source reference>` the
+    // later `source` pass mangles that placeholder. Matching the original
+    // keeps substitution single-pass and idempotent — the same rule
+    // resolved-value redaction uses — and the placeholder skip below covers a
+    // second call (or an error that already carried one).
+    let mut out = String::with_capacity(error.len());
+    let mut cursor = 0usize;
+    while cursor < error.len() {
+        let rest = &error[cursor..];
+
+        if rest.starts_with(REDACTED_REFERENCE)
+            && !candidates.iter().any(|candidate| {
+                candidate.len() >= REDACTED_REFERENCE.len()
+                    && rest.starts_with(candidate.as_str())
+            })
+        {
+            out.push_str(REDACTED_REFERENCE);
+            cursor += REDACTED_REFERENCE.len();
+            continue;
+        }
+
+        if let Some(matched) = candidates.iter().find(|candidate| {
+            candidate.len() >= MIN_REDACTABLE_REFERENCE_LEN && rest.starts_with(candidate.as_str())
+        }) {
+            out.push_str(REDACTED_REFERENCE);
+            cursor += matched.len();
+            continue;
+        }
+
+        match rest.chars().next() {
+            Some(next) => {
+                out.push(next);
+                cursor += next.len_utf8();
+            }
+            None => break,
         }
     }
-    error
+    out
 }
 
 /// Every string form of a source reference that a backend error can plausibly
@@ -1271,6 +1306,39 @@ mod tests {
         assert!(
             redacted.contains(REDACTED_REFERENCE),
             "expected the placeholder to be present: {redacted}"
+        );
+    }
+
+    /// A later, shorter candidate must not re-scan a placeholder an earlier
+    /// longer match just inserted.
+    ///
+    /// `source#field` yields both `source#field` and `source`. A `replace()`
+    /// loop over the running message turns the first hit into
+    /// `<redacted source reference>` and then the `source` pass mangles that
+    /// placeholder. Single-pass matching over the original error keeps the
+    /// placeholder intact.
+    #[test]
+    fn redact_source_reference_does_not_mangle_its_own_placeholder() {
+        let error =
+            "backend failed for source#field: permission denied (source unavailable)".to_string();
+        let redacted = redact_source_reference(error, "source#field");
+        assert!(
+            !redacted.contains("source#field"),
+            "the full reference must not survive: {redacted}"
+        );
+        assert_eq!(
+            redacted.matches(REDACTED_REFERENCE).count(),
+            2,
+            "both the full reference and the bare path half must redact once each: {redacted}"
+        );
+        assert!(
+            !redacted.contains(&format!("<redacted {REDACTED_REFERENCE}")),
+            "placeholder must not be re-redacted: {redacted}"
+        );
+        // Idempotent: a second pass leaves the message byte-for-byte identical.
+        assert_eq!(
+            redact_source_reference(redacted.clone(), "source#field"),
+            redacted
         );
     }
 
