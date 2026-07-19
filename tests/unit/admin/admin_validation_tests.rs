@@ -667,6 +667,21 @@ fn test_basic_auth_audit_redaction_uses_one_shape_independent_marker() {
 }
 
 #[test]
+fn test_audit_redaction_omits_unknown_credential_values() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "custom_auth".to_string(),
+        json!([{"api_token": "audit-must-not-disclose-this-secret"}]),
+    );
+    let consumer = make_consumer(credentials);
+
+    let redacted = ferrum_edge::config::types::redact_consumer_credentials_for_audit(&consumer);
+    assert!(!redacted.credentials.contains_key("custom_auth"));
+    let serialized = serde_json::to_string(&redacted).expect("redacted consumer serializes");
+    assert!(!serialized.contains("audit-must-not-disclose-this-secret"));
+}
+
+#[test]
 fn test_redact_hmac_auth_secret() {
     let mut credentials = std::collections::HashMap::new();
     credentials.insert(
@@ -677,8 +692,8 @@ fn test_redact_hmac_auth_secret() {
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
     let hmac = redacted.credentials.get("hmac_auth").unwrap();
-    assert_eq!(hmac["secret"], "[REDACTED]");
-    assert_eq!(hmac["username"], "bob");
+    assert_eq!(hmac[0]["secret"], "[REDACTED]");
+    assert!(hmac[0].get("username").is_none());
 }
 
 #[test]
@@ -692,8 +707,8 @@ fn test_redact_jwt_secret() {
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
     let jwt = redacted.credentials.get("jwt").unwrap();
-    assert_eq!(jwt["secret"], "[REDACTED]");
-    assert_eq!(jwt["algorithm"], "HS256");
+    assert_eq!(jwt[0]["secret"], "[REDACTED]");
+    assert!(jwt[0].get("algorithm").is_none());
 }
 
 #[test]
@@ -704,7 +719,7 @@ fn test_redact_keyauth_key() {
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
     let keyauth = redacted.credentials.get("keyauth").unwrap();
-    assert_eq!(keyauth["key"], "[REDACTED]");
+    assert_eq!(keyauth[0]["key"], "[REDACTED]");
 }
 
 #[test]
@@ -724,8 +739,14 @@ fn test_redact_multiple_credential_types() {
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
 
     assert!(!redacted.credentials.contains_key("basicauth"));
-    assert_eq!(redacted.credentials["hmac_auth"]["secret"], "[REDACTED]");
-    assert_eq!(redacted.credentials["keyauth"]["key"], "[REDACTED]");
+    assert_eq!(
+        redacted.credentials["hmac_auth"][0]["secret"],
+        "[REDACTED]"
+    );
+    assert_eq!(
+        redacted.credentials["keyauth"][0]["key"],
+        "[REDACTED]"
+    );
 }
 
 #[test]
@@ -739,7 +760,7 @@ fn test_redact_mtls_identity_unchanged() {
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
     assert_eq!(
-        redacted.credentials["mtls_auth"]["identity"],
+        redacted.credentials["mtls_auth"][0]["identity"],
         "CN=client.example.com"
     );
 }
@@ -770,9 +791,9 @@ fn test_redact_array_jwt_secrets() {
     let arr = jwt.as_array().unwrap();
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["secret"], "[REDACTED]");
-    assert_eq!(arr[0]["algorithm"], "HS256");
+    assert!(arr[0].get("algorithm").is_none());
     assert_eq!(arr[1]["secret"], "[REDACTED]");
-    assert_eq!(arr[1]["algorithm"], "HS256");
+    assert!(arr[1].get("algorithm").is_none());
 }
 
 #[test]

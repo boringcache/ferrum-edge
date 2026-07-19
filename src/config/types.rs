@@ -190,8 +190,8 @@ fn basic_auth_credential_error(
     if let Some(password) = credential.get("password") {
         return match password.as_str() {
             Some("") => Some("password must not be empty"),
-            Some(password) if password.len() > MAX_CREDENTIAL_VALUE_LENGTH => {
-                Some("password must not exceed 4096 bytes")
+            Some(password) if password.chars().count() > MAX_CREDENTIAL_VALUE_LENGTH => {
+                Some("password must not exceed 4096 characters")
             }
             Some(password) if contains_control_chars(password) => {
                 Some("password must not contain control characters")
@@ -7005,11 +7005,7 @@ impl Consumer {
                 }
                 for (key, val) in *obj {
                     if let Some(s) = val.as_str() {
-                        let value_length = if cred_type == "jwt" && key == "secret" {
-                            s.chars().count()
-                        } else {
-                            s.len()
-                        };
+                        let value_length = s.chars().count();
                         if value_length > MAX_CREDENTIAL_VALUE_LENGTH {
                             errors.push(format!(
                                 "{}.{} must not exceed {} characters (got {})",
@@ -7077,36 +7073,73 @@ fn record_consumer_identity<'a>(
 pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     let mut redacted = consumer.clone();
 
-    fn redact_field(cred_value: &mut serde_json::Value, field: &str) {
-        match cred_value {
-            serde_json::Value::Array(arr) => {
-                for entry in arr {
-                    if let Some(obj) = entry.as_object_mut()
-                        && obj.contains_key(field)
-                    {
-                        obj.insert(field.to_string(), serde_json::json!("[REDACTED]"));
-                    }
-                }
+    fn entry_objects(
+        credential_value: &serde_json::Value,
+    ) -> Vec<&serde_json::Map<String, serde_json::Value>> {
+        match credential_value {
+            serde_json::Value::Array(entries) => {
+                entries.iter().filter_map(serde_json::Value::as_object).collect()
             }
-            serde_json::Value::Object(obj) if obj.contains_key(field) => {
-                obj.insert(field.to_string(), serde_json::json!("[REDACTED]"));
-            }
-            _ => {}
+            serde_json::Value::Object(object) => vec![object],
+            _ => Vec::new(),
         }
     }
 
-    // Basic credentials have a strict request/backup schema. Omit the entire
-    // credential type from ordinary Consumer responses so those responses do
-    // not expose values or return a pattern-invalid redaction placeholder.
-    redacted.credentials.remove("basicauth");
-    if let Some(hmac) = redacted.credentials.get_mut("hmac_auth") {
-        redact_field(hmac, "secret");
+    fn secret_placeholders(
+        credential_value: &serde_json::Value,
+        field: &str,
+    ) -> Option<serde_json::Value> {
+        let entries: Vec<_> = entry_objects(credential_value)
+            .into_iter()
+            .map(|_| serde_json::json!({(field): "[REDACTED]"}))
+            .collect();
+        (!entries.is_empty()).then(|| serde_json::Value::Array(entries))
     }
-    if let Some(jwt) = redacted.credentials.get_mut("jwt") {
-        redact_field(jwt, "secret");
+
+    fn visible_mtls_identities(
+        credential_value: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let entries: Vec<_> = entry_objects(credential_value)
+            .into_iter()
+            .filter_map(|entry| entry.get("identity").and_then(serde_json::Value::as_str))
+            .filter(|identity| {
+                !identity.trim().is_empty()
+                    && identity.chars().count() <= MAX_CREDENTIAL_VALUE_LENGTH
+                    && !contains_control_chars(identity)
+            })
+            .map(|identity| serde_json::json!({"identity": identity}))
+            .collect();
+        (!entries.is_empty()).then(|| serde_json::Value::Array(entries))
     }
-    if let Some(key) = redacted.credentials.get_mut("keyauth") {
-        redact_field(key, "key");
+
+    // Ordinary responses are a deliberately closed projection. Rebuild the
+    // credential map from known, explicitly safe fields so legacy extra fields
+    // and unknown/custom credential values cannot cross the management
+    // boundary. Input, persistence, backup, and restore retain the original
+    // credential map; this projection affects ordinary responses and audit
+    // events only.
+    redacted.credentials.clear();
+    for (cred_type, field) in [
+        ("keyauth", "key"),
+        ("jwt", "secret"),
+        ("hmac_auth", "secret"),
+    ] {
+        if let Some(entries) = consumer
+            .credentials
+            .get(cred_type)
+            .and_then(|value| secret_placeholders(value, field))
+        {
+            redacted.credentials.insert(cred_type.to_string(), entries);
+        }
+    }
+    if let Some(entries) = consumer
+        .credentials
+        .get("mtls_auth")
+        .and_then(visible_mtls_identities)
+    {
+        redacted
+            .credentials
+            .insert("mtls_auth".to_string(), entries);
     }
 
     redacted

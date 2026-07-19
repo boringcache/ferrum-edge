@@ -2215,6 +2215,7 @@ fn test_validate_fields_rejects_malformed_or_weak_hmac_secrets() {
         serde_json::json!({"secret": ""}),
         serde_json::json!({"secret": "                                "}),
         serde_json::json!({"secret": "short-secret"}),
+        serde_json::json!({"secret": format!("{}{}", "h".repeat(31), " ".repeat(64))}),
         serde_json::json!({"secret": "valid-hmac-secret-at-least-32-characters", "extra": true}),
     ] {
         let mut consumer = make_consumer("c1", "alice");
@@ -2240,6 +2241,43 @@ fn test_validate_fields_accepts_strong_hmac_rotation_entries() {
         ]),
     );
     assert!(consumer.validate_fields().is_ok());
+}
+
+#[test]
+fn test_validate_fields_credential_maxima_use_unicode_characters() {
+    let max = ferrum_edge::config::types::MAX_CREDENTIAL_VALUE_LENGTH;
+    for (cred_type, field) in [
+        ("basicauth", "password"),
+        ("keyauth", "key"),
+        ("hmac_auth", "secret"),
+        ("mtls_auth", "identity"),
+    ] {
+        let mut accepted = make_consumer("accepted", "alice");
+        accepted.credentials.insert(
+            cred_type.into(),
+            serde_json::json!([{(field): "🔐".repeat(max)}]),
+        );
+        assert!(
+            accepted.validate_fields().is_ok(),
+            "{cred_type}.{field} must accept {max} multibyte characters"
+        );
+
+        let mut rejected = make_consumer("rejected", "bob");
+        rejected.credentials.insert(
+            cred_type.into(),
+            serde_json::json!([{(field): "🔐".repeat(max + 1)}]),
+        );
+        let errors = rejected
+            .validate_fields()
+            .expect_err("4097 credential characters must be rejected");
+        assert!(
+            errors.iter().any(|error| error.contains(&format!(
+                "credentials.{cred_type}[0].{field} must not exceed {max} characters (got {})",
+                max + 1
+            ))),
+            "unexpected errors for {cred_type}.{field}: {errors:?}"
+        );
+    }
 }
 
 #[test]

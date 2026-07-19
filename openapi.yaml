@@ -5986,6 +5986,8 @@ components:
             Redacted JSON diff for the successful mutation. Basic credential
             changes expose only the credential type, action, and a stable
             `[REDACTED]` marker, never values, entry fields, shape, or count.
+            Unknown/custom credential types are omitted from audit payloads so
+            their unmodeled values cannot be disclosed.
             Sensitive plugin configuration is also redacted; loki_logging
             endpoint paths/queries, authorization, and custom-header values
             are never persisted.
@@ -6609,7 +6611,9 @@ components:
         Consumer CRUD and credential-mutation endpoints. Credential secrets are
         redacted per `ConsumerCredentialsRedacted`: `basicauth` is omitted
         entirely and `keyauth`/`jwt`/`hmac_auth` secret fields carry the exact
-        `[REDACTED]` placeholder.
+        `[REDACTED]` placeholder. Unknown/custom credential types and legacy
+        extra entry fields are omitted from this ordinary response projection.
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ConsumerBase"
         - type: object
@@ -6623,6 +6627,7 @@ components:
         items in `POST /batch`. Credential values are write-only inputs:
         plaintext `basicauth` `password` fields are hashed on write and stored
         secrets are never returned by ordinary Consumer responses.
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ConsumerBase"
         - type: object
@@ -6636,6 +6641,7 @@ components:
         unredacted stored values (`basicauth` entries carry the stored
         `password_hash`; plaintext passwords are never exported) suitable for
         disaster-recovery restoration via `POST /restore`.
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ConsumerBase"
         - type: object
@@ -6649,6 +6655,7 @@ components:
         canonical stored values produced by `GET /backup`; `basicauth` entries
         may instead supply a plaintext `password`, which is hashed before
         storage exactly as on create/update.
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ConsumerBase"
         - type: object
@@ -6714,6 +6721,8 @@ components:
         and replace the `keyauth` `key`, `jwt` `secret`, and `hmac_auth`
         `secret` fields with the exact `[REDACTED]` placeholder string.
         `mtls_auth.identity` is a non-secret lookup key and remains visible.
+        Unknown/custom credential types and legacy extra fields are omitted so
+        ordinary responses expose only the explicitly modeled safe projection.
         `GET /backup` is the only surface that returns canonical unredacted
         values.
       properties:
@@ -6742,11 +6751,7 @@ components:
             $ref: "#/components/schemas/MtlsAuthCredential"
           minItems: 1
           description: Multiple mTLS identities for zero-downtime rotation. Each `identity` must be globally unique.
-      additionalProperties:
-        type: array
-        items:
-          type: object
-        minItems: 1
+      additionalProperties: false
 
     ConsumerCredentialsBackup:
       type: object
@@ -6847,10 +6852,14 @@ components:
         key:
           type: string
           minLength: 1
-          pattern: "\\S"
+          maxLength: 4096
+          allOf:
+            - pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+            - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           description: >-
-            API key value. Must be non-empty after trimming and globally unique
-            across all consumers.
+            API key value. Must be non-empty after trimming, no more than 4096
+            characters, free of disallowed ASCII control bytes, and globally
+            unique across all consumers.
       description: "API key credential for the `key_auth` authentication plugin."
 
     BasicAuthCredential:
@@ -6918,12 +6927,17 @@ components:
         secret:
           type: string
           minLength: 32
+          maxLength: 4096
+          allOf:
+            - pattern: '^(?:[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]){32}'
+            - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           writeOnly: true
           description: >-
             Shared secret for HMAC signature computation and verification. Must
-            contain at least 32 non-whitespace characters and must not be
-            shared by different Consumers within one namespace. Separate
-            namespaces may reuse the same secret.
+            contain 32-4096 characters, at least 32 of which are
+            non-whitespace, and must not contain disallowed ASCII control
+            bytes or be shared by different Consumers within one namespace.
+            Separate namespaces may reuse the same secret.
       description: >-
         HMAC auth credential for the `hmac_auth` plugin. Consumer is looked up
         by username within the matched proxy namespace; all secrets are tried
@@ -6938,7 +6952,9 @@ components:
           type: string
           minLength: 1
           maxLength: 4096
-          pattern: '.*\S.*'
+          allOf:
+            - pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+            - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           description: >-
             Certificate field value to match against the client certificate
             (e.g., CN, SAN DNS name, fingerprint, or serial). The field
@@ -6968,6 +6984,7 @@ components:
     KeyAuthCredentialRedacted:
       type: object
       required: [key]
+      additionalProperties: false
       properties:
         key:
           type: string
@@ -7016,10 +7033,14 @@ components:
         key:
           type: string
           minLength: 1
-          pattern: "\\S"
+          maxLength: 4096
+          allOf:
+            - pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+            - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           description: >-
-            Canonical stored API key, carried unredacted in backup and restore
-            payloads.
+            Canonical stored API key (1-4096 characters, non-whitespace and
+            free of disallowed ASCII control bytes), carried unredacted in
+            backup and restore payloads.
       description: >-
         `keyauth` entry in backup/restore payloads: the canonical unredacted
         stored API key.
@@ -7052,9 +7073,14 @@ components:
         secret:
           type: string
           minLength: 32
+          maxLength: 4096
+          allOf:
+            - pattern: '^(?:[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]){32}'
+            - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           description: >-
-            Canonical stored HMAC secret (at least 32 characters), carried
-            unredacted in backup and restore payloads.
+            Canonical stored HMAC secret (32-4096 characters, including at
+            least 32 non-whitespace characters, and no disallowed ASCII
+            control bytes), carried unredacted in backup and restore payloads.
       description: >-
         `hmac_auth` entry in backup/restore payloads: the canonical unredacted
         stored secret.
@@ -7081,7 +7107,9 @@ components:
         Single credential entry accepted by the credential mutation endpoints.
         The expected shape is determined by the `{cred_type}` path parameter;
         plaintext `basicauth` `password` values are hashed on write and never
-        returned.
+        returned. OpenAPI cannot condition a request-body schema on a path
+        parameter, so this union lists every allowed entry shape and the server
+        enforces that the selected shape matches `{cred_type}`.
       anyOf:
         - $ref: "#/components/schemas/KeyAuthCredential"
         - $ref: "#/components/schemas/BasicAuthCredential"
