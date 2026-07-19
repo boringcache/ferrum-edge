@@ -616,9 +616,7 @@ pub(crate) fn effective_response_media_type<'a>(
     if pristine_proves_framing {
         return content_type;
     }
-    let Some(representation) = super::grpc_web::client_grpc_framing_representation(ctx) else {
-        return None;
-    };
+    let representation = super::grpc_web::client_grpc_framing_representation(ctx)?;
     let framed = super::grpc_web::bytes_are_complete_grpc_frames(body, representation);
     framed.then_some(live)
 }
