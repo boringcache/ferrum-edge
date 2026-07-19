@@ -2631,19 +2631,42 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
         let mut parts = pair.splitn(2, '=');
         let raw_key = parts.next().unwrap_or("");
         let raw_val = parts.next().unwrap_or("");
-        // URL-decode both names and values. Decoding only values lets encoded
-        // pagination names bypass this endpoint's narrower `u32` offset bound
-        // (e.g. `?%6fffset=` aliasing `offset`), so names are decoded too.
-        // Invalid UTF-8 sequences in percent-encoded *values* are rejected with
-        // 400 to prevent bypassing downstream character-validation checks (e.g.
-        // the `title_contains` wildcard rejection below). A *name* that does not
-        // decode to valid UTF-8 cannot alias any recognized ASCII filter name,
-        // so it is an unknown parameter and is ignored like every other unknown
-        // key rather than failing the request.
-        let val = percent_decode(raw_val)?;
+        // URL-decode both names and values, NAME FIRST. Decoding only values
+        // lets encoded pagination names bypass this endpoint's narrower `u32`
+        // offset bound (e.g. `?%6fffset=` aliasing `offset`), so names are
+        // decoded too. A *name* that does not decode to valid UTF-8 cannot
+        // alias any recognized ASCII filter name, so it is an unknown parameter
+        // and is ignored like every other unknown key.
         let Ok(key) = percent_decode(raw_key) else {
             continue;
         };
+
+        // Whether the name is recognized is decided BEFORE its value is
+        // decoded, and the value of an ignored name is never decoded at all.
+        // Otherwise a parameter that is ignored anyway (`?%80=%80`, or any
+        // third-party `?unknown=%80`) would still fail the request on its
+        // value. Invalid UTF-8 in the value of a *recognized* name stays a
+        // strict 400: decoding it is what stops percent-encoded bytes from
+        // bypassing the character-validation checks below (e.g. the
+        // `title_contains` LIKE-wildcard rejection).
+        //
+        // Keep this list in sync with the recognized arms of the match below;
+        // a name missing here is silently ignored.
+        if !matches!(
+            key.as_str(),
+            "limit"
+                | "offset"
+                | "proxy_id"
+                | "spec_version"
+                | "title_contains"
+                | "updated_since"
+                | "has_tag"
+                | "sort_by"
+                | "order"
+        ) {
+            continue;
+        }
+        let val = percent_decode(raw_val)?;
 
         match key.as_str() {
             // `/api-specs` keeps its own stricter bounds (default 50, max 200)

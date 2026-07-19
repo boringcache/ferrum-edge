@@ -814,6 +814,50 @@ fn parse_pagination(uri: &hyper::Uri) -> Result<PaginationParams, Box<Response<F
     Ok(PaginationParams { offset, limit })
 }
 
+/// Narrow a shared `i64` pagination offset to the `u32` the audit store
+/// indexes by, producing the documented audit 400 when it does not fit.
+///
+/// Shared by `parse_audit_filter` and the pre-body validation in
+/// [`enforce_route_pagination_bounds`] so the two paths cannot report different
+/// results for the same request.
+fn audit_pagination_offset(offset: i64) -> Result<u32, Box<Response<Full<Bytes>>>> {
+    u32::try_from(offset).map_err(|_| {
+        Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Audit offset exceeds supported range"}),
+        ))
+    })
+}
+
+/// Apply the route-specific pagination ceilings that are narrower than the
+/// shared [`parse_pagination`] contract.
+///
+/// `parse_pagination` accepts any offset up to `i64::MAX`, but some routes
+/// narrow it further inside their handler. Replaying those ceilings in the
+/// pre-body path keeps its verdict identical to the one the route arm reaches
+/// after the body read — otherwise a request that the arm would reject with the
+/// documented `400` instead buffers an unused body and returns `413`.
+///
+/// Keep this in sync with the per-route narrowing the handlers perform; every
+/// route listed here must also appear in [`paginated_get_list_route_role`], or
+/// the bound is never reached before the body read.
+fn enforce_route_pagination_bounds(
+    segments: &[&str],
+    pagination: &PaginationParams,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    match segments {
+        // `parse_audit_filter` narrows the offset to the audit store's `u32`.
+        // `limit` needs no extra bound: `parse_pagination` already caps it at
+        // `MAX_PAGE_SIZE`, so the arm's `clamp(1, MAX_PAGE_SIZE) as u32` is
+        // infallible.
+        ["audit"] => {
+            audit_pagination_offset(pagination.offset)?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Return a representable, strictly advancing cursor only when more rows
 /// remain. `None` prevents clients from looping at the `u32` ceiling or when a
 /// backend unexpectedly returns an empty page before its reported total.
@@ -1636,7 +1680,18 @@ pub async fn handle_admin_request(
                     return Ok(resp);
                 }
                 match parse_pagination(&uri) {
-                    Ok(pagination) => Some(pagination),
+                    Ok(pagination) => {
+                        // Routes whose handler narrows the shared bounds must
+                        // apply that ceiling here too, or their documented 400
+                        // is still preempted by the body-size 413 below.
+                        if let Err(response) =
+                            enforce_route_pagination_bounds(segments_peek.as_slice(), &pagination)
+                        {
+                            drop(req.into_body());
+                            return Ok(*response);
+                        }
+                        Some(pagination)
+                    }
                     Err(response) => {
                         drop(req.into_body());
                         return Ok(*response);
@@ -7124,12 +7179,9 @@ fn parse_audit_filter(
     query: Option<&str>,
     pagination: &PaginationParams,
 ) -> Result<audit::AuditListFilter, Box<Response<Full<Bytes>>>> {
-    let offset = u32::try_from(pagination.offset).map_err(|_| {
-        Box::new(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "Audit offset exceeds supported range"}),
-        ))
-    })?;
+    // Shared with the pre-body check in `enforce_route_pagination_bounds`, so a
+    // too-large offset yields this same 400 whether or not a body was sent.
+    let offset = audit_pagination_offset(pagination.offset)?;
     let mut filter = audit::AuditListFilter {
         limit: pagination.limit.clamp(1, MAX_PAGE_SIZE) as u32,
         offset,

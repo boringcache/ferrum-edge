@@ -321,7 +321,12 @@ value defaulting to 0. As everywhere else, malformed or negative
 `limit`/`offset` values, limits beyond the unsigned 64-bit range, and offsets
 above `2^32 - 1` are rejected with HTTP 400 rather than coerced to a default.
 Percent-encoded query parameter names are decoded before matching, so encoding
-`limit` or `offset` cannot bypass these bounds.
+`limit` or `offset` cannot bypass these bounds. Names are decoded before values:
+a name that is not one of the recognized filters below — including one whose
+percent-encoding is not valid UTF-8 — is ignored without decoding its value, so
+unrelated third-party query parameters never break the request. Malformed
+percent-encoding in the value of a *recognized* filter is still rejected with
+HTTP 400.
 
 It supports the following query parameters in addition to `limit` and `offset`:
 

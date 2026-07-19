@@ -3550,10 +3550,12 @@ async fn list_endpoint_malformed_pagination_returns_400() {
     }
 }
 
-/// Unknown query parameters stay ignored even when their *name* cannot be
-/// percent-decoded to valid UTF-8. Such a name cannot alias any recognized
-/// ASCII filter, so it must not fail an otherwise valid request — clients
-/// routinely append unrelated parameters.
+/// Unknown query parameters stay ignored even when their *name* or their
+/// *value* cannot be percent-decoded to valid UTF-8. An undecodable name cannot
+/// alias any recognized ASCII filter, so it is unknown; and because the name is
+/// matched before the value is decoded, an ignored parameter's value is never
+/// decoded at all. Neither may fail an otherwise valid request — clients
+/// routinely append unrelated parameters. Recognized filters stay strict.
 #[tokio::test]
 async fn list_endpoint_ignores_undecodable_unknown_query_keys() {
     let dir = TempDir::new().unwrap();
@@ -3574,6 +3576,54 @@ async fn list_endpoint_ignores_undecodable_unknown_query_keys() {
     let (status, body) = client.get_json("/api-specs?%80=1&limit=7").await;
     assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
     assert_eq!(body["limit"], 7, "sibling recognized key still parsed");
+
+    // The *value* of an ignored key is never decoded, so an undecodable value
+    // on an ignored name cannot fail the request either. Both orderings are
+    // asserted: whether the ignored pair precedes or follows a recognized one
+    // must not change the outcome.
+    for query in [
+        // Undecodable name AND undecodable value.
+        "/api-specs?%80=%80",
+        // Decodable but unrecognized name with an undecodable value — clients
+        // routinely append third-party parameters carrying arbitrary bytes.
+        "/api-specs?tracking_id=%80",
+        "/api-specs?%80=%80&limit=7",
+        "/api-specs?limit=7&%80=%80",
+        "/api-specs?limit=7&tracking_id=%80",
+    ] {
+        let (status, body) = client.get_json(query).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "{query}: an ignored key must never be rejected on its value: {body}"
+        );
+    }
+
+    // ...and the recognized sibling is still applied in either order.
+    for query in ["/api-specs?%80=%80&limit=7", "/api-specs?limit=7&%80=%80"] {
+        let (_, body) = client.get_json(query).await;
+        assert_eq!(body["limit"], 7, "{query}: recognized sibling still parsed");
+    }
+
+    // Every recognized name stays strict on an undecodable value; ignoring a
+    // value must never extend to a filter that is actually consumed.
+    for query in [
+        "/api-specs?offset=%80",
+        "/api-specs?proxy_id=%80",
+        "/api-specs?spec_version=%80",
+        "/api-specs?title_contains=%80",
+        "/api-specs?updated_since=%80",
+        "/api-specs?has_tag=%80",
+        "/api-specs?sort_by=%80",
+        "/api-specs?order=%80",
+    ] {
+        let (status, body) = client.get_json(query).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{query}: recognized keys keep strict value decoding: {body}"
+        );
+    }
 
     // Recognized keys stay strict: a malformed *value* is still a 400, and an
     // encoded name that DOES decode to a recognized key is still bound-checked

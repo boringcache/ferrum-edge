@@ -6663,6 +6663,70 @@ async fn malformed_pagination_on_get_list_precedes_body_buffering() {
     );
 }
 
+/// `/audit` narrows the shared `i64` offset to the audit store's `u32`. That
+/// route-specific ceiling has to be replayed in the pre-body gate too, or an
+/// offset the handler would reject with `400` instead buffers an unused body
+/// and returns `413`.
+#[tokio::test]
+async fn audit_offset_ceiling_precedes_body_buffering() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // u32::MAX + 1: inside the shared parser's range, outside the audit store's.
+    let (status, body) = admin_request_with_body(
+        reqwest::Method::GET,
+        &base_url,
+        "/audit?offset=4294967296",
+        Some(&token),
+        OVERSIZED_BODY,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "audit offset ceiling must precede the body read: {body:?}"
+    );
+    assert_eq!(
+        body["error"], "Audit offset exceeds supported range",
+        "pre-body rejection must reuse the handler's message: {body:?}"
+    );
+
+    // Without a body the same request reports the identical error, so the two
+    // paths through `audit_pagination_offset` cannot diverge.
+    let (status, body, _) = admin_get(&base_url, "/audit?offset=4294967296", &token).await;
+    assert_eq!(status, 400, "no-body audit offset: {body:?}");
+    assert_eq!(body["error"], "Audit offset exceeds supported range");
+
+    // The bound is exact: `u32::MAX` is still accepted, so the oversized body
+    // reaches the shared reader and its `413` — proving the `400` above came
+    // from the ceiling, not from a blanket rejection of the route.
+    let (status, body) = admin_request_with_body(
+        reqwest::Method::GET,
+        &base_url,
+        "/audit?offset=4294967295",
+        Some(&token),
+        OVERSIZED_BODY,
+    )
+    .await;
+    assert_eq!(
+        status, 413,
+        "u32::MAX offset is in range and must not be pre-rejected: {body:?}"
+    );
+
+    // Unrelated list routes keep the wider `i64` contract: the same offset is a
+    // valid request beyond the collection, not a `400`.
+    let (status, body, _) = admin_get(&base_url, "/proxies?offset=4294967296", &token).await;
+    assert_eq!(
+        status, 200,
+        "the audit ceiling must not narrow other routes: {body:?}"
+    );
+    assert!(
+        body["data"].as_array().unwrap().is_empty(),
+        "offset beyond the collection returns an empty page: {body:?}"
+    );
+}
+
 /// The pre-body pagination gate must not reorder the security checks ahead of
 /// it: an unauthenticated caller still gets `401` and an under-privileged one
 /// still gets `403`, even when the pagination is malformed.
