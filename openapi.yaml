@@ -239,6 +239,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TlsInventoryListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -323,6 +325,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AcmeCertificateRecordListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -444,6 +448,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AcmeOrderListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -500,6 +506,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AcmeAccountListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -636,6 +644,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecordListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -747,6 +757,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecordListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -857,6 +869,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecordListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -967,6 +981,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecordListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1077,6 +1093,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecordListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -3034,6 +3052,16 @@ paths:
         the diff. Basic credential
         mutations remain visible by type and action, but values, entry fields,
         shape, and count are replaced by one stable `[REDACTED]` marker.
+
+        `limit` follows the shared bounds (default 100, maximum 1000), but this
+        endpoint's `offset` ceiling is narrower than the shared
+        `PaginationOffset` description: the audit store indexes offsets as a
+        32-bit value, so an `offset` above 4294967295 is rejected with `400`
+        even though other list endpoints accept it up to 2^63 - 1. The audit
+        response uses its own `{items, limit, offset, next_offset, total}`
+        envelope rather than the shared `data`/`pagination` envelope.
+        `next_offset` is `null` when the next page does not exist or its cursor
+        cannot be represented without exceeding the 32-bit ceiling.
       tags: [Audit]
       parameters:
         - name: actor
@@ -3069,7 +3097,18 @@ paths:
             type: string
             format: date-time
         - $ref: "#/components/parameters/PaginationLimit"
-        - $ref: "#/components/parameters/PaginationOffset"
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: uint32
+            minimum: 0
+            maximum: 4294967295
+            default: 0
+          description: |
+            Number of audit events to skip. Negative, non-integer, or values
+            above 4294967295 are rejected with `400`.
       responses:
         "200":
           description: Paginated audit events
@@ -3400,7 +3439,7 @@ paths:
       - $ref: "#/components/parameters/XFerrumNamespace"
     get:
       operationId: listProxies
-      summary: List all proxies
+      summary: List proxies (paginated)
       description: |
         Falls back to cached config when the database is unavailable.
 
@@ -3429,6 +3468,8 @@ paths:
                       $ref: "#/components/schemas/Proxy"
                   pagination:
                     $ref: "#/components/schemas/Pagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -3585,7 +3626,7 @@ paths:
       - $ref: "#/components/parameters/XFerrumNamespace"
     get:
       operationId: listConsumers
-      summary: List all consumers
+      summary: List consumers (paginated)
       description: |
         Returns a paginated envelope with `data` and `pagination` fields.
       tags: [Consumers]
@@ -3612,6 +3653,8 @@ paths:
                       $ref: "#/components/schemas/Consumer"
                   pagination:
                     $ref: "#/components/schemas/Pagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -4020,7 +4063,7 @@ paths:
       - $ref: "#/components/parameters/XFerrumNamespace"
     get:
       operationId: listPluginConfigs
-      summary: List all plugin configurations
+      summary: List plugin configurations (paginated)
       description: |
         Returns a paginated envelope with `data` and `pagination` fields.
       tags: [Plugins]
@@ -4047,6 +4090,8 @@ paths:
                       $ref: "#/components/schemas/PluginConfig"
                   pagination:
                     $ref: "#/components/schemas/Pagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -4168,7 +4213,7 @@ paths:
       - $ref: "#/components/parameters/XFerrumNamespace"
     get:
       operationId: listUpstreams
-      summary: List all upstreams
+      summary: List upstreams (paginated)
       description: |
         Returns a paginated envelope with `data` and `pagination` fields.
       tags: [Upstreams]
@@ -4195,6 +4240,8 @@ paths:
                       $ref: "#/components/schemas/Upstream"
                   pagination:
                     $ref: "#/components/schemas/Pagination"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -4357,18 +4404,27 @@ paths:
           required: false
           schema:
             type: integer
-            minimum: 1
-            maximum: 200
+            format: uint64
+            minimum: 0
+            maximum: 18446744073709551615
             default: 50
-          description: Maximum number of items to return (max 200).
+          description: |
+            Maximum number of items to return. `0` selects the default of 50;
+            values above 200 are accepted and capped at 200. Negative,
+            non-integer, or values beyond the unsigned 64-bit range are
+            rejected with `400`.
         - name: offset
           in: query
           required: false
           schema:
             type: integer
+            format: uint32
             minimum: 0
+            maximum: 4294967295
             default: 0
-          description: Number of items to skip.
+          description: |
+            Number of items to skip. Negative, non-integer, or values above
+            4294967295 are rejected with `400`.
         - name: proxy_id
           in: query
           required: false
@@ -4443,7 +4499,11 @@ paths:
                 $ref: "#/components/schemas/ApiSpecListResponse"
         "400":
           description: |
-            Invalid query parameter — for example, an unknown `sort_by` value.
+            Invalid query parameter — an unknown `sort_by` value, a SQL `LIKE`
+            wildcard in a text filter, or a malformed `limit`/`offset`. As on
+            every other list endpoint, malformed pagination is rejected rather
+            than silently coerced to a default; `limit=0` still means the
+            server default (50 here) and values above 200 are capped.
           content:
             application/json:
               schema:
@@ -5104,12 +5164,15 @@ components:
       required: false
       schema:
         type: integer
+        format: int64
         minimum: 0
+        maximum: 9223372036854775807
         default: 0
       description: |
-        Number of items to skip. Invalid values are treated as `0`. List
-        endpoints return a paginated envelope containing `data` and
-        `pagination` fields even when this parameter is omitted.
+        Number of items to skip. Non-integer, negative, or values beyond the
+        backend-safe range (`2^63 - 1`) are rejected with `400` rather than
+        coerced. List endpoints return a paginated envelope containing `data`
+        and `pagination` fields even when this parameter is omitted.
 
     PaginationLimit:
       name: limit
@@ -5117,12 +5180,17 @@ components:
       required: false
       schema:
         type: integer
-        minimum: 1
-        maximum: 1000
+        format: uint64
+        minimum: 0
+        maximum: 18446744073709551615
+        default: 100
       description: |
-        Maximum number of items to return. When omitted, the server returns all
-        matching items. Explicit invalid values or `0` are coerced to the server
-        default of 100. Values above 1000 are capped at 1000.
+        Maximum number of items to return. When omitted, the server applies the
+        default of 100; list endpoints never return unbounded collections
+        (`GET /backup` is the intentional full-export mechanism). `0` is
+        coerced to the default of 100, and values above 1000 are capped at
+        1000. Non-integer or negative values are rejected with `400`.
+        Values beyond the unsigned 64-bit range are also rejected with `400`.
         List endpoints return a paginated envelope containing `data` and
         `pagination` fields even when this parameter is omitted.
 
@@ -5994,7 +6062,7 @@ components:
 
     AuditEventListResponse:
       type: object
-      required: [items, limit, offset, total]
+      required: [items, limit, offset, next_offset, total]
       properties:
         items:
           type: array
@@ -6002,12 +6070,26 @@ components:
             $ref: "#/components/schemas/AuditEvent"
         limit:
           type: integer
+          format: uint32
+          minimum: 1
+          maximum: 1000
         offset:
           type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
         next_offset:
           type: [integer, "null"]
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
+          description: |
+            Strictly advancing offset for the next page, or `null` when no
+            further page exists or the next offset cannot be represented.
         total:
           type: integer
+          format: int64
+          minimum: 0
 
     # ── Proxy ───────────────────────────────────────────────────────
     Proxy:
@@ -6398,10 +6480,12 @@ components:
           description: |
             Maximum allowed response amplification factor for UDP proxies.
             When set, backend→client datagrams are dropped if their size exceeds
-            `last_request_size * factor`. Protects against UDP amplification
-            attacks (e.g., spoofed-source reflection). When omitted (default),
-            no per-datagram amplification cap is applied. Only applicable for
-            `udp` / `dtls` proxies.
+            `payload_size * factor`. A zero-length request receives an explicit
+            one-byte reply allowance so it cannot black-hole the session;
+            nonempty requests retain the exact configured payload ratio. This
+            protects against UDP amplification attacks (e.g., spoofed-source
+            reflection). When omitted (default), no per-datagram amplification
+            cap is applied. Only applicable for `udp` / `dtls` proxies.
         allowed_methods:
           oneOf:
             - type: array
@@ -10137,12 +10221,24 @@ components:
       properties:
         offset:
           type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
           description: Number of items skipped
         limit:
           type: integer
-          description: Maximum items per page
+          format: int32
+          minimum: 1
+          maximum: 1000
+          description: |
+            The page size the server actually applied — not the number of items
+            returned. When the request omits `limit` this reports the server
+            default of 100, and when the request exceeds the maximum it reports
+            the capped value of 1000.
         total:
           type: integer
+          format: int64
+          minimum: 0
           description: Total number of items in the collection (before pagination)
 
     # ── Batch ──────────────────────────────────────────────────────────
@@ -18758,26 +18854,57 @@ components:
 
     GeoRestrictionConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: geo_restriction — country-level access control backed by a
-        MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is mmap'd at
-        construction time for zero-copy lookups; the file dependency is
-        validated per-mode (fatal in file mode, warn in db mode, skipped on
-        the data plane so a missing file degrades to `on_lookup_failure`
-        instead of rejecting the whole config). `allow_countries` and
-        `deny_countries` are mutually exclusive; at least one must be
-        non-empty. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
+        MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is fully verified
+        and loaded into bounded owned immutable memory at construction. Files
+        larger than 512 MiB, aggregate verified MMDB content above 512 MiB per
+        validation generation/cache build, and records containing unsupported
+        country codes are rejected before publication. File dependency
+        validation is fatal in file mode and warns for absent/unreadable files
+        in database mode. CP performs structure-only validation without opening
+        node-local files; DP validates and refreshes its node-local files for
+        full snapshots and affected incremental rebuilds. On runtime nodes that
+        construct the plugin, a missing file uses
+        `on_lookup_failure`, while a readable corrupt, incompatible, or
+        wrong-product database is rejected.
+        Exactly one of `allow_countries` and `deny_countries` must be non-empty.
+        Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
       required: [db_path]
+      oneOf:
+        - title: Allow-list mode
+          required: [allow_countries]
+          properties:
+            allow_countries:
+              minItems: 1
+            deny_countries:
+              maxItems: 0
+        - title: Deny-list mode
+          required: [deny_countries]
+          properties:
+            allow_countries:
+              maxItems: 0
+            deny_countries:
+              minItems: 1
       properties:
         db_path:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: >-
-            Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database.
-            Required.
+            Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database no
+            larger than 512 MiB. Across one validation generation/cache build,
+            the verified sizes of all distinct content snapshots must also total
+            no more than 512 MiB; equivalent path spellings with identical
+            verified content are charged once. A changed candidate overlaps the live snapshot;
+            when their combined size exceeds 512 MiB, hot replacement is
+            rejected and the installed database must be loaded by restarting
+            the gateway. Required.
         allow_countries:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/GeoRestrictionCountryCode"
           default: []
           description: >-
             ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
@@ -18786,7 +18913,7 @@ components:
         deny_countries:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/GeoRestrictionCountryCode"
           default: []
           description: >-
             ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
@@ -18798,7 +18925,12 @@ components:
           description: >-
             When true, inject the resolved country code into the proxied
             request as the `x-geo-country` header (uppercase ISO 3166-1
-            alpha-2). HTTP-family proxies only — ignored on TCP/UDP streams.
+            alpha-2). Central header materialization strips any client-supplied
+            value even when no geo plugin is attached. The header remains
+            absent on fail-open lookup paths unless an earlier geo instance
+            already emitted an authoritative value; later non-injecting
+            instances preserve that value. HTTP-family proxies only — ignored
+            on TCP/UDP streams.
         on_lookup_failure:
           type: string
           enum: [allow, deny]
@@ -18812,6 +18944,17 @@ components:
             disables the geo gate. Set this explicitly to `deny` for fail-closed
             behaviour. When the default is used, a one-time warning is logged at
             startup, and the first request-time fail-open is logged at warn.
+
+    GeoRestrictionCountryCode:
+      type: string
+      minLength: 2
+      maxLength: 2
+      pattern: '^(?:[Aa][DdEeFfGgIiLlMmOoQqRrSsTtUuWwXxZz]|[Bb][AaBbDdEeFfGgHhIiJjLlMmNnOoQqRrSsTtVvWwYyZz]|[Cc][AaCcDdFfGgHhIiKkLlMmNnOoRrUuVvWwXxYyZz]|[Dd][EeJjKkMmOoZz]|[Ee][CcEeGgHhRrSsTt]|[Ff][IiJjKkMmOoRr]|[Gg][AaBbDdEeFfGgHhIiLlMmNnPpQqRrSsTtUuWwYy]|[Hh][KkMmNnRrTtUu]|[Ii][DdEeLlMmNnOoQqRrSsTt]|[Jj][EeMmOoPp]|[Kk][EeGgHhIiMmNnPpRrWwYyZz]|[Ll][AaBbCcIiKkRrSsTtUuVvYy]|[Mm][AaCcDdEeFfGgHhKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz]|[Nn][AaCcEeFfGgIiLlOoPpRrUuZz]|[Oo][Mm]|[Pp][AaEeFfGgHhKkLlMmNnRrSsTtWwYy]|[Qq][Aa]|[Rr][EeOoSsUuWw]|[Ss][AaBbCcDdEeGgHhIiJjKkLlMmNnOoRrSsTtVvXxYyZz]|[Tt][CcDdFfGgHhJjKkLlMmNnOoRrTtVvWwZz]|[Uu][AaGgMmSsYyZz]|[Vv][AaCcEeGgIiNnUu]|[Ww][FfSs]|[Xx][Kk]|[Yy][EeTt]|[Zz][AaMmWw])$'
+      description: >-
+        A currently assigned ISO 3166-1 alpha-2 country code, or XK (the
+        user-assigned Kosovo code emitted by MaxMind). Matching is
+        case-insensitive and runtime storage is normalized to uppercase. Other
+        reserved, user-assigned, deleted, and alias codes are rejected.
 
     RateSpec:
       type: object
@@ -19266,6 +19409,7 @@ components:
     ApiSpecListResponse:
       type: object
       description: Paginated response from `GET /api-specs`.
+      required: [items, limit, offset, next_offset, total]
       properties:
         items:
           type: array
@@ -19274,16 +19418,31 @@ components:
           description: Spec summary records for the current page
         limit:
           type: integer
-          description: Maximum items per page (as requested)
+          format: uint32
+          minimum: 1
+          maximum: 200
+          description: Page size applied after defaulting or capping
         offset:
           type: integer
-          description: Number of items skipped (as requested)
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
+          description: Number of items skipped
         next_offset:
           type: [integer, "null"]
+          format: uint32
+          minimum: 0
+          maximum: 4294967295
           description: |
             Offset to use for the next page, or `null` when this is the last
-            page. A non-null value means `items.length == limit`; the actual
-            total item count is not returned to avoid an expensive COUNT query.
+            page or when the next offset cannot be represented. A non-null
+            value is strictly greater than `offset` and equals
+            `offset + items.length` while that value remains below `total`.
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Total number of matching API specs before pagination
 
     ApiSpecCreateResponse:
       type: object

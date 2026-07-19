@@ -86,6 +86,19 @@ fn schema_property_names(
         .collect()
 }
 
+fn operation_parameter<'a>(
+    spec: &'a serde_json::Value,
+    parameters_pointer: &str,
+    name: &str,
+) -> &'a serde_json::Value {
+    spec.pointer(parameters_pointer)
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("missing parameter array at {parameters_pointer}"))
+        .iter()
+        .find(|parameter| parameter.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        .unwrap_or_else(|| panic!("missing `{name}` parameter at {parameters_pointer}"))
+}
+
 fn assert_serde_schema_field_parity<T>(
     spec: &serde_json::Value,
     schema_label: &str,
@@ -133,6 +146,52 @@ fn assert_serde_component_field_parity<T>(
         &format!("/components/schemas/{component}/properties"),
         intentionally_undocumented,
         schema_only,
+    );
+}
+
+#[test]
+fn admin_pagination_schema_matches_runtime_bounds_and_coercion() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let shared_offset = spec
+        .pointer("/components/parameters/PaginationOffset/schema")
+        .expect("shared pagination offset schema");
+    assert_eq!(shared_offset["minimum"], json!(0));
+    assert_eq!(shared_offset["maximum"], json!(i64::MAX));
+    assert_eq!(shared_offset["format"], json!("int64"));
+
+    let shared_limit = spec
+        .pointer("/components/parameters/PaginationLimit/schema")
+        .expect("shared pagination limit schema");
+    assert_eq!(shared_limit["minimum"], json!(0));
+    assert_eq!(shared_limit["maximum"], json!(u64::MAX));
+    assert_eq!(shared_limit["default"], json!(100));
+
+    let api_spec_parameters = "/paths/~1api-specs/get/parameters";
+    let api_spec_limit = operation_parameter(&spec, api_spec_parameters, "limit");
+    assert_eq!(api_spec_limit["schema"]["minimum"], json!(0));
+    assert_eq!(api_spec_limit["schema"]["maximum"], json!(u64::MAX));
+    assert_eq!(api_spec_limit["schema"]["default"], json!(50));
+    let api_spec_offset = operation_parameter(&spec, api_spec_parameters, "offset");
+    assert_eq!(api_spec_offset["schema"]["minimum"], json!(0));
+    assert_eq!(api_spec_offset["schema"]["maximum"], json!(u32::MAX));
+
+    let audit_offset = operation_parameter(&spec, "/paths/~1audit/get/parameters", "offset");
+    assert_eq!(audit_offset["schema"]["minimum"], json!(0));
+    assert_eq!(audit_offset["schema"]["maximum"], json!(u32::MAX));
+
+    let api_spec_response = spec
+        .pointer("/components/schemas/ApiSpecListResponse")
+        .expect("API-spec list response schema");
+    assert!(
+        api_spec_response["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("total")))
+    );
+    assert_eq!(
+        api_spec_response["properties"]["total"]["minimum"],
+        json!(0)
     );
 }
 
@@ -1479,6 +1538,160 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         validator.validate(&custom).is_ok(),
         "custom plugins should keep generic PluginConfig config shape"
     );
+}
+
+#[test]
+fn geo_restriction_schema_matches_strict_runtime_contract() {
+    use ferrum_edge::plugins::geo_restriction::GeoRestriction;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/GeoRestrictionConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("GeoRestrictionConfig schema compiles");
+
+    let fixtures = [
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["ad", "cA", "xK", "Zw"]
+            }),
+            true,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": [],
+                "deny_countries": ["CN"]
+            }),
+            true,
+        ),
+        (json!({"db_path": "/nonexistent/country.mmdb"}), false),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": [],
+                "deny_countries": []
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["US"],
+                "deny_countries": ["CN"]
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["USA"]
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": [" US "]
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["ZZ"]
+            }),
+            false,
+        ),
+        (json!({"db_path": " \t ", "allow_countries": ["US"]}), false),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["US"],
+                "on_lookup_failur": "deny"
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": null
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["US"],
+                "inject_headers": null
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["US"],
+                "on_lookup_failure": null
+            }),
+            false,
+        ),
+    ];
+
+    for (config, expected_valid) in fixtures {
+        let schema_valid = validator.validate(&config).is_ok();
+        let runtime_valid = GeoRestriction::new(&config).is_ok();
+        assert_eq!(
+            schema_valid, expected_valid,
+            "unexpected GeoRestrictionConfig schema result for {config}"
+        );
+        assert_eq!(
+            runtime_valid, expected_valid,
+            "unexpected geo_restriction runtime result for {config}"
+        );
+    }
+
+    let mut supported_code_count = 0;
+    for first in b'A'..=b'Z' {
+        for second in b'A'..=b'Z' {
+            let code = String::from_utf8(vec![first, second]).expect("ASCII country code");
+            let lowercase = code.to_ascii_lowercase();
+            let mixed_case =
+                String::from_utf8(vec![first.to_ascii_lowercase(), second]).expect("ASCII code");
+            let mut assignment_supported = None;
+            for candidate in [code.clone(), lowercase, mixed_case] {
+                let config = json!({
+                    "db_path": "/nonexistent/country.mmdb",
+                    "allow_countries": [candidate.clone()],
+                    "on_lookup_failure": "deny"
+                });
+                let schema_valid = validator.validate(&config).is_ok();
+                let runtime_valid = GeoRestriction::new(&config).is_ok();
+                assert_eq!(
+                    schema_valid, runtime_valid,
+                    "schema/runtime country assignment mismatch for {candidate}"
+                );
+                if let Some(expected) = assignment_supported {
+                    assert_eq!(
+                        runtime_valid, expected,
+                        "country assignment must be case-insensitive for {candidate}"
+                    );
+                } else {
+                    assignment_supported = Some(runtime_valid);
+                }
+            }
+            if assignment_supported == Some(true) {
+                supported_code_count += 1;
+            }
+        }
+    }
+    // 249 currently assigned ISO codes plus MaxMind's XK extension.
+    assert_eq!(supported_code_count, 250);
 }
 
 #[tokio::test]

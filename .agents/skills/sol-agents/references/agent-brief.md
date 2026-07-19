@@ -7,8 +7,9 @@ and decides whether it can merge; never merge a PR yourself.
 ## Implement directly
 
 Write, commit, and push the changes yourself in this session. Do not invoke any agent-dispatch
-skill or script in the environment, including `sol-agents`, `opus-agents`,
-`.agents/skills/*/scripts/dispatch-agent.sh`, or Claude CLI workers. Do not spawn nested workers.
+skill or script in the environment, including `sol-agents`, `opus-agents`, `fable-agents`,
+`grok-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI
+workers. Do not spawn nested workers.
 The orchestrator chose this session's model and reasoning effort deliberately. If a skill registry
 entry is stale or unavailable, ignore it and continue with this brief and the dispatch prompt.
 

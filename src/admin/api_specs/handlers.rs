@@ -95,10 +95,12 @@ enum ApiSpecLateWriteRecovery {
 
 fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
     if is_mtls_dns_admission_unavailable(&e) {
-        return ApiSpecError::AdmissionUnavailable(e.to_string());
+        return ApiSpecError::AdmissionUnavailable(
+            "namespace config admission unavailable".to_string(),
+        );
     }
     if is_mtls_dns_identity_conflict(&e) {
-        return ApiSpecError::Conflict(e.to_string());
+        return ApiSpecError::Conflict("mTLS DNS identity conflict".to_string());
     }
     if let Some(conflict) = tcp_connection_throttle_attachment_conflict(&e) {
         return ApiSpecError::PluginComposition(conflict.errors().to_vec());
@@ -111,8 +113,13 @@ fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
         return ApiSpecError::NotFound;
     }
 
-    let msg = e.to_string();
-    classify_db_error_str(&msg)
+    for cause in e.chain() {
+        let classified = classify_db_error_str(&cause.to_string());
+        if !matches!(classified, ApiSpecError::Internal(_)) {
+            return classified;
+        }
+    }
+    ApiSpecError::Internal("database operation failed".to_string())
 }
 
 fn classify_db_error_str(msg: &str) -> ApiSpecError {
@@ -122,18 +129,18 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
         || lower.contains("duplicate key")
         || lower.contains("duplicate entry")
     {
-        ApiSpecError::Conflict(msg.to_string())
+        ApiSpecError::Conflict("resource conflict".to_string())
     } else if msg.contains("MongoDB document limit") {
         ApiSpecError::MongoDocTooLarge
     } else if lower.contains("foreign key constraint")
         || lower.contains("foreign key")
         || lower.contains("references a")
     {
-        ApiSpecError::Unprocessable(msg.to_string())
+        ApiSpecError::Unprocessable("referential integrity violation".to_string())
     } else if is_row_missing_error_message(&lower) {
         ApiSpecError::NotFound
     } else {
-        ApiSpecError::Internal(msg.to_string())
+        ApiSpecError::Internal("database operation failed".to_string())
     }
 }
 
@@ -168,31 +175,30 @@ where
         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(result)) => {
             result.map_err(classify_db_error)
         }
-        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
-            tracing::warn!(
-                %error,
-                "API-spec persistence completed after namespace config admission was lost"
-            );
+        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_namespace_admission_lost");
             match result {
                 Ok(result) => {
                     let lost_generation = guard.generation();
                     drop(guard);
-                    let recovery_guard = crate::admin::crud::lock_namespace_config_admission(
-                        db, namespace,
-                    )
-                    .await
-                    .map_err(|recovery_error| {
-                        tracing::error!(
-                            %recovery_error,
-                            "Failed to reacquire API-spec namespace admission after a late write"
-                        );
-                        ApiSpecError::AdmissionUnavailable(recovery_error.to_string())
-                    })?;
+                    let recovery_guard =
+                        crate::admin::crud::lock_namespace_config_admission(db, namespace)
+                            .await
+                            .map_err(|_recovery_error| {
+                                crate::admin::error_persistence_failure_redacted(
+                                    "api_spec_namespace_admission_reacquire_after_late_write",
+                                );
+                                ApiSpecError::AdmissionUnavailable(
+                                    "namespace config admission unavailable".to_string(),
+                                )
+                            })?;
                     if recovery_guard.immediately_succeeds_generation(lost_generation) {
                         return Ok(result);
                     }
                     if !compensate_after_intervening_write {
-                        return Err(ApiSpecError::AdmissionUnavailable(error.to_string()));
+                        return Err(ApiSpecError::AdmissionUnavailable(
+                            "namespace config admission unavailable".to_string(),
+                        ));
                     }
                     match recovery_guard
                         .run_to_completion_while_held(compensation)
@@ -206,38 +212,39 @@ where
                         ))) => {}
                         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
                             result: Ok(_),
-                            error: recovery_error,
+                            error: _,
                         }) => {
-                            tracing::error!(
-                                %recovery_error,
-                                "API-spec late-write compensation lost namespace admission"
+                            crate::admin::error_persistence_failure_redacted(
+                                "api_spec_late_write_compensation_admission_lost",
                             );
                         }
                         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Err(
-                            recovery_error,
+                            _,
                         )))
                         | Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
-                            result: Err(recovery_error),
+                            result: Err(_),
                             ..
                         })
-                        | Err(recovery_error) => {
-                            tracing::error!(
-                                %recovery_error,
-                                "API-spec late-write compensation failed"
+                        | Err(_) => {
+                            crate::admin::error_persistence_failure_redacted(
+                                "api_spec_late_write_compensation",
                             );
                         }
                     }
-                    Err(ApiSpecError::AdmissionUnavailable(error.to_string()))
+                    Err(ApiSpecError::AdmissionUnavailable(
+                        "namespace config admission unavailable".to_string(),
+                    ))
                 }
                 Err(error) => Err(classify_db_error(error)),
             }
         }
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "API-spec persistence could not start with namespace config admission held"
+        Err(_error) => {
+            crate::admin::warn_persistence_failure_redacted(
+                "api_spec_namespace_admission_before_persist",
             );
-            Err(ApiSpecError::AdmissionUnavailable(error.to_string()))
+            Err(ApiSpecError::AdmissionUnavailable(
+                "namespace config admission unavailable".to_string(),
+            ))
         }
     }
 }
@@ -564,8 +571,8 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::NOT_FOUND,
             &json!({"error": "API spec not found"}),
         ),
-        ApiSpecError::Conflict(detail) => {
-            tracing::warn!("api-spec conflict (raw DB error): {}", detail);
+        ApiSpecError::Conflict(_detail) => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_conflict");
             json_resp(
                 StatusCode::CONFLICT,
                 &json!({
@@ -577,8 +584,8 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::PAYLOAD_TOO_LARGE,
             &json!({"error": "Spec document exceeds MongoDB document size limit"}),
         ),
-        ApiSpecError::Unprocessable(detail) => {
-            tracing::warn!("api-spec unprocessable (raw DB error): {}", detail);
+        ApiSpecError::Unprocessable(_detail) => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_unprocessable");
             json_resp(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &json!({
@@ -600,15 +607,12 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "No database configured"}),
         ),
-        ApiSpecError::AdmissionUnavailable(detail) => {
-            tracing::warn!(
-                "api-spec namespace admission temporarily unavailable: {}",
-                detail
-            );
+        ApiSpecError::AdmissionUnavailable(_detail) => {
+            crate::admin::warn_persistence_failure_redacted("api_spec_admission_unavailable");
             crate::admin::mtls_dns_admission_unavailable_response()
         }
-        ApiSpecError::Internal(msg) => {
-            tracing::error!("api-specs internal error: {}", msg);
+        ApiSpecError::Internal(_msg) => {
+            crate::admin::error_persistence_failure_redacted("api_spec_internal");
             json_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &json!({"error": "Internal server error"}),
@@ -2595,10 +2599,21 @@ fn spec_content_response(
 // Helper: parse list filter from query string (Wave 5)
 // ---------------------------------------------------------------------------
 
+/// Build the stable API-spec pagination error without exposing parser internals.
+fn invalid_pagination(field: &str, error: crate::admin::PaginationValueError) -> ApiSpecError {
+    ApiSpecError::BadRequest(format!("{field} {}", error.reason()))
+}
+
 /// Parse `GET /api-specs` query parameters into an [`ApiSpecListFilter`].
 ///
-/// Unknown parameters are silently ignored. Returns `Err` only for invalid
-/// `sort_by` values (rejected with 400 to prevent accidental SQL-like injection).
+/// Unknown parameters are silently ignored. Returns `Err` (400) for invalid
+/// `sort_by` values (rejected to prevent accidental SQL-like injection), for
+/// SQL `LIKE` wildcards in text filters, and for malformed `limit`/`offset`.
+///
+/// This endpoint keeps a stricter pagination scheme than the shared
+/// [`crate::admin::PaginationParams`] used elsewhere — default 50, maximum 200,
+/// and a `u32` offset — but shares its rejection contract: malformed values are
+/// never silently coerced into a default.
 fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError> {
     const DEFAULT_LIMIT: u32 = 50;
     const MAX_LIMIT: u32 = 200;
@@ -2614,21 +2629,69 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
 
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
-        let key = parts.next().unwrap_or("");
+        let raw_key = parts.next().unwrap_or("");
         let raw_val = parts.next().unwrap_or("");
-        // URL-decode the value (simple percent-decoding for common chars).
-        // Invalid UTF-8 sequences in percent-encoded bytes are rejected with 400
-        // to prevent bypassing downstream character-validation checks (e.g. the
-        // `title_contains` wildcard rejection below).
+        // URL-decode both names and values, NAME FIRST. Decoding only values
+        // lets encoded pagination names bypass this endpoint's narrower `u32`
+        // offset bound (e.g. `?%6fffset=` aliasing `offset`), so names are
+        // decoded too. A *name* that does not decode to valid UTF-8 cannot
+        // alias any recognized ASCII filter name, so it is an unknown parameter
+        // and is ignored like every other unknown key.
+        let Ok(key) = percent_decode(raw_key) else {
+            continue;
+        };
+
+        // Whether the name is recognized is decided BEFORE its value is
+        // decoded, and the value of an ignored name is never decoded at all.
+        // Otherwise a parameter that is ignored anyway (`?%80=%80`, or any
+        // third-party `?unknown=%80`) would still fail the request on its
+        // value. Invalid UTF-8 in the value of a *recognized* name stays a
+        // strict 400: decoding it is what stops percent-encoded bytes from
+        // bypassing the character-validation checks below (e.g. the
+        // `title_contains` LIKE-wildcard rejection).
+        //
+        // Keep this list in sync with the recognized arms of the match below;
+        // a name missing here is silently ignored.
+        if !matches!(
+            key.as_str(),
+            "limit"
+                | "offset"
+                | "proxy_id"
+                | "spec_version"
+                | "title_contains"
+                | "updated_since"
+                | "has_tag"
+                | "sort_by"
+                | "order"
+        ) {
+            continue;
+        }
         let val = percent_decode(raw_val)?;
 
-        match key {
+        match key.as_str() {
+            // `/api-specs` keeps its own stricter bounds (default 50, max 200)
+            // and its `{items, next_offset}` envelope, but malformed input is
+            // rejected with 400 exactly as `parse_pagination` does for every
+            // other list route — never silently coerced to a default.
             "limit" => {
-                let parsed = val.parse::<u32>().unwrap_or(DEFAULT_LIMIT);
-                filter.limit = parsed.clamp(1, MAX_LIMIT);
+                let parsed = crate::admin::parse_unsigned_pagination_value(&val)
+                    .map_err(|error| invalid_pagination("limit", error))?;
+                // `0` keeps the documented "server default" meaning; values
+                // above the maximum are capped.
+                filter.limit = if parsed == 0 {
+                    DEFAULT_LIMIT
+                } else {
+                    u32::try_from(parsed.min(u64::from(MAX_LIMIT))).map_err(|_| {
+                        invalid_pagination("limit", crate::admin::PaginationValueError::Overflow)
+                    })?
+                };
             }
             "offset" => {
-                filter.offset = val.parse::<u32>().unwrap_or(0);
+                let parsed = crate::admin::parse_unsigned_pagination_value(&val)
+                    .map_err(|error| invalid_pagination("offset", error))?;
+                filter.offset = u32::try_from(parsed).map_err(|_| {
+                    invalid_pagination("offset", crate::admin::PaginationValueError::Overflow)
+                })?;
             }
             "proxy_id" if !val.is_empty() => {
                 filter.proxy_id = Some(val);
@@ -2828,10 +2891,12 @@ pub async fn handle_post_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+            Err(_error) => {
+                crate::admin::warn_persistence_failure_redacted(
+                    "api_spec_namespace_admission_acquire",
+                );
                 return Ok(error_response(ApiSpecError::AdmissionUnavailable(
-                    error.to_string(),
+                    "namespace config admission unavailable".to_string(),
                 )));
             }
         };
@@ -2990,10 +3055,12 @@ pub async fn handle_put_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+            Err(_error) => {
+                crate::admin::warn_persistence_failure_redacted(
+                    "api_spec_namespace_admission_acquire",
+                );
                 return Ok(error_response(ApiSpecError::AdmissionUnavailable(
-                    error.to_string(),
+                    "namespace config admission unavailable".to_string(),
                 )));
             }
         };
@@ -3260,8 +3327,6 @@ pub async fn handle_list_api_specs(
         Ok(f) => f,
         Err(e) => return Ok(error_response(e)),
     };
-    let limit = filter.limit as usize;
-    let offset = filter.offset as usize;
 
     let paginated = match db.list_api_specs(namespace, &filter).await {
         Ok(p) => p,
@@ -3297,16 +3362,13 @@ pub async fn handle_list_api_specs(
         })
         .collect();
 
-    let next_offset: Option<usize> = if (offset + items.len()) < (paginated.total.max(0) as usize) {
-        Some(offset + items.len())
-    } else {
-        None
-    };
+    let next_offset =
+        crate::admin::advancing_u32_offset(filter.offset, items.len(), paginated.total);
 
     let body = json!({
         "items": items,
-        "limit": limit,
-        "offset": offset,
+        "limit": filter.limit,
+        "offset": filter.offset,
         "next_offset": next_offset,
         "total": paginated.total,
     });
@@ -3336,10 +3398,12 @@ pub async fn handle_delete_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+            Err(_error) => {
+                crate::admin::warn_persistence_failure_redacted(
+                    "api_spec_namespace_admission_acquire",
+                );
                 return Ok(error_response(ApiSpecError::AdmissionUnavailable(
-                    error.to_string(),
+                    "namespace config admission unavailable".to_string(),
                 )));
             }
         };

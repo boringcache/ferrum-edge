@@ -10,36 +10,110 @@
 //! - Configurable default action when IP lookup fails (defaults to `allow`,
 //!   i.e. fail-open — see `on_lookup_failure`)
 //!
-//! The `.mmdb` file is memory-mapped via `mmap(2)` at plugin construction time
-//! (`Reader::open_mmap`) for zero-copy lookups on the hot path without loading
-//! the entire database into heap memory. If the file is unavailable at construction
-//! time (e.g., on a control plane that doesn't proxy traffic), the plugin degrades
-//! gracefully — lookups fall back to the `on_lookup_failure` policy. File existence
-//! is validated separately by `GatewayConfig::validate_plugin_file_dependencies()`,
-//! which each mode calls independently: fatal in file mode, warn in db mode,
-//! skipped in dp mode (plugin degrades gracefully with `reader: None`).
+//! The `.mmdb` file is loaded into an owned immutable byte buffer at plugin
+//! construction. This keeps live readers safe from external in-place database
+//! rewrites or truncation while retaining zero-copy decoding from the in-memory
+//! buffer. The complete database and its country record shape are verified
+//! before publication, and each validation/load session bounds the aggregate
+//! declared size of its distinct MMDB paths. If the file is unavailable at
+//! construction time on a runtime node, the plugin degrades gracefully and
+//! lookups use `on_lookup_failure`; a readable but invalid database is rejected.
 
 use async_trait::async_trait;
-use maxminddb::{Mmap, Reader};
-use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
+use crate::config::types::{
+    CountryMmdbLoadError, CountryMmdbLoadSession, CountryMmdbSnapshot, SUPPORTED_GEO_COUNTRY_CODES,
+    load_validated_country_mmdb,
+};
 
-/// Deserialization target for MaxMind country-level GeoIP records.
-#[derive(Deserialize, Debug)]
-struct GeoCountryRecord {
-    country: Option<CountryInfo>,
-    registered_country: Option<CountryInfo>,
+const GEO_COUNTRY_HEADER: &str = "x-geo-country";
+const CONFIG_KEYS: &[&str] = &[
+    "db_path",
+    "allow_countries",
+    "deny_countries",
+    "inject_headers",
+    "on_lookup_failure",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CountryCode(u16);
+
+impl CountryCode {
+    fn parse(value: &str) -> Option<Self> {
+        let bytes = value.as_bytes();
+        if bytes.len() != 2 || !bytes.iter().all(u8::is_ascii_alphabetic) {
+            return None;
+        }
+        Some(Self(
+            ((bytes[0].to_ascii_uppercase() as u16) << 8) | bytes[1].to_ascii_uppercase() as u16,
+        ))
+    }
+
+    fn bytes(self) -> [u8; 2] {
+        [(self.0 >> 8) as u8, self.0 as u8]
+    }
+
+    fn is_supported(self) -> bool {
+        let code = self.bytes();
+        SUPPORTED_GEO_COUNTRY_CODES
+            .chunks_exact(2)
+            .any(|assigned| assigned == code.as_slice())
+    }
+
+    fn bit_index(self) -> usize {
+        let [first, second] = self.bytes();
+        usize::from(first - b'A') * 26 + usize::from(second - b'A')
+    }
+
+    fn into_string(self) -> String {
+        let [first, second] = self.bytes();
+        let mut value = String::with_capacity(2);
+        value.push(first as char);
+        value.push(second as char);
+        value
+    }
 }
 
-#[derive(Deserialize, Debug)]
-struct CountryInfo {
-    iso_code: Option<String>,
+impl std::fmt::Display for CountryCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let [first, second] = self.bytes();
+        write!(formatter, "{}{}", first as char, second as char)
+    }
+}
+
+#[derive(Default)]
+struct CountrySet {
+    bits: [u64; 11],
+    len: usize,
+}
+
+impl CountrySet {
+    fn insert(&mut self, country: CountryCode) {
+        let bit_index = country.bit_index();
+        let word = bit_index / u64::BITS as usize;
+        let mask = 1_u64 << (bit_index % u64::BITS as usize);
+        if self.bits[word] & mask == 0 {
+            self.bits[word] |= mask;
+            self.len += 1;
+        }
+    }
+
+    fn contains(&self, country: CountryCode) -> bool {
+        let bit_index = country.bit_index();
+        let word = bit_index / u64::BITS as usize;
+        let mask = 1_u64 << (bit_index % u64::BITS as usize);
+        self.bits[word] & mask != 0
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 /// Action when GeoIP lookup fails (IP not in database).
@@ -50,14 +124,11 @@ enum LookupFailureAction {
 }
 
 pub struct GeoRestriction {
-    reader: Option<Arc<Reader<Mmap>>>,
+    reader: Option<Arc<CountryMmdbSnapshot>>,
     db_path: String,
-    /// Allow-list of ISO 3166-1 alpha-2 country codes (uppercase). Empty disables allow-list mode.
-    /// `HashSet` for O(1) membership tests on the hot path.
-    allow_countries: HashSet<String>,
-    /// Deny-list of ISO 3166-1 alpha-2 country codes (uppercase). Empty disables deny-list mode.
-    /// `HashSet` for O(1) membership tests on the hot path.
-    deny_countries: HashSet<String>,
+    /// Packed ISO country-code bitsets keep membership checks allocation-free.
+    allow_countries: CountrySet,
+    deny_countries: CountrySet,
     inject_headers: bool,
     on_lookup_failure: LookupFailureAction,
     /// Set once the first request-time fail-open (lookup failed but policy is
@@ -66,28 +137,46 @@ pub struct GeoRestriction {
     fail_open_warned: AtomicBool,
 }
 
+struct GeoRestrictionConfig {
+    db_path: String,
+    allow_countries: CountrySet,
+    deny_countries: CountrySet,
+    inject_headers: bool,
+    on_lookup_failure: LookupFailureAction,
+    on_lookup_failure_explicit: bool,
+}
+
 impl GeoRestriction {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let db_path = string_config(config, "db_path")?;
-        let allow_countries = parse_country_set(config, "allow_countries")?;
-        let deny_countries = parse_country_set(config, "deny_countries")?;
+        Self::new_with_loader(config, load_validated_country_mmdb)
+    }
 
-        if allow_countries.is_empty() && deny_countries.is_empty() {
-            return Err(
-                "geo_restriction: at least one 'allow_countries' or 'deny_countries' entry is required"
-                    .to_string(),
-            );
-        }
+    pub(crate) fn new_with_load_session(
+        config: &Value,
+        load_session: &CountryMmdbLoadSession,
+    ) -> Result<Self, String> {
+        Self::new_with_loader(config, |path| load_session.load(path))
+    }
 
-        if !allow_countries.is_empty() && !deny_countries.is_empty() {
-            return Err(
-                "geo_restriction: 'allow_countries' and 'deny_countries' are mutually exclusive"
-                    .to_string(),
-            );
-        }
+    /// Validate only the JSON policy shape. Node-local MMDB I/O belongs to the
+    /// mode-aware plugin-file dependency stage, which deduplicates paths and
+    /// hands validated snapshots to the real cache build.
+    pub(crate) fn validate_config(config: &Value) -> Result<(), String> {
+        parse_config(config).map(|_| ())
+    }
 
-        let inject_headers = bool_config(config, "inject_headers", false)?;
-        let on_lookup_failure = lookup_failure_action(config)?;
+    fn new_with_loader(
+        config: &Value,
+        loader: impl FnOnce(&str) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError>,
+    ) -> Result<Self, String> {
+        let GeoRestrictionConfig {
+            db_path,
+            allow_countries,
+            deny_countries,
+            inject_headers,
+            on_lookup_failure,
+            on_lookup_failure_explicit,
+        } = parse_config(config)?;
 
         // Nudge operators toward an explicit failure policy. When
         // `on_lookup_failure` is omitted it defaults to `allow` (fail-open):
@@ -95,8 +184,6 @@ impl GeoRestriction {
         // missing/stale .mmdb — is permitted. For an access-control plugin
         // that silently disables the geo gate, so surface the default once at
         // construction so it is a conscious choice.
-        let on_lookup_failure_explicit =
-            !matches!(config.get("on_lookup_failure"), None | Some(Value::Null));
         if !on_lookup_failure_explicit && on_lookup_failure == LookupFailureAction::Allow {
             warn!(
                 plugin = "geo_restriction",
@@ -106,23 +193,22 @@ impl GeoRestriction {
             );
         }
 
-        // Open the MaxMind database file. If the file is missing or unreadable,
-        // log a warning but allow the plugin to be created — the file may exist
-        // on data plane nodes but not on the control plane, or may be deployed
-        // after config is pushed. At request time, a missing reader falls back
-        // to the on_lookup_failure policy.
-        // SAFETY: The mmdb file is read-only after construction. The gateway only
-        // opens it once at plugin init and does not modify or truncate it.
-        let reader = match unsafe { Reader::open_mmap(&db_path) } {
-            Ok(r) => Some(Arc::new(r)),
-            Err(e) => {
+        // A missing or unreadable node-local dependency remains a supported
+        // fallback condition. Once bytes are readable, however, corruption,
+        // product mismatch, and incompatible records reject the generation.
+        let reader = match loader(&db_path) {
+            Ok(reader) => Some(reader),
+            Err(CountryMmdbLoadError::Unavailable(error)) => {
                 warn!(
                     db_path = %db_path,
-                    error = %e,
+                    error = %error,
                     plugin = "geo_restriction",
                     "MaxMind database file not available — plugin will use on_lookup_failure policy until file is present"
                 );
                 None
+            }
+            Err(CountryMmdbLoadError::Invalid(error)) => {
+                return Err(format!("geo_restriction: invalid 'db_path': {error}"));
             }
         };
 
@@ -161,29 +247,35 @@ impl GeoRestriction {
     }
 
     /// Look up the country ISO code for a given IP address string.
-    fn lookup_country(&self, ip_str: &str) -> Result<Option<String>, String> {
+    fn lookup_country(&self, ip_str: &str) -> Result<Option<CountryCode>, String> {
         let reader = self
             .reader
             .as_ref()
             .ok_or_else(|| "MaxMind database not loaded".to_string())?;
 
-        let ip: std::net::IpAddr = ip_str.parse().map_err(|e| format!("invalid IP: {}", e))?;
+        let ip: std::net::IpAddr = ip_str.parse().map_err(|e| format!("invalid IP: {e}"))?;
+        let ip = ip.to_canonical();
 
         let result = reader.lookup(ip).map_err(|e| e.to_string())?;
-        let record: Option<GeoCountryRecord> = result.decode().map_err(|e| e.to_string())?;
-
-        let iso_code = record.and_then(|r| {
-            // Prefer the direct country, fall back to registered_country
-            r.country
-                .and_then(|c| c.iso_code)
-                .or_else(|| r.registered_country.and_then(|c| c.iso_code))
-        });
-
-        Ok(iso_code.map(|s: String| s.to_ascii_uppercase()))
+        let direct: Option<&str> = result
+            .decode_path(&maxminddb::path!["country", "iso_code"])
+            .map_err(|e| e.to_string())?;
+        let registered: Option<&str> = result
+            .decode_path(&maxminddb::path!["registered_country", "iso_code"])
+            .map_err(|e| e.to_string())?;
+        let Some(raw_code) = direct.or(registered) else {
+            return Ok(None);
+        };
+        // CountryMmdbSnapshot is published only after every record has passed
+        // the shared supported-code invariant. Keep the request path to packed
+        // parsing plus the constant-time policy bitset lookup.
+        CountryCode::parse(raw_code)
+            .map(Some)
+            .ok_or_else(|| format!("invalid country code in MaxMind record: {raw_code:?}"))
     }
 
     /// Check whether the client IP's country is allowed.
-    fn check_ip(&self, client_ip: &str) -> (PluginResult, Option<String>) {
+    fn check_ip(&self, client_ip: &str) -> (PluginResult, Option<CountryCode>) {
         if self.reader.is_none() {
             // Database file not loaded — apply the configured failure policy.
             return match self.on_lookup_failure {
@@ -249,7 +341,7 @@ impl GeoRestriction {
         };
 
         // Allow-list mode: only listed countries pass
-        if !self.allow_countries.is_empty() && !self.allow_countries.contains(&country) {
+        if !self.allow_countries.is_empty() && !self.allow_countries.contains(country) {
             warn!(
                 client_ip = %client_ip,
                 country = %country,
@@ -268,7 +360,7 @@ impl GeoRestriction {
         }
 
         // Deny-list mode: listed countries are blocked
-        if self.deny_countries.contains(&country) {
+        if self.deny_countries.contains(country) {
             warn!(
                 client_ip = %client_ip,
                 country = %country,
@@ -288,6 +380,53 @@ impl GeoRestriction {
 
         (PluginResult::Continue, Some(country))
     }
+}
+
+fn parse_config(config: &Value) -> Result<GeoRestrictionConfig, String> {
+    let object = config
+        .as_object()
+        .ok_or_else(|| format!("geo_restriction: config must be an object, got: {config}"))?;
+    if let Some(unknown) = object
+        .keys()
+        .find(|key| !CONFIG_KEYS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "geo_restriction: unknown configuration field '{unknown}'"
+        ));
+    }
+
+    let db_path = string_config(config, "db_path")?;
+    let allow_countries = parse_country_set(config, "allow_countries")?;
+    let deny_countries = parse_country_set(config, "deny_countries")?;
+
+    if allow_countries.is_empty() && deny_countries.is_empty() {
+        return Err(
+            "geo_restriction: at least one 'allow_countries' or 'deny_countries' entry is required"
+                .to_string(),
+        );
+    }
+
+    if !allow_countries.is_empty() && !deny_countries.is_empty() {
+        return Err(
+            "geo_restriction: 'allow_countries' and 'deny_countries' are mutually exclusive"
+                .to_string(),
+        );
+    }
+
+    let inject_headers = bool_config(config, "inject_headers", false)?;
+    let on_lookup_failure = lookup_failure_action(config)?;
+    // Explicit null is rejected by `lookup_failure_action`, so successful
+    // parsing only needs to distinguish presence from omission here.
+    let on_lookup_failure_explicit = config.get("on_lookup_failure").is_some();
+
+    Ok(GeoRestrictionConfig {
+        db_path,
+        allow_countries,
+        deny_countries,
+        inject_headers,
+        on_lookup_failure,
+        on_lookup_failure_explicit,
+    })
 }
 
 fn string_config(config: &Value, key: &str) -> Result<String, String> {
@@ -311,12 +450,14 @@ fn string_config(config: &Value, key: &str) -> Result<String, String> {
     }
 }
 
-fn parse_country_set(config: &Value, key: &str) -> Result<HashSet<String>, String> {
+fn parse_country_set(config: &Value, key: &str) -> Result<CountrySet, String> {
     let Some(value) = config.get(key) else {
-        return Ok(HashSet::new());
+        return Ok(CountrySet::default());
     };
     if value.is_null() {
-        return Ok(HashSet::new());
+        return Err(format!(
+            "geo_restriction: '{key}' must be an array of ISO country codes"
+        ));
     }
     let Value::Array(arr) = value else {
         return Err(format!(
@@ -324,25 +465,29 @@ fn parse_country_set(config: &Value, key: &str) -> Result<HashSet<String>, Strin
         ));
     };
 
-    let mut countries = HashSet::with_capacity(arr.len());
+    let mut countries = CountrySet::default();
     for value in arr {
         let country = value.as_str().ok_or_else(|| {
             format!("geo_restriction: '{key}' entries must be strings, got: {value}")
         })?;
-        let country = country.trim();
-        if country.len() != 2 || !country.bytes().all(|b| b.is_ascii_alphabetic()) {
+        let Some(country_code) = CountryCode::parse(country) else {
             return Err(format!(
                 "geo_restriction: '{key}' contains invalid ISO 3166-1 alpha-2 country code: {country:?}"
             ));
+        };
+        if !country_code.is_supported() {
+            return Err(format!(
+                "geo_restriction: '{key}' contains unassigned ISO 3166-1 alpha-2 country code: {country:?}"
+            ));
         }
-        countries.insert(country.to_ascii_uppercase());
+        countries.insert(country_code);
     }
     Ok(countries)
 }
 
 fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
     match config.get(key) {
-        None | Some(Value::Null) => Ok(default),
+        None => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
             "geo_restriction: '{key}' must be a boolean, got: {other}"
@@ -352,7 +497,7 @@ fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String>
 
 fn lookup_failure_action(config: &Value) -> Result<LookupFailureAction, String> {
     match config.get("on_lookup_failure") {
-        None | Some(Value::Null) => Ok(LookupFailureAction::Allow),
+        None => Ok(LookupFailureAction::Allow),
         Some(Value::String(action)) if action == "allow" => Ok(LookupFailureAction::Allow),
         Some(Value::String(action)) if action == "deny" => Ok(LookupFailureAction::Deny),
         Some(other) => Err(format!(
@@ -367,19 +512,16 @@ impl Plugin for GeoRestriction {
         "geo_restriction"
     }
 
+    fn country_mmdb_snapshot(&self) -> Option<&CountryMmdbSnapshot> {
+        self.reader.as_deref()
+    }
+
     fn priority(&self) -> u16 {
         super::priority::GEO_RESTRICTION
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
-    }
-
-    /// Declares that `before_proxy` may insert `x-geo-country` into outbound headers.
-    /// The proxy uses this hint to take the explicit-clone code path instead of
-    /// the zero-clone optimization, ensuring deterministic header propagation.
-    fn modifies_request_headers(&self) -> bool {
-        self.inject_headers
     }
 
     async fn on_stream_connect(
@@ -393,27 +535,19 @@ impl Plugin for GeoRestriction {
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         let (result, country) = self.check_ip(&ctx.client_ip);
 
-        // Inject geo headers if configured and lookup succeeded
+        // Header materialization centrally strips every client-supplied value
+        // before the plugin chain. Writing the authoritative value here avoids
+        // metadata collisions and lets later non-injecting or fail-open geo
+        // instances preserve an assertion produced by an earlier instance.
         if self.inject_headers
-            && let Some(ref code) = country
+            && matches!(&result, PluginResult::Continue)
+            && let Some(code) = country
         {
-            ctx.metadata.insert("geo_country".to_string(), code.clone());
+            ctx.set_backend_geo_country(code.bytes());
+            ctx.headers
+                .insert(GEO_COUNTRY_HEADER.to_string(), code.into_string());
         }
 
         result
-    }
-
-    async fn before_proxy(
-        &self,
-        ctx: &mut RequestContext,
-        headers: &mut HashMap<String, String>,
-    ) -> PluginResult {
-        // Inject geo headers into the upstream request if configured
-        if self.inject_headers
-            && let Some(country) = ctx.metadata.get("geo_country")
-        {
-            headers.insert("x-geo-country".to_string(), country.clone());
-        }
-        PluginResult::Continue
     }
 }

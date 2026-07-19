@@ -132,15 +132,12 @@ impl AuditSink {
                             break;
                         };
 
-                        if let Err(message) = db
-                            .insert_audit_event(&envelope.event)
-                            .await
-                            .map_err(|error| error.to_string())
-                        {
+                        if db.insert_audit_event(&envelope.event).await.is_err() {
                             error!(
                                 audit_event_id = %envelope.event.id,
-                                error = %message,
-                                "Failed to persist admin audit event"
+                                surface = "audit_event_persist",
+                                detail_withheld = true,
+                                "Failed to persist admin audit event; persistence detail withheld"
                             );
                         }
                     }

@@ -29,7 +29,7 @@ pub(super) async fn handle_inventory(
     pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let inventory = collect_inventory(state);
-    let body = super::paginate_response(&json!(inventory.entries), pagination);
+    let body = super::paginate_response(&inventory.entries, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
 
@@ -65,7 +65,7 @@ pub(super) async fn handle_events(
         }
     };
     let events = crate::tls::events::global_event_log().list(&filter);
-    let body = super::paginate_response(&json!(events), pagination);
+    let body = super::paginate_response(&events, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
 
@@ -78,7 +78,7 @@ pub(super) async fn handle_list_managed(
         Err(response) => return Ok(*response),
     };
     let records = store.list(kind);
-    let body = super::paginate_response(&json!(records), pagination);
+    let body = super::paginate_response(&records, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
 
@@ -90,7 +90,7 @@ pub(super) async fn handle_list_acme_certificates(
         Err(response) => return Ok(*response),
     };
     let records = store.list_certificates();
-    let body = super::paginate_response(&json!(records), pagination);
+    let body = super::paginate_response(&records, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
 
@@ -118,7 +118,7 @@ pub(super) async fn handle_list_acme_orders(
         Err(response) => return Ok(*response),
     };
     let records = store.list_orders();
-    let body = super::paginate_response(&json!(records), pagination);
+    let body = super::paginate_response(&records, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
 
@@ -153,7 +153,7 @@ pub(super) async fn handle_list_acme_accounts(
         Err(_) => Vec::new(),
     };
     let accounts = order_store.list_accounts(&certificates, &persisted_accounts);
-    let body = super::paginate_response(&json!(accounts), pagination);
+    let body = super::paginate_response(&accounts, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
 
@@ -1921,17 +1921,12 @@ fn persist_acme_account_credentials(order: &AcmeOrderRecord) {
         warn!("ACME account store is unavailable; renewal will rely on order credentials");
         return;
     };
-    if let Err(error) = store.upsert_account(
+    if let Err(_error) = store.upsert_account(
         account_id.to_string(),
         order.directory_url.clone(),
         credentials_json.to_string(),
     ) {
-        warn!(
-            account_id = account_id,
-            directory_url = %order.directory_url,
-            error = %error,
-            "failed to persist ACME account credentials"
-        );
+        super::warn_persistence_failure_redacted("acme_account_credentials_persist");
     }
 }
 

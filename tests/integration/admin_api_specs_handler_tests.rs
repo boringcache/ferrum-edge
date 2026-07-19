@@ -121,6 +121,7 @@ fn make_admin_state(db: DatabaseStore, max_spec_mib: usize) -> AdminState {
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
         cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -3490,6 +3491,173 @@ async fn list_endpoint_invalid_order_returns_400() {
         reqwest::StatusCode::BAD_REQUEST,
         "invalid order must return 400: {body}"
     );
+}
+
+/// Malformed `limit`/`offset` return 400 rather than being silently coerced to
+/// the endpoint default. `/api-specs` keeps its own stricter bounds (default
+/// 50, max 200) but shares the rejection contract of every other list endpoint.
+#[tokio::test]
+async fn list_endpoint_malformed_pagination_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    for (query, expected_message) in [
+        (
+            "/api-specs?limit=abc",
+            "limit must be a non-negative integer",
+        ),
+        (
+            "/api-specs?limit=-1",
+            "limit must be a non-negative integer",
+        ),
+        (
+            "/api-specs?limit=1.5",
+            "limit must be a non-negative integer",
+        ),
+        (
+            "/api-specs?offset=abc",
+            "offset must be a non-negative integer",
+        ),
+        (
+            "/api-specs?offset=-1",
+            "offset must be a non-negative integer",
+        ),
+        // Above u32::MAX: this endpoint's offset is a 32-bit value.
+        (
+            "/api-specs?offset=4294967296",
+            "offset exceeds the maximum supported value",
+        ),
+        // Percent-encoding the key must not bypass the same narrower ceiling.
+        (
+            "/api-specs?%6fffset=4294967296",
+            "offset exceeds the maximum supported value",
+        ),
+        // One past u64::MAX cannot be represented by the coercion parser.
+        (
+            "/api-specs?limit=18446744073709551616",
+            "limit exceeds the maximum supported value",
+        ),
+    ] {
+        let (status, body) = client.get_json(query).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{query} must be rejected with 400, not coerced: {body}"
+        );
+        assert_eq!(body["error"], expected_message, "wrong error for {query}");
+    }
+}
+
+/// Unknown query parameters stay ignored even when their *name* or their
+/// *value* cannot be percent-decoded to valid UTF-8. An undecodable name cannot
+/// alias any recognized ASCII filter, so it is unknown; and because the name is
+/// matched before the value is decoded, an ignored parameter's value is never
+/// decoded at all. Neither may fail an otherwise valid request — clients
+/// routinely append unrelated parameters. Recognized filters stay strict.
+#[tokio::test]
+async fn list_endpoint_ignores_undecodable_unknown_query_keys() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    // %80 is a bare UTF-8 continuation byte: an undecodable, unrecognized name.
+    let (status, body) = client.get_json("/api-specs?%80=1").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "undecodable unknown key must be ignored, not rejected: {body}"
+    );
+    assert_eq!(body["limit"], 50, "endpoint default still applies: {body}");
+
+    // An ignored key must not disturb the recognized parameters beside it.
+    let (status, body) = client.get_json("/api-specs?%80=1&limit=7").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert_eq!(body["limit"], 7, "sibling recognized key still parsed");
+
+    // The *value* of an ignored key is never decoded, so an undecodable value
+    // on an ignored name cannot fail the request either. Both orderings are
+    // asserted: whether the ignored pair precedes or follows a recognized one
+    // must not change the outcome.
+    for query in [
+        // Undecodable name AND undecodable value.
+        "/api-specs?%80=%80",
+        // Decodable but unrecognized name with an undecodable value — clients
+        // routinely append third-party parameters carrying arbitrary bytes.
+        "/api-specs?tracking_id=%80",
+        "/api-specs?%80=%80&limit=7",
+        "/api-specs?limit=7&%80=%80",
+        "/api-specs?limit=7&tracking_id=%80",
+    ] {
+        let (status, body) = client.get_json(query).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "{query}: an ignored key must never be rejected on its value: {body}"
+        );
+    }
+
+    // ...and the recognized sibling is still applied in either order.
+    for query in ["/api-specs?%80=%80&limit=7", "/api-specs?limit=7&%80=%80"] {
+        let (_, body) = client.get_json(query).await;
+        assert_eq!(body["limit"], 7, "{query}: recognized sibling still parsed");
+    }
+
+    // Every recognized name stays strict on an undecodable value; ignoring a
+    // value must never extend to a filter that is actually consumed.
+    for query in [
+        "/api-specs?offset=%80",
+        "/api-specs?proxy_id=%80",
+        "/api-specs?spec_version=%80",
+        "/api-specs?title_contains=%80",
+        "/api-specs?updated_since=%80",
+        "/api-specs?has_tag=%80",
+        "/api-specs?sort_by=%80",
+        "/api-specs?order=%80",
+    ] {
+        let (status, body) = client.get_json(query).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{query}: recognized keys keep strict value decoding: {body}"
+        );
+    }
+
+    // Recognized keys stay strict: a malformed *value* is still a 400, and an
+    // encoded name that DOES decode to a recognized key is still bound-checked
+    // (the `%6fffset` alias asserted in the 400 test above).
+    let (status, body) = client.get_json("/api-specs?limit=%80").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "recognized key with undecodable value must still be rejected: {body}"
+    );
+}
+
+/// `limit=0` means the endpoint default (50) and an over-max limit caps at 200,
+/// mirroring the shared parser's semantics at this endpoint's own bounds.
+#[tokio::test]
+async fn list_endpoint_limit_zero_and_over_max_are_bounded() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let (status, body) = client.get_json("/api-specs?limit=0").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "limit=0 body: {body}");
+    assert_eq!(body["limit"], 50, "limit=0 means the server default");
+
+    let (status, body) = client.get_json("/api-specs?limit=100000").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "over-max body: {body}");
+    assert_eq!(body["limit"], 200, "over-max limit caps at 200");
+
+    let (status, body) = client
+        .get_json("/api-specs?limit=9223372036854775808")
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "u64 limit body: {body}");
+    assert_eq!(body["limit"], 200, "any representable over-max limit caps");
 }
 
 /// The list summary includes Tier 1 metadata fields but excludes resource_hash.

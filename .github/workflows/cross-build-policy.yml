@@ -1,0 +1,301 @@
+name: Cross Build Policy
+
+on:
+  pull_request_target:
+    branches:
+      - main
+
+concurrency:
+  group: cross-build-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Trusted Cross Build Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # pull_request_target loads this workflow from the base branch. Keep the
+      # checkout on the trusted base commit and treat the PR's configuration
+      # and workflow files only as data; no code from the PR is executed here.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enforce trusted ARM64 cross-build policy
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::invalid triggering PR head SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::invalid triggering base SHA" >&2
+            exit 1
+          fi
+          # The checkout is the only code this job executes, so it must be the
+          # trusted base commit the event was created from.
+          checked_out="$(git rev-parse HEAD)"
+          if [ "$checked_out" != "$BASE_SHA" ]; then
+            echo "::error::checkout ${checked_out} is not the triggering base ${BASE_SHA}" >&2
+            exit 1
+          fi
+
+          # `main` can advance after the event is created. Comparing against the
+          # event's base SHA would then measure the PR against a stale policy
+          # surface, so fetch the live base branch tip from the trusted
+          # repository, authenticate it against the triggering base, and pin it
+          # to an immutable SHA that every later extraction reads.
+          if [[ ! "$BASE_REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$BASE_REF" == *".."* ]] \
+            || [[ "$BASE_REF" == -* ]] || [[ "$BASE_REF" == */ ]]; then
+            echo "::error::invalid triggering base ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin \
+            "+refs/heads/${BASE_REF}:refs/remotes/trusted-base"
+          trusted_base="$(git rev-parse "refs/remotes/trusted-base^{commit}")"
+          if [[ ! "$trusted_base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::live trusted base did not resolve to a commit" >&2
+            exit 1
+          fi
+          # A live tip that does not descend from the triggering base is a
+          # rewritten or confused ref rather than an advance of trusted `main`.
+          if ! git merge-base --is-ancestor "$BASE_SHA" "$trusted_base"; then
+            echo "::error::live base ${trusted_base} does not descend from ${BASE_SHA}" >&2
+            exit 1
+          fi
+          echo "trusted base tip: ${trusted_base} (event base ${BASE_SHA})"
+
+          # GitHub loaded this workflow file from the event base, so the
+          # extraction contract executing right now is the stale copy. It
+          # cannot be re-executed from the live tip, so authenticate it by
+          # comparison and fail closed when the trusted tip has moved it. The
+          # verifier itself is not subject to that limit and is executed from
+          # the live tip below.
+          if ! git diff --no-ext-diff --quiet "$BASE_SHA" "$trusted_base" \
+            -- ".github/workflows/cross-build-policy.yml"; then
+            echo "::error::the trusted extraction contract changed on ${BASE_REF} after this event was created; re-run once the pull request base is updated" >&2
+            exit 1
+          fi
+
+          # Every executed byte and every baseline now comes from one immutable
+          # trusted commit, so a Cross surface that only the newer live-base
+          # verifier recognizes is still enforced.
+          trusted_dir="$RUNNER_TEMP/trusted-policy"
+          mkdir -p "$trusted_dir"
+          verifier_entry="$(git ls-tree "$trusted_base" -- .github/scripts/verify_cross_build_policy.py)"
+          if [[ "$verifier_entry" != "100644 blob "* && "$verifier_entry" != "100755 blob "* ]]; then
+            echo "::error::the live trusted Cross policy verifier must be a regular blob" >&2
+            exit 1
+          fi
+          trusted_verifier="$trusted_dir/verify_cross_build_policy.py"
+          git show "$trusted_base:.github/scripts/verify_cross_build_policy.py" > "$trusted_verifier"
+          trusted_policy_workflow="$trusted_dir/cross-build-policy.yml"
+          git show "$trusted_base:.github/workflows/cross-build-policy.yml" > "$trusted_policy_workflow"
+
+          proposed_cross="$RUNNER_TEMP/proposed-Cross.toml"
+          proposed_cargo="$RUNNER_TEMP/proposed-Cargo.toml"
+          proposed_cargo_tool="$RUNNER_TEMP/proposed-cargo-config.toml"
+          proposed_cargo_legacy="$RUNNER_TEMP/proposed-cargo-config"
+          proposed_ci="$RUNNER_TEMP/proposed-ci.yml"
+          proposed_release="$RUNNER_TEMP/proposed-release.yml"
+          merge_base_ci="$RUNNER_TEMP/current-base-ci.yml"
+          merge_base_release="$RUNNER_TEMP/current-base-release.yml"
+          proposed_workflows="$RUNNER_TEMP/proposed-workflows"
+          merge_base_workflows="$RUNNER_TEMP/current-base-workflows"
+          proposed_actions="$RUNNER_TEMP/proposed-actions"
+          merge_base_actions="$RUNNER_TEMP/current-base-actions"
+          proposed_automation="$RUNNER_TEMP/proposed-automation"
+          merge_base_automation="$RUNNER_TEMP/current-base-automation"
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+          fetched_head="$(git rev-parse FETCH_HEAD)"
+          if [ "$fetched_head" != "$PR_HEAD_SHA" ]; then
+            echo "::error::fetched PR head ${fetched_head} does not match triggering head ${PR_HEAD_SHA}" >&2
+            exit 1
+          fi
+
+          # These files define and invoke the trusted policy. Once this
+          # bootstrap workflow is on main, changes to either require an
+          # explicit branch-protection bypass rather than an ordinary PR. Use
+          # the merge base with the live trusted tip so unrelated changes made
+          # later on main do not make an otherwise untouched PR appear to
+          # modify these files.
+          protected_paths=(
+            ".github/scripts/verify_cross_build_policy.py"
+            ".github/workflows/cross-build-policy.yml"
+          )
+          for protected_path in "${protected_paths[@]}"; do
+            if ! git diff --no-ext-diff --quiet \
+              "$trusted_base...$PR_HEAD_SHA" -- "$protected_path"; then
+              echo "::error file=${protected_path}::trusted cross-build policy files cannot be changed by a pull request" >&2
+              exit 1
+            fi
+          done
+
+          git show "FETCH_HEAD:Cross.toml" > "$proposed_cross"
+          git show "FETCH_HEAD:Cargo.toml" > "$proposed_cargo"
+          cargo_tool_entry="$(git ls-tree FETCH_HEAD -- .cargo/config.toml)"
+          if [[ "$cargo_tool_entry" != "100644 blob "* ]]; then
+            echo "::error file=.cargo/config.toml::Cargo config must be a regular blob" >&2
+            exit 1
+          fi
+          git show "FETCH_HEAD:.cargo/config.toml" > "$proposed_cargo_tool"
+          if git cat-file -e "FETCH_HEAD:.cargo/config" 2>/dev/null; then
+            git show "FETCH_HEAD:.cargo/config" > "$proposed_cargo_legacy"
+          fi
+          git show "FETCH_HEAD:.github/workflows/ci.yml" > "$proposed_ci"
+          git show "FETCH_HEAD:.github/workflows/release.yml" > "$proposed_release"
+          # Compare executable/configuration surfaces to the live trusted base
+          # tip rather than the event's base SHA. A stale event base therefore
+          # cannot restore a Cross surface that current main removed.
+          git show "$trusted_base:.github/workflows/ci.yml" > "$merge_base_ci"
+          git show "$trusted_base:.github/workflows/release.yml" > "$merge_base_release"
+
+          extract_workflows() {
+            local commit="$1"
+            local destination="$2"
+            local path relative entry listing
+            mkdir -p "$destination"
+            listing="${destination}.ls-tree"
+            if ! git ls-tree -rz --name-only "$commit" -- .github/workflows > "$listing"; then
+              echo "::error::.github/workflows tree enumeration failed" >&2
+              return 1
+            fi
+            while IFS= read -r -d '' path; do
+              relative="${path#.github/workflows/}"
+              if [[ "$relative" == */* ]]; then
+                continue
+              fi
+              if [[ ! "$relative" =~ ^[A-Za-z0-9._+@~\ -]+\.(yml|yaml)$ ]]; then
+                echo "::error file=${path}::unsupported workflow filename; use letters, digits, '.', '_', '+', '@', '~', spaces, or '-'" >&2
+                return 1
+              fi
+              entry="$(git ls-tree "$commit" -- "$path")"
+              if [[ "$entry" != "100644 blob "* ]]; then
+                echo "::error file=${path}::workflow must be a regular non-symlink blob" >&2
+                return 1
+              fi
+              git show "${commit}:${path}" > "${destination}/${relative}"
+            done < "$listing"
+          }
+
+          extract_workflows FETCH_HEAD "$proposed_workflows"
+          extract_workflows "$trusted_base" "$merge_base_workflows"
+
+          extract_actions() {
+            local commit="$1"
+            local destination="$2"
+            local path relative entry output listing
+            mkdir -p "$destination"
+            listing="${destination}.ls-tree"
+            if ! git ls-tree -rz --name-only "$commit" -- .github/actions > "$listing"; then
+              echo "::error::.github/actions tree enumeration failed" >&2
+              return 1
+            fi
+            while IFS= read -r -d '' path; do
+              relative="${path#.github/actions/}"
+              if [[ "/$relative/" == *"/../"* ]]; then
+                echo "::error file=${path}::local-action paths must not contain '..'" >&2
+                return 1
+              fi
+              if [[ ! "$relative" =~ ^[A-Za-z0-9._+@~\ -]+(/[A-Za-z0-9._+@~\ -]+)*$ ]]; then
+                echo "::error file=${path}::unsupported local-action path; use letters, digits, '.', '_', '+', '@', '~', spaces, or '-'" >&2
+                return 1
+              fi
+              entry="$(git ls-tree "$commit" -- "$path")"
+              if [[ "$entry" != "100644 blob "* && "$entry" != "100755 blob "* ]]; then
+                echo "::error file=${path}::local-action input must be a regular blob" >&2
+                return 1
+              fi
+              output="${destination}/${relative}"
+              mkdir -p "$(dirname "$output")"
+              git show "${commit}:${path}" > "$output"
+            done < "$listing"
+          }
+
+          extract_actions FETCH_HEAD "$proposed_actions"
+          extract_actions "$trusted_base" "$merge_base_actions"
+
+          extract_automation() {
+            local commit="$1"
+            local destination="$2"
+            local path entry output listing workspace_listing
+            mkdir -p "$destination"
+            listing="${destination}.ls-tree"
+            workspace_listing="${destination}.workspace-ls-tree"
+            if ! git ls-tree -rz --name-only "$commit" -- \
+              .github/scripts comparison scripts tests/k8s tests/performance \
+              Makefile makefile GNUmakefile package.json \
+              justfile Justfile .justfile Taskfile.yml Taskfile.yaml > "$listing"; then
+              echo "::error::automation tree enumeration failed" >&2
+              return 1
+            fi
+            if ! git ls-tree -rz --name-only "$commit" > "$workspace_listing"; then
+              echo "::error::workspace manifest enumeration failed" >&2
+              return 1
+            fi
+            while IFS= read -r -d '' path; do
+              if [[ "$path" == */package.json ]]; then
+                printf '%s\0' "$path" >> "$listing"
+              fi
+            done < "$workspace_listing"
+            while IFS= read -r -d '' path; do
+              if [[ "/$path/" == *"/../"* ]]; then
+                echo "::error file=${path}::automation paths must not contain '..'" >&2
+                return 1
+              fi
+              if [[ ! "$path" =~ ^[A-Za-z0-9._+@~\ -]+(/[A-Za-z0-9._+@~\ -]+)*$ ]]; then
+                echo "::error file=${path}::unsupported automation path; use letters, digits, '.', '_', '+', '@', '~', spaces, or '-'" >&2
+                return 1
+              fi
+              entry="$(git ls-tree "$commit" -- "$path")"
+              if [[ "$entry" != "100644 blob "* && "$entry" != "100755 blob "* ]]; then
+                echo "::error file=${path}::automation input must be a regular blob" >&2
+                return 1
+              fi
+              output="${destination}/${path}"
+              mkdir -p "$(dirname "$output")"
+              git show "${commit}:${path}" > "$output"
+            done < "$listing"
+          }
+
+          extract_automation FETCH_HEAD "$proposed_automation"
+          extract_automation "$trusted_base" "$merge_base_automation"
+
+          # Both the executed verifier and every trusted baseline now come from
+          # the pinned live trusted tip, so a Cross surface that only the newer
+          # verifier recognizes is still enforced against this pull request.
+          python3 -I "$trusted_verifier" \
+            --self-test \
+            --config "$proposed_cross" \
+            --cargo-config "$proposed_cargo" \
+            --cargo-tool-config "$proposed_cargo_tool" \
+            --cargo-legacy-config "$proposed_cargo_legacy" \
+            --ci-workflow "$merge_base_ci" \
+            --release-workflow "$merge_base_release" \
+            --trusted-policy-workflow "$trusted_policy_workflow" \
+            --workflows-dir "$merge_base_workflows" \
+            --actions-dir "$merge_base_actions" \
+            --automation-dir "$merge_base_automation" \
+            --merge-base-ci-workflow "$merge_base_ci" \
+            --proposed-ci-workflow "$proposed_ci" \
+            --merge-base-release-workflow "$merge_base_release" \
+            --proposed-release-workflow "$proposed_release" \
+            --merge-base-workflows-dir "$merge_base_workflows" \
+            --proposed-workflows-dir "$proposed_workflows" \
+            --merge-base-actions-dir "$merge_base_actions" \
+            --proposed-actions-dir "$proposed_actions" \
+            --merge-base-automation-dir "$merge_base_automation" \
+            --proposed-automation-dir "$proposed_automation" \
+            --proposed-tree-listing "${proposed_automation}.workspace-ls-tree"

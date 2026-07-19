@@ -6,6 +6,7 @@ use ferrum_edge::_test_support::{
     request_deduplication_expire_inflight_entries_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
     request_deduplication_redis_payload_for_test, request_deduplication_request_identity_for_test,
+    request_deduplication_set_request_state_for_test,
     request_deduplication_with_instance_id_for_test,
 };
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
@@ -105,6 +106,50 @@ fn request_identity(
     ctx: &RequestContext,
 ) -> Option<(String, String)> {
     request_deduplication_request_identity_for_test(plugin, ctx)
+}
+
+#[tokio::test]
+async fn request_context_debug_redacts_request_deduplication_state() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = body_ctx("POST", "/payments", br#"{"amount":100}"#);
+    let mut upstream_headers = keyed_headers("ordinary-idempotency-key", "api.example.test", 14);
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut upstream_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(request_identity(&plugin, &ctx).is_some());
+
+    let protected_values = [
+        ("key", "dedup-debug-key-sentinel-9f21"),
+        ("fingerprint", "dedup-debug-fingerprint-sentinel-6c38"),
+        (
+            "local_inflight_owner_token",
+            "dedup-debug-local-owner-sentinel-4a57",
+        ),
+        ("redis_lock_token", "dedup-debug-redis-lock-sentinel-2d84"),
+    ];
+    request_deduplication_set_request_state_for_test(
+        &plugin,
+        &mut ctx,
+        protected_values[0].1,
+        protected_values[1].1,
+        protected_values[2].1,
+        Some(protected_values[3].1),
+    );
+
+    let debug_output = format!("{ctx:?}");
+    assert!(debug_output.contains("RequestDeduplicationRequestState"));
+    for (field, sentinel) in protected_values {
+        assert!(
+            debug_output.contains(&format!(r#"{field}: "<redacted>""#)),
+            "missing redacted {field} structure: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains(sentinel),
+            "{field} leaked through RequestContext Debug"
+        );
+    }
 }
 
 fn keyed_headers(key: &str, host: &str, body_len: usize) -> HashMap<String, String> {

@@ -899,7 +899,7 @@ async fn handle_h3_connection(
     // to avoid per-request String allocation from SocketAddr::ip().to_string().
     // Updated in-place when QUIC connection migration is detected.
     let mut cached_addr = quinn_conn.remote_address();
-    let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_string());
+    let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_canonical().to_string());
 
     loop {
         match h3_conn.accept().await {
@@ -914,7 +914,7 @@ async fn handle_h3_connection(
                         cached_addr, current_addr
                     );
                     cached_addr = current_addr;
-                    socket_ip = Arc::from(current_addr.ip().to_string());
+                    socket_ip = Arc::from(current_addr.ip().to_canonical().to_string());
                 }
 
                 let state = Arc::clone(&state);
@@ -2752,27 +2752,34 @@ async fn handle_h3_request(
             initial_needs_ctx_headers_for_body_hooks,
         )
     };
-    // Reserved consumer-identity headers are gateway-asserted. Strip any
+    // Reserved gateway assertions — consumer identity AND the private GeoIP
+    // lookup result — are never sourced from mutable plugin headers. Strip any
     // client- OR plugin-supplied value UNCONDITIONALLY before backend dispatch,
-    // then inject the authenticated value when a principal resolved. `materialize_headers`
+    // then inject the authenticated principal and the authoritative country
+    // only after a successful lookup/allow decision. `materialize_headers`
     // only removed the RAW client header BEFORE plugins ran, so an unauthenticated
-    // route where a `before_proxy` transformer adds `x-consumer-*` would otherwise
-    // forward that plugin value to the backend — the exact spoofing path. The strip
-    // is case-insensitive (the gateway injects mixed-case keys; the H3 wire and
-    // plugins use lowercase). To preserve the zero-alloc hot path, only
-    // materialize/scrub when a principal must be injected OR a reserved header is
-    // actually present in the effective source.
-    let source_has_reserved_identity = owned_proxy_headers
+    // route where a `before_proxy` transformer adds `x-consumer-*` or
+    // `x-geo-country` would otherwise forward that plugin value to the backend —
+    // the exact spoofing path. The strip is case-insensitive (the gateway
+    // injects mixed-case keys; the H3 wire and plugins use lowercase). To
+    // preserve the zero-alloc hot path, only materialize/scrub when an
+    // assertion must be injected OR a reserved header is actually present in
+    // the effective source.
+    let source_has_reserved_assertion = owned_proxy_headers
         .as_ref()
         .unwrap_or(&ctx.headers)
         .keys()
         .any(|k| {
             k.eq_ignore_ascii_case("x-consumer-username")
                 || k.eq_ignore_ascii_case("x-consumer-custom-id")
+                || k.eq_ignore_ascii_case("x-geo-country")
         });
-    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
+    if ctx.backend_consumer_username().is_some()
+        || ctx.backend_geo_country().is_some()
+        || source_has_reserved_assertion
+    {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        crate::proxy::refresh_backend_consumer_identity_headers(&ctx, headers);
+        crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
     // Resolve proxy_headers into an owned HashMap to avoid borrowing
     // ctx.headers while ctx is passed as &mut to proxy functions downstream.
@@ -3002,9 +3009,9 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.path = backend_ctx_path;
         if matches!(deferred_result, PluginResult::Continue) {
-            // Re-establish gateway-authenticated identity and egress baggage
+            // Re-establish gateway assertions and egress baggage
             // policy before a deferred function's headers reach a backend.
-            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers);
             crate::modes::mesh::hbone::strip_egress_baggage_in_map(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,
@@ -3030,7 +3037,7 @@ async fn handle_h3_request(
             ctx.path = backend_ctx_path;
         }
         if matches!(deferred_result, PluginResult::Continue) {
-            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers);
             crate::modes::mesh::hbone::strip_egress_baggage_in_map(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,
@@ -6316,9 +6323,11 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
-        // Sticky session cookie injection
+        // Sticky session cookie injection. The buffered variant also records the
+        // cookie as gateway-owned so a committed-hook deadline cannot strip it.
         if !after_proxy_rejected {
-            inject_sticky_cookie(
+            inject_sticky_cookie_with_deadline_provenance(
+                &mut ctx,
                 &epoch,
                 &proxy,
                 upstream_target.as_deref(),
@@ -6337,6 +6346,7 @@ async fn handle_h3_request(
                 response_status,
                 &mut response_headers,
                 &mut response_body,
+                initial_response_header_policy_plugins.as_ref(),
             )
             .await
             {
@@ -7179,13 +7189,22 @@ fn build_h3_backend_headers(
 /// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
 /// Inject a sticky-session `Set-Cookie` header when the LB strategy is cookie-based
 /// and the cookie was not present in the original request.
+///
+/// Returns whether a cookie was actually injected. Buffered callers use this to
+/// record `set-cookie` as gateway-owned in gRPC-deadline provenance before
+/// `response_committed` hooks run — mirroring the H1/H2 gRPC and plain buffered
+/// paths. Without that record, a committed hook that exhausts the RPC deadline
+/// rebuilds the response from gateway-owned headers only, and the freshly
+/// injected affinity cookie is stripped, silently breaking stickiness for the
+/// client. Streaming callers may ignore the result: their headers are already on
+/// the wire before any deadline rebuild can run.
 pub(crate) fn inject_sticky_cookie(
     epoch: &crate::request_epoch::RequestEpoch,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
     sticky_cookie_needed: bool,
     response_headers: &mut HashMap<String, String>,
-) {
+) -> bool {
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
@@ -7211,8 +7230,50 @@ pub(crate) fn inject_sticky_cookie(
                     v.push_str(&cookie_val);
                 })
                 .or_insert(cookie_val);
+            return true;
         }
     }
+    false
+}
+
+/// Inject the sticky-affinity cookie on a BUFFERED H3 response and, when one was
+/// written, declare it gateway-owned in gRPC-deadline provenance.
+///
+/// Every buffered H3 path must use this instead of calling
+/// [`inject_sticky_cookie`] directly. A `response_committed` hook that exhausts
+/// the RPC deadline rebuilds the response from gateway-owned headers only, so an
+/// unrecorded affinity cookie is stripped and the client silently loses
+/// stickiness. Recording here — before any committed hook runs — mirrors the
+/// H1/H2 gRPC and plain buffered paths in `src/proxy/mod.rs`.
+///
+/// Streaming paths deliberately keep calling [`inject_sticky_cookie`]: their
+/// headers reach the wire before a deadline can rebuild anything.
+pub(crate) fn inject_sticky_cookie_with_deadline_provenance(
+    ctx: &mut RequestContext,
+    epoch: &crate::request_epoch::RequestEpoch,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    sticky_cookie_needed: bool,
+    response_headers: &mut HashMap<String, String>,
+) -> bool {
+    if !inject_sticky_cookie(
+        epoch,
+        proxy,
+        upstream_target,
+        sticky_cookie_needed,
+        response_headers,
+    ) {
+        return false;
+    }
+    // The injection APPENDS onto any co-present backend cookie, so it records
+    // mutations rather than declaring ownership — ownership means whole-value
+    // replacement and retires the backend cookie baseline, which would credit a
+    // backend cookie as gateway output. `record_deadline_response_header_…`
+    // returns immediately when no deadline provenance is being tracked, so
+    // ordinary sticky traffic pays nothing here (same shape as the H1/H2
+    // buffered sites in `src/proxy/mod.rs`).
+    ctx.record_deadline_response_header_mutations(response_headers);
+    true
 }
 
 /// Whether an H3 dispatch failure counts as a connect-class (pre-wire) backend
@@ -10481,6 +10542,22 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
         return false;
     }
 
+    // Seed gateway-rejection provenance for every H3 reject path that can reach
+    // a committed hook, not just the ones routed through
+    // `apply_reject_after_proxy_and_synthetic_body_hooks`. Direct gateway-error
+    // callers (notably the mesh dispatch-required 502 emitted straight after
+    // `finalize_h3_gateway_error_headers`) otherwise hand gateway-authored
+    // headers to a committed hook with no provenance at all; if that hook
+    // exhausts the RPC deadline, `replace_buffered_h3_response_with_grpc_deadline`
+    // below rebuilds from an empty gateway map and strips them. These headers are
+    // the rejection the gateway itself synthesized, so declaring them
+    // gateway-owned adds no backend surface. Seeding here (after the
+    // no-committed-hook early return, and on the same `headers` the deadline
+    // rebuild clones) covers the shared wrapper and the direct delegate callers
+    // in one place; on paths that already seeded, this folds through
+    // `adopt_gateway_rejection` rather than restarting provenance.
+    ctx.begin_rejection_deadline_response_header_provenance(headers);
+
     let (committed_status, committed_headers, committed_body) = if let Some(content_type) =
         grpc_web_response_content_type
     {
@@ -11333,6 +11410,8 @@ mod h3_request_body_timeout_tests {
             ("x-correlation-id".to_string(), "request-123".to_string()),
         ]);
         let mut body = b"backend response".to_vec();
+        ctx.mark_gateway_deadline_response_selected();
+        ctx.begin_rejection_deadline_response_header_provenance(&headers);
 
         let status = super::replace_buffered_h3_response_with_grpc_deadline(
             &mut ctx,

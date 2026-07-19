@@ -10464,6 +10464,7 @@ fn start_mesh_admin_listeners(
         admin_allowed_cidrs,
         metrics_auth,
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
