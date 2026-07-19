@@ -277,7 +277,7 @@ Resource and TLS list endpoints — `GET /proxies`, `/consumers`, `/plugins/conf
 
 `pagination.limit` reports the page size the server applied, not the number of items returned: an omitted `limit` reports 100 even when fewer rows exist.
 
-Pagination is validated only by routes that consume it, after their authentication, namespace-claim, and role gates. A malformed `limit`/`offset` therefore never preempts the `401` or `403` the caller would otherwise receive, never affects the always-unauthenticated `/live` observability tier, and is ignored on non-paginated routes such as `/namespaces`, `/backup`, and `/cluster`.
+Pagination is validated only by routes that consume it, after their authentication, namespace-claim, and role gates. A malformed `limit`/`offset` therefore never preempts the `401` or `403` the caller would otherwise receive, never affects the always-unauthenticated `/live` observability tier, and is ignored on non-paginated routes such as `/namespaces`, `/backup`, and `/cluster`. On the paginated `GET` routes the check runs before the request body is read, so a malformed `limit`/`offset` returns `400` without buffering a body the read endpoint would never use.
 
 Two endpoints intentionally differ and document their own bounds below: `GET /audit` shares these bounds for `limit` but caps `offset` at `2^32 - 1`, and `GET /api-specs` uses a default of 50 and a maximum of 200. Both return their own `{ items, ..., next_offset }` envelope instead of `data`/`pagination`.
 

@@ -28,9 +28,9 @@ Configuration and database mutations are blocked and return `403 Forbidden`:
 - `POST /consumers` - Create new consumer
 - `PUT /consumers/{id}` - Update existing consumer
 - `DELETE /consumers/{id}` - Delete consumer
-- `POST /plugin-configs` - Create new plugin configuration
-- `PUT /plugin-configs/{id}` - Update existing plugin configuration
-- `DELETE /plugin-configs/{id}` - Delete plugin configuration
+- `POST /plugins/config` - Create new plugin configuration
+- `PUT /plugins/config/{id}` - Update existing plugin configuration
+- `DELETE /plugins/config/{id}` - Delete plugin configuration
 
 Operational POST endpoints that do not persist configuration remain available
 with their normal JWT and role checks. These include

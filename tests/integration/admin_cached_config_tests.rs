@@ -6557,3 +6557,162 @@ async fn test_cluster_endpoint_database_mode() {
     assert_eq!(body["mode"], "database");
     assert!(body["message"].is_string());
 }
+
+// ---- Pagination is validated before the shared request-body read ----
+
+fn generate_test_token_with_role(config: &TestConfig, role: &str) -> String {
+    let now = chrono::Utc::now();
+    let claims = json!({
+        "iss": config.jwt_issuer,
+        "sub": "test-user",
+        "role": role,
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + chrono::Duration::seconds(config.max_ttl as i64)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string()
+    });
+    let header = Header::new(jsonwebtoken::Algorithm::HS256);
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    encode(&header, &claims, &key).unwrap()
+}
+
+/// Send a request carrying `body_len` bytes, past the admin 1 MiB body cap.
+async fn admin_request_with_body(
+    method: reqwest::Method,
+    base_url: &str,
+    path: &str,
+    token: Option<&str>,
+    body_len: usize,
+) -> (reqwest::StatusCode, Value) {
+    let client = reqwest::Client::new();
+    let mut req = client
+        .request(method, format!("{}{}", base_url, path))
+        .body(vec![b'x'; body_len]);
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {}", token));
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(json!(null));
+    (status, body)
+}
+
+const OVERSIZED_BODY: usize = 2 * 1024 * 1024;
+
+/// A paginated GET must resolve `limit`/`offset` from the request line before
+/// the shared `Limited::collect` body read. Otherwise an oversized (and wholly
+/// unused) GET body turns the documented malformed-pagination `400` into a
+/// `413`, after buffering up to the cap on a read endpoint.
+#[tokio::test]
+async fn malformed_pagination_on_get_list_precedes_body_buffering() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for path in [
+        "/proxies?limit=abc",
+        "/consumers?offset=-1",
+        "/plugins/config?limit=1.5",
+        "/upstreams?offset=18446744073709551616",
+    ] {
+        let (status, body) = admin_request_with_body(
+            reqwest::Method::GET,
+            &base_url,
+            path,
+            Some(&token),
+            OVERSIZED_BODY,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "{path} must return the pagination 400 without buffering the body: {body:?}"
+        );
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("must be")
+                || body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("maximum supported value"),
+            "{path} must report the pagination error, not a body error: {body:?}"
+        );
+    }
+
+    // Well-formed pagination on the same route still succeeds; only the
+    // malformed case short-circuits ahead of the body read.
+    let (status, body, _) = admin_get(&base_url, "/proxies?limit=2", &token).await;
+    assert_eq!(status, 200, "valid pagination unaffected: {body:?}");
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+
+    // Body handling for mutation routes is unchanged: an oversized POST body is
+    // still rejected with 413 by the shared reader.
+    let (status, body) = admin_request_with_body(
+        reqwest::Method::POST,
+        &base_url,
+        "/proxies?limit=abc",
+        Some(&token),
+        OVERSIZED_BODY,
+    )
+    .await;
+    assert_eq!(
+        status, 413,
+        "mutation routes keep the shared body cap: {body:?}"
+    );
+}
+
+/// The pre-body pagination gate must not reorder the security checks ahead of
+/// it: an unauthenticated caller still gets `401` and an under-privileged one
+/// still gets `403`, even when the pagination is malformed.
+#[tokio::test]
+async fn pre_body_pagination_never_preempts_authentication_or_rbac() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let viewer = generate_test_token_with_role(&tc, "viewer");
+
+    // No credentials at all -> 401, never the pagination 400.
+    let (status, body) = admin_request_with_body(
+        reqwest::Method::GET,
+        &base_url,
+        "/proxies?limit=abc",
+        None,
+        OVERSIZED_BODY,
+    )
+    .await;
+    assert_eq!(
+        status, 401,
+        "unauthenticated malformed pagination must stay 401: {body:?}"
+    );
+
+    // Authenticated but under-privileged on routes whose arm gates on a role
+    // before parsing pagination -> 403, never the pagination 400.
+    for path in [
+        "/audit?limit=abc",
+        "/admin/tls/inventory?limit=abc",
+        "/admin/tls/certificates?offset=-1",
+    ] {
+        let (status, body) = admin_request_with_body(
+            reqwest::Method::GET,
+            &base_url,
+            path,
+            Some(&viewer),
+            OVERSIZED_BODY,
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "{path} must return 403 before pagination validation: {body:?}"
+        );
+    }
+
+    // `/live` stays unauthenticated and minimal regardless of query garbage.
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/live?limit=abc", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({"status": "ok"}));
+}

@@ -875,6 +875,41 @@ fn require_admin_role(actor: &AuditActor, required: AdminRole) -> Option<Respons
     ))
 }
 
+/// The GET list routes that actually consume `limit`/`offset`, paired with the
+/// role their route arm requires before parsing pagination.
+///
+/// `Some(None)` means the arm has no role gate (the caller's role is passed
+/// through to the handler for row-level filtering instead); `Some(Some(role))`
+/// mirrors the `require_admin_role` call the arm makes first. `None` means the
+/// route does not consume pagination — those routes must keep ignoring
+/// irrelevant `limit`/`offset` parameters, so they are deliberately absent
+/// (including the non-paginated `/admin/tls/**/{id}` detail routes that
+/// [`tls_route_required_role`] also matches).
+///
+/// This exists so pagination can be validated before the shared request-body
+/// read without reordering authentication, namespace-claim enforcement, or
+/// RBAC ahead of it. Keep it in sync with the `route_pagination!()` call sites.
+fn paginated_get_list_route_role(method: &Method, segments: &[&str]) -> Option<Option<AdminRole>> {
+    if method != Method::GET {
+        return None;
+    }
+    match segments {
+        ["proxies"] | ["consumers"] | ["upstreams"] | ["plugins", "config"] => Some(None),
+        ["audit"] => Some(Some(AdminRole::Admin)),
+        ["admin", "tls", "inventory"]
+        | ["admin", "tls", "events"]
+        | ["admin", "tls", "acme", "certificates"]
+        | ["admin", "tls", "acme", "accounts"]
+        | ["admin", "tls", "acme", "orders"]
+        | ["admin", "tls", "certificates"]
+        | ["admin", "tls", "ca-bundles"]
+        | ["admin", "tls", "crls"]
+        | ["admin", "tls", "ocsp-responses"]
+        | ["admin", "tls", "jwks"] => Some(Some(AdminRole::Operator)),
+        _ => None,
+    }
+}
+
 fn tls_route_required_role(method: &Method, segments: &[&str]) -> Option<AdminRole> {
     match (method, segments) {
         (
@@ -1584,6 +1619,33 @@ pub async fn handle_admin_request(
         return Ok(resp);
     }
 
+    // Pagination lives in the request line, not the body, so validate it for the
+    // GET list routes that consume it BEFORE the shared body read below. Without
+    // this, `GET /proxies?limit=abc` carrying an oversized (and entirely unused)
+    // body returns `413` and buffers up to the limit instead of the documented
+    // malformed-pagination `400`. The route's own role gate is replayed here
+    // first so pagination can never preempt the `403` the arm would return; the
+    // in-arm gates below remain authoritative and simply re-run idempotently.
+    let prevalidated_pagination =
+        match paginated_get_list_route_role(&method, segments_peek.as_slice()) {
+            Some(required_role) => {
+                if let Some(role) = required_role
+                    && let Some(resp) = require_admin_role(&auth, role)
+                {
+                    drop(req.into_body());
+                    return Ok(resp);
+                }
+                match parse_pagination(&uri) {
+                    Ok(pagination) => Some(pagination),
+                    Err(response) => {
+                        drop(req.into_body());
+                        return Ok(*response);
+                    }
+                }
+            }
+            None => None,
+        };
+
     // Read body with size limit.
     // /restore gets a configurable limit (default 100 MiB) for large-scale
     // backups (30K+ proxies / 90K+ plugins can reach ~80 MB);
@@ -1625,9 +1687,15 @@ pub async fn handle_admin_request(
 
     macro_rules! route_pagination {
         () => {
-            match parse_pagination(&uri) {
-                Ok(pagination) => pagination,
-                Err(response) => return Ok(*response),
+            match prevalidated_pagination {
+                // Validated before the body read for every route in
+                // `paginated_get_list_route_role`; reuse it rather than
+                // re-parsing so the two paths cannot diverge.
+                Some(pagination) => pagination,
+                None => match parse_pagination(&uri) {
+                    Ok(pagination) => pagination,
+                    Err(response) => return Ok(*response),
+                },
             }
         };
     }

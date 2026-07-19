@@ -2632,12 +2632,18 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
         let raw_key = parts.next().unwrap_or("");
         let raw_val = parts.next().unwrap_or("");
         // URL-decode both names and values. Decoding only values lets encoded
-        // pagination names bypass this endpoint's narrower `u32` offset bound.
-        // Invalid UTF-8 sequences in percent-encoded bytes are rejected with 400
-        // to prevent bypassing downstream character-validation checks (e.g. the
-        // `title_contains` wildcard rejection below).
-        let key = percent_decode(raw_key)?;
+        // pagination names bypass this endpoint's narrower `u32` offset bound
+        // (e.g. `?%6fffset=` aliasing `offset`), so names are decoded too.
+        // Invalid UTF-8 sequences in percent-encoded *values* are rejected with
+        // 400 to prevent bypassing downstream character-validation checks (e.g.
+        // the `title_contains` wildcard rejection below). A *name* that does not
+        // decode to valid UTF-8 cannot alias any recognized ASCII filter name,
+        // so it is an unknown parameter and is ignored like every other unknown
+        // key rather than failing the request.
         let val = percent_decode(raw_val)?;
+        let Ok(key) = percent_decode(raw_key) else {
+            continue;
+        };
 
         match key.as_str() {
             // `/api-specs` keeps its own stricter bounds (default 50, max 200)

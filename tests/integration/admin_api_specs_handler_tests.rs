@@ -3550,6 +3550,42 @@ async fn list_endpoint_malformed_pagination_returns_400() {
     }
 }
 
+/// Unknown query parameters stay ignored even when their *name* cannot be
+/// percent-decoded to valid UTF-8. Such a name cannot alias any recognized
+/// ASCII filter, so it must not fail an otherwise valid request — clients
+/// routinely append unrelated parameters.
+#[tokio::test]
+async fn list_endpoint_ignores_undecodable_unknown_query_keys() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    // %80 is a bare UTF-8 continuation byte: an undecodable, unrecognized name.
+    let (status, body) = client.get_json("/api-specs?%80=1").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "undecodable unknown key must be ignored, not rejected: {body}"
+    );
+    assert_eq!(body["limit"], 50, "endpoint default still applies: {body}");
+
+    // An ignored key must not disturb the recognized parameters beside it.
+    let (status, body) = client.get_json("/api-specs?%80=1&limit=7").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert_eq!(body["limit"], 7, "sibling recognized key still parsed");
+
+    // Recognized keys stay strict: a malformed *value* is still a 400, and an
+    // encoded name that DOES decode to a recognized key is still bound-checked
+    // (the `%6fffset` alias asserted in the 400 test above).
+    let (status, body) = client.get_json("/api-specs?limit=%80").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "recognized key with undecodable value must still be rejected: {body}"
+    );
+}
+
 /// `limit=0` means the endpoint default (50) and an over-max limit caps at 200,
 /// mirroring the shared parser's semantics at this endpoint's own bounds.
 #[tokio::test]
