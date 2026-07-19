@@ -6023,24 +6023,46 @@ def cross_surface_line_report(
         for line, shell_evaluated, starts_command in logical_scan_lines(
             command_contents
         ):
-            if (
-                OPAQUE_INLINE_SHELL.search(line)
-                or WRAPPED_LITERAL_CROSS.search(line)
-                or opaque_arm_cross_execution(line)
-                or contains_opaque_executable_cross(line)
-            ):
-                return f" (projected command text: {line.strip()[:160]!r})"
+            projected_reason = next(
+                (
+                    reason
+                    for reason, matched in (
+                        ("opaque inline shell", OPAQUE_INLINE_SHELL.search(line)),
+                        ("wrapped literal Cross", WRAPPED_LITERAL_CROSS.search(line)),
+                        ("opaque ARM Cross", opaque_arm_cross_execution(line)),
+                        (
+                            "opaque executable Cross",
+                            contains_opaque_executable_cross(line),
+                        ),
+                    )
+                    if matched
+                ),
+                None,
+            )
+            if projected_reason is not None:
+                return (
+                    f" (projected command text/{projected_reason}: "
+                    f"{line.strip()[:160]!r})"
+                )
             for variant in scan_variants(
                 line,
                 include_opaque_shell_executable=include_opaque_shell_executable,
                 shell_evaluated=shell_evaluated,
                 starts_command=starts_command,
             ):
-                if has_cross_command_context(
+                command_match = has_cross_command_context(
                     variant,
                     include_opaque_shell_executable=include_opaque_shell_executable,
-                ) or CROSS_ENVIRONMENT.search(variant):
-                    return f" (projected command text: {line.strip()[:160]!r})"
+                )
+                environment_match = CROSS_ENVIRONMENT.search(variant)
+                if command_match or environment_match:
+                    reason = (
+                        "command context" if command_match else "environment token"
+                    )
+                    return (
+                        f" (projected command text/{reason}: "
+                        f"{line.strip()[:120]!r}; variant={variant.strip()[:120]!r})"
+                    )
     return ""
 
 
@@ -9332,20 +9354,6 @@ def python_command_scripts(
         elif override_opaque and reject_dynamic_commands:
             errors.append(f"{source} has an opaque process executable override")
 
-        if command is None:
-            if reject_dynamic_commands and override is None:
-                errors.append(f"{source} has an opaque process command")
-            continue
-        if command_text is not None:
-            commands.append(command_text)
-        elif command_from_keyword:
-            errors.append(
-                f"{source} keyword process commands must be literal strings or "
-                "string arrays"
-            )
-        elif reject_dynamic_commands:
-            errors.append(f"{source} has an opaque process command")
-
         process_input = next(
             (
                 keyword.value
@@ -9354,14 +9362,36 @@ def python_command_scripts(
             ),
             None,
         )
+        stdin_program: str | None = None
         if process_input is not None and command_words is not None and (
             shell_argv_reads_stdin_program(command_words)
         ):
             input_text = literal_string(process_input)
             if input_text is not None:
-                commands.append(input_text)
+                stdin_program = input_text
             elif reject_dynamic_commands:
                 errors.append(f"{source} has opaque shell process input")
+
+        if command is None:
+            if reject_dynamic_commands and override is None:
+                errors.append(f"{source} has an opaque process command")
+            continue
+        if command_text is not None:
+            # A bare shell argv plus a literal `input=` has one executable
+            # program: the input text. Recording the bare `bash` separately
+            # makes it look like an unrelated shell with unknown stdin and
+            # rejects a readable benign program before its source is scanned.
+            if stdin_program is None:
+                commands.append(command_text)
+        elif command_from_keyword:
+            errors.append(
+                f"{source} keyword process commands must be literal strings or "
+                "string arrays"
+            )
+        elif reject_dynamic_commands:
+            errors.append(f"{source} has an opaque process command")
+        if stdin_program is not None:
+            commands.append(stdin_program)
     return commands, errors
 
 
