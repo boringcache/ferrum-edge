@@ -7483,10 +7483,14 @@ def automation_file_cross_surfaces(
         if shell_reading
         else []
     )
-    heredoc_shell_reading = (
+    # Nested heredocs belong to this reading too. A suffixless file only needs
+    # the fallback shell interpretation when its own contents name no language;
+    # an explicit Python/PowerShell shebang remains authoritative unless the
+    # call graph supplies shell provenance.
+    heredoc_shell_reading = shell_reading and (
         language == "shell"
         or "shell" in interpreters
-        or PurePosixPath(name).suffix == ""
+        or (language is None and PurePosixPath(name).suffix == "")
         or is_dispatcher_manifest(name)
     )
     if heredoc_shell_reading:
@@ -10370,7 +10374,8 @@ def validate_automation_collection(
             and (
                 language == "shell"
                 or (
-                    PurePosixPath(name).suffix == ""
+                    language is None
+                    and PurePosixPath(name).suffix == ""
                     and not is_dispatcher_manifest(name)
                 )
             )
@@ -10419,7 +10424,9 @@ def validate_automation_collection(
         # Python, that reading is additionally performed here rather than
         # replacing the shell one: the two are a union, so nothing a prior class
         # already rejected stops being rejected, and `python3 ci/unsafe` no
-        # longer hides `subprocess.run(cmd)` behind a missing suffix.
+        # longer hides `subprocess.run(cmd)` behind a missing suffix. A Python
+        # shebang is its own evidence and does not receive the fallback shell
+        # reading unless a call site explicitly supplies shell provenance.
         if (
             contents is not None
             and language != "python"
@@ -10460,20 +10467,19 @@ def validate_automation_collection(
                 )
         # And the same union for POSIX shell, which the two branches above left
         # out. The shell scan ran only when the file's *own* evidence said shell
-        # or it was suffixless, so `run: sh scripts/poly.py` — a file the
-        # reachability walk now records and follows as a shell reading — was
-        # read only as Python here. A polyglot could therefore carry
+        # or its suffixless contents named no interpreter. A file reached by
+        # `run: sh scripts/poly.py` is recorded and followed as a shell reading,
+        # but was read only as Python here. A polyglot could therefore carry
         # `cross build --target aarch64-unknown-linux-gnu` down its shell path
-        # and pass exact-tree validation, while PR comparison rejected it:
-        # `automation_file_cross_surfaces` runs the generic shell scan over
-        # every file regardless of language. Replaying the recorded shell
-        # provenance restores that parity, and like the Python and PowerShell
-        # unions it only adds a reading.
+        # and pass exact-tree validation. Replaying the recorded shell
+        # provenance restores parity with `automation_file_cross_surfaces`, and
+        # like the Python and PowerShell unions it only adds a reading.
         if (
             contents is not None
             and language != "shell"
             and not (
-                PurePosixPath(name).suffix == ""
+                language is None
+                and PurePosixPath(name).suffix == ""
                 and not is_dispatcher_manifest(name)
             )
             and "shell" in interpreters.get(name, set())
@@ -16757,6 +16763,41 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("benign extensionless Python automation was rejected")
+    # A suffixless file with an explicit Python shebang is Python source, not a
+    # POSIX-shell polyglot. Heredoc-looking text inside a Python string is data
+    # unless a call site separately invokes the file through a shell. Exact-tree
+    # validation and PR surface comparison must make the same decision.
+    extensionless_python_template = {
+        "scripts/build": (
+            "#!/usr/bin/env -S python3 -I\n"
+            'template = """bash <<\'EOF\'\n'
+            f"cross build --target {TARGET}\n"
+            "EOF\n"
+            '"""\n'
+            "print(template)\n"
+        )
+    }
+    if validate_automation_collection(
+        {"ci.yml": extensionless_workflow},
+        {"setup/action.yml": safe_action},
+        extensionless_python_template,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "heredoc-looking data in extensionless Python was read as shell"
+        )
+    if compare_pr_automation_collection(
+        {"ci.yml": extensionless_workflow},
+        {"ci.yml": extensionless_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        extensionless_baseline,
+        extensionless_python_template,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "heredoc-looking extensionless Python data changed the PR Cross surface"
+        )
     for label, proposed in (
         ("extensionless Python", extensionless_python_cross),
         ("extensionless shell", extensionless_shell_cross),
@@ -17329,12 +17370,10 @@ pre_build = []
 
     # A file that carries its own `.py` suffix but is invoked through `sh` is
     # executed by the shell, so the shell reading is the one that runs. Exact
-    # validation ran the shell Cross scan only when the file's *own* language
-    # was shell or it was suffixless, and the provenance-union branches replayed
-    # only Python and PowerShell — so a shell-executed polyglot could carry
-    # `cross build --target ...` down its shell path and pass. PR comparison
-    # never had that gap: `automation_file_cross_surfaces` runs the generic
-    # shell scan over every file regardless of language.
+    # validation once omitted shell provenance when the file's *own* language
+    # was Python, so a shell-executed polyglot could carry `cross build --target
+    # ...` down its shell path and pass. Both exact validation and PR comparison
+    # now replay that named shell reading.
     def shell_executed_polyglot_result(command: str, body: str) -> list[str]:
         """Validate a tree whose only edge runs a `.py` file through a shell."""
 
