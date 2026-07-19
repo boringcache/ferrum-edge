@@ -654,11 +654,9 @@ pub async fn serve(
     // occupies the port until shutdown nor reserves it against stream
     // proxies. Enabled nonzero env-bound HTTPS still fail-closes later when
     // paths are set but unloadable.
-    let admin_tls_paths_ready = env_config.admin_tls_cert_path.is_some()
-        && env_config.admin_tls_key_path.is_some();
-    if !admin_tls_paths_ready
-        && let Some(listener) = prebound.admin_https.take()
-    {
+    let admin_tls_paths_ready =
+        env_config.admin_tls_cert_path.is_some() && env_config.admin_tls_key_path.is_some();
+    if !admin_tls_paths_ready && let Some(listener) = prebound.admin_https.take() {
         match listener.local_addr() {
             Ok(addr) => info!(
                 "Dropping unused pre-bound admin HTTPS listener on {addr} — \
