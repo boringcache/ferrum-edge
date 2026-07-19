@@ -447,9 +447,11 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   the command substitutions *inside* an arithmetic expansion before evaluating
   it, so `$(( $(bash scripts/unsafe.sh) + 0 ))` is recursed into and that script
   is recorded and scanned. `$( (cmd) )`, the only spelling that nests a real
-  substitution, still executes. Backtick substitutions stay line-local, because a
-  backtick pair spanning physical lines cannot be told apart from the Markdown a
-  documentation heredoc writes. Each
+  substitution, still executes. Backtick substitutions are paired across
+  physical lines too, because the shell permits that spelling and dropping it
+  would miss a real execution edge. This can conservatively scan a backtick pair
+  in Markdown written by an unquoted documentation heredoc, which is the
+  fail-closed side of the ambiguity. Each
   interior runs in a subshell, so it is followed as its own nested program: a
   `cd` inside one resolves that interior's own operands and then ends with the
   subshell, instead of rewriting the working directory every later real line of
@@ -491,7 +493,10 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   ordinary wrapper there either, so `timeout --preserve-status $seconds build`
   reads `$seconds` as the duration operand it is and `build` as the executable,
   instead of reporting the benign dynamic duration as an opaque Cross
-  executable.
+  executable. The restored raw-line slot also preserves the wrapper's assignment
+  semantics: after `env \` or `sudo \`, `FOO=bar $cmd` still dispatches `$cmd`,
+  while after `exec \`, `nohup \`, or `timeout 30 \`, `FOO=bar` is the wrapper's
+  command argv itself and no later executable slot is invented.
   Leading words that precede the executable without being it do not close the
   slot: a negation (`! cmd`), assignment words (`FOO=bar $cmd`), process
   wrappers, `env` and its options, and any number of spaced or unspaced subshell
@@ -518,7 +523,10 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   one expansion to the scanner but not to the cheap pattern, so every balanced
   `$(...)` span is collapsed to a single placeholder before that gate runs and
   `$( (printf cross) ) build --target aarch64-unknown-linux-gnu` reaches the
-  analysis it would otherwise be dropped before. Widening that gate reports
+  analysis it would otherwise be dropped before. When the substitution or a
+  backtick pair spans physical lines, only the newlines inside that one shell
+  word are joined before classification; unrelated commands on adjacent lines
+  remain separate. Widening that gate reports
   nothing by itself — every admitted line is still decided by the substitution,
   the Cross-subcommand check, and the command-context check.
   The interleaved assignment/wrapper/`env` prefix layer is one model shared by
@@ -538,7 +546,12 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   opens no slot, so ``echo "- Test: \`${{ matrix.test }}\`"`` writes Markdown in a
   real `run:` block and stays editable. An executable heredoc is unaffected
   throughout: it is extracted and rescanned as its own program, where its lines
-  are command lines again.
+  are command lines again. Every queued heredoc on a command is consumed in
+  opener order, so a later body in `cat <<D <<'PY' | python3` cannot hide behind
+  the first delimiter. Only an outer pipeline attaches a body to an
+  interpreter; pipes inside quotes, substitutions, backticks, subshells, or
+  process substitutions remain nested command syntax rather than receivers of
+  the heredoc.
   Binding Cross to another executable name is itself a Cross surface: linking,
   copying, moving, or installing the Cross binary under a new name, and writing
   a wrapper script whose body runs Cross, are all detected, and every later
@@ -562,6 +575,10 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   receive the same AST analysis, while dynamic or unsupported shells fail
   closed. Shell, Python, Perl, PHP, R, JavaScript/TypeScript, PowerShell, awk,
   and BusyBox script launchers are recognized when resolving repository paths.
+  Only shell, Python, and PowerShell file bodies have language-aware transitive
+  readers; an explicit unsupported interpreter for a suffixless repository
+  helper therefore fails closed instead of being downgraded to a bare shell
+  reading.
   Inline interpreter source is dispatched the same way: a `run:` step that
   hands a program to Python (`-c`), PowerShell (`-Command`, any unambiguous
   prefix), Node, Deno, Bun, Perl, Ruby, PHP, Lua, R, Julia, Elixir, Groovy,
@@ -594,7 +611,9 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   shell automation both reject an undecodable stdin program. Deciding it only
   under the opaque-executable analysis meant the tree path — which enters
   through the literal scan — accepted on `main` what comparison had rejected on
-  the pull request.
+  the pull request. Literal shell commands extracted from Python process APIs
+  re-enter that same opaque-stdin scope, including commands discovered through
+  an explicit Python interpreter edge to a suffixless helper.
   A `shell: pwsh`/`powershell` body, a PowerShell `-Command` operand, a
   PowerShell heredoc, and a `SHELL ["pwsh", ...]` Dockerfile selection are
   parsed as PowerShell rather than as POSIX shell: `Start-Process`,
