@@ -394,10 +394,12 @@ pub async fn start_admin_listener_with_dynamic_tls_and_signal(
 /// Production callers go through [`start_admin_listener_with_tls_and_signal`],
 /// which binds internally and signals startup readiness.
 ///
-/// `file::serve` (the in-process gateway entry point) also calls this
-/// directly when a `ServeOptions::admin_http` / `admin_https` listener is
-/// supplied, so the in-process harness shares one accept loop with the
-/// binary path.
+/// `file::serve` (the in-process gateway entry point) calls this for a
+/// supplied `ServeOptions::admin_http` listener, and for
+/// `ServeOptions::admin_https` when frontend TLS live reload did not prepare
+/// a hot-swap slot. When a slot is present, file mode uses
+/// [`serve_admin_on_listener_with_dynamic_tls`] instead so cert rotation
+/// reaches the caller-owned HTTPS socket.
 pub async fn serve_admin_on_listener(
     listener: TcpListener,
     state: AdminState,
@@ -504,6 +506,12 @@ pub async fn serve_admin_on_listener(
 /// from a shared `ArcSwap` slot on every new connection, allowing the
 /// frontend TLS file-watch task to atomically swap in a rotated cert/key
 /// pair without restarting the listener.
+///
+/// Used by the env-bound admin HTTPS path (via
+/// [`start_admin_listener_with_dynamic_tls_and_signal`]) and by
+/// `file::serve` when a caller-owned `ServeOptions::admin_https` socket is
+/// served with live reload enabled — both paths share this accept loop so
+/// cert rotation is not limited to process-bound listeners.
 ///
 /// In-flight admin connections keep their original `ServerConfig` (rustls
 /// consults the config only during the handshake; swapping it does not tear

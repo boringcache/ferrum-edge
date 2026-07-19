@@ -57,3 +57,51 @@ fn cp_grpc_listener_port_is_reserved_when_configured() {
     let reserved = config.reserved_gateway_ports();
     assert!(reserved.contains(&50051));
 }
+
+#[test]
+fn admin_https_listener_enabled_requires_port_and_tls_material() {
+    // Port 0 is the disable sentinel: TLS material alone must not enable the
+    // listener (CP, DP, and mesh previously bound an ephemeral port here).
+    let port_zero_with_tls = EnvConfig {
+        admin_https_port: 0,
+        admin_tls_cert_path: Some("/tmp/tls.crt".to_string()),
+        admin_tls_key_path: Some("/tmp/tls.key".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        !port_zero_with_tls.admin_https_listener_enabled(),
+        "FERRUM_ADMIN_HTTPS_PORT=0 must disable admin HTTPS even with cert/key configured"
+    );
+
+    let enabled = EnvConfig {
+        admin_https_port: 9443,
+        admin_tls_cert_path: Some("/tmp/tls.crt".to_string()),
+        admin_tls_key_path: Some("/tmp/tls.key".to_string()),
+        ..Default::default()
+    };
+    assert!(enabled.admin_https_listener_enabled());
+
+    let no_tls = EnvConfig {
+        admin_https_port: 9443,
+        admin_tls_cert_path: None,
+        admin_tls_key_path: None,
+        ..Default::default()
+    };
+    assert!(!no_tls.admin_https_listener_enabled());
+
+    let cert_without_key = EnvConfig {
+        admin_https_port: 9443,
+        admin_tls_cert_path: Some("/tmp/tls.crt".to_string()),
+        admin_tls_key_path: None,
+        ..Default::default()
+    };
+    assert!(!cert_without_key.admin_https_listener_enabled());
+
+    let port_zero_without_tls = EnvConfig {
+        admin_https_port: 0,
+        admin_tls_cert_path: None,
+        admin_tls_key_path: None,
+        ..Default::default()
+    };
+    assert!(!port_zero_without_tls.admin_https_listener_enabled());
+}
