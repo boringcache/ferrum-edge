@@ -372,8 +372,8 @@ run_bench_capture() {
 
     # Show a quick summary inline
     local rps errors
-    rps=$(python3 -c "import json; d=json.load(open('$RESULTS_DIR/$result_file')); print(f\"{d['rps']:,.0f}\")" 2>/dev/null || echo "?")
-    errors=$(python3 -c "import json; d=json.load(open('$RESULTS_DIR/$result_file')); print(d['total_errors'])" 2>/dev/null || echo "?")
+    rps=$(python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); print(format(d["rps"], ",.0f"))' "$RESULTS_DIR/$result_file" 2>/dev/null || echo "?")
+    errors=$(python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); print(d["total_errors"])' "$RESULTS_DIR/$result_file" 2>/dev/null || echo "?")
     echo -e "      RPS: ${GREEN}${rps}${NC}  Errors: ${errors}"
 }
 
