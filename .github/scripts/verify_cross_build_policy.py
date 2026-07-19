@@ -5963,29 +5963,46 @@ def cross_surface_line_report(
     """
 
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    source_lines = logical_contents.splitlines()
+    projected_lines = opaque_arm_command_line_projection(logical_contents)
+    if projected_lines is not None:
+        for number, (source_line, command_line) in enumerate(
+            zip(source_lines, projected_lines),
+            start=1,
+        ):
+            if (
+                OPAQUE_INLINE_SHELL.search(command_line)
+                or opaque_arm_cross_execution(command_line)
+                or contains_opaque_executable_cross(command_line)
+            ):
+                return f" (line {number}: {source_line.strip()[:160]!r})"
     # Alias and shim expansions follow the source lines and are synthesized
     # rather than located, so they are reported without a line number.
-    source_line_count = len(logical_contents.splitlines())
-    for number, (line, shell_evaluated, starts_command) in enumerate(
-        logical_scan_lines(logical_contents),
-        start=1,
-    ):
-        for variant in scan_variants(
-            line,
-            include_opaque_shell_executable=include_opaque_shell_executable,
-            shell_evaluated=shell_evaluated,
-            starts_command=starts_command,
+    source_line_count = len(source_lines)
+    # Exact trusted-shell validation deliberately fails closed on an undecoded
+    # stdin program. Replay that same scope here so its diagnostic points to the
+    # line that caused the rejection instead of returning an empty suffix.
+    with opaque_stdin_program_scope():
+        for number, (line, shell_evaluated, starts_command) in enumerate(
+            logical_scan_lines(logical_contents),
+            start=1,
         ):
-            if has_cross_command_context(
-                variant,
+            for variant in scan_variants(
+                line,
                 include_opaque_shell_executable=include_opaque_shell_executable,
-            ) or CROSS_ENVIRONMENT.search(variant):
-                where = (
-                    f"line {number}"
-                    if number <= source_line_count
-                    else "expanded command text"
-                )
-                return f" ({where}: {line.strip()[:160]!r})"
+                shell_evaluated=shell_evaluated,
+                starts_command=starts_command,
+            ):
+                if has_cross_command_context(
+                    variant,
+                    include_opaque_shell_executable=include_opaque_shell_executable,
+                ) or CROSS_ENVIRONMENT.search(variant):
+                    where = (
+                        f"line {number}"
+                        if number <= source_line_count
+                        else "expanded command text"
+                    )
+                    return f" ({where}: {line.strip()[:160]!r})"
     return ""
 
 
@@ -8107,13 +8124,16 @@ def opaque_arm_command_line_projection(contents: str) -> tuple[str, ...] | None:
         """Re-emit the finished body's substitutions as command lines.
 
         The whole body is joined first because a substitution may open on one
-        body line and close on a later one.
+        body line and close on a later one. The delimiter already stored at
+        this index must remain ahead of those synthetic commands: removing it
+        leaves the projected opener unterminated, so every real command after
+        the heredoc is misclassified as body data on the next scan.
         """
 
         if body_lines:
             commands = heredoc_body_substitution_commands("\n".join(body_lines))
             if commands:
-                projected[index] = "\n".join(commands)
+                projected[index] = "\n".join((projected[index], *commands))
             body_lines.clear()
 
     for index, line in enumerate(source_lines):
@@ -8121,6 +8141,9 @@ def opaque_arm_command_line_projection(contents: str) -> tuple[str, ...] | None:
             delimiter, quoted, executable = delimiters[0]
             if line.strip() == delimiter:
                 delimiters.pop(0)
+                # The terminator is syntax, not body data. Preserve it so the
+                # projected program closes the same heredoc as the source.
+                projected[index] = line
                 flush_body(index)
                 continue
             if executable:
@@ -16076,7 +16099,7 @@ pre_build = []
         ("literal", "printf 'echo built' | bash"),
         ("escaped non-Cross", "printf 'echo \\x62uilt' | bash"),
     ):
-        if validate_workflow_collection(
+        benign_workflow_errors = validate_workflow_collection(
             {
                 "benign_stdin.yml": opaque_stdin_workflow.replace(
                     opaque_stdin_run,
@@ -16085,12 +16108,13 @@ pre_build = []
                 )
             },
             "self-test workflow directory",
-        ):
+        )
+        if benign_workflow_errors:
             failures.append(
                 f"a benign {benign_stdin_label} stdin producer was rejected by "
-                "workflow validation"
+                f"workflow validation: {benign_workflow_errors!r}"
             )
-        if validate_action_collection(
+        benign_action_errors = validate_action_collection(
             {
                 "benign/action.yml": opaque_stdin_action.replace(
                     opaque_stdin_run,
@@ -16099,10 +16123,11 @@ pre_build = []
                 )
             },
             "self-test action directory",
-        ):
+        )
+        if benign_action_errors:
             failures.append(
                 f"a benign {benign_stdin_label} stdin producer was rejected by "
-                "action validation"
+                f"action validation: {benign_action_errors!r}"
             )
 
     # A format conversion can join a decoded fragment to a later operand. It is
@@ -16439,7 +16464,7 @@ pre_build = []
             "run(['bash'], input='cargo test --locked', text=True)\n"
         )
     }
-    if compare_pr_automation_collection(
+    benign_python_alias_errors = compare_pr_automation_collection(
         {"ci.yml": python_workflow},
         {"ci.yml": python_workflow},
         {"setup/action.yml": safe_action},
@@ -16447,8 +16472,12 @@ pre_build = []
         python_baseline,
         benign_python_alias_input,
         "self-test automation directory",
-    ):
-        failures.append("benign Python alias/stdin automation was rejected")
+    )
+    if benign_python_alias_errors:
+        failures.append(
+            "benign Python alias/stdin automation was rejected: "
+            f"{benign_python_alias_errors!r}"
+        )
 
     # The coverage helper's fixed Git diff argv keeps only its revision
     # expression dynamic and places it after an end-of-options marker. That
