@@ -2641,8 +2641,11 @@ async fn functional_cli_run_withholds_externally_resolved_mode() {
         )
         // The line is `info!`; the hermetic env drops any inherited level.
         .env("FERRUM_LOG_LEVEL", "info")
-        .env("FERRUM_PROXY_HTTP_PORT", "18994")
-        .env("FERRUM_ADMIN_HTTP_PORT", "18995")
+        // No listener is needed to observe the startup record. Disable both
+        // plaintext listeners so this nextest case cannot contend with the
+        // other CLI tests that intentionally exercise fixed listener ports.
+        .env("FERRUM_PROXY_HTTP_PORT", "0")
+        .env("FERRUM_ADMIN_HTTP_PORT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::null())
