@@ -39,6 +39,7 @@ REQUIRED_JOBS = {
     "two-cluster-mesh-live",
     "performance-regression",
     "build-binaries",
+    "build-arm64-cross",
 }
 
 # These jobs do not depend on another full-CI validation job, so each must
@@ -56,6 +57,7 @@ DIRECT_FULL_CI_JOBS = {
     "build-ebpf-userspace",
     "performance-regression",
     "build-binaries",
+    "build-arm64-cross",
 }
 
 PATH_GATED_JOBS = {
