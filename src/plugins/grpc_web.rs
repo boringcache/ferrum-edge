@@ -140,7 +140,7 @@ pub(crate) fn bytes_are_complete_grpc_frames(data: &[u8]) -> bool {
 pub(crate) fn bytes_are_grpc_web_text_frames(data: &[u8]) -> bool {
     // Standard base64 with padding: a whole number of 4-character groups, and
     // `=` padding only in the final group.
-    if data.is_empty() || data.len() % 4 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(4) {
         return false;
     }
     let payload = match data.strip_suffix(b"==") {
