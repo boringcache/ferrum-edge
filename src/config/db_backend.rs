@@ -1059,6 +1059,9 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         proxy_id: &str,
         namespace: &str,
     ) -> Result<bool, anyhow::Error>;
+    /// Return a stable, backend-paginated proxy page and the namespace total.
+    /// Callers must pass a positive bounded `limit` and an `offset` in
+    /// `0..=i64::MAX`; admin callers satisfy this through validated pagination.
     async fn list_proxies_paginated(
         &self,
         namespace: &str,
@@ -1084,6 +1087,9 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         namespace: &str,
         id: &str,
     ) -> Result<Option<Consumer>, anyhow::Error>;
+    /// Return a stable, backend-paginated consumer page and the namespace total.
+    /// Callers must pass a positive bounded `limit` and an `offset` in
+    /// `0..=i64::MAX`; admin callers satisfy this through validated pagination.
     async fn list_consumers_paginated(
         &self,
         namespace: &str,
@@ -1103,6 +1109,9 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         namespace: &str,
         id: &str,
     ) -> Result<Option<PluginConfig>, anyhow::Error>;
+    /// Return a stable, backend-paginated plugin-config page and namespace total.
+    /// Callers must pass a positive bounded `limit` and an `offset` in
+    /// `0..=i64::MAX`; admin callers satisfy this through validated pagination.
     async fn list_plugin_configs_paginated(
         &self,
         namespace: &str,
@@ -1127,6 +1136,9 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         namespace: &str,
         upstream_id: &str,
     ) -> Result<(), anyhow::Error>;
+    /// Return a stable, backend-paginated upstream page and the namespace total.
+    /// Callers must pass a positive bounded `limit` and an `offset` in
+    /// `0..=i64::MAX`; admin callers satisfy this through validated pagination.
     async fn list_upstreams_paginated(
         &self,
         namespace: &str,

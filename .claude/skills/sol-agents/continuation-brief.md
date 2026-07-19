@@ -11,8 +11,9 @@ branch is checked out there).
 ## YOU are the implementer (do not sub-dispatch)
 
 Implement, commit, and push the changes YOURSELF, in this session. Do NOT invoke any
-agent-dispatch skill or script available in your environment (e.g. `opus-agents`,
-`.agents/skills/*/scripts/dispatch-agent.sh`, `claude` CLI workers) and do NOT spawn nested
+agent-dispatch skill or script available in your environment (e.g. `opus-agents`, `fable-agents`,
+`grok-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, `claude` CLI workers) and do NOT
+spawn nested
 workers — the orchestrator chose this session's model and reasoning effort deliberately, and
 delegating the implementation silently substitutes different hands at a different effort. If a
 skill index entry fails to load (stale path), ignore it and continue; you need nothing beyond
