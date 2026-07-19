@@ -991,12 +991,15 @@ async fn serve_still_reserves_env_admin_https_port_without_prebound_drop() {
     };
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let err = file::serve(env_config, config, opts, shutdown_tx)
-        .await
-        .expect_err(
+    // Match instead of expect_err: ServeHandles does not implement Debug, and
+    // Result::expect_err requires Debug on the Ok type.
+    let err = match file::serve(env_config, config, opts, shutdown_tx).await {
+        Ok(_) => panic!(
             "serve() must still reject a stream proxy on the env admin HTTPS port when \
-             no unusable prebound FD was dropped",
-        );
+             no unusable prebound FD was dropped"
+        ),
+        Err(err) => err,
+    };
     let msg = err.to_string();
     assert!(
         msg.to_lowercase().contains("stream proxy port conflicts")
