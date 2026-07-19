@@ -32,8 +32,8 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::HttpFlavor;
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, RequestContext, request_transformer::RequestTransformer,
-    response_transformer::ResponseTransformer,
+    Plugin, PluginResult, RequestContext, compression::CompressionPlugin, grpc_web::GrpcWebPlugin,
+    request_transformer::RequestTransformer, response_transformer::ResponseTransformer,
 };
 use serde_json::json;
 
@@ -4022,4 +4022,317 @@ async fn malformed_coding_still_fails_closed_under_an_identity_refusal() {
     assert!(replaced, "an undecodable body is never forwarded");
     assert_eq!(reason.as_deref(), Some("malformed_content_coding"));
     assert_ne!(body, b"not a gzip stream at all".to_vec());
+}
+
+// ---------------------------------------------------------------------------
+// Translated gRPC-Web with an untyped backend: the live relabelling must not
+// excuse the bytes from the gate.
+//
+// `grpc_web::after_proxy` stamps `application/grpc-web*` onto the LIVE header
+// map of every translated response so its own body re-encode can run. When the
+// backend stamped no `Content-Type` of its own, that label is the gateway's
+// intent rather than proof of anything the backend sent — and applying the
+// framed-media-type decline to it AFTER the byte parse had already answered
+// "these are not frames" put the redaction bypass straight back: malformed
+// bytes and bare JSON error documents came back unclaimed and were forwarded
+// and rewrapped with the configured redaction silently skipped.
+//
+// These drive the REAL plugin lifecycle — the `grpc_web` plugin's own
+// `on_request_received` (which records the translation marker), its own
+// `after_proxy` (which does the relabelling), and the shared buffered body
+// phase with both plugins in production priority order.
+// ---------------------------------------------------------------------------
+
+/// The two client representations a translated gRPC-Web request can speak.
+fn translated_grpc_web_client_content_types() -> [&'static str; 2] {
+    [
+        "application/grpc-web+proto",
+        "application/grpc-web-text+proto",
+    ]
+}
+
+/// Drive a translated gRPC-Web request end to end: real request classification,
+/// real `after_proxy` relabelling, then the shared buffered body phase.
+///
+/// Plugin order is production order (ascending priority): `grpc_web` at 260
+/// re-encodes the buffered body before `response_transformer` at 4000 is ever
+/// handed it.
+async fn run_translated_grpc_web_lifecycle(
+    client_content_type: &str,
+    backend_content_type: Option<&str>,
+    body: Vec<u8>,
+) -> (bool, u16, Option<String>, Vec<u8>) {
+    let grpc_web = GrpcWebPlugin::new(&json!({})).expect("grpc_web config");
+    let mut plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(grpc_web)];
+    plugins.extend(redacting_plugins());
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("content-type".to_string(), client_content_type.to_string());
+    // Records the translation marker and rewrites the request to native gRPC,
+    // exactly as it does in production.
+    assert!(
+        matches!(
+            plugins[0].on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ),
+        "a well-formed gRPC-Web request must be classified, not rejected"
+    );
+
+    let mut status = 200;
+    let mut headers = HashMap::new();
+    if let Some(content_type) = backend_content_type {
+        headers.insert("content-type".to_string(), content_type.to_string());
+    }
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    // The relabelling under test: this is the real hook, not a hand-written map.
+    assert!(
+        !run_after_proxy_hooks_for_test(&plugins, &mut ctx, status, &mut headers).await,
+        "no `after_proxy` hook may reject a translated gRPC-Web response"
+    );
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some(client_content_type),
+        "the test is vacuous unless `grpc_web` actually relabelled the live map"
+    );
+
+    let mut body = body;
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        Some(client_content_type),
+        false,
+    )
+    .await;
+    let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
+    (replaced, status, reason, body)
+}
+
+/// The bypass: an untyped backend answering a translated gRPC-Web request with a
+/// bare JSON document. The live `application/grpc-web*` label must not make the
+/// claim predicate decline it — and because the gRPC-Web re-encoder runs AFTER
+/// the redaction, admitting it would publish the secret rewrapped, so the gate
+/// fails closed instead.
+#[tokio::test]
+async fn translated_grpc_web_untyped_bare_json_is_not_excused_by_the_live_label() {
+    for client_content_type in translated_grpc_web_client_content_types() {
+        let (replaced, _, reason, body) = run_translated_grpc_web_lifecycle(
+            client_content_type,
+            None,
+            br#"{"secret":"hunter2","keep":1}"#.to_vec(),
+        )
+        .await;
+
+        assert!(
+            replaced,
+            "{client_content_type}: an unenforceable document must not be forwarded"
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some("unenforceable_grpc_web_framing"),
+            "{client_content_type}"
+        );
+        assert_secret_not_forwarded(&body);
+    }
+}
+
+/// The same relabelling over bytes that are neither framing nor a document. The
+/// byte parse says "not frames", the live label must not override it, and the
+/// response fails closed rather than being rewrapped.
+#[tokio::test]
+async fn translated_grpc_web_untyped_malformed_bytes_fail_closed() {
+    for client_content_type in translated_grpc_web_client_content_types() {
+        // A truncated frame: a valid 5-byte prefix promising more than it carries.
+        let truncated = vec![0x00, 0x00, 0x00, 0x00, 0x10, 0x01, 0x02];
+        let (replaced, _, reason, body) =
+            run_translated_grpc_web_lifecycle(client_content_type, None, truncated.clone()).await;
+
+        assert!(
+            replaced,
+            "{client_content_type}: truncated framing must not be forwarded"
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some("unenforceable_grpc_web_framing"),
+            "{client_content_type}"
+        );
+        assert_ne!(
+            body, truncated,
+            "{client_content_type}: the original bytes must not be published"
+        );
+    }
+}
+
+/// The control that must keep working: a translated gRPC-Web response whose
+/// backend really did answer in native framing is passed through and re-encoded
+/// exactly as before — never claimed, never rejected. Asserted with the backend
+/// untyped (the byte parse is the only evidence) and with a pristine
+/// `application/grpc` stamp (the snapshot is authoritative).
+#[tokio::test]
+async fn translated_grpc_web_valid_native_framing_is_still_re_encoded() {
+    for client_content_type in translated_grpc_web_client_content_types() {
+        for backend_content_type in [None, Some("application/grpc")] {
+            let frames = grpc_frame(b"\x08\x01");
+            let (replaced, status, reason, body) = run_translated_grpc_web_lifecycle(
+                client_content_type,
+                backend_content_type,
+                frames.clone(),
+            )
+            .await;
+
+            let case = format!("{client_content_type}/{backend_content_type:?}");
+            assert!(!replaced, "{case}: valid framing must not be claimed");
+            assert_eq!(status, 200, "{case}: a valid RPC reply stays a 200");
+            assert_eq!(reason, None, "{case}: valid framing must never reject");
+            assert!(
+                body.len() > frames.len(),
+                "{case}: `grpc_web` must still have appended its trailer frame"
+            );
+            if client_content_type == "application/grpc-web+proto" {
+                assert!(
+                    body.starts_with(&frames),
+                    "{case}: the backend's own frames must survive intact"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Representation-gate rejections must leave the wire headers truthful.
+//
+// The non-gRPC branch runs the opt-in `applies_after_proxy_on_reject`
+// decorators over the gateway-authored `502`, and the body-transform phase that
+// would actually compress is skipped. A reject-path header hook must therefore
+// never advertise a body transform that did not run.
+// ---------------------------------------------------------------------------
+
+/// `response_transformer` (4000) then `compression` (4050) — production order.
+/// `min_content_length` is lowered so the small bodies here are genuinely
+/// compressible; the control below proves the configuration really does compress.
+fn redacting_plugins_with_compression() -> Vec<Arc<dyn Plugin>> {
+    let compression = CompressionPlugin::new(&json!({"min_content_length": 1}))
+        .expect("compression config");
+    let mut plugins = redacting_plugins();
+    plugins.push(Arc::new(compression));
+    plugins
+}
+
+/// Drive a non-gRPC backend response that the gate rejects, with a client that
+/// advertised `Accept-Encoding: gzip`.
+async fn run_compressing_backend_rejection(
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+) -> (bool, u16, Option<String>, HashMap<String, String>, Vec<u8>) {
+    let plugins = redacting_plugins_with_compression();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept-encoding".to_string(), "gzip, br".to_string());
+
+    let mut status = status;
+    let mut headers = headers;
+    let mut body = body;
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
+    (replaced, status, reason, headers, body)
+}
+
+/// The control that makes the assertions below non-vacuous: with the SAME
+/// plugins and the SAME `Accept-Encoding`, an ordinary `200` really does get a
+/// `Content-Encoding` committed by `compression`'s `after_proxy`.
+#[tokio::test]
+async fn compression_does_commit_an_encoding_on_a_non_rejected_response() {
+    let plugins = redacting_plugins_with_compression();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept-encoding".to_string(), "gzip, br".to_string());
+    let mut headers = json_headers();
+
+    assert!(
+        !run_after_proxy_hooks_for_test(&plugins, &mut ctx, 200, &mut headers).await,
+        "no `after_proxy` hook may reject an ordinary 200"
+    );
+    assert!(
+        headers.contains_key("content-encoding"),
+        "the reject-path assertions are vacuous unless this config compresses: {headers:?}"
+    );
+}
+
+/// Every representation-rejection flavor on the non-gRPC branch must publish a
+/// body and headers that agree: the gateway-authored JSON error is plaintext, so
+/// no `Content-Encoding` may be advertised over it.
+#[tokio::test]
+async fn representation_rejections_never_advertise_an_uncompressed_body_as_compressed() {
+    let mut fragment_headers = json_headers();
+    fragment_headers.insert("content-range".to_string(), "bytes 0-9/64".to_string());
+    let mut encoded_headers = json_headers();
+    encoded_headers.insert("content-encoding".to_string(), "zstd".to_string());
+
+    // (expected rejection reason, backend status, backend headers, backend body)
+    let cases = [
+        (
+            "unparseable_document",
+            200_u16,
+            json_headers(),
+            b"{not json at all".to_vec(),
+        ),
+        (
+            "partial_representation",
+            206_u16,
+            fragment_headers,
+            br#"{"secret":"hunter2"}"#.to_vec(),
+        ),
+        (
+            "unsupported_content_coding",
+            200_u16,
+            encoded_headers,
+            b"not really a zstd stream".to_vec(),
+        ),
+    ];
+
+    for (expected_reason, status, headers, body) in cases {
+        let (replaced, status, reason, headers, body) =
+            run_compressing_backend_rejection(status, headers, body).await;
+
+        assert!(replaced, "{expected_reason}: the response must be replaced");
+        assert_eq!(status, 502, "{expected_reason}: rejection is a 502");
+        assert_eq!(reason.as_deref(), Some(expected_reason));
+        assert!(
+            !headers.contains_key("content-encoding"),
+            "{expected_reason}: a plaintext error body was labelled compressed: {headers:?}"
+        );
+        // The published bytes really are the plaintext JSON error, so the absent
+        // header is truthful rather than merely absent.
+        let rendered = String::from_utf8(body.clone())
+            .unwrap_or_else(|_| panic!("{expected_reason}: error body must be UTF-8"));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&rendered).is_ok(),
+            "{expected_reason}: the error body must be a parseable JSON document: {rendered}"
+        );
+        assert_secret_not_forwarded(&body);
+        // A stale backend `Content-Length` describing the rejected bytes must not
+        // survive onto the replacement either.
+        if let Some(content_length) = headers.get("content-length") {
+            assert_eq!(
+                content_length.parse::<usize>().ok(),
+                Some(body.len()),
+                "{expected_reason}: `Content-Length` must describe the published body"
+            );
+        }
+    }
 }

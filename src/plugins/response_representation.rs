@@ -123,6 +123,19 @@
 //!   asked twice: once over the wire bytes to decide whether a decode is owed,
 //!   and again over the decoded identity bytes, which is the binding answer and
 //!   the exact representation the enforcer receives.
+//!
+//!   The LIVE `Content-Type` cannot settle this either way on its own, because
+//!   the main gRPC path relabels it: `grpc_web`'s `after_proxy` stamps
+//!   `application/grpc-web*` on every translated response before this gate runs.
+//!   [`effective_response_media_type`] therefore honors a framed gRPC label only
+//!   when the pristine snapshot or a total frame parse proves framing; otherwise
+//!   the label resolves to the untyped branch, so an untyped backend's malformed
+//!   frames or bare JSON document cannot be waved through as framing.
+//!
+//!   On a TRANSLATED gRPC-Web route the re-encoder runs AFTER the enforcer, so a
+//!   claimed backend body that is not already native framing cannot be enforced
+//!   at all and is rejected rather than published rewrapped — see
+//!   [`RepresentationRejection::UnenforceableFraming`].
 //! * **Backend-chosen media type.** A backend that *mislabels* a JSON payload
 //!   `text/plain` or `application/octet-stream` is not claimed by a JSON body
 //!   policy, here or in the transform itself. Content-type sniffing or an
@@ -141,7 +154,7 @@ use std::sync::Arc;
 
 use super::Plugin;
 use super::RequestContext;
-use super::utils::body_transform::is_json_content_type;
+use super::utils::body_transform::{is_framed_grpc_content_type, is_json_content_type};
 
 /// Hard ceiling on the decoded size of one buffered response body inspected on
 /// behalf of a configured body policy.
@@ -230,6 +243,11 @@ pub(crate) enum RepresentationRejection {
     /// serve a representation the client explicitly refused, and it does not
     /// re-encode, so neither the encoded nor the decoded bytes are servable.
     IdentityCodingUnacceptable,
+    /// A translated gRPC-Web backend response whose bytes are not native gRPC
+    /// framing. The gRPC-Web re-encoder rewraps the body AFTER the body-policy
+    /// enforcer runs, so the policy provably cannot apply to what the client
+    /// receives, and admitting it would publish the document unredacted.
+    UnenforceableFraming,
 }
 
 impl RepresentationRejection {
@@ -246,6 +264,7 @@ impl RepresentationRejection {
             Self::UnparseableDocument => "unparseable_document",
             Self::UnprovenOriginState => "unproven_origin_state",
             Self::IdentityCodingUnacceptable => "identity_coding_unacceptable",
+            Self::UnenforceableFraming => "unenforceable_grpc_web_framing",
         }
     }
 }
@@ -544,6 +563,66 @@ fn decode_response_body(
     Ok(Some(current))
 }
 
+/// Resolve the media type the gate — and every claim predicate it consults — may
+/// trust as a description of `body`.
+///
+/// The live `content-type` has already passed through `after_proxy`, and the
+/// main gRPC path RELABELS it: [`super::grpc_web`]'s `after_proxy` stamps
+/// `application/grpc-web*` onto the live header map of every translated response
+/// so its own phase-9 re-encode can run, whatever the backend actually sent.
+/// That label states what the gateway INTENDS to emit; it is not proof of what
+/// arrived. Letting it stand on its own was a fail-open: a translated gRPC-Web
+/// response from a backend that stamped no `Content-Type` at all could carry
+/// malformed frames or a bare JSON error document, and the framed label alone
+/// made the claim predicate decline it — so the gate answered `Unprotected` and
+/// the bytes were forwarded (and re-wrapped) with a configured redaction never
+/// applied.
+///
+/// A framed-gRPC label is therefore honored only when something the pipeline
+/// cannot have invented proves framing:
+///
+/// * the PRISTINE media type stamped by
+///   [`crate::proxy::stamp_original_response_metadata`] before any response hook
+///   ran was itself a framed gRPC type — the backend's own description, which
+///   stays authoritative exactly as it is everywhere else in this gate; or
+/// * the bytes TOTAL-PARSE as a complete frame sequence under the one grammar
+///   the client's representation admits
+///   ([`super::grpc_web::client_grpc_framing_representation`]).
+///
+/// Otherwise the label resolves to `None` — the untyped branch — so the bytes
+/// are claimed, parsed, and either redacted (a genuine bare JSON document) or
+/// rejected (malformed, truncated, or mode-illegal framing), which is the same
+/// answer the response would have received had no hook relabelled it.
+///
+/// The resolution is ONE-DIRECTIONAL and cannot manufacture a spurious `502`:
+/// bytes that really are complete frames keep their label and stay declined, and
+/// a label that is not a framed gRPC type is returned untouched. The pristine
+/// type wins outright, so a proven framed backend response is never re-parsed
+/// into the JSON branch.
+pub(crate) fn effective_response_media_type<'a>(
+    ctx: &RequestContext,
+    content_type: Option<&'a str>,
+    body: &[u8],
+) -> Option<&'a str> {
+    let live = content_type?;
+    if !is_framed_grpc_content_type(live) {
+        return content_type;
+    }
+    let pristine_proves_framing = ctx
+        .metadata
+        .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
+        .map(String::as_str)
+        .is_some_and(is_framed_grpc_content_type);
+    if pristine_proves_framing {
+        return content_type;
+    }
+    let Some(representation) = super::grpc_web::client_grpc_framing_representation(ctx) else {
+        return None;
+    };
+    let framed = super::grpc_web::bytes_are_complete_grpc_frames(body, representation);
+    framed.then_some(live)
+}
+
 /// Whether the decoded bytes are a complete parseable document that a
 /// field-level body rule can act on.
 ///
@@ -579,7 +658,13 @@ pub(crate) fn evaluate_response_body_policy_posture(
     response_headers: &HashMap<String, String>,
     response_body: &[u8],
 ) -> ResponseBodyPolicyPosture {
-    let content_type = response_headers.get("content-type").map(String::as_str);
+    // Resolve the live header before anything reads it. A framed gRPC label that
+    // neither the pristine snapshot nor a total frame parse supports describes
+    // nothing the backend proved, and must not excuse these bytes from either the
+    // claim below or the document parse further down — see
+    // [`effective_response_media_type`].
+    let live_content_type = response_headers.get("content-type").map(String::as_str);
+    let content_type = effective_response_media_type(ctx, live_content_type, response_body);
     if !body_policy_claimed(plugins, ctx, content_type, response_body) {
         return ResponseBodyPolicyPosture::Unprotected;
     }
@@ -611,6 +696,17 @@ pub(crate) fn evaluate_response_body_policy_posture(
     };
 
     let inspected = decoded.as_deref().unwrap_or(response_body);
+    // Re-resolve the label over the decoded bytes for the same reason the claim
+    // is re-asked below: the frame parse that can prove a framed label is a
+    // statement about the representation the client actually receives, and after
+    // a decode that is `inspected`, not the wire bytes. Skipped when no decode
+    // happened, where the two byte strings — and therefore both answers — are
+    // identical.
+    let content_type = if decoded.is_some() {
+        effective_response_media_type(ctx, live_content_type, inspected)
+    } else {
+        content_type
+    };
     // Re-ask the claim over the bytes the enforcer will actually be handed. The
     // first ask ran over the WIRE bytes, which is the only way to know whether a
     // decode was owed at all; but a predicate that decides structurally (framed
@@ -655,6 +751,35 @@ pub(crate) fn evaluate_response_body_policy_posture(
         return ResponseBodyPolicyPosture::Reject(
             RepresentationRejection::IdentityCodingUnacceptable,
         );
+    }
+    // A TRANSLATED gRPC-Web response is re-encoded AFTER the enforcer, so a
+    // claimed body that is not already native framing cannot be enforced at all.
+    // `grpc_web` (priority 260) appends the trailer frame and base64-encodes in
+    // the same buffered transform loop, before `response_transformer` (4000) is
+    // ever handed the bytes: a field rule would then run over the rewrapped body,
+    // fail to parse it, return `None`, and the document would go out WRAPPED AND
+    // UNREDACTED. Answering `Enforce` here would be a promise the lifecycle
+    // cannot keep — the same `None`-conflation this gate exists to close — so the
+    // response is rejected in the client's gRPC-Web flavor instead.
+    //
+    // This cannot fire on working traffic. A translated request reached the
+    // backend as `application/grpc`, so a reply that is not a complete native
+    // frame sequence is a broken backend response its gRPC-Web client could not
+    // have consumed either; and a reply that IS framing never reaches this line,
+    // because the claim declines proven framing above.
+    //
+    // Scoped to `Backend` origin and to translation on purpose:
+    //   * gateway-generated bytes are the gateway's own JSON rejection, which
+    //     must survive rather than be overwritten by a generic gate error;
+    //   * native gRPC and RETAINED-only gRPC-Web routes run no re-encoder after
+    //     the enforcer, so their untyped bare JSON documents stay claimed,
+    //     redacted, and served exactly as before.
+    let native_framing = super::grpc_web::GrpcFramingRepresentation::Native;
+    if origin == RepresentationOrigin::Backend
+        && super::grpc_web::request_is_grpc_web_translated(ctx)
+        && !super::grpc_web::bytes_are_complete_grpc_frames(inspected, native_framing)
+    {
+        return ResponseBodyPolicyPosture::Reject(RepresentationRejection::UnenforceableFraming);
     }
     if !document_is_parseable(content_type, inspected) {
         return ResponseBodyPolicyPosture::Reject(RepresentationRejection::UnparseableDocument);

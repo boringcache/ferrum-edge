@@ -41,6 +41,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use tracing::debug;
 
+use super::response_representation::effective_response_media_type;
 use super::utils::body_transform::{self, BodyRule};
 use super::utils::route_header_transform::{
     RouteHeaderTransformOp, RouteHeaderTransformRule, apply_route_header_transforms,
@@ -598,6 +599,25 @@ fn framed_grpc_request_without_proven_media_type(
     super::grpc_web::bytes_are_complete_grpc_frames(response_body, representation)
 }
 
+/// Whether the response's media type admits this plugin's JSON body rules.
+///
+/// Mirrors the media-type half of [`Plugin::transform_response_body`] exactly,
+/// but over the RESOLVED type rather than the raw live header: a framed gRPC
+/// label that neither the pristine snapshot nor a total frame parse supports is
+/// an `after_proxy`/translation artifact, not a description of these bytes, and
+/// must not decline them. See
+/// [`super::response_representation::effective_response_media_type`].
+fn media_type_admits_body_rules(
+    ctx: &RequestContext,
+    response_content_type: Option<&str>,
+    response_body: &[u8],
+) -> bool {
+    let media_type = effective_response_media_type(ctx, response_content_type, response_body);
+    media_type.is_none_or(|ct| {
+        body_transform::is_json_content_type(ct) && !body_transform::is_framed_grpc_content_type(ct)
+    })
+}
+
 #[async_trait]
 impl Plugin for ResponseTransformer {
     fn name(&self) -> &str {
@@ -763,13 +783,24 @@ impl Plugin for ResponseTransformer {
         // type, that helper decides on the response bytes rather than the request
         // flavor, so an untyped bare JSON error/envelope on a mixed gRPC route
         // stays claimed and redacted instead of being waved through as framing.
+        //
+        // The live media-type test must then not undo that answer, which is why
+        // it runs over `effective_response_media_type` rather than the raw
+        // header. The main gRPC path RELABELS the live map: `grpc_web`'s
+        // `after_proxy` stamps `application/grpc-web*` on every translated
+        // response before this gate runs. Applying the framed-media-type decline
+        // to that label AFTER the byte parse had already answered "not framed"
+        // put the fail-open straight back — an untyped backend's malformed frames
+        // or bare JSON error came back unclaimed and were forwarded and
+        // re-wrapped by the phase-9 re-encode with the redaction skipped. The
+        // resolver drops only a framed label that neither the pristine snapshot
+        // nor a total frame parse supports, so the byte parse OVERRIDES the
+        // relabelling instead of being overridden by it, while a pristine framed
+        // type and genuinely framed bytes both still decline.
         !self.body_rules.is_empty()
             && self.rules_enabled()
             && !framed_grpc_request_without_proven_media_type(ctx, response_body)
-            && response_content_type.is_none_or(|ct| {
-                body_transform::is_json_content_type(ct)
-                    && !body_transform::is_framed_grpc_content_type(ct)
-            })
+            && media_type_admits_body_rules(ctx, response_content_type, response_body)
     }
 
     /// The pre-`after_proxy` capability probe, deliberately WIDER than the claim.
@@ -935,6 +966,14 @@ impl Plugin for ResponseTransformer {
         if framed_grpc_request_without_proven_media_type(ctx, body) {
             return None;
         }
+        // Same resolution the claim predicate applies, for the same reason and
+        // over the same bytes: an unproven post-hook/translation-added framed
+        // gRPC label must not make the enforcer decline what the claim just
+        // claimed. Dropping it here restores the untyped branch, so
+        // `apply_body_rules` actually runs — and a body that is not a parseable
+        // document still returns `None` into the gate's fail-closed rejection
+        // instead of being forwarded unredacted.
+        let content_type = effective_response_media_type(ctx, content_type, body);
         self.transform_response_body(body, content_type, response_headers)
             .await
     }
