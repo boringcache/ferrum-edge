@@ -700,11 +700,8 @@ pub async fn serve(
     //     bind time, where they bypass the up-front validation contract.
     // CP gRPC isn't pre-bindable via `ServeOptions` so it still comes
     // from env_config.
-    let reserved_ports = effective_reserved_ports(
-        &env_config,
-        &prebound,
-        suppress_env_admin_https_reservation,
-    );
+    let reserved_ports =
+        effective_reserved_ports(&env_config, &prebound, suppress_env_admin_https_reservation);
     if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
         for msg in &errors {
             error!("{}", msg);
