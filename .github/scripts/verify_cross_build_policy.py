@@ -3889,8 +3889,22 @@ def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
             return None
         separator = "\n" if arguments[0] == "%s\\n" else ""
         return separator.join(arguments[1:])
-    # A conversion can splice later operands into the program. Only the exact
-    # `%s` forms above are modeled; mixing conversions with escapes stays opaque
+    if (
+        arguments[0].count("%") == 1
+        and "%s" in arguments[0]
+        and "\\" not in arguments[0]
+    ):
+        # One literal percent-s conversion has deterministic output even with
+        # a literal prefix or suffix. Modeling it also keeps quote-normalized
+        # scanner variants from becoming spuriously opaque.
+        if any("\\" in argument for argument in arguments[1:]):
+            return None
+        prefix, suffix = arguments[0].split("%s", maxsplit=1)
+        values = arguments[1:] or [""]
+        return "".join(f"{prefix}{value}{suffix}" for value in values)
+    # A conversion can splice later operands into the program. Only the bounded
+    # `%s` forms above are modeled; mixing conversions with escapes or using
+    # another conversion stays opaque,
     # so `printf '\x63%s' 'ross ...'` cannot be accepted as inert source.
     if "%" in arguments[0]:
         return None
@@ -16428,6 +16442,10 @@ pre_build = []
     shell_automation_escapes(
         "printf conversion splicing a Cross executable",
         f"printf '\\x63%s' 'ross {arm_target}' | bash",
+    )
+    shell_automation_escapes(
+        "bounded printf conversion splicing a Cross executable",
+        f"printf 'cr%s {arm_target}' 'oss' | bash",
     )
     shell_automation_escapes(
         "repeated printf format exposing a later Cross command",

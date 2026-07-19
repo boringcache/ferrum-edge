@@ -644,7 +644,7 @@ wait_for_gateway() {
                 sleep 0.5
                 ;;
             *)
-                if bash -c ">/dev/tcp/127.0.0.1/$target_port" 2>/dev/null; then
+                if bash -c '>/dev/tcp/127.0.0.1/$1' _ "$target_port" 2>/dev/null; then
                     echo "[gateway] ready on port $target_port"
                     sleep 1  # grace period
                     return 0
