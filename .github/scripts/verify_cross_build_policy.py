@@ -6428,6 +6428,23 @@ def contains_opaque_executable_cross(contents: str) -> bool:
     return False
 
 
+def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
+    """Recognize Cross-sensitive surfaces in trusted shell automation."""
+
+    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    return (
+        contains_literal_executable_cross(contents)
+        or WRAPPED_LITERAL_CROSS.search(contents) is not None
+        or OPAQUE_INLINE_SHELL.search(logical_contents) is not None
+        # An executable word assembled from shell expansions is opaque, so an
+        # ARM64 cross build driven by one fails closed here too.
+        or OPAQUE_ARM_CROSS_EXECUTION.search(logical_contents) is not None
+        # A variable-resolved executable dispatching a Cargo/Cross subcommand is
+        # opaque for every target, not just the ARM64 one above.
+        or contains_opaque_executable_cross(contents)
+    )
+
+
 def is_dispatcher_manifest(name: str) -> bool:
     return PurePosixPath(name).name in DISPATCHER_MANIFEST_NAMES
 
@@ -8455,17 +8472,14 @@ def validate_automation_collection(
         language = automation_language(name, contents) if contents is not None else None
         if (
             contents is not None
-            and language == "shell"
             and (
-                contains_literal_executable_cross(contents)
-                or WRAPPED_LITERAL_CROSS.search(contents)
-                # An executable word assembled from shell expansions is opaque,
-                # so an ARM64 cross build driven by one fails closed here too.
-                or OPAQUE_ARM_CROSS_EXECUTION.search(
-                    re.sub(r"\\\r?\n[ \t]*", "", contents)
+                language == "shell"
+                or (
+                    PurePosixPath(name).suffix == ""
+                    and not is_dispatcher_manifest(name)
                 )
-                or contains_opaque_executable_cross(contents)
             )
+            and contains_direct_trusted_shell_cross_surface(contents)
         ):
             errors.append(
                 f"{source}/{name} contains an unprotected Cross executable or "
@@ -12920,6 +12934,36 @@ pre_build = []
             "self-test automation directory",
         ):
             failures.append(f"{label} automation edit was not rejected")
+
+    extensionless_interpreted_shell_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "bash scripts/build",
+    )
+    extensionless_interpreted_shell_cross = {
+        "scripts/build": f"cross {arm_target}\n"
+    }
+    if not validate_automation_collection(
+        {"ci.yml": extensionless_interpreted_shell_workflow},
+        {"setup/action.yml": safe_action},
+        extensionless_interpreted_shell_cross,
+        "self-test automation directory",
+    ):
+        failures.append("extensionless interpreted shell Cross was not rejected")
+
+    opaque_inline_shell_cross = {
+        "scripts/safe.sh": (
+            "#!/bin/sh\n"
+            "bash -c \"$(printf '\\143\\162\\157\\163\\163 build "
+            "--target aarch64-unknown-linux-gnu')\"\n"
+        )
+    }
+    if not validate_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        opaque_inline_shell_cross,
+        "self-test automation directory",
+    ):
+        failures.append("opaque inline shell Cross surface was not rejected")
 
     opaque_shell_stdin = {
         "scripts/safe.sh": (
