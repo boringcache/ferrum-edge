@@ -813,7 +813,40 @@ impl RedactionPlan {
     /// would shred every diagnostic the operator needs to read. Same threshold,
     /// and same reasoning, as `MIN_REDACTABLE_REFERENCE_LEN` in
     /// `secrets::registry`.
+    ///
+    /// See [`Self::derived_candidate_admitted`] for the one exemption.
     const MIN_DERIVED_CANDIDATE_LEN: usize = 3;
+
+    /// Whether a form derived from `value` survives the length filter.
+    ///
+    /// The minimum exists to keep a *shorter* fragment of a secret from
+    /// matching constantly and shredding unrelated diagnostics. A derived form
+    /// that is **no shorter than the exact value it came from** cannot do that,
+    /// because the exact value is already an unconditional candidate at that
+    /// same length: admitting the rewrite causes no replacement the secret
+    /// itself would not already cause, at a span the design has already
+    /// accepted. So the minimum does not apply to it.
+    ///
+    /// Without this exemption a *whole-value transformation* shorter than three
+    /// bytes is the only rendering an operator ever sees, and it is dropped.
+    /// `FERRUM_MODE_FILE=DB` is the motivating case: `OperatingMode::resolve`
+    /// lowercases before echoing, so the diagnostic carries `db` and never the
+    /// exact `DB`, and the two-byte derived form was filtered out — the
+    /// resolved secret was printed verbatim. The same holds for any
+    /// length-preserving rewrite (every ASCII case fold) and any lengthening
+    /// one (`1` -> `true`, a JSON escape, a numeric canonicalization that grows).
+    ///
+    /// **Residual, deliberate:** a *shortening* whole-value rewrite below the
+    /// minimum — `trim()` of a padded one-character value, a short list
+    /// segment — is still dropped. Admitting it would create a matching span
+    /// shorter than the operator's own value and corrupt every diagnostic
+    /// containing that letter, which is the failure this minimum exists to
+    /// prevent. Those surfaces are covered key-tied instead, by
+    /// [`report_env_field`] and `config::env_config_macro::invalid_env_value`,
+    /// which withhold on provenance and so do not depend on length at all.
+    fn derived_candidate_admitted(derived: &str, value: &str) -> bool {
+        derived.len() >= Self::MIN_DERIVED_CANDIDATE_LEN || derived.len() >= value.len()
+    }
 
     fn build<I: IntoIterator<Item = String>>(values: I) -> Self {
         let mut candidates: Vec<String> = Vec::new();
@@ -839,7 +872,7 @@ impl RedactionPlan {
             candidates.extend(
                 derive_candidates(&value)
                     .into_iter()
-                    .filter(|derived| derived.len() >= Self::MIN_DERIVED_CANDIDATE_LEN),
+                    .filter(|derived| Self::derived_candidate_admitted(derived, &value)),
             );
         }
         // Distinct candidates only: two keys holding the same secret describe

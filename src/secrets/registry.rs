@@ -508,6 +508,12 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     // determinism reason.
     let mut invalid_unicode: Vec<String> = Vec::new();
 
+    // Non-Unicode values on ordinary `FERRUM_*` variables — i.e. direct
+    // configuration rather than a secret *source reference*. Kept separate from
+    // `invalid_unicode` because it is reported later, after the conflict check;
+    // see the report site below for why the ordering is load-bearing.
+    let mut invalid_unicode_direct: Vec<String> = Vec::new();
+
     // `std::env::vars()` *panics* on any variable whose name or value is not
     // valid Unicode, and it panics during iteration — before this loop can
     // filter to `FERRUM_*`. A single unrelated non-UTF-8 variable elsewhere in
@@ -535,16 +541,37 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
         };
         let Some(value) = value_os.to_str() else {
             // The name decoded, so we can tell whether this is a *source*
-            // reference or an ordinary direct value. An undecodable source
-            // reference is unusable and fails closed; an ordinary `FERRUM_*`
-            // variable holding undecodable bytes is not this function's
-            // business — it is still counted as a directly configured source
-            // by `env_var_os_is_set` in the conflict check below, so it cannot
-            // silently coexist with a suffixed source.
+            // reference or an ordinary direct value. Both fail closed, but at
+            // different points and with different messages.
+            //
+            // An undecodable source reference is unusable: we cannot issue the
+            // fetch it describes.
+            //
+            // An undecodable *direct* value is a silent-misconfiguration
+            // hazard, which is why it cannot simply be skipped. Every
+            // downstream config resolver reads the environment with
+            // `std::env::var`, which reports non-Unicode as `Err` — that is,
+            // as **unset**. So a `FERRUM_ADMIN_HTTP_PORT` or
+            // `FERRUM_CONF_PATH` holding undecodable bytes does not fail; it
+            // silently falls through to `ferrum.conf` or to the built-in
+            // default, and the gateway comes up on settings the operator never
+            // chose. `env_var_os_is_set` makes such a value visible to the
+            // conflict check below, but nothing else ever sees it.
+            //
+            // Every `FERRUM_*` name is in Ferrum's own configuration
+            // namespace, and no Ferrum setting is parsed from anything but a
+            // `String`, so undecodable bytes can never be a value Ferrum could
+            // have used. There is no "definitely unrelated" `FERRUM_*` name to
+            // carve out — including the `NON_SECRET_FILE_SUFFIX_KEYS` entries,
+            // which are ordinary path settings that merely end in `_FILE`.
+            // Unrelated non-Ferrum variables never reach here at all: the raw
+            // prefix screen above skipped them without decoding.
             let is_source = unsupported_cloud_suffix(raw_key).is_some()
                 || match_suffix(raw_key).is_some_and(|(_, base_key)| !base_key.is_empty());
             if is_source {
                 invalid_unicode.push(sanitize_env_key(&raw_key_os));
+            } else {
+                invalid_unicode_direct.push(sanitize_env_key(&raw_key_os));
             }
             continue;
         };
@@ -640,6 +667,27 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             suffixed_key: suffixed_key.clone(),
             backend_kind: *backend,
         });
+    }
+
+    // Reported *after* the conflict check, deliberately. A base key that holds
+    // undecodable bytes *and* has a suffixed source is a genuine
+    // multiple-sources misconfiguration, and that is the more specific and more
+    // actionable diagnostic; `env_var_os_is_set` already counts the undecodable
+    // direct value as a source there, so that case is caught above and never
+    // reaches here. What is left is the case nothing else catches: a direct
+    // Ferrum value that no source competes with, which would otherwise read as
+    // unset to every downstream `std::env::var` and be silently replaced by a
+    // conf-file entry or a default.
+    //
+    // Lexicographically first offender, sanitized to its ASCII skeleton, for
+    // the same determinism and non-disclosure reasons as the checks above.
+    if !invalid_unicode_direct.is_empty() {
+        invalid_unicode_direct.sort();
+        return Err(format!(
+            "Environment variable {} is not valid Unicode. Ferrum configuration values must be \
+             valid Unicode; fix or unset the variable.",
+            invalid_unicode_direct[0]
+        ));
     }
 
     let fetch_timeout = startup_secret_fetch_timeout();

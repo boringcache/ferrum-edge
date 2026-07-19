@@ -2058,9 +2058,9 @@ async fn functional_cli_validate_rejects_non_unicode_ferrum_name() {
 }
 
 /// A recognized suffixed *source* key whose value is not Unicode is an unusable
-/// reference and fails closed. (An undecodable value on an ordinary base key is
-/// deliberately not fatal — it is still counted as a directly configured source
-/// by the conflict check, so it cannot silently coexist with a suffixed one.)
+/// reference and fails closed. An ordinary base key holding undecodable bytes
+/// also fails closed, but later and with its own message — see
+/// `functional_cli_validate_rejects_non_unicode_direct_value` below.
 #[cfg(unix)]
 #[ignore]
 #[tokio::test]
@@ -2096,6 +2096,195 @@ async fn functional_cli_validate_rejects_non_unicode_source_reference() {
         !output.stderr.contains(&0xffu8),
         "the undecodable reference bytes must never be echoed: {stderr}"
     );
+}
+
+/// A *direct* Ferrum configuration value that is not Unicode fails closed.
+///
+/// This is the silent-misconfiguration case. Every downstream config resolver
+/// reads the environment with `std::env::var`, which reports non-Unicode as
+/// `Err` — that is, as **unset**. So an undecodable `FERRUM_ADMIN_HTTP_PORT`
+/// used to be skipped by secret resolution and then ignored by everything
+/// after it: validate succeeded and the gateway would have come up on the
+/// `ferrum.conf` entry or the built-in default, on settings the operator never
+/// chose and with nothing said about it.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_non_unicode_direct_value() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_ADMIN_HTTP_PORT",
+            std::ffi::OsStr::from_bytes(b"84\xff43"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an undecodable direct value must fail closed rather than read as unset: \
+         stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("is not valid Unicode"),
+        "the diagnostic must name the failure class: {stderr}"
+    );
+    assert!(
+        stderr.contains("FERRUM_ADMIN_HTTP_PORT"),
+        "the diagnostic must name the variable: {stderr}"
+    );
+    assert!(
+        !output.stderr.contains(&0xffu8),
+        "raw undecodable bytes must never reach the operator: {stderr}"
+    );
+}
+
+/// The same rule reaches a variable consumed before `EnvConfig` exists.
+/// `FERRUM_CONF_PATH` selects the settings file itself, so reading it as unset
+/// silently repoints the whole process at a different file.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_non_unicode_direct_conf_path() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_CONF_PATH",
+            std::ffi::OsStr::from_bytes(b"/etc/ferrum/\xff.conf"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an undecodable settings-file path must fail closed: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("is not valid Unicode") && stderr.contains("FERRUM_CONF_PATH"),
+        "the diagnostic must name the failure class and the variable: {stderr}"
+    );
+    assert!(
+        !output.stderr.contains(&0xffu8),
+        "raw undecodable bytes must never reach the operator: {stderr}"
+    );
+}
+
+/// A key ending in `_FILE` that is *not* a secret source is still ordinary
+/// Ferrum configuration, so it takes the direct-value path rather than being
+/// mistaken for an unreadable source reference.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_non_unicode_non_secret_file_suffix_value() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_DNS_RESOLVER_HOSTS_FILE",
+            std::ffi::OsStr::from_bytes(b"/etc/\xff-hosts"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an undecodable non-secret `_FILE` config value must fail closed: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("is not valid Unicode")
+            && stderr.contains("FERRUM_DNS_RESOLVER_HOSTS_FILE"),
+        "the diagnostic must name the failure class and the variable: {stderr}"
+    );
+}
+
+/// Precedence control: when an undecodable direct value *competes* with a
+/// suffixed source, the more specific multiple-sources diagnostic still wins.
+/// That case is already caught by the conflict check, which counts the direct
+/// value through `var_os`, and it must not be masked by the new check.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_reports_conflict_over_non_unicode_direct_value() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new().unwrap();
+    let secret_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&secret_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            std::ffi::OsStr::from_bytes(b"direct-\xff-secret"),
+        )
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET_FILE",
+            secret_path.to_str().unwrap(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the conflict must fail: {stderr}");
+    assert!(
+        stderr.contains("Multiple secret sources configured for FERRUM_ADMIN_JWT_SECRET"),
+        "the specific conflict diagnostic must win over the generic Unicode one: {stderr}"
+    );
+    assert!(
+        !output.stderr.contains(&0xffu8),
+        "raw undecodable bytes must never reach the operator: {stderr}"
+    );
+}
+
+/// Benign control: a well-formed direct value is untouched by the new check.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_accepts_valid_direct_values() {
+    let temp_dir = TempDir::new().unwrap();
+    let secret_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&secret_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        // Database mode requires the admin JWT secret; sourced through `_FILE`
+        // so the suffixed path stays exercised alongside the direct values.
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET_FILE",
+            secret_path.to_str().unwrap(),
+        )
+        .env("FERRUM_ADMIN_HTTP_PORT", "8443")
+        .env("FERRUM_DNS_RESOLVER_HOSTS_FILE", "/etc/hosts")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "ordinary direct configuration must be unaffected: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(stdout.contains("Validation passed."));
 }
 
 // ── run: externally resolved operating mode is not disclosed ────────────────

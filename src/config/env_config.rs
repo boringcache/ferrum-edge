@@ -57,10 +57,26 @@ impl OperatingMode {
             "injector" => Ok(Self::Injector),
             "node_agent" => Ok(Self::NodeAgent),
             "migrate" => Ok(Self::Migrate),
-            other => Err(format!(
-                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, mesh, injector, node_agent, migrate",
-                other
-            )),
+            other => {
+                const MODES: &str = "database, file, cp, dp, mesh, injector, node_agent, migrate";
+                // Withheld by key, not by shape. This site *lowercases* before
+                // echoing, so what an operator sees is a rendering of the
+                // resolved value rather than the value itself, and a short
+                // rendering (`DB` -> `db`) is exactly where the textual
+                // backstop is weakest. `is_external_secret_key` is exact: the
+                // variable is known by name to have been externally resolved,
+                // so no rendering of it escapes here. The expected-value list
+                // is the actionable part and is kept. Same boundary and same
+                // shape as `env_config_macro::invalid_env_value`, which this
+                // hand-written `format!` does not go through.
+                if crate::secrets::is_external_secret_key("FERRUM_MODE") {
+                    return Err(format!(
+                        "Invalid FERRUM_MODE {}. Expected: {MODES}",
+                        crate::secrets::EXTERNAL_SECRET_PLACEHOLDER
+                    ));
+                }
+                Err(format!("Invalid FERRUM_MODE '{other}'. Expected: {MODES}"))
+            }
         }
     }
 }

@@ -1,1 +1,2 @@
 mod san_allow_list_verifier_tests;
+mod source_redaction_tests;

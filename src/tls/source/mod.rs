@@ -100,6 +100,21 @@ impl SourceScheme {
             Self::Pkcs11 => "pkcs11",
         }
     }
+
+    /// True when this scheme addresses an external secret provider, so its
+    /// identifier is a *secret source reference* rather than ordinary local
+    /// configuration.
+    ///
+    /// These are the four schemes whose identifier is a Vault path, an ARN or
+    /// secret name, a Key Vault URL, or a GCP secret resource name — the exact
+    /// class `secrets::registry::redact_source_reference` already withholds
+    /// from backend error text. `file`/`k8s`/`acme`/`managed`/`pkcs11`
+    /// identifiers are operator-authored local configuration that appears in
+    /// the settings file and is needed verbatim to act on a diagnostic, so they
+    /// are deliberately not included.
+    pub fn is_secret_provider(self) -> bool {
+        matches!(self, Self::Vault | Self::Aws | Self::Azure | Self::Gcp)
+    }
 }
 
 /// Redacted string wrapper for inline PEM material.
@@ -190,7 +205,35 @@ impl CertSourceUri {
     pub fn source_id(&self) -> String {
         format!("{}://{}", self.scheme.as_str(), self.identifier)
     }
+
+    /// [`Self::source_id`] with a secret provider's identifier withheld — the
+    /// form that is safe to put in an operator-facing error or log record.
+    ///
+    /// [`Self::source_id`] is an *identity*: it keys TLS inventory entries and
+    /// event filters (`tls::events`), so it must stay distinguishing and is not
+    /// redacted in place. But it is also what the `MaterialError` variants
+    /// interpolate, and their `Display` reaches `validate` output and startup
+    /// logs. For a `vault://`/`aws://`/`azure://`/`gcp://` source that means the
+    /// full secret path, ARN, or Key Vault URL was printed even though the
+    /// backend's own error detail beside it had already been scrubbed by
+    /// `secrets::registry::redact_source_reference` — the reference leaked
+    /// through the wrapper instead of through the detail.
+    ///
+    /// The scheme is retained rather than dropped: it is a bounded, fixed-set
+    /// label that tells an operator which provider to go look at, and it
+    /// discloses nothing the configuration does not already state. Only the
+    /// identifier is withheld.
+    pub fn redacted_source_id(&self) -> String {
+        if self.scheme.is_secret_provider() {
+            format!("{}://{}", self.scheme.as_str(), REDACTED_IDENTIFIER)
+        } else {
+            self.source_id()
+        }
+    }
 }
+
+/// Substituted for a secret provider's identifier in operator-facing output.
+const REDACTED_IDENTIFIER: &str = "<redacted source reference>";
 
 fn parse_options(query: &str) -> BTreeMap<String, String> {
     url::form_urlencoded::parse(query.as_bytes())
@@ -236,6 +279,15 @@ impl CertSource {
             Self::Path(path) => path.display().to_string(),
             Self::InlinePem(_) => "inline-pem:<redacted>".to_string(),
             Self::Uri(uri) => uri.source_id(),
+        }
+    }
+
+    /// [`Self::source_id`] safe for operator-facing output — see
+    /// [`CertSourceUri::redacted_source_id`]. Non-URI sources are unchanged.
+    pub fn redacted_source_id(&self) -> String {
+        match self {
+            Self::Uri(uri) => uri.redacted_source_id(),
+            other => other.source_id(),
         }
     }
 
@@ -418,7 +470,7 @@ pub fn load_material_blocking(
         CertSource::Uri(uri) if uri.scheme == SourceScheme::File => {
             let path =
                 uri_file_path(&uri.identifier).ok_or_else(|| MaterialError::InvalidSource {
-                    source_id: uri.source_id(),
+                    source_id: uri.redacted_source_id(),
                     details: "file URI has no path".to_string(),
                 })?;
             load_file_material(Path::new(&path), uri.kind)
@@ -474,7 +526,16 @@ fn load_secret_material(
         });
     }
 
-    let source_id = uri.source_id();
+    // Provider-only, never the Vault path / ARN / Key Vault URL. This is both
+    // the error wrapper's `source_id` and the materialized value's, because the
+    // latter is interpolated into PEM-parse and verifier-construction failures
+    // all over the tree (`tls::mod`, `identity::file_loader`, `ldap_auth`,
+    // `tcp_logging`, `ws_logging`, `soap_ws_security`, `spec_expose`,
+    // `http_client`, `mongo_store`, `modes::mesh`) — one producer is the only
+    // place this can be enforced. `resolved.source` is the registry's
+    // `<provider>:<identifier>` rendering and carries the reference too, so it
+    // is deliberately not used here.
+    let source_id = uri.redacted_source_id();
     let scheme = uri.scheme;
     let identifier = uri.identifier.clone();
     let key = format!("TLS {} material", uri.kind.as_str());
@@ -487,7 +548,7 @@ fn load_secret_material(
     Ok(MaterializedMaterial::from_bytes(
         resolved.value.into_bytes(),
         scheme,
-        resolved.source,
+        source_id,
         if uri.kind == MaterialKind::Unknown {
             fallback_kind
         } else {
@@ -540,14 +601,14 @@ fn load_managed_material(
         uri.kind
     };
     let store = crate::tls::managed::global_store().map_err(|details| MaterialError::Secret {
-        source_id: uri.source_id(),
+        source_id: uri.redacted_source_id(),
         details,
     })?;
     let material =
         store
             .material(&uri.identifier, kind)
             .map_err(|error| MaterialError::InvalidSource {
-                source_id: uri.source_id(),
+                source_id: uri.redacted_source_id(),
                 details: error.to_string(),
             })?;
     Ok(MaterializedMaterial::from_bytes(
@@ -570,14 +631,14 @@ fn load_acme_material(
     };
     let store =
         crate::tls::acme::global_certificate_store().map_err(|details| MaterialError::Secret {
-            source_id: uri.source_id(),
+            source_id: uri.redacted_source_id(),
             details,
         })?;
     let material =
         store
             .material(&uri.identifier, kind)
             .map_err(|error| MaterialError::InvalidSource {
-                source_id: uri.source_id(),
+                source_id: uri.redacted_source_id(),
                 details: error.to_string(),
             })?;
     Ok(MaterializedMaterial::from_bytes(
@@ -851,7 +912,7 @@ impl MaterialLoader for FileLoader {
 
     async fn load(&self, uri: &CertSourceUri) -> Result<MaterializedMaterial, MaterialError> {
         let path = uri_file_path(&uri.identifier).ok_or_else(|| MaterialError::InvalidSource {
-            source_id: uri.source_id(),
+            source_id: uri.redacted_source_id(),
             details: "file URI has no path".to_string(),
         })?;
         load_file_material(Path::new(&path), uri.kind)

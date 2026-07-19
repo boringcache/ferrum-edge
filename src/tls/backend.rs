@@ -899,7 +899,7 @@ fn load_backend_material(
         },
         other => TlsError::Rustls(format!(
             "Failed to load {kind} from {}: {other}",
-            source.source_id()
+            source.redacted_source_id()
         )),
     })
 }

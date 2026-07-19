@@ -188,7 +188,7 @@ fn source_poll_interval(
                 Ok(interval) => Some(interval),
                 Err(details) => {
                     warn!(
-                        source_id = %uri.source_id(),
+                        source_id = %uri.redacted_source_id(),
                         poll = %raw,
                         details = %details,
                         "Invalid TLS material source poll interval; using default"

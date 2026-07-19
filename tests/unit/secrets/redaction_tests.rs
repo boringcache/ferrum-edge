@@ -148,7 +148,34 @@ const METADATA_KEY_VALUE: &str = "metadata-key-sentinel";
 const METADATA_KEY_TWO_KEY: &str = "FERRUM_REDACTION_FIXTURE_METADATA_KEY_TWO";
 const METADATA_KEY_TWO_VALUE: &str = "second-metadata-key-sentinel";
 
-const FIXTURES: [(&str, &str); 20] = [
+/// A short externally sourced value whose only operator-visible rendering is a
+/// *whole-value transformation* of it.
+///
+/// `FERRUM_MODE_FILE=DB` is the shape: `OperatingMode::resolve` lowercases
+/// before echoing, so the diagnostic carries `db` and never the exact `DB`. At
+/// two bytes the lowercased form sits below the derived-candidate minimum and
+/// was filtered out of the plan, so the resolved value was printed verbatim.
+///
+/// Deliberately a digraph that appears in no diagnostic in this binary: arming
+/// a two-byte candidate process-wide is only safe when it is genuinely rare.
+/// This adds no new *class* of risk — the exact value already carries no
+/// minimum, so `Qz` itself was armed process-wide before this fixture existed.
+const SHORT_CASE_KEY: &str = "FERRUM_REDACTION_FIXTURE_SHORT_CASE";
+const SHORT_CASE_VALUE: &str = "Qz";
+const SHORT_CASE_LOWERED: &str = "qz";
+
+/// The deliberate residual, pinned as a control: a *shortening* whole-value
+/// rewrite that lands below the minimum stays out of the candidate set.
+///
+/// `trim()` of this value is one byte. Admitting it would make every diagnostic
+/// containing that letter unreadable, which is precisely what the minimum
+/// exists to prevent, so it is covered key-tied (`report_env_field`,
+/// `invalid_env_value`) rather than textually. The exact padded value is still
+/// a candidate.
+const PADDED_SHORT_KEY: &str = "FERRUM_REDACTION_FIXTURE_PADDED_SHORT";
+const PADDED_SHORT_VALUE: &str = "  w  ";
+
+const FIXTURES: [(&str, &str); 22] = [
     (PLAIN_KEY, PLAIN_VALUE),
     (LIST_KEY, LIST_VALUE),
     (CASE_KEY, CASE_VALUE),
@@ -169,6 +196,8 @@ const FIXTURES: [(&str, &str); 20] = [
     (WITHHELD_TARGET_KEY, WITHHELD_TARGET_VALUE),
     (METADATA_KEY_KEY, METADATA_KEY_VALUE),
     (METADATA_KEY_TWO_KEY, METADATA_KEY_TWO_VALUE),
+    (SHORT_CASE_KEY, SHORT_CASE_VALUE),
+    (PADDED_SHORT_KEY, PADDED_SHORT_VALUE),
 ];
 
 static RECORDED: Once = Once::new();
@@ -229,6 +258,65 @@ fn redacts_the_value_exactly_as_materialized() {
     // The variable name stays; withholding it too would make the diagnostic
     // unactionable, and it is not secret.
     assert!(redacted.contains(PLAIN_KEY) && redacted.contains(EXTERNAL_SECRET_PLACEHOLDER));
+}
+
+/// A whole-value rewrite that is *no shorter than the value itself* carries no
+/// minimum length, because the exact value is already an unconditional
+/// candidate at that same length — so admitting the rewrite cannot cause any
+/// replacement the secret would not already cause.
+///
+/// Without that exemption `FERRUM_MODE_FILE=DB` leaked: the only rendering an
+/// operator ever sees is the lowercased `db`, and at two bytes it was dropped.
+#[test]
+fn redacts_a_short_whole_value_case_transformation() {
+    arm_redaction();
+    let redacted = redact_external_secret_values(&format!(
+        "Invalid FERRUM_MODE '{SHORT_CASE_LOWERED}'. Expected: database, file, cp, dp"
+    ));
+    assert!(
+        !redacted.contains(SHORT_CASE_LOWERED),
+        "a lowercased whole-value rendering must not survive just for being short: {redacted}"
+    );
+    assert!(redacted.contains(EXTERNAL_SECRET_PLACEHOLDER));
+    // The actionable part of the diagnostic is untouched.
+    assert!(redacted.contains("Expected: database, file, cp, dp"));
+}
+
+/// The exact value of the same fixture stays covered, as it always was.
+#[test]
+fn redacts_the_short_value_as_materialized() {
+    arm_redaction();
+    let redacted =
+        redact_external_secret_values(&format!("Invalid FERRUM_MODE '{SHORT_CASE_VALUE}'"));
+    assert!(
+        !redacted.contains(SHORT_CASE_VALUE),
+        "the exact short value must not survive: {redacted}"
+    );
+}
+
+/// Control for the deliberate residual: the exemption is keyed on the derived
+/// form being *no shorter than* the value, so a shortening rewrite below the
+/// minimum is still excluded and unrelated diagnostics stay readable.
+///
+/// If this ever starts failing because `w` was admitted as a candidate, the
+/// exemption has been widened into the diagnostic-shredding behavior the
+/// minimum exists to prevent — and the fix is key-tied withholding at the
+/// affected site, not a wider candidate set.
+#[test]
+fn does_not_admit_a_shortening_rewrite_below_the_minimum() {
+    arm_redaction();
+    let message = "Listener bound with a w flag set";
+    assert_eq!(
+        redact_external_secret_values(message),
+        message,
+        "a one-byte trimmed form must not be a candidate"
+    );
+    // ...while the value exactly as materialized still is.
+    let exact = redact_external_secret_values(&format!("value '{PADDED_SHORT_VALUE}'"));
+    assert!(
+        exact.contains(EXTERNAL_SECRET_PLACEHOLDER),
+        "the padded value as materialized must still redact: {exact}"
+    );
 }
 
 /// Exact-value matching alone is insufficient: `Vec<String>` parsing trims each
