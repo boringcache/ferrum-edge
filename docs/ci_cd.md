@@ -432,7 +432,18 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   substitution in such a body is followed as a repository execution edge:
   `cat <<EOF ... $(bash scripts/unsafe.sh) ... EOF` really runs that script, so
   it is recorded and scanned. Only the substitution interior becomes a command;
-  the surrounding data line never gains a command slot of its own.
+  the surrounding data line never gains a command slot of its own — including
+  for the opaque-ARM64-executable search, which reads a program's command text
+  rather than its raw lines, so `cat <<EOF ... $cmd build --target
+  aarch64-unknown-linux-gnu ... EOF` is the configuration data it is while the
+  same words inside a body `$()` still fail closed. An arithmetic expansion in
+  such a body dispatches nothing — `$((scripts/build))` evaluates a division —
+  so it is skipped in parity with the heredoc-opener parser, while `$( (cmd) )`,
+  the only spelling that nests a real substitution, still executes. Each
+  interior runs in a subshell, so it is followed as its own nested program: a
+  `cd` inside one resolves that interior's own operands and then ends with the
+  subshell, instead of rewriting the working directory every later real line of
+  the parent script is resolved against.
   Which bodies are quoted is decided by parsing the delimiter as the shell word
   it is. A shell suppresses body expansion when *any* character of the delimiter
   is quoted and terminates on the dequoted word, so `<<E"OF"` and `<<\EOF` are
@@ -461,7 +472,11 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   an option operand. `env -u \` and `sudo -u \` end the line mid-option, so the
   word that follows is the name being unset or the user being assumed, not an
   executable; treating it as a whole-command slot is a deterministic false
-  positive rather than a caught dispatch.
+  positive rather than a caught dispatch. `timeout` is the same case with a
+  positional operand: its duration is mandatory and precedes the command, so
+  `timeout --preserve-status \` and `timeout -k 5 \` hand the next line that
+  duration, while `timeout 30 \` and `timeout --preserve-status 30 \` have
+  already consumed it and do restore the slot.
   Leading words that precede the executable without being it do not close the
   slot: a negation (`! cmd`), assignment words (`FOO=bar $cmd`), process
   wrappers, `env` and its options, and any number of spaced or unspaced subshell
@@ -479,9 +494,21 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   the two further spellings the ordinary Cargo/Cross parser accepts: a literal
   `cross` subcommand, since `$tool cross build` runs Cross when `$tool` is
   `cargo`, and a toolchain selector, since `$tool +nightly build` runs Cross
-  when `$tool` is `cross`. Widening that gate reports nothing by itself — every
-  admitted line is still decided by the substitution, the Cross-subcommand
-  check, and the command-context check.
+  when `$tool` is `cross`. A command substitution with nested parentheses is
+  one expansion to the scanner but not to the cheap pattern, so every balanced
+  `$(...)` span is collapsed to a single placeholder before that gate runs and
+  `$( (printf cross) ) build --target aarch64-unknown-linux-gnu` reaches the
+  analysis it would otherwise be dropped before. Widening that gate reports
+  nothing by itself — every admitted line is still decided by the substitution,
+  the Cross-subcommand check, and the command-context check.
+  The interleaved assignment/wrapper/`env` prefix layer is one model shared by
+  every discovery pattern, not only by opaque-executable scanning, so
+  `env sudo bash scripts/unsafe.sh`, `sudo FOO=bar bash scripts/unsafe.sh`,
+  `env sudo make -C build all`, and `env sudo python3 -m ci.build` are recorded
+  as the repository script, dispatcher manifest, and Python module they really
+  execute. Every alternative in that layer consumes a whole word, so it widens
+  the accepted orderings of prefix words without opening data or argument
+  positions.
   A block-scalar body is one string value rather than YAML structure, so prose in
   an action input declares no mapping key, alias, or merge key: `--allowedTools
   "Bash(gh pr comment:*)"` inside a `claude_args: |` body is not a `comment:` key
@@ -689,7 +716,24 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   scannable interpreter, while the extensionless shell revalidation above still
   runs. The two readings are a union rather than a choice, so nothing an earlier
   class already rejected stops being rejected, and a bare `./ci/unsafe` that
-  names no interpreter invents none.
+  names no interpreter invents none. A bare extensionless reference is read as
+  shell during traversal as well as during revalidation, so `run: scripts/build`
+  is followed into the script instead of being reported as automation with no
+  scannable interpreter by the very stage whose successor does scan it; an
+  explicit interpreter and a build-dispatcher manifest keep their own readings.
+  PowerShell provenance is replayed the same way Python provenance is: `pwsh
+  scripts/opaque` reaching an extensionless file adds a cmdlet reading to the
+  shell one, so `Start-Process cross -ArgumentList 'build --target ...'` — which
+  is not a dispatch in POSIX shell at all — still fails closed. Pull-request
+  surface comparison receives the same provenance and applies it to both the
+  merge-base and the proposed tree, so a proposed no-shebang `scripts/opaque`
+  reached by `python3 scripts/opaque` is compared as Python rather than as
+  unread text, and the two sides stay symmetric.
+  A reached build-dispatcher recipe is shell, so it is held to the same
+  opaque-stdin rule as any other reached shell automation: a `printf
+  '\x63ross build --target ...' | bash` recipe fails closed during exact-tree
+  revalidation instead of only during pull-request comparison. A recipe whose
+  producer is an ordinary unescaped literal stays readable and stays editable.
   Cross-sensitive jobs, local-action files, and
   reachable scripts are represented by full digests, while unrelated workflow,
   action, and script additions or edits remain permitted. The isolated jobs use
