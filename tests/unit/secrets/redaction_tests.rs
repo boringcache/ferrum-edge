@@ -43,10 +43,23 @@ const QUOTE_VALUE: &str = "\"";
 const DELIMITER_KEY: &str = "FERRUM_REDACTION_FIXTURE_DELIMITER";
 const DELIMITER_VALUE: &str = ",";
 
-/// A secret equal to one of the log schema's own field names. The *key* must
-/// survive; occurrences in values must not.
+/// A secret equal to one of the tracing envelope's own field names. In a record
+/// the fmt layer produced the *key* must survive; occurrences in values must
+/// not — and in an access record, which has no envelope, the key must go too.
 const FIELD_NAME_KEY: &str = "FERRUM_REDACTION_FIXTURE_FIELD_NAME";
 const FIELD_NAME_VALUE: &str = "level";
+
+/// A second envelope name, the one the fmt layer emits *nested* under `fields`
+/// rather than at the root. `log_schema` can equally put it in key position in
+/// an access record at any depth.
+const MESSAGE_NAME_KEY: &str = "FERRUM_REDACTION_FIXTURE_MESSAGE_NAME";
+const MESSAGE_NAME_VALUE: &str = "message";
+
+/// A third envelope name, and the one named in the review finding: `filename`
+/// is structural only because the fmt layer emits it, and is otherwise an
+/// entirely ordinary key for `static_fields:` or a flattened `metadata` entry.
+const FILENAME_NAME_KEY: &str = "FERRUM_REDACTION_FIXTURE_FILENAME_NAME";
+const FILENAME_NAME_VALUE: &str = "filename";
 
 /// A secret that appears in a record as an unquoted JSON number — the shape a
 /// resolved port or limit produces.
@@ -135,7 +148,7 @@ const METADATA_KEY_VALUE: &str = "metadata-key-sentinel";
 const METADATA_KEY_TWO_KEY: &str = "FERRUM_REDACTION_FIXTURE_METADATA_KEY_TWO";
 const METADATA_KEY_TWO_VALUE: &str = "second-metadata-key-sentinel";
 
-const FIXTURES: [(&str, &str); 18] = [
+const FIXTURES: [(&str, &str); 20] = [
     (PLAIN_KEY, PLAIN_VALUE),
     (LIST_KEY, LIST_VALUE),
     (CASE_KEY, CASE_VALUE),
@@ -143,6 +156,8 @@ const FIXTURES: [(&str, &str); 18] = [
     (QUOTE_KEY, QUOTE_VALUE),
     (DELIMITER_KEY, DELIMITER_VALUE),
     (FIELD_NAME_KEY, FIELD_NAME_VALUE),
+    (MESSAGE_NAME_KEY, MESSAGE_NAME_VALUE),
+    (FILENAME_NAME_KEY, FILENAME_NAME_VALUE),
     (NUMBER_KEY, NUMBER_VALUE),
     (TAB_KEY, TAB_VALUE),
     (BACKSPACE_KEY, BACKSPACE_VALUE),
@@ -361,6 +376,12 @@ fn through_sink(write: impl FnOnce(&NonBlockingSink)) -> String {
     String::from_utf8(bytes).expect("sink output is UTF-8")
 }
 
+/// Emit an **access record**: `try_write_json`, the path `stdout_logging` uses.
+///
+/// These carry no tracing envelope, so no key in them is structural — not even
+/// at the root, which is exactly where `log_schema`'s `rename:`,
+/// `static_fields:`, and `MetadataPolicy::Flatten` deposit operator-supplied
+/// names.
 fn emit(sink: &NonBlockingSink, value: &serde_json::Value) {
     assert_eq!(
         sink.try_write_json(value)
@@ -368,6 +389,22 @@ fn emit(sink: &NonBlockingSink, value: &serde_json::Value) {
         EnqueueResult::Queued,
         "the fixture record must be accepted, not dropped"
     );
+}
+
+/// Emit a **tracing record**: through the sink's `MakeWriter` impl, which is
+/// what `tracing_subscriber`'s JSON fmt layer holds.
+///
+/// This is the only producer that genuinely carries the fixed envelope, so it
+/// is the only one whose envelope keys are exempt from key redaction. The
+/// writer auto-submits on drop, matching the fmt layer's own use.
+fn emit_tracing(sink: &NonBlockingSink, value: &serde_json::Value) {
+    use tracing_subscriber::fmt::MakeWriter;
+
+    let serialized = serde_json::to_vec(value).expect("fixture serializes");
+    let mut writer = sink.make_writer();
+    writer.write_all(&serialized).expect("record accepted");
+    writer.write_all(b"\n").expect("newline accepted");
+    drop(writer);
 }
 
 fn parse_record(line: &str) -> serde_json::Value {
@@ -381,7 +418,7 @@ fn parse_record(line: &str) -> serde_json::Value {
 #[test]
 fn one_character_quote_secret_does_not_corrupt_the_record() {
     let line = through_sink(|sink| {
-        emit(
+        emit_tracing(
             sink,
             &serde_json::json!({
                 "level": "WARN",
@@ -405,7 +442,7 @@ fn one_character_quote_secret_does_not_corrupt_the_record() {
 #[test]
 fn structural_delimiter_secret_does_not_rewrite_json_syntax() {
     let line = through_sink(|sink| {
-        emit(
+        emit_tracing(
             sink,
             &serde_json::json!({
                 "level": "INFO",
@@ -431,16 +468,17 @@ fn structural_delimiter_secret_does_not_rewrite_json_syntax() {
     assert!(message.contains(EXTERNAL_SECRET_PLACEHOLDER));
 }
 
-/// A secret equal to a schema field name must not rename the field. `level` is
-/// one of the fixed tracing schema names, whose presence is structural rather
-/// than derived from configuration — it appears in every record whatever the
-/// secret holds — so it is exempt from the key redaction that dynamic keys get
-/// (see the key-position tests at the end of this file). Occurrences in
-/// *values* are still a leak channel and must go.
+/// A secret equal to a schema field name must not rename the field *in a
+/// tracing record*. `level` is one of the envelope names, whose presence at a
+/// fmt-layer record's root is structural rather than derived from configuration
+/// — it appears in every such record whatever the secret holds — so it is exempt
+/// from the key redaction that dynamic keys get. The same spelling in an access
+/// record is not exempt; see the key-position tests at the end of this file.
+/// Occurrences in *values* are still a leak channel and must go.
 #[test]
 fn field_name_secret_keeps_the_key_and_redacts_the_value() {
     let line = through_sink(|sink| {
-        emit(
+        emit_tracing(
             sink,
             &serde_json::json!({
                 "level": "WARN",
@@ -467,7 +505,7 @@ fn field_name_secret_keeps_the_key_and_redacts_the_value() {
 #[test]
 fn numeric_scalar_values_are_redacted() {
     let line = through_sink(|sink| {
-        emit(
+        emit_tracing(
             sink,
             &serde_json::json!({
                 "level": "INFO",
@@ -499,7 +537,7 @@ fn numeric_scalar_values_are_redacted() {
 #[test]
 fn escaped_string_values_are_redacted_and_reescaped() {
     let line = through_sink(|sink| {
-        emit(
+        emit_tracing(
             sink,
             &serde_json::json!({
                 "level": "WARN",
@@ -524,7 +562,7 @@ fn escaped_string_values_are_redacted_and_reescaped() {
 #[test]
 fn a_record_with_no_resolved_value_round_trips_unchanged() {
     let line = through_sink(|sink| {
-        emit(
+        emit_tracing(
             sink,
             &serde_json::json!({
                 "level": "INFO",
@@ -695,7 +733,7 @@ fn a_non_json_record_without_a_resolved_value_is_untouched() {
 #[test]
 fn one_character_escaped_control_secret_is_redacted() {
     let line = through_sink(|sink| {
-        emit(
+        emit_tracing(
             sink,
             &serde_json::json!({
                 "level": "WARN",
@@ -723,7 +761,7 @@ fn one_character_escaped_control_secret_is_redacted() {
 #[test]
 fn a_second_escaped_control_secret_is_redacted() {
     let line = through_sink(|sink| {
-        emit(
+        emit_tracing(
             sink,
             &serde_json::json!({
                 "level": "INFO",
@@ -751,7 +789,7 @@ fn a_second_escaped_control_secret_is_redacted() {
 #[test]
 fn a_null_scalar_value_is_redacted() {
     let line = through_sink(|sink| {
-        emit(
+        emit_tracing(
             sink,
             &serde_json::json!({
                 "level": "INFO",
@@ -822,8 +860,7 @@ fn a_resolved_metadata_key_and_its_value_are_both_redacted() {
         emit(
             sink,
             &object(vec![
-                ("level", string("INFO")),
-                ("message", string("access")),
+                ("status", string("200")),
                 (
                     "metadata",
                     object(vec![
@@ -858,8 +895,8 @@ fn a_resolved_metadata_key_and_its_value_are_both_redacted() {
         "an unrelated metadata entry must survive untouched: {line}"
     );
     assert_eq!(
-        record["message"], "access",
-        "fixed schema fields must be unaffected: {line}"
+        record["status"], "200",
+        "an unrelated access-log field must be unaffected: {line}"
     );
 }
 
@@ -871,7 +908,7 @@ fn a_resolved_top_level_key_is_redacted() {
         emit(
             sink,
             &object(vec![
-                ("level", string("INFO")),
+                ("status", string("200")),
                 (METADATA_KEY_VALUE, string("flattened-value")),
             ]),
         );
@@ -887,8 +924,8 @@ fn a_resolved_top_level_key_is_redacted() {
     );
     let record = parse_record(&line);
     assert_eq!(
-        record["level"], "INFO",
-        "the fixed schema key must be unaffected: {line}"
+        record["status"], "200",
+        "an unrelated access-log field must be unaffected: {line}"
     );
 }
 
@@ -902,7 +939,7 @@ fn colliding_redacted_keys_collapse_to_one_parseable_entry() {
         emit(
             sink,
             &object(vec![
-                ("level", string("INFO")),
+                ("status", string("200")),
                 (
                     "metadata",
                     object(vec![
@@ -945,18 +982,20 @@ fn colliding_redacted_keys_collapse_to_one_parseable_entry() {
     assert_eq!(metadata["kept"], "yes", "{line}");
 }
 
-/// The fixed tracing schema keys stay verbatim and in emitted order even when a
-/// resolved value matches one of them. Their presence is structural — `level`
-/// is in every record whatever a secret holds — so leaving them discloses
-/// nothing, while rewriting one would break every downstream consumer.
+/// The tracing envelope keys stay verbatim and in emitted order even when a
+/// resolved value matches one of them, including `message` at its real position
+/// nested under `fields`. Their presence is structural — `level` is in every
+/// fmt-layer record whatever a secret holds — so leaving them discloses nothing,
+/// while rewriting one would break every downstream consumer.
 #[test]
 fn fixed_schema_keys_survive_and_keep_their_order() {
     let line = through_sink(|sink| {
-        emit(
+        emit_tracing(
             sink,
             &object(vec![
                 ("timestamp", string("2026-07-18T00:00:00Z")),
                 ("level", string("WARN")),
+                ("filename", string("src/config/env_config.rs")),
                 ("target", string("ferrum_edge::fixture")),
                 ("fields", object(vec![("message", string("unrelated"))])),
             ]),
@@ -969,10 +1008,15 @@ fn fixed_schema_keys_survive_and_keep_their_order() {
             "the fixed schema key `{key}` must survive verbatim: {line}"
         );
     }
+    assert!(
+        line.contains("\"filename\":"),
+        "the envelope `filename` key must survive verbatim: {line}"
+    );
     // Order is asserted on the wire, not through the parsed map.
     let positions = [
         offset_of(&line, "\"timestamp\":"),
         offset_of(&line, "\"level\":"),
+        offset_of(&line, "\"filename\":"),
         offset_of(&line, "\"target\":"),
         offset_of(&line, "\"fields\":"),
     ];
@@ -980,4 +1024,157 @@ fn fixed_schema_keys_survive_and_keep_their_order() {
         positions.windows(2).all(|pair| pair[0] < pair[1]),
         "fixed schema keys must keep their emitted order: {line}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Scoping of the envelope exemption.
+//
+// The exemption above is keyed on the *producer* and the key's *position*, not
+// on spelling. An access record (`try_write_json`) carries no tracing envelope,
+// so a key spelled `filename`, `level`, or `message` in one is operator- or
+// plugin-supplied — `log_schema`'s `rename:`/`static_fields:` and
+// `MetadataPolicy::Flatten` all put such names at the root, the same depth the
+// genuine envelope occupies, so a depth test alone would not separate them.
+// ---------------------------------------------------------------------------
+
+/// The envelope names at the **root of an access record** are still withheld.
+///
+/// This is the review finding: a flattened `static_fields`/`rename:` key equal
+/// to an externally resolved `filename` occupies the root, where a global
+/// spelling-based exemption waved it through unredacted.
+#[test]
+fn envelope_names_in_access_record_root_keys_are_redacted() {
+    for resolved in [FILENAME_NAME_VALUE, FIELD_NAME_VALUE, MESSAGE_NAME_VALUE] {
+        let fixture = object(vec![
+            ("status", string("200")),
+            (resolved, string("value-under-the-resolved-key")),
+        ]);
+        let line = through_sink(|sink| emit(sink, &fixture));
+
+        assert!(
+            !line.contains(&format!("\"{resolved}\":")),
+            "the resolved `{resolved}` must not survive as an access-record root key: {line}"
+        );
+        assert!(
+            !line.contains("value-under-the-resolved-key"),
+            "the value beneath the resolved `{resolved}` key must not survive: {line}"
+        );
+        let record = parse_record(&line);
+        assert_eq!(
+            record[EXTERNAL_SECRET_PLACEHOLDER],
+            string(EXTERNAL_SECRET_PLACEHOLDER),
+            "the entry must collapse to placeholder key and value: {line}"
+        );
+        assert_eq!(
+            record["status"], "200",
+            "an unrelated access-log field must be unaffected: {line}"
+        );
+    }
+}
+
+/// Same names, one level down: a plugin-inserted `metadata` key. Nesting is not
+/// what makes them dynamic — the record's provenance is.
+#[test]
+fn envelope_names_nested_in_an_access_record_are_redacted() {
+    for resolved in [FILENAME_NAME_VALUE, FIELD_NAME_VALUE, MESSAGE_NAME_VALUE] {
+        let nested = object(vec![
+            (resolved, string("nested-value")),
+            ("request_id", string("abc-123")),
+        ]);
+        let fixture = object(vec![("status", string("200")), ("metadata", nested)]);
+        let line = through_sink(|sink| emit(sink, &fixture));
+
+        assert!(
+            !line.contains(&format!("\"{resolved}\":")),
+            "the resolved `{resolved}` must not survive as a metadata key: {line}"
+        );
+        assert!(
+            !line.contains("nested-value"),
+            "the value beneath the resolved `{resolved}` key must not survive: {line}"
+        );
+        let record = parse_record(&line);
+        let metadata = record["metadata"]
+            .as_object()
+            .expect("metadata stays an object");
+        assert_eq!(
+            metadata.get(EXTERNAL_SECRET_PLACEHOLDER),
+            Some(&string(EXTERNAL_SECRET_PLACEHOLDER)),
+            "the entry must collapse to placeholder key and value: {line}"
+        );
+        assert_eq!(metadata["request_id"], "abc-123", "{line}");
+    }
+}
+
+/// Inside a *tracing* record the exemption is still positional: the envelope
+/// covers the root and `message` under `fields`, and nothing below that. A span
+/// field or an event field named `filename` is developer/runtime data, not
+/// envelope structure, so it stays screened.
+#[test]
+fn envelope_names_below_the_tracing_envelope_are_redacted() {
+    let fields = object(vec![
+        ("message", string("unrelated")),
+        (FILENAME_NAME_VALUE, string("event-field-value")),
+    ]);
+    let span = object(vec![(FIELD_NAME_VALUE, string("span-field-value"))]);
+    let fixture = object(vec![
+        ("level", string("WARN")),
+        ("filename", string("src/config/env_config.rs")),
+        ("fields", fields),
+        ("span", span),
+    ]);
+    let line = through_sink(|sink| emit_tracing(sink, &fixture));
+
+    let record = parse_record(&line);
+    // The genuine envelope survives, at both of its positions.
+    assert_eq!(record["level"], "WARN", "{line}");
+    assert_eq!(record["filename"], "src/config/env_config.rs", "{line}");
+    assert_eq!(record["fields"]["message"], "unrelated", "{line}");
+    // A same-named key one level deeper does not.
+    assert!(
+        !line.contains("event-field-value") && !line.contains("span-field-value"),
+        "values beneath a resolved key below the envelope must not survive: {line}"
+    );
+    assert_eq!(
+        record["fields"][EXTERNAL_SECRET_PLACEHOLDER],
+        string(EXTERNAL_SECRET_PLACEHOLDER),
+        "an event field named like an envelope key is not envelope structure: {line}"
+    );
+    assert_eq!(
+        record["span"][EXTERNAL_SECRET_PLACEHOLDER],
+        string(EXTERNAL_SECRET_PLACEHOLDER),
+        "a span field named like an envelope key is not envelope structure: {line}"
+    );
+}
+
+/// Scoping does not weaken the fail-closed path, and the notice it emits keeps
+/// its *own* envelope.
+///
+/// The withheld template is a fixed literal carrying the fmt layer's root
+/// `level`/`target`/`message` keys, so it is redacted as a tracing record. With
+/// `message` and `level` both armed as resolved values here, classifying that
+/// literal as dynamic would rewrite the notice's own schema keys and leave log
+/// pipelines with an unrecognizable line on the one path that exists to keep
+/// them informed.
+#[test]
+fn the_withheld_notice_keeps_its_own_envelope_keys() {
+    let withheld = through_sink(|sink| {
+        assert_eq!(
+            sink.try_write_bytes(format!("{{not json: {PLAIN_VALUE}\n").as_bytes()),
+            EnqueueResult::Queued
+        );
+    });
+
+    assert!(
+        !withheld.contains(PLAIN_VALUE),
+        "the resolved value must not survive: {withheld}"
+    );
+    assert_eq!(withheld, format!("{}\n", withheld_log_record()));
+    let record = parse_record(&withheld);
+    let object = record.as_object().expect("record is a JSON object");
+    for key in ["level", "target", "message"] {
+        assert!(
+            object.contains_key(key),
+            "the withheld notice must keep its own `{key}` envelope key: {withheld}"
+        );
+    }
 }

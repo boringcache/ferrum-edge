@@ -206,9 +206,10 @@ pub fn redact_external_secret_values(message: &str) -> String {
 ///
 /// So the record is parsed, redacted per *value*, and reserialized:
 ///
-/// * object **keys** are rewritten only when they are *not* one of the fixed
-///   tracing schema names in [`FIXED_LOG_SCHEMA_KEYS`]. Access records are not
-///   all-static: `TransactionSummary.metadata` and
+/// * object **keys** are rewritten unless they occupy a position in the
+///   *tracing envelope*, which is decided by the record's [`LogRecordSource`]
+///   and its position in the document, never by spelling alone. Access records
+///   are not all-static: `TransactionSummary.metadata` and
 ///   `StreamTransactionSummary.metadata` serialize a `HashMap` as a nested JSON
 ///   object whose keys are whatever plugins inserted at runtime, and
 ///   `plugins::utils::log_schema` promotes operator configuration into key
@@ -219,12 +220,26 @@ pub fn redact_external_secret_values(message: &str) -> String {
 ///   value, so a key that matches a candidate has both the key *and* the value
 ///   beneath it replaced (see [`RedactionPlan::redact_json_value`]).
 ///
-///   The fixed schema names are exempt because their presence is structural,
-///   not derived: `level` appears in every record regardless of what any secret
-///   holds, so leaving it discloses nothing, while rewriting it would silently
-///   change the record's schema for every downstream consumer. `level` stays
-///   `level` even when `level` is itself a resolved secret; its occurrences in
-///   *values* are still redacted.
+///   The envelope names are exempt because their presence is structural, not
+///   derived: `level` appears in every fmt-layer record regardless of what any
+///   secret holds, so leaving it discloses nothing, while rewriting it would
+///   silently change the record's schema for every downstream consumer. `level`
+///   stays `level` even when `level` is itself a resolved secret; its
+///   occurrences in *values* are still redacted.
+///
+///   The exemption is *scoped*, because the same spellings are reachable as
+///   operator/plugin-supplied keys. It applies only to a record the sink
+///   received from the tracing fmt layer ([`LogRecordSource::TracingEnvelope`]),
+///   and within such a record only at the two positions the formatter actually
+///   emits it: the root object ([`TRACING_ENVELOPE_ROOT_KEYS`]) and `message`
+///   inside the root `fields` object ([`TRACING_ENVELOPE_FIELDS_KEYS`]). An
+///   access record ([`LogRecordSource::Dynamic`], everything reaching
+///   `try_write_json`) has no envelope at all, so *no* key in it is exempt at
+///   any depth — including the root, which is exactly where
+///   `MetadataPolicy::Flatten` and `rename:` deposit operator-supplied names.
+///   A depth test alone would not do: a flattened dynamic `filename` occupies
+///   the root of an access record, the same depth as the genuine envelope
+///   field.
 /// * string **values** are matched after unescaping, so JSON escaping cannot
 ///   smuggle a value past the scan and the reserializer re-escapes correctly.
 ///   (The escaped form stays a candidate in its own right — for
@@ -252,7 +267,7 @@ pub fn redact_external_secret_values(message: &str) -> String {
 /// ([`RedactionPlan::contains_candidate`]) when one was but this record does
 /// not contain it — parsing and copying happen only for records that actually
 /// carry a resolved value.
-pub(crate) fn redact_log_record(record: &mut Vec<u8>) {
+pub(crate) fn redact_log_record(record: &mut Vec<u8>, source: LogRecordSource) {
     if !REDACTION_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
@@ -261,21 +276,25 @@ pub(crate) fn redact_log_record(record: &mut Vec<u8>) {
     };
 
     let trailing_newline = record.last() == Some(&b'\n');
+    let root = source.root_position();
     // Scoped so the immutable borrow of `record` ends before the assignment.
     let outcome = match std::str::from_utf8(record) {
         // Non-UTF-8 bytes cannot be scanned at all, so this record cannot be
         // shown to be free of a resolved value. Unreachable for the three
         // producers above; withhold rather than guess.
         Err(_) => Some(withheld_record(plan, trailing_newline)),
-        Ok(text) if plan.contains_candidate(text) => Some(match plan.redact_json_record(text) {
-            Some(mut redacted) => {
-                if trailing_newline {
-                    redacted.push('\n');
+        Ok(text) if plan.contains_candidate(text) => {
+            let redacted = plan.redact_json_record(text, root);
+            Some(match redacted {
+                Some(mut redacted) => {
+                    if trailing_newline {
+                        redacted.push('\n');
+                    }
+                    redacted.into_bytes()
                 }
-                redacted.into_bytes()
-            }
-            None => withheld_record(plan, trailing_newline),
-        }),
+                None => withheld_record(plan, trailing_newline),
+            })
+        }
         // Nothing to redact: leave the record's bytes exactly as serialized.
         Ok(_) => None,
     };
@@ -343,19 +362,93 @@ fn withheld_record(plan: &RedactionPlan, trailing_newline: bool) -> Vec<u8> {
     bytes
 }
 
-/// Object keys whose presence in a record is structural rather than derived
-/// from configuration, and which are therefore exempt from key redaction.
+/// Which producer handed a record to the sink.
 ///
-/// These are the field names the `tracing_subscriber` JSON formatter emits.
-/// They appear in every record no matter what any resolved value holds, so
-/// leaving them intact discloses nothing about a secret, while rewriting one
-/// would make the record unparseable for downstream consumers — the contract
-/// that fixed schema keys stay stable and ordered.
+/// The tracing envelope is a property of the *producer*, not of a key's
+/// spelling: `filename` is a structural field the fmt layer emits on every
+/// event, and it is also a perfectly ordinary key for `log_schema`'s `rename:`,
+/// `static_fields:`, or a flattened plugin `metadata` entry to occupy in an
+/// access record. Nothing in the serialized bytes distinguishes the two, so the
+/// distinction is carried explicitly from the emission site instead of guessed
+/// at from shape. See [`redact_log_record`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogRecordSource {
+    /// `tracing_subscriber`'s JSON fmt layer (`logging::non_blocking`'s
+    /// `MakeWriter` impl), and the sink's own failure-notice literal, which is
+    /// a fixed string carrying that same envelope. Keys in envelope position
+    /// are exempt from key redaction.
+    TracingEnvelope,
+    /// Every other producer: `stdout_logging` access records via
+    /// `try_write_json`, and arbitrary operator-shaped bytes via
+    /// `try_write_bytes`. These have no tracing envelope, so no key in them is
+    /// structural at any depth — including the root.
+    Dynamic,
+}
+
+impl LogRecordSource {
+    fn root_position(self) -> EnvelopePosition {
+        match self {
+            Self::TracingEnvelope => EnvelopePosition::TracingRoot,
+            Self::Dynamic => EnvelopePosition::Dynamic,
+        }
+    }
+}
+
+/// Where the object currently being walked sits relative to the tracing
+/// envelope, which is what decides whether a key may be exempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopePosition {
+    /// The root object of a record emitted by the tracing fmt layer.
+    TracingRoot,
+    /// The `fields` object directly beneath such a root.
+    TracingFields,
+    /// Anywhere else. No key here is structural: nested span field names,
+    /// anything inside an array, every object in an access record, and every
+    /// object below the two envelope positions above.
+    Dynamic,
+}
+
+impl EnvelopePosition {
+    /// Position of the object reached by descending through `key`.
+    ///
+    /// The envelope is exactly two levels deep and does not nest further, so
+    /// every descent other than root -> `fields` lands in dynamic territory.
+    fn child(self, key: &str) -> Self {
+        match self {
+            Self::TracingRoot if key == "fields" => Self::TracingFields,
+            _ => Self::Dynamic,
+        }
+    }
+
+    /// Whether `key` is a structural envelope name *at this position*.
+    fn exempts(self, key: &str) -> bool {
+        match self {
+            Self::TracingRoot => TRACING_ENVELOPE_ROOT_KEYS.contains(&key),
+            Self::TracingFields => TRACING_ENVELOPE_FIELDS_KEYS.contains(&key),
+            Self::Dynamic => false,
+        }
+    }
+}
+
+/// Root-object keys the `tracing_subscriber` JSON formatter emits.
 ///
-/// Deliberately *not* listed: access-log field names. `log_schema`'s `rename:`
-/// can move an operator-supplied string into any of those positions, so they
-/// are not structural and stay subject to the candidate screen.
-const FIXED_LOG_SCHEMA_KEYS: [&str; 11] = [
+/// Their presence at that position is structural rather than derived from
+/// configuration: they appear in every fmt-layer record no matter what any
+/// resolved value holds, so leaving them intact discloses nothing about a
+/// secret, while rewriting one would make the record unparseable for downstream
+/// consumers — the contract that fixed schema keys stay stable and ordered.
+///
+/// `message` is listed because the formatter hoists it to the root when
+/// configured with `flatten_event(true)`; Ferrum's layer is not, so in practice
+/// it arrives under `fields` (see [`TRACING_ENVELOPE_FIELDS_KEYS`]) and the
+/// root entry is what [`WITHHELD_LOG_RECORD`] carries.
+///
+/// Deliberately *not* covered: any of these spellings in an access record, at
+/// the root or anywhere else. `log_schema`'s `rename:`, `static_fields:`, and
+/// `MetadataPolicy::Flatten` can all move an operator-supplied string into a
+/// top-level key, so a `filename` there is not structural and stays subject to
+/// the candidate screen. [`LogRecordSource`] is what tells the two apart.
+const TRACING_ENVELOPE_ROOT_KEYS: [&str; 11] = [
     "timestamp",
     "level",
     "fields",
@@ -368,6 +461,12 @@ const FIXED_LOG_SCHEMA_KEYS: [&str; 11] = [
     "filename",
     "line_number",
 ];
+
+/// Keys that are structural inside a tracing record's root `fields` object.
+///
+/// Only the event message. The remaining entries there are `tracing` event
+/// field names, which are not part of the envelope, so they stay screened.
+const TRACING_ENVELOPE_FIELDS_KEYS: [&str; 1] = ["message"];
 
 /// An order-preserving JSON document, used only by [`redact_log_record`].
 ///
@@ -772,8 +871,12 @@ impl RedactionPlan {
         // JSON object cannot fail, but the fallback is a minimal object rather
         // than the template so that "cannot sanitize" never means "emit
         // unsanitized".
+        // Redacted as a tracing-envelope record, which is what it is: a fixed
+        // literal carrying the formatter's own `level`/`target`/`message` root
+        // keys. That keeps the notice's shape stable for log pipelines while
+        // still scrubbing its values.
         let withheld_record = plan
-            .redact_json_record(WITHHELD_LOG_RECORD)
+            .redact_json_record(WITHHELD_LOG_RECORD, EnvelopePosition::TracingRoot)
             .unwrap_or_else(|| MINIMAL_WITHHELD_LOG_RECORD.to_string());
         plan.withheld_record = withheld_record;
         plan
@@ -808,14 +911,15 @@ impl RedactionPlan {
     /// reserialized; the caller withholds the record rather than emitting
     /// anything derived from it. See [`redact_log_record`] for why this is
     /// structural rather than a text pass.
-    fn redact_json_record(&self, text: &str) -> Option<String> {
+    fn redact_json_record(&self, text: &str, root: EnvelopePosition) -> Option<String> {
         let mut document: LogJson = serde_json::from_str(text).ok()?;
-        self.redact_json_value(&mut document);
+        self.redact_json_value(&mut document, root);
         serde_json::to_string(&document).ok()
     }
 
-    /// Redact values in place, leaving object keys and JSON structure alone.
-    fn redact_json_value(&self, value: &mut LogJson) {
+    /// Redact values in place, leaving JSON structure alone and rewriting only
+    /// those keys that `position` does not mark as tracing-envelope structure.
+    fn redact_json_value(&self, value: &mut LogJson, position: EnvelopePosition) {
         // A matched scalar is replaced *after* the match, so the borrow of
         // `value` taken by the pattern has ended by the time it is reassigned.
         let scalar_matches = match value {
@@ -831,15 +935,18 @@ impl RedactionPlan {
             }
             LogJson::Array(items) => {
                 for item in items.iter_mut() {
-                    self.redact_json_value(item);
+                    // An array element is never an envelope position: the
+                    // formatter emits the envelope as objects only.
+                    self.redact_json_value(item, EnvelopePosition::Dynamic);
                 }
                 false
             }
             // Keys are redacted too, because access records put runtime and
             // operator-supplied strings in key position (plugin `metadata`
             // maps, `log_schema` `rename:`/`static_fields:`/flatten prefixes).
-            // Only the fixed tracing schema names are exempt; see
-            // `FIXED_LOG_SCHEMA_KEYS` and the contract on `redact_log_record`.
+            // Only tracing-envelope positions are exempt, and only in a record
+            // the fmt layer produced; see `EnvelopePosition` and the contract
+            // on `redact_log_record`.
             LogJson::Object(entries) => {
                 // A key that carries a resolved value collapses to the
                 // placeholder, and so could several keys in one object. JSON
@@ -856,12 +963,10 @@ impl RedactionPlan {
                             return false;
                         }
                         placeholder_key_taken = true;
-                        self.redact_json_value(entry);
+                        self.redact_json_value(entry, position.child(key));
                         return true;
                     }
-                    if !FIXED_LOG_SCHEMA_KEYS.contains(&key.as_str())
-                        && self.contains_candidate(key)
-                    {
+                    if !position.exempts(key) && self.contains_candidate(key) {
                         if placeholder_key_taken {
                             return false;
                         }
@@ -876,7 +981,7 @@ impl RedactionPlan {
                         *entry = LogJson::String(EXTERNAL_SECRET_PLACEHOLDER.to_string());
                         return true;
                     }
-                    self.redact_json_value(entry);
+                    self.redact_json_value(entry, position.child(key));
                     true
                 });
                 false
