@@ -54,6 +54,7 @@ fn base_config() -> serde_json::Value {
 
 fn html_ctx() -> RequestContext {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.request_is_secure = true;
     ctx.headers
         .insert("accept".to_string(), "text/html".to_string());
     ctx.headers
@@ -189,6 +190,7 @@ fn assert_same_correlation_scope(created: &str, cleared: &str) {
 
 fn callback_context(challenge: &BrowserChallenge) -> RequestContext {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/oauth/callback".into());
+    ctx.request_is_secure = true;
     ctx.headers.insert(
         "cookie".to_string(),
         cookie_pair(&challenge.cookie).to_string(),
@@ -207,6 +209,7 @@ fn refresh_config(token_endpoint: &str) -> serde_json::Value {
 
 fn session_ctx(set_cookie: &str) -> RequestContext {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.request_is_secure = true;
     ctx.headers.insert(
         "cookie".to_string(),
         set_cookie
@@ -243,6 +246,7 @@ fn ctx_with_session_cookie(set_cookie: &str) -> RequestContext {
         .expect("OIDC session cookie pair")
         .to_string();
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.request_is_secure = true;
     ctx.headers.insert("cookie".to_string(), cookie_pair);
     ctx
 }
@@ -806,6 +810,7 @@ async fn oidc_multi_auth_preserves_distinct_rejected_session_cookies() {
     let first_pair = first_cookie.split(';').next().expect("first cookie pair");
     let second_pair = second_cookie.split(';').next().expect("second cookie pair");
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.request_is_secure = true;
     ctx.headers
         .insert("cookie".to_string(), format!("{first_pair}; {second_pair}"));
     let first_plugin: Arc<dyn Plugin> = first.clone();
@@ -915,6 +920,7 @@ async fn oidc_multi_auth_uses_later_same_name_rejected_session_cookie() {
     .unwrap();
     let cookie_pair = cookie.split(';').next().expect("session cookie pair");
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.request_is_secure = true;
     ctx.headers
         .insert("cookie".to_string(), cookie_pair.to_string());
     let first_plugin: Arc<dyn Plugin> = first;

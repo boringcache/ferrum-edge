@@ -1043,6 +1043,13 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         node_id: node_id.to_string(),
         ferrum_version: FERRUM_VERSION.to_string(),
         namespace: namespace.to_string(),
+        real_ip_header: Some(
+            proxy_state
+                .env_config
+                .real_ip_header
+                .clone()
+                .unwrap_or_default(),
+        ),
     });
 
     let mut stream = client.subscribe(request).await?.into_inner();
@@ -1203,7 +1210,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 continue;
                             }
                         };
-                        match proxy_state.update_config(config) {
+                        match proxy_state.update_config_off_thread(config).await {
                             ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
                                 commit_frontend_tls_snapshot(
                                     frontend_tls_update,

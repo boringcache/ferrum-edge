@@ -1401,6 +1401,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     );
 
     for (plugin_name, config) in [
+        ("correlation_id", json!({})),
         ("bot_detection", json!({})),
         ("udp_rate_limiting", json!({"datagrams_per_second": 100})),
         (
@@ -1429,6 +1430,10 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     }
 
     for (plugin_name, config) in [
+        ("correlation_id", None),
+        ("correlation_id", Some(serde_json::Value::Null)),
+        ("correlation_id", Some(json!([]))),
+        ("correlation_id", Some(json!({"echo_downsteam": false}))),
         ("bot_detection", None),
         ("bot_detection", Some(serde_json::Value::Null)),
         ("bot_detection", Some(json!([]))),
@@ -1474,6 +1479,160 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         validator.validate(&custom).is_ok(),
         "custom plugins should keep generic PluginConfig config shape"
     );
+}
+
+#[test]
+fn geo_restriction_schema_matches_strict_runtime_contract() {
+    use ferrum_edge::plugins::geo_restriction::GeoRestriction;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/GeoRestrictionConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("GeoRestrictionConfig schema compiles");
+
+    let fixtures = [
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["ad", "cA", "xK", "Zw"]
+            }),
+            true,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": [],
+                "deny_countries": ["CN"]
+            }),
+            true,
+        ),
+        (json!({"db_path": "/nonexistent/country.mmdb"}), false),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": [],
+                "deny_countries": []
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["US"],
+                "deny_countries": ["CN"]
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["USA"]
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": [" US "]
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["ZZ"]
+            }),
+            false,
+        ),
+        (json!({"db_path": " \t ", "allow_countries": ["US"]}), false),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["US"],
+                "on_lookup_failur": "deny"
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": null
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["US"],
+                "inject_headers": null
+            }),
+            false,
+        ),
+        (
+            json!({
+                "db_path": "/nonexistent/country.mmdb",
+                "allow_countries": ["US"],
+                "on_lookup_failure": null
+            }),
+            false,
+        ),
+    ];
+
+    for (config, expected_valid) in fixtures {
+        let schema_valid = validator.validate(&config).is_ok();
+        let runtime_valid = GeoRestriction::new(&config).is_ok();
+        assert_eq!(
+            schema_valid, expected_valid,
+            "unexpected GeoRestrictionConfig schema result for {config}"
+        );
+        assert_eq!(
+            runtime_valid, expected_valid,
+            "unexpected geo_restriction runtime result for {config}"
+        );
+    }
+
+    let mut supported_code_count = 0;
+    for first in b'A'..=b'Z' {
+        for second in b'A'..=b'Z' {
+            let code = String::from_utf8(vec![first, second]).expect("ASCII country code");
+            let lowercase = code.to_ascii_lowercase();
+            let mixed_case =
+                String::from_utf8(vec![first.to_ascii_lowercase(), second]).expect("ASCII code");
+            let mut assignment_supported = None;
+            for candidate in [code.clone(), lowercase, mixed_case] {
+                let config = json!({
+                    "db_path": "/nonexistent/country.mmdb",
+                    "allow_countries": [candidate.clone()],
+                    "on_lookup_failure": "deny"
+                });
+                let schema_valid = validator.validate(&config).is_ok();
+                let runtime_valid = GeoRestriction::new(&config).is_ok();
+                assert_eq!(
+                    schema_valid, runtime_valid,
+                    "schema/runtime country assignment mismatch for {candidate}"
+                );
+                if let Some(expected) = assignment_supported {
+                    assert_eq!(
+                        runtime_valid, expected,
+                        "country assignment must be case-insensitive for {candidate}"
+                    );
+                } else {
+                    assignment_supported = Some(runtime_valid);
+                }
+            }
+            if assignment_supported == Some(true) {
+                supported_code_count += 1;
+            }
+        }
+    }
+    // 249 currently assigned ISO codes plus MaxMind's XK extension.
+    assert_eq!(supported_code_count, 250);
 }
 
 #[tokio::test]
@@ -1623,6 +1782,73 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
     assert_component_validity(
         &spec,
         "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://functions.example/run",
+            "forwad_body": true
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://functions.example/run",
+            "mode": null
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://functions.example/run",
+            "error_status_code": 399
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://functions.example/run",
+            "error_status_code": 400
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://user:password@functions.example/run"
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "gcp_cloud_functions",
+            "function_url": "https://functions.example/run#credential"
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "aws_lambda",
+            "aws_endpoint_url": "https://lambda.example/not-an-origin"
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
         &json!({"provider": "gcp_cloud_functions", "function_url": "ftp://functions.example"}),
         false,
     );
@@ -1751,6 +1977,137 @@ fn assert_component_validity(
         actual_valid, expected_valid,
         "unexpected {component} validation result for {instance}"
     );
+}
+
+#[test]
+fn stdout_logging_schema_rejects_unknown_outer_and_filter_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for valid in [
+        serde_json::Value::Null,
+        json!({}),
+        json!({"filter": null}),
+        json!({"filter": {"status_code_min": 500, "errors_only": true}}),
+        json!({"schema_ref": "common"}),
+    ] {
+        assert_component_validity(&spec, "StdoutLoggingConfig", &valid, true);
+    }
+    for invalid in [
+        json!({"filters": {"errors_only": true}}),
+        json!({"log_level": "info"}),
+        json!({"filter": {"error_only": true}}),
+        json!({"filter": {"min_latency_msec": 100}}),
+    ] {
+        assert_component_validity(&spec, "StdoutLoggingConfig", &invalid, false);
+    }
+}
+
+#[test]
+fn correlation_id_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::correlation_id::CorrelationId;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for valid in [
+        json!({}),
+        json!({"header_name": "x-request-id", "echo_downstream": false}),
+        json!({"header_name": "X-Correlation-ID", "echo_downstream": true}),
+        json!({"header_name": " X-Trimmed-ID "}),
+        json!({"header_name": null, "echo_downstream": null}),
+    ] {
+        assert_component_validity(&spec, "CorrelationIdConfig", &valid, true);
+        CorrelationId::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+
+    for invalid in [
+        serde_json::Value::Null,
+        json!([]),
+        json!("config"),
+        json!(42),
+        json!(true),
+        json!({"echo_downsteam": false}),
+        json!({"header_name": "x:request-id"}),
+        json!({"header_name": 42}),
+        json!({"echo_downstream": "true"}),
+        json!({"header_name": "API-Key"}),
+        json!({"header_name": "Authentication-Info"}),
+        json!({"header_name": "Authorization"}),
+        json!({"header_name": "Connection"}),
+        json!({"header_name": " Connection "}),
+        json!({"header_name": "Content-Encoding"}),
+        json!({"header_name": "Content-Length"}),
+        json!({"header_name": "Cookie"}),
+        json!({"header_name": " eARLY-dATA "}),
+        json!({"header_name": " eXPECT "}),
+        json!({"header_name": " fORWARDED "}),
+        json!({"header_name": "Grpc-Message"}),
+        json!({"header_name": "Grpc-Status"}),
+        json!({"header_name": "Grpc-Status-Details-Bin"}),
+        json!({"header_name": "Host"}),
+        json!({"header_name": "Keep-Alive"}),
+        json!({"header_name": "Proxy-Authenticate"}),
+        json!({"header_name": "Proxy-Authentication-Info"}),
+        json!({"header_name": "Proxy-Authorization"}),
+        json!({"header_name": "Proxy-Connection"}),
+        json!({"header_name": "X-Forwarded-Host"}),
+        json!({"header_name": " x-FORWARDED-proto "}),
+        json!({"header_name": "Sec-WebSocket-Accept"}),
+        json!({"header_name": "Sec-WebSocket-Extensions"}),
+        json!({"header_name": "Sec-WebSocket-Key"}),
+        json!({"header_name": "Sec-WebSocket-Protocol"}),
+        json!({"header_name": "Sec-WebSocket-Version"}),
+        json!({"header_name": "Set-Cookie"}),
+        json!({"header_name": "TE"}),
+        json!({"header_name": "Traceparent"}),
+        json!({"header_name": "Tracestate"}),
+        json!({"header_name": "Trailer"}),
+        json!({"header_name": "Transfer-Encoding"}),
+        json!({"header_name": "Upgrade"}),
+        json!({"header_name": "vIA"}),
+        json!({"header_name": "WWW-Authenticate"}),
+        json!({"header_name": "X-API-Key"}),
+        json!({"header_name": "X-Auth-Token"}),
+        json!({"header_name": "X-CSRF-Token"}),
+        json!({"header_name": "X-Ferrum-Original-Content-Encoding"}),
+        json!({"header_name": "X-Forwarded-Authorization"}),
+        json!({"header_name": "X-Forwarded-For"}),
+        json!({"header_name": "X-Goog-API-Key"}),
+        json!({"header_name": "x-gRPC-wEB-mODE"}),
+        json!({"header_name": "X-XSRF-Token"}),
+    ] {
+        assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
+        assert!(
+            CorrelationId::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let header_name_schema = spec
+        .pointer("/components/schemas/CorrelationIdConfig/properties/header_name")
+        .expect("correlation header_name schema exists");
+    for exclusion_pointer in ["/not", "/allOf/0/not"] {
+        let exclusion = header_name_schema
+            .pointer(exclusion_pointer)
+            .unwrap_or_else(|| panic!("correlation exclusion {exclusion_pointer} exists"));
+        let validator = jsonschema::draft202012::options()
+            .build(exclusion)
+            .unwrap_or_else(|error| panic!("correlation exclusion compiles: {error}"));
+        for reserved in [
+            json!(" Early-Data "),
+            json!(" Traceparent "),
+            json!("Tracestate"),
+            json!("X-Ferrum-Original-Content-Encoding"),
+            json!("x-gRPC-wEB-mODE"),
+        ] {
+            assert!(
+                validator.validate(&reserved).is_ok(),
+                "correlation exclusion {exclusion_pointer} missed {reserved}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -2679,6 +3036,61 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
 }
 
 #[test]
+fn ai_token_metrics_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::ai_token_metrics::AiTokenMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiTokenMetricsConfig")
+        .expect("missing AiTokenMetricsConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiTokenMetricsConfig schema compiles");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    for config in [
+        json!({}),
+        json!({"provider": "openai"}),
+        json!({"provider": "google"}),
+        json!({"metadata_prefix": "tenant.ai_1"}),
+        json!({"buffer_streaming_responses": true}),
+        json!({"cost_per_prompt_token": 0.000003}),
+        json!({"cost_per_prompt_token": 18_446_744_073_709.55}),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema rejected {config}"
+        );
+        assert!(
+            AiTokenMetrics::new(&config).is_ok(),
+            "runtime rejected {config}"
+        );
+    }
+
+    for config in [
+        json!({"providre": "openai"}),
+        json!({"provider": "unknown"}),
+        json!({"provider": "OpenAI"}),
+        json!({"provider": " openai"}),
+        json!({"metadata_prefix": "not allowed"}),
+        json!({"metadata_prefix": " ai"}),
+        json!({"metadata_prefix": "x".repeat(65)}),
+        json!({"cost_per_prompt_token": -1}),
+        json!({"cost_per_prompt_token": 18_446_744_073_710.0}),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema accepted {config}"
+        );
+        assert!(
+            AiTokenMetrics::new(&config).is_err(),
+            "runtime accepted {config}"
+        );
+    }
+}
+
+#[test]
 fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -2986,6 +3398,7 @@ fn plugin_graph_delete_rejections_have_openapi_parity() {
         .and_then(serde_json::Value::as_array)
         .expect("API-spec validation resource types");
     assert!(resource_types.contains(&json!("plugin_composition")));
+    assert!(resource_types.contains(&json!("upstream_graph")));
 }
 
 #[test]

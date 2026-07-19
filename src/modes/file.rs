@@ -486,15 +486,16 @@ pub async fn run(
     }
     let config_path = env_config
         .file_config_path
-        .as_deref()
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("FERRUM_FILE_CONFIG_PATH not set"))?;
 
-    let config = file_loader::load_config_from_file(
-        config_path,
+    let config = file_loader::load_config_from_file_off_thread(
+        config_path.clone(),
         env_config.tls_cert_expiry_warning_days,
-        &env_config.backend_allow_ips,
-        &env_config.namespace,
-    )?;
+        env_config.backend_allow_ips.clone(),
+        env_config.namespace.clone(),
+    )
+    .await?;
 
     // Install the SIGHUP handler BEFORE serve() so a HUP arriving during
     // startup (DNS warmup, pool warmup, listener bind) doesn't take the
@@ -521,7 +522,7 @@ pub async fn run(
     // SIGHUP-driven config reload (Unix only). On non-Unix this future just
     // waits on shutdown so the join order is unchanged.
     let proxy_state_reload = handles.proxy_state.clone();
-    let config_path_owned = config_path.to_string();
+    let config_path_owned = config_path;
     let reload_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
     let reload_backend_allow_ips = env_config.backend_allow_ips.clone();
     let reload_namespace = env_config.namespace.clone();
@@ -552,7 +553,14 @@ pub async fn run(
                 tokio::select! {
                     _ = sighup.recv() => {
                         info!("SIGHUP received, reloading configuration...");
-                        match file_loader::reload_config_from_file(&config_path_owned, reload_cert_expiry_warning_days, &reload_backend_allow_ips, &reload_namespace) {
+                        match file_loader::reload_config_from_file_off_thread(
+                            config_path_owned.clone(),
+                            reload_cert_expiry_warning_days,
+                            reload_backend_allow_ips.clone(),
+                            reload_namespace.clone(),
+                        )
+                        .await
+                        {
                             Ok(new_config) => {
                                 match proxy_state_reload.update_config(new_config) {
                                     proxy::ConfigApplyOutcome::Applied => {
@@ -959,6 +967,7 @@ pub async fn serve(
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
         metrics_auth: metrics_auth.clone(),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,

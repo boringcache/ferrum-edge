@@ -118,6 +118,7 @@ fn admin_state_with_runtime_metrics(jwt: JwtManager) -> AdminState {
         stream_proxy_bind_address: "0.0.0.0".to_string(),
         admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
         cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -284,5 +285,7 @@ async fn runtime_metrics_endpoint_returns_seeded_json_shape() {
         body["logs"]["by_level"]["warn"].as_u64().unwrap_or(0) >= 1,
         "seeded log counter missing: {body}"
     );
+    assert!(body["logs"]["sinks"]["stdout"].is_null());
+    assert!(body["logs"]["sinks"]["stderr"].is_null());
     assert_eq!(body["overload"]["level"].as_str(), Some("normal"));
 }

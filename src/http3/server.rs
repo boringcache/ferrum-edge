@@ -899,7 +899,7 @@ async fn handle_h3_connection(
     // to avoid per-request String allocation from SocketAddr::ip().to_string().
     // Updated in-place when QUIC connection migration is detected.
     let mut cached_addr = quinn_conn.remote_address();
-    let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_string());
+    let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_canonical().to_string());
 
     loop {
         match h3_conn.accept().await {
@@ -914,7 +914,7 @@ async fn handle_h3_connection(
                         cached_addr, current_addr
                     );
                     cached_addr = current_addr;
-                    socket_ip = Arc::from(current_addr.ip().to_string());
+                    socket_ip = Arc::from(current_addr.ip().to_canonical().to_string());
                 }
 
                 let state = Arc::clone(&state);
@@ -1062,6 +1062,8 @@ async fn handle_h3_request(
 
     // Build request context (client_ip resolved below after headers are parsed)
     let mut ctx = RequestContext::new(socket_ip.to_owned(), method.clone(), path.clone());
+    let mut request_scheme = "https";
+    ctx.request_is_secure = true;
     ctx.metadata
         .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
     if let Some(content_type) = grpc_web_response_content_type.as_deref() {
@@ -1306,6 +1308,13 @@ async fn handle_h3_request(
     // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
     if !state.trusted_proxies.is_empty() {
         let socket_addr: std::net::IpAddr = remote_addr.ip();
+        if let Some(forwarded_scheme) = crate::proxy::apply_trusted_forwarded_request_scheme(
+            &mut ctx,
+            &socket_addr,
+            &state.trusted_proxies,
+        ) {
+            request_scheme = forwarded_scheme;
+        }
         let real_ip_header_val =
             state
                 .env_config
@@ -1412,7 +1421,7 @@ async fn handle_h3_request(
         None => None,
     };
     let request_authority = raw_host.and_then(|authority| {
-        crate::proxy::normalize_request_authority_for_signing(authority, Some("https"))
+        crate::proxy::normalize_request_authority_for_signing(authority, Some(request_scheme))
     });
     ctx.request_authority = request_authority;
 
@@ -2743,27 +2752,34 @@ async fn handle_h3_request(
             initial_needs_ctx_headers_for_body_hooks,
         )
     };
-    // Reserved consumer-identity headers are gateway-asserted. Strip any
+    // Reserved gateway assertions — consumer identity AND the private GeoIP
+    // lookup result — are never sourced from mutable plugin headers. Strip any
     // client- OR plugin-supplied value UNCONDITIONALLY before backend dispatch,
-    // then inject the authenticated value when a principal resolved. `materialize_headers`
+    // then inject the authenticated principal and the authoritative country
+    // only after a successful lookup/allow decision. `materialize_headers`
     // only removed the RAW client header BEFORE plugins ran, so an unauthenticated
-    // route where a `before_proxy` transformer adds `x-consumer-*` would otherwise
-    // forward that plugin value to the backend — the exact spoofing path. The strip
-    // is case-insensitive (the gateway injects mixed-case keys; the H3 wire and
-    // plugins use lowercase). To preserve the zero-alloc hot path, only
-    // materialize/scrub when a principal must be injected OR a reserved header is
-    // actually present in the effective source.
-    let source_has_reserved_identity = owned_proxy_headers
+    // route where a `before_proxy` transformer adds `x-consumer-*` or
+    // `x-geo-country` would otherwise forward that plugin value to the backend —
+    // the exact spoofing path. The strip is case-insensitive (the gateway
+    // injects mixed-case keys; the H3 wire and plugins use lowercase). To
+    // preserve the zero-alloc hot path, only materialize/scrub when an
+    // assertion must be injected OR a reserved header is actually present in
+    // the effective source.
+    let source_has_reserved_assertion = owned_proxy_headers
         .as_ref()
         .unwrap_or(&ctx.headers)
         .keys()
         .any(|k| {
             k.eq_ignore_ascii_case("x-consumer-username")
                 || k.eq_ignore_ascii_case("x-consumer-custom-id")
+                || k.eq_ignore_ascii_case("x-geo-country")
         });
-    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
+    if ctx.backend_consumer_username().is_some()
+        || ctx.backend_geo_country().is_some()
+        || source_has_reserved_assertion
+    {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        crate::proxy::refresh_backend_consumer_identity_headers(&ctx, headers);
+        crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
     // Resolve proxy_headers into an owned HashMap to avoid borrowing
     // ctx.headers while ctx is passed as &mut to proxy functions downstream.
@@ -2993,9 +3009,9 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.path = backend_ctx_path;
         if matches!(deferred_result, PluginResult::Continue) {
-            // Re-establish gateway-authenticated identity and egress baggage
+            // Re-establish gateway assertions and egress baggage
             // policy before a deferred function's headers reach a backend.
-            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers);
             crate::modes::mesh::hbone::strip_egress_baggage_in_map(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,
@@ -3021,7 +3037,7 @@ async fn handle_h3_request(
             ctx.path = backend_ctx_path;
         }
         if matches!(deferred_result, PluginResult::Continue) {
-            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers);
             crate::modes::mesh::hbone::strip_egress_baggage_in_map(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,
@@ -4029,6 +4045,12 @@ async fn handle_h3_request(
         }
 
         let requires_websocket_framing = plugin_cache_view.requires_ws_frame_hooks();
+        crate::proxy::apply_effective_backend_scheme_headers(
+            &mut proxy_headers,
+            &ctx.client_ip,
+            ctx.request_is_secure,
+            state.add_forwarded_header,
+        );
         // Transfer request-side accounting to the H3 WebSocket bridge. The
         // bridge starts its long-lived `ConnectionGuard` before dropping this
         // `RequestGuard`, so backend handshakes stay visible to overload
@@ -4413,6 +4435,7 @@ async fn handle_h3_request(
             error_class: outcome.error_class,
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
         };
         if !outcome.rejection_logged {
             crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -4467,6 +4490,7 @@ async fn handle_h3_request(
             &client_ip_owned,
             socket_ip,
             &state,
+            ctx.request_is_secure,
             ctx.is_early_data,
         );
         let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(&proxy);
@@ -4701,6 +4725,7 @@ async fn handle_h3_request(
                     error_class: Some(h3_error_class),
                     bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
                     metadata: crate::proxy::clone_log_metadata(&ctx),
+                    ai_usage_export: ctx.ai_usage_export.clone(),
                     ..TransactionSummary::default()
                 };
                 crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -4870,6 +4895,7 @@ async fn handle_h3_request(
                 },
                 mirror: false,
                 metadata: crate::proxy::clone_log_metadata(&ctx),
+                ai_usage_export: ctx.ai_usage_export.clone(),
             };
             crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
             record_request(&state, reject.status_code);
@@ -5343,6 +5369,7 @@ async fn handle_h3_request(
             bytes_received: bytes_streamed,
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
         };
 
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -5924,6 +5951,7 @@ async fn handle_h3_request(
             bytes_received: h3_stream_result.bytes_streamed,
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
         };
 
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -5987,6 +6015,7 @@ async fn handle_h3_request(
                         &ctx.client_ip,
                         socket_ip,
                         current_target.as_deref(),
+                        ctx.request_is_secure,
                         ctx.is_early_data,
                     )
                     .await
@@ -6176,6 +6205,7 @@ async fn handle_h3_request(
                     &ctx.client_ip,
                     socket_ip,
                     current_target.as_deref(),
+                    ctx.request_is_secure,
                     ctx.is_early_data,
                 )
                 .await;
@@ -6214,6 +6244,7 @@ async fn handle_h3_request(
                 &ctx.client_ip,
                 socket_ip,
                 upstream_target.as_deref(),
+                ctx.request_is_secure,
                 ctx.is_early_data,
             )
             .await;
@@ -6292,9 +6323,11 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
-        // Sticky session cookie injection
+        // Sticky session cookie injection. The buffered variant also records the
+        // cookie as gateway-owned so a committed-hook deadline cannot strip it.
         if !after_proxy_rejected {
-            inject_sticky_cookie(
+            inject_sticky_cookie_with_deadline_provenance(
+                &mut ctx,
                 &epoch,
                 &proxy,
                 upstream_target.as_deref(),
@@ -6313,6 +6346,7 @@ async fn handle_h3_request(
                 response_status,
                 &mut response_headers,
                 &mut response_body,
+                initial_response_header_policy_plugins.as_ref(),
             )
             .await
             {
@@ -6384,7 +6418,10 @@ async fn handle_h3_request(
         }
 
         // transform_response_body hooks — only for buffered responses.
-        if !after_proxy_rejected && !plugins.is_empty() {
+        if !after_proxy_rejected
+            && !plugins.is_empty()
+            && crate::plugins::response_body_rewrite_allowed(response_status)
+        {
             let phase_start = std::time::Instant::now();
             let (deadline_replaced, body_transformed) =
                 crate::proxy::transform_buffered_response_body_with_deadline(
@@ -6662,6 +6699,7 @@ async fn handle_h3_request(
             bytes_sent: raw_request_body_bytes,
             bytes_received,
             metadata: crate::proxy::clone_log_metadata(&ctx),
+            ai_usage_export: ctx.ai_usage_export.clone(),
             ..TransactionSummary::default()
         };
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -7019,6 +7057,7 @@ fn build_h3_backend_url_for_flavor(
 /// backends reject and that breaks virtual-host routing on the upstream.
 /// Falls back to `proxy.backend_host` only when no upstream selection is
 /// available (single-target proxies).
+#[allow(clippy::too_many_arguments)]
 fn build_h3_backend_headers(
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
@@ -7026,6 +7065,7 @@ fn build_h3_backend_headers(
     client_ip: &str,
     xff_append_ip: &str,
     state: &ProxyState,
+    request_is_secure: bool,
     is_early_data: bool,
 ) -> Vec<(http::header::HeaderName, http::header::HeaderValue)> {
     let mut h3_headers = Vec::with_capacity(headers.len() + 5);
@@ -7106,10 +7146,12 @@ fn build_h3_backend_headers(
         ));
     }
 
+    let request_scheme = if request_is_secure { "https" } else { "http" };
+
     // X-Forwarded-Proto
     h3_headers.push((
         http::header::HeaderName::from_static("x-forwarded-proto"),
-        http::header::HeaderValue::from_static("https"),
+        http::header::HeaderValue::from_static(request_scheme),
     ));
 
     // X-Forwarded-Host
@@ -7135,7 +7177,7 @@ fn build_h3_backend_headers(
             .get("host")
             .or_else(|| headers.get(":authority"))
             .map(|s| s.as_str());
-        let fwd = crate::proxy::build_forwarded_value(client_ip, "https", host);
+        let fwd = crate::proxy::build_forwarded_value(client_ip, request_scheme, host);
         if let Ok(val) = http::header::HeaderValue::from_str(&fwd) {
             h3_headers.push((http::header::HeaderName::from_static("forwarded"), val));
         }
@@ -7147,13 +7189,22 @@ fn build_h3_backend_headers(
 /// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
 /// Inject a sticky-session `Set-Cookie` header when the LB strategy is cookie-based
 /// and the cookie was not present in the original request.
+///
+/// Returns whether a cookie was actually injected. Buffered callers use this to
+/// record `set-cookie` as gateway-owned in gRPC-deadline provenance before
+/// `response_committed` hooks run — mirroring the H1/H2 gRPC and plain buffered
+/// paths. Without that record, a committed hook that exhausts the RPC deadline
+/// rebuilds the response from gateway-owned headers only, and the freshly
+/// injected affinity cookie is stripped, silently breaking stickiness for the
+/// client. Streaming callers may ignore the result: their headers are already on
+/// the wire before any deadline rebuild can run.
 pub(crate) fn inject_sticky_cookie(
     epoch: &crate::request_epoch::RequestEpoch,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
     sticky_cookie_needed: bool,
     response_headers: &mut HashMap<String, String>,
-) {
+) -> bool {
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
@@ -7179,8 +7230,50 @@ pub(crate) fn inject_sticky_cookie(
                     v.push_str(&cookie_val);
                 })
                 .or_insert(cookie_val);
+            return true;
         }
     }
+    false
+}
+
+/// Inject the sticky-affinity cookie on a BUFFERED H3 response and, when one was
+/// written, declare it gateway-owned in gRPC-deadline provenance.
+///
+/// Every buffered H3 path must use this instead of calling
+/// [`inject_sticky_cookie`] directly. A `response_committed` hook that exhausts
+/// the RPC deadline rebuilds the response from gateway-owned headers only, so an
+/// unrecorded affinity cookie is stripped and the client silently loses
+/// stickiness. Recording here — before any committed hook runs — mirrors the
+/// H1/H2 gRPC and plain buffered paths in `src/proxy/mod.rs`.
+///
+/// Streaming paths deliberately keep calling [`inject_sticky_cookie`]: their
+/// headers reach the wire before a deadline can rebuild anything.
+pub(crate) fn inject_sticky_cookie_with_deadline_provenance(
+    ctx: &mut RequestContext,
+    epoch: &crate::request_epoch::RequestEpoch,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    sticky_cookie_needed: bool,
+    response_headers: &mut HashMap<String, String>,
+) -> bool {
+    if !inject_sticky_cookie(
+        epoch,
+        proxy,
+        upstream_target,
+        sticky_cookie_needed,
+        response_headers,
+    ) {
+        return false;
+    }
+    // The injection APPENDS onto any co-present backend cookie, so it records
+    // mutations rather than declaring ownership — ownership means whole-value
+    // replacement and retires the backend cookie baseline, which would credit a
+    // backend cookie as gateway output. `record_deadline_response_header_…`
+    // returns immediately when no deadline provenance is being tracked, so
+    // ordinary sticky traffic pays nothing here (same shape as the H1/H2
+    // buffered sites in `src/proxy/mod.rs`).
+    ctx.record_deadline_response_header_mutations(response_headers);
+    true
 }
 
 /// Whether an H3 dispatch failure counts as a connect-class (pre-wire) backend
@@ -7445,6 +7538,7 @@ async fn proxy_to_backend_h3_refined_response(
         client_ip,
         xff_append_ip,
         state,
+        ctx.request_is_secure,
         is_early_data,
     );
     let body = Bytes::from(body_bytes);
@@ -8233,6 +8327,7 @@ async fn dispatch_grpc_native_h3(
         client_ip,
         xff_append_ip,
         state,
+        ctx.request_is_secure,
         is_early_data,
     );
     // Re-add `te: trailers`. `build_h3_backend_headers` strips `te` as a
@@ -9605,6 +9700,7 @@ async fn log_h3_grpc_transaction(
         error_class,
         mirror: false,
         metadata: crate::proxy::clone_log_metadata(ctx),
+        ai_usage_export: ctx.ai_usage_export.clone(),
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
 }
@@ -9643,6 +9739,7 @@ async fn proxy_to_backend_h3_streaming(
         client_ip,
         xff_append_ip,
         state,
+        ctx.request_is_secure,
         ctx.is_early_data,
     );
     let body = bytes::Bytes::from(body_bytes);
@@ -10125,6 +10222,7 @@ async fn proxy_to_backend_h3(
     client_ip: &str,
     xff_append_ip: &str,
     upstream_target: Option<&UpstreamTarget>,
+    request_is_secure: bool,
     is_early_data: bool,
 ) -> H3BufferedDispatchResult {
     let h3_headers = build_h3_backend_headers(
@@ -10134,6 +10232,7 @@ async fn proxy_to_backend_h3(
         client_ip,
         xff_append_ip,
         state,
+        request_is_secure,
         is_early_data,
     );
     let body = bytes::Bytes::copy_from_slice(body_bytes);
@@ -10442,6 +10541,22 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
     {
         return false;
     }
+
+    // Seed gateway-rejection provenance for every H3 reject path that can reach
+    // a committed hook, not just the ones routed through
+    // `apply_reject_after_proxy_and_synthetic_body_hooks`. Direct gateway-error
+    // callers (notably the mesh dispatch-required 502 emitted straight after
+    // `finalize_h3_gateway_error_headers`) otherwise hand gateway-authored
+    // headers to a committed hook with no provenance at all; if that hook
+    // exhausts the RPC deadline, `replace_buffered_h3_response_with_grpc_deadline`
+    // below rebuilds from an empty gateway map and strips them. These headers are
+    // the rejection the gateway itself synthesized, so declaring them
+    // gateway-owned adds no backend surface. Seeding here (after the
+    // no-committed-hook early return, and on the same `headers` the deadline
+    // rebuild clones) covers the shared wrapper and the direct delegate callers
+    // in one place; on paths that already seeded, this folds through
+    // `adopt_gateway_rejection` rather than restarting provenance.
+    ctx.begin_rejection_deadline_response_header_provenance(headers);
 
     let (committed_status, committed_headers, committed_body) = if let Some(content_type) =
         grpc_web_response_content_type
@@ -11295,6 +11410,8 @@ mod h3_request_body_timeout_tests {
             ("x-correlation-id".to_string(), "request-123".to_string()),
         ]);
         let mut body = b"backend response".to_vec();
+        ctx.mark_gateway_deadline_response_selected();
+        ctx.begin_rejection_deadline_response_header_provenance(&headers);
 
         let status = super::replace_buffered_h3_response_with_grpc_deadline(
             &mut ctx,
@@ -12279,6 +12396,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -12287,10 +12405,26 @@ mod build_h3_backend_headers_tests {
             Some(&b"https"[..]),
             "X-Forwarded-Proto must carry the URI scheme, not the H3 ALPN token"
         );
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &state,
+            /* request_is_secure = */ false,
+            /* is_early_data = */ false,
+        );
+        assert_eq!(
+            header_value(&out, "x-forwarded-proto").map(|v| v.as_bytes()),
+            Some(&b"http"[..]),
+            "a trusted original HTTP scheme must override the H3 transport scheme"
+        );
     }
 
     #[tokio::test]
-    async fn native_h3_forwarded_header_uses_https_scheme() {
+    async fn native_h3_forwarded_header_uses_effective_request_scheme() {
         let mut state = minimal_proxy_state();
         state.add_forwarded_header = true;
         let proxy = minimal_proxy();
@@ -12304,6 +12438,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -12311,6 +12446,22 @@ mod build_h3_backend_headers_tests {
             header_value(&out, "forwarded").and_then(|v| v.to_str().ok()),
             Some("for=203.0.113.1;proto=https;host=api.example"),
             "Forwarded proto must be the URI scheme, not the H3 ALPN token"
+        );
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &state,
+            /* request_is_secure = */ false,
+            /* is_early_data = */ false,
+        );
+        assert_eq!(
+            header_value(&out, "forwarded").and_then(|v| v.to_str().ok()),
+            Some("for=203.0.113.1;proto=http;host=api.example"),
+            "Forwarded must carry a trusted original HTTP scheme"
         );
     }
 
@@ -12328,6 +12479,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ true,
         );
 
@@ -12356,6 +12508,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -12382,6 +12535,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ true,
         );
 
@@ -12418,6 +12572,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -12447,6 +12602,7 @@ mod build_h3_backend_headers_tests {
             "198.51.100.7", // resolved client (already in the chain)
             "10.0.0.7",     // immediate QUIC peer (the LB)
             &state,
+            true,
             false,
         );
         assert_eq!(
@@ -12465,6 +12621,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.9", // resolved from FERRUM_REAL_IP_HEADER
             "10.0.0.7",    // immediate QUIC peer (the LB)
             &state,
+            true,
             false,
         );
         assert_eq!(
@@ -12481,6 +12638,7 @@ mod build_h3_backend_headers_tests {
             "203.0.113.1",
             "203.0.113.1",
             &state,
+            true,
             false,
         );
         assert_eq!(

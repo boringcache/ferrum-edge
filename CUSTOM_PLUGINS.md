@@ -276,6 +276,7 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `transform_request_body(&body, content_type)` | Pre-backend (buffered) | No | Rewrite request body before sending to backend |
 | `on_final_request_body(&headers, &body)` | Pre-backend (post-transform) | Yes | Validate the final request body after all transforms |
 | `after_proxy(&mut ctx, status, &mut headers)` | Post-backend | Yes | Transform response headers, reject responses |
+| `apply_websocket_handshake_response_headers(&ctx, status, &mut headers)` | Successful WebSocket handshake (H1 `101`; H2/H3 `200`) | No | Synchronously decorate successful handshake response headers in configured order. After this non-rejecting hook returns, proxy core scrubs transport-owned handshake/framing fields and reconstructs them authoritatively. |
 | `on_response_body(&mut ctx, status, &headers, &body)` | Post-backend (buffered) | Yes | Inspect buffered response body, extract metrics |
 | `transform_response_body(&body, content_type, &headers)` | Post-backend (buffered) | No | Rewrite response body before sending to client |
 | `on_final_response_body(&mut ctx, status, &headers, &body)` | Post-backend (post-transform) | Yes | Validate the final response body after all transforms |
@@ -354,6 +355,8 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn is_auth_plugin(&self) -> bool` | `false` | Set to `true` if your plugin participates in the authentication phase. |
 | `fn modifies_request_headers(&self) -> bool` | `false` | Set to `true` if your plugin modifies outgoing request headers in `before_proxy`. |
 | `fn modifies_request_body(&self) -> bool` | `false` | Set to `true` if your plugin transforms the request body via `transform_request_body`. |
+| `fn egresses_request_body_before_finalization(&self) -> bool` | `false` | Set to `true` if `before_proxy` sends the buffered request body to an external service before request transforms/final hooks. Candidate admission and runtime cache construction then reject same-protocol body-transform compositions. |
+| `fn requires_prior_request_deduplication(&self) -> bool` | `false` | Set to `true` if `before_proxy` can execute an external side effect and return a terminal response. Any attached same-protocol `request_deduplication` instance must then have a strictly lower effective priority. |
 | `fn requires_request_body_before_before_proxy(&self) -> bool` | `false` | Set to `true` if your plugin needs the raw request body available during `before_proxy`. |
 | `fn requires_request_body_buffering(&self) -> bool` | Derived | By default returns `true` if `modifies_request_body()` or `requires_request_body_before_before_proxy()`. Override for custom logic. |
 | `fn should_buffer_request_body(&self, &ctx) -> bool` | Delegates | Per-request decision on whether to buffer. Defaults to `requires_request_body_buffering()`. Override for conditional buffering (e.g., only for certain content types). |
@@ -364,6 +367,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn requires_response_stream_hooks(&self) -> bool` | `false` | Config-time opt-in for streaming response inspection. |
 | `fn response_stream_inspector(&self, &ctx, status, content_type) -> Option<Box<dyn ResponseStreamInspector>>` | `None` | Create state owned by one eligible streaming response, or return `None` for passthrough. |
 | `fn forces_reqwest_dispatch(&self, &ctx) -> bool` | `false` | Optional per-request native-H3 dispatch override when reqwest is operationally preferable; inspectors do not require it for transport coverage. |
+| `fn correlation_id_header_name(&self) -> Option<&str>` | `None` | Return the non-empty correlation header owned by this instance, or `None` when it owns no correlation header. Empty or whitespace-only claims fail admission with a capability-specific error. Core candidate admission and runtime cache construction defensively trim and compare valid claims ASCII-case-insensitively, rejecting the effective deployment-specific `FERRUM_REAL_IP_HEADER` and duplicate effective headers or priorities on one plugin chain, including custom-only chains. CP/DP deployments require every DP to advertise the same effective real-IP header as the CP before config distribution. Custom plugins must still trim, validate, and normalize the header names used by their own runtime writes. |
 | `fn applies_after_proxy_on_reject(&self) -> bool` | `false` | Set to `true` if your plugin's `after_proxy` should also run on gateway-generated rejection responses (e.g., CORS headers on error responses). |
 | `fn requires_ws_frame_hooks(&self) -> bool` | `false` | Set to `true` if your plugin implements `on_ws_frame()`. Pre-computed per proxy for zero overhead when unused. |
 | `fn warmup_hostnames(&self) -> Vec<String>` | `[]` | Hostnames your plugin connects to (for DNS pre-warming at startup). |
@@ -789,8 +793,8 @@ impl Plugin for MyStreamPlugin {
     ) -> PluginResult {
         // ctx.client_ip, ctx.proxy_id, ctx.listen_port, ctx.backend_scheme
         // ctx.tls_client_cert_der (available for TCP+TLS after handshake)
-        // ctx.metadata — shared between connect and disconnect
-        ctx.metadata.insert("connected_at".to_string(), "...".to_string());
+        // Metadata is shared between connect and disconnect.
+        ctx.insert_metadata("connected_at".to_string(), "...".to_string());
         PluginResult::Continue
     }
 
@@ -1056,25 +1060,28 @@ if let Some(val) = ctx.metadata.get("my_custom_field") {
 The `StreamConnectionContext` is passed to `on_stream_connect` for TCP/UDP stream proxies:
 
 ```rust
-pub struct StreamConnectionContext {
-    pub client_ip: String,
-    pub proxy_id: String,
-    pub proxy_name: Option<String>,
-    pub listen_port: u16,
-    pub backend_scheme: BackendScheme,
-    pub consumer_index: Arc<ConsumerIndex>,
-    pub identified_consumer: Option<Consumer>,
-    pub authenticated_identity: Option<String>,
-    /// Authentication mechanism that succeeded (e.g., "mtls_auth").
-    pub auth_method: Option<&'static str>,
-    pub metadata: HashMap<String, String>,
-    /// DER-encoded client cert from frontend TLS handshake (TCP+TLS only).
-    pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
-    pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-}
+let mut ctx = StreamConnectionContext::new(
+    client_ip,
+    direct_client_ip,
+    proxy_id,
+    proxy_name,
+    listen_port,
+    backend_scheme,
+    consumer_index,
+);
+
+ctx.authenticated_identity = Some("external-principal".to_string());
+ctx.insert_metadata("custom.key".to_string(), "value".to_string());
 ```
 
-Metadata set during `on_stream_connect` is carried through to `on_stream_disconnect` via `StreamTransactionSummary.metadata`.
+Runtime code creates the context, so custom plugins normally only read or update its public fields.
+External test harnesses must use `StreamConnectionContext::new`; struct literals are intentionally
+unsupported because authoritative stream correlation ownership is private lifecycle state. A plugin
+that changes the public `client_ip` may reset `canonical_client_ip` to `Default::default()` so typed
+client-IP policy reparses the new value. That reset does not erase correlation ownership. Metadata
+set during `on_stream_connect` is carried through to `on_stream_disconnect` via
+`StreamTransactionSummary.metadata`; built-in correlation values are authoritatively re-projected
+over plugin-writable compatibility metadata when the terminal summary is constructed.
 
 ## Transaction Summary
 
@@ -1201,7 +1208,7 @@ ferrum-edge/
 ├── build.rs                   # Auto-discovers plugins + migrations at compile time
 ├── custom_plugins/            # YOUR PLUGINS GO HERE — just drop .rs files
 │   ├── mod.rs                 # Thin shim (includes build-script-generated code)
-│   ├── example_plugin.rs      # Working example — header/body transforms (can be removed)
+│   ├── example_plugin.rs      # Working example — protocol-scoped header/body/correlation capabilities (can be removed)
 │   ├── example_audit_plugin.rs # Working example — database migrations (can be removed)
 │   ├── my_header_injector.rs  # Your plugin
 │   └── my_custom_auth.rs      # Your plugin
@@ -1494,6 +1501,8 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] `supported_protocols()` returns the correct protocol set
 - [ ] `is_auth_plugin()` returns `true` if it's an auth plugin
 - [ ] `modifies_request_body()` returns `true` if it transforms the request body
+- [ ] `egresses_request_body_before_finalization()` returns `true` if `before_proxy` sends body bytes to an external service before finalization
+- [ ] `requires_prior_request_deduplication()` returns `true` if a terminal external side effect must run after attached deduplication instances
 - [ ] `requires_request_body_buffering()` returns `true` if it reads the request body
 - [ ] Complete-body response plugins declare `requires_response_body_buffering()` and only narrow it in `should_buffer_response_body*()`
 - [ ] Streaming response plugins declare `requires_response_stream_hooks()` and return a bounded, state-owning `ResponseStreamInspector`

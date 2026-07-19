@@ -173,19 +173,21 @@ pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
     "ferrum:replaceable_rejection_response";
 
 /// One-shot handoff for requester-owned auth session state that changed before
-/// authentication attempts rejected. Distinct cookie names are newline-joined;
-/// a later attempt replaces an earlier candidate with the same exact name. The
-/// authentication phase removes this key on every exit: it attaches the cookies
-/// only to the final rejection and discards them when a later credential
-/// succeeds. The key contains "cookie" so metadata serialization still redacts
-/// the sealed values defensively.
+/// authentication attempts rejected. Distinct cookie storage keys are
+/// newline-joined; a later attempt replaces an earlier candidate with the same
+/// exact name/domain/host-only/path/partitioned scope. The authentication phase
+/// removes this key on every exit: it attaches the cookies only to the final
+/// rejection and discards them when a later credential succeeds. The key
+/// contains "cookie" so metadata serialization still redacts the sealed values
+/// defensively.
 pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_set_cookie";
 
 /// Marker recorded in `ctx.metadata` for the duration of
 /// [`apply_synthetic_response_body_hooks`] — i.e. while the response-body hook
 /// pipeline (`on_response_body`, `transform_response_body_with_context`,
-/// `on_final_response_body`) runs over a synthetic 2xx plugin short-circuit body
-/// rather than a real backend response. Unlike
+/// `on_final_response_body`) runs over a governed synthetic plugin short-circuit
+/// body rather than a real backend response. This includes final 2xx-5xx
+/// terminate-mode serverless responses. Unlike
 /// [`REJECTION_RESPONSE_METADATA_KEY`] (scoped to the `after_proxy` reject hooks
 /// only), this marker stays set across the body-hook phase so that a storing
 /// plugin's `on_final_response_body` can tell apart "this body was produced by a
@@ -301,6 +303,34 @@ pub(crate) const LATER_STRONG_ETAG_RESPONSE_METADATA_KEY: &str =
 /// or renames `Cache-Control` before compression's own `before_proxy` hook.
 pub(crate) const NO_TRANSFORM_REQUEST_METADATA_KEY: &str = "ferrum:no_transform_request";
 
+/// Marker recorded in `ctx.metadata` when the ORIGINAL client request declared a
+/// non-identity `Content-Encoding`, captured before any `before_proxy` hook can
+/// mutate request headers. `serverless_function` reads this so a header-only
+/// `request_transformer` (priority 3000) that removes or renames
+/// `Content-Encoding` before the serverless egress (priority 3025) cannot smuggle
+/// the original compressed body past the fail-closed encoded-body boundary — the
+/// buffered `ctx.request_body_bytes` are the original client bytes, so their
+/// content coding is described by the original request headers, not the
+/// transformed map the plugin receives.
+pub(crate) const ORIGIN_ENCODED_REQUEST_METADATA_KEY: &str = "ferrum:origin_encoded_request";
+
+/// Marker recorded in `ctx.metadata` when a `request_transformer` query rule
+/// actually mutated `ctx.query_params` (add/remove/update/rename). Query
+/// transformations operate on the decoded parameter map, which cannot be
+/// reconciled with `serverless_function`'s raw-query payload without losing the
+/// raw plus/duplicate/decode/auth-strip invariants the raw path exists to
+/// preserve, so the serverless egress fails closed on the composition rather than
+/// emitting a payload that silently ignores the operator's query transform.
+pub(crate) const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
+
+/// True when a `Content-Encoding` field-line declares a coding other than
+/// `identity`. Whitespace-only and empty values are treated as encoded
+/// (fail-closed): a present-but-empty encoding is malformed and cannot be proven
+/// to describe identity-coded bytes.
+pub(crate) fn content_encoding_declares_non_identity(value: &str) -> bool {
+    !value.trim().eq_ignore_ascii_case("identity")
+}
+
 pub(crate) fn stamp_original_request_metadata(ctx: &mut RequestContext) {
     let raw_has_no_transform = ctx
         .raw_header_values("cache-control")
@@ -308,6 +338,26 @@ pub(crate) fn stamp_original_request_metadata(ctx: &mut RequestContext) {
     if raw_has_no_transform || headers_have_cache_control_directive(&ctx.headers, "no-transform") {
         ctx.metadata.insert(
             NO_TRANSFORM_REQUEST_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+
+    // Capture the original non-identity content coding before any before_proxy
+    // header transform can drop it. Check raw field-lines first (the pristine
+    // wire header, available here because `set_raw_headers` runs immediately
+    // before this) and fall back to the materialized map for paths that already
+    // consumed the raw headers.
+    let raw_declares_encoding = ctx
+        .raw_header_values("content-encoding")
+        .any(content_encoding_declares_non_identity);
+    let materialized_declares_encoding = ctx
+        .headers
+        .get("content-encoding")
+        .map(String::as_str)
+        .is_some_and(content_encoding_declares_non_identity);
+    if raw_declares_encoding || materialized_declares_encoding {
+        ctx.metadata.insert(
+            ORIGIN_ENCODED_REQUEST_METADATA_KEY.to_string(),
             "true".to_string(),
         );
     }
@@ -2578,6 +2628,7 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
     let mut metadata = ctx.metadata.clone();
+    ctx.project_correlation_ids(&mut metadata);
     redact_request_body_from_log_metadata(&mut metadata);
     ctx.apply_waf_owned_log_metadata(&mut metadata);
     metadata
@@ -3346,6 +3397,31 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
     val
 }
 
+/// Replace proxy-managed scheme metadata with the effective browser-facing
+/// request scheme. Direct gRPC and WebSocket dispatch start from a sanitized
+/// request map instead of the canonical HTTP backend builders, so normalize
+/// these fields before those protocol-specific paths merge or forward it.
+/// Remove every case-insensitive variant first because this string-keyed map
+/// does not otherwise provide HTTP header-name equality.
+pub(crate) fn apply_effective_backend_scheme_headers(
+    headers: &mut HashMap<String, String>,
+    client_ip: &str,
+    request_is_secure: bool,
+    add_forwarded_header: bool,
+) {
+    let scheme = if request_is_secure { "https" } else { "http" };
+    let forwarded = add_forwarded_header
+        .then(|| build_forwarded_value(client_ip, scheme, headers.get("host").map(String::as_str)));
+    headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("x-forwarded-proto")
+            && (!add_forwarded_header || !name.eq_ignore_ascii_case("forwarded"))
+    });
+    headers.insert("x-forwarded-proto".to_string(), scheme.to_string());
+    if let Some(forwarded) = forwarded {
+        headers.insert("forwarded".to_string(), forwarded);
+    }
+}
+
 fn push_forwarded_param_value(buf: &mut String, value: &str) {
     if is_forwarded_token(value) {
         buf.push_str(value);
@@ -3630,6 +3706,19 @@ impl ConfigApplyOutcome {
             errors: vec![error.into()],
         }
     }
+}
+
+struct StagedIncrementalRequestEpoch {
+    request_epoch: StagedRequestEpoch,
+    proxy_plugin_rebuild_count: usize,
+}
+
+pub(crate) fn plugin_rebuild_targets_for_incremental_stage(
+    current_config: &GatewayConfig,
+    candidate_config: &GatewayConfig,
+    delta: &crate::config_delta::ConfigDelta,
+) -> HashSet<String> {
+    delta.proxy_ids_needing_plugin_rebuild(current_config, candidate_config)
 }
 
 /// Shared state for the proxy engine.
@@ -4504,6 +4593,21 @@ fn spawn_backend_svid_rotation_task(
 }
 
 impl ProxyState {
+    /// Apply a full snapshot on Tokio's blocking pool. DP snapshots cannot
+    /// carry a CP-side node-local MMDB handoff, so their plugin-cache build may
+    /// synchronously hash, verify, and scan the configured database.
+    pub async fn update_config_off_thread(&self, new_config: GatewayConfig) -> ConfigApplyOutcome {
+        let proxy_state = self.clone();
+        match tokio::task::spawn_blocking(move || proxy_state.update_config(new_config)).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let message = format!("configuration update worker failed: {error}");
+                error!("Config reload rejected: {}", message);
+                ConfigApplyOutcome::rejected_one(message)
+            }
+        }
+    }
+
     /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
     ///
     /// If the gateway already has a file-loaded SVID, rebuild the SVID bundle
@@ -5164,7 +5268,8 @@ impl ProxyState {
             env_config_arc.backend_allow_ips.clone(),
             mesh_egress_strip_baggage_keys.clone(),
             env_config_arc.pool_shard_amount,
-        );
+        )
+        .with_real_ip_header(env_config_arc.real_ip_header.clone());
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will
         // route `__mesh_bpf_metrics` to use it via `with_state`.
@@ -7208,8 +7313,11 @@ impl ProxyState {
         new_config: &GatewayConfig,
         staged_config: Arc<GatewayConfig>,
         delta: &crate::config_delta::ConfigDelta,
-    ) -> Result<StagedRequestEpoch, String> {
-        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
+        country_mmdb_load_mode: crate::plugin_cache::CountryMmdbLoadMode,
+    ) -> Result<StagedIncrementalRequestEpoch, String> {
+        let proxy_ids_to_rebuild =
+            plugin_rebuild_targets_for_incremental_stage(&current.config, new_config, delta);
+        let proxy_plugin_rebuild_count = proxy_ids_to_rebuild.len();
         let rebuild_globals = delta.global_plugin_configs_changed;
         // A route-indexed proxy delta OR a change to the route table's mesh
         // inputs (e.g. `mesh.local_inbound_tcp_routes`, invisible to `ConfigDelta`)
@@ -7226,6 +7334,7 @@ impl ProxyState {
             &proxy_ids_to_rebuild,
             &delta.removed_proxy_ids,
             rebuild_globals,
+            country_mmdb_load_mode,
         )?;
         let consumer_inner = if consumer_changed {
             ConsumerIndex::build_inner(&new_config.consumers)
@@ -7249,14 +7358,17 @@ impl ProxyState {
             Arc::clone(&current.route_table)
         };
 
-        Ok(StagedRequestEpoch {
-            config: staged_config,
-            route_table,
-            plugin_cache: plugin_inner,
-            consumer_index: consumer_inner,
-            load_balancer,
-            route_changed,
-            lb_changed,
+        Ok(StagedIncrementalRequestEpoch {
+            request_epoch: StagedRequestEpoch {
+                config: staged_config,
+                route_table,
+                plugin_cache: plugin_inner,
+                consumer_index: consumer_inner,
+                load_balancer,
+                route_changed,
+                lb_changed,
+            },
+            proxy_plugin_rebuild_count,
         })
     }
 
@@ -7495,34 +7607,41 @@ impl ProxyState {
         }
 
         let mut applied_delta = None;
-        // `Cell` so both `update_config` closures can share access — closure 1
-        // writes via `set()` (requires only `&Cell`), closure 2 reads via
-        // `get()`. A plain `let mut route_changed = false` would force closure
-        // 1 to capture `&mut bool` and closure 2 `&bool` simultaneously, which
-        // the borrow checker rejects even though both closures are `FnOnce`
-        // and never run concurrently.
+        // `Cell` lets the staging closure carry accepted-snapshot facts into
+        // the publish mirror and post-publish maintenance. Plain mutable locals
+        // would force incompatible mutable/immutable captures across the two
+        // `FnOnce` closures even though they never run concurrently.
         let route_changed = std::cell::Cell::new(false);
+        let proxy_plugin_rebuild_count = std::cell::Cell::new(0usize);
         let staged_config = Arc::new(new_config.clone());
         let publish_result = self.request_epoch.update_config(
             |current| {
                 let delta = ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
-                    // No proxy / upstream / consumer / plugin delta. The mesh
-                    // block (`config.mesh`) is NOT diffed by `ConfigDelta`
-                    // (it carries no `id`/`updated_at`), and mesh endpoints
-                    // (`mesh.workloads`/`mesh.services`) are resolved at REQUEST
-                    // time from the live request-epoch's `config.mesh` (e.g. the
-                    // inbound HBONE relay destination guard, and the mesh
-                    // service discoverer) — NOT from any materialized
-                    // `Upstream.targets`. So a mesh-only change (a federation
-                    // bundle refresh, or a cross-cluster remote-cluster
-                    // scale-up/down merged in by
-                    // `merge_remote_endpoints_into_mesh`) leaves the delta empty
-                    // yet genuinely changes routable state. Republish the epoch
-                    // with the fresh config so the request path observes the new
-                    // `config.mesh`; the plugin/consumer/LB caches are unaffected
-                    // by a mesh-only change and reused as-is, and the route table
-                    // is reused UNLESS the mesh route inputs changed (see below).
+                    // ConfigDelta does not represent node-local plugin-file
+                    // contents or the mesh block. Claim an accepted MMDB
+                    // validation handoff before deciding this generation is a
+                    // no-op: a same-path file replacement must atomically
+                    // publish fresh geo readers even though every serialized
+                    // config field and timestamp is unchanged.
+                    let country_mmdb_plugin_cache =
+                        self.plugin_cache.build_country_mmdb_reload_inner(
+                            &current.plugin_cache,
+                            &new_config,
+                            matches!(
+                                self.env_config.mode,
+                                crate::config::env_config::OperatingMode::DataPlane
+                            ),
+                        )?;
+                    let mesh_changed = current.config.mesh != new_config.mesh;
+                    if !mesh_changed && country_mmdb_plugin_cache.is_none() {
+                        return Ok(None);
+                    }
+
+                    // Mesh endpoints (`mesh.workloads`/`mesh.services`) are
+                    // resolved at REQUEST time from the request epoch's live
+                    // `config.mesh`, not materialized `Upstream.targets`. A
+                    // mesh-only change therefore also needs an epoch publish.
                     //
                     // Without this, the `Ok(None)` no-delta path below updates
                     // only `ProxyState.config` (the ArcSwap the request path
@@ -7530,43 +7649,50 @@ impl ProxyState {
                     // stale — so a remote scale-up / trust-bundle overlay never
                     // reaches the live proxy until an unrelated proxy/upstream
                     // delta forces a republish (codex F7.2 round-5, finding 3).
-                    if current.config.mesh == new_config.mesh {
-                        return Ok(None);
-                    }
-                    // The mesh block changed. The pre-computed plugin/consumer/LB
-                    // caches are unaffected by a mesh-only change and are reused,
-                    // but the route table snapshot materializes mesh-derived maps
+                    // When the mesh block changed, the route table snapshot
+                    // must also refresh because it materializes mesh-derived maps
                     // (raw-TCP inbound port map from the `#[serde(skip)]`
                     // `mesh.local_inbound_tcp_routes`, VIP egress tables, sibling
-                    // port groups), and the route table is a pure function of
-                    // `config.mesh`, so a mesh change rebuilds it here. Without this,
+                    // port groups). Without this,
                     // a mesh slice update that retargets/adds/removes a local
                     // stream-family port would leave the inbound accept loop relaying
                     // to a stale loopback backend (or falling through to Hyper for a
-                    // newly added port). `mesh_route_table_inputs_changed` is the same
-                    // whole-mesh signal the incremental path ORs into `route_changed`;
-                    // having already established the mesh differs, the rebuild is
-                    // unconditional here.
-                    route_changed.set(true);
+                    // newly added port). An MMDB-only publish reuses that table.
+                    route_changed.set(mesh_changed);
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
-                        route_table: RouterCache::build_route_table_snapshot(&new_config),
-                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        route_table: if mesh_changed {
+                            RouterCache::build_route_table_snapshot(&new_config)
+                        } else {
+                            Arc::clone(&current.route_table)
+                        },
+                        plugin_cache: country_mmdb_plugin_cache
+                            .unwrap_or_else(|| Arc::clone(&current.plugin_cache)),
                         consumer_index: Arc::clone(&current.consumer_index),
                         load_balancer: Arc::clone(&current.load_balancer),
-                        route_changed: true,
+                        route_changed: mesh_changed,
                         lb_changed: false,
                     }));
                 }
+                let country_mmdb_load_mode = if matches!(
+                    self.env_config.mode,
+                    crate::config::env_config::OperatingMode::DataPlane
+                ) {
+                    crate::plugin_cache::CountryMmdbLoadMode::NodeLocalRefresh
+                } else {
+                    crate::plugin_cache::CountryMmdbLoadMode::Standard
+                };
                 let staged = self.stage_incremental_request_epoch(
                     current,
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
+                    country_mmdb_load_mode,
                 )?;
-                route_changed.set(staged.route_changed);
+                route_changed.set(staged.request_epoch.route_changed);
+                proxy_plugin_rebuild_count.set(staged.proxy_plugin_rebuild_count);
                 applied_delta = Some(delta);
-                Ok(Some(staged))
+                Ok(Some(staged.request_epoch))
             },
             |published| {
                 self.mirror_request_epoch_wrappers(published, route_changed.get(), false);
@@ -7591,19 +7717,16 @@ impl ProxyState {
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
-        // Mesh-only republish (no proxy/upstream/consumer/plugin delta — only
-        // `config.mesh` changed): the pre-computed caches were reused unchanged,
-        // so there is nothing to prune, warm, reconcile, or restart. The fresh
-        // epoch (and the mirrored `ProxyState.config`) already carry the new
-        // `config.mesh` for the request path. `mirror_request_epoch_wrappers`
-        // published the new config above. Return without running the
-        // delta-keyed maintenance below (it would all be a no-op anyway, and
-        // `applied_delta` is `None` here).
+        // Out-of-band republish (mesh-only and/or accepted MMDB-only reload):
+        // there is no resource delta to drive pruning, DNS warmup, listener
+        // reconciliation, or health-check restarts. The request epoch already
+        // carries the new mesh config and/or geo plugin snapshot, and
+        // `mirror_request_epoch_wrappers` published its wrapper views above.
         let Some(delta) = applied_delta else {
-            debug!("Config update: mesh-only change republished (caches reused)");
+            debug!("Config update: out-of-band mesh/MMDB generation republished");
             return ConfigApplyOutcome::Applied;
         };
-        let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
+        let proxy_plugin_rebuild_count = proxy_plugin_rebuild_count.get();
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -7738,11 +7861,12 @@ impl ProxyState {
             + delta.added_plugin_configs.len()
             + delta.removed_plugin_config_ids.len()
             + delta.modified_plugin_configs.len()
+            + delta.plugin_association_changed_proxy_ids.len()
             + delta.added_upstreams.len()
             + delta.removed_upstream_ids.len()
             + delta.modified_upstreams.len();
         info!(
-            "Config updated incrementally: {} changes (proxies: +{} -{} ~{}, consumers: +{} -{} ~{}, plugins: +{} -{} ~{}, upstreams: +{} -{} ~{}, {} proxy plugin lists rebuilt)",
+            "Config updated incrementally: {} changes (proxies: +{} -{} ~{}, consumers: +{} -{} ~{}, plugins: +{} -{} ~{}, plugin associations: ~{}, upstreams: +{} -{} ~{}, {} proxy plugin lists rebuilt)",
             total_changes,
             delta.added_proxies.len(),
             delta.removed_proxy_ids.len(),
@@ -7753,6 +7877,7 @@ impl ProxyState {
             delta.added_plugin_configs.len(),
             delta.removed_plugin_config_ids.len(),
             delta.modified_plugin_configs.len(),
+            delta.plugin_association_changed_proxy_ids.len(),
             delta.added_upstreams.len(),
             delta.removed_upstream_ids.len(),
             delta.modified_upstreams.len(),
@@ -7965,6 +8090,35 @@ impl ProxyState {
             return ConfigApplyOutcome::rejected(errors);
         }
 
+        // Incremental database and CP/DP deltas stage plugin caches directly
+        // on this async call path. Expand the prospective rebuild scope using
+        // the same adaptive-concurrency route-definition logic as cache
+        // staging, preload every MMDB that exact scope reconstructs on the
+        // blocking pool, then require the cache stage to claim the handoff
+        // without synchronous file work.
+        let prospective_delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+        let prospective_proxy_rebuilds =
+            prospective_delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
+        if self.plugin_cache.country_mmdb_preload_required(
+            &new_config,
+            &prospective_proxy_rebuilds,
+            prospective_delta.global_plugin_configs_changed,
+        ) {
+            new_config = match crate::config::validation_pipeline::validate_plugin_file_dependencies_off_thread(
+                new_config,
+                crate::config::validation_pipeline::ValidationAction::Warn,
+            )
+            .await
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    let message = format!("incremental plugin file validation failed: {error}");
+                    error!("Incremental config rejected: {}", message);
+                    return ConfigApplyOutcome::rejected_one(message);
+                }
+            };
+        }
+
         let mut applied_delta = None;
         // See `update_config` rustdoc nearby for why this is a `Cell` and not
         // a plain `let mut bool`.
@@ -7974,17 +8128,38 @@ impl ProxyState {
             |current| {
                 let delta = crate::config_delta::ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
-                    return Ok(None);
+                    // A concurrent writer can make the prospective delta above
+                    // disappear after its off-thread MMDB generation was
+                    // accepted. Claim and publish that handoff rather than
+                    // leaving it unowned or retaining stale geo readers.
+                    let Some(plugin_cache) = self.plugin_cache.build_country_mmdb_reload_inner(
+                        &current.plugin_cache,
+                        &new_config,
+                        false,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(StagedRequestEpoch {
+                        config: Arc::clone(&staged_config),
+                        route_table: Arc::clone(&current.route_table),
+                        plugin_cache,
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: false,
+                        lb_changed: false,
+                    }));
                 }
                 let staged = self.stage_incremental_request_epoch(
                     current,
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
+                    crate::plugin_cache::CountryMmdbLoadMode::PreloadedOnly,
                 )?;
-                route_changed.set(staged.route_changed);
+                route_changed.set(staged.request_epoch.route_changed);
                 applied_delta = Some(delta);
-                Ok(Some(staged))
+                Ok(Some(staged.request_epoch))
             },
             |published| {
                 self.mirror_request_epoch_wrappers(published, route_changed.get(), false);
@@ -8000,7 +8175,10 @@ impl ProxyState {
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
-        let delta = applied_delta.expect("delta captured when publish_result is Some");
+        let Some(delta) = applied_delta else {
+            debug!("Incremental config: accepted MMDB-only generation republished");
+            return ConfigApplyOutcome::Applied;
+        };
 
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -8444,6 +8622,28 @@ pub(crate) fn finalize_websocket_response_headers(
     strip_websocket_transport_managed_response_header_map(response_headers);
 }
 
+/// Apply the successful-handshake response chain in configured plugin order.
+///
+/// Static initial-response policies and request-local WebSocket decorators
+/// share this pass so priority overrides remain authoritative across both
+/// categories. The hook contract is non-rejecting; once the backend handshake
+/// succeeds, this boundary always proceeds to a protocol-correct client
+/// handshake after transport-managed fields are stripped.
+pub(crate) fn finalize_successful_websocket_response_headers(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+) {
+    for plugin in plugins {
+        plugin.apply_websocket_handshake_response_headers(ctx, response_status, response_headers);
+        if plugin.is_initial_response_header_policy() {
+            plugin.apply_initial_response_header_policy(response_headers);
+        }
+    }
+    strip_websocket_transport_managed_response_header_map(response_headers);
+}
+
 fn build_websocket_error_response(
     status: StatusCode,
     body: &str,
@@ -8618,11 +8818,14 @@ async fn handle_websocket_request_authenticated(
             custom_id.to_string(),
         );
     }
+    if let Some(country) = ctx.backend_geo_country() {
+        push_forwardable_header_override(&mut client_headers, "x-geo-country", country.to_string());
+    }
 
     // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`.
     // The WebSocket handshake gets the same sanitized `proxy_headers` as the
     // HTTP/gRPC dispatch paths. Keep applying the vector helper here because
-    // this function may append identity headers before backend dial.
+    // this function may append gateway assertions before backend dial.
     hbone_proxy::strip_egress_baggage_in_vec(
         &mut client_headers,
         &state.mesh_egress_strip_baggage_keys,
@@ -9175,6 +9378,7 @@ async fn handle_websocket_request_authenticated(
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
                             error_class: Some(ws_error_class),
                             metadata,
+                            ai_usage_export: ctx.ai_usage_export.clone(),
                             ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror_before_buffered_response(
@@ -9336,6 +9540,7 @@ async fn handle_websocket_request_authenticated(
         latency_gateway_overhead_ms: ws_gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         metadata: clone_log_metadata(&ctx),
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
 
@@ -9345,9 +9550,16 @@ async fn handle_websocket_request_authenticated(
     // This matches ordinary HTTP/gRPC ordering: operator policy governs backend
     // metadata, while the gateway's selected-target cookie and mandatory
     // handshake fields are committed at the client boundary afterward.
+    let response_status = if is_h2_websocket {
+        StatusCode::OK
+    } else {
+        StatusCode::SWITCHING_PROTOCOLS
+    };
     let mut response_headers = HashMap::new();
-    finalize_websocket_response_headers(
-        &initial_response_header_policy_plugins,
+    finalize_successful_websocket_response_headers(
+        &plugins,
+        &ctx,
+        response_status.as_u16(),
         &mut response_headers,
     );
     if sticky_cookie_needed
@@ -9375,11 +9587,6 @@ async fn handle_websocket_request_authenticated(
     // HTTP/2 Extended CONNECT (RFC 8441): 200 OK — the H2 stream becomes the WebSocket
     // transport. No Upgrade/Connection/Sec-WebSocket-Accept headers (those are HTTP/1.1).
     // HTTP/1.1: 101 Switching Protocols with standard WebSocket handshake headers.
-    let response_status = if is_h2_websocket {
-        StatusCode::OK
-    } else {
-        StatusCode::SWITCHING_PROTOCOLS
-    };
     let mut ws_resp_builder = headers_mod::apply_response_headers(
         Response::builder().status(response_status),
         &response_headers,
@@ -9639,7 +9846,7 @@ fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(
 /// handshake-equivalent repeated headers such as multiple
 /// `Sec-WebSocket-Protocol` values, while still honoring plugin-driven strips
 /// and rewrites reflected in `proxy_headers`.
-fn collect_forwardable_websocket_headers(
+pub(crate) fn collect_forwardable_websocket_headers(
     raw_headers: &hyper::HeaderMap,
     proxy_headers: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
@@ -9767,6 +9974,7 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             | "sec-websocket-extensions"
             | "x-consumer-username"
             | "x-consumer-custom-id"
+            | "x-geo-country"
     )
 }
 
@@ -9779,16 +9987,17 @@ fn push_forwardable_header_override(
     headers.push((name.to_string(), value));
 }
 
-fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, String>) {
+fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, String>) {
     headers.retain(|name, _| {
         !name.eq_ignore_ascii_case("x-consumer-username")
             && !name.eq_ignore_ascii_case("x-consumer-custom-id")
+            && !name.eq_ignore_ascii_case("x-geo-country")
     });
 }
 
-/// Remove plugin-controlled consumer identity headers and restore only the
-/// gateway-authenticated values for backend dispatch.
-pub(crate) fn refresh_backend_consumer_identity_headers(
+/// Remove plugin-controlled gateway assertion headers and restore only the
+/// authenticated principal and private GeoIP lookup result for dispatch.
+pub(crate) fn refresh_backend_gateway_assertion_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
@@ -9796,33 +10005,39 @@ pub(crate) fn refresh_backend_consumer_identity_headers(
     let principal_custom_id = principal_username
         .as_ref()
         .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
-    let source_has_reserved_identity = principal_username.is_none()
+    let geo_country = ctx.backend_geo_country().map(str::to_string);
+    let source_has_reserved_assertion = principal_username.is_none()
+        && geo_country.is_none()
         && headers.keys().any(|name| {
             name.eq_ignore_ascii_case("x-consumer-username")
                 || name.eq_ignore_ascii_case("x-consumer-custom-id")
+                || name.eq_ignore_ascii_case("x-geo-country")
         });
-    if principal_username.is_none() && !source_has_reserved_identity {
+    if principal_username.is_none() && geo_country.is_none() && !source_has_reserved_assertion {
         return;
     }
 
-    sanitize_reserved_consumer_identity_headers(headers);
+    sanitize_reserved_gateway_assertion_headers(headers);
     if let Some(username) = principal_username {
         headers.insert("x-consumer-username".to_string(), username);
         if let Some(custom_id) = principal_custom_id {
             headers.insert("x-consumer-custom-id".to_string(), custom_id);
         }
     }
+    if let Some(country) = geo_country {
+        headers.insert("x-geo-country".to_string(), country);
+    }
 }
 
-fn refresh_effective_backend_consumer_identity_headers(
+fn refresh_effective_backend_gateway_assertion_headers(
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
 ) {
     if let Some(headers) = owned_proxy_headers.as_mut() {
-        refresh_backend_consumer_identity_headers(ctx, headers);
+        refresh_backend_gateway_assertion_headers(ctx, headers);
     } else {
         let mut headers = std::mem::take(&mut ctx.headers);
-        refresh_backend_consumer_identity_headers(ctx, &mut headers);
+        refresh_backend_gateway_assertion_headers(ctx, &mut headers);
         ctx.headers = headers;
     }
 }
@@ -13692,76 +13907,15 @@ pub(crate) async fn log_rejected_request_with_path(
         // is typically small and flowing through the main handler's buffered
         // arm, which populates `bytes_received` separately. Leave 0 here.
         metadata,
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
 
     crate::plugins::log_with_mirror_before_buffered_response(plugins, summary, ctx).await;
 }
 
-/// Keep already-applied response decorators while removing fields that describe
-/// the response representation, transport framing, cache state, or terminal
-/// gRPC outcome being replaced. `Vary: Origin` is retained explicitly because
-/// it is part of the CORS decorator contract rather than backend content
-/// negotiation for the discarded representation.
-fn retain_deadline_response_decorators(response_headers: &mut HashMap<String, String>) {
-    let preserve_origin_vary = response_headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("vary"))
-        .is_some_and(|(_, value)| {
-            value
-                .split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("origin"))
-        });
-    response_headers.retain(|name, _| {
-        ![
-            "accept-ranges",
-            "age",
-            "cache-control",
-            "cdn-cache-control",
-            "connection",
-            "content-encoding",
-            "content-digest",
-            "content-language",
-            "content-length",
-            "content-location",
-            "content-md5",
-            "content-range",
-            "content-type",
-            "digest",
-            "etag",
-            "expires",
-            "grpc-accept-encoding",
-            "grpc-encoding",
-            "grpc-message",
-            "grpc-previous-rpc-attempts",
-            "grpc-retry-pushback-ms",
-            "grpc-status",
-            "grpc-status-details-bin",
-            "keep-alive",
-            "last-modified",
-            "pragma",
-            "proxy-authenticate",
-            "proxy-connection",
-            "proxy-status",
-            "repr-digest",
-            "retry-after",
-            "surrogate-control",
-            "te",
-            "trailer",
-            "transfer-encoding",
-            "upgrade",
-            "vary",
-            "warning",
-        ]
-        .iter()
-        .any(|managed| name.eq_ignore_ascii_case(managed))
-    });
-    if preserve_origin_vary {
-        response_headers.insert("vary".to_string(), "Origin".to_string());
-    }
-}
-
 fn replace_rejection_with_gateway_deadline(
+    ctx: &mut RequestContext,
     status_code: &mut u16,
     response_body: Option<&mut Vec<u8>>,
     response_headers: &mut HashMap<String, String>,
@@ -13770,16 +13924,14 @@ fn replace_rejection_with_gateway_deadline(
     if let Some(body) = response_body {
         body.clear();
     }
-    retain_deadline_response_decorators(response_headers);
-    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
-    response_headers.insert(
-        "grpc-status".to_string(),
-        GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER.to_string(),
+    ctx.retain_deadline_response_gateway_headers(response_headers);
+    grpc_proxy::finalize_grpc_error_response_headers(
+        response_headers,
+        grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+        GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+        &[],
     );
-    response_headers.insert(
-        "grpc-message".to_string(),
-        GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
-    );
+    ctx.sync_deadline_response_terminal_headers(response_headers);
 }
 
 const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -13883,6 +14035,7 @@ fn spawn_detached_rejection_cleanup(
             } = pending_hook.await;
             ctx.mark_gateway_deadline_response_selected();
             replace_rejection_with_gateway_deadline(
+                &mut ctx,
                 &mut status_code,
                 response_body.as_mut(),
                 &mut response_headers,
@@ -13920,6 +14073,7 @@ async fn run_after_proxy_hooks_on_rejection(
     mut response_body: Option<&mut Vec<u8>>,
     response_headers: &mut HashMap<String, String>,
 ) {
+    ctx.begin_rejection_deadline_response_header_provenance(response_headers);
     let previous_replaceable_marker = if response_body.is_some() {
         ctx.metadata.insert(
             REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY.to_string(),
@@ -13941,6 +14095,7 @@ async fn run_after_proxy_hooks_on_rejection(
     if initial_terminal_gateway_deadline {
         ctx.mark_gateway_deadline_response_selected();
         replace_rejection_with_gateway_deadline(
+            ctx,
             status_code,
             response_body.as_deref_mut(),
             response_headers,
@@ -13957,6 +14112,7 @@ async fn run_after_proxy_hooks_on_rejection(
         if terminal_gateway_deadline {
             ctx.mark_gateway_deadline_response_selected();
             replace_rejection_with_gateway_deadline(
+                ctx,
                 status_code,
                 response_body.as_deref_mut(),
                 response_headers,
@@ -14022,6 +14178,7 @@ async fn run_after_proxy_hooks_on_rejection(
                 () = &mut deadline_sleep => {
                     ctx.mark_gateway_deadline_response_selected();
                     replace_rejection_with_gateway_deadline(
+                        ctx,
                         status_code,
                         response_body.as_deref_mut(),
                         response_headers,
@@ -14058,6 +14215,9 @@ async fn run_after_proxy_hooks_on_rejection(
         };
         if terminal_gateway_deadline {
             ctx.mark_gateway_deadline_response_selected();
+        }
+        if matches!(&result, PluginResult::Continue) || !plugin.may_replace_rejection_response() {
+            ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
         }
         match result {
             PluginResult::Continue => {}
@@ -14121,6 +14281,7 @@ async fn run_after_proxy_hooks_on_rejection(
                             })
                             .or_insert_with(|| "Origin".to_string());
                     }
+                    ctx.record_deadline_response_header_mutations(response_headers);
                     if plugin.warn_on_rejection_response_replacement() {
                         warn!(
                             rejecting_plugin = plugin.name(),
@@ -14164,7 +14325,7 @@ async fn run_after_proxy_hooks_on_rejection(
             .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
     {
         ctx.mark_gateway_deadline_response_selected();
-        replace_rejection_with_gateway_deadline(status_code, response_body, response_headers);
+        replace_rejection_with_gateway_deadline(ctx, status_code, response_body, response_headers);
     }
 
     restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
@@ -14238,19 +14399,20 @@ pub(crate) async fn apply_plugin_rejection_response(
 }
 
 /// Decide whether response-body guardrails / transforms should run over a
-/// synthetic 2xx plugin short-circuit body (e.g. `ai_federation` /
-/// `ai_semantic_cache` synthetic responses surfaced via `RejectBinary{200}`).
+/// synthetic plugin short-circuit body. This includes ordinary successful
+/// synthetic responses (e.g. `ai_federation` / `ai_semantic_cache` surfaced via
+/// `RejectBinary{200}`) and every final 2xx-5xx terminate-mode serverless
+/// response, which is application-owned content rather than a gateway error.
 ///
 /// General rule: these hooks (`on_response_body`,
 /// `transform_response_body_with_context`, `on_final_response_body`) run over a
-/// 2xx short-circuit body **only** when there is a body to inspect and the same
-/// response-body-buffering capability gate the normal response path uses is
-/// satisfied. Specifically we skip when:
+/// governed short-circuit body **only** when there is a body to inspect and the
+/// same response-body-buffering capability gate the normal response path uses
+/// is satisfied. Specifically we skip when:
 /// - the request is gRPC (synthetic gRPC bodies are handled as trailers-only),
-/// - the status is not 2xx,
-/// - the status is 204 (a body-emitting transform there is protocol-incorrect —
-///   `204 No Content` MUST NOT carry a body; 304 is already outside the 2xx
-///   range checked above),
+/// - the status is neither 2xx nor a marked final serverless response,
+/// - the status is 204, 205, or 304 (a body-emitting transform there is
+///   protocol-incorrect),
 /// - the synthetic body is empty (nothing to inspect/transform), or
 /// - no active plugin wants to buffer this response. We mirror the normal
 ///   response path's two-tier gate exactly: a plugin's per-request
@@ -14270,16 +14432,18 @@ fn should_apply_synthetic_response_body_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
 ) -> bool {
+    let governed_synthetic_status = (200..300).contains(&status_code)
+        || (ctx.serverless_terminate_response && (200..=599).contains(&status_code));
     !is_grpc_request
-        && (200..300).contains(&status_code)
-        && status_code != 204
+        && governed_synthetic_status
+        && !matches!(status_code, 204 | 205 | 304)
         && !response_body.is_empty()
         && plugins.iter().any(|plugin| {
             plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
         })
 }
 
-/// Run the synthetic 2xx short-circuit response-body hook pipeline
+/// Run the governed synthetic short-circuit response-body hook pipeline
 /// (`on_response_body`, `transform_response_body_with_context`,
 /// `on_final_response_body`) over a plugin-generated body, replacing the
 /// response when a body guardrail rejects it.
@@ -14289,7 +14453,7 @@ fn should_apply_synthetic_response_body_hooks(
 /// run the `after_proxy` reject hooks. The caller
 /// ([`apply_reject_after_proxy_and_synthetic_body_hooks`]) runs those hooks
 /// exactly once after this function returns, over whatever the final response
-/// turned out to be (the synthetic 2xx or the body-rejection response), so
+/// turned out to be (the synthetic response or the body-rejection response), so
 /// one-shot `after_proxy` response state (e.g. the `oidc_relying_party` rotated
 /// session cookie, `response_transformer` route overrides) lands on the final
 /// response exactly once instead of being consumed by an earlier pass and lost
@@ -14343,26 +14507,61 @@ async fn apply_synthetic_response_body_hooks(
 
     let content_type = response_headers.get("content-type").cloned();
     let ct_ref = content_type.as_deref();
-    for plugin in plugins.iter() {
-        let deadline = ctx.grpc_deadline_at();
-        let transformed = match crate::plugins::await_grpc_deadline(
-            deadline,
-            plugin.transform_response_body_with_context(
-                ctx,
-                response_body,
-                ct_ref,
+    if crate::plugins::response_body_rewrite_allowed(*response_status) {
+        let mut mandatory_replay_transform_failed = None;
+        for plugin in plugins.iter() {
+            let mandatory_replay_transform = ctx.deduplication_replay_response_finalized
+                && plugin.requires_replay_response_body_transform(ctx);
+            if ctx.deduplication_replay_response_finalized && !mandatory_replay_transform {
+                continue;
+            }
+            let deadline = ctx.grpc_deadline_at();
+            let transformed = match crate::plugins::await_grpc_deadline(
+                deadline,
+                plugin.transform_response_body_with_context(
+                    ctx,
+                    response_body,
+                    ct_ref,
+                    response_headers,
+                ),
+            )
+            .await
+            {
+                Ok(transformed) => transformed,
+                Err(()) if mandatory_replay_transform => {
+                    mandatory_replay_transform_failed = Some(plugin.name());
+                    break;
+                }
+                Err(()) => break,
+            };
+            if let Some(transformed) = transformed {
+                response_headers
+                    .insert("content-length".to_string(), transformed.len().to_string());
+                *response_body = transformed;
+                crate::plugins::finalize_response_body_transformation(
+                    plugin.as_ref(),
+                    ctx,
+                    response_headers,
+                );
+            } else if mandatory_replay_transform {
+                mandatory_replay_transform_failed = Some(plugin.name());
+                break;
+            }
+        }
+        if let Some(plugin_name) = mandatory_replay_transform_failed {
+            warn!(
+                plugin = plugin_name,
+                "Mandatory replay response redaction transform failed; rejecting response"
+            );
+            *response_body = rebuild_plugin_rejection_response_headers(
+                response_status,
                 response_headers,
-            ),
-        )
-        .await
-        {
-            Ok(transformed) => transformed,
-            Err(()) => break,
-        };
-        if let Some(transformed) = transformed {
-            response_headers.insert("content-length".to_string(), transformed.len().to_string());
-            *response_body = transformed;
-            plugin.on_response_body_transformed(ctx, response_headers);
+                RejectedResponseParts {
+                    status_code: 502,
+                    body: br#"{"error":"response redaction failed"}"#.to_vec(),
+                    headers: HashMap::new(),
+                },
+            );
         }
     }
 
@@ -14426,17 +14625,17 @@ async fn apply_synthetic_response_body_hooks(
 ///
 /// Ordering: the synthetic body hooks run first (they may *replace* the
 /// response when `ai_response_guard` / `ai_semantic_firewall` rejects the
-/// synthetic 2xx body — see [`apply_synthetic_response_body_hooks`], which
+/// synthetic body — see [`apply_synthetic_response_body_hooks`], which
 /// rebuilds headers via [`rebuild_plugin_rejection_response_headers`] without
 /// running `after_proxy`). The `after_proxy` reject hooks then run a single
-/// time over whatever the FINAL response is (the synthetic 2xx OR the
+/// time over whatever the FINAL response is (the synthetic response OR the
 /// body-rejection response). Running `after_proxy` exactly once — and last —
 /// preserves one-shot response state that those hooks emit: the
 /// `oidc_relying_party` rotated session cookie and `response_transformer`
 /// route-override headers are staged from metadata that the hook consumes on
 /// first invocation, so they must be applied to the final response, not
-/// consumed against a synthetic 2xx that a later body rejection discards. The
-/// reject-path `after_proxy` hooks are header-only and do not depend on the
+/// consumed against a synthetic response that a later body rejection discards.
+/// The reject-path `after_proxy` hooks are header-only and do not depend on the
 /// body-hook output (`compression::after_proxy` deliberately no-ops on the
 /// rejection path), so deferring them past the body hooks is safe.
 pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
@@ -14472,15 +14671,16 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         // ahead of the body hooks: doing so would re-break the one-shot
         // `after_proxy` response-state contract that the caller relies on. The
         // body hooks may REPLACE the response when a guardrail rejects the
-        // synthetic 2xx body (`apply_synthetic_response_body_hooks` rebuilds
+        // synthetic body (`apply_synthetic_response_body_hooks` rebuilds
         // headers via `rebuild_plugin_rejection_response_headers`). The
         // `after_proxy` reject hooks therefore have to run exactly once and LAST,
         // over the FINAL response, so one-shot state emitted from consumed
         // metadata — the `oidc_relying_party` rotated session cookie, the
         // `response_transformer` route override — lands on whatever the client
-        // actually receives instead of being consumed against a synthetic 2xx
-        // that a later body rejection discards (see commit 36de1bf0 and the
-        // function-level doc on `apply_reject_after_proxy_and_synthetic_body_hooks`).
+        // actually receives instead of being consumed against a synthetic
+        // response that a later body rejection discards (see commit 36de1bf0
+        // and the function-level doc on
+        // `apply_reject_after_proxy_and_synthetic_body_hooks`).
         // The two requirements directly conflict; we keep the one-shot guarantee
         // and accept the minor body-transform divergence on the synthetic path.
         apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
@@ -14489,7 +14689,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         ctx.method = original_method;
     }
     // Apply the after_proxy reject hooks exactly once, over the final response
-    // (the synthetic 2xx or the body-rejection response produced above), so
+    // (the synthetic response or the body-rejection response produced above), so
     // one-shot response state (rotated session cookie, route overrides) is
     // emitted onto whatever the client actually receives. Runs LAST by design —
     // see the divergence note above.
@@ -14539,7 +14739,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             };
             if !terminal_gateway_deadline {
                 ctx.mark_gateway_deadline_response_selected();
-                replace_rejection_with_gateway_deadline(status, Some(body), headers);
+                replace_rejection_with_gateway_deadline(ctx, status, Some(body), headers);
             }
             spawn_detached_response_committed_hooks(
                 pending_hook,
@@ -14565,6 +14765,10 @@ pub(crate) async fn run_after_proxy_hooks(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
 ) -> Option<AfterProxyReject> {
+    // Establish backend provenance before the first trusted response hook can
+    // mutate the map. A later deadline replacement retains only mutations from
+    // hooks that completed, never backend fields selected by header name.
+    ctx.begin_buffered_deadline_response_header_provenance(response_headers);
     // Capture the genuine backend status BEFORE any after_proxy hook can reject
     // and replace the response. If a hook at a lower priority rejects a 2xx
     // backend response (e.g. `response_size_limiting` at 3490 rejecting an
@@ -14637,6 +14841,7 @@ pub(crate) async fn run_after_proxy_hooks(
                     plugin.as_ref(),
                     response_headers,
                 );
+                ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
             }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let RejectedResponseParts {
@@ -15031,6 +15236,20 @@ fn merge_grpc_web_expose_headers(
 /// headers before sending. The generated representation fields are also
 /// authoritative: neither a security policy nor reject headers may replace
 /// them or supply a stale content length.
+///
+/// The base gRPC-Web expose list is one of those authoritative generated
+/// fields, so it is seeded from the canonical constant rather than read back
+/// out of `response.headers`. Callers populate this map by EXTENDING the
+/// generated error with other header sources — retained deadline-provenance
+/// gateway output, or a finalized reject chain — and `extend` overwrites on key
+/// collision. Reading the field back therefore did not observe the generated
+/// base list at all once any of those sources carried its own
+/// `access-control-expose-headers`: a partial value (a CORS policy's configured
+/// list, or a provenance-partitioned suffix) replaced it wholesale, and the
+/// browser-facing DEADLINE_EXCEEDED response could omit `grpc-status` /
+/// `grpc-message` — the terminal metadata gRPC-Web carries in the body trailer
+/// frame and JavaScript cannot read without them being exposed. Everything else
+/// present still merges in on top; the merge dedups case-insensitively.
 pub(crate) fn finalize_grpc_web_error_response_headers(
     response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
@@ -15038,10 +15257,6 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
 ) {
     let content_type = response.headers.get("content-type").cloned();
     let grpc_web = response.headers.get("x-grpc-web").cloned();
-    let expose_headers = response
-        .headers
-        .get("access-control-expose-headers")
-        .cloned();
 
     if let Some(finalized_headers) = finalized_reject_headers {
         response.headers.extend(
@@ -15068,8 +15283,10 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
         );
     }
 
-    let expose_headers =
-        merge_grpc_web_expose_headers(expose_headers.as_deref(), &response.headers);
+    let expose_headers = merge_grpc_web_expose_headers(
+        Some(crate::plugins::grpc_web::BASE_EXPOSE_HEADERS_VALUE),
+        &response.headers,
+    );
 
     response.headers.retain(|name, _| {
         ![
@@ -15124,7 +15341,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
     ctx.mark_gateway_deadline_response_selected();
-    retain_deadline_response_decorators(response_headers);
+    ctx.retain_deadline_response_gateway_headers(response_headers);
     if let Some(content_type) = grpc_web_response_content_type {
         let mut response = crate::plugins::grpc_web::error_response_for_content_type(
             content_type,
@@ -15148,6 +15365,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
         );
         response_body.clear();
     }
+    ctx.sync_deadline_response_terminal_headers(response_headers);
     insert_grpc_error_metadata(
         &mut ctx.metadata,
         grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -15168,39 +15386,50 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     grpc_web_response_content_type: Option<&str>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> (bool, bool) {
+    ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
     let content_type = response_headers.get("content-type").cloned();
     let content_type = content_type.as_deref();
     let mut body_transformed = false;
-    for plugin in plugins {
-        let transformed = match crate::plugins::await_grpc_deadline(
-            ctx.grpc_deadline_at(),
-            plugin.transform_response_body_with_context(
-                ctx,
-                response_body,
-                content_type,
-                response_headers,
-            ),
-        )
-        .await
-        {
-            Ok(transformed) => transformed,
-            Err(()) => {
-                *response_status = replace_buffered_grpc_response_with_deadline(
+    // Range/delta representations (206/226) are only a selected slice, so they
+    // are not rewritten into a truthful full representation here.
+    if crate::plugins::response_body_rewrite_allowed(*response_status) {
+        for plugin in plugins {
+            let transformed = match crate::plugins::await_grpc_deadline(
+                ctx.grpc_deadline_at(),
+                plugin.transform_response_body_with_context(
                     ctx,
-                    grpc_web_response_content_type,
-                    response_headers,
                     response_body,
-                    initial_response_header_policy_plugins,
-                )
-                .as_u16();
-                return (true, body_transformed);
+                    content_type,
+                    response_headers,
+                ),
+            )
+            .await
+            {
+                Ok(transformed) => transformed,
+                Err(()) => {
+                    *response_status = replace_buffered_grpc_response_with_deadline(
+                        ctx,
+                        grpc_web_response_content_type,
+                        response_headers,
+                        response_body,
+                        initial_response_header_policy_plugins,
+                    )
+                    .as_u16();
+                    return (true, body_transformed);
+                }
+            };
+            if let Some(transformed) = transformed {
+                response_headers
+                    .insert("content-length".to_string(), transformed.len().to_string());
+                *response_body = transformed;
+                crate::plugins::finalize_response_body_transformation(
+                    plugin.as_ref(),
+                    ctx,
+                    response_headers,
+                );
+                body_transformed = true;
             }
-        };
-        if let Some(transformed) = transformed {
-            response_headers.insert("content-length".to_string(), transformed.len().to_string());
-            *response_body = transformed;
-            plugin.on_response_body_transformed(ctx, response_headers);
-            body_transformed = true;
+            ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
         }
     }
     (false, body_transformed)
@@ -15881,14 +16110,27 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     PluginResult::Continue
 }
 
-/// Return the RFC 6265 cookie-name from the leading cookie-pair only.
-/// Attributes, padded names, and lines without a valid token are not names.
+const MAX_SET_COOKIE_NAME_VALUE_BYTES: usize = 4096;
+
+/// Return the RFC 10025 cookie-name from a browser-comparable leading
+/// cookie-pair. Keep the existing strict producer grammar for names, but use
+/// the user-agent value boundary: browsers accept non-control value syntax
+/// that producers are discouraged from emitting, including spaces, commas,
+/// quotes, and backslashes.
 fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     let cookie_pair = set_cookie
         .split_once(';')
         .map_or(set_cookie, |(pair, _)| pair);
-    let (name, _) = cookie_pair.split_once('=')?;
-    if name.is_empty()
+    let (name, value) = cookie_pair.split_once('=')?;
+    // RFC 6265 strips leading and trailing SP/HTAB from both sides of the
+    // cookie-pair before validating its name and value.
+    let name = name.trim_matches([' ', '\t']);
+    let value = value.trim_matches([' ', '\t']);
+    // RFC 10025 rejects a cookie when its trimmed name and value total more
+    // than 4096 octets. Such a line cannot own and suppress a valid staged
+    // cleanup cookie that the browser can actually store.
+    if name.len().saturating_add(value.len()) > MAX_SET_COOKIE_NAME_VALUE_BYTES
+        || name.is_empty()
         || !name.bytes().all(|byte| {
             matches!(
                 byte,
@@ -15914,18 +16156,338 @@ fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     {
         return None;
     }
+
+    // The first semicolon already terminated `cookie_pair`. Reject C0/DEL so
+    // malformed or header-injection-bearing values remain non-comparable,
+    // while retaining ownership for values a user agent can actually store.
+    if value.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+        return None;
+    }
+
     Some(name)
 }
 
+/// RFC 6265 ignores one leading dot on Domain attributes and compares the
+/// resulting canonicalized domain case-insensitively. Ferrum accepts the full
+/// RFC 3986 reg-name and bracketed IP-literal forms at request admission, so
+/// apply the same validation here instead of narrowing comparable cookie
+/// scopes to LDH names. Normalize IPv6 text so equivalent compressed and
+/// expanded forms cannot evade storage-key ownership.
+enum CanonicalSetCookieDomain<'a> {
+    Text(&'a str),
+    Ipv6(std::net::Ipv6Addr),
+}
+
+fn canonical_set_cookie_domain(domain: &str) -> Option<CanonicalSetCookieDomain<'_>> {
+    let domain = domain.strip_prefix('.').unwrap_or(domain);
+    if let Some(content) = domain
+        .strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+    {
+        if let Ok(ipv6) = content.parse::<std::net::Ipv6Addr>() {
+            return Some(CanonicalSetCookieDomain::Ipv6(ipv6));
+        }
+        return is_valid_ip_literal_contents(content)
+            .then_some(CanonicalSetCookieDomain::Text(domain));
+    }
+    if domain.ends_with('.') || !is_valid_reg_name(domain) {
+        return None;
+    }
+    Some(CanonicalSetCookieDomain::Text(domain))
+}
+
+fn canonical_set_cookie_domain_ip(domain: &CanonicalSetCookieDomain<'_>) -> Option<IpAddr> {
+    match domain {
+        CanonicalSetCookieDomain::Text(domain) => domain.parse().ok(),
+        CanonicalSetCookieDomain::Ipv6(domain) => Some(IpAddr::V6(*domain)),
+    }
+}
+
+fn set_cookie_request_host(authority: Option<&str>) -> Option<&str> {
+    split_request_authority(authority?).map(|(host, _)| host)
+}
+
+fn set_cookie_request_host_ip(request_host: Option<&str>) -> Option<IpAddr> {
+    let host = request_host?;
+    host.strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
+fn set_cookie_domain_is_public_suffix(domain: &str) -> bool {
+    let lowercase_domain = domain.to_ascii_lowercase();
+    psl::suffix_str(&lowercase_domain).is_some_and(|suffix| suffix == lowercase_domain.as_str())
+}
+
+fn valid_set_cookie_path(path: &str) -> bool {
+    path.starts_with('/') && !path.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
+}
+
+fn default_set_cookie_path(request_path: &str) -> &str {
+    if !request_path.starts_with('/') {
+        return "/";
+    }
+    match request_path.rfind('/') {
+        Some(0) | None => "/",
+        Some(last_slash) => &request_path[..last_slash],
+    }
+}
+
+/// Browsers treat HTTP loopback and `localhost` origins as potentially
+/// trustworthy, so they may store `Secure` cookies even without TLS. Match the
+/// default trust boundary from Secure Contexts; user-configured browser
+/// allowlists are intentionally unknowable at the proxy.
+fn request_authority_is_potentially_trustworthy(authority: &str) -> bool {
+    let Some((host, _)) = split_request_authority(authority) else {
+        return false;
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let localhost_suffix = ".localhost";
+    if host.eq_ignore_ascii_case("localhost")
+        || (host.len() > localhost_suffix.len()
+            && host
+                .get(host.len() - localhost_suffix.len()..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(localhost_suffix)))
+    {
+        return true;
+    }
+
+    let ip_literal = host
+        .strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+        .unwrap_or(host);
+    match ip_literal.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => address.octets()[0] == 127,
+        Ok(std::net::IpAddr::V6(address)) => address.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+fn request_can_store_secure_cookie(ctx: &RequestContext) -> bool {
+    ctx.request_is_secure
+        || ctx
+            .request_authority
+            .as_deref()
+            .is_some_and(request_authority_is_potentially_trustworthy)
+}
+
+struct SetCookieStorageKey<'a> {
+    name: &'a str,
+    domain: Option<CanonicalSetCookieDomain<'a>>,
+    path: &'a str,
+    host_only: bool,
+    partitioned: bool,
+}
+
+/// Return the effective RFC 10025 cookie storage key. Omitted Domain resolves
+/// to the exact validated request host used for browser cookie comparison while
+/// retaining its host-only state. Omitted, empty, or non-absolute Path
+/// attributes use the request path's default directory. Host-only and
+/// Partitioned cookies remain independent from otherwise equivalent domain and
+/// unpartitioned cookies.
+fn set_cookie_storage_key<'a>(
+    set_cookie: &'a str,
+    default_path: &'a str,
+    request_is_secure: bool,
+    request_host: Option<&'a str>,
+    request_host_ip: Option<IpAddr>,
+) -> Option<SetCookieStorageKey<'a>> {
+    let name = set_cookie_name(set_cookie)?;
+    let mut domain_attribute = None;
+    let mut path_attribute = None;
+    let mut partitioned = false;
+    let mut secure = false;
+    let mut http_only = false;
+    let mut same_site_none = false;
+
+    for attribute in set_cookie.split(';').skip(1) {
+        let attribute = attribute.trim_matches([' ', '\t']);
+        // User agents reject control-bearing cookie attributes. Do not treat a
+        // hostile Path control as ordinary invalid syntax and resolve it to the
+        // default path, which could suppress a valid staged cleanup cookie.
+        if attribute.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+            return None;
+        }
+        let (attribute_name, attribute_value) = match attribute.split_once('=') {
+            Some((name, value)) => (
+                name.trim_matches([' ', '\t']),
+                Some(value.trim_matches([' ', '\t'])),
+            ),
+            None => (attribute, None),
+        };
+        if attribute_name.eq_ignore_ascii_case("partitioned") {
+            partitioned = true;
+        } else if attribute_name.eq_ignore_ascii_case("secure") {
+            secure = true;
+        } else if attribute_name.eq_ignore_ascii_case("httponly") {
+            http_only = true;
+        } else if attribute_name.eq_ignore_ascii_case("samesite") {
+            // The last SameSite attribute wins; invalid and bare values map to
+            // the default enforcement rather than preserving an earlier None.
+            same_site_none =
+                attribute_value.is_some_and(|value| value.eq_ignore_ascii_case("none"));
+        } else if attribute_name.eq_ignore_ascii_case("domain") {
+            // User agents ignore empty and bare Domain cookie-avs. A later
+            // empty value therefore does not erase an earlier valid Domain.
+            if let Some(value) = attribute_value.filter(|value| !value.is_empty()) {
+                domain_attribute = Some(value);
+            }
+        } else if attribute_name.eq_ignore_ascii_case("path") {
+            // A bare Path is the last Path attribute with an empty value, so
+            // it supersedes an earlier value and resolves to default_path.
+            path_attribute = Some(attribute_value.unwrap_or(""));
+        }
+    }
+
+    // RFC 6265 uses the last effective Domain/Path attribute. Empty Domain
+    // values were ignored above, while a trailing-dot or otherwise malformed
+    // non-empty Domain rejects the cookie. Mainstream user agents treat an
+    // exact-IP Domain as a host cookie and reject a nonmatching IP Domain.
+    // An invalid Path value falls back to the request's default path.
+    let (domain, host_only) = match domain_attribute {
+        None => (request_host.and_then(canonical_set_cookie_domain), true),
+        Some(domain) => {
+            let domain = canonical_set_cookie_domain(domain)?;
+            if let Some(domain_ip) = canonical_set_cookie_domain_ip(&domain) {
+                if request_host_ip != Some(domain_ip) {
+                    return None;
+                }
+                (Some(domain), true)
+            } else {
+                // RFC 6265bis public-suffix handling is storage-key-visible:
+                // a Domain equal to the request host is converted to a
+                // host-only cookie, while any other public-suffix Domain is
+                // rejected. Use the current Mozilla PSL (including private
+                // suffixes such as github.io) so Ferrum compares the same key
+                // a browser will actually store.
+                let CanonicalSetCookieDomain::Text(domain_text) = &domain else {
+                    return None;
+                };
+                if set_cookie_domain_is_public_suffix(domain_text) {
+                    if !request_host.is_some_and(|host| host.eq_ignore_ascii_case(domain_text)) {
+                        return None;
+                    }
+                    (Some(domain), true)
+                } else {
+                    (Some(domain), false)
+                }
+            }
+        }
+    };
+    let path = match path_attribute {
+        Some(path) if valid_set_cookie_path(path) => path,
+        Some(_) | None => default_path,
+    };
+
+    // RFC 10025 §5.4 requires user agents to match cookie-name prefix strings
+    // case-insensitively; §5.7 applies that rule in the __Secure-/__Host-
+    // storage checks. Keep every browser-prefix check here case-insensitive.
+    let secure_prefix = name
+        .get(.."__Secure-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Secure-"));
+    let host_prefix = name
+        .get(.."__Host-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Host-"));
+    let http_prefix = name
+        .get(.."__Http-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Http-"));
+    let host_http_prefix = name
+        .get(.."__Host-Http-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Host-Http-"));
+    // Cookies that a browser will reject cannot own a staged cookie's storage
+    // key. Keep the selected line in the response, but make it non-comparable
+    // so a valid earlier cleanup is appended after it. `__Host-` additionally
+    // requires an explicit Path=/ attribute, not merely a default path of `/`;
+    // `__Http-` and `__Host-Http-` additionally require HttpOnly.
+    if (secure && !request_is_secure)
+        || (partitioned && !secure)
+        || (same_site_none && !secure)
+        || (secure_prefix && !secure)
+        || (host_prefix && (!secure || !host_only || path_attribute != Some("/")))
+        || (http_prefix && (!secure || !http_only))
+        || (host_http_prefix && !http_only)
+    {
+        return None;
+    }
+
+    Some(SetCookieStorageKey {
+        name,
+        domain,
+        path,
+        host_only,
+        partitioned,
+    })
+}
+
+fn set_cookie_same_storage_key(
+    existing: &str,
+    candidate: &str,
+    default_path: &str,
+    request_is_secure: bool,
+    request_host: Option<&str>,
+    request_host_ip: Option<IpAddr>,
+) -> bool {
+    let Some(existing_key) = set_cookie_storage_key(
+        existing,
+        default_path,
+        request_is_secure,
+        request_host,
+        request_host_ip,
+    ) else {
+        return false;
+    };
+    let Some(candidate_key) = set_cookie_storage_key(
+        candidate,
+        default_path,
+        request_is_secure,
+        request_host,
+        request_host_ip,
+    ) else {
+        return false;
+    };
+
+    existing_key.name == candidate_key.name
+        && existing_key.path == candidate_key.path
+        && existing_key.host_only == candidate_key.host_only
+        && existing_key.partitioned == candidate_key.partitioned
+        && match (existing_key.domain, candidate_key.domain) {
+            (
+                Some(CanonicalSetCookieDomain::Text(existing_domain)),
+                Some(CanonicalSetCookieDomain::Text(candidate_domain)),
+            ) => existing_domain.eq_ignore_ascii_case(candidate_domain),
+            (
+                Some(CanonicalSetCookieDomain::Ipv6(existing_domain)),
+                Some(CanonicalSetCookieDomain::Ipv6(candidate_domain)),
+            ) => existing_domain == candidate_domain,
+            (None, None) => true,
+            _ => false,
+        }
+}
+
 /// Add newline-joined `Set-Cookie` lines in encounter order, replacing an
-/// earlier line when a later line owns the same exact, case-sensitive cookie
-/// name. Invalid cookie-pairs can only replace byte-identical lines.
-fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
+/// earlier line only when a later line owns the same RFC 10025 storage key.
+/// Invalid cookie-pairs can only replace byte-identical lines.
+fn collect_later_set_cookies(
+    cookies: &mut Vec<String>,
+    joined: &str,
+    default_path: &str,
+    request_is_secure: bool,
+    request_host: Option<&str>,
+    request_host_ip: Option<IpAddr>,
+) {
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
-        let candidate_name = set_cookie_name(candidate);
         if let Some(index) = cookies.iter().position(|existing| {
             existing == candidate
-                || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+                || set_cookie_same_storage_key(
+                    existing,
+                    candidate,
+                    default_path,
+                    request_is_secure,
+                    request_host,
+                    request_host_ip,
+                )
         }) {
             cookies.remove(index);
         }
@@ -15933,22 +16495,53 @@ fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
     }
 }
 
-fn set_cookie_conflicts(cookies: &[String], candidate: &str) -> bool {
-    let candidate_name = set_cookie_name(candidate);
+fn set_cookie_conflicts(
+    cookies: &[String],
+    candidate: &str,
+    default_path: &str,
+    request_is_secure: bool,
+    request_host: Option<&str>,
+    request_host_ip: Option<IpAddr>,
+) -> bool {
     cookies.iter().any(|existing| {
         existing == candidate
-            || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+            || set_cookie_same_storage_key(
+                existing,
+                candidate,
+                default_path,
+                request_is_secure,
+                request_host,
+                request_host_ip,
+            )
     })
 }
 
 /// Stage requester-owned cookies from rejecting auth attempts. This remains on
 /// the rejection path: successful authentication only removes the metadata.
 pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
+    let default_path = default_set_cookie_path(&ctx.path);
+    let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
+    let request_host = set_cookie_request_host(ctx.request_authority.as_deref());
+    let request_host_ip = set_cookie_request_host_ip(request_host);
     let mut staged = Vec::new();
     if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
-        collect_later_set_cookies(&mut staged, existing);
+        collect_later_set_cookies(
+            &mut staged,
+            existing,
+            default_path,
+            can_store_secure_cookie,
+            request_host,
+            request_host_ip,
+        );
     }
-    collect_later_set_cookies(&mut staged, &cookie);
+    collect_later_set_cookies(
+        &mut staged,
+        &cookie,
+        default_path,
+        can_store_secure_cookie,
+        request_host,
+        request_host_ip,
+    );
 
     if staged.is_empty() {
         ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
@@ -15967,6 +16560,10 @@ fn attach_auth_rejection_set_cookie(
     let Some(staged) = ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) else {
         return;
     };
+    let default_path = default_set_cookie_path(&ctx.path);
+    let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
+    let request_host = set_cookie_request_host(ctx.request_authority.as_deref());
+    let request_host_ip = set_cookie_request_host_ip(request_host);
 
     // A custom plugin can return multiple case variants because rejection
     // headers use a String-keyed HashMap. Sort the variants by their exact key
@@ -15983,16 +16580,37 @@ fn attach_auth_rejection_set_cookie(
 
     let mut merged = Vec::new();
     for (_, value) in selected_variants {
-        collect_later_set_cookies(&mut merged, &value);
+        collect_later_set_cookies(
+            &mut merged,
+            &value,
+            default_path,
+            can_store_secure_cookie,
+            request_host,
+            request_host_ip,
+        );
     }
 
     let mut staged_cookies = Vec::new();
-    collect_later_set_cookies(&mut staged_cookies, &staged);
+    collect_later_set_cookies(
+        &mut staged_cookies,
+        &staged,
+        default_path,
+        can_store_secure_cookie,
+        request_host,
+        request_host_ip,
+    );
     for candidate in staged_cookies {
         // The selected final rejection owns conflicts. Preserve each selected
         // line's full attributes and deterministic order, appending only
-        // independently named requester-owned cookies from earlier rejects.
-        if !set_cookie_conflicts(&merged, &candidate) {
+        // independently scoped requester-owned cookies from earlier rejects.
+        if !set_cookie_conflicts(
+            &merged,
+            &candidate,
+            default_path,
+            can_store_secure_cookie,
+            request_host,
+            request_host_ip,
+        ) {
             merged.push(candidate);
         }
     }
@@ -16129,6 +16747,30 @@ pub async fn run_authentication_phase(
             }
         }
     }
+}
+
+/// Apply the original HTTP-family scheme reported by a directly connected
+/// trusted proxy through either a singleton overwrite or an XFF-correlated
+/// appended chain. The same accepted fact drives browser cookie storage checks,
+/// authority normalization, and canonical frontend URL metadata consumed by
+/// authentication plugins.
+pub fn apply_trusted_forwarded_request_scheme(
+    ctx: &mut RequestContext,
+    socket_addr: &IpAddr,
+    trusted_proxies: &client_ip::TrustedProxies,
+) -> Option<&'static str> {
+    let forwarded_scheme = client_ip::trusted_forwarded_request_scheme(
+        socket_addr,
+        ctx.raw_header_value_bytes("x-forwarded-for"),
+        ctx.raw_header_value_bytes("x-forwarded-proto"),
+        trusted_proxies,
+    );
+    if let Some(scheme) = forwarded_scheme {
+        ctx.request_is_secure = scheme == "https";
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), scheme.to_string());
+    }
+    forwarded_scheme
 }
 
 /// Handle a single proxy request.
@@ -16277,9 +16919,11 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    let mut request_scheme = if is_tls { "https" } else { "http" };
+    ctx.request_is_secure = is_tls;
     ctx.metadata.insert(
         "ferrum.frontend_scheme".to_string(),
-        if is_tls { "https" } else { "http" }.to_string(),
+        request_scheme.to_string(),
     );
     ctx.frontend_listen_port = Some(connection_metadata.frontend_listen_port.unwrap_or(
         if is_tls {
@@ -16512,6 +17156,11 @@ async fn handle_proxy_request_inner(
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         if let Some(ref addr) = socket_addr {
+            if let Some(forwarded_scheme) =
+                apply_trusted_forwarded_request_scheme(&mut ctx, addr, &state.trusted_proxies)
+            {
+                request_scheme = forwarded_scheme;
+            }
             let real_ip_header_val =
                 state
                     .env_config
@@ -16619,10 +17268,7 @@ async fn handle_proxy_request_inner(
         None => None,
     };
     let request_authority = raw_host.and_then(|authority| {
-        normalize_request_authority_for_signing(
-            authority,
-            Some(if is_tls { "https" } else { "http" }),
-        )
+        normalize_request_authority_for_signing(authority, Some(request_scheme))
     });
     ctx.request_authority = request_authority;
 
@@ -17903,18 +18549,21 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
-    // Strip plugin-controlled identity headers and inject only the gateway's
-    // authenticated values. The common no-header/no-principal path avoids
-    // materializing an owned header map.
-    let source_has_reserved_identity = owned_proxy_headers.as_ref().is_some_and(|headers| {
-        headers.keys().any(|name| {
-            name.eq_ignore_ascii_case("x-consumer-username")
-                || name.eq_ignore_ascii_case("x-consumer-custom-id")
-        })
+    // Strip plugin-controlled gateway assertions and inject only the
+    // authenticated principal and private GeoIP result. The common
+    // no-assertion path avoids materializing an owned header map.
+    let effective_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    let source_has_reserved_assertion = effective_headers.keys().any(|name| {
+        name.eq_ignore_ascii_case("x-consumer-username")
+            || name.eq_ignore_ascii_case("x-consumer-custom-id")
+            || name.eq_ignore_ascii_case("x-geo-country")
     });
-    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
+    if ctx.backend_consumer_username().is_some()
+        || ctx.backend_geo_country().is_some()
+        || source_has_reserved_assertion
+    {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        refresh_backend_consumer_identity_headers(&ctx, headers);
+        refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
     // Egress baggage strip — operator-configured key prefixes are removed
     // from the outbound `baggage` header. Default empty list is a no-op.
@@ -18067,9 +18716,9 @@ async fn handle_proxy_request_inner(
         ctx.path = backend_ctx_path;
         if matches!(deferred_result, PluginResult::Continue) {
             // A deferred routing function can return arbitrary headers.
-            // Restore gateway-owned identity and reapply the egress baggage
+            // Restore gateway-owned assertions and reapply the egress baggage
             // policy before those headers can reach any backend transport.
-            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            refresh_effective_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
                 &ctx.headers,
@@ -18117,7 +18766,7 @@ async fn handle_proxy_request_inner(
             ctx.path = backend_ctx_path;
         }
         if matches!(deferred_result, PluginResult::Continue) {
-            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            refresh_effective_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
                 &ctx.headers,
@@ -18614,6 +19263,7 @@ async fn handle_proxy_request_inner(
                     }
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
+                    ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
                     if let Some(body) = request_body {
                         ctx.metadata.insert("request_body".to_string(), body);
                     }
@@ -18676,12 +19326,6 @@ async fn handle_proxy_request_inner(
     // Early-prepared bodies already ran both hook phases above.
     let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
         .then(|| ctx.clone_for_final_request_body_hooks());
-    // Keep only the independently owned header map borrowed across dispatch.
-    // When no owned map exists, borrow `ctx.headers` at each use so final-body
-    // deadline provenance can still update the rest of `ctx` without cloning
-    // the hot-path request headers.
-    let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
-
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
     // (plaintext `http` or TLS `https`) can serve WebSocket upgrades; the
@@ -18736,7 +19380,14 @@ async fn handle_proxy_request_inner(
             }
         };
         let requires_websocket_framing = plugin_cache_view.requires_ws_frame_hooks();
-        let websocket_proxy_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
+        let mut websocket_proxy_headers =
+            owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        apply_effective_backend_scheme_headers(
+            &mut websocket_proxy_headers,
+            &ctx.client_ip,
+            ctx.request_is_secure,
+            state.add_forwarded_header,
+        );
         return handle_websocket_request_authenticated(
             request,
             state,
@@ -18827,6 +19478,17 @@ async fn handle_proxy_request_inner(
             )
         });
     if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
+        {
+            let grpc_proxy_headers = owned_proxy_headers.as_mut().unwrap_or(&mut ctx.headers);
+            apply_effective_backend_scheme_headers(
+                grpc_proxy_headers,
+                &ctx.client_ip,
+                ctx.request_is_secure,
+                state.add_forwarded_header,
+            );
+        }
+        let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
+
         // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
         // branch cannot dispatch over its secured transport (issue #2003):
         //   * CROSS-CLUSTER east-west targets (Ambient `mesh.hbone` or Sidecar
@@ -19194,6 +19856,7 @@ async fn handle_proxy_request_inner(
                 // it). Disjoint field assignments avoid a whole-`ctx` borrow.
                 let request_body = ctx.metadata.remove("request_body");
                 ctx.metadata = body_hook_ctx.metadata;
+                ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
                 if let Some(body) = request_body {
                     ctx.metadata.insert("request_body".to_string(), body);
                 }
@@ -20378,6 +21041,7 @@ async fn handle_proxy_request_inner(
                         error_class: final_error_class,
                         bytes_sent,
                         metadata,
+                        ai_usage_export: ctx.ai_usage_export.clone(),
                         ..TransactionSummary::default()
                     };
                     if body_exceeded {
@@ -20780,6 +21444,7 @@ async fn handle_proxy_request_inner(
                         response_status,
                         &mut plugin_response_headers,
                         &mut response_body,
+                        initial_response_header_policy_plugins.as_ref(),
                     )
                     .await;
                     for plugin in plugins.iter() {
@@ -21075,6 +21740,24 @@ async fn handle_proxy_request_inner(
                                 v.push_str(&cookie_val);
                             })
                             .or_insert(cookie_val);
+                        // Record the gateway-authored affinity cookie in deadline
+                        // provenance: it is injected here (not by a plugin
+                        // mutation), so a later response-committed hook that
+                        // exhausts the RPC deadline would otherwise rebuild the
+                        // DEADLINE_EXCEEDED response without it and the client
+                        // would not stay pinned. Line-granular recording keeps
+                        // any co-present backend cookie out of gateway output.
+                        //
+                        // This is an APPEND, so it deliberately does not declare
+                        // ownership: ownership means whole-value replacement and
+                        // retires the backend cookie baseline, which here would
+                        // credit a co-present backend cookie as gateway output.
+                        // The injection always changes the field (`or_insert`
+                        // into an absent slot, or `and_modify` adding a line), so
+                        // mutation tracking sees it unconditionally, and the
+                        // occurrence partition credits the affinity line even
+                        // when it is byte-identical to a backend cookie.
+                        ctx.record_deadline_response_header_mutations(&response_headers);
                     }
                 }
 
@@ -21145,6 +21828,7 @@ async fn handle_proxy_request_inner(
                         bytes_sent,
                         bytes_received,
                         metadata: clone_log_metadata(&ctx),
+                        ai_usage_export: ctx.ai_usage_export.clone(),
                         ..TransactionSummary::default()
                     };
                     crate::plugins::log_with_mirror_before_buffered_response(
@@ -21327,6 +22011,7 @@ async fn handle_proxy_request_inner(
                             error_class: Some(grpc_error_class),
                             bytes_sent,
                             metadata,
+                            ai_usage_export: ctx.ai_usage_export.clone(),
                             ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror_before_buffered_response(
@@ -21382,6 +22067,12 @@ async fn handle_proxy_request_inner(
             }
         }
     }
+
+    // Keep only the independently owned header map borrowed across the
+    // selected generic dispatch. When no owned map exists, borrow
+    // `ctx.headers` at each use so final-body deadline provenance can still
+    // update the rest of `ctx` without cloning the hot-path request headers.
+    let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
 
     // Build backend URL (using upstream target if available)
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
@@ -21693,7 +22384,7 @@ async fn handle_proxy_request_inner(
             request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
-            is_tls,
+            ctx.request_is_secure,
             false,
             false,
             current_dispatch_h3,
@@ -21711,6 +22402,7 @@ async fn handle_proxy_request_inner(
             // Disjoint field assignments avoid a whole-`ctx` borrow.
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
             if let Some(body) = request_body {
                 ctx.metadata.insert("request_body".to_string(), body);
             }
@@ -22039,7 +22731,7 @@ async fn handle_proxy_request_inner(
                     &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
-                    is_tls,
+                    ctx.request_is_secure,
                     inbound_version,
                 )
                 .await
@@ -22057,7 +22749,7 @@ async fn handle_proxy_request_inner(
                     &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
-                    is_tls,
+                    ctx.request_is_secure,
                     inbound_version,
                 )
                 .await
@@ -22101,7 +22793,7 @@ async fn handle_proxy_request_inner(
             request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
-            is_tls,
+            ctx.request_is_secure,
             current_dispatch_hbone,
             current_dispatch_mesh_mtls,
             current_dispatch_h3,
@@ -22119,6 +22811,7 @@ async fn handle_proxy_request_inner(
             // Disjoint field assignments avoid a whole-`ctx` borrow.
             let request_body = ctx.metadata.remove("request_body");
             ctx.metadata = body_hook_ctx.metadata;
+            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
             if let Some(body) = request_body {
                 ctx.metadata.insert("request_body".to_string(), body);
             }
@@ -22461,6 +23154,7 @@ async fn handle_proxy_request_inner(
     // intentionally remain after on_response_body.
     if !after_proxy_rejected
         && !plugins.is_empty()
+        && crate::plugins::response_body_rewrite_allowed(response_status)
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
@@ -22470,6 +23164,7 @@ async fn handle_proxy_request_inner(
             response_status,
             &mut response_headers,
             data,
+            initial_response_header_policy_plugins.as_ref(),
         )
         .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -22528,6 +23223,7 @@ async fn handle_proxy_request_inner(
     // JSON fields in the response body before it is sent to the client.
     if !after_proxy_rejected
         && !plugins.is_empty()
+        && crate::plugins::response_body_rewrite_allowed(response_status)
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
@@ -22617,6 +23313,13 @@ async fn handle_proxy_request_inner(
                     v.push_str(&cookie_val);
                 })
                 .or_insert(cookie_val);
+            // Record the gateway-authored affinity cookie in deadline provenance
+            // before the committed-hook phase can exhaust the RPC deadline and
+            // rebuild the response from gateway-owned output only. Line-granular
+            // recording keeps any co-present backend cookie out of gateway output.
+            // An APPEND, so it records mutations rather than declaring ownership
+            // (which means whole-value replacement) — see the sibling site above.
+            ctx.record_deadline_response_header_mutations(&response_headers);
         }
     }
 
@@ -22759,6 +23462,7 @@ async fn handle_proxy_request_inner(
                 bytes_sent,
                 bytes_received: bytes_received_buffered,
                 metadata: clone_log_metadata(&ctx),
+                ai_usage_export: ctx.ai_usage_export.clone(),
                 ..TransactionSummary::default()
             };
 
@@ -23888,7 +24592,7 @@ pub(crate) async fn proxy_to_backend_retry(
     request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
     // Honor DestinationRule per-port `connect_timeout_ms` overrides for this
@@ -24065,7 +24769,7 @@ pub(crate) async fn proxy_to_backend_retry(
         xff_append_ip,
         &state.trusted_proxies,
     );
-    let proto_str = if is_tls { "https" } else { "http" };
+    let proto_str = if request_is_secure { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
@@ -24697,7 +25401,7 @@ async fn proxy_to_backend(
     request_body_prepared: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     dispatch_hbone: bool,
     dispatch_mesh_mtls: bool,
     dispatch_h3: bool,
@@ -24833,7 +25537,7 @@ async fn proxy_to_backend(
             stream_response,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
         )
@@ -24919,7 +25623,7 @@ async fn proxy_to_backend(
             stream_response,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             resolved_ip.clone(),
             ctx_bytes_sent_observed,
         )
@@ -24989,7 +25693,7 @@ async fn proxy_to_backend(
             upstream_target,
             client_ip,
             xff_append_ip,
-            is_tls,
+            request_is_secure,
             inbound_version,
             stream_request_body,
             retain_request_body,
@@ -25232,7 +25936,7 @@ async fn proxy_to_backend(
                         stream_response,
                         client_ip,
                         xff_append_ip,
-                        is_tls,
+                        request_is_secure,
                         resolved_ip,
                         ctx_bytes_sent_observed,
                     )
@@ -25428,7 +26132,7 @@ async fn proxy_to_backend(
         xff_append_ip,
         &state.trusted_proxies,
     );
-    let proto_str = if is_tls { "https" } else { "http" };
+    let proto_str = if request_is_secure { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
@@ -26616,7 +27320,7 @@ fn normalize_authority_for_consistency(value: &str, scheme: Option<&str>) -> Opt
 /// Canonicalize a validated Host/`:authority` value for request signatures.
 /// Default ports are omitted so equivalent HTTP authorities have one signing
 /// representation; non-default ports and bracketed IPv6 literals are retained.
-pub(crate) fn normalize_request_authority_for_signing(
+pub fn normalize_request_authority_for_signing(
     value: &str,
     scheme: Option<&str>,
 ) -> Option<String> {
@@ -27300,7 +28004,7 @@ async fn proxy_to_backend_hbone(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (
@@ -27733,7 +28437,7 @@ async fn proxy_to_backend_hbone(
         "hbone",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -27756,7 +28460,7 @@ async fn proxy_to_backend_hbone(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -27999,7 +28703,7 @@ async fn proxy_to_backend_mesh_mtls(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (
@@ -28659,7 +29363,7 @@ async fn proxy_to_backend_mesh_mtls(
         "mesh_mtls",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -28682,7 +29386,7 @@ async fn proxy_to_backend_mesh_mtls(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -29107,7 +29811,7 @@ async fn proxy_to_backend_http2(
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     resolved_ip: Option<String>,
     // Shared counter for request body bytes. The H2 direct pool forwards
     // the body via hyper without the reqwest adapter layer, so we wrap
@@ -29245,7 +29949,7 @@ async fn proxy_to_backend_http2(
         "direct_h2",
         "generated_x_forwarded_proto",
         "x-forwarded-proto",
-        if is_tls { "https" } else { "http" },
+        if request_is_secure { "https" } else { "http" },
     );
     if let Some(host) = headers.get("host") {
         insert_outbound_header_or_warn(
@@ -29268,7 +29972,7 @@ async fn proxy_to_backend_http2(
         );
     }
     if state.add_forwarded_header {
-        let proto_str = if is_tls { "https" } else { "http" };
+        let proto_str = if request_is_secure { "https" } else { "http" };
         let fwd = build_forwarded_value(
             client_ip,
             proto_str,
@@ -29458,7 +30162,7 @@ struct Http3BackendHeaderContext<'a> {
     client_ip: &'a str,
     xff_append_ip: &'a str,
     effective_host: &'a str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
     content_length: Option<&'a str>,
 }
@@ -29531,7 +30235,11 @@ fn build_http3_backend_headers(
     if let Ok(v) = xff.parse() {
         http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
     }
-    let proto = if ctx.is_tls { "https" } else { "http" };
+    let proto = if ctx.request_is_secure {
+        "https"
+    } else {
+        "http"
+    };
     if let Ok(v) = proto.parse() {
         http3_headers.push((
             hyper::header::HeaderName::from_static("x-forwarded-proto"),
@@ -29588,7 +30296,7 @@ async fn proxy_to_backend_http3(
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
     stream_request_body: bool,
     retain_request_body: bool,
@@ -29685,7 +30393,7 @@ async fn proxy_to_backend_http3(
                         client_ip,
                         xff_append_ip,
                         effective_host,
-                        is_tls,
+                        request_is_secure,
                         inbound_version,
                         content_length: headers.get("content-length").map(String::as_str),
                     },
@@ -30045,7 +30753,7 @@ async fn proxy_to_backend_http3(
             client_ip,
             xff_append_ip,
             effective_host,
-            is_tls,
+            request_is_secure,
             inbound_version,
             content_length: request_content_length.as_deref(),
         },
@@ -30673,7 +31381,7 @@ async fn proxy_to_backend_http3_retry(
     request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
-    is_tls: bool,
+    request_is_secure: bool,
     inbound_version: hyper::Version,
 ) -> retry::BackendResponse {
     // reqwest dispatch receives `upstream_target` separately, so it only
@@ -30721,7 +31429,7 @@ async fn proxy_to_backend_http3_retry(
             client_ip,
             xff_append_ip,
             effective_host,
-            is_tls,
+            request_is_secure,
             inbound_version,
             content_length: None,
         },
@@ -32127,6 +32835,8 @@ mod tests {
         should_buffer: bool,
     }
 
+    struct SyntheticBodyTransformPlugin;
+
     struct SyntheticNormalizationProbePlugin;
 
     struct HeadSkippingSyntheticGuardPlugin;
@@ -32153,6 +32863,26 @@ mod tests {
 
         fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
             self.should_buffer
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for SyntheticBodyTransformPlugin {
+        fn name(&self) -> &str {
+            "synthetic_body_transform"
+        }
+
+        fn requires_response_body_buffering(&self) -> bool {
+            true
+        }
+
+        async fn transform_response_body(
+            &self,
+            _body: &[u8],
+            _content_type: Option<&str>,
+            _response_headers: &HashMap<String, String>,
+        ) -> Option<Vec<u8>> {
+            Some(b"transformed application response".to_vec())
         }
     }
 
@@ -32937,6 +33667,64 @@ mod tests {
         assert_eq!(
             ctx.metadata.get("test:committed_body").map(String::as_str),
             Some(r#"{"error":"blocked"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_serverless_non_2xx_runs_synthetic_body_transforms() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(SyntheticBodyTransformPlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/invoke".to_string(),
+        );
+        ctx.serverless_terminate_response = true;
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 429,
+            body: bytes::Bytes::from_static(b"original function error"),
+            headers: HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("etag".to_string(), "\"function-v1\"".to_string()),
+                ("content-digest".to_string(), "sha-256=:stale:".to_string()),
+            ]),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.body, b"transformed application response");
+        assert!(!response.headers.contains_key("etag"));
+        assert!(!response.headers.contains_key("content-digest"));
+        assert_eq!(
+            response.headers.get("content-length").map(String::as_str),
+            Some("32")
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_non_2xx_reject_does_not_run_synthetic_body_transforms() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(SyntheticBodyTransformPlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/invoke".to_string(),
+        );
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 429,
+            body: bytes::Bytes::from_static(b"ordinary gateway rejection"),
+            headers: HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("etag".to_string(), "\"gateway-v1\"".to_string()),
+            ]),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.body, b"ordinary gateway rejection");
+        assert_eq!(
+            response.headers.get("etag").map(String::as_str),
+            Some("\"gateway-v1\"")
         );
     }
 
@@ -34226,7 +35014,7 @@ mod tests {
                 false, // request_body_prepared
                 "127.0.0.1",
                 "127.0.0.1",
-                false, // is_tls
+                false, // request_is_secure
                 false, // dispatch_hbone
                 false, // dispatch_mesh_mtls
                 false, // dispatch_h3
@@ -34411,7 +35199,7 @@ mod tests {
                 client_ip: "203.0.113.44",
                 xff_append_ip: "127.0.0.1",
                 effective_host: "backend.internal",
-                is_tls: false,
+                request_is_secure: false,
                 inbound_version: hyper::Version::HTTP_11,
                 content_length: None,
             },
@@ -34459,7 +35247,7 @@ mod tests {
                 client_ip: "203.0.113.9",
                 xff_append_ip: "10.0.0.7",
                 effective_host: "h3-backend.example",
-                is_tls: true,
+                request_is_secure: true,
                 inbound_version: hyper::Version::HTTP_2,
                 content_length: None,
             },
@@ -34946,7 +35734,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_identity_headers_override_client_supplied_values() {
+    fn websocket_gateway_assertions_override_mutable_values() {
         let mut headers = vec![
             ("x-consumer-username".to_string(), "spoofed".to_string()),
             (
@@ -34957,6 +35745,7 @@ mod tests {
                 "x-consumer-custom-id".to_string(),
                 "spoofed-custom".to_string(),
             ),
+            ("X-Geo-Country".to_string(), "ATTACKER".to_string()),
             ("x-request-id".to_string(), "req-1".to_string()),
         ];
 
@@ -34970,6 +35759,7 @@ mod tests {
             "x-consumer-custom-id",
             "trusted-custom".to_string(),
         );
+        push_forwardable_header_override(&mut headers, "x-geo-country", "SE".to_string());
 
         let usernames: Vec<&str> = headers
             .iter()
@@ -34985,9 +35775,17 @@ mod tests {
                     .then_some(value.as_str())
             })
             .collect();
+        let countries: Vec<&str> = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("x-geo-country")
+                    .then_some(value.as_str())
+            })
+            .collect();
 
         assert_eq!(usernames, vec!["trusted-user"]);
         assert_eq!(custom_ids, vec!["trusted-custom"]);
+        assert_eq!(countries, vec!["SE"]);
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
         }));

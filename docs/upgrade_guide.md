@@ -476,6 +476,25 @@ FERRUM_MODE=file \
 
 New Ferrum versions may introduce new `FERRUM_*` environment variables. Review `ferrum.conf` in the release for new defaults.
 
+### Process Logging Buffer Bounds
+
+The process logging writer now defaults to 4,096 admitted records per sink
+instead of the former 128,000-line channel and adds a 32 MiB aggregate byte
+budget plus a 64 KiB per-record limit. Stdout runtime events and
+`stdout_logging` access records share one sink; stderr has an independent sink
+with the same bounds. Existing `FERRUM_LOG_BUFFER_CAPACITY=128000` settings are
+applied as 65,536, the current maximum, and emit a startup warning rather than
+being changed silently.
+
+Admission still reserves the maximum record size before serializing untrusted
+data. After serialization succeeds, the reservation shrinks to the actual
+record length and remains charged until the worker finishes writing it. Size
+`FERRUM_LOG_BUFFER_CAPACITY` and `FERRUM_LOG_BUFFER_BYTES` together: raising the
+record limit is ineffective if actual outstanding bytes plus the provisional
+maximum-record reservation reach the byte budget first. Monitor the
+authenticated log-sink diagnostics and `ferrum_log_sink_*` metrics before and
+after rollout for saturation, oversize, writer, flush, and drain failures.
+
 ### Logging Metadata Redaction
 
 Transaction metadata is redacted at serialization time before any built-in logger sink writes it. Keys matching built-in sensitive substrings such as `authorization`, `cookie`, `password`, `secret`, or `token` now serialize as `[REDACTED]`; use `FERRUM_LOG_REDACT_METADATA_KEYS` to add operator-specific substrings. The in-memory metadata map is unchanged for plugin logic.

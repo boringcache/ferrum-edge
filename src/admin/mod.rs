@@ -36,9 +36,11 @@ use crate::admin::backup::{
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
-    BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
-    NamespaceResourceCounts, SnapshotDataIntegrityError, classify_atomic_clear_verification,
-    is_mtls_dns_admission_unavailable,
+    BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
+    MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE, NamespaceResourceCounts, PROXY_ROUTE_CONFLICT_ERROR,
+    SnapshotDataIntegrityError, classify_atomic_clear_verification,
+    is_mtls_dns_admission_unavailable, mtls_dns_identity_conflict,
+    tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
@@ -66,6 +68,61 @@ pub struct CachedDbHealthResult {
 
 /// Duration for which a DB health check result is reused.
 const DB_HEALTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Bound on a single `/health`-driven database probe. A hung dependency must
+/// not hold the single-flight refresh lock (or the readiness signal) hostage;
+/// `SELECT 1` on a healthy path is sub-second.
+const DB_HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Return the cached DB connectivity signal, refreshing it when the entry is
+/// missing or older than `cache_ttl`. Fresh-cache hits are lock-free; on an
+/// empty or expired entry at most one caller invokes `probe_factory`
+/// (single-flight) while concurrent callers wait for and then share that
+/// result. Keeping the probe lazy avoids constructing an async-trait boxed
+/// future on either fresh-cache path. Probe failures and timeouts cache
+/// `false`, preserving the previous per-request error semantics.
+pub async fn cached_db_health_connected<P, F, E>(
+    cache: &ArcSwap<Option<CachedDbHealthResult>>,
+    refresh_lock: &tokio::sync::Mutex<()>,
+    cache_ttl: std::time::Duration,
+    probe_timeout: std::time::Duration,
+    probe_factory: P,
+) -> bool
+where
+    P: FnOnce() -> F,
+    F: std::future::Future<Output = Result<(), E>>,
+{
+    if let Some(entry) = &**cache.load()
+        && entry.checked_at.elapsed() < cache_ttl
+    {
+        return entry.connected;
+    }
+    let _guard = refresh_lock.lock().await;
+    // Re-check after acquiring: a concurrent caller may have completed the
+    // refresh while we waited, in which case its result is shared without a
+    // second probe.
+    if let Some(entry) = &**cache.load()
+        && entry.checked_at.elapsed() < cache_ttl
+    {
+        return entry.connected;
+    }
+    let connected = match tokio::time::timeout(probe_timeout, probe_factory()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_error)) => {
+            warn_persistence_failure_redacted("admin_health_database_query");
+            false
+        }
+        Err(_elapsed) => {
+            warn_persistence_failure_redacted("admin_health_database_query_timeout");
+            false
+        }
+    };
+    cache.store(Arc::new(Some(CachedDbHealthResult {
+        connected,
+        checked_at: Instant::now(),
+    })));
+    connected
+}
 
 /// Authorization policy for the observability scrape surfaces — `/metrics`, and
 /// the *detailed* views of `/health` and `/overload`.
@@ -241,6 +298,10 @@ pub struct AdminState {
     /// Cached DB health check result to avoid hitting the database on every
     /// `/health` request. Shared across clones via `Arc<ArcSwap<_>>`.
     pub cached_db_health: Arc<ArcSwap<Option<CachedDbHealthResult>>>,
+    /// Single-flight lock serializing refreshes of `cached_db_health`. Shared
+    /// across clones via `Arc` so at most one `/health`-driven database probe
+    /// runs per refresh window process-wide; fresh-cache hits never touch it.
+    pub db_health_refresh: Arc<tokio::sync::Mutex<()>>,
     /// Registry of connected DP nodes (CP mode only).
     pub dp_registry: Option<Arc<DpNodeRegistry>>,
     /// Registry of connected mesh config-stream nodes (CP mode only).
@@ -800,9 +861,10 @@ fn tls_route_required_role(method: &Method, segments: &[&str]) -> Option<AdminRo
     }
 }
 
-pub(crate) fn log_audit_enqueue_failure(error: &anyhow::Error) {
+pub(crate) fn log_audit_enqueue_failure(_error: &anyhow::Error) {
     warn!(
-        error = %error,
+        surface = "audit_enqueue",
+        detail_withheld = true,
         "Admin mutation persisted but audit event was not enqueued"
     );
 }
@@ -995,53 +1057,25 @@ pub async fn handle_admin_request(
 
     // Health check (unauthenticated)
     if path == "/health" || path == "/status" {
+        let detailed = observability_detail_allowed(&state, auth_header.as_deref(), &client_ip);
         let mut health_status = json!({
             "status": "ok",
             "timestamp": Utc::now().to_rfc3339(),
             "mode": state.mode
         });
 
-        // Check database connectivity if available (cached for 15s)
+        // Check database connectivity if available (cached for 15s; refreshes
+        // are single-flight so concurrent unauthenticated requests on an empty
+        // or expired cache cannot stampede the database pool)
         if let Some(db) = &state.db {
-            let cached = state.cached_db_health.load();
-            let db_connected = if let Some(ref entry) = **cached {
-                if entry.checked_at.elapsed() < DB_HEALTH_CACHE_TTL {
-                    // Cache hit — reuse the previous result
-                    entry.connected
-                } else {
-                    // Cache expired — re-check
-                    let connected = match db.health_check().await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            warn!("Health check database query failed: {}", e);
-                            false
-                        }
-                    };
-                    state
-                        .cached_db_health
-                        .store(Arc::new(Some(CachedDbHealthResult {
-                            connected,
-                            checked_at: Instant::now(),
-                        })));
-                    connected
-                }
-            } else {
-                // No cached result yet — first call
-                let connected = match db.health_check().await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        warn!("Health check database query failed: {}", e);
-                        false
-                    }
-                };
-                state
-                    .cached_db_health
-                    .store(Arc::new(Some(CachedDbHealthResult {
-                        connected,
-                        checked_at: Instant::now(),
-                    })));
-                connected
-            };
+            let db_connected = cached_db_health_connected(
+                &state.cached_db_health,
+                &state.db_health_refresh,
+                DB_HEALTH_CACHE_TTL,
+                DB_HEALTH_PROBE_TIMEOUT,
+                || db.health_check(),
+            )
+            .await;
 
             if db_connected {
                 let mut db_info = json!({
@@ -1180,6 +1214,15 @@ pub async fn handle_admin_request(
             });
         }
 
+        // Sink internals are authenticated detail. The minimal health body
+        // below deliberately omits queue sizes, loss counters, and failure
+        // timestamps while operators using the established observability auth
+        // paths can diagnose stdout/stderr independently.
+        if detailed {
+            health_status["logging"] =
+                serde_json::to_value(crate::logging::snapshot()).unwrap_or_default();
+        }
+
         let response_code = if !ready {
             // Distinguish "never became ready" (still starting up) from "was
             // ready, then a serving listener died after startup" (degraded).
@@ -1203,7 +1246,7 @@ pub async fn handle_admin_request(
         // receives only liveness + readiness, which is enough to drive health
         // checks without leaking operational internals. Authorized callers
         // (admin JWT / metrics token / allowlisted CIDR) get the full body.
-        if observability_detail_allowed(&state, auth_header.as_deref(), &client_ip) {
+        if detailed {
             return Ok(json_response(response_code, &health_status));
         }
         let minimal = json!({
@@ -1264,6 +1307,7 @@ pub async fn handle_admin_request(
         let inventory = tls_management::collect_inventory(&state);
         registry.refresh_tls_certificate_inventory(&inventory);
         let mut metrics_output = registry.render();
+        metrics_output.push_str(&crate::logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
         let resp = Response::builder()
             .status(StatusCode::OK)
@@ -2750,12 +2794,8 @@ async fn acquire_credential_namespace_admission(
 ) -> Result<crud::NamespaceConfigAdmissionGuard, Response<Full<Bytes>>> {
     crud::lock_namespace_config_admission(db, namespace)
         .await
-        .map_err(|error| {
-            warn!(
-                namespace = %namespace,
-                %error,
-                "Credential namespace config admission could not be acquired"
-            );
+        .map_err(|_error| {
+            warn_persistence_failure_redacted("credential_namespace_admission_acquire");
             mtls_dns_admission_unavailable_response()
         })
 }
@@ -2873,12 +2913,8 @@ async fn persist_consumer_update(
         return *response;
     }
     consumer.updated_at = Utc::now();
-    if let Err(error) = namespace_admission.ensure_held() {
-        warn!(
-            namespace = %consumer.namespace,
-            %error,
-            "Credential namespace config admission was lost before persistence"
-        );
+    if let Err(_error) = namespace_admission.ensure_held() {
+        warn_persistence_failure_redacted("credential_namespace_admission_before_persist");
         return mtls_dns_admission_unavailable_response();
     }
     let persistence = match namespace_admission
@@ -2886,14 +2922,12 @@ async fn persist_consumer_update(
         .await
     {
         Ok(crud::NamespaceConfigAdmissionCompletion::Held(result)) => result,
-        Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+        Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
             Ok(true) => {
                 let lost_generation = namespace_admission.generation();
-                if let Err(release_error) = admission.release_guard().await {
-                    error!(
-                        namespace = %consumer.namespace,
-                        %release_error,
-                        "Credential mTLS admission guard could not be released before namespace recovery"
+                if let Err(_release_error) = admission.release_guard().await {
+                    error_persistence_failure_redacted(
+                        "credential_mtls_guard_release_before_recovery",
                     );
                     return mtls_dns_admission_unavailable_response();
                 }
@@ -2909,19 +2943,14 @@ async fn persist_consumer_update(
                 {
                     Ok(true) => Ok(true),
                     Ok(false) => {
-                        warn!(
-                            namespace = %consumer.namespace,
-                            %error,
-                            "Credential namespace admission was lost during persistence; the late write was compensated"
+                        warn_persistence_failure_redacted(
+                            "credential_namespace_admission_lost_compensated",
                         );
                         return mtls_dns_admission_unavailable_response();
                     }
-                    Err(recovery_error) => {
-                        error!(
-                            namespace = %consumer.namespace,
-                            %error,
-                            %recovery_error,
-                            "Credential namespace admission was lost during persistence and recovery failed"
+                    Err(_recovery_error) => {
+                        error_persistence_failure_redacted(
+                            "credential_namespace_admission_recovery",
                         );
                         return mtls_dns_admission_unavailable_response();
                     }
@@ -2929,12 +2958,8 @@ async fn persist_consumer_update(
             }
             other => other,
         },
-        Err(error) => {
-            warn!(
-                namespace = %consumer.namespace,
-                %error,
-                "Credential namespace config admission was lost before persistence"
-            );
+        Err(_error) => {
+            warn_persistence_failure_redacted("credential_namespace_admission_before_persist");
             return mtls_dns_admission_unavailable_response();
         }
     };
@@ -3171,11 +3196,9 @@ impl Drop for MtlsDnsAdmissionGuardLifecycle {
                 .await
                 {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => error!(
-                        namespace = %namespace,
-                        error = %error,
-                        "mTLS DNS admission guard cancellation cleanup failed"
-                    ),
+                    Ok(Err(_error)) => {
+                        error_persistence_failure_redacted("mtls_admission_guard_drop_cleanup");
+                    }
                     Err(_) => error!(
                         namespace = %namespace,
                         "mTLS DNS admission guard cancellation cleanup timed out"
@@ -3234,22 +3257,14 @@ where
 {
     let mut guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db, namespace).await {
         Ok(guard) => guard,
-        Err(error) => {
-            warn!(
-                namespace = %namespace,
-                error = %error,
-                "mTLS DNS admission guard could not be acquired"
-            );
+        Err(_error) => {
+            warn_persistence_failure_redacted("mtls_admission_guard_acquire");
             return mtls_dns_admission_unavailable_response();
         }
     };
     let response = operation(guard.operation()).await;
-    if let Err(error) = guard.release().await {
-        error!(
-            namespace = %namespace,
-            error = %error,
-            "mTLS DNS admission guard retained after credential operation; manual recovery may be required"
-        );
+    if let Err(_error) = guard.release().await {
+        error_persistence_failure_redacted("mtls_admission_guard_release");
     }
     response
 }
@@ -3523,11 +3538,38 @@ async fn validate_batch_route_override_conflicts(
     Ok(())
 }
 
-fn payload_persist_error_message(error: &anyhow::Error) -> String {
+const DATABASE_OPERATION_FAILED_MESSAGE: &str = "Database unavailable — operation failed";
+pub(crate) const RESOURCE_IDENTITY_CONFLICT_MESSAGE: &str =
+    "Resource identity conflicts with an existing resource in the namespace";
+const CONFIG_ADMISSION_UNAVAILABLE_MESSAGE: &str = "Config admission unavailable";
+const NAMESPACE_ADMISSION_LOST_MESSAGE: &str =
+    "Namespace config admission was lost during persistence";
+
+/// Sanitize a batch/restore persistence error before it reaches an admin
+/// response. Internally constructed conflict messages (mTLS DNS identity,
+/// tcp_connection_throttle attachment, proxy route conflicts) are safe to
+/// surface; driver-provided strings are classified and replaced so schema,
+/// constraint, and backend details never reach the wire or the admin log.
+pub(crate) fn payload_persist_error_message(error: &anyhow::Error) -> String {
     if is_mtls_dns_admission_unavailable(error) {
-        MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
+        return MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string();
+    }
+    if let Some(conflict) = mtls_dns_identity_conflict(error) {
+        // Render the typed conflict, not the chain's outermost message, so
+        // driver context wrapped above it can never reach the wire.
+        return conflict.to_string();
+    }
+    if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
+        return conflict.errors().join("; ");
+    }
+    // Classification walks the chain because stores wrap driver errors with
+    // their own context; rendering stays on constants and static strings.
+    if chain_has_proxy_route_conflict(error) {
+        PROXY_ROUTE_CONFLICT_ERROR.to_string()
+    } else if chain_has_unique_constraint_violation(error) {
+        RESOURCE_IDENTITY_CONFLICT_MESSAGE.to_string()
     } else {
-        error.to_string()
+        redacted_persistence_error_message("batch_persist", error).to_string()
     }
 }
 
@@ -3640,7 +3682,14 @@ async fn rollback_failed_batch_create(
             match db.get_proxy(namespace, &proxy.id).await {
                 Ok(Some(current)) if current.updated_at == proxy.updated_at => {
                     if let Err(error) = db.delete_proxy(namespace, &proxy.id).await {
-                        errors.push(format!("proxy '{}': {}", proxy.id, error));
+                        errors.push(format!(
+                            "proxy '{}': {}",
+                            proxy.id,
+                            redacted_persistence_error_message(
+                                "batch_rollback_delete_proxy",
+                                &error
+                            )
+                        ));
                     }
                 }
                 Ok(Some(_)) => errors.push(format!(
@@ -3648,7 +3697,11 @@ async fn rollback_failed_batch_create(
                     proxy.id
                 )),
                 Ok(None) => {}
-                Err(error) => errors.push(format!("proxy '{}': {}", proxy.id, error)),
+                Err(error) => errors.push(format!(
+                    "proxy '{}': {}",
+                    proxy.id,
+                    redacted_persistence_error_message("batch_rollback_load_proxy", &error)
+                )),
             }
         }
     }
@@ -3665,7 +3718,14 @@ async fn rollback_failed_batch_create(
                 Ok(Some(current)) if current.updated_at == plugin_config.updated_at => {
                     if let Err(error) = db.delete_plugin_config(namespace, &plugin_config.id).await
                     {
-                        errors.push(format!("plugin_config '{}': {}", plugin_config.id, error));
+                        errors.push(format!(
+                            "plugin_config '{}': {}",
+                            plugin_config.id,
+                            redacted_persistence_error_message(
+                                "batch_rollback_delete_plugin_config",
+                                &error,
+                            )
+                        ));
                     }
                 }
                 Ok(Some(_)) => errors.push(format!(
@@ -3674,7 +3734,14 @@ async fn rollback_failed_batch_create(
                 )),
                 Ok(None) => {}
                 Err(error) => {
-                    errors.push(format!("plugin_config '{}': {}", plugin_config.id, error));
+                    errors.push(format!(
+                        "plugin_config '{}': {}",
+                        plugin_config.id,
+                        redacted_persistence_error_message(
+                            "batch_rollback_load_plugin_config",
+                            &error,
+                        )
+                    ));
                 }
             }
         }
@@ -3684,7 +3751,14 @@ async fn rollback_failed_batch_create(
             match db.get_consumer(namespace, &consumer.id).await {
                 Ok(Some(current)) if current.updated_at == consumer.updated_at => {
                     if let Err(error) = db.delete_consumer(namespace, &consumer.id).await {
-                        errors.push(format!("consumer '{}': {}", consumer.id, error));
+                        errors.push(format!(
+                            "consumer '{}': {}",
+                            consumer.id,
+                            redacted_persistence_error_message(
+                                "batch_rollback_delete_consumer",
+                                &error,
+                            )
+                        ));
                     }
                 }
                 Ok(Some(_)) => errors.push(format!(
@@ -3692,7 +3766,11 @@ async fn rollback_failed_batch_create(
                     consumer.id
                 )),
                 Ok(None) => {}
-                Err(error) => errors.push(format!("consumer '{}': {}", consumer.id, error)),
+                Err(error) => errors.push(format!(
+                    "consumer '{}': {}",
+                    consumer.id,
+                    redacted_persistence_error_message("batch_rollback_load_consumer", &error)
+                )),
             }
         }
     }
@@ -3701,7 +3779,14 @@ async fn rollback_failed_batch_create(
             match db.get_upstream(namespace, &upstream.id).await {
                 Ok(Some(current)) if current.updated_at == upstream.updated_at => {
                     if let Err(error) = db.delete_upstream(namespace, &upstream.id).await {
-                        errors.push(format!("upstream '{}': {}", upstream.id, error));
+                        errors.push(format!(
+                            "upstream '{}': {}",
+                            upstream.id,
+                            redacted_persistence_error_message(
+                                "batch_rollback_delete_upstream",
+                                &error,
+                            )
+                        ));
                     }
                 }
                 Ok(Some(_)) => errors.push(format!(
@@ -3709,7 +3794,11 @@ async fn rollback_failed_batch_create(
                     upstream.id
                 )),
                 Ok(None) => {}
-                Err(error) => errors.push(format!("upstream '{}': {}", upstream.id, error)),
+                Err(error) => errors.push(format!(
+                    "upstream '{}': {}",
+                    upstream.id,
+                    redacted_persistence_error_message("batch_rollback_load_upstream", &error)
+                )),
             }
         }
     }
@@ -3814,7 +3903,10 @@ fn transaction_log_graph_validation_error_message(error: crud::AfterValidateErro
     match error {
         crud::AfterValidateError::BadRequest(errors)
         | crud::AfterValidateError::Conflict(errors) => errors.join("; "),
-        crud::AfterValidateError::Db(error) => error.to_string(),
+        crud::AfterValidateError::Db(error) => {
+            redacted_persistence_error_message("batch_recovery_transaction_log_graph", &error)
+                .to_string()
+        }
         crud::AfterValidateError::Response(_) => {
             "transaction-log schema validation returned an HTTP response".to_string()
         }
@@ -3832,8 +3924,10 @@ async fn rollback_failed_restore(
     };
     let mut errors = Vec::new();
     if let Err(error) = db.delete_all_resources(namespace, &mode).await {
-        errors.push(format!(
-            "failed to clear partially imported config: {error}"
+        errors.push(redacted_recovery_error_message(
+            "restore_rollback_clear",
+            "failed to clear partially imported config",
+            &error,
         ));
     } else {
         let (_, persist_errors, _) = persist_payload_resources(db, snapshot, false, &mode).await;
@@ -3939,7 +4033,13 @@ async fn restore_snapshot_after_intervening_clear(
     let current = db
         .load_namespace_snapshot(namespace)
         .await
-        .map_err(|error| vec![format!("failed to load intervening resources: {error}")])?;
+        .map_err(|error| {
+            vec![redacted_recovery_error_message(
+                "restore_additive_rollback_load",
+                "failed to load intervening resources",
+                &error,
+            )]
+        })?;
     let (candidate, missing) = intervening_clear_recovery_candidate(snapshot, &current);
     let mut identity_errors = candidate
         .validate_mtls_auth_compatibility()
@@ -3972,8 +4072,10 @@ async fn restore_snapshot_after_intervening_clear(
             )]);
         }
         Err(crud::AfterValidateError::Db(error)) => {
-            return Err(vec![format!(
-                "failed to validate the additive rollback graph: {error}"
+            return Err(vec![redacted_recovery_error_message(
+                "restore_additive_rollback_graph",
+                "failed to validate the additive rollback graph",
+                &error,
             )]);
         }
         Err(crud::AfterValidateError::Response(_)) => {
@@ -4022,19 +4124,16 @@ async fn finish_failed_restore(
         Ok(()) => ("completed", None),
         Err(errors) => {
             error!(
-                "Restore: rollback failed for namespace '{}': {}",
-                namespace,
-                errors.join("; ")
+                namespace = %namespace,
+                error_count = errors.len(),
+                detail_withheld = true,
+                "Restore: rollback failed"
             );
             ("incomplete", Some(errors))
         }
     };
-    if let Err(error) = guard.release().await {
-        error!(
-            namespace = %namespace,
-            error = %error,
-            "Restore: rollback guard could not be released"
-        );
+    if let Err(_error) = guard.release().await {
+        error_persistence_failure_redacted("restore_rollback_guard_release");
         rollback_status = "incomplete";
         rollback_errors
             .get_or_insert_with(Vec::new)
@@ -4123,18 +4222,15 @@ async fn finish_failed_restore_after_intervening_clear(
         Err(errors) => {
             error!(
                 namespace = %namespace,
-                errors = %errors.join("; "),
+                error_count = errors.len(),
+                detail_withheld = true,
                 "Restore: additive rollback after an intervening clear failed"
             );
             ("incomplete", Some(errors))
         }
     };
-    if let Err(error) = guard.release().await {
-        error!(
-            namespace = %namespace,
-            %error,
-            "Restore: additive rollback guard could not be released"
-        );
+    if let Err(_error) = guard.release().await {
+        error_persistence_failure_redacted("restore_additive_rollback_guard_release");
         rollback_status = "incomplete";
         rollback_errors
             .get_or_insert_with(Vec::new)
@@ -4184,15 +4280,11 @@ async fn finish_atomic_delete_failure(
     db: Arc<dyn DatabaseBackend>,
     actor: &AuditActor,
     namespace: &str,
-    delete_error: String,
+    clear_error: String,
     guard: &mut MtlsDnsAdmissionGuardLifecycle,
 ) -> Response<Full<Bytes>> {
-    if let Err(error) = guard.release().await {
-        error!(
-            namespace = %namespace,
-            error = %error,
-            "Restore: admission guard could not be released after definitive clear abort"
-        );
+    if let Err(_error) = guard.release().await {
+        error_persistence_failure_redacted("restore_guard_release_after_clear_abort");
     }
     let event = audit::AuditEvent::new(
         actor,
@@ -4213,7 +4305,7 @@ async fn finish_atomic_delete_failure(
         StatusCode::INTERNAL_SERVER_ERROR,
         &json!({
             "error": "Restore failed while clearing existing config; the clear is atomic, so the prior config was retained",
-            "restore_errors": [format!("failed to clear existing config: {}", delete_error)],
+            "restore_errors": [clear_error],
             "rollback": "not_needed",
         }),
     )
@@ -4224,7 +4316,7 @@ async fn finish_unknown_atomic_delete_failure(
     db: Arc<dyn DatabaseBackend>,
     actor: &AuditActor,
     namespace: &str,
-    delete_error: String,
+    clear_error: String,
     guard: &MtlsDnsAdmissionGuardLifecycle,
 ) -> Response<Full<Bytes>> {
     guard.retain_uncertain();
@@ -4247,7 +4339,7 @@ async fn finish_unknown_atomic_delete_failure(
         StatusCode::INTERNAL_SERVER_ERROR,
         &json!({
             "error": "Restore failed while clearing existing config; the atomic clear outcome could not be verified. The namespace admission guard was retained and manual recovery is required.",
-            "restore_errors": [format!("failed to clear existing config: {}", delete_error)],
+            "restore_errors": [clear_error],
             "rollback": "unknown_outcome",
         }),
     )
@@ -4317,12 +4409,8 @@ async fn handle_update_credentials(
             Err(response) => return Ok(response),
         };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
-        if let Err(error) = namespace_admission.ensure_held() {
-            warn!(
-                namespace = %namespace,
-                %error,
-                "Credential namespace config admission was lost before the update read"
-            );
+        if let Err(_error) = namespace_admission.ensure_held() {
+            warn_persistence_failure_redacted("credential_namespace_admission_before_update_read");
             return mtls_dns_admission_unavailable_response();
         }
         let mode = BatchConfigWriteMode::GuardedAdmission {
@@ -4422,12 +4510,8 @@ async fn handle_delete_credentials(
             Err(response) => return Ok(response),
         };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
-        if let Err(error) = namespace_admission.ensure_held() {
-            warn!(
-                namespace = %namespace,
-                %error,
-                "Credential namespace config admission was lost before the delete read"
-            );
+        if let Err(_error) = namespace_admission.ensure_held() {
+            warn_persistence_failure_redacted("credential_namespace_admission_before_delete_read");
             return mtls_dns_admission_unavailable_response();
         }
         let mode = BatchConfigWriteMode::GuardedAdmission {
@@ -4517,12 +4601,8 @@ async fn handle_append_credential(
             Err(response) => return Ok(response),
         };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
-        if let Err(error) = namespace_admission.ensure_held() {
-            warn!(
-                namespace = %namespace,
-                %error,
-                "Credential namespace config admission was lost before the append read"
-            );
+        if let Err(_error) = namespace_admission.ensure_held() {
+            warn_persistence_failure_redacted("credential_namespace_admission_before_append_read");
             return mtls_dns_admission_unavailable_response();
         }
         let mode = BatchConfigWriteMode::GuardedAdmission {
@@ -4656,11 +4736,9 @@ async fn handle_delete_credential_by_index(
             Err(response) => return Ok(response),
         };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
-        if let Err(error) = namespace_admission.ensure_held() {
-            warn!(
-                namespace = %namespace,
-                %error,
-                "Credential namespace config admission was lost before the indexed delete read"
+        if let Err(_error) = namespace_admission.ensure_held() {
+            warn_persistence_failure_redacted(
+                "credential_namespace_admission_before_indexed_delete_read",
             );
             return mtls_dns_admission_unavailable_response();
         }
@@ -4749,7 +4827,7 @@ async fn handle_list_plugin_types() -> Result<Response<Full<Bytes>>, hyper::Erro
     ))
 }
 
-fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClient {
+pub(crate) fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClient {
     state
         .proxy_state
         .as_ref()
@@ -4759,9 +4837,13 @@ fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClien
             // still carries the configured backend IP policy, so a plugin whose
             // endpoint resolves to a denied literal IP is rejected at the admin
             // boundary instead of being accepted here and rejected later by DPs.
+            // The real-IP header is also safe to resolve from this CP: ConfigSync
+            // rejects every DP that does not advertise the same effective value
+            // before any snapshot can be distributed.
             plugins::PluginHttpClient::default_with_backend_allow_ips(
                 state.backend_allow_ips.clone(),
             )
+            .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
         })
 }
 
@@ -5126,10 +5208,11 @@ async fn handle_batch_create(
     let _namespace_config_admission_guard =
         match crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => {
+            Err(_error) => {
+                warn_persistence_failure_redacted("batch_namespace_admission_acquire");
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Config admission unavailable: {error}")}),
+                    &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
                 ));
             }
         };
@@ -5253,7 +5336,10 @@ async fn handle_batch_create(
             }
             Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
                 "Failed to load config for transaction-log schema candidate validation: {}",
-                error
+                redacted_persistence_error_message(
+                    "batch_transaction_log_schema_candidate_load",
+                    &error,
+                )
             )),
             Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
                 "Transaction-log schema candidate validation returned an unexpected response"
@@ -5282,7 +5368,11 @@ async fn handle_batch_create(
             Ok(false) => {}
             Err(err) => validation_errors.push(format!(
                 "PluginConfig '{}': prometheus_metrics uniqueness check failed: {}",
-                submitted_id, err
+                submitted_id,
+                redacted_persistence_error_message(
+                    "batch_prometheus_metrics_uniqueness_check",
+                    &err,
+                )
             )),
         }
     }
@@ -5360,7 +5450,7 @@ async fn handle_batch_create(
         }
         Err(error) => validation_errors.push(format!(
             "Failed to load namespace config for credential candidate validation: {}",
-            error
+            redacted_persistence_error_message("batch_credential_candidate_load", &error)
         )),
     }
 
@@ -5384,7 +5474,7 @@ async fn handle_batch_create(
             }
             Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
                 "Failed to load config for plugin-graph candidate validation: {}",
-                error
+                redacted_persistence_error_message("batch_plugin_graph_candidate_load", &error)
             )),
             Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
                 "Plugin-graph candidate validation returned an unexpected response".to_string(),
@@ -5448,7 +5538,8 @@ async fn handle_batch_create(
                 }
                 Err(err) => validation_errors.push(format!(
                     "Proxy '{}' upstream reference check failed: {}",
-                    proxy.id, err
+                    proxy.id,
+                    redacted_persistence_error_message("batch_upstream_reference_check", &err)
                 )),
             }
         }
@@ -5471,7 +5562,11 @@ async fn handle_batch_create(
                     Err(err) => {
                         validation_errors.push(format!(
                             "Proxy '{}' upstream subset reference check failed: {}",
-                            proxy.id, err
+                            proxy.id,
+                            redacted_persistence_error_message(
+                                "batch_upstream_subset_reference_check",
+                                &err,
+                            )
                         ));
                         false
                     }
@@ -5502,7 +5597,11 @@ async fn handle_batch_create(
                     Err(err) => {
                         validation_errors.push(format!(
                             "Proxy '{}' upstream mesh-transport check failed: {}",
-                            proxy.id, err
+                            proxy.id,
+                            redacted_persistence_error_message(
+                                "batch_upstream_mesh_transport_check",
+                                &err,
+                            )
                         ));
                         None
                     }
@@ -5553,7 +5652,11 @@ async fn handle_batch_create(
         {
             validation_errors.push(format!(
                 "Proxy '{}' route-override mesh-transport check failed: {}",
-                proxy.id, err
+                proxy.id,
+                redacted_persistence_error_message(
+                    "batch_route_override_mesh_transport_check",
+                    &err,
+                )
             ));
         }
 
@@ -5602,7 +5705,11 @@ async fn handle_batch_create(
                 Ok(errs) => validation_errors.extend(errs),
                 Err(err) => validation_errors.push(format!(
                     "Proxy '{}' plugin association check failed: {}",
-                    proxy.id, err
+                    proxy.id,
+                    redacted_persistence_error_message(
+                        "batch_proxy_plugin_association_check",
+                        &err,
+                    )
                 )),
             }
         }
@@ -5626,7 +5733,8 @@ async fn handle_batch_create(
                 }
                 Err(err) => validation_errors.push(format!(
                     "PluginConfig '{}' proxy reference check failed: {}",
-                    plugin_config.id, err
+                    plugin_config.id,
+                    redacted_persistence_error_message("batch_proxy_reference_check", &err)
                 )),
             }
         }
@@ -5642,7 +5750,11 @@ async fn handle_batch_create(
             Ok(errs) => validation_errors.extend(errs),
             Err(err) => validation_errors.push(format!(
                 "PluginConfig '{}' mesh_route_dispatch upstream reference check failed: {}",
-                plugin_config.id, err
+                plugin_config.id,
+                redacted_persistence_error_message(
+                    "batch_mesh_route_dispatch_upstream_reference_check",
+                    &err,
+                )
             )),
         }
     }
@@ -5663,13 +5775,14 @@ async fn handle_batch_create(
     let batch_rollback_snapshot = match db.load_namespace_snapshot(namespace).await {
         Ok(config) => restore_payload_from_config(config),
         Err(error) => {
+            let message = redacted_recovery_error_message(
+                "batch_rollback_snapshot",
+                "Batch aborted: prior config could not be snapshotted for admission recovery",
+                &error,
+            );
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({
-                    "error": format!(
-                        "Batch aborted: prior config could not be snapshotted for admission recovery: {error}"
-                    )
-                }),
+                &json!({"error": message}),
             ));
         }
     };
@@ -5684,10 +5797,11 @@ async fn handle_batch_create(
         .await
     {
         Ok(result) => result,
-        Err(error) => {
+        Err(_error) => {
+            warn_persistence_failure_redacted("batch_namespace_admission_before_persist");
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("Config admission unavailable: {error}")}),
+                &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
             ));
         }
     };
@@ -5695,13 +5809,9 @@ async fn handle_batch_create(
         crud::NamespaceConfigAdmissionCompletion::Held(result) => result,
         crud::NamespaceConfigAdmissionCompletion::Lost {
             result: (created, errors, _),
-            error,
+            error: _,
         } => {
-            error!(
-                namespace = %namespace,
-                %error,
-                "Batch: namespace admission was lost during persistence; reacquiring for rollback"
-            );
+            error_persistence_failure_redacted("batch_namespace_admission_lost");
             let lost_generation = _namespace_config_admission_guard.generation();
             drop(_namespace_config_admission_guard);
             let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
@@ -5709,13 +5819,16 @@ async fn handle_batch_create(
             {
                 Ok(guard) => guard,
                 Err(rollback_error) => {
+                    let response_error = redacted_recovery_error_message(
+                        "batch_rollback_namespace_admission_reacquire",
+                        "Config admission was lost during batch persistence and could not be reacquired for rollback",
+                        &rollback_error,
+                    );
                     return Ok(json_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         &json!({
-                            "error": format!(
-                                "Config admission was lost during batch persistence and could not be reacquired for rollback: {rollback_error}"
-                            ),
-                            "admission_error": error.to_string(),
+                            "error": response_error,
+                            "admission_error": NAMESPACE_ADMISSION_LOST_MESSAGE,
                             "persistence_errors": errors,
                             "created": {
                                 "proxies": created.proxies,
@@ -5733,13 +5846,16 @@ async fn handle_batch_create(
                 let current = match db.load_namespace_snapshot(namespace).await {
                     Ok(current) => current,
                     Err(recovery_error) => {
+                        let response_error = redacted_recovery_error_message(
+                            "batch_intervening_graph_load",
+                            "Config admission was lost during batch persistence and the intervening graph could not be loaded for recovery",
+                            &recovery_error,
+                        );
                         return Ok(json_response(
                             StatusCode::SERVICE_UNAVAILABLE,
                             &json!({
-                                "error": format!(
-                                    "Config admission was lost during batch persistence and the intervening graph could not be loaded for recovery: {recovery_error}"
-                                ),
-                                "admission_error": error.to_string(),
+                                "error": response_error,
+                                "admission_error": NAMESPACE_ADMISSION_LOST_MESSAGE,
                                 "persistence_errors": errors,
                                 "rollback": "not_started_after_intervening_write",
                             }),
@@ -5758,7 +5874,7 @@ async fn handle_batch_create(
                         StatusCode::SERVICE_UNAVAILABLE,
                         &json!({
                             "error": "Config admission was lost during batch persistence after another writer acquired the namespace lease; the merged graph is valid and was preserved",
-                            "admission_error": error.to_string(),
+                            "admission_error": NAMESPACE_ADMISSION_LOST_MESSAGE,
                             "persistence_errors": errors,
                             "created": {
                                 "proxies": created.proxies,
@@ -5796,7 +5912,7 @@ async fn handle_batch_create(
                                 "Config admission was lost during batch persistence; conditional rollback after an intervening writer would not restore a valid transaction-log schema graph: {}",
                                 transaction_log_graph_validation_error_message(validation_error)
                             ),
-                            "admission_error": error.to_string(),
+                            "admission_error": NAMESPACE_ADMISSION_LOST_MESSAGE,
                             "persistence_errors": errors,
                             "rollback": "skipped_after_intervening_write",
                         }),
@@ -5821,19 +5937,36 @@ async fn handle_batch_create(
                 }
                 Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
                     result: Ok(()),
-                    error,
-                }) => ("completed", None, Some(error.to_string())),
+                    error: _,
+                }) => (
+                    "completed",
+                    None,
+                    Some(NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()),
+                ),
                 Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
                     result: Err(errors),
-                    error,
-                }) => ("incomplete", Some(errors), Some(error.to_string())),
-                Err(error) => ("not_started", None, Some(error.to_string())),
+                    error: _,
+                }) => (
+                    "incomplete",
+                    Some(errors),
+                    Some(NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()),
+                ),
+                Err(_error) => {
+                    warn_persistence_failure_redacted(
+                        "batch_rollback_namespace_admission_before_start",
+                    );
+                    (
+                        "not_started",
+                        None,
+                        Some(CONFIG_ADMISSION_UNAVAILABLE_MESSAGE.to_string()),
+                    )
+                }
             };
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
                     "error": "Config admission was lost during batch persistence",
-                    "admission_error": error.to_string(),
+                    "admission_error": NAMESPACE_ADMISSION_LOST_MESSAGE,
                     "persistence_errors": errors,
                     "created": {
                         "proxies": created.proxies,
@@ -5909,10 +6042,13 @@ async fn handle_backup(
 
     // Try database first, then cached config
     let (config, source) = if let Some(ref db) = state.db {
-        match db.load_full_config(namespace).await {
+        match db
+            .load_full_config_for_purpose(namespace, FullConfigLoadPurpose::BackupExport)
+            .await
+        {
             Ok(config) => (config, "database"),
-            Err(e) => {
-                warn!("Backup: database load failed, trying cached config: {}", e);
+            Err(_e) => {
+                warn_persistence_failure_redacted("backup_database_load");
                 match state.cached_gateway_config() {
                     Some(c) => (filter_config_by_namespace(&c, namespace), "cached"),
                     None => {
@@ -6093,13 +6229,12 @@ async fn handle_restore(
     .await
     {
         Ok(guard) => guard,
-        Err(error) => {
+        Err(_error) => {
+            warn_persistence_failure_redacted("restore_namespace_admission_acquire");
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
-                    "error": format!(
-                        "Restore aborted: config admission unavailable: {error}. Existing config was NOT deleted."
-                    ),
+                    "error": "Restore aborted: config admission unavailable. Existing config was NOT deleted.",
                     "failure_class": "connectivity",
                 }),
             ));
@@ -6188,14 +6323,12 @@ async fn handle_restore(
             .await
             {
                 Ok(result) => result,
-                Err(error) => {
+                Err(_error) => {
+                    warn_persistence_failure_redacted("restore_payload_validation_task");
                     return Ok(json_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         &json!({
-                            "error": format!(
-                                "Restore aborted: payload validation could not complete: {}. Existing config was NOT deleted.",
-                                error
-                            )
+                            "error": "Restore aborted: payload validation could not complete. Existing config was NOT deleted."
                         }),
                     ));
                 }
@@ -6229,14 +6362,14 @@ async fn handle_restore(
                         .to_string(),
                 ),
                 Ok(false) => {}
-                Err(error) => {
+                Err(_error) => {
+                    warn_persistence_failure_redacted(
+                        "restore_prometheus_metrics_ownership_check",
+                    );
                     return Ok(json_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         &json!({
-                            "error": format!(
-                                "Restore aborted: prometheus_metrics ownership could not be validated: {}. Existing config was NOT deleted.",
-                                error
-                            )
+                            "error": "Restore aborted: prometheus_metrics ownership could not be validated because the database is unavailable. Existing config was NOT deleted."
                         }),
                     ));
                 }
@@ -6250,14 +6383,12 @@ async fn handle_restore(
             ) => {
                 validation_errors.extend(errors);
             }
-            Err(crud::AfterValidateError::Db(error)) => {
+            Err(crud::AfterValidateError::Db(_error)) => {
+                warn_persistence_failure_redacted("restore_plugin_security_composition_check");
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
-                        "error": format!(
-                            "Restore aborted: HMAC request-transform composition could not be validated: {}. Existing config was NOT deleted.",
-                            error
-                        )
+                        "error": "Restore aborted: plugin security composition could not be validated because the database is unavailable. Existing config was NOT deleted."
                     }),
                 ));
             }
@@ -6300,11 +6431,7 @@ async fn handle_restore(
     {
         Ok(guard) => guard,
         Err(error) => {
-            warn!(
-                namespace = %namespace,
-                error = %error,
-                "Restore: namespace admission guard could not be acquired"
-            );
+            warn_persistence_failure_redacted("restore_mtls_admission_guard_acquire");
             if crate::config::db_loader::is_transient_database_error(&error) {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -6333,22 +6460,18 @@ async fn handle_restore(
     let snapshot = match snapshot_namespace_for_rollback(db.as_ref(), namespace).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            if let Err(release_error) = restore_guard.release().await {
-                error!(
-                    namespace = %namespace,
-                    error = %release_error,
-                    "Restore: admission guard could not be released after snapshot failure"
-                );
+            if let Err(_release_error) = restore_guard.release().await {
+                error_persistence_failure_redacted("restore_guard_release_after_snapshot_failure");
             }
             let data_integrity = error
                 .downcast_ref::<SnapshotDataIntegrityError>()
                 .map(ToString::to_string);
-            error!(
-                namespace = %namespace,
-                error = %error,
-                "Restore: aborting — prior config could not be snapshotted for rollback; existing config NOT deleted"
-            );
             if let Some(integrity_error) = data_integrity {
+                error!(
+                    namespace = %namespace,
+                    failure_class = "data_integrity",
+                    "Restore: aborting — prior config could not be snapshotted for rollback; existing config NOT deleted"
+                );
                 return Ok(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &json!({
@@ -6358,11 +6481,12 @@ async fn handle_restore(
                     }),
                 ));
             }
+            error_persistence_failure_redacted("restore_rollback_snapshot");
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
                     "error": "Restore aborted: the prior configuration could not be snapshotted for rollback (database unavailable). Existing config was NOT deleted; retry once the database is reachable.",
-                    "restore_errors": [format!("failed to snapshot prior config for rollback: {}", error)],
+                    "restore_errors": ["failed to snapshot prior config for rollback: Database unavailable — operation failed"],
                     "failure_class": "connectivity",
                 }),
             ));
@@ -6379,10 +6503,11 @@ async fn handle_restore(
         .await
     {
         Ok(result) => result,
-        Err(error) => {
+        Err(_error) => {
+            warn_persistence_failure_redacted("restore_namespace_admission_before_clear");
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("Config admission unavailable: {error}")}),
+                &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
             ));
         }
     };
@@ -6396,21 +6521,20 @@ async fn handle_restore(
         // compensating rollback reaches a definitive result.
         restore_guard.retain_uncertain();
     }
-    if let Some(error) = delete_admission_error {
-        error!(
-            namespace = %namespace,
-            %error,
-            "Restore: namespace admission was lost during clear; reacquiring for recovery"
-        );
+    if let Some(_error) = delete_admission_error {
+        error_persistence_failure_redacted("restore_namespace_admission_lost_during_clear");
         let lost_generation = namespace_config_admission_guard.generation();
         if let Err(release_error) = restore_guard.release().await {
+            let response_error = redacted_recovery_error_message(
+                "restore_guard_release_before_clear_recovery",
+                "Config admission was lost during restore clear and the restore guard could not be released before recovery",
+                &release_error,
+            );
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
-                    "error": format!(
-                        "Config admission was lost during restore clear and the restore guard could not be released before recovery: {release_error}"
-                    ),
-                    "restore_errors": [error.to_string()],
+                    "error": response_error,
+                    "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
                 }),
             ));
         }
@@ -6423,13 +6547,16 @@ async fn handle_restore(
         {
             Ok(guard) => guard,
             Err(recovery_error) => {
+                let response_error = redacted_recovery_error_message(
+                    "restore_namespace_admission_reacquire_after_clear",
+                    "Config admission was lost during restore clear and could not be reacquired for recovery",
+                    &recovery_error,
+                );
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
-                        "error": format!(
-                            "Config admission was lost during restore clear and could not be reacquired for recovery: {recovery_error}"
-                        ),
-                        "restore_errors": [error.to_string()],
+                        "error": response_error,
+                        "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
                     }),
                 ));
             }
@@ -6439,21 +6566,22 @@ async fn handle_restore(
         restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(recovery_error) => {
+                let response_error = redacted_recovery_error_message(
+                    "restore_guard_reacquire_after_clear",
+                    "Config admission was reacquired after restore clear, but the restore guard could not be reacquired",
+                    &recovery_error,
+                );
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
-                        "error": format!(
-                            "Config admission was reacquired after restore clear, but the restore guard could not be reacquired: {recovery_error}"
-                        ),
-                        "restore_errors": [error.to_string()],
+                        "error": response_error,
+                        "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
                     }),
                 ));
             }
         };
         if delete_result.is_ok() {
-            let restore_errors = vec![format!(
-                "namespace admission was lost during restore clear: {error}"
-            )];
+            let restore_errors = vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()];
             let rollback = async {
                 if intervening_write {
                     finish_failed_restore_after_intervening_clear(
@@ -6485,23 +6613,26 @@ async fn handle_restore(
                     .await
                 {
                     Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
-                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
-                        error!(
-                            namespace = %namespace,
-                            %error,
-                            "Restore: admission was lost again after clear recovery completed"
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => {
+                        error_persistence_failure_redacted(
+                            "restore_namespace_admission_lost_after_clear_recovery",
                         );
                         result
                     }
-                    Err(rollback_error) => json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": format!(
-                                "Config admission was unavailable before restore clear recovery: {rollback_error}"
-                            ),
-                            "restore_errors": [error.to_string()],
-                        }),
-                    ),
+                    Err(rollback_error) => {
+                        let response_error = redacted_recovery_error_message(
+                            "restore_namespace_admission_before_clear_recovery",
+                            "Config admission was unavailable before restore clear recovery",
+                            &rollback_error,
+                        );
+                        json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({
+                                "error": response_error,
+                                "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
+                            }),
+                        )
+                    }
                 },
             );
         }
@@ -6510,14 +6641,18 @@ async fn handle_restore(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
                     "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
-                    "restore_errors": [error.to_string()],
+                    "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
                     "rollback": "not_needed_after_intervening_write",
                 }),
             ));
         }
     }
     if let Err(e) = delete_result {
-        error!("Restore: failed to delete existing resources: {}", e);
+        let clear_error = redacted_recovery_error_message(
+            "restore_clear_existing_config",
+            "failed to clear existing config",
+            &e,
+        );
         if e.mode().is_atomic() {
             if e.has_unknown_commit_result() {
                 // The server may have committed even though the client did not
@@ -6526,11 +6661,9 @@ async fn handle_restore(
                 // that ambiguity.
                 restore_guard.retain_uncertain();
                 let verification = db.count_namespace_resources(namespace).await;
-                if let Err(error) = &verification {
-                    error!(
-                        namespace = %namespace,
-                        error = %error,
-                        "Restore: failed to verify ambiguous atomic clear outcome"
+                if verification.is_err() {
+                    error_persistence_failure_redacted(
+                        "restore_ambiguous_atomic_clear_verification",
                     );
                 }
                 let clear_verification =
@@ -6541,7 +6674,7 @@ async fn handle_restore(
                         db.clone(),
                         actor,
                         namespace,
-                        e.to_string(),
+                        clear_error,
                         &restore_guard,
                     )
                     .await
@@ -6551,7 +6684,7 @@ async fn handle_restore(
                         db.clone(),
                         actor,
                         namespace,
-                        vec![format!("failed to clear existing config: {}", e)],
+                        vec![clear_error],
                         &snapshot,
                         &mut restore_guard,
                     )
@@ -6565,7 +6698,7 @@ async fn handle_restore(
                 db.clone(),
                 actor,
                 namespace,
-                e.to_string(),
+                clear_error,
                 &mut restore_guard,
             )
             .await);
@@ -6578,7 +6711,7 @@ async fn handle_restore(
             db.clone(),
             actor,
             namespace,
-            vec![format!("failed to clear existing config: {}", e)],
+            vec![clear_error],
             &snapshot,
             &mut restore_guard,
         )
@@ -6601,10 +6734,11 @@ async fn handle_restore(
         .await
     {
         Ok(result) => result,
-        Err(error) => {
+        Err(_error) => {
+            warn_persistence_failure_redacted("restore_namespace_admission_before_import");
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("Config admission unavailable: {error}")}),
+                &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
             ));
         }
     };
@@ -6612,25 +6746,21 @@ async fn handle_restore(
         crud::NamespaceConfigAdmissionCompletion::Held(result) => result,
         crud::NamespaceConfigAdmissionCompletion::Lost {
             result: (_, mut errors, _),
-            error,
+            error: _,
         } => {
-            error!(
-                namespace = %namespace,
-                %error,
-                "Restore: namespace admission was lost during import; reacquiring for rollback"
-            );
-            errors.insert(
-                0,
-                format!("namespace admission was lost during restore import: {error}"),
-            );
+            error_persistence_failure_redacted("restore_namespace_admission_lost_during_import");
+            errors.insert(0, NAMESPACE_ADMISSION_LOST_MESSAGE.to_string());
             let lost_generation = namespace_config_admission_guard.generation();
             if let Err(release_error) = restore_guard.release().await {
+                let response_error = redacted_recovery_error_message(
+                    "restore_guard_release_before_import_rollback",
+                    "Config admission was lost during restore import and the restore guard could not be released before rollback",
+                    &release_error,
+                );
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
-                        "error": format!(
-                            "Config admission was lost during restore import and the restore guard could not be released before rollback: {release_error}"
-                        ),
+                        "error": response_error,
                         "restore_errors": errors,
                     }),
                 ));
@@ -6641,12 +6771,15 @@ async fn handle_restore(
             {
                 Ok(guard) => guard,
                 Err(rollback_error) => {
+                    let response_error = redacted_recovery_error_message(
+                        "restore_namespace_admission_reacquire_for_import_rollback",
+                        "Config admission was lost during restore and could not be reacquired for rollback",
+                        &rollback_error,
+                    );
                     return Ok(json_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         &json!({
-                            "error": format!(
-                                "Config admission was lost during restore and could not be reacquired for rollback: {rollback_error}"
-                            ),
+                            "error": response_error,
                             "restore_errors": errors,
                         }),
                     ));
@@ -6667,12 +6800,15 @@ async fn handle_restore(
             {
                 Ok(guard) => guard,
                 Err(rollback_error) => {
+                    let response_error = redacted_recovery_error_message(
+                        "restore_guard_reacquire_for_import_rollback",
+                        "Config admission was reacquired after restore import, but the restore guard could not be reacquired",
+                        &rollback_error,
+                    );
                     return Ok(json_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         &json!({
-                            "error": format!(
-                                "Config admission was reacquired after restore import, but the restore guard could not be reacquired: {rollback_error}"
-                            ),
+                            "error": response_error,
                             "restore_errors": errors,
                         }),
                     ));
@@ -6690,22 +6826,23 @@ async fn handle_restore(
             return Ok(
                 match rollback_guard.run_to_completion_while_held(rollback).await {
                     Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
-                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
-                        error!(
-                            namespace = %namespace,
-                            %error,
-                            "Restore: admission was lost again after import rollback completed"
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => {
+                        error_persistence_failure_redacted(
+                            "restore_namespace_admission_lost_after_import_rollback",
                         );
                         result
                     }
-                    Err(rollback_error) => json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": format!(
-                                "Config admission was unavailable before restore import rollback: {rollback_error}"
-                            ),
-                        }),
-                    ),
+                    Err(rollback_error) => {
+                        let response_error = redacted_recovery_error_message(
+                            "restore_namespace_admission_before_import_rollback",
+                            "Config admission was unavailable before restore import rollback",
+                            &rollback_error,
+                        );
+                        json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({"error": response_error}),
+                        )
+                    }
                 },
             );
         }
@@ -6727,9 +6864,10 @@ async fn handle_restore(
 
     if !errors.is_empty() {
         error!(
-            "Restore: import failed; rolling back namespace '{}': {}",
-            namespace,
-            errors.join("; ")
+            namespace = %namespace,
+            error_count = errors.len(),
+            detail_withheld = true,
+            "Restore: import failed; rolling back namespace"
         );
         let rollback = finish_failed_restore(
             state,
@@ -6746,28 +6884,29 @@ async fn handle_restore(
                 .await
             {
                 Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
-                Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
-                    error!(
-                        namespace = %namespace,
-                        %error,
-                        "Restore: admission was lost after failed-import rollback completed"
+                Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => {
+                    error_persistence_failure_redacted(
+                        "restore_namespace_admission_lost_after_failed_import_rollback",
                     );
                     result
                 }
-                Err(error) => json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Config admission unavailable during restore rollback: {error}")}),
-                ),
+                Err(error) => {
+                    let response_error = redacted_recovery_error_message(
+                        "restore_namespace_admission_during_rollback",
+                        "Config admission unavailable during restore rollback",
+                        &error,
+                    );
+                    json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({"error": response_error}),
+                    )
+                }
             },
         );
     }
 
-    if let Err(error) = restore_guard.release().await {
-        error!(
-            namespace = %namespace,
-            error = %error,
-            "Restore: completed writes but retained the namespace admission guard"
-        );
+    if let Err(_error) = restore_guard.release().await {
+        error_persistence_failure_redacted("restore_guard_release_after_successful_import");
         return Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({
@@ -6911,7 +7050,7 @@ async fn handle_list_namespaces(state: &AdminState) -> Result<Response<Full<Byte
             Ok(namespaces) => Ok(json_response(StatusCode::OK, &json!(namespaces))),
             Err(e) => Ok(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({"error": format!("Failed to list namespaces: {}", e)}),
+                &db_error_response(&e),
             )),
         }
     } else if let Some(config) = state.cached_gateway_config() {
@@ -6974,11 +7113,12 @@ fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<B
         })
 }
 
-/// Log a database error internally and return a generic error body for the client.
-/// Avoids leaking database schema details in API responses.
-fn db_error_response(e: &dyn std::fmt::Display) -> Value {
-    warn!("Database error in admin API: {}", e);
-    json!({"error": "Database unavailable — operation failed"})
+/// Return the shared generic database-error body and emit only a content-free
+/// structured diagnostic. The error is accepted for a uniform call contract
+/// but is deliberately never formatted or inspected.
+pub(crate) fn db_error_response(error: &dyn std::fmt::Display) -> Value {
+    let message = redacted_persistence_error_message("database_response", error);
+    json!({"error": message})
 }
 
 /// Check if a database error message indicates a unique constraint violation.
@@ -6990,6 +7130,84 @@ fn is_unique_constraint_violation(error_msg: &str) -> bool {
     lower.contains("unique constraint")
         || lower.contains("duplicate key")
         || lower.contains("duplicate entry")
+}
+
+/// Chain-aware unique-constraint classification for the sanitizing responders.
+///
+/// Persistence layers wrap driver errors with their own context — a MongoDB
+/// replica-set write wraps an inner `E11000 duplicate key` with transaction
+/// context — so the chain's outermost message alone misses the violation and
+/// misroutes a conflict onto the generic branch. Only classification walks the
+/// chain; the matched cause's text is never rendered to a client or a log,
+/// because a duplicate-key message names the index and echoes the conflicting
+/// (credential-derived) key value.
+pub(crate) fn chain_has_unique_constraint_violation(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| is_unique_constraint_violation(&cause.to_string()))
+}
+
+/// Chain-aware match for the static proxy-route-conflict sentinel. Safe to
+/// classify deeply because callers render the constant, not the matched text.
+pub(crate) fn chain_has_proxy_route_conflict(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(PROXY_ROUTE_CONFLICT_ERROR))
+}
+
+/// Route an untrusted persistence error through the static fail-closed response
+/// and logging contract. The error is deliberately never formatted or
+/// inspected: driver messages can contain DSNs, schema/constraint names, and
+/// duplicate-key values derived from consumer credentials.
+fn redacted_persistence_error_message(
+    surface: &'static str,
+    _error: &dyn std::fmt::Display,
+) -> &'static str {
+    warn_persistence_failure_redacted(surface);
+    DATABASE_OPERATION_FAILED_MESSAGE
+}
+
+pub(crate) fn redacted_recovery_error_message(
+    surface: &'static str,
+    context: &'static str,
+    error: &dyn std::fmt::Display,
+) -> String {
+    format!(
+        "{context}: {}",
+        redacted_persistence_error_message(surface, error)
+    )
+}
+
+/// Emit a persistence-failure diagnostic that carries no error text.
+///
+/// The repository rule forbids logging unredacted credential metadata, and
+/// persistence errors can contain DSNs, schema/index names, and duplicate-key
+/// values derived from consumer credentials. Operators get a stable surface
+/// identifier for correlation without persisting secret-bearing material here.
+pub(crate) fn warn_persistence_failure_redacted(surface: &'static str) {
+    warn!(
+        surface = surface,
+        detail_withheld = true,
+        "Persistence failure in admin API; error detail withheld (may contain \
+         credential-derived index values, schema names, or connection strings)"
+    );
+}
+
+pub(crate) fn error_persistence_failure_redacted(surface: &'static str) {
+    error!(
+        surface = surface,
+        detail_withheld = true,
+        "Persistence failure in admin API; error detail withheld (may contain \
+         credential-derived index values, schema names, or connection strings)"
+    );
+}
+
+pub(crate) fn debug_persistence_failure_redacted(surface: &'static str) {
+    debug!(
+        surface = surface,
+        detail_withheld = true,
+        "Persistence failure in admin API; error detail withheld"
+    );
 }
 
 /// Create a copy of the consumer with sensitive credential values redacted
@@ -7307,20 +7525,6 @@ async fn handle_node_waypoint_identities_get(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn consumer_unique_conflict_response_redacts_mongo_credential_metadata() {
-        let secret = "must-not-escape-hmac-secret-at-least-32-characters";
-        let error = anyhow::anyhow!(
-            "E11000 duplicate key error dup key: {{ namespace: ferrum, credentials.hmac_auth.secret: {} }}",
-            secret
-        );
-
-        let message = crud::consumer_persist_error_message(&error);
-        assert!(message.contains("conflicts with another Consumer"));
-        assert!(!message.contains(secret));
-        assert!(!message.contains("credentials.hmac_auth.secret"));
-    }
 
     #[test]
     fn namespace_scoped_routes_cover_tenant_resources_only() {

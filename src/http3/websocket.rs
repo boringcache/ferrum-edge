@@ -351,16 +351,12 @@ fn collect_forwardable_h3_headers(
         ":path",
         ":protocol",
         ":status",
-        // Reserved consumer identity headers. Client-supplied values are already
-        // stripped by RequestContext::materialize_headers, and the H3 server
-        // injects the authenticated values into the proxy header map with
-        // mixed-case keys. Strip whatever is in the forwarded map here so the
-        // authoritative values can be re-injected below with override semantics
-        // (one header each), instead of being lower-cased through and then
-        // appended a second time. Mirrors the H1/H2 WebSocket path, which strips
-        // these reserved names before injecting authenticated identity.
+        // Reserved gateway assertion headers. Strip the mutable map so the
+        // authenticated principal and private GeoIP value can be re-injected
+        // below with single-value override semantics.
         "x-consumer-username",
         "x-consumer-custom-id",
+        "x-geo-country",
     ];
 
     let mut out: Vec<(String, String)> = headers
@@ -688,6 +684,13 @@ pub(crate) async fn handle_h3_websocket(
             &mut client_headers,
             "x-consumer-custom-id",
             custom_id.to_string(),
+        );
+    }
+    if let Some(country) = ctx.backend_geo_country() {
+        push_h3_forwardable_header_override(
+            &mut client_headers,
+            "x-geo-country",
+            country.to_string(),
         );
     }
     crate::modes::mesh::hbone::strip_egress_baggage_in_vec(
@@ -1184,8 +1187,10 @@ pub(crate) async fn handle_h3_websocket(
     // are HTTP/1.1 only). The QUIC stream becomes the WebSocket
     // transport as soon as the client sees the 200.
     let mut response_headers = HashMap::new();
-    crate::proxy::finalize_websocket_response_headers(
-        &initial_response_header_policy_plugins,
+    crate::proxy::finalize_successful_websocket_response_headers(
+        &plugins,
+        &ctx,
+        StatusCode::OK.as_u16(),
         &mut response_headers,
     );
 
@@ -1573,6 +1578,7 @@ async fn emit_successful_upgrade_summary(
         latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: proxy_headers.get("user-agent").cloned(),
         metadata: crate::proxy::clone_log_metadata(ctx),
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
@@ -1655,6 +1661,7 @@ async fn emit_failed_upgrade_summary(
         request_user_agent: proxy_headers.get("user-agent").cloned(),
         error_class: Some(error_class),
         metadata,
+        ai_usage_export: ctx.ai_usage_export.clone(),
         ..TransactionSummary::default()
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
@@ -1937,15 +1944,11 @@ mod tests {
     }
 
     #[test]
-    fn collect_strips_reserved_consumer_identity_headers() {
-        // The H3 server injects authenticated identity into the proxy header
-        // map with mixed-case keys (`X-Consumer-Username` / `X-Consumer-Custom-Id`).
-        // collect_forwardable_h3_headers must treat these as reserved and strip
-        // them so handle_h3_websocket can re-inject a single authoritative value,
-        // matching the H1/H2 WebSocket path.
+    fn collect_strips_reserved_gateway_assertion_headers() {
         let headers = make_headers(&[
             ("X-Consumer-Username", "spoofed-or-injected"),
             ("X-Consumer-Custom-Id", "spoofed-or-injected-id"),
+            ("X-Geo-Country", "ATTACKER"),
             ("x-trace-id", "keepme"),
         ]);
         let out = collect_forwardable_h3_headers(&headers, false);
@@ -1957,15 +1960,15 @@ mod tests {
             !has_key(&out, "x-consumer-custom-id"),
             "reserved x-consumer-custom-id must be stripped from the forwarded map"
         );
+        assert!(
+            !has_key(&out, "x-geo-country"),
+            "reserved x-geo-country must be stripped from the forwarded map"
+        );
         assert_eq!(value_for(&out, "x-trace-id"), Some("keepme"));
     }
 
     #[test]
-    fn override_helper_yields_single_authoritative_identity_header() {
-        // Simulate the handle_h3_websocket injection flow: even if a reserved
-        // identity header survived into the forwardable list, the override
-        // helper must replace it (case-insensitively) so the backend receives
-        // exactly one header with the authenticated value — never a duplicate.
+    fn override_helper_yields_single_authoritative_gateway_assertions() {
         let headers = make_headers(&[
             ("X-Consumer-Username", "mixed-case-leftover"),
             ("x-trace-id", "keepme"),
@@ -1974,11 +1977,13 @@ mod tests {
         // Defensively re-introduce a stray case variant to prove the override
         // collapses it rather than appending a second value.
         out.push(("X-Consumer-Username".to_string(), "stray".to_string()));
+        out.push(("X-Geo-Country".to_string(), "ATTACKER".to_string()));
         push_h3_forwardable_header_override(
             &mut out,
             "x-consumer-username",
             "authenticated-user".to_string(),
         );
+        push_h3_forwardable_header_override(&mut out, "x-geo-country", "SE".to_string());
         let count = out
             .iter()
             .filter(|(k, _)| k.eq_ignore_ascii_case("x-consumer-username"))
@@ -1991,6 +1996,13 @@ mod tests {
             value_for(&out, "x-consumer-username"),
             Some("authenticated-user")
         );
+        assert_eq!(
+            out.iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("x-geo-country"))
+                .count(),
+            1
+        );
+        assert_eq!(value_for(&out, "x-geo-country"), Some("SE"));
         assert_eq!(value_for(&out, "x-trace-id"), Some("keepme"));
     }
 }

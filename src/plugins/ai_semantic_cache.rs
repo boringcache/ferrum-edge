@@ -1779,6 +1779,16 @@ impl Plugin for AiSemanticCache {
         PluginResult::Continue
     }
 
+    /// `x-ai-cache-status` is an unconditional gateway `insert`, so a backend
+    /// echoing the identical value hides the write from net-diff mutation
+    /// tracking and a later gRPC-deadline rebuild would drop the gateway's cache
+    /// telemetry. Declared owned only when this request actually produced a
+    /// status to write.
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        name.eq_ignore_ascii_case("x-ai-cache-status")
+            && ctx.metadata.contains_key("ai_cache_status")
+    }
+
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,

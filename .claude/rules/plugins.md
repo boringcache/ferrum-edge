@@ -41,6 +41,11 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 4. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, serverless, mock, gRPC deadline, mirror, load, cache, compression
 5. `on_final_request_body`: body validator and gRPC-Web validation
 6. `after_proxy`: response-side counterpart to before_proxy
+   - Successful H1/H2/H3 WebSocket handshakes bypass general `after_proxy` and
+     instead run the synchronous, non-rejecting
+     `apply_websocket_handshake_response_headers` boundary in configured order.
+     Transport-owned handshake/framing fields are stripped afterward and
+     restored only by proxy core.
 7. `normalize_response_body`: provider/protocol adapters produce the client-visible buffered representation
 8. `on_response_body`: AI response guard and token metrics inspect the normalized body
 9. `transform_response_body`: ordinary client-facing body rewrites
@@ -130,7 +135,7 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 ## File Dependencies And Custom Plugins
 
 - Backend TLS file validation belongs to `validate_all_fields_with_ip_policy()`: file mode fatal, DB/CP admin warn, DP rejects update and keeps old config.
-- Plugin file dependencies, such as MaxMind `.mmdb`, belong to `validate_plugin_file_dependencies()`: file fatal, DB warn, CP admin and DP skip.
+- Plugin file dependencies, such as MaxMind `.mmdb`, belong to `validate_plugin_file_dependencies()`: file fatal; DB warns for absent/unreadable files; CP admin validates structure but skips node-local files; DP validates and refreshes its node-local files off the runtime worker for full snapshots and affected incremental rebuilds. On DB/DP runtime nodes, absent/unreadable files use the configured request-time fallback, while readable invalid files reject the new plugin generation.
 - Plugin constructors with file deps should tolerate missing files, log a warning, store `None`, and apply configured request-time fallback policy.
 - Frontend TLS cert failure is always fatal.
 - Custom plugins live under `custom_plugins/` and may export `plugin_migrations() -> Vec<CustomPluginMigration>`.

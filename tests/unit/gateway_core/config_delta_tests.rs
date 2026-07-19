@@ -435,7 +435,7 @@ fn test_proxy_ids_needing_plugin_rebuild_from_proxy_change() {
         ..Default::default()
     };
     let delta = ConfigDelta::compute(&old, &new);
-    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
     assert!(ids.contains("p1"));
 }
 
@@ -467,7 +467,7 @@ fn test_proxy_ids_needing_plugin_rebuild_from_global_plugin_change() {
         ..Default::default()
     };
     let delta = ConfigDelta::compute(&old, &new);
-    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
     // Global plugin change should trigger rebuild for ALL proxies
     assert!(ids.contains("p1"));
 }
@@ -502,7 +502,7 @@ fn test_proxy_ids_needing_plugin_rebuild_when_global_plugin_changes_scope() {
     };
 
     let delta = ConfigDelta::compute(&old, &new);
-    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
 
     assert!(delta.global_plugin_configs_changed);
     assert!(ids.contains("p1"));
@@ -535,7 +535,7 @@ fn test_proxy_ids_needing_plugin_rebuild_from_removed_proxy_plugin_config() {
     };
 
     let delta = ConfigDelta::compute(&old, &new);
-    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
 
     assert!(!delta.global_plugin_configs_changed);
     assert!(ids.contains("p1"));
@@ -780,7 +780,7 @@ fn test_plugin_rebuild_proxy_scoped_plugin_change() {
         ..Default::default()
     };
     let delta = ConfigDelta::compute(&old, &new);
-    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
     assert!(ids.contains("p1"));
 }
 
@@ -814,7 +814,7 @@ fn test_plugin_rebuild_unrelated_proxy_not_affected() {
         ..Default::default()
     };
     let delta = ConfigDelta::compute(&old, &new);
-    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
     assert!(ids.contains("p1"));
     // p2 should NOT need rebuild since its plugin didn't change
     assert!(!ids.contains("p2"));

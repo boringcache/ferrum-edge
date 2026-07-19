@@ -112,9 +112,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use percent_encoding::percent_decode_str;
+use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -201,6 +202,15 @@ pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
 /// WebSocket-only (plugins that operate on WebSocket frames, not HTTP request/response).
 pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
 
+/// Canonical metadata key for the request ID selected by the first configured
+/// correlation-ID instance in lifecycle order.
+///
+/// Later instances retain their independently resolved values in
+/// header-scoped slots and must not overwrite this consumer-facing key. The
+/// first correlation instance claims ownership independently of any generic
+/// metadata value an earlier custom plugin may have stored under this key.
+pub const REQUEST_ID_METADATA_KEY: &str = "request_id";
+
 /// Parser-level limits contributed by a WebSocket size-policy plugin.
 ///
 /// The relay combines every applicable instance before either peer is read,
@@ -242,6 +252,77 @@ pub fn apply_initial_response_header_policies(
     }
 }
 
+/// Representation metadata that becomes invalid whenever a buffered response
+/// transform replaces the client-visible bytes.
+const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
+    "accept-ranges",
+    "content-range",
+    "content-md5",
+    "digest",
+    "content-digest",
+    "repr-digest",
+    "etag",
+    "last-modified",
+    "delta-base",
+    "im",
+    "variant-key",
+    "signature",
+    "signature-input",
+    "content-signature",
+    "content-signature-input",
+    "content-checksum",
+];
+
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+fn is_transform_invalidated_response_header(name: &str) -> bool {
+    TRANSFORM_INVALIDATED_RESPONSE_HEADERS
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
+        || starts_with_ascii_case_insensitive(name, "x-amz-checksum-")
+        || starts_with_ascii_case_insensitive(name, "x-checksum-")
+        || name.eq_ignore_ascii_case("x-goog-hash")
+        || name.eq_ignore_ascii_case("x-ms-content-crc64")
+}
+
+/// Whether buffered response bytes may be rewritten while preserving the
+/// response status semantics.
+///
+/// A `206 Partial Content` body is only the selected range, not a complete
+/// representation. A `226 IM Used` body is a delta whose interpretation
+/// depends on `IM` and `Delta-Base`. Rewriting either body while removing its
+/// representation metadata would leave the unchanged status incoherent. Keep
+/// both response forms untouched. Inspection hooks still run; enforcing
+/// plugins whose findings require a rewrite must reject instead of reporting a
+/// redaction that cannot be applied. All protocol paths and the
+/// provider/protocol normalization phase consult this shared gate.
+pub(crate) fn response_body_rewrite_allowed(response_status: u16) -> bool {
+    !matches!(response_status, 206 | 226)
+}
+
+/// Finalize one successful buffered response-body transformation.
+///
+/// Every protocol path calls this immediately after replacing the bytes and
+/// recomputing `Content-Length`. The lifecycle owns invalidation of upstream
+/// validators, range metadata, integrity digests, and content-bound signatures
+/// so an individual transformer cannot accidentally leave stale metadata. The
+/// plugin-specific hook runs afterward and may attach metadata it recomputed
+/// for the new representation. Returning `None` from the transform skips this
+/// function, preserving untouched response semantics.
+pub(crate) fn finalize_response_body_transformation(
+    plugin: &dyn Plugin,
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+) {
+    response_headers.retain(|name, _| !is_transform_invalidated_response_header(name));
+    plugin.on_response_body_transformed(ctx, response_headers);
+}
+
 /// Ordered outcome of deterministic initial-response policy for a buffered
 /// response whose hook-visible map also contains trailer compatibility fields.
 ///
@@ -264,6 +345,575 @@ pub struct BufferedInitialResponseHeaderPolicyState {
     /// this pre-policy outcome on the trailer channel, while a final policy
     /// removal suppresses both compatibility-view copies.
     pre_policy_application_trailers: HashMap<String, Option<String>>,
+}
+
+/// Header provenance for an uncommitted response that may be replaced by the
+/// request's absolute gRPC deadline.
+///
+/// The pristine map is captured before response hooks run. Completed gateway
+/// hooks then advance `observed_headers` and record only fields they added or
+/// changed. Deadline replacement rebuilds from that gateway-owned output rather
+/// than trusting a backend value merely because its name resembles a known
+/// decorator. This state exists only for deadline-bound buffered responses.
+#[derive(Debug, Clone)]
+struct BufferedDeadlineResponseHeaderProvenance {
+    observed_headers: HashMap<String, String>,
+    gateway_headers: HashMap<String, String>,
+    /// The backend response's original `Set-Cookie` lines (newline-separated,
+    /// captured before any trusted hook runs). `Set-Cookie` provenance is
+    /// line-granular: a trusted hook (sticky-affinity injection,
+    /// `oidc_relying_party`'s rolling session, ...) commonly APPENDS its cookie
+    /// onto the backend's existing `Set-Cookie` value, which mutation tracking
+    /// would otherwise record wholesale — dragging the backend cookie across a
+    /// synthesized DEADLINE_EXCEEDED response. Only lines absent from this
+    /// backend baseline are gateway-authored and may cross. Empty for gateway
+    /// rejections (no backend contributed the response).
+    backend_set_cookie_lines: Vec<String>,
+    /// The pristine BACKEND header snapshot, captured before any trusted hook
+    /// runs. `Set-Cookie` is not the only field a trusted hook APPENDS to: a
+    /// route-level response `add` rule appends onto an existing backend value
+    /// with a comma (`apply_route_header_transforms`), so a backend
+    /// `x-meta: secret` plus a route `add` of `public` yields
+    /// `x-meta: secret,public`. Mutation tracking sees only "the field changed"
+    /// and would record the whole post-hook value, crediting the backend
+    /// portion as gateway-authored and crossing it onto a synthesized
+    /// DEADLINE_EXCEEDED response. This baseline lets
+    /// [`Self::gateway_appended_value`] partition such a value and keep only the
+    /// appended elements. Empty for gateway rejections, and retired per field
+    /// once a trusted hook declares authoritative ownership of it (see
+    /// [`Self::record_gateway_mutations`]).
+    backend_headers: HashMap<String, String>,
+}
+
+/// Case-insensitive membership test for a borrowed owned-header-name slice.
+/// Written as a loop rather than an iterator chain so no temporary is built on
+/// the deadline-provenance path.
+fn header_name_is_declared(declared: &[&str], name: &str) -> bool {
+    for candidate in declared {
+        if candidate.eq_ignore_ascii_case(name) {
+            return true;
+        }
+    }
+    false
+}
+
+impl BufferedDeadlineResponseHeaderProvenance {
+    fn backend_response(headers: &HashMap<String, String>) -> Self {
+        let observed_headers = Self::canonical_snapshot(headers);
+        let backend_set_cookie_lines = Self::set_cookie_lines(observed_headers.get("set-cookie"));
+        Self {
+            backend_headers: observed_headers.clone(),
+            observed_headers,
+            gateway_headers: HashMap::new(),
+            backend_set_cookie_lines,
+        }
+    }
+
+    /// Rejection headers are gateway/plugin output rather than backend
+    /// metadata. Their provenance is already known; later non-replacing hooks
+    /// are tracked by mutation like buffered responses.
+    fn gateway_rejection(headers: &HashMap<String, String>) -> Self {
+        let observed_headers = Self::canonical_snapshot(headers);
+        let gateway_headers = observed_headers.clone();
+        Self {
+            observed_headers,
+            gateway_headers,
+            // A gateway rejection has no backend contribution, so every
+            // `Set-Cookie` line — and every element of every other field — is
+            // gateway-authored.
+            backend_set_cookie_lines: Vec::new(),
+            backend_headers: HashMap::new(),
+        }
+    }
+
+    /// Split a `Set-Cookie` header value into its individual cookie lines. The
+    /// gateway stores multiple `Set-Cookie` values newline-joined (RFC 6265
+    /// requires separate header lines downstream); this recovers each line so
+    /// backend-vs-gateway provenance can be tracked per cookie.
+    fn set_cookie_lines(value: Option<&String>) -> Vec<String> {
+        value
+            .map(|value| value.split('\n').map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// Reduce a live `Set-Cookie` value to only its gateway-authored lines by
+    /// dropping every line the backend originally supplied. Returns `None` when
+    /// nothing gateway-authored remains, so the caller drops the header entirely
+    /// rather than crossing a backend cookie onto the deadline response.
+    ///
+    /// Matching is by OCCURRENCE, not by value membership: each backend line is
+    /// consumed at most once. A trusted hook may author a cookie line that is
+    /// byte-for-byte identical to one the backend already sent (a deterministic
+    /// affinity cookie, or a session refresh that reproduces the upstream
+    /// value). Value-only filtering would drop every copy including the
+    /// gateway's, leaving the client with no cookie at all on a deadline
+    /// rebuild.
+    ///
+    /// The exact invariant this enforces is therefore: a line survives only to
+    /// the extent the live value carries MORE occurrences of it than the backend
+    /// baseline did. Every backend-supplied occurrence is always dropped; only
+    /// the surplus a trusted hook added crosses onto the deadline response. A
+    /// hook that re-appends a byte-identical copy of a backend line is
+    /// consequently indistinguishable from having authored it — that copy is
+    /// treated as gateway-authored, which is the deliberate trade for not
+    /// silently destroying deterministic gateway cookies.
+    ///
+    /// Implemented by [`Self::gateway_surplus_value`], which partitions by
+    /// per-line occurrence count in a single linear pass (cookie-line counts are
+    /// tiny, and the whole path runs only for a deadline-tracked response).
+    ///
+    /// Surplus filtering is the APPEND defence, so it is deliberately NOT
+    /// consulted for a field a trusted hook authoritatively OWNS. Ownership is
+    /// declared only for whole-value REPLACEMENT writes, which leave no backend
+    /// line underneath; [`Self::record_gateway_mutations`] credits those
+    /// directly and retires this baseline instead of calling here, so a
+    /// replacement followed by a gateway append cannot be mistaken for a bare
+    /// append and lose the operator-configured cookie.
+    fn gateway_set_cookie_value(&self, value: &str) -> Option<String> {
+        if self.backend_set_cookie_lines.is_empty() {
+            // No backend contributed to this response (a gateway rejection), so
+            // every line is gateway-authored. Skips the partition below entirely.
+            return Some(value.to_string());
+        }
+        Self::gateway_surplus_value(
+            value,
+            "\n",
+            self.backend_set_cookie_lines.iter().map(String::as_str),
+        )
+    }
+
+    /// The ordinary-header counterpart of [`Self::gateway_set_cookie_value`]:
+    /// reduce a changed list-valued header to only the elements a trusted hook
+    /// APPENDED beyond the backend baseline, comma being the RFC 9110 list
+    /// separator that route-level `add` rules use.
+    ///
+    /// Without this partition, a route override adding `x-meta: public` on top
+    /// of a backend `x-meta: secret` produced `secret,public`, and mutation
+    /// tracking recorded that whole value as gateway-authored — so a gRPC
+    /// deadline rebuild emitted the backend's `secret` even though the backend
+    /// response itself was discarded.
+    ///
+    /// Occurrence semantics, the trade they make, and the reason surplus (not
+    /// value membership) is the test are identical to
+    /// [`Self::gateway_set_cookie_value`]; see that docstring. A pure
+    /// replacement is unaffected: none of its elements match the baseline, so
+    /// the entire new value is surplus. A header with no backend baseline (a
+    /// field the gateway introduced, or a gateway rejection) is wholly
+    /// gateway-authored.
+    fn gateway_appended_value(&self, name: &str, value: &str) -> Option<String> {
+        let Some(backend_value) = self.backend_headers.get(name) else {
+            return Some(value.to_string());
+        };
+        Self::gateway_surplus_value(value, ",", backend_value.split(','))
+    }
+
+    /// Occurrence-surplus partition shared by the `Set-Cookie` (newline-joined
+    /// lines) and ordinary list-valued (comma-joined elements) paths.
+    ///
+    /// An element survives only to the extent the live value carries MORE
+    /// occurrences of it than the backend baseline supplied. Returns `None` when
+    /// nothing gateway-authored remains, so the caller drops the field rather
+    /// than crossing backend data onto the deadline response.
+    ///
+    /// Runs in a single linear pass over both sides. The backend baseline is
+    /// folded into an occurrence BUDGET keyed by element, and each live element
+    /// either consumes one unit of that budget (a backend-supplied occurrence,
+    /// dropped) or is surplus (gateway-authored, kept). The earlier formulation
+    /// re-split the live value once per element to recount how often the element
+    /// appeared before it, which is O(n^2) in the element count — and the
+    /// element count is backend-controlled, since a backend can return a
+    /// comma-list header with arbitrarily many elements and any gateway append
+    /// to that field then forces the scan. The budget is exactly equivalent:
+    /// consuming one unit per occurrence drops the first `k` copies for a
+    /// baseline count of `k` and keeps the rest, which is what the recount's
+    /// `seen_before >= k` test computed.
+    fn gateway_surplus_value<'a>(
+        value: &str,
+        separator: &str,
+        backend_elements: impl Iterator<Item = &'a str>,
+    ) -> Option<String> {
+        let mut backend_budget: HashMap<&str, usize> = HashMap::new();
+        for element in backend_elements {
+            *backend_budget.entry(element).or_insert(0) += 1;
+        }
+        let mut gateway_elements = Vec::new();
+        for element in value.split(separator) {
+            match backend_budget.get_mut(element) {
+                // Still covered by the backend baseline: this occurrence came
+                // from the backend and must not cross onto the deadline response.
+                Some(remaining) if *remaining > 0 => *remaining -= 1,
+                _ => gateway_elements.push(element),
+            }
+        }
+        (!gateway_elements.is_empty()).then(|| gateway_elements.join(separator))
+    }
+
+    /// Retire, from a list-valued field's backend baseline, ONE occurrence of
+    /// each element a completed trusted hook authored itself.
+    ///
+    /// This is the element-granular counterpart of the whole-field baseline
+    /// retirement performed by the owned branch of
+    /// [`Self::record_gateway_mutations`], for hooks that APPEND a known,
+    /// gateway-configured element set onto a value the backend may also have
+    /// supplied (`grpc_web` writing `access-control-expose-headers` from its
+    /// configured `expose_headers`).
+    ///
+    /// Such a hook cannot declare whole-field ownership: that would credit the
+    /// backend-only tokens sharing the field. Nor can it rely on mutation
+    /// tracking alone: a backend that pre-populates the identical combined list
+    /// makes the write invisible, and the deadline rebuild then drops the
+    /// operator-configured tokens. Reducing the BASELINE instead keeps the
+    /// ordinary occurrence partition in charge — the authored elements become
+    /// surplus and are credited, backend-only elements keep their baseline
+    /// occurrence and are dropped — and it stays correct for every later append,
+    /// which continues to partition against a baseline that still describes the
+    /// backend-only remainder.
+    ///
+    /// One occurrence per authored element is retired, never all of them, so a
+    /// backend that repeated a token cannot launder the extra copies. Comparison
+    /// is trimmed and, for ordinary headers, ASCII-case-insensitive per RFC 9110
+    /// token rules; `set-cookie` lines are compared exactly (cookie values are
+    /// case-sensitive). Retiring an element the backend also sent is safe: the
+    /// gateway writes that element on this request regardless, so it is
+    /// gateway-authored output either way.
+    fn retire_backend_authored_elements(&mut self, name: &str, authored: &[&str]) {
+        if name == "set-cookie" {
+            for element in authored {
+                let element = element.trim();
+                if let Some(index) = self
+                    .backend_set_cookie_lines
+                    .iter()
+                    .position(|line| line.trim() == element)
+                {
+                    self.backend_set_cookie_lines.remove(index);
+                }
+            }
+        }
+        let separator = if name == "set-cookie" { "\n" } else { "," };
+        // Scoped so the baseline borrow ends before `backend_headers` is mutated.
+        let rebuilt = {
+            let Some(baseline) = self.backend_headers.get(name) else {
+                return;
+            };
+            let mut remaining = baseline.split(separator).collect::<Vec<_>>();
+            for element in authored {
+                let element = element.trim();
+                let found = remaining.iter().position(|candidate| {
+                    let candidate = candidate.trim();
+                    if name == "set-cookie" {
+                        candidate == element
+                    } else {
+                        candidate.eq_ignore_ascii_case(element)
+                    }
+                });
+                if let Some(index) = found {
+                    remaining.remove(index);
+                }
+            }
+            (!remaining.is_empty()).then(|| remaining.join(separator))
+        };
+        match rebuilt {
+            Some(baseline) => {
+                self.backend_headers.insert(name.to_string(), baseline);
+            }
+            None => {
+                self.backend_headers.remove(name);
+            }
+        }
+    }
+
+    fn canonical_snapshot(headers: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut entries = headers.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(left, _)| *left);
+        let mut canonical = HashMap::with_capacity(entries.len());
+        for (name, value) in entries {
+            let lowercase = name.to_ascii_lowercase();
+            if name == &lowercase || !canonical.contains_key(&lowercase) {
+                canonical.insert(lowercase, value.clone());
+            }
+        }
+        canonical
+    }
+
+    /// `is_owned` is consulted per canonical (lowercase) field name and reports
+    /// whether the completed hook authoritatively wrote that field. It is a
+    /// predicate rather than a name slice so callers can answer from data they
+    /// already hold — no owned-name `Vec`/`String` is materialized on the hot
+    /// path (see [`RequestContext::record_deadline_owned_response_headers`]).
+    fn record_gateway_mutations(
+        &mut self,
+        is_owned: impl Fn(&str) -> bool,
+        headers: &HashMap<String, String>,
+    ) {
+        self.record_gateway_mutations_with_repartition(is_owned, |_| false, headers);
+    }
+
+    /// As [`Self::record_gateway_mutations`], plus `needs_repartition`: fields
+    /// whose backend baseline this same recording just narrowed
+    /// ([`Self::retire_backend_authored_elements`]) and which therefore must be
+    /// re-partitioned even though their live value is byte-identical to what was
+    /// last observed.
+    ///
+    /// The plain net-diff short-circuit is exactly the case the element
+    /// recorder exists to defend: a backend that pre-populates the identical
+    /// combined list leaves the gateway's write invisible, so without this the
+    /// retired baseline is never consulted and the configured elements are
+    /// dropped from the synthesized deadline response. A repartitioned field
+    /// takes the occurrence-partition branch, never the owned branch, so
+    /// backend-only elements sharing the field still cannot cross over.
+    fn record_gateway_mutations_with_repartition(
+        &mut self,
+        is_owned: impl Fn(&str) -> bool,
+        needs_repartition: impl Fn(&str) -> bool,
+        headers: &HashMap<String, String>,
+    ) {
+        let current = Self::canonical_snapshot(headers);
+        for (name, value) in &current {
+            let owned = is_owned(name.as_str());
+            let changed = self.observed_headers.get(name) != Some(value)
+                || owned
+                || needs_repartition(name.as_str());
+            if !changed {
+                continue;
+            }
+            if name == "set-cookie" && owned {
+                // Ownership is declared ONLY for whole-value REPLACEMENT writes
+                // (`response_transformer` `update` to `set-cookie`, a `rename`
+                // whose destination is `set-cookie`, or an `add` that
+                // re-inserted `set-cookie` into a slot a `remove` had cleared).
+                // Appending sites — sticky-affinity injection — deliberately do
+                // NOT declare ownership; they record through
+                // `record_deadline_response_header_mutations` and stay on the
+                // occurrence-partition branch below, so the backend's cookie can
+                // never ride an append into gateway output.
+                //
+                // A replacement overwrites the entire field, so NO backend line
+                // survives underneath it: the replacement's own value plus any
+                // gateway append that follows it is wholly gateway-authored.
+                // The baseline must therefore be retired unconditionally rather
+                // than only when the surplus happens to be empty. Gating on
+                // "zero surplus" inferred replacement-ness from the value shape,
+                // which misreads a replacement FOLLOWED BY an append recorded
+                // under one provenance record: the surplus branch credited only
+                // the appended line, dropped the operator-configured replacement
+                // cookie, and left a stale backend baseline that then filtered
+                // later gateway appends matching the overwritten backend value.
+                // Same rationale as `adopt_gateway_rejection`: once the backend
+                // bytes are gone from the tracked map, the baseline no longer
+                // describes it.
+                self.gateway_headers.insert(name.clone(), value.clone());
+                self.backend_set_cookie_lines = Vec::new();
+                self.backend_headers.remove(name);
+            } else if name == "set-cookie" {
+                // `Set-Cookie` is line-granular: record only the gateway-authored
+                // cookie lines so a hook that appends its cookie onto the
+                // backend's existing value never drags the backend cookie into
+                // gateway-owned output. When only backend lines remain, drop the
+                // header from gateway output entirely.
+                match self.gateway_set_cookie_value(value) {
+                    Some(gateway_value) => {
+                        self.gateway_headers.insert(name.clone(), gateway_value);
+                    }
+                    None => {
+                        self.gateway_headers.remove(name);
+                    }
+                }
+            } else if owned {
+                // Ownership of an ordinary header is only ever declared for
+                // WHOLE-VALUE gateway writes: unconditional replacements
+                // (`update` rules and fired `rename` destinations) and `add`
+                // rules that actually INSERTED into an absent slot (the
+                // add-after-remove sequence, where the final map can be
+                // byte-identical to the backend's). An `add` that appended onto
+                // an existing value is deliberately NOT declared owned — it
+                // stays on the append-partition branch below. So the whole
+                // configured value is gateway output. Retire this field's
+                // backend baseline for the same reason as the `set-cookie`
+                // branch above — the backend value was overwritten, and leaving
+                // a stale baseline would make a later append partition against
+                // data no longer in the response.
+                self.gateway_headers.insert(name.clone(), value.clone());
+                self.backend_headers.remove(name);
+            } else {
+                // A mutation-detected change may be an append rather than a
+                // replacement (a route-level `add` rule appends onto the
+                // existing backend value with a comma). Credit only the
+                // appended elements so the backend portion never crosses onto a
+                // synthesized DEADLINE_EXCEEDED response.
+                match self.gateway_appended_value(name, value) {
+                    Some(gateway_value) => {
+                        self.gateway_headers.insert(name.clone(), gateway_value);
+                    }
+                    None => {
+                        self.gateway_headers.remove(name);
+                    }
+                }
+            }
+        }
+        for name in self.observed_headers.keys() {
+            if !current.contains_key(name) {
+                self.gateway_headers.remove(name);
+            }
+        }
+        self.observed_headers = current;
+    }
+
+    fn retain_gateway_output(&mut self, headers: &mut HashMap<String, String>) {
+        let preserve_origin_vary = headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("vary")
+                && value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("origin"))
+        });
+
+        // `gateway_headers` already holds only gateway-authored output, so this
+        // strip governs gateway-produced values, not backend leakage. It removes
+        // transport/framing fields and stale cache/representation metadata that
+        // must never ride a synthesized DEADLINE_EXCEEDED response. `set-cookie`
+        // is deliberately absent: a trusted hook (e.g. `oidc_relying_party`'s
+        // refreshed session cookie or sticky-affinity injection) authors it
+        // precisely so the client applies the update. Every backend-supplied
+        // cookie OCCURRENCE is dropped before a value reaches `gateway_headers`,
+        // even when a hook APPENDS its cookie onto the backend value —
+        // `record_gateway_mutations` keeps only the surplus beyond the backend
+        // baseline (see `gateway_set_cookie_value`) — so retaining
+        // gateway-authored `set-cookie` cannot re-open backend cookie leakage.
+        // The one deliberate exception is documented there: a trusted hook that
+        // re-appends a byte-identical copy of a backend line is credited with
+        // authoring that copy, because the alternative destroys deterministic
+        // gateway cookies. The other way a cookie reaches `gateway_headers` is an
+        // owned whole-value REPLACEMENT, which by definition left no backend line
+        // underneath and retires the baseline; the appending proxy-core sites do
+        // not declare ownership, so they cannot reach that branch.
+        // Ordinary list-valued headers get the same treatment through
+        // `gateway_appended_value`: a route-level `add` rule appends onto the
+        // backend value with a comma, so only the appended elements reach
+        // `gateway_headers` and the backend portion never crosses here either.
+        // `x-grpc-web` is gRPC-Web framing regenerated by the deadline error
+        // response; a completed hook must not overwrite the canonical
+        // `x-grpc-web: 1` (the buffered replacement extends the generated error
+        // headers with this retained map before finalization captures the
+        // value), so it is stripped here like the other framing fields.
+        *headers = self.gateway_headers.clone();
+        headers.retain(|name, _| {
+            ![
+                "accept-ranges",
+                "age",
+                "authorization",
+                "cache-control",
+                "cdn-cache-control",
+                "connection",
+                "content-digest",
+                "content-encoding",
+                "content-language",
+                "content-length",
+                "content-location",
+                "content-md5",
+                "content-range",
+                "content-type",
+                "cookie",
+                "digest",
+                "etag",
+                "expires",
+                "grpc-accept-encoding",
+                "grpc-encoding",
+                "grpc-message",
+                "grpc-previous-rpc-attempts",
+                "grpc-retry-pushback-ms",
+                "grpc-status",
+                "grpc-status-details-bin",
+                "keep-alive",
+                "last-modified",
+                "pragma",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "proxy-connection",
+                "proxy-status",
+                "repr-digest",
+                "retry-after",
+                "surrogate-control",
+                "te",
+                "trailer",
+                "transfer-encoding",
+                "upgrade",
+                "www-authenticate",
+                "x-grpc-web",
+                "vary",
+                "warning",
+            ]
+            .contains(&name.as_str())
+        });
+        if preserve_origin_vary {
+            headers.insert("vary".to_string(), "Origin".to_string());
+        }
+        self.observed_headers = Self::canonical_snapshot(headers);
+    }
+
+    /// Transition an in-flight buffered-response provenance into a gateway
+    /// rejection without discarding decorations that completed hooks already
+    /// recorded. The rejection headers are freshly generated gateway output, so
+    /// they join `gateway_headers`, while previously recorded gateway output
+    /// (correlation, CORS, ...) is preserved for a terminal deadline rebuild.
+    /// The observed baseline resets to the rejection headers so any non-replacing
+    /// reject hook that runs next is tracked by mutation. When no gateway output
+    /// was recorded yet, `gateway_headers` is empty and this is identical to
+    /// starting a fresh [`Self::gateway_rejection`].
+    ///
+    /// # Why the backend baselines are retired here
+    ///
+    /// (The reasoning below is written for `backend_set_cookie_lines`; it
+    /// applies verbatim to the `backend_headers` append baseline, which is
+    /// captured from the same discarded backend map.)
+    ///
+    /// `headers` is a gateway-authored REPLACEMENT map, never the mutated
+    /// backend response map. Every caller of
+    /// [`RequestContext::begin_rejection_deadline_response_header_provenance`]
+    /// reaches it with either a freshly constructed map, a
+    /// `PluginResult::Reject{,Binary}` header map lifted out by
+    /// `plugin_result_into_reject_parts`, or gateway-synthesized error headers.
+    /// The two sites whose caller-supplied map has backend lineage
+    /// (`apply_plugin_rejection_response` and
+    /// `apply_reject_after_proxy_and_synthetic_body_hooks`) both run
+    /// `rebuild_plugin_rejection_response_headers` first, which does
+    /// `response_headers.clear()` before re-populating from the rejection parts.
+    /// So no backend-sent header survives into this transition.
+    ///
+    /// That makes `backend_set_cookie_lines` — the baseline captured from the
+    /// BACKEND response map in [`Self::backend_response`] — no longer a
+    /// description of the map being tracked. Continuing to filter against it
+    /// misattributed authorship: a rejection that intentionally sets
+    /// `Set-Cookie: X` while the discarded backend response happened to have
+    /// sent a byte-identical `Set-Cookie: X` scored zero surplus occurrences and
+    /// was dropped, so a later gRPC-deadline rebuild silently discarded an
+    /// authored rejection/session cookie.
+    ///
+    /// Retiring the baseline does not weaken the leak boundary. It is the
+    /// buffered path's [`Self::record_gateway_mutations`] that defends against
+    /// backend cookies, and it still holds the baseline for as long as the
+    /// backend map is the response. A backend-only `Set-Cookie` can only reach a
+    /// deadline response by being present in some map, and after this transition
+    /// the backend map is gone — the response is rebuilt from the rejection.
+    /// Keeping a stale baseline could therefore only produce further false
+    /// drops, never prevent a real leak.
+    fn adopt_gateway_rejection(&mut self, headers: &HashMap<String, String>) {
+        let rejection = Self::canonical_snapshot(headers);
+        for (name, value) in &rejection {
+            self.gateway_headers.insert(name.clone(), value.clone());
+        }
+        // The backend response map has been replaced wholesale by gateway
+        // output, so neither the backend cookie baseline nor the backend
+        // header baseline describes what is being tracked. Retire both,
+        // matching [`Self::gateway_rejection`], so hooks that run after this
+        // transition are credited for what they actually author on the
+        // rejection map.
+        self.backend_set_cookie_lines = Vec::new();
+        self.backend_headers = HashMap::new();
+        self.observed_headers = rejection;
+    }
+
+    fn sync_terminal_headers(&mut self, headers: &HashMap<String, String>) {
+        self.observed_headers = Self::canonical_snapshot(headers);
+    }
 }
 
 impl BufferedInitialResponseHeaderPolicyState {
@@ -489,6 +1139,8 @@ pub enum UdpDatagramDirection {
 /// relaying the response to the client).
 #[allow(dead_code)]
 pub struct UdpDatagramContext<'a> {
+    /// Canonical client IP identity. IPv4-mapped IPv6 is normalized once when
+    /// the UDP/DTLS session is created so per-datagram hooks only clone this Arc.
     pub client_ip: Arc<str>,
     pub proxy_id: Arc<str>,
     pub proxy_name: Option<Arc<str>>,
@@ -661,9 +1313,49 @@ pub struct WsDisconnectContext {
 /// IPv4-mapped IPv6, and publishes the result here. Every later plugin instance
 /// performs only the lock-free `OnceLock::get_or_init` fast path. `None` is
 /// cached as well, preserving fail-closed behavior for malformed identities.
+/// When embedded privately in [`RequestContext`], the same typed state also
+/// retains authoritative HTTP correlation values. Stream contexts keep their
+/// correlation lifecycle state separately so replacing this public cache to
+/// reparse a changed client IP cannot erase stream correlation ownership.
 #[derive(Debug, Clone, Default)]
 pub struct CanonicalClientIpCache {
     value: OnceLock<Option<IpAddr>>,
+    correlation_ids: CorrelationIdState,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CorrelationIdState {
+    canonical: Option<String>,
+    instances: HashMap<String, String>,
+}
+
+impl CorrelationIdState {
+    fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
+        let publish_canonical = self.canonical.is_none();
+        self.instances
+            .insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            self.canonical = Some(request_id);
+        }
+        publish_canonical
+    }
+
+    fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.instances.get(instance_key).map(String::as_str)
+    }
+
+    fn canonical_correlation_id(&self) -> Option<&str> {
+        self.canonical.as_deref()
+    }
+
+    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        for (key, value) in &self.instances {
+            metadata.insert(key.clone(), value.clone());
+        }
+        if let Some(request_id) = &self.canonical {
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.clone());
+        }
+    }
 }
 
 impl CanonicalClientIpCache {
@@ -682,6 +1374,23 @@ impl CanonicalClientIpCache {
     pub fn is_initialized(&self) -> bool {
         self.value.get().is_some()
     }
+
+    fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) -> bool {
+        self.correlation_ids
+            .publish_correlation_id(instance_key, request_id)
+    }
+
+    fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.correlation_ids.correlation_id(instance_key)
+    }
+
+    fn canonical_correlation_id(&self) -> Option<&str> {
+        self.correlation_ids.canonical_correlation_id()
+    }
+
+    fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        self.correlation_ids.project_correlation_ids(metadata);
+    }
 }
 
 fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
@@ -690,11 +1399,11 @@ fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
 
 /// Parse the legacy client/rule literal forms without allocation.
 ///
-/// IPv4 accepts the same four decimal-octet grammar used by the original
-/// `ip_restriction` matcher. Brackets and zone identifiers remain IPv6-only;
-/// accepting them on IPv4 would broaden the established policy grammar.
+/// IPv4 uses the standard library's strict literal grammar. Brackets and zone
+/// identifiers remain IPv6-only; accepting them on IPv4 would broaden the
+/// established policy grammar.
 fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
-    if let Some(ipv4) = parse_ipv4_client_ip_literal(client_ip) {
+    if let Ok(ipv4) = client_ip.parse() {
         return Some(IpAddr::V4(ipv4));
     }
 
@@ -708,18 +1417,72 @@ fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
     without_zone.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
 }
 
-fn parse_ipv4_client_ip_literal(client_ip: &str) -> Option<Ipv4Addr> {
-    let mut octets = client_ip.split('.');
-    let ipv4 = [
-        octets.next()?.parse::<u8>().ok()?,
-        octets.next()?.parse::<u8>().ok()?,
-        octets.next()?.parse::<u8>().ok()?,
-        octets.next()?.parse::<u8>().ok()?,
-    ];
-    if octets.next().is_some() {
-        return None;
+/// AI usage that was produced by a built-in accounting path.
+///
+/// This is deliberately carried outside [`RequestContext::metadata`]. Backend
+/// responses and operator-configured metadata writers can populate arbitrary
+/// public metadata keys, so those keys are not authoritative provenance for
+/// Prometheus token or cost export.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiCost {
+    /// Whole micro-units of configured currency.
+    pub microunits: u64,
+    /// Fractional micro-units at 10^-12 precision. Kept separate so the full
+    /// supported whole-cost range still fits in `u64`.
+    pub submicrounits: u64,
+}
+
+/// Number of fixed-point remainder units in one micro-unit.
+pub(crate) const AI_COST_SUBMICRO_SCALE: u64 = 1_000_000_000_000;
+
+impl AiCost {
+    pub(crate) fn from_currency_units(value: f64) -> Option<Self> {
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+
+        let scaled = value * 1_000_000.0;
+        if !scaled.is_finite() || scaled > u64::MAX as f64 {
+            return None;
+        }
+
+        let whole_microunits = scaled.floor();
+        let mut microunits = whole_microunits as u64;
+        let mut submicrounits =
+            ((scaled - whole_microunits) * AI_COST_SUBMICRO_SCALE as f64).round() as u64;
+        if submicrounits >= AI_COST_SUBMICRO_SCALE {
+            microunits = microunits.checked_add(1)?;
+            submicrounits -= AI_COST_SUBMICRO_SCALE;
+        }
+        Some(Self {
+            microunits,
+            submicrounits,
+        })
     }
-    Some(Ipv4Addr::from(ipv4))
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiUsageExport {
+    pub prefix: Arc<str>,
+    pub provider: &'static str,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cost: Option<AiCost>,
+}
+
+impl AiUsageExport {
+    fn token_completeness(&self) -> usize {
+        usize::from(self.prompt_tokens.is_some())
+            + usize::from(self.completion_tokens.is_some())
+            + usize::from(self.total_tokens.is_some())
+    }
+
+    fn completeness(&self) -> usize {
+        self.token_completeness() + usize::from(self.cost.is_some())
+    }
 }
 
 /// Context passed through the plugin pipeline for a single request.
@@ -750,6 +1513,14 @@ pub struct RequestContext {
     /// non-default port is retained. HTTP frontends populate this after
     /// Host/`:authority` validation and before authentication.
     pub request_authority: Option<String>,
+    /// Whether the browser-facing request used a cryptographic transport.
+    /// HTTP/1.1, HTTP/2, and HTTP/3 initialize this from the accepted frontend
+    /// transport, then a direct peer in `FERRUM_TRUSTED_PROXIES` may override it
+    /// with a valid singleton overwrite or XFF-correlated appended
+    /// `X-Forwarded-Proto: http` or `https` value. Cookie storage checks combine
+    /// this with `request_authority` because browsers also trust HTTP localhost
+    /// and loopback origins.
+    pub request_is_secure: bool,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
     /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
@@ -793,6 +1564,10 @@ pub struct RequestContext {
     /// Human-readable identity for the `X-Consumer-Username` header sent to the
     /// backend. Falls back to `authenticated_identity` when not set separately.
     pub authenticated_identity_header: Option<String>,
+    /// Authoritative GeoIP country assertion staged by `geo_restriction` for
+    /// backend dispatch. Kept outside the mutable plugin header map and public
+    /// metadata so later request hooks cannot replace or log a forged value.
+    backend_geo_country: Option<[u8; 2]>,
     /// Authentication mechanism that succeeded (e.g., `"jwt_auth"`, `"key_auth"`).
     /// `&'static str` because every `AuthMechanism::mechanism_name()` returns a
     /// compiled-in literal — zero allocation on the hot path.
@@ -831,12 +1606,16 @@ pub struct RequestContext {
     gateway_deadline_response_selected: bool,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
-    /// Per-request ownership state for each live request-deduplication plugin
-    /// instance. Multiple instances may coexist on one proxy; keeping their
-    /// correlation state in a private instance-keyed map prevents one hook
-    /// from consuming another instance's key or local/Redis owner token.
-    pub(crate) request_deduplication_state:
-        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
+    /// Most complete built-in AI usage snapshot for Prometheus export.
+    /// Kept outside public metadata so backend/operator metadata cannot mint or
+    /// overwrite trusted token and cost series.
+    pub(crate) ai_usage_export: Option<AiUsageExport>,
+    /// Prefix that supplied the selected token fields. Cost is selected
+    /// independently, so its provenance cannot distort later token tie-breaks.
+    ai_usage_export_token_prefix: Option<Arc<str>>,
+    /// Prefix that supplied the selected trusted cost. This remains private so
+    /// public metadata cannot influence deterministic multi-instance pricing.
+    ai_usage_export_cost_prefix: Option<Arc<str>>,
     /// Aggregate CORS policy state staged across every attached CORS instance
     /// and consumed by the cache-inserted CORS finalizer. Kept outside public
     /// metadata so policy details never enter transaction logs.
@@ -856,6 +1635,10 @@ pub struct RequestContext {
     /// cheap; the live request uses `Arc::make_mut` after the clone is dropped.
     buffered_initial_response_header_policy_state:
         Option<Arc<BufferedInitialResponseHeaderPolicyState>>,
+    /// Backend/gateway response-header provenance used only when an absolute
+    /// gRPC deadline can replace an uncommitted buffered response.
+    buffered_deadline_response_header_provenance:
+        Option<Arc<BufferedDeadlineResponseHeaderProvenance>>,
     /// Client-visible HTTP flavor classified before any plugin hook can mutate
     /// request headers. Fault rejection shaping consults this fixed value so a
     /// transformer cannot add or remove native-gRPC semantics mid-pipeline.
@@ -886,6 +1669,15 @@ pub struct RequestContext {
     /// instances may coexist on one proxy and must never consume each other's
     /// dedup state.
     pub(crate) ai_tool_governor_response_hashes: HashMap<u64, String>,
+    /// `ai_response_guard` instances that inspected an already-finalized
+    /// deduplication replay and found content requiring a current-policy
+    /// redaction transform. Kept outside public metadata so response data or a
+    /// custom plugin cannot opt a replay into or out of mandatory rewriting.
+    pub(crate) ai_response_guard_replay_redactions: HashSet<u64>,
+    /// `ai_tool_governor` equivalent of
+    /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
+    /// governor from consuming another instance's transform requirement.
+    pub(crate) ai_tool_governor_replay_redactions: HashSet<u64>,
     /// Per-instance governed-call identity multisets (identity hash -> count),
     /// the one-for-one skip ledgers final re-checks consume. Kept off
     /// `metadata` for the same reason as the response hashes.
@@ -903,6 +1695,44 @@ pub struct RequestContext {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
+    /// Per-`request_deduplication`-instance completion state acquired during
+    /// `before_proxy`. Keeping this out of public metadata prevents internal
+    /// cache keys and lock tokens from entering transaction logs. The map is
+    /// bounded by the configured deduplication instances on the matched proxy.
+    pub(crate) request_deduplication_states:
+        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
+    /// Whether `request_deduplication` supplied an already-finalized committed
+    /// representation for this request. The shared synthetic rejection path
+    /// must not run ordinary presentation transforms over it again. Inspection
+    /// and final-body validation still run over the replayed client
+    /// representation, and a current redaction decision can require its own
+    /// transform or fail closed.
+    /// Kept private so request metadata cannot suppress response inspection.
+    pub(crate) deduplication_replay_response_finalized: bool,
+    /// Deduplication instances whose in-flight ownership can be released after
+    /// a serverless rejection proven to occur before external invocation. Each
+    /// committed hook consumes only its own entry, preserving exactly-once
+    /// cleanup without weakening uncertain-side-effect retention.
+    pub(crate) serverless_pre_invocation_rejection_owners: HashSet<u64>,
+    /// Deduplication instances that own protection for a terminal serverless
+    /// invocation. Each committed/stream-terminal hook consumes or observes
+    /// only its own entry, so one instance cannot publish into another cache or
+    /// release another instance's in-flight marker. This set is bounded by the
+    /// completion-state map above.
+    pub(crate) serverless_external_side_effect_owners: HashSet<u64>,
+    /// Whether a successful terminate-mode serverless invocation produced the
+    /// current synthetic response. Unlike ordinary plugin rejections, every
+    /// final 2xx-5xx function response is application-owned content and must run
+    /// through the buffered response-body lifecycle when configured. Kept out
+    /// of public metadata so a custom plugin cannot opt an unrelated rejection
+    /// into that contract.
+    pub(crate) serverless_terminate_response: bool,
+    /// Deduplication instance currently publishing an owned terminal response
+    /// from the observe-only committed hook. This transient private marker lets
+    /// the ordinary publication path retain in-flight protection when no replay
+    /// can be stored. Committed hooks run sequentially, so at most one instance
+    /// occupies the slot.
+    pub(crate) serverless_owned_dedup_publication: Option<u64>,
     /// Per-`ai_prompt_compressor`-instance source digest, transformed bytes, and
     /// stats staged by `before_proxy`. Kept out of public metadata so a staged
     /// prompt copy and prompt-derived digest cannot enter transaction logs.
@@ -1219,6 +2049,7 @@ impl RequestContext {
             method,
             path,
             request_authority: None,
+            request_is_secure: false,
             frontend_listen_port: None,
             frontend_sni_hostname: None,
             lb_generation: 1,
@@ -1231,6 +2062,7 @@ impl RequestContext {
             identified_consumer: None,
             authenticated_identity: None,
             authenticated_identity_header: None,
+            backend_geo_country: None,
             auth_method: None,
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
@@ -1242,21 +2074,32 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             metadata: HashMap::new(),
-            request_deduplication_state: HashMap::new(),
+            ai_usage_export: None,
+            ai_usage_export_token_prefix: None,
+            ai_usage_export_cost_prefix: None,
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
             buffered_initial_response_header_policy_state: None,
+            buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
             websocket_response_boundary: false,
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
             ai_tool_governor_response_hashes: HashMap::new(),
+            ai_response_guard_replay_redactions: HashSet::new(),
+            ai_tool_governor_replay_redactions: HashSet::new(),
             ai_tool_governor_call_hashes: HashMap::new(),
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
+            request_deduplication_states: HashMap::new(),
+            deduplication_replay_response_finalized: false,
+            serverless_pre_invocation_rejection_owners: HashSet::new(),
+            serverless_external_side_effect_owners: HashSet::new(),
+            serverless_terminate_response: false,
+            serverless_owned_dedup_publication: None,
             ai_prompt_compressor_staged: HashMap::new(),
             ai_prompt_compressor_classification_path: None,
             ai_prompt_compressor_wire_stats_started: false,
@@ -1310,6 +2153,112 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
+    }
+
+    pub(crate) fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) {
+        let publish_canonical = self
+            .canonical_client_ip
+            .publish_correlation_id(instance_key, request_id.clone());
+        self.metadata
+            .insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            self.metadata
+                .insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+        }
+    }
+
+    pub(crate) fn correlation_id(&self, instance_key: &str) -> Option<&str> {
+        self.canonical_client_ip.correlation_id(instance_key)
+    }
+
+    pub(crate) fn canonical_correlation_id(&self) -> Option<&str> {
+        self.canonical_client_ip.canonical_correlation_id()
+    }
+
+    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+        self.canonical_client_ip.project_correlation_ids(metadata);
+    }
+
+    fn replace_ai_usage_export(&mut self, candidate: AiUsageExport) {
+        self.ai_usage_export_token_prefix =
+            (candidate.token_completeness() != 0).then(|| Arc::clone(&candidate.prefix));
+        self.ai_usage_export_cost_prefix = candidate
+            .cost
+            .as_ref()
+            .map(|_| Arc::clone(&candidate.prefix));
+        self.ai_usage_export = Some(candidate);
+    }
+
+    pub(crate) fn stage_ai_usage_export(&mut self, candidate: AiUsageExport) {
+        if candidate.completeness() == 0 {
+            return;
+        }
+        let Some(mut current) = self.ai_usage_export.take() else {
+            self.replace_ai_usage_export(candidate);
+            return;
+        };
+
+        // Different providers must never be combined. Preserve the existing
+        // whole-snapshot selection rule for that defensive edge case.
+        if candidate.provider != current.provider {
+            let replace = candidate.completeness() > current.completeness()
+                || (candidate.completeness() == current.completeness()
+                    && candidate.prefix.as_ref() < current.prefix.as_ref());
+            if replace {
+                self.replace_ai_usage_export(candidate);
+            } else {
+                self.ai_usage_export = Some(current);
+            }
+            return;
+        }
+
+        // Token detail and trusted cost are independent dimensions. A detailed
+        // unpriced instance must not discard a cost from a less-detailed priced
+        // instance, and neither dimension may be counted more than once.
+        let candidate_token_completeness = candidate.token_completeness();
+        let current_token_completeness = current.token_completeness();
+        let current_token_prefix = self
+            .ai_usage_export_token_prefix
+            .as_deref()
+            .unwrap_or(current.prefix.as_ref());
+        let replace_tokens = candidate_token_completeness > current_token_completeness
+            || (candidate_token_completeness != 0
+                && candidate_token_completeness == current_token_completeness
+                && candidate.prefix.as_ref() < current_token_prefix);
+        if replace_tokens {
+            current.prompt_tokens = candidate.prompt_tokens;
+            current.completion_tokens = candidate.completion_tokens;
+            current.total_tokens = candidate.total_tokens;
+            self.ai_usage_export_token_prefix = Some(Arc::clone(&candidate.prefix));
+        }
+
+        if let Some(candidate_cost) = candidate.cost {
+            let replace_cost = self
+                .ai_usage_export_cost_prefix
+                .as_ref()
+                .is_none_or(|prefix| candidate.prefix.as_ref() < prefix.as_ref());
+            if replace_cost {
+                current.cost = Some(candidate_cost);
+                self.ai_usage_export_cost_prefix = Some(Arc::clone(&candidate.prefix));
+            }
+        }
+
+        if let Some(prefix) = self
+            .ai_usage_export_cost_prefix
+            .as_ref()
+            .or(self.ai_usage_export_token_prefix.as_ref())
+        {
+            current.prefix = Arc::clone(prefix);
+        }
+        self.ai_usage_export = Some(current);
+    }
+
+    /// Return the typed built-in usage snapshot carried to transaction logs.
+    /// Public only for external contract tests; runtime metadata producers
+    /// cannot access or populate this path.
+    #[doc(hidden)]
+    pub fn authoritative_ai_usage_export(&self) -> Option<AiUsageExport> {
+        self.ai_usage_export.clone()
     }
 
     /// Return the one absolute gRPC deadline established for this request.
@@ -1427,6 +2376,233 @@ impl RequestContext {
         self.buffered_initial_response_header_policy_state.take()
     }
 
+    /// Capture the pristine backend header map before trusted response hooks
+    /// execute. No state is allocated for requests without an absolute RPC
+    /// deadline.
+    pub(crate) fn begin_buffered_deadline_response_header_provenance(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        self.buffered_deadline_response_header_provenance = (self.grpc_deadline_at.is_some()
+            || self.gateway_deadline_response_selected)
+            .then(|| {
+                Arc::new(BufferedDeadlineResponseHeaderProvenance::backend_response(
+                    response_headers,
+                ))
+            });
+    }
+
+    pub(crate) fn ensure_buffered_deadline_response_header_provenance(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        if self.buffered_deadline_response_header_provenance.is_none() {
+            self.begin_buffered_deadline_response_header_provenance(response_headers);
+        }
+    }
+
+    /// Start a rejection response at the gateway provenance boundary. The
+    /// response did not come from a backend, so its plugin-produced fields are
+    /// provenance-known gateway output.
+    ///
+    /// # Contract
+    ///
+    /// `response_headers` MUST be a gateway-authored REPLACEMENT map: a freshly
+    /// built map, a `PluginResult::Reject{,Binary}` header map, or
+    /// gateway-synthesized error headers. It must not be a backend response map,
+    /// nor a map that still carries backend-sent headers — callers whose map has
+    /// backend lineage clear it first (see
+    /// `rebuild_plugin_rejection_response_headers`). This transition declares
+    /// the whole map gateway-owned and retires the backend `Set-Cookie`
+    /// baseline (see `adopt_gateway_rejection`), so handing it a mixed map would
+    /// credit backend lines as gateway-authored. A future caller that cannot
+    /// satisfy this must clear or partition its map rather than relaxing the
+    /// transition.
+    pub(crate) fn begin_rejection_deadline_response_header_provenance(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        if !(self.grpc_deadline_at.is_some() || self.gateway_deadline_response_selected) {
+            self.buffered_deadline_response_header_provenance = None;
+            return;
+        }
+        match self.buffered_deadline_response_header_provenance.as_mut() {
+            // A rejection generated after the buffered-response path already ran
+            // trusted `after_proxy` hooks — for example a later hook exhausting
+            // the RPC deadline, which converts into a fresh
+            // `grpc_deadline_exceeded_plugin_result()` — must not throw away the
+            // gateway decorations those completed hooks recorded. Fold the new
+            // rejection headers into the existing gateway-owned set instead of
+            // restarting provenance from the rejection headers alone.
+            Some(state) => Arc::make_mut(state).adopt_gateway_rejection(response_headers),
+            None => {
+                self.buffered_deadline_response_header_provenance = Some(Arc::new(
+                    BufferedDeadlineResponseHeaderProvenance::gateway_rejection(response_headers),
+                ));
+            }
+        }
+    }
+
+    /// Record the header result of one completed trusted gateway phase.
+    pub(crate) fn record_deadline_response_header_mutations(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
+            Arc::make_mut(state).record_gateway_mutations(|_| false, response_headers);
+        }
+    }
+
+    pub(crate) fn record_deadline_response_header_plugin(
+        &mut self,
+        plugin: &dyn Plugin,
+        response_headers: &HashMap<String, String>,
+    ) {
+        if self.buffered_deadline_response_header_provenance.is_none() {
+            return;
+        }
+        // Owned names are BORROWED from the response map and matched
+        // case-insensitively against the canonical (lowercase) snapshot, rather
+        // than being lowercased into fresh `String`s. Most plugins own nothing,
+        // so the common case is an empty collect with no per-name allocation at
+        // all; a declaring plugin allocates one small `Vec<&str>` instead of one
+        // `String` per response header. Same matching helper as
+        // `record_deadline_owned_response_headers`, so the two cannot diverge.
+        let plugin_owned_headers = response_headers
+            .keys()
+            .filter(|name| plugin.owns_deadline_response_header(self, name))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
+            Arc::make_mut(state).record_gateway_mutations(
+                |name| header_name_is_declared(&plugin_owned_headers, name),
+                response_headers,
+            );
+        }
+    }
+
+    /// Whether backend/gateway deadline-response provenance is being tracked for
+    /// this request. Trusted response hooks whose owned-name set must be
+    /// COMPUTED (e.g. `response_transformer` accumulating fired `update` /
+    /// `rename` / `add` keys) consult this first so that work is skipped
+    /// entirely on the common path with no absolute RPC deadline. Hooks that
+    /// own a fixed name can call
+    /// [`Self::record_deadline_owned_response_headers`] with a borrowed static
+    /// slice unconditionally — it allocates nothing and returns immediately
+    /// when provenance is absent.
+    pub(crate) fn has_buffered_deadline_response_header_provenance(&self) -> bool {
+        self.buffered_deadline_response_header_provenance.is_some()
+    }
+
+    /// Record response-header keys a completed trusted hook authoritatively
+    /// wrote even when the value matches what the backend already supplied
+    /// (e.g. a `response_transformer` `update` rule or route override). Mutation
+    /// tracking alone drops such a write, so a backend that pre-populates the
+    /// identical key/value could otherwise suppress the gateway decoration on a
+    /// terminal deadline rebuild. Declaring the keys owned keeps them in
+    /// `gateway_headers`.
+    ///
+    /// # Ownership means REPLACEMENT
+    ///
+    /// Declaring a name here asserts that the hook wrote the field's WHOLE
+    /// value, so nothing backend-authored remains underneath it and the
+    /// field's backend baseline is retired. A hook that only APPENDS onto a
+    /// value the backend may also have supplied must NOT be declared here — it
+    /// records through [`Self::record_deadline_response_header_mutations`] and
+    /// stays on the occurrence-partition branch (sticky-affinity cookie
+    /// injection), or, when it appends a known configured element set that an
+    /// exact backend spoof could hide, through
+    /// [`Self::record_deadline_authored_response_header_elements`].
+    ///
+    /// Names are matched case-insensitively against the canonical (lowercase)
+    /// snapshot rather than being lowercased into a fresh `Vec<String>`, so
+    /// callers can pass borrowed static names (`&["set-cookie"]`) and pay no
+    /// per-request allocation for provenance bookkeeping, whether or not a
+    /// deadline is being tracked.
+    pub(crate) fn record_deadline_owned_response_headers(
+        &mut self,
+        owned_header_names: &[&str],
+        response_headers: &HashMap<String, String>,
+    ) {
+        if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
+            Arc::make_mut(state).record_gateway_mutations(
+                |name| header_name_is_declared(owned_header_names, name),
+                response_headers,
+            );
+        }
+    }
+
+    /// Record a completed trusted hook that APPENDED a known, gateway-configured
+    /// element set onto a list-valued response header the backend may also have
+    /// supplied.
+    ///
+    /// Whole-field ownership ([`Self::record_deadline_owned_response_headers`])
+    /// is wrong for such a hook — it would credit the backend-only elements
+    /// sharing the field onto the synthesized deadline response. Plain mutation
+    /// tracking is also insufficient — a backend that pre-populates the
+    /// identical combined list hides the write entirely, so the deadline rebuild
+    /// silently drops the operator-configured elements. This retires one backend
+    /// baseline occurrence per authored element and then re-partitions the field
+    /// even when its live value is unchanged, so the ordinary occurrence
+    /// partition credits exactly the gateway's contribution and no backend-only
+    /// element ever crosses over. See
+    /// [`BufferedDeadlineResponseHeaderProvenance::retire_backend_authored_elements`].
+    ///
+    /// `name` must already be canonical (lowercase). Like the sibling recorders
+    /// this returns immediately when no deadline provenance is being tracked,
+    /// and it borrows the authored elements rather than cloning them.
+    pub(crate) fn record_deadline_authored_response_header_elements(
+        &mut self,
+        name: &str,
+        authored_elements: &[&str],
+        response_headers: &HashMap<String, String>,
+    ) {
+        if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
+            let state = Arc::make_mut(state);
+            state.retire_backend_authored_elements(name, authored_elements);
+            // Re-partition this field unconditionally: the exact-spoof case this
+            // recorder exists for leaves the live value byte-identical to the
+            // last observation, so the plain net-diff short-circuit would skip
+            // the field and the baseline just retired would never be consulted.
+            state.record_gateway_mutations_with_repartition(
+                |_| false,
+                |candidate| candidate == name,
+                response_headers,
+            );
+        }
+    }
+
+    /// Rebuild a terminal deadline header map from provenance-known gateway
+    /// output plus the narrow `Vary: Origin` compatibility contract.
+    pub(crate) fn retain_deadline_response_gateway_headers(
+        &mut self,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
+            Arc::make_mut(state).retain_gateway_output(response_headers);
+            return;
+        }
+        let preserve_origin_vary = response_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("vary")
+                && value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("origin"))
+        });
+        response_headers.clear();
+        if preserve_origin_vary {
+            response_headers.insert("vary".to_string(), "Origin".to_string());
+        }
+    }
+
+    pub(crate) fn sync_deadline_response_terminal_headers(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
+        if let Some(state) = self.buffered_deadline_response_header_provenance.as_mut() {
+            Arc::make_mut(state).sync_terminal_headers(response_headers);
+        }
+    }
+
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
     /// transforms. The compressor's private staged representation and incoming
@@ -1444,6 +2620,7 @@ impl RequestContext {
             method: self.method.clone(),
             path: self.path.clone(),
             request_authority: self.request_authority.clone(),
+            request_is_secure: self.request_is_secure,
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             lb_generation: self.lb_generation,
@@ -1456,6 +2633,7 @@ impl RequestContext {
             identified_consumer: self.identified_consumer.clone(),
             authenticated_identity: self.authenticated_identity.clone(),
             authenticated_identity_header: self.authenticated_identity_header.clone(),
+            backend_geo_country: self.backend_geo_country,
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
@@ -1478,10 +2656,9 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            // Deduplication has no final request-body hook, and the caller only
-            // copies selected hook results back. Keep ownership solely on the
-            // live context instead of cloning request keys and tokens here.
-            request_deduplication_state: HashMap::new(),
+            ai_usage_export: self.ai_usage_export.clone(),
+            ai_usage_export_token_prefix: self.ai_usage_export_token_prefix.clone(),
+            ai_usage_export_cost_prefix: self.ai_usage_export_cost_prefix.clone(),
             // Final request-body hooks cannot observe or mutate the real CORS
             // aggregate. CORS has no body hook, and only metadata is copied
             // back from this compatibility context.
@@ -1492,16 +2669,29 @@ impl RequestContext {
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
             buffered_initial_response_header_policy_state: None,
+            buffered_deadline_response_header_provenance: None,
             request_http_flavor: self.request_http_flavor,
             websocket_response_boundary: self.websocket_response_boundary,
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
+            ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
+            ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
+            request_deduplication_states: self.request_deduplication_states.clone(),
+            deduplication_replay_response_finalized: self.deduplication_replay_response_finalized,
+            serverless_pre_invocation_rejection_owners: self
+                .serverless_pre_invocation_rejection_owners
+                .clone(),
+            serverless_external_side_effect_owners: self
+                .serverless_external_side_effect_owners
+                .clone(),
+            serverless_terminate_response: self.serverless_terminate_response,
+            serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
             // Transfer rather than clone the potentially body-sized compressor
             // stage. The final wire hook consumes it from this compatibility
             // context, while the live context no longer retains a second copy.
@@ -1956,6 +3146,20 @@ impl RequestContext {
             .filter_map(|value| value.to_str().ok())
     }
 
+    /// Iterate every raw field-line value as bytes, including values that are
+    /// not valid UTF-8. Security decisions that depend on the final field line
+    /// must use this instead of silently skipping an unparseable value.
+    #[inline]
+    pub fn raw_header_value_bytes<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a [u8]> + 'a {
+        self.raw_headers
+            .iter()
+            .flat_map(move |headers| headers.get_all(name).iter())
+            .map(|value| value.as_bytes())
+    }
+
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
     /// String>`). This is a one-time operation — subsequent calls are no-ops.
     /// Non-UTF-8 header values are silently skipped (same as the previous eager
@@ -1973,8 +3177,10 @@ impl RequestContext {
                     // clients. Identity headers are injected after
                     // authentication; path-param headers are injected after
                     // route matching from regex captures.
-                    if matches!(key, "x-consumer-username" | "x-consumer-custom-id")
-                        || key.starts_with("x-path-param-")
+                    if matches!(
+                        key,
+                        "x-consumer-username" | "x-consumer-custom-id" | "x-geo-country"
+                    ) || key.starts_with("x-path-param-")
                     {
                         continue;
                     }
@@ -2125,6 +3331,21 @@ impl RequestContext {
             return None;
         }
         Some(custom_id)
+    }
+
+    /// Return the GeoIP country value to assert at the backend boundary.
+    ///
+    /// `geo_restriction` records this packed value privately when header
+    /// injection is enabled. Backend dispatch strips every mutable
+    /// `x-geo-country` value and restores only this lookup result.
+    pub fn backend_geo_country(&self) -> Option<&str> {
+        self.backend_geo_country
+            .as_ref()
+            .and_then(|country| std::str::from_utf8(country).ok())
+    }
+
+    pub(crate) fn set_backend_geo_country(&mut self, country: [u8; 2]) {
+        self.backend_geo_country = Some(country);
     }
 
     /// Whether a plugin opted this request out of gateway consumer-identity
@@ -2548,7 +3769,15 @@ pub async fn normalize_response_body_for_inspection(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Vec<u8>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
+    // Seed provenance before the rewrite gate: a status that forbids body
+    // rewrites can still be replaced by the request's gRPC deadline, and an
+    // unseeded provenance strips every header from that replacement.
+    ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
+    if !response_body_rewrite_allowed(response_status) {
+        return false;
+    }
     let content_type = response_headers.get("content-type").cloned();
     let mut normalized = false;
     for plugin in plugins {
@@ -2574,7 +3803,7 @@ pub async fn normalize_response_body_for_inspection(
                     grpc_web_response_content_type,
                     response_headers,
                     response_body,
-                    &[],
+                    initial_response_header_policy_plugins,
                 );
                 normalized = true;
                 break;
@@ -2585,6 +3814,7 @@ pub async fn normalize_response_body_for_inspection(
             *response_body = body;
             normalized = true;
         }
+        ctx.record_deadline_response_header_mutations(response_headers);
     }
     normalized
 }
@@ -2771,12 +4001,6 @@ pub struct MirrorResponseMeta {
     pub mirror_error: Option<String>,
 }
 
-/// Serde skip predicate: true when the value is zero. Used to keep logs tidy
-/// when new u64 counters are unset for a given transaction.
-fn is_zero_u64(v: &u64) -> bool {
-    *v == 0
-}
-
 /// Which direction of a bidirectional stream experienced a failure first.
 ///
 /// Used by TCP/UDP/WebSocket disconnect logging so operators can tell whether
@@ -2833,14 +4057,13 @@ pub enum DisconnectCause {
 ///     ..TransactionSummary::default()
 /// }
 /// ```
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default)]
 pub struct TransactionSummary {
     /// Namespace of the matched proxy.
     pub namespace: String,
     pub timestamp_received: String,
     pub client_ip: String,
     pub consumer_username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<&'static str>,
     pub http_method: String,
     pub request_path: String,
@@ -2849,11 +4072,9 @@ pub struct TransactionSummary {
     /// JSON key as `StreamTransactionSummary.proxy_id` so log consumers see
     /// a single `proxy_id` field across HTTP, gRPC, WebSocket, TCP, UDP, and
     /// DTLS transactions.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_id: Option<String>,
     /// Human-friendly proxy name; same JSON key as
     /// `StreamTransactionSummary.proxy_name`.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_name: Option<String>,
     /// Backend the request was forwarded to. For HTTP this is the full URL
     /// (`scheme://host:port/path`); `None` when the request was rejected
@@ -2862,7 +4083,6 @@ pub struct TransactionSummary {
     /// uses `host:port` form, since stream proxies have no path).
     pub backend_target: Option<String>,
     /// The DNS-resolved IP address of the backend that was connected to.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_resolved_ip: Option<String>,
     pub response_status_code: u16,
     pub latency_total_ms: f64,
@@ -2899,7 +4119,6 @@ pub struct TransactionSummary {
     /// True when the response body was streamed (not buffered).
     /// When true, `latency_backend_total_ms` is populated at deferred-log
     /// fire time from the real body-completion timestamp (see that field).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub response_streamed: bool,
     /// True when the client disconnected before receiving the full response.
     ///
@@ -2913,12 +4132,10 @@ pub struct TransactionSummary {
     ///   the handler function has already constructed and emitted the
     ///   summary. Consumers should treat `false` on a buffered response
     ///   as "not known to have disconnected," not as a positive assertion.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub client_disconnected: bool,
     /// Human-friendly classification of the error when the gateway itself
     /// failed to communicate with the backend. `None` for successful requests
     /// and normal HTTP error responses from the backend.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<crate::retry::ErrorClass>,
     /// Classification of an error that occurred while streaming the response
     /// body to the client (e.g., client RST after headers were sent). `None`
@@ -2927,12 +4144,10 @@ pub struct TransactionSummary {
     /// Distinct from `error_class`, which covers errors reaching the backend.
     /// Populated by the deferred-logging path when the response body wrapper
     /// returns an error frame or is dropped before completion.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub body_error_class: Option<crate::retry::ErrorClass>,
     /// True when the response body finished streaming all frames successfully.
     /// False when streaming was interrupted (client disconnect, backend RST,
     /// body size limit exceeded) or when no streaming occurred.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub body_completed: bool,
     /// Bytes of the request body relayed from the client to the backend
     /// (gateway-perspective: bytes it sent onward on the client's behalf).
@@ -2948,9 +4163,8 @@ pub struct TransactionSummary {
     ///   an `Arc<AtomicU64>` between the forwarded body and the summary
     ///   builder so the final byte count is visible once hyper has consumed
     ///   the body.
-    /// * **Empty / GET / HEAD / size-zero requests**: zero (skipped during
-    ///   serialization via `skip_serializing_if = "is_zero_u64"`).
-    #[serde(skip_serializing_if = "is_zero_u64")]
+    /// * **Empty / GET / HEAD / size-zero requests**: zero (omitted by the
+    ///   transaction summary serializer).
     pub bytes_sent: u64,
     /// Bytes of the response body relayed from the backend to the client
     /// (gateway-perspective: bytes it received and forwarded back). Unified
@@ -2965,12 +4179,10 @@ pub struct TransactionSummary {
     /// * **Streaming responses**: populated at deferred-log fire time from
     ///   the body counter. On a client disconnect mid-stream this reflects
     ///   bytes actually flushed before the disconnect.
-    #[serde(skip_serializing_if = "is_zero_u64")]
     pub bytes_received: u64,
     /// True when this summary represents a mirror (shadow) request, not the
     /// actual client-facing proxy traffic. Logged as a separate entry with the
     /// same schema so existing log queries and dashboards work without changes.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub mirror: bool,
     /// Plugin-injected metadata. Sensitive keys (authorization, cookie,
     /// credential/session tokens, secrets — see
@@ -2978,13 +4190,131 @@ pub struct TransactionSummary {
     /// plus operator extras from `FERRUM_LOG_REDACT_METADATA_KEYS`) are
     /// replaced with `[REDACTED]` at serialize time. The in-memory value is
     /// untouched so other plugin phases can still read the original.
-    #[serde(
-        serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
-    )]
     pub metadata: HashMap<String, String>,
+    /// Built-in AI usage provenance for Prometheus. This is intentionally not
+    /// serialized into transaction logs; the operator-visible usage metadata
+    /// remains in `metadata` while trust stays typed and private to the request
+    /// pipeline.
+    #[doc(hidden)]
+    pub ai_usage_export: Option<AiUsageExport>,
+}
+
+impl Serialize for TransactionSummary {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use crate::plugins::utils::metadata_redaction::RedactedMetadata;
+
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("namespace", &self.namespace)?;
+        map.serialize_entry("timestamp_received", &self.timestamp_received)?;
+        map.serialize_entry("client_ip", &self.client_ip)?;
+        map.serialize_entry("consumer_username", &self.consumer_username)?;
+        if let Some(auth_method) = self.auth_method {
+            map.serialize_entry("auth_method", auth_method)?;
+        }
+        map.serialize_entry("http_method", &self.http_method)?;
+        map.serialize_entry("request_path", &self.request_path)?;
+        if let Some(proxy_id) = &self.proxy_id {
+            map.serialize_entry("proxy_id", proxy_id)?;
+        }
+        if let Some(proxy_name) = &self.proxy_name {
+            map.serialize_entry("proxy_name", proxy_name)?;
+        }
+        map.serialize_entry("backend_target", &self.backend_target)?;
+        if let Some(backend_resolved_ip) = &self.backend_resolved_ip {
+            map.serialize_entry("backend_resolved_ip", backend_resolved_ip)?;
+        }
+        map.serialize_entry("response_status_code", &self.response_status_code)?;
+        if let Some(grpc_status) = self.grpc_status() {
+            map.serialize_entry("grpc_status", &grpc_status)?;
+        }
+        map.serialize_entry("latency_total_ms", &self.latency_total_ms)?;
+        map.serialize_entry(
+            "latency_gateway_processing_ms",
+            &self.latency_gateway_processing_ms,
+        )?;
+        map.serialize_entry("latency_backend_ttfb_ms", &self.latency_backend_ttfb_ms)?;
+        map.serialize_entry("latency_backend_total_ms", &self.latency_backend_total_ms)?;
+        map.serialize_entry(
+            "latency_plugin_execution_ms",
+            &self.latency_plugin_execution_ms,
+        )?;
+        map.serialize_entry(
+            "latency_plugin_external_io_ms",
+            &self.latency_plugin_external_io_ms,
+        )?;
+        map.serialize_entry(
+            "latency_gateway_overhead_ms",
+            &self.latency_gateway_overhead_ms,
+        )?;
+        map.serialize_entry("request_user_agent", &self.request_user_agent)?;
+        if self.response_streamed {
+            map.serialize_entry("response_streamed", &true)?;
+        }
+        if self.client_disconnected {
+            map.serialize_entry("client_disconnected", &true)?;
+        }
+        if let Some(error_class) = self.error_class {
+            map.serialize_entry("error_class", &error_class)?;
+        }
+        if let Some(body_error_class) = self.body_error_class {
+            map.serialize_entry("body_error_class", &body_error_class)?;
+        }
+        if self.body_completed {
+            map.serialize_entry("body_completed", &true)?;
+        }
+        if self.bytes_sent != 0 {
+            map.serialize_entry("bytes_sent", &self.bytes_sent)?;
+        }
+        if self.bytes_received != 0 {
+            map.serialize_entry("bytes_received", &self.bytes_received)?;
+        }
+        if self.mirror {
+            map.serialize_entry("mirror", &true)?;
+        }
+        map.serialize_entry("metadata", &RedactedMetadata(&self.metadata))?;
+        map.end()
+    }
 }
 
 impl TransactionSummary {
+    /// Authoritative final gRPC application status, kept separate from the
+    /// HTTP transport status. Missing or malformed terminal status on a known
+    /// gRPC transaction remains a failure: missing is UNKNOWN (2), while
+    /// malformed input uses the existing `u32::MAX` invalid-status sentinel.
+    /// Translated gRPC-Web requests are stamped as `request_protocol="grpc"`
+    /// by the H1/H2 and H3 dispatchers; no runtime path currently produces
+    /// `request_protocol="grpc-web"` (mesh uses `mesh.request_protocol`).
+    pub fn grpc_status(&self) -> Option<u32> {
+        match self.metadata.get("grpc_status") {
+            Some(status) => Some(crate::proxy::grpc_proxy::parse_grpc_status_value(status)),
+            None if self
+                .metadata
+                .get("request_protocol")
+                .is_some_and(|protocol| protocol == "grpc") =>
+            {
+                Some(crate::proxy::grpc_proxy::grpc_status::UNKNOWN)
+            }
+            None => None,
+        }
+    }
+
+    /// One authoritative terminal-failure predicate for transaction loggers.
+    ///
+    /// HTTP status filters remain independent: an upstream HTTP 5xx without a
+    /// gateway/terminal failure is not implicitly an `errors_only` match.
+    pub fn is_terminal_failure(&self) -> bool {
+        self.error_class.is_some()
+            || self.body_error_class.is_some()
+            || self.client_disconnected
+            || (self.response_streamed && !self.body_completed)
+            || self.metadata.contains_key("rejection_phase")
+            || self.metadata.contains_key("mirror_error")
+            || self.grpc_status().is_some_and(|status| status != 0)
+    }
+
     /// Build a mirror transaction summary from this summary and a mirror result.
     ///
     /// Clones the original request context fields (client_ip, method, path, proxy,
@@ -3009,6 +4339,22 @@ impl TransactionSummary {
         mirror.error_class = None;
         mirror.body_error_class = None;
         mirror.body_completed = false;
+        // The cloned metadata describes the primary response. Clear every
+        // response-only key that participates in terminal classification or
+        // mirror serialization before applying the mirror task's own outcome.
+        // In particular, retaining request_protocol="grpc" without a mirror
+        // grpc-status would synthesize UNKNOWN, while retaining grpc_status
+        // would report and filter on the primary backend's status.
+        for key in [
+            "request_protocol",
+            "grpc_status",
+            "grpc_message",
+            "rejection_phase",
+            "mirror_error",
+            "response_size_bytes",
+        ] {
+            mirror.metadata.remove(key);
+        }
         // Mirror traffic is fire-and-forget from the client's perspective — body
         // byte counters from the primary transaction are not meaningful on the
         // mirror summary. Mirror response size goes into metadata instead.
@@ -3179,9 +4525,16 @@ pub struct StreamConnectionContext {
     /// `mesh_authz` to populate Istio's `source.ip` principal (socket peer)
     /// separately from `remote.ip` (forwarded/resolved address).
     pub direct_client_ip: String,
-    /// Shared typed-client-IP cache for stream policy instances.
+    /// Shared typed client-IP cache for stream policy instances.
+    /// Replacing this cache after changing `client_ip` invalidates only typed
+    /// client-IP parsing; authoritative correlation ownership is independent.
     #[doc(hidden)]
     pub canonical_client_ip: CanonicalClientIpCache,
+    /// Authoritative per-instance and canonical stream correlation values.
+    ///
+    /// This must remain private and non-replaceable by custom plugins. Public
+    /// metadata is only a compatibility projection of this lifecycle state.
+    correlation_ids: CorrelationIdState,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub listen_port: u16,
@@ -3245,6 +4598,47 @@ pub struct StreamConnectionContext {
 }
 
 impl StreamConnectionContext {
+    /// Create a stream plugin context with empty optional lifecycle state.
+    ///
+    /// External plugins and tests must use this constructor rather than a
+    /// struct literal because authoritative correlation ownership is private.
+    /// The public fields may still be populated or updated before hooks run;
+    /// if `client_ip` changes, replace `canonical_client_ip` with its default
+    /// value to force an independent typed-IP reparse.
+    pub fn new(
+        client_ip: String,
+        direct_client_ip: String,
+        proxy_id: String,
+        proxy_name: Option<String>,
+        listen_port: u16,
+        backend_scheme: BackendScheme,
+        consumer_index: Arc<ConsumerIndex>,
+    ) -> Self {
+        Self {
+            client_ip,
+            direct_client_ip,
+            canonical_client_ip: CanonicalClientIpCache::default(),
+            correlation_ids: CorrelationIdState::default(),
+            proxy_id,
+            proxy_name,
+            listen_port,
+            backend_scheme,
+            consumer_index,
+            identified_consumer: None,
+            authenticated_identity: None,
+            auth_method: None,
+            metadata: None,
+            admission_permits: Vec::new(),
+            tls_client_cert_der: None,
+            tls_client_cert_chain_der: None,
+            sni_hostname: None,
+            mesh_direction: None,
+            node_waypoint_policy_scope: None,
+            first_bytes: None,
+            first_bytes_kind: None,
+        }
+    }
+
     /// Return the authoritative stream client IP as a canonical typed address.
     ///
     /// The value is parsed at most once per TCP connection or UDP/DTLS session
@@ -3257,6 +4651,17 @@ impl StreamConnectionContext {
     #[doc(hidden)]
     pub fn canonical_client_ip_is_initialized(&self) -> bool {
         self.canonical_client_ip.is_initialized()
+    }
+
+    pub(crate) fn publish_correlation_id(&mut self, instance_key: &str, request_id: String) {
+        let publish_canonical = self
+            .correlation_ids
+            .publish_correlation_id(instance_key, request_id.clone());
+        let metadata = self.metadata.get_or_insert_with(HashMap::new);
+        metadata.insert(instance_key.to_string(), request_id.clone());
+        if publish_canonical {
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+        }
     }
 
     /// Return the stable authenticated identity for stream policies. A mapped
@@ -3277,7 +4682,25 @@ impl StreamConnectionContext {
 
     /// Take the metadata map, returning an empty map if never allocated.
     pub fn take_metadata(&mut self) -> HashMap<String, String> {
-        self.metadata.take().unwrap_or_default()
+        let mut metadata = self.metadata.take().unwrap_or_default();
+        self.correlation_ids.project_correlation_ids(&mut metadata);
+        metadata
+    }
+
+    /// Transfer plugin-writable metadata and private correlation ownership to a
+    /// session that can receive additional metadata before its terminal summary.
+    ///
+    /// UDP and DTLS keep the correlation state immutable after admission, then
+    /// re-project it after all per-datagram metadata has been merged. This avoids
+    /// cloning correlation values per datagram while preventing those hooks from
+    /// replacing the authoritative terminal values.
+    pub(crate) fn take_metadata_with_correlation_ids(
+        &mut self,
+    ) -> (HashMap<String, String>, CorrelationIdState) {
+        (
+            self.metadata.take().unwrap_or_default(),
+            std::mem::take(&mut self.correlation_ids),
+        )
     }
 
     pub(crate) fn add_admission_permit(&mut self, permit: StreamAdmissionPermit) {
@@ -3590,6 +5013,24 @@ pub trait Plugin: Send + Sync {
     /// Returns the plugin name.
     fn name(&self) -> &str;
 
+    /// Returns the immutable country-MMDB snapshot retained by this plugin.
+    ///
+    /// Plugin-cache generation construction uses this cold-path hook to enforce
+    /// the aggregate live-snapshot budget across both rebuilt and retained geo
+    /// instances. Ordinary plugins retain the allocation-free default.
+    fn country_mmdb_snapshot(&self) -> Option<&crate::config::types::CountryMmdbSnapshot> {
+        None
+    }
+
+    /// Return the non-empty correlation header owned by this instance, or
+    /// `None` when it owns no correlation header. Plugin-cache admission trims
+    /// and ASCII-case-folds claims before rejecting empty, deployment-owned
+    /// `FERRUM_REAL_IP_HEADER`, or ambiguous writers.
+    #[doc(hidden)]
+    fn correlation_id_header_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Returns the execution priority (lower = runs first).
     ///
     /// Plugins are sorted by priority within each lifecycle phase.
@@ -3682,13 +5123,35 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin sends the buffered request body to an
+    /// external service during `before_proxy`, before request-body transforms
+    /// and final-body policy hooks run. Cache validation rejects a same-protocol
+    /// transformer in that chain so policy cannot govern different bytes than
+    /// the backend receives.
+    fn egresses_request_body_before_finalization(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin can execute an external side effect and
+    /// then terminate the request from `before_proxy`.
+    ///
+    /// A configured `request_deduplication` instance must have a strictly lower
+    /// effective priority so it acquires replay/in-flight ownership before the
+    /// side effect can run. This capability does not require deduplication to be
+    /// configured; it only makes an attached deduplication chain fail closed on
+    /// an unsafe ordering.
+    fn requires_prior_request_deduplication(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs the raw request body to be available
     /// during `before_proxy`.
     ///
     /// This is narrower than `requires_request_body_buffering()`: body
     /// transformers can buffer later, after `before_proxy` rejects have had a
-    /// chance to short-circuit. Override this only for plugins that read
-    /// `ctx.metadata["request_body"]` inside `before_proxy`.
+    /// chance to short-circuit. Override this only for plugins that inspect
+    /// `ctx.metadata["request_body"]` or `ctx.request_body_bytes` inside
+    /// `before_proxy`.
     fn requires_request_body_before_before_proxy(&self) -> bool {
         false
     }
@@ -3870,6 +5333,32 @@ pub trait Plugin: Send + Sync {
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Return whether this hook authoritatively owns a response field even
+    /// when it writes the same bytes the backend supplied. Most plugins rely
+    /// on mutation tracking; request-aware decorators with configurable names
+    /// should opt in so an exact backend spoof cannot hide their write.
+    fn owns_deadline_response_header(&self, _ctx: &RequestContext, _name: &str) -> bool {
+        false
+    }
+
+    /// Decorate the successful WebSocket handshake response before the
+    /// frontend commits it.
+    ///
+    /// H1 Upgrade and H2/H3 Extended CONNECT bypass the ordinary
+    /// `after_proxy` response lifecycle. This deliberately non-rejecting,
+    /// synchronous hook gives request-local header decorators an equivalent
+    /// boundary without introducing backend-handshake rollback or I/O after
+    /// the upstream has already accepted the session. Protocol-managed fields
+    /// are removed after the ordered hook chain, then the frontend restores
+    /// its authoritative Upgrade/subprotocol fields.
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
     }
 
     /// Returns `true` when this plugin defines deterministic response-header
@@ -4330,13 +5819,27 @@ pub trait Plugin: Send + Sync {
             .await
     }
 
-    /// Called immediately after this plugin returns a transformed response
-    /// body, before the next body transform runs.
+    /// Whether this plugin's response inspection just determined that its
+    /// transform is required to make an already-finalized deduplication replay
+    /// safe under current policy.
     ///
-    /// Use this for response headers that are valid only for the original body
-    /// representation, such as upstream validators or integrity digests. The
-    /// hook is not called when the transform returns `None`, so unchanged
-    /// responses retain their original headers.
+    /// Ordinary presentation transforms do not run twice over replayed bytes.
+    /// A plugin returning true here is therefore making a fail-closed security
+    /// claim: its transform must return replacement bytes before delivery. As
+    /// with every response-body hook, the plugin must also advertise response
+    /// buffering through `requires_response_body_buffering()`.
+    fn requires_replay_response_body_transform(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Called immediately after this plugin returns a transformed response
+    /// body, after the core removes stale representation metadata and before
+    /// the next body transform runs.
+    ///
+    /// Use this to attach validators, integrity digests, or other headers the
+    /// plugin recomputed for its replacement bytes. The hook is not called when
+    /// the transform returns `None`, so unchanged responses retain their
+    /// original headers.
     fn on_response_body_transformed(
         &self,
         _ctx: &mut RequestContext,
@@ -4840,7 +6343,16 @@ pub fn create_plugin_with_http_client(
             config,
         )?))),
         "bot_detection" => Ok(Some(Arc::new(bot_detection::BotDetection::new(config)?))),
-        "correlation_id" => Ok(Some(Arc::new(correlation_id::CorrelationId::new(config)?))),
+        "correlation_id" => {
+            let plugin = match http_client.real_ip_header() {
+                Some(real_ip_header) => correlation_id::CorrelationId::new_with_real_ip_header(
+                    config,
+                    Some(real_ip_header),
+                )?,
+                None => correlation_id::CorrelationId::new(config)?,
+            };
+            Ok(Some(Arc::new(plugin)))
+        }
         "request_transformer" => Ok(Some(Arc::new(
             request_transformer::RequestTransformer::new(config)?,
         ))),
@@ -5057,6 +6569,9 @@ pub(crate) fn validate_plugin_config_with_http_client(
     config: &Value,
     http_client: PluginHttpClient,
 ) -> Result<(), String> {
+    if name == "geo_restriction" {
+        return geo_restriction::GeoRestriction::validate_config(config);
+    }
     if name == "oidc_relying_party" {
         screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
         return oidc_relying_party::OidcRelyingParty::validate_config(config, http_client);
@@ -5078,7 +6593,8 @@ pub fn validate_plugin_config_with_policy(
     config: &Value,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
-    let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
+    let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
+        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header());
     validate_plugin_config_with_http_client(name, config, http_client)?;
     validate_plugin_config_policy_only(name, config, backend_allow_ips)
 }

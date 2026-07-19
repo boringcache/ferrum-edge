@@ -3,8 +3,8 @@
 //! Parses LLM response bodies to extract token usage metadata (prompt tokens,
 //! completion tokens, total tokens, model name) and writes the data to
 //! `RequestContext.metadata` so it flows into `TransactionSummary` for
-//! downstream logging/observability plugins (stdout_logging, http_logging,
-//! prometheus_metrics, otel_tracing).
+//! downstream logging plugins. Prometheus receives the same usage through a
+//! private typed snapshot rather than trusting public metadata provenance.
 //!
 //! Supports OpenAI, Anthropic, Google Gemini, Cohere, Mistral, and AWS Bedrock
 //! response formats. Auto-detection inspects the JSON structure to determine
@@ -16,19 +16,20 @@
 //! is opt-in. By default a streamed request (client `Accept: text/event-stream` or a
 //! `stream: true` request another AI plugin flagged) is never buffered, on every
 //! backend dispatch path. For streaming responses, the plugin parses each `data:`
-//! line as JSON, extracts
-//! the model name from the first chunk, and looks for a final `usage` object in
-//! the last chunk (OpenAI sends usage in the final SSE event when
-//! `stream_options.include_usage` is set). For Anthropic streaming, the plugin
-//! looks for `message_delta` events containing `usage`. For Cohere v2 streaming
-//! (`/v2/chat` with `stream: true`), the plugin looks for the `message-end`
-//! event which nests counts under `delta.usage.tokens.*`.
+//! line as JSON and merges provider cumulative/partial usage snapshots without
+//! summing repeated cumulative values. OpenAI Chat Completions and
+//! `response.completed`, Anthropic start/delta, Gemini/Vertex usage metadata,
+//! and Cohere terminal usage shapes are recognized.
+//!
+//! This plugin supports HTTP JSON/SSE only. Native gRPC protobuf messages do not
+//! have a generic verifiable provider schema and are deliberately excluded.
 //!
 //! This plugin is observability-only: it never rejects a request.
 
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::debug;
 
 use super::utils::ai_providers::{
@@ -36,8 +37,9 @@ use super::utils::ai_providers::{
     extract_response_usage, parse_ai_provider,
 };
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::sse::is_sse_request;
-use super::{Plugin, PluginResult, RequestContext};
+use super::{AiCost, AiUsageExport, Plugin, PluginResult, RequestContext};
 
 pub struct AiTokenMetrics {
     provider: String,
@@ -50,24 +52,54 @@ pub struct AiTokenMetrics {
     model_key: String,
     estimated_cost_key: String,
     streaming_key: String,
+    metadata_prefix: Arc<str>,
     buffer_streaming_responses: bool,
     cost_per_prompt_token: Option<f64>,
     cost_per_completion_token: Option<f64>,
 }
+
+const ALLOWED_CONFIG_KEYS: &[&str] = &[
+    "provider",
+    "include_model",
+    "include_token_details",
+    "metadata_prefix",
+    "buffer_streaming_responses",
+    "cost_per_prompt_token",
+    "cost_per_completion_token",
+];
+const MAX_METADATA_PREFIX_LEN: usize = 64;
+const MAX_INSPECTION_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CUMULATIVE_DECODED_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONTENT_CODINGS: usize = 4;
+const MAX_COST_RATE: f64 = 18_446_744_073_709.55;
 
 impl AiTokenMetrics {
     pub fn new(config: &Value) -> Result<Self, String> {
         if !config.is_object() {
             return Err("ai_token_metrics: config must be an object".to_string());
         }
+        let object = config
+            .as_object()
+            .ok_or_else(|| "ai_token_metrics: config must be an object".to_string())?;
+        let unknown = object
+            .keys()
+            .filter(|key| !ALLOWED_CONFIG_KEYS.contains(&key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "ai_token_metrics: unknown config key(s): {}; allowed keys: {}",
+                unknown.join(", "),
+                ALLOWED_CONFIG_KEYS.join(", ")
+            ));
+        }
 
         let provider = match optional_string(config, "provider")? {
             Some(raw) => {
-                let provider = raw.trim();
-                if provider.is_empty() {
+                if raw.is_empty() {
                     return Err("ai_token_metrics: 'provider' must not be empty".to_string());
                 }
-                provider.to_ascii_lowercase()
+                raw.to_string()
             }
             None => "auto".to_string(),
         };
@@ -82,11 +114,19 @@ impl AiTokenMetrics {
         let include_token_details = optional_bool(config, "include_token_details")?.unwrap_or(true);
         let metadata_prefix = match optional_string(config, "metadata_prefix")? {
             Some(raw) => {
-                let prefix = raw.trim();
-                if prefix.is_empty() {
+                if raw.is_empty() {
                     return Err("ai_token_metrics: 'metadata_prefix' must not be empty".to_string());
                 }
-                prefix.to_string()
+                if raw.len() > MAX_METADATA_PREFIX_LEN
+                    || !raw.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                    })
+                {
+                    return Err(format!(
+                        "ai_token_metrics: 'metadata_prefix' must be 1-{MAX_METADATA_PREFIX_LEN} ASCII letters, digits, '.', '_' or '-'"
+                    ));
+                }
+                raw.to_string()
             }
             None => "ai".to_string(),
         };
@@ -99,17 +139,17 @@ impl AiTokenMetrics {
         // nonsensical (negative or NaN/Inf) cost metrics that pollute
         // observability pipelines and chargeback accounting.
         if let Some(rate) = cost_per_prompt_token
-            && (rate < 0.0 || !rate.is_finite())
+            && (rate < 0.0 || !rate.is_finite() || rate > MAX_COST_RATE)
         {
             return Err(format!(
-                "ai_token_metrics: 'cost_per_prompt_token' must be a non-negative finite number, got {rate}"
+                "ai_token_metrics: 'cost_per_prompt_token' must be a non-negative finite number no greater than {MAX_COST_RATE}, got {rate}"
             ));
         }
         if let Some(rate) = cost_per_completion_token
-            && (rate < 0.0 || !rate.is_finite())
+            && (rate < 0.0 || !rate.is_finite() || rate > MAX_COST_RATE)
         {
             return Err(format!(
-                "ai_token_metrics: 'cost_per_completion_token' must be a non-negative finite number, got {rate}"
+                "ai_token_metrics: 'cost_per_completion_token' must be a non-negative finite number no greater than {MAX_COST_RATE}, got {rate}"
             ));
         }
 
@@ -120,6 +160,8 @@ impl AiTokenMetrics {
         let model_key = metadata_key(&metadata_prefix, "model");
         let estimated_cost_key = metadata_key(&metadata_prefix, "estimated_cost");
         let streaming_key = metadata_key(&metadata_prefix, "streaming");
+
+        debug!("ai_token_metrics is HTTP-only; native gRPC protobuf responses are not inspected");
 
         Ok(Self {
             provider,
@@ -132,6 +174,7 @@ impl AiTokenMetrics {
             model_key,
             estimated_cost_key,
             streaming_key,
+            metadata_prefix: Arc::from(metadata_prefix),
             buffer_streaming_responses,
             cost_per_prompt_token,
             cost_per_completion_token,
@@ -150,17 +193,20 @@ impl AiTokenMetrics {
 
     /// Parse an SSE (text/event-stream) response body to extract token usage.
     ///
-    /// SSE responses consist of `data: {...}\n\n` lines. The plugin scans for:
-    /// - **Model name**: extracted from the first parseable chunk
-    /// - **Usage data**: extracted from the final chunk that contains a `usage` object
-    ///   (OpenAI sends this when `stream_options.include_usage: true`)
-    /// - **Anthropic streaming**: looks for `message_delta` events with `usage`
+    /// SSE responses consist of `data: {...}\n\n` lines. Supported providers
+    /// report cumulative or partial snapshots, so each newer present field
+    /// replaces that field while omitted fields retain the earlier value.
     fn extract_from_sse(&self, body: &[u8]) -> Option<AiTokenUsage> {
         let body_str = std::str::from_utf8(body).ok()?;
 
         let mut model: Option<String> = None;
         let mut final_usage: Option<AiTokenUsage> = None;
         let mut detected_provider: Option<AiProvider> = None;
+        let fixed_provider = if self.provider == "auto" {
+            None
+        } else {
+            parse_ai_provider(&self.provider)
+        };
 
         for line in body_str.lines() {
             let data = if let Some(stripped) = line.strip_prefix("data: ") {
@@ -181,139 +227,175 @@ impl AiTokenMetrics {
                 Err(_) => continue,
             };
 
-            // Extract model from first chunk that has it
+            let event_type = json.get("type").and_then(Value::as_str);
+            // Failed/incomplete Responses events are deliberately not usage
+            // authorities. Only response.completed unwraps its Response object.
+            let payload = if event_type == Some("response.completed") {
+                let Some(response) = json.get("response") else {
+                    continue;
+                };
+                response
+            } else if event_type.is_some_and(|kind| kind.starts_with("response.")) {
+                continue;
+            } else if event_type == Some("message_start") {
+                json.get("message").unwrap_or(&json)
+            } else {
+                &json
+            };
+
             if model.is_none() {
-                model = json.get("model").and_then(|v| v.as_str()).map(String::from);
+                model = payload
+                    .get("model")
+                    .or_else(|| payload.get("modelVersion"))
+                    .and_then(Value::as_str)
+                    .map(String::from);
             }
 
-            // Auto-detect provider from first parseable chunk
-            if detected_provider.is_none() {
-                if self.provider == "auto" {
-                    detected_provider = detect_sse_provider(&json);
-                } else {
-                    detected_provider = parse_ai_provider(&self.provider);
-                }
-            }
+            let event_provider = fixed_provider
+                .or_else(|| detect_sse_provider(payload))
+                .or(detected_provider);
+            let Some(provider) = event_provider else {
+                continue;
+            };
+            detected_provider.get_or_insert(provider);
 
-            // Check for usage data in this chunk
-            // OpenAI: final chunk has "usage" object with prompt_tokens/completion_tokens
-            if let Some(usage) = json.get("usage")
-                && usage.is_object()
-                && !usage.as_object().is_some_and(|o| o.is_empty())
+            let mut extracted = extract_response_usage(payload, provider);
+            if extracted.prompt_tokens.is_none()
+                && extracted.completion_tokens.is_none()
+                && extracted.total_tokens.is_none()
             {
-                let provider = detected_provider.unwrap_or(AiProvider::OpenAi);
-                let mut extracted = extract_response_usage(&json, provider);
-                if extracted.model.is_none() {
-                    extracted.model = model.clone();
-                }
-                final_usage = Some(extracted);
+                continue;
             }
-
-            // Anthropic streaming: message_delta event with usage
-            if json.get("type").and_then(|t| t.as_str()) == Some("message_delta")
-                && json.get("usage").is_some()
-            {
-                let usage = json.get("usage");
-                let output_tokens = usage
-                    .and_then(|u| u.get("output_tokens"))
-                    .and_then(|v| v.as_u64());
-                // message_delta only has output_tokens; input_tokens come from message_start
-                if output_tokens.is_some() {
-                    let mut u = AiTokenUsage {
-                        prompt_tokens: None,
-                        completion_tokens: output_tokens,
-                        total_tokens: None,
-                        model: model.clone(),
-                        provider: Some(AiProvider::Anthropic),
-                    };
-                    // Try to merge with any previously seen input_tokens
-                    if let Some(ref prev) = final_usage {
-                        u.prompt_tokens = prev.prompt_tokens;
-                    }
-                    u.total_tokens = match (u.prompt_tokens, u.completion_tokens) {
-                        (Some(p), Some(c)) => Some(p.saturating_add(c)),
-                        _ => None,
-                    };
-                    final_usage = Some(u);
-                }
+            if extracted.model.is_none() {
+                extracted.model = model.clone();
             }
-
-            // Anthropic streaming: message_start event with input_tokens
-            if json.get("type").and_then(|t| t.as_str()) == Some("message_start")
-                && let Some(message) = json.get("message")
-            {
-                let input_tokens = message
-                    .get("usage")
-                    .and_then(|u| u.get("input_tokens"))
-                    .and_then(|v| v.as_u64());
-                if input_tokens.is_some() {
-                    let u = AiTokenUsage {
-                        prompt_tokens: input_tokens,
-                        completion_tokens: None,
-                        total_tokens: None,
-                        model: message
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                            .or_else(|| model.clone()),
-                        provider: Some(AiProvider::Anthropic),
-                    };
-                    final_usage = Some(u);
-                }
-            }
-
-            // Cohere v2 streaming: message-end event nests counts under
-            // `delta.usage.tokens.*` instead of root `usage`, so the
-            // root-`usage` check above doesn't fire. `extract_cohere_usage`
-            // knows how to read both shapes.
-            if json.get("type").and_then(|t| t.as_str()) == Some("message-end") {
-                let mut extracted = extract_response_usage(&json, AiProvider::Cohere);
-                if extracted.prompt_tokens.is_some() || extracted.completion_tokens.is_some() {
-                    if extracted.model.is_none() {
-                        extracted.model = model.clone();
-                    }
-                    final_usage = Some(extracted);
-                }
+            match &mut final_usage {
+                Some(current) => current.merge_cumulative(extracted),
+                None => final_usage = Some(extracted),
             }
         }
 
         final_usage
     }
+    fn calculate_cost(
+        &self,
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+    ) -> Option<(f64, AiCost)> {
+        let prompt_cost = prompt_tokens
+            .zip(self.cost_per_prompt_token)
+            .map(|(tokens, rate)| tokens as f64 * rate);
+        let completion_cost = completion_tokens
+            .zip(self.cost_per_completion_token)
+            .map(|(tokens, rate)| tokens as f64 * rate);
+        if prompt_cost.is_none() && completion_cost.is_none() {
+            return None;
+        }
+
+        let total_cost = prompt_cost.unwrap_or(0.0) + completion_cost.unwrap_or(0.0);
+        if !total_cost.is_finite() || total_cost > MAX_COST_RATE {
+            return None;
+        }
+        Some((total_cost, AiCost::from_currency_units(total_cost)?))
+    }
+
+    fn provider_matches_export(&self, provider: &str) -> bool {
+        if self.provider == "auto" {
+            return true;
+        }
+        let family = match provider {
+            "openai" | "azure_openai" | "xai" | "deepseek" | "meta_llama" | "hugging_face" => {
+                "openai"
+            }
+            "anthropic" => "anthropic",
+            "google" | "google_gemini" | "google_vertex" => "google",
+            "cohere" => "cohere",
+            "mistral" => "mistral",
+            "bedrock" | "aws_bedrock" => "bedrock",
+            _ => return false,
+        };
+        self.provider == family
+    }
+
+    /// Apply this instance's configured rates to a trusted federation usage
+    /// snapshot. Federation already parsed the provider response and publishes
+    /// typed provenance before its synthetic response enters body hooks, so no
+    /// public metadata or client-visible body needs to be trusted here.
+    fn price_federated_usage(&self, ctx: &mut RequestContext) {
+        let Some(mut usage) = ctx.authoritative_ai_usage_export() else {
+            return;
+        };
+        if !self.provider_matches_export(usage.provider) {
+            return;
+        }
+        let Some((total_cost, cost)) =
+            self.calculate_cost(usage.prompt_tokens, usage.completion_tokens)
+        else {
+            return;
+        };
+
+        ctx.metadata
+            .insert(self.estimated_cost_key.clone(), format!("{total_cost:.6}"));
+        usage.prefix = Arc::clone(&self.metadata_prefix);
+        usage.cost = Some(cost);
+        ctx.stage_ai_usage_export(usage);
+    }
+
     /// Write extracted token usage into the request context metadata.
-    fn write_metadata(&self, metadata: &mut HashMap<String, String>, usage: &AiTokenUsage) {
+    fn write_metadata(&self, ctx: &mut RequestContext, usage: &AiTokenUsage) {
         if let Some(provider) = usage.provider {
-            metadata.insert(self.provider_key.clone(), provider.as_str().to_string());
+            ctx.metadata
+                .insert(self.provider_key.clone(), provider.as_str().to_string());
         }
 
         if let Some(total) = usage.total_tokens {
-            metadata.insert(self.total_tokens_key.clone(), total.to_string());
+            ctx.metadata
+                .insert(self.total_tokens_key.clone(), total.to_string());
         }
 
         if self.include_token_details {
             if let Some(prompt) = usage.prompt_tokens {
-                metadata.insert(self.prompt_tokens_key.clone(), prompt.to_string());
+                ctx.metadata
+                    .insert(self.prompt_tokens_key.clone(), prompt.to_string());
             }
             if let Some(completion) = usage.completion_tokens {
-                metadata.insert(self.completion_tokens_key.clone(), completion.to_string());
+                ctx.metadata
+                    .insert(self.completion_tokens_key.clone(), completion.to_string());
             }
         }
 
         if self.include_model
             && let Some(ref model) = usage.model
         {
-            metadata.insert(self.model_key.clone(), model.clone());
+            ctx.metadata.insert(self.model_key.clone(), model.clone());
         }
 
-        // Calculate estimated cost if at least one cost rate is configured
-        if self.cost_per_prompt_token.is_some() || self.cost_per_completion_token.is_some() {
-            let prompt_tokens = usage.prompt_tokens.unwrap_or(0) as f64;
-            let completion_tokens = usage.completion_tokens.unwrap_or(0) as f64;
-            let total_cost = prompt_tokens * self.cost_per_prompt_token.unwrap_or(0.0)
-                + completion_tokens * self.cost_per_completion_token.unwrap_or(0.0);
-            metadata.insert(
-                self.estimated_cost_key.clone(),
-                format!("{:.6}", total_cost),
-            );
+        // Public per-request metadata retains its six-decimal contract, while
+        // the typed export keeps a sub-micro remainder for cumulative metrics.
+        let cost = self
+            .calculate_cost(usage.prompt_tokens, usage.completion_tokens)
+            .map(|(total_cost, cost)| {
+                ctx.metadata
+                    .insert(self.estimated_cost_key.clone(), format!("{total_cost:.6}"));
+                cost
+            });
+        if let Some(provider) = usage.provider {
+            ctx.stage_ai_usage_export(AiUsageExport {
+                prefix: Arc::clone(&self.metadata_prefix),
+                provider: provider.as_str(),
+                prompt_tokens: if self.include_token_details {
+                    usage.prompt_tokens
+                } else {
+                    None
+                },
+                completion_tokens: if self.include_token_details {
+                    usage.completion_tokens
+                } else {
+                    None
+                },
+                total_tokens: usage.total_tokens,
+                cost,
+            });
         }
     }
 }
@@ -359,21 +441,11 @@ fn optional_f64(config: &Value, field: &'static str) -> Result<Option<f64>, Stri
         .ok_or_else(|| format!("ai_token_metrics: '{field}' must be a number"))
 }
 
-/// Whether the request carries a native gRPC `content-type` (`application/grpc`,
-/// optionally with a `+subtype`/`;param`/OWS suffix; excluding
-/// `application/grpc-web` and bogus suffixes like `application/grpcfoo`).
-///
-/// Delegates to the canonical, delimiter-aware
-/// [`crate::proxy::backend_dispatch::is_native_grpc_content_type`] classifier so
-/// the buffering decision stays aligned with the dispatch path: a value the
-/// dispatcher routes as plain HTTP (e.g. `application/grpcfoo`) must NOT be
-/// treated as native gRPC here, otherwise a JSON LLM response from a tolerant
-/// upstream would be opted out of buffering and its token usage skipped. Operates
-/// on raw bytes with no allocation, so it is safe on the decision hot path.
-fn is_native_grpc_request(ctx: &RequestContext) -> bool {
-    ctx.headers.get("content-type").is_some_and(|content_type| {
-        crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
-    })
+fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
 #[async_trait]
@@ -387,7 +459,7 @@ impl Plugin for AiTokenMetrics {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_GRPC_PROTOCOLS
+        super::HTTP_ONLY_PROTOCOLS
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -396,24 +468,17 @@ impl Plugin for AiTokenMetrics {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // The pre-header buffering decision drives EVERY backend dispatch path —
-        // including the retry, native-gRPC, and HTTP/3-backend paths that never
+        // including the retry and HTTP/3-backend paths that never
         // consult the header-time `should_buffer_response_body_for_content_type`
         // refinement below. Gate it on the request shape so those paths preserve
         // streaming too, mirroring `ai_response_guard`:
         //
-        //   * Native gRPC requests are never buffered — this plugin only parses
-        //     JSON / SSE LLM bodies, never `application/grpc` framing, so holding
-        //     a server-streaming gRPC response to EOF would add latency and
-        //     memory pressure for no token data.
         //   * A client asking for a stream (`Accept: text/event-stream`) or a
         //     request another plugin flagged as `stream: true`
         //     (`ai_request_streaming`) keeps streaming unless the operator opted
         //     into `buffer_streaming_responses`. Otherwise the SSE response would
         //     be collected until `max_response_body_size_bytes` (502) instead of
         //     streaming tokens to the client — the exact regression #1726 fixes.
-        if is_native_grpc_request(ctx) {
-            return false;
-        }
         if !self.buffer_streaming_responses && self.request_prefers_streaming(ctx) {
             return false;
         }
@@ -470,6 +535,7 @@ impl Plugin for AiTokenMetrics {
             .metadata
             .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
         {
+            self.price_federated_usage(ctx);
             debug!(
                 "ai_token_metrics: skipping synthetic short-circuit response (no model tokens consumed)"
             );
@@ -487,21 +553,51 @@ impl Plugin for AiTokenMetrics {
             return PluginResult::Continue;
         }
 
-        let content_type = response_headers
-            .get("content-type")
-            .map(|s| s.as_str())
-            .unwrap_or("");
+        let content_type = header_value(response_headers, "content-type").unwrap_or("");
+
+        // Buffering is a shared response-level decision: another plugin may
+        // require an SSE body even when this instance did not opt in. Enforce
+        // the local streaming policy again before inspection so a sibling
+        // bufferer cannot enable token accounting implicitly.
+        if is_event_stream_content_type(content_type) && !self.buffer_streaming_responses {
+            debug!("ai_token_metrics: skipping SSE response because stream buffering is disabled");
+            return PluginResult::Continue;
+        }
 
         if body.is_empty() {
             debug!("ai_token_metrics: empty response body, skipping");
             return PluginResult::Continue;
         }
 
+        if body.len() > MAX_INSPECTION_BYTES {
+            debug!(
+                "ai_token_metrics: encoded response body exceeds inspection limit of {} bytes",
+                MAX_INSPECTION_BYTES
+            );
+            return PluginResult::Continue;
+        }
+
+        let inspection_body = match decode_content_encoding(
+            header_value(response_headers, "content-encoding"),
+            body,
+            DecodeLimits {
+                max_decoded_bytes: MAX_INSPECTION_BYTES,
+                max_cumulative_bytes: MAX_CUMULATIVE_DECODED_BYTES,
+                max_codings: MAX_CONTENT_CODINGS,
+            },
+        ) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                debug!("ai_token_metrics: response content decoding skipped: {error}");
+                return PluginResult::Continue;
+            }
+        };
+
         // Handle SSE streaming responses
         if is_event_stream_content_type(content_type) {
             debug!("ai_token_metrics: parsing SSE streaming response");
-            if let Some(usage) = self.extract_from_sse(body) {
-                self.write_metadata(&mut ctx.metadata, &usage);
+            if let Some(usage) = self.extract_from_sse(&inspection_body) {
+                self.write_metadata(ctx, &usage);
                 ctx.metadata
                     .insert(self.streaming_key.clone(), "true".to_string());
             } else {
@@ -520,7 +616,7 @@ impl Plugin for AiTokenMetrics {
         }
 
         // Parse the response body as JSON
-        let json: Value = match serde_json::from_slice(body) {
+        let json: Value = match serde_json::from_slice(&inspection_body) {
             Ok(v) => v,
             Err(e) => {
                 debug!("ai_token_metrics: failed to parse response JSON: {}", e);
@@ -552,7 +648,14 @@ impl Plugin for AiTokenMetrics {
 
         // Extract token usage and write to metadata
         let usage = extract_response_usage(&json, provider);
-        self.write_metadata(&mut ctx.metadata, &usage);
+        if usage.prompt_tokens.is_none()
+            && usage.completion_tokens.is_none()
+            && usage.total_tokens.is_none()
+        {
+            debug!("ai_token_metrics: provider response contained no valid usage fields");
+            return PluginResult::Continue;
+        }
+        self.write_metadata(ctx, &usage);
 
         PluginResult::Continue
     }

@@ -1475,7 +1475,7 @@ fn materialize_fault_runtime_overlay(
     }
 }
 
-/// Advance only the fault-plugin generations whose materialized config changed.
+/// Advance fault-plugin generations whose reconciled non-persistence content changed.
 ///
 /// RTDS is not one of the mesh slice's version-coherence resource types, so an
 /// RTDS-only response can legitimately keep `GatewayConfig.loaded_at` stable.
@@ -1483,7 +1483,10 @@ fn materialize_fault_runtime_overlay(
 /// cold-path stamp makes the affected instances rebuild from their materialized
 /// effective config before `RequestEpoch` publishes the candidate. Unchanged
 /// and unrelated scopes retain their stateful plugin instances.
-fn reconcile_fault_plugin_generations(candidate: &mut GatewayConfig, previous: &GatewayConfig) {
+pub(crate) fn reconcile_fault_plugin_generations(
+    candidate: &mut GatewayConfig,
+    previous: &GatewayConfig,
+) {
     let previous_plugins = previous
         .plugin_configs
         .iter()
@@ -1500,11 +1503,11 @@ fn reconcile_fault_plugin_generations(candidate: &mut GatewayConfig, previous: &
         else {
             continue;
         };
-        if plugin.config == previous.config && plugin.enabled == previous.enabled {
+        if plugin_config_content_eq_ignoring_persistence(plugin, previous) {
             // The candidate may have been reconstructed from the static mesh
             // source timestamp while `previous` carries the synthetic stamp
             // assigned to an earlier RTDS materialization. Preserve that
-            // accepted stamp when the effective config is identical so
+            // accepted stamp when every non-persistence field is identical so
             // ConfigDelta does not rebuild the plugin or reset its sampler.
             plugin.updated_at = previous.updated_at;
             continue;
@@ -1519,6 +1522,33 @@ fn reconcile_fault_plugin_generations(candidate: &mut GatewayConfig, previous: &
         } else {
             now
         };
+    }
+}
+
+/// Whether two plugin configs are identical after neutralizing persistence-only
+/// timestamps.
+///
+/// Serializing the normalized configs makes this comparison automatically
+/// complete over the `PluginConfig` schema: a future runtime-relevant field is
+/// included without another hand-maintained equality update. `api_spec_id` is
+/// intentionally still compared; an extra cold-path rebuild for an admin-only
+/// metadata edit is safer than retaining a stale runtime instance. A
+/// serialization failure is treated as changed so reconciliation fails toward
+/// rebuilding rather than stale reuse.
+fn plugin_config_content_eq_ignoring_persistence(
+    candidate: &PluginConfig,
+    previous: &PluginConfig,
+) -> bool {
+    let mut normalized_candidate = candidate.clone();
+    normalized_candidate.created_at = previous.created_at;
+    normalized_candidate.updated_at = previous.updated_at;
+
+    match (
+        serde_json::to_value(&normalized_candidate),
+        serde_json::to_value(previous),
+    ) {
+        (Ok(candidate), Ok(previous)) => candidate == previous,
+        _ => false,
     }
 }
 
@@ -10434,6 +10464,7 @@ fn start_mesh_admin_listeners(
         admin_allowed_cidrs,
         metrics_auth,
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -22538,6 +22569,23 @@ mod tests {
         );
         reconcile_fault_plugin_generations(&mut unrelated_only, &accepted);
         assert_eq!(unrelated_only.plugin_configs[0].updated_at, generation);
+
+        let mut moved_to_proxy = accepted.clone();
+        moved_to_proxy.plugin_configs[0].scope = PluginScope::Proxy;
+        moved_to_proxy.plugin_configs[0].proxy_id = Some("checkout".to_string());
+        reconcile_fault_plugin_generations(&mut moved_to_proxy, &accepted);
+        assert_ne!(moved_to_proxy.plugin_configs[0].updated_at, generation);
+        let moved_delta = crate::config_delta::ConfigDelta::compute(&accepted, &moved_to_proxy);
+        assert_eq!(moved_delta.modified_plugin_configs.len(), 1);
+        assert!(moved_delta.global_plugin_configs_changed);
+
+        let mut reprioritized = accepted.clone();
+        reprioritized.plugin_configs[0].priority_override = Some(42);
+        reconcile_fault_plugin_generations(&mut reprioritized, &accepted);
+        assert_ne!(reprioritized.plugin_configs[0].updated_at, generation);
+        let priority_delta = crate::config_delta::ConfigDelta::compute(&accepted, &reprioritized);
+        assert_eq!(priority_delta.modified_plugin_configs.len(), 1);
+        assert!(priority_delta.global_plugin_configs_changed);
 
         let mut disabled = accepted.clone();
         materialize_fault_runtime_overlay(

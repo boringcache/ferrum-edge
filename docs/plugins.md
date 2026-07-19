@@ -124,7 +124,7 @@ Use `priority_override` to control the relative execution order of instances tha
 
 With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one establishes a nonblank mapped Consumer or permitted external principal; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned.
 
-In either mode, rejected, not-applicable, and principal-less attempts leave no claim headers, external identity header, mesh principal, rolling session cookie, or backend token-stripping state for another credential to inherit. Requester-owned cookies from rejected attempts are retained only when authentication ultimately rejects and are merged with the selected rejection's cookies by exact cookie name; a later successful credential discards them. After authentication, the Access Control plugin can apply consumer or group policy.
+In either mode, rejected, not-applicable, and principal-less attempts leave no claim headers, external identity header, mesh principal, rolling session cookie, or backend token-stripping state for another credential to inherit. Requester-owned cookies from rejected attempts are retained only when authentication ultimately rejects and are merged with the selected rejection's cookies by effective RFC 10025 storage key (case-sensitive name, canonicalized reg-name or bracketed IP-literal Domain with omitted Domain resolved to the validated request host, computed host-only state, Path after RFC default-path resolution, and Partitioned state); a later successful credential discards them. Malformed cookie-pairs, including control-bearing values, a trimmed name/value pair over 4096 octets, or invalid Domain syntax, and cookies that fail browser storage requirements for Secure (accounting for direct TLS, HTTPS reported by a peer in `FERRUM_TRUSTED_PROXIES`, and trustworthy localhost/loopback origins), HttpOnly-constrained `__Http-`/`__Host-Http-` prefixes, Partitioned, SameSite=None, or `__Secure-`/`__Host-` prefixes replace only byte-identical lines. After authentication, the Access Control plugin can apply consumer or group policy.
 
 ## Consumer Identity Headers
 
@@ -153,12 +153,12 @@ These headers are injected on all proxy paths (HTTP, gRPC, and WebSocket).
 
 ### `stdout_logging`
 
-Writes one JSON transaction (or stream) summary per line to stdout for each request. Output goes through the same non-blocking writer the runtime tracing logs use, so logging never blocks request-processing threads. It is emitted independent of `FERRUM_LOG_LEVEL` — enabling the plugin is the on/off switch, so lowering runtime verbosity never silences access logs and the default runtime stdout stays quiet until you turn this on.
+Writes one JSON transaction (or stream) summary per line to stdout for each request. Output goes through the same bounded non-blocking writer as runtime stdout events, so logging never waits for stdout on request-processing threads. Capacity is reserved before JSON serialization; saturation and oversize records are dropped with monotonic telemetry. It is emitted independent of `FERRUM_LOG_LEVEL` — enabling the plugin is the on/off switch.
 
-Scope it to one or more proxies to log only those proxies' traffic, or attach it globally to log every proxy's transactions. An optional `filter` (evaluated before any `schema:`) suppresses entries by status code, latency, or error class. This is also the sink mesh mode injects to honor a Telemetry CRD's `accessLogging` configuration.
+Scope it to one or more proxies to log only those proxies' traffic, or attach it globally to log every proxy's transactions. An optional `filter` (evaluated before any `schema:`) suppresses entries by status code, latency, or terminal outcome. For HTTP-family terminal summaries, `errors_only` uses one final predicate: dispatch/error class, response-body error, incomplete streamed body, client disconnect, gateway rejection, or nonzero final gRPC status. TCP, UDP, WebSocket, and DTLS stream/disconnect summaries instead match `error_class` or `connection_error`. HTTP status and latency filters remain independent and all configured predicates must match. This is also the sink mesh mode injects to honor a Telemetry CRD's `accessLogging` configuration.
 
 **Priority:** 9000
-**Config**: All fields optional; `config: {}` logs every transaction.
+**Config**: The accepted outer keys are exactly `filter`, `schema`, and `schema_ref`; filter keys are exactly `status_code_min`, `status_code_max`, `min_latency_ms`, and `errors_only`. Unknown keys are rejected with their full path. `null`, `{}`, and `filter: null` preserve the default of logging every transaction.
 
 ```yaml
 plugin_name: stdout_logging
@@ -166,7 +166,7 @@ config:
   filter:                 # optional; all present predicates must match
     status_code_min: 500  # skip responses with status < 500
     min_latency_ms: 1000  # skip transactions/streams faster than 1s
-    errors_only: true     # skip transactions with no error
+    errors_only: true     # require an authoritative terminal failure
 ```
 
 ### `http_logging`
@@ -699,6 +699,7 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `backend_target` | String or null | Backend the request was forwarded to. For HTTP this is the full URL (`scheme://host:port/path`); `null` when the request was rejected before backend selection. Same JSON key as `StreamTransactionSummary.backend_target` (which uses `host:port` form because stream proxies have no path). |
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
 | `response_status_code` | u16 | HTTP status code |
+| `grpc_status` | u32 | Final normalized gRPC application status, separate from HTTP transport status; emitted for gRPC transactions. Missing terminal status normalizes to `2` (UNKNOWN); malformed input uses the existing `u32::MAX` invalid-status sentinel |
 | `latency_total_ms` | f64 | Total request-to-response time |
 | `latency_gateway_processing_ms` | f64 | Total time excluding backend communication |
 | `latency_backend_ttfb_ms` | f64 | Time to first byte from backend; -1.0 if no backend call |
@@ -717,7 +718,7 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `mirror` | bool | Present and `true` when this entry is a mirror (shadow) request rather than the client-facing transaction |
 | `metadata` | Object | Plugin-injected key-value pairs (correlation ID, trace ID, etc.) |
 
-**Notes on conditional fields:** `auth_method`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when false/null to keep log entries compact.
+**Notes on conditional fields:** `auth_method`, `grpc_status`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when not applicable/false/null to keep log entries compact.
 
 **`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_received` reflect the full client-visible outcome.
 
@@ -787,7 +788,7 @@ Only set when the gateway itself could not communicate with the backend (or when
   "latency_plugin_external_io_ms": 0.0,
   "latency_gateway_overhead_ms": 0.88,
   "request_user_agent": "python-requests/2.31.0",
-  "metadata": {"x-correlation-id": "abc-123-def"}
+  "metadata": {"request_id": "abc-123-def"}
 }
 ```
 
@@ -842,7 +843,7 @@ Only set when the gateway itself could not communicate with the backend (or when
   "latency_plugin_external_io_ms": 0.0,
   "latency_gateway_overhead_ms": 0.85,
   "request_user_agent": "CFNetwork/1568.200.51",
-  "metadata": {"x-correlation-id": "h3-789-xyz"}
+  "metadata": {"request_id": "h3-789-xyz"}
 }
 ```
 
@@ -871,7 +872,7 @@ HTTP/3 uses the same `TransactionSummary` as HTTP/1.1 and HTTP/2. The frontend a
   "latency_gateway_overhead_ms": 0.70,
   "request_user_agent": "grpc-go/1.62.0",
   "metadata": {
-    "x-correlation-id": "grpc-456",
+    "request_id": "grpc-456",
     "grpc_service": "myapp.UserService",
     "grpc_method": "GetUser"
   }
@@ -902,7 +903,7 @@ gRPC errors return HTTP 200 with the error in `grpc-status`/`grpc-message` trail
   "latency_plugin_external_io_ms": 0.0,
   "latency_gateway_overhead_ms": 0.40,
   "request_user_agent": "Mozilla/5.0",
-  "metadata": {"x-correlation-id": "ws-101-abc"}
+  "metadata": {"request_id": "ws-101-abc"}
 }
 ```
 
@@ -1100,16 +1101,24 @@ The configuration object is closed: any key other than `redacted_headers` is rej
 
 ### `correlation_id`
 
-Generates and propagates correlation IDs for request tracing across services. When the inbound request already includes the configured header (and the value is no longer than 256 characters), the existing value is preserved and forwarded; otherwise the plugin generates a fresh UUID v4 and stores it in `ctx.metadata["request_id"]` for downstream logging plugins to pick up.
+Generates and propagates correlation IDs for request tracing across services. An inbound value is preserved only when it is non-empty, no longer than 256 bytes, and matches `[A-Za-z0-9._-]+`. UUIDs and ULID-style values are accepted; printable punctuation such as `order:123`, `Root=1-abc;Parent=def`, spaces, slashes, plus signs, and non-ASCII text are rejected. Every missing or rejected value is replaced by a fresh UUID v4; values are never truncated.
+
+The first configured `correlation_id` instance in lifecycle/priority order owns the canonical request ID consumed by built-in approval, chargeback, transaction, and WebSocket logging plugins. Every instance retains its authoritative resolved value in private typed request/session state and uses only that value for backend forwarding and downstream echo. The plugin projects those values into the compatibility metadata keys `request_id` and `correlation_id.instance.<lowercase-header-name>`; later plugin writes to those public keys cannot change authoritative forwarding, echo, or logged correlation values. Multiple headers therefore remain independent trust domains: a later client-preserved value cannot overwrite an earlier gateway-generated ID. Priority overrides explicitly select which instance owns the canonical `request_id` without collapsing the other headers.
+
+Canonical ownership is private request/session lifecycle state, not inferred from plugin-writable metadata. An earlier custom plugin therefore cannot claim ownership by pre-populating either `request_id` or the documented instance namespace. Effective instances on the same proxy chain that overlap on at least one supported protocol must normalize to distinct `header_name` values and must have distinct effective priorities; configure `priority_override` on all but at most one overlapping instance to make the canonical owner deterministic across storage backends and reloads. Admission and reload reject either ambiguous composition. The same header or priority remains valid on disjoint proxy chains and between custom owners whose supported protocol sets do not overlap.
+
+`ai_tool_governor` approval requests read private canonical correlation state first, then fall back to custom-plugin `request_id` and `correlation_id` metadata when no built-in producer claimed a canonical value. `api_chargeback_sink` reads canonical `request_id` first. Its older `x-request-id` and `correlation_id` metadata spellings remain fallback-only for compatibility with custom plugins that predate the canonical contract. WebSocket disconnect logging likewise prefers `request_id` and falls back to custom `correlation_id` metadata. Built-in producers and consumers use `request_id`.
 
 **Priority:** 50
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `header_name` | String | `x-request-id` | Header name used for inbound, outbound, and echoed IDs. Lowercased internally. Must be a non-empty valid HTTP header token (RFC 7230 §3.2.6) — non-string values, empty strings, and values containing separators like `:` are rejected at plugin load time. |
-| `echo_downstream` | bool | `true` | Include correlation ID in response headers. Non-boolean values are rejected at plugin load time. |
+| `header_name` | String or null | `x-request-id` | Header name used for inbound, outbound, and echoed IDs. Surrounding whitespace is trimmed and the name is lowercased internally. Must be a non-empty valid HTTP header token (RFC 7230 §3.2.6). Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing-context, gRPC status, WebSocket handshake, and internal marker names (`host`, `forwarded`, `via`, `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, `connection`, `content-encoding`, `content-length`, `early-data`, `expect`, `traceparent`, `tracestate`, `transfer-encoding`, `upgrade`, `grpc-status`, `x-grpc-web-mode`, `x-ferrum-original-content-encoding`, `sec-websocket-*`, and the other names listed in the OpenAPI schema) are rejected. The effective deployment-specific `FERRUM_REAL_IP_HEADER` value is also rejected case-insensitively so correlation cannot overwrite backend-visible client attribution; CP/DP deployments enforce one matching value across the config-sync handshake before distributing config. Security-sensitive request and response names (`authorization`, `cookie`, `set-cookie`, `www-authenticate`, `api-key`, `x-api-key`, `x-goog-api-key`, API/auth/CSRF/XSRF token aliases, forwarded authorization, and proxy equivalents) are also rejected so correlation processing cannot replace, copy, or echo credentials or authentication state. Null selects the default. |
+| `echo_downstream` | bool or null | `true` | Include the resolved ID in ordinary responses, plugin rejection responses, and successful H1 Upgrade/H2-H3 Extended CONNECT WebSocket handshakes. Null selects the default. |
 
-The plugin runs across all protocols (HTTP, gRPC, WebSocket, TCP, UDP). For stream protocols the ID is generated and stashed at `on_stream_connect`.
+The config itself must be a JSON object; top-level null and every other non-object value are rejected. The object is closed: keys other than `header_name` and `echo_downstream` are rejected deterministically rather than silently enabling defaults.
+
+The plugin runs across all protocols (HTTP, gRPC, WebSocket, TCP, UDP). For stream protocols each instance generates an isolated ID at `on_stream_connect`, and the first instance publishes the canonical `request_id`.
 
 ### `prometheus_metrics`
 
@@ -2085,6 +2094,7 @@ Limits concurrent TCP connections per observed client identity on a per-proxy ba
 - Otherwise the key is `proxy:{proxy_id}:ip:{client_ip}`, with IPv4-mapped IPv6 addresses canonicalized to their IPv4 form
 
 The proxy ID is included so the same identity can hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners. Each successful admission owns an opaque permit for the exact plugin instance and counter entry it incremented. Multiple throttle instances, priority/authentication boundaries, later plugin rejection, and config reloads do not share mutable metadata or release one another's entries.
+IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 once when the stream client identity is resolved, before plugin execution, so the two textual forms share one connection budget without per-plugin reparsing.
 
 Accounting is **process-local**. Each replica independently permits up to `max_connections_per_key`, so a deployment with _N_ replicas can collectively admit as many as _N × max_connections_per_key_ connections for one identity when traffic is distributed across them. There is no distributed synchronization mode. Compatible cache generations share accounting by plugin namespace and configuration ID, so reload does not reset live counts; removing a policy and later recreating it starts a new generation whose permits cannot be decremented by old connections.
 
@@ -2169,28 +2179,33 @@ Restricts access based on the geographic location of the client IP address using
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `db_path` | String | (required) | Path to MaxMind `.mmdb` file |
-| `allow_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to allow (whitelist mode). Case-insensitive — normalized to uppercase at load. |
-| `deny_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to deny (blacklist mode). Case-insensitive — normalized to uppercase at load. |
-| `inject_headers` | bool | `false` | Inject `x-geo-country` (uppercase ISO code) into the proxied request. HTTP-family proxies only — ignored for TCP/UDP streams. |
+| `db_path` | String | (required) | Path to a MaxMind `.mmdb` file no larger than 512 MiB. The verified sizes of all distinct MMDB content snapshots in one validation generation, the snapshots retained by a resulting cache generation, and the peak of live plus in-flight candidate snapshots must each total no more than 512 MiB. Equivalent path spellings resolving to identical verified content are charged once. |
+| `allow_countries` | String[] | `[]` | Currently assigned ISO 3166-1 alpha-2 country codes, plus MaxMind's `XK` Kosovo extension, to allow (whitelist mode). Case-insensitive — normalized to uppercase at load. Other reserved, user-assigned, deleted, alias, and nonexistent codes are rejected. |
+| `deny_countries` | String[] | `[]` | Currently assigned ISO 3166-1 alpha-2 country codes, plus MaxMind's `XK` Kosovo extension, to deny (blacklist mode). Case-insensitive — normalized to uppercase at load. Other reserved, user-assigned, deleted, alias, and nonexistent codes are rejected. |
+| `inject_headers` | bool | `false` | Inject `x-geo-country` (uppercase ISO code) into the proxied request. Client-supplied values are centrally stripped even when no geo plugin is attached and remain absent on fail-open lookups. The lookup result is also retained in private request state and reasserted at HTTP, gRPC, native-H3, and WebSocket backend boundaries, so later mutable request hooks cannot spoof it. A later non-injecting instance preserves an authoritative value emitted by an earlier instance. HTTP-family proxies only — ignored for TCP/UDP streams. |
 | `on_lookup_failure` | String | `"allow"` | Action when GeoIP lookup fails (private IP, unallocated range, missing `.mmdb` on data plane): `allow` or `deny`. |
 
 `allow_countries` and `deny_countries` are mutually exclusive. At least one must be non-empty.
 
-Country code matches are O(1) — both lists are stored as `HashSet<String>` and compared in uppercase.
+Country code matches are O(1) and allocation-free on the default request path: codes are decoded as borrowed MMDB strings, packed into two bytes, and matched against precomputed bitsets. A `String` is created only when `inject_headers: true` emits an authoritative value.
+IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 before lookup, so both forms receive the same GeoIP decision.
 
-The `.mmdb` file is memory-mapped at plugin startup for zero-copy lookups on the hot path. A gateway restart (or config reload) is required to pick up a new database file.
+The `.mmdb` file is read into an owned immutable byte buffer at plugin startup, with metadata and bounded-read checks rejecting files larger than 512 MiB before parsing. Non-regular paths (including FIFOs and devices) are rejected by path metadata before open; Unix also opens non-blocking so a regular path raced to a special file cannot wedge startup or reload, then verifies the opened handle's type and identity. One validation generation and its cache-build load session also have a fixed 512 MiB aggregate budget across the declared sizes of all distinct MMDB paths. Ferrum first streams a SHA-256 digest through a fixed-size buffer, allowing identical content to reuse a live snapshot without allocating a duplicate. Changed content must reserve the candidate size against all live and concurrently in-flight snapshots before allocating its owned buffer; a reload that would exceed the 512 MiB peak fails closed before that allocation. Because a changed candidate overlaps the live snapshot until atomic publication, any replacement whose live plus candidate sizes exceed 512 MiB cannot be hot-replaced: install the replacement and restart the gateway so it loads without the outgoing snapshot. This restart-required constraint commonly applies to same-sized databases larger than 256 MiB; unchanged content reuses the live digest snapshot and does not incur the overlap. The resulting plugin-cache generation independently enforces the same limit across all distinct snapshots it retains, including geo instances preserved from the preceding generation during an incremental update. Ferrum fully verifies the search tree and data section, checks for a supported country-capable product (`GeoIP2`/`GeoLite2` Country or City, or GeoIP2 Enterprise), and scans every country record against the same supported-code set used by policy admission before publishing the plugin. Generic plugin validation checks policy structure without opening node-local files; the mode-aware dependency stage deduplicates identical content by its verified digest and owns every successful snapshot or classified load failure as part of that configuration generation. Async file, database, MongoDB, and DP full or incremental reload paths perform the synchronous digest, verification, and record scan on Tokio's blocking pool rather than a runtime worker. A successful generation hands its snapshots, failures, and aggregate accounting to a build-scoped load session, which shares one verified snapshot or prior failure among every geo instance using the path; rejected generations release their handoffs, and a newly accepted generation supersedes any older unclaimed generation. Claiming an accepted handoff refreshes the relevant geo plugin instances and atomically republishes the request epoch even when only file contents changed and the serialized config has no delta; unrelated stateful plugin instances remain shared with the prior cache. Every reload candidate is bounded-read and SHA-256 digested because portable filesystem metadata cannot prove content identity. After both the identity pass and owned-buffer read, Ferrum re-stats the configured path and rejects a target change; Unix compares device/inode plus size and timestamps, while other platforms additionally re-open and stream the path digest without retaining another snapshot buffer. Identical bytes reuse a live content-addressed snapshot without another verification or record scan, while the accepted validation handoff avoids a second construction-time read entirely. Consequently, an atomic rename during a reload or a same-length, timestamp-preserving replacement cannot leave the new generation serving stale bytes. Existing live plugin generations keep their immutable snapshot while a restart or eligible config reload validates and publishes the replacement. A readable oversized, aggregate-over-budget, corrupt, incompatible, wrong-product, or unsupported-code database is rejected; only an initially absent or unreadable node-local file degrades to `on_lookup_failure` in modes that permit that fallback.
+
+Aggregate admission identifies snapshots by the SHA-256 digest computed from the already-opened, identity-checked file. It does not canonicalize path strings, so symlink resolution cannot introduce a new path-based TOCTOU window; different spellings of identical content consume one snapshot charge.
+
+Database full loads carry an explicit purpose. Runtime loads validate node-local plugin files and hand snapshots to the immediately following plugin-cache build; CP distribution and backup-export loads skip node-local files entirely because neither consumer constructs proxy plugins. Every accepted DP full snapshot explicitly refreshes each configured node-local MMDB under the same aggregate budget even though CP file validation was skipped, including snapshots with no serialized config delta.
 
 **CP/DP deployment note:** In control plane / data plane deployments, the `.mmdb` file only needs to exist on the **data plane** nodes where proxy traffic is handled. The control plane accepts `geo_restriction` plugin configs via the admin API without requiring the file locally. If the `.mmdb` file is missing on a data plane node at startup, the plugin degrades gracefully — all GeoIP lookups fall back to the `on_lookup_failure` policy (default: `allow`) until the file is deployed and the config is reloaded. Other proxies and plugins are unaffected.
 
 **Behavior by mode:**
 
-| Mode | Missing `.mmdb` file at startup |
-|------|-------------------------------|
-| **File** | Fatal — gateway refuses to start |
-| **Database** | Warning logged, plugin degrades to `on_lookup_failure` policy |
-| **Control Plane** | Admin API accepts config normally (CP does not proxy traffic) |
-| **Data Plane** | Warning logged, plugin degrades to `on_lookup_failure` policy; all other proxies/plugins work normally |
+| Mode | MMDB dependency behavior at startup/reload |
+|------|--------------------------------------------|
+| **File** | An absent, unreadable, or invalid file is fatal — the gateway refuses to publish the config. |
+| **Database** | Warning logged for an absent/unreadable file; plugin degrades to `on_lookup_failure`. Readable invalid files are rejected during plugin construction. |
+| **Control Plane** | Strict plugin structure is validated, but the CP does not open the node-local path because it does not proxy traffic. |
+| **Data Plane** | Warning logged for an absent/unreadable node-local file and the plugin degrades to `on_lookup_failure`; a readable invalid file rejects the new plugin generation. |
 
 > **Note:** Ferrum Edge does not ship or bundle any GeoIP database. Operators are responsible for obtaining a MaxMind GeoIP2 or GeoLite2 `.mmdb` file, accepting MaxMind's license terms, and managing updates. GeoLite2 (free) requires a [MaxMind account](https://www.maxmind.com/en/geolite2/signup) and is subject to the [GeoLite2 EULA](https://www.maxmind.com/en/geolite2/eula). MaxMind publishes weekly database updates.
 
@@ -2250,6 +2265,8 @@ At least one rate window must be configured in every rule. Do not combine the cu
 - `limit_by: "spiffe_identity"` — Enforces in `authorize` phase (after `spiffe_identity`), keyed by `ctx.peer_spiffe_id`. Falls back to client IP if no peer SPIFFE identity exists.
 - Stream (`on_stream_connect`) — `consumer` mode uses the stream Consumer identity when available. `spiffe_identity` mode uses `peer_spiffe_id` metadata written by the stream `spiffe_identity` hook. Both modes fall back to client IP when their identity is absent.
 
+The resolved request client identity canonicalizes IPv4-mapped IPv6 to native IPv4 once before plugin execution. Every local or Redis fallback key therefore uses the same canonical text without reparsing it in each limiter.
+
 **Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`. The limiter key/identity is never exposed: for `limit_by: "consumer"`/`"spiffe_identity"` it would echo the gateway's internal caller identity (consumer username) or the peer workload SVID back to the client.
 
 Returns HTTP `429 Too Many Requests` when exceeded.
@@ -2294,7 +2311,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `header_name` | String | `"Idempotency-Key"` | Header name to read the idempotency key from (case-insensitive) |
 | `ttl_seconds` | u64 | `300` | Time-to-live for cached responses (must be > 0) |
 | `inflight_ttl_seconds` | u64 | `ttl_seconds` | How long an in-flight marker remains valid before being treated as stale and replaced by a fresh request (must be > 0). Set at or above the longest backend request that should be protected from concurrent duplicate execution — if set too low, a slow legitimate request still running past this TTL can have a duplicate retry bypass the in-flight lock and re-execute side-effecting operations. Defaults to `ttl_seconds` |
-| `max_entries` | u64 | `10000` | Maximum number of tracked local entries. Active in-flight markers count toward this limit but are not evicted while live |
+| `max_entries` | u64 | `10000` | Maximum number of tracked local entries. Active in-flight markers and fail-closed terminal tombstones count toward this limit but are not evicted while live |
 | `max_entry_size_bytes` | u64 | `1048576` | Maximum retained size of one completed response entry. Oversized retained responses are returned normally, clear the in-flight marker, and are not retained locally or serialized for Redis. Redis payloads are also skipped when their serialized value exceeds this cap |
 | `max_total_size_bytes` | u64 | `104857600` | Exact maximum retained size across local completed response entries. Responses that would exceed this cap are returned normally and are not retained. In local mode they clear the in-flight marker immediately; in Redis mode, Redis publish failures leave local and distributed locks to expire |
 | `applicable_methods` | String[] | `["POST", "PUT", "PATCH"]` | HTTP methods to apply deduplication to |
@@ -2311,22 +2328,22 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `redis_password` | String (optional) | — | Redis password |
 
 **Behavior:**
-- Logical idempotency keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when `scope_by_consumer: true`, and the idempotency header value. The stored key is a framed SHA-256 digest, not a delimiter-joined raw string
+- Logical idempotency keys are scoped by the stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when `scope_by_consumer: true`, and the idempotency header value. The stored key is a framed SHA-256 digest, not a delimiter-joined raw string
 - Request fingerprints bind the logical key to the HTTP method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and a SHA-256 request-body digest. Raw request bodies, credentials, cookies, identities, and idempotency values are not stored in keys or fingerprints
-- On cache hit with the same fingerprint: returns the cached response with `X-Idempotent-Replayed: true` header
+- On cache hit with the same fingerprint: returns the cached response with `X-Idempotent-Replayed: true` header. Cached bytes are the already-finalized client representation and do not run through ordinary presentation transforms again on replay; response inspectors and final-body validators still evaluate the replayed bytes. If current inspection records a redaction decision, that policy's transform alone must rewrite the replay under the current policy or the replay fails closed with 502
 - Reusing the same logical idempotency key for a different fingerprint returns `409 Conflict`
 - Concurrent duplicates with the same fingerprint return `409 Conflict` while the first request is still in-flight
 - Applicable methods with a declared body are buffered before `before_proxy`, even if the idempotency header is not present yet, so earlier header-transform plugins can add the key without making the body unavailable for fingerprinting
 - If a request declares a body but the body bytes are unavailable for fingerprinting, the request is rejected with 400 instead of being deduplicated unsafely
 - Streamed non-buffered responses, including `text/event-stream`, keep the in-flight marker while the stream is active. On a clean completion the marker is released without retaining a replayable response, so the next matching request re-executes normally. If the stream is interrupted — a client disconnect or mid-stream error — the marker is instead retained until `inflight_ttl_seconds`, so an immediate retry of the same idempotency key cannot re-run a side-effecting backend operation that has no replay/tombstone protection
-- Stale in-flight markers (request died after `before_proxy` but before `on_final_response_body` or a clean streamed completion — e.g., backend timeout, downstream plugin reject, process crash — plus interrupted streams that deliberately retain their marker) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
-- Completed response storage is bounded by `max_entry_size_bytes` and `max_total_size_bytes`. Size-skipped responses still return to the original client, but no replayable response is retained. In local mode, skipped responses clear the in-flight marker so a later retry can execute normally; in Redis mode, a local-total-cap skip keeps local and distributed locks until `inflight_ttl_seconds` if Redis publication fails
-- A completed `ai_federation` provider call is treated as a protected external operation rather than an ordinary synthetic response. The first request receives the final guarded response; the deduplicator stores a small `409` completed tombstone instead of replaying a body that could be transformed twice or cached before a later response guard rejects it. An identical key/fingerprint retry therefore cannot issue another billable provider call during `ttl_seconds`. If the configured retention limits cannot hold even the tombstone, local and distributed in-flight ownership is retained until `inflight_ttl_seconds` rather than released immediately. This provenance contract currently covers federation calls only; other externally executed synthetic plugins must define their own completion provenance
-- LRU eviction under `max_entries` pressure only evicts completed entries. Active (non-stale) in-flight markers are never evicted — evicting a live marker would release the in-flight lock while the original request is still executing. As a result, `max_entries` can be temporarily exceeded if the cache is saturated with active in-flight work; correctness is preferred over the memory cap
+- Stale in-flight markers (request died after `before_proxy` but before buffered/committed response completion or a clean streamed completion — e.g., backend timeout, downstream plugin reject, process crash — plus interrupted streams that deliberately retain their marker) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
+- Completed response storage is bounded by `max_entry_size_bytes` and `max_total_size_bytes`. Size-skipped responses still return to the original client, but no replayable response is retained. In local mode, ordinary skipped responses clear the in-flight marker so a later retry can execute normally. A terminate-mode `serverless_function` response, or a buffered backend fallback after that function may have executed, instead retains each owning in-flight marker until `inflight_ttl_seconds` whenever the settled response cannot be retained; an immediate retry cannot re-run an external side effect without a replay. The retention is scoped to outcomes where a side effect may have occurred: a serverless invocation that fails **proven pre-wire** (payload serialization, provider request signing, or a transport class that never reached the function — connect refused/timeout, DNS, TLS, pool/port exhaustion, or an egress-policy denial) releases the in-flight marker like any other pre-invocation rejection, because no function ran; only an ambiguous or post-wire failure (a timeout after send, a mid-response reset, an oversized/unreadable response) keeps the marker. In Redis mode, the same owned-response rule retains the distributed lock, while an ordinary local-total-cap skip keeps local and distributed locks only if Redis publication fails
+- A completed external operation performed by a synthetic short-circuit — for example an `ai_federation` provider call, which marks the request as having completed an external operation — retains the in-flight marker (and any distributed lock) until `inflight_ttl_seconds` instead of releasing it or caching the synthetic body. The first request receives its final guarded response, while an identical key/fingerprint retry cannot issue another billable provider call before the marker expires. Externally executed synthetic plugins that do not mark this provenance must define their own completion contract
+- LRU eviction under `max_entries` pressure only evicts completed entries. Active (non-stale) in-flight markers are never evicted — evicting a live marker would release the in-flight lock while the original request is still executing. An externally executing terminal completion remains replayable while it is the only completed entry competing with active work. If later completed-entry pressure makes that replay impossible to retain and no distributed replay was confirmed, eviction replaces it with an in-flight tombstone until `inflight_ttl_seconds` instead of deleting all local safety state. As a result, `max_entries` can be temporarily exceeded by active work or security tombstones; correctness is preferred over the memory cap
 - GET/HEAD/OPTIONS/DELETE requests are ignored unless explicitly added to `applicable_methods`
 - `scope_by_consumer: true` isolates keys per authenticated identity so different consumers can use the same idempotency key independently
 
-**Centralized mode** (`sync_mode: "redis"`): Uses the shared `RedisRateLimitClient` infrastructure for centralized deduplication across multiple gateway instances. Before a fresh request reaches the backend, the plugin acquires a Redis in-flight lock with `SET NX` and an ownership token; peers with the same fingerprint receive 409 while the first request is running, and peers reusing the same logical key for a different fingerprint receive the fingerprint-mismatch 409. Completed responses are published to Redis before the lock is token-released, so a peer cannot miss both the in-flight marker and the replayable response. Streamed non-buffered responses do not publish completed responses; on a clean completion their local marker and Redis lock are token-released, while an interrupted stream leaves them to expire under `inflight_ttl_seconds` so a same-key retry cannot re-execute without a replay value. Redis completed-response values include the request fingerprint and are not backward-compatible with pre-fingerprint serialized values. Redis publication requires both the retained response size and serialized payload size to fit `max_entry_size_bytes`; the total byte limit bounds local completed-response retention. If the local total cap skips retention, the response is still published to Redis when it fits the per-entry cap; if that Redis publish fails, the local and distributed in-flight locks are left to expire under `inflight_ttl_seconds` to avoid immediate duplicate execution without a replay value. Automatic local fallback is used when Redis is unreachable. Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
+**Centralized mode** (`sync_mode: "redis"`): Uses the shared `RedisRateLimitClient` infrastructure for centralized deduplication across multiple gateway instances. Every completed and in-flight logical key includes the stable `plugin_config_id`, so sibling deduplication instances remain partitioned even when they use the same header and explicit/default `redis_key_prefix`, while the same configured instance shares keys across gateways. Before a fresh request reaches the backend, the plugin acquires a Redis in-flight lock with `SET NX` and an ownership token; peers with the same fingerprint receive 409 while the first request is running, and peers reusing the same logical key for a different fingerprint receive the fingerprint-mismatch 409. Completed responses are published to Redis before the lock is token-released, so a peer cannot miss both the in-flight marker and the replayable response. Streamed non-buffered responses do not publish completed responses; on a clean completion their local marker and Redis lock are token-released, while an interrupted stream leaves them to expire under `inflight_ttl_seconds` so a same-key retry cannot re-execute without a replay value. Redis completed-response values include the fingerprint, and v3 logical keys are not backward-compatible with earlier key versions. Redis publication requires both the retained response size and serialized payload size to fit `max_entry_size_bytes`; the total byte limit bounds local completed-response retention. If an owned terminal response fits local retention but its serialized Redis value exceeds the per-entry cap, the distributed lock remains until `inflight_ttl_seconds`: Redis admission is settled before ordinary local eviction, the lock-owning gateway preserves one matching local replay while active entries temporarily occupy the cap, and later pressure converts that protected replay to an in-flight tombstone rather than permitting re-execution. Peers without the local value continue to receive 409. If the local total cap skips retention, the response is still published to Redis when it fits the per-entry cap; if that Redis publish fails, the local and distributed in-flight locks are left to expire under `inflight_ttl_seconds` to avoid immediate duplicate execution without a replay value. Automatic local fallback is used when Redis is unreachable. Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
 
 ```yaml
 plugin_name: request_deduplication
@@ -2495,13 +2512,14 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | `aws_function_name` | String | — | Lambda function name or ARN. Falls back to `AWS_LAMBDA_FUNCTION_NAME` env var |
 | `aws_session_token` | String | — | STS session token. Falls back to `AWS_SESSION_TOKEN` env var |
 | `aws_qualifier` | String | — | Optional version/alias qualifier (e.g., `$LATEST`, `prod`) |
+| `aws_endpoint_url` | String | — | Optional HTTP(S) origin-only Lambda endpoint override. No userinfo, path, query, or fragment; falls back to `AWS_LAMBDA_ENDPOINT_URL` |
 
 **Azure Functions** — calls the HTTP trigger URL:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `provider` | String | (required) | `"azure_functions"` |
-| `function_url` | String | (required) | HTTPS trigger URL |
+| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
 | `azure_function_key` | String | — | Function key for auth. Falls back to `AZURE_FUNCTIONS_KEY` env var |
 
 **GCP Cloud Functions** — calls the HTTPS trigger URL:
@@ -2509,7 +2527,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `provider` | String | (required) | `"gcp_cloud_functions"` |
-| `function_url` | String | (required) | HTTPS trigger URL |
+| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
 | `gcp_bearer_token` | String | — | Bearer token for auth. Falls back to `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` env var |
 
 #### Common Parameters
@@ -2517,15 +2535,21 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `mode` | String | `"pre_proxy"` | `"pre_proxy"` or `"terminate"`. Unknown values rejected at plugin load. **Note:** terminate mode is not supported for gRPC requests — gRPC reject normalization would drop the function response body, so the request fails with 500 |
-| `forward_body` | bool | `false` | Include request body in function payload |
+| `forward_body` | bool | `false` | Include the lossless buffered request body for every method. UTF-8 bytes are an exact string with `body_encoding: "utf8"`; other bytes are base64 with `body_encoding: "base64"`. The active media type is carried separately as `body_content_type` |
 | `forward_headers` | String[] | `[]` | Header names to forward to the function (lowercased at config load) |
-| `forward_query_params` | bool | `false` | Include query parameters in function payload |
+| `forward_query_params` | bool | `false` | Include decoded query parameters after omitting credentials that an earlier auth plugin marked for backend stripping. Duplicate decoded names, invalid percent-encoded UTF-8, raw `+` ambiguity, and parameters lacking the original encoded representation fail before invocation |
 | `timeout_ms` | u64 | `5000` | Function invocation timeout in milliseconds. Must be > 0 |
 | `max_response_body_bytes` | u64 | `10485760` | Max function response body size (10 MiB). Must be > 0 |
 | `on_error` | String | `"reject"` | `"reject"` returns error to client; `"continue"` skips and proxies normally. Unknown values rejected at plugin load |
-| `error_status_code` | u16 | `502` | HTTP status when rejecting on error. Must be in range 100-599 |
+| `error_status_code` | u16 | `502` | Final HTTP error status when rejecting on error. Must be in range 400-599 |
 
-**Strict config validation:** unknown `provider`, `mode`, or `on_error` values are rejected at plugin construction (no silent defaulting). Non-string values for `mode` / `on_error`, `timeout_ms` of `0`, `max_response_body_bytes` of `0`, and `error_status_code` outside 100-599 are also rejected.
+**Strict config validation:** the config must be an object, unknown fields are rejected, and explicit `null` is rejected for every property (omit an optional field instead; required fields must be non-null). Unknown `provider`, `mode`, or `on_error` values, non-string values for string fields, `timeout_ms` of `0`, `max_response_body_bytes` of `0`, and `error_status_code` outside 400-599 are rejected.
+
+`function_url` and `aws_endpoint_url` reject URL userinfo (`user:password@host`). The AWS endpoint override must be an origin only, with no path, query, or fragment. Automatic redirects are disabled. In `pre_proxy` mode only a 2xx function response is approval; every other response uses `on_error` and `error_status_code`. In `terminate` mode only final 2xx-5xx statuses (`200..=599`) are returned intentionally; informational or out-of-range three-digit statuses use the configured error path.
+
+When `forward_body` is enabled, the plugin buffers before `before_proxy` for every HTTP method and fails closed without calling the function if the exact body bytes are unavailable or the request carries a non-identity `Content-Encoding`. The buffered bytes are the original client body, so the encoding check consults the **original** request headers (captured at request intake) as well as the active header map: a header-only `request_transformer` that removes or renames `Content-Encoding` before this plugin cannot strip the label off the still-compressed bytes and smuggle them past the boundary. The payload has one authoritative lossless body representation: Ferrum never parses JSON into a structured value, so duplicate object members, lexical number forms, whitespace, and every other byte remain identical to the backend-visible request. Valid UTF-8 is carried as an exact JSON string with `body_encoding: "utf8"`; arbitrary bytes use base64 with `body_encoding: "base64"`. `body_content_type` separately records the active hook `Content-Type` when present without changing the representation. Query forwarding starts from the same effective raw query used for backend dispatch, so credentials that an earlier auth plugin marked for hiding are removed before parsing and cannot be resurrected in external policy egress. Because that payload is rebuilt from the raw query to preserve plus/duplicate/decode invariants, it cannot faithfully reflect a `request_transformer` **query** rule (add/remove/update/rename operates on the decoded parameter map); a request that ran such a query transform before this plugin therefore fails closed rather than emit a payload that silently ignores the operator's transform. Query/body representation ambiguity is governed input and remains fail-closed even with `on_error: "continue"`; that option applies to invocation/response failures, not to inputs the configured policy cannot inspect faithfully. A serverless body-egress instance cannot share a protocol chain with a request-body transformer; candidate admission and cache construction reject that composition so the external decision and backend cannot observe different representations. Registered custom plugins participate in the same validation through `egresses_request_body_before_finalization()` rather than a built-in-name exception.
+
+Candidate composition admission derives only the serverless protocol, effective priority, `mode`, and `forward_body` capabilities and does not construct the environment-bound HTTP/AWS client. CP/database admission therefore does not require AWS or externally resolved credentials that intentionally exist only on DPs; runtime cache construction still resolves and validates them fail closed.
 
 #### Function Request Payload
 
@@ -2540,9 +2564,13 @@ The plugin sends a JSON payload to the function:
   "authenticated_identity": "user@example.com",
   "headers": { "x-request-id": "abc-123" },
   "query_params": { "page": "1" },
-  "body": { "name": "Alice" }
+  "body": "{\"name\":\"Alice\"}",
+  "body_encoding": "utf8",
+  "body_content_type": "application/json"
 }
 ```
+
+For a non-UTF-8 body, `body` contains standard base64 and `body_encoding` is `"base64"`. The encoding field is always present when body forwarding is enabled.
 
 #### Function Response Format (pre_proxy mode)
 
@@ -2561,7 +2589,17 @@ The function should return JSON with optional `headers` and `metadata` fields:
 }
 ```
 
-Headers are injected into the proxied request. Metadata is stored in `ctx.metadata` with a `serverless_` prefix and flows into transaction logs.
+Headers are validated before injection; invalid and hop-by-hop/protocol-managed request headers are ignored. Metadata is stored under `serverless_function.<plugin-config-id>.metadata.<key>`, while invocation status and sanitized error class use the same instance namespace. Namespace segments percent-encode punctuation other than `-`/`_`. This keeps multiple instances independent and deterministic in transaction metadata.
+
+In `terminate` mode, applicable end-to-end function response headers (including repeated `Set-Cookie`, benign singleton `Location`, `Content-Location`, and `Refresh`, list-valued `Link`, `Retry-After`, `ETag`, and `Content-Disposition`) are returned with the function status/body. Hop-by-hop, `Connection`-listed, transport-managed, provider-control, and credential-bearing fields are stripped. The URL-valued headers `Location`, `Content-Location`, `Refresh` (`url=` and bare URI forms after semicolon, comma, or ASCII-whitespace delay separators), and every target in `Link` are also removed when a relative, absolute, encoded, or nested target exposes the configured function's signed path/query components. Multiple field lines for a singleton URL-valued header fail closed instead of being comma-folded; repeated `Link` lines are revalidated as the exact combined list returned downstream. A complete signed path is matched at slash-delimited segment boundaries even when the response adds prefix or descendant segments, but not inside lookalikes such as `/signed/triggered`. Both non-empty components of every configured query pair are protected credential scalars: a key remains protected whether it is key-only (`?SIGNED_TOKEN=`) or paired with a value (`?SIGNED_TOKEN=1`), and a non-empty value is protected independently. Each scalar remains protected if copied into either side of another query pair, into a decoded path at URI-component boundaries (including path-parameter/query delimiters), or into a decoded fragment at URI-component boundaries. Decoded scalar fragments are checked directly even when they are not themselves URI-shaped. Query comparison follows generic URI semantics: percent escapes are decoded, but a literal `+` remains `+` rather than becoming a form-data space. URI userinfo, malformed target syntax, malformed percent triplets, percent-decoded non-UTF-8 bytes, and inspection-budget overflow fail closed even when the configured function uses a root path with no signed query. Explicit numeric authority ports are inspected before URL normalization can erase a scheme's default port. Inspection is bounded to 16 KiB per URL-valued field, 32 `Link` targets, 32 embedded path URI references, eight percent-decoding transforms, and two nested URI-reference hops. Residual encoding or another structural URI reference at the nesting boundary also removes that field rather than forwarding an unproven target; ordinary non-URL `Refresh` directives, quoted `Link` parameters, unrelated same-origin/cross-origin targets, and scalar labels that contain no signed component remain observable. This bounded fail-closed boundary prevents deeper redirector chains from hiding a signed destination without introducing unbounded decoding or substring matching. Ferrum recomputes framing; HEAD, 204, 205, and 304 responses have no body. Every other non-empty final 2xx-5xx terminate response is application-owned content and enters the shared synthetic response-body lifecycle when an active plugin requests buffering. Successful-response guardrails retain their configured status scope, while response transforms also apply to function redirects and errors; changed bytes receive the same stale range, validator, digest/checksum, and content-bound-signature invalidation as a transformed backend response. Ordinary gateway-generated non-2xx rejections remain outside this body-transform contract. `206 Partial Content` and `226 IM Used` are not transformed because their bytes depend on range or delta metadata; their statuses, representation metadata, and bodies remain coherent. Transform-dependent header hooks also decline them instead of relabelling untouched bytes. Inspection still runs, and an enforcing redaction-dependent plugin rejects governed range/delta content when it cannot safely rewrite those bytes.
+
+The complete slash-trimmed signed function path is also protected when copied exactly into either side of a decoded redirect query pair. For example, a function destination ending in `/api/signed-token` causes `?leak=api/signed-token` and `?api/signed-token=other` to be stripped even when the destination has no signed query. Longer scalar lookalikes such as `api/signed-token-extra` remain observable.
+
+Protected query scalars also govern exact ASCII-case-insensitive URI scheme copies such as `secret://attacker.example`; longer scheme lookalikes remain observable.
+
+Leading and trailing slashes are part of each protected query scalar and are never trimmed. A slash-only scalar remains governed and therefore causes ambiguous URL-path surfaces to fail closed rather than becoming an empty, unprotected value. DNS-compatible scalars are also protected when copied as complete hostname-label sequences in a response URL authority, including the lowercase/IDNA-normalized form a URL parser sends to DNS; exact numeric port copies are protected as well, including explicit default ports that URL normalization omits. Longer label and substring lookalikes remain observable.
+
+If request deduplication acquired an idempotency key earlier in the chain, each deduplication instance independently stores the final terminal status/body plus a cache-safe subset of the settled headers, so one instance cannot consume another instance's completion ownership. Candidate admission and cache construction reject terminate-mode priority overrides that place the function at or before any applicable `request_deduplication` instance; identical retries therefore cannot reach the external side effect before ownership is acquired. A function payload-validation, unsupported-gRPC rejection, DNS denial, or denied literal-IP endpoint proven to occur before invocation releases every acquired local/Redis owner after the rejection is committed, allowing a corrected retry immediately; a real remote 502 is an application response, and other failures after invocation becomes possible retain the existing uncertain-side-effect protection. Replay is deliberately not a byte-for-byte copy of the first response headers: security sanitization removes session/credential fields such as `Set-Cookie`, `Authorization`, and `WWW-Authenticate`, per-request `Retry-After`, trace/correlation headers, and rate-limit counters before storage and again on replay. The stored body is already the finalized client representation, so a replay does not run ordinary presentation transforms a second time; response inspectors and final-body validators still evaluate it. If current inspection records a redaction decision, that policy's transform alone must rewrite the replay under the current policy or the replay fails closed with 502. Empty and HEAD terminal responses are still covered through the final committed-response hook even though there are no body bytes to inspect or transform. If the function may already have executed but `on_error: "continue"` falls through to a streamed backend response, each owning in-flight marker is retained until its TTL even after a clean stream completion because no replayable function response exists.
 
 #### Environment Variable Fallback
 
@@ -2874,7 +2912,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 - Forces response body buffering on proxies where this plugin is enabled
 - When `decompress_request` is enabled, supported gzip/brotli request bodies are decoded before final request-body hooks and the forwarded request has `Content-Encoding` and `Content-Length` removed
 - Request `Cache-Control: no-transform` skips gateway response compression but does not disable configured request decompression; client-controlled `no-transform` is not honored as an opt-out from upload normalization or body-inspection hooks
-- Strong origin `ETag` validators are preserved by skipping compression; weak ETags can be forwarded with compressed variants
+- Strong origin `ETag` validators are preserved by skipping compression; when a weak-ETag response is compressed, the shared body-transform lifecycle removes that upstream validator because the client-visible bytes changed
 
 ```yaml
 config:
@@ -3619,7 +3657,7 @@ by `ai_rate_limiter` (not via `ai_federation`, which rejects streaming — see
 above), configure OpenAI-compatible callers with `stream_options.include_usage:
 true` so a final usage signal is emitted.
 
-**Synthetic-path hook ordering (known divergence).** On the synthetic short-circuit path (any plugin-generated 2xx surfaced via `RejectBinary`, including `ai_federation` / `ai_semantic_cache` / `response_mock` bodies) the response-**body** hooks (`on_response_body`, body transforms, `on_final_response_body`) run **before** the `after_proxy` reject hooks, whereas on the normal backend path `after_proxy` runs **before** the body transforms. Provider/protocol normalization is deliberately skipped: a synthetic body is owned by the short-circuiting plugin and is already in its client-visible representation, so request metadata left by an earlier provider router must not reinterpret it as backend-native bytes. This is a deliberate trade-off: the body hooks may *replace* the response when a guardrail rejects the synthetic body, so `after_proxy` must run exactly once and last — over the final response — to preserve one-shot response state (e.g. an `oidc_relying_party` rotated session cookie or a `response_transformer` route override) that would otherwise be consumed against a discarded synthetic 2xx. The consequence is that a body transform which depends on a header/metadata mutation made by an `after_proxy` hook (for example `response_transformer` rewriting `Content-Type` before its JSON body rules) can behave differently on a synthetic 2xx than on an equivalent backend 2xx. If you need such a transform applied identically, drive it from `before_proxy`/body-side configuration rather than from `after_proxy` header mutations on the synthetic path.
+**Synthetic-path hook ordering (known divergence).** On the governed synthetic short-circuit path (any plugin-generated 2xx surfaced via `RejectBinary`, including `ai_federation` / `ai_semantic_cache` / `response_mock` bodies, plus final 2xx-5xx `serverless_function` terminate responses) the response-**body** hooks (`on_response_body`, body transforms, `on_final_response_body`) run **before** the `after_proxy` reject hooks, whereas on the normal backend path `after_proxy` runs **before** the body transforms. Provider/protocol normalization is deliberately skipped: a synthetic body is owned by the short-circuiting plugin and is already in its client-visible representation, so request metadata left by an earlier provider router must not reinterpret it as backend-native bytes. This is a deliberate trade-off: the body hooks may *replace* the response when a guardrail rejects the synthetic body, so `after_proxy` must run exactly once and last — over the final response — to preserve one-shot response state (e.g. an `oidc_relying_party` rotated session cookie or a `response_transformer` route override) that would otherwise be consumed against a discarded synthetic response. The consequence is that a body transform which depends on a header/metadata mutation made by an `after_proxy` hook (for example `response_transformer` rewriting `Content-Type` before its JSON body rules) can behave differently on a synthetic response than on an equivalent backend response. If you need such a transform applied identically, drive it from `before_proxy`/body-side configuration rather than from `after_proxy` header mutations on the synthetic path.
 
 **Multimodal content is explicit.** OpenAI Chat Completions content arrays may contain text plus non-text parts such as `image_url`. Provider configs accept `multimodal_mode`:
 
@@ -3765,7 +3803,7 @@ Use this only when the normal backend has equivalent authentication, model allow
 - `ai_federation` (4060) routes that final transformed body to a provider before backend dispatch and writes token metadata to `ctx.metadata`
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
 
-**Metadata and metrics:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, and `ai_federation_provider` use the same transaction keys as `ai_token_metrics`. Circuit observations use `ai_federation_circuit_last_provider`, `ai_federation_circuit_last_state`, `ai_federation_circuit_open_skips`, and `ai_federation_circuit_half_open_probes`. `/metrics` exposes the provider-name-free `ferrum_ai_federation_circuits_open` gauge and `ferrum_ai_federation_circuits_{opened,closed}_total`, `ferrum_ai_federation_circuit_half_open_probes_total`, and `ferrum_ai_federation_circuit_open_skips_total` counters. Removing/reloading an open configured circuit decrements the gauge; transition/probe logs carry only the restricted provider name, never an endpoint or credential. When `multimodal_mode: text_only_with_warning` drops non-text parts, the plugin also writes `ai_federation_multimodal_mode`, `ai_federation_multimodal_dropped_parts`, `ai_federation_multimodal_dropped_types`, `ai_federation_multimodal_dropped_roles`, and `ai_federation_multimodal_provider`.
+**Metadata and metrics:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, and `ai_federation_provider` use the same transaction keys as `ai_token_metrics`. Prometheus authorization for token and cost series is carried separately in private typed request state, so backend, serverless, workload-tag, and custom-header metadata cannot mint trusted usage. Federation provider types are normalized to the bounded OpenAI, Anthropic, Google, Cohere, Mistral, or Bedrock metric families without changing the raw `ai_provider` metadata consumed by logs and policy plugins. Circuit observations use `ai_federation_circuit_last_provider`, `ai_federation_circuit_last_state`, `ai_federation_circuit_open_skips`, and `ai_federation_circuit_half_open_probes`. `/metrics` exposes the provider-name-free `ferrum_ai_federation_circuits_open` gauge and `ferrum_ai_federation_circuits_{opened,closed}_total`, `ferrum_ai_federation_circuit_half_open_probes_total`, and `ferrum_ai_federation_circuit_open_skips_total` counters. Removing/reloading an open configured circuit decrements the gauge; transition/probe logs carry only the restricted provider name, never an endpoint or credential. When `multimodal_mode: text_only_with_warning` drops non-text parts, the plugin also writes `ai_federation_multimodal_mode`, `ai_federation_multimodal_dropped_parts`, `ai_federation_multimodal_dropped_types`, `ai_federation_multimodal_dropped_roles`, and `ai_federation_multimodal_provider`.
 
 **TLS trust chain:** Because this plugin bypasses the normal proxy dispatch and makes outbound HTTP calls via the shared `PluginHttpClient`, it uses **global TLS settings only** — `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides (`backend_tls_server_ca_cert_path`, `backend_tls_client_cert_path`, `backend_tls_verify_server_cert`) and CRL checking do not apply. For providers behind private endpoints (e.g., Azure Private Link, VPC endpoints), add the internal CA to the global CA bundle PEM file. Note that when `FERRUM_TLS_CA_BUNDLE_PATH` is set, webpki/system roots are excluded (CA exclusivity) — include public root CAs in the bundle if some providers are public and others use internal CAs.
 
@@ -4148,7 +4186,7 @@ config:
 
 ### `ai_token_metrics`
 
-Extracts token usage from LLM JSON response bodies and writes it to request metadata for downstream logging and observability plugins. This plugin is observability-only: it never rejects requests and does not enforce a token budget. Use `ai_rate_limiter` for enforced budget controls. SSE (Server-Sent Events) usage extraction is available only when explicitly opted into because it requires buffering the full stream.
+Extracts token usage from LLM HTTP JSON response bodies and writes it to request metadata for downstream logging and observability plugins. This plugin is observability-only: it never rejects requests and does not enforce a token budget. Use `ai_rate_limiter` for enforced budget controls. SSE (Server-Sent Events) usage extraction is available only when explicitly opted into because it requires buffering the full stream. Native gRPC protobuf responses are not supported: the plugin advertises only HTTP attachment rather than pretending arbitrary protobuf messages have a verifiable usage schema.
 
 **Priority:** 4100
 
@@ -4157,18 +4195,22 @@ Extracts token usage from LLM JSON response bodies and writes it to request meta
 | `provider` | String | `"auto"` | LLM provider format |
 | `include_model` | Boolean | `true` | Extract model name into metadata |
 | `include_token_details` | Boolean | `true` | Extract prompt/completion tokens separately |
-| `metadata_prefix` | String | `"ai"` | Prefix for metadata keys |
+| `metadata_prefix` | String | `"ai"` | Prefix for metadata keys (1–64 ASCII letters, digits, `.`, `_`, or `-`) |
 | `buffer_streaming_responses` | Boolean | `false` | Buffer `text/event-stream` responses so final SSE usage events can be parsed; this disables streaming delivery for those responses |
-| `cost_per_prompt_token` | Float | *(none)* | Calculate estimated cost per request |
-| `cost_per_completion_token` | Float | *(none)* | Calculate estimated cost per request |
+| `cost_per_prompt_token` | Float | *(none)* | Calculate estimated cost per request (maximum `18446744073709.55`) |
+| `cost_per_completion_token` | Float | *(none)* | Calculate estimated cost per request (maximum `18446744073709.55`) |
 
 **Note**: Requires response body buffering for JSON responses. `text/event-stream` responses are not buffered by default so LLM streaming remains live; set `buffer_streaming_responses: true` only when buffered SSE token metrics are more important than streaming delivery.
 
-`provider` is parsed case-insensitively and ignores surrounding whitespace.
+`provider` must use one exact lowercase enum value: `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, or `bedrock`. Surrounding whitespace and alternate casing are rejected. Every unknown root configuration key is rejected at startup with the allowed-key list, so misspellings cannot silently change accounting or cost behavior.
 
 **Status filtering**: Only 2xx responses are inspected for token usage. Error responses (4xx, 5xx) are typically not LLM-shaped JSON and would otherwise pollute token metrics and chargeback accounting.
 
-**SSE streaming support:** When `buffer_streaming_responses: true` and the response content-type is `text/event-stream`, the plugin buffers the stream and parses `data:` lines to extract token usage. For OpenAI-compatible providers, usage data is found in the final SSE event (when `stream_options.include_usage: true` is set on the request). For Anthropic streaming, usage is extracted from `message_start` (input tokens) and `message_delta` (output tokens) events. Model name is extracted from the first parseable chunk. Sets `{prefix}_streaming: true` metadata when processing a streaming response.
+**Provider and streaming support:** OpenAI Chat Completions and the Responses API (`input_tokens`/`output_tokens`, including `response.completed`) are supported. Anthropic `message_start` and `message_delta` usage is merged without losing an earlier input count. Gemini/Vertex `usageMetadata`, Cohere billed units, Bedrock Converse usage, and Amazon Titan InvokeModel `inputTextTokenCount` plus a single `results[].tokenCount` are supported. AWS binary event-stream frames are not parsed. When `buffer_streaming_responses: true`, cumulative and partial SSE snapshots are merged field-by-field; repeated cumulative terminal events replace their fields instead of being summed, and `response.incomplete`/`response.failed` events are not treated as authoritative usage. Malformed, non-integer, ambiguous, or overflowing usage is ignored rather than saturated or invented. Model name is extracted from the first parseable event. Sets `{prefix}_streaming: true` metadata when processing an SSE response.
+
+**Origin content encodings:** JSON and opted-in SSE inspection supports case-insensitive `gzip` and `br`, including correctly ordered coding chains. Inspection is bounded to four codings, 4 MiB for every decoded layer, and 8 MiB cumulative decoded work across the chain. Parameterized, unsupported, malformed, truncated, trailing/concatenated, or oversized encodings are skipped safely. Decoding is inspection-only: the original encoded response bytes and headers remain exactly client-visible.
+
+**Prometheus export:** A globally scoped `prometheus_metrics` plugin exports prompt, completion, and total token counters plus estimated cost from typed usage snapshots produced only by direct `ai_token_metrics` inspection or `ai_federation`. Public transaction metadata is never provenance for export. Labels are limited to `proxy_id`, the bounded provider family, and the configured metrics namespace—raw model names, metadata prefixes, federation provider aliases, and arbitrary request metadata are never labels. Multiple `ai_token_metrics` instances contribute one most-complete token snapshot and at most one independently selected trusted cost per request, so a detailed unpriced instance cannot discard configured pricing and overlapping prefixes cannot double count. Configured rates also price trusted federation usage when the instance provider matches the serving provider family. Estimated cost retains a sub-micro fixed-point remainder while accumulating, publishes rounded totals atomically, and is emitted in currency units with exactly six decimal places.
 
 ```yaml
 plugin_name: ai_token_metrics
@@ -4287,6 +4329,8 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 
 `provider` is parsed case-insensitively and ignores surrounding whitespace.
 
+When `limit_by: "ip"`, the request client identity has already canonicalized IPv4-mapped IPv6 to native IPv4 before plugin execution, so local and Redis keys share one token budget without per-limiter reparsing.
+
 **Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster. Database-backed token counters are intentionally unsupported.
 
 **Streaming token accounting**: SSE responses (Anthropic `message_start` / `message_delta`, OpenAI `stream_options.include_usage`) are counted when the final usage signal is available. Configure OpenAI-compatible clients to send `stream_options.include_usage: true` whenever possible. If a streamed 2xx response has no final usage, the default `on_unmetered_response: "charge_estimate"` keeps the pre-request reservation so streaming is not free. When only a partial token signal is observed (e.g., a `message_delta` carrying `output_tokens` without a preceding `message_start`), the available count is still recorded against the budget — partial information is preferred over dropping the request entirely. Token sums use saturating arithmetic.
@@ -4375,11 +4419,17 @@ Request buffering is only enabled for matching JSON `POST` requests without a no
 | `target_ratio` | Number | `0.5` | Fraction of word-tokens to keep. `0.5` ≈ 50% reduction; `0.3` is more aggressive. Strictly between 0 and 1. |
 | `min_content_tokens` | Integer | `200` | Estimated-token floor per content string; shorter content is passed through unchanged. |
 | `max_scan_bytes` | Integer | `1048576` | Skip statistical compression when the request body exceeds this size; configured marker sanitation remains active through the hard 1 MiB body/output bound. |
-| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` is kept verbatim and the markers are stripped. At most 64 ASCII letters, digits, `-`, `_`. |
+| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` string values is kept verbatim and the markers are stripped. Object member names are never sanitized. At most 64 ASCII letters, digits, `-`, `_`. |
 
 The filter scores each word by stop-word membership, length, in-document rarity, and a proper-noun signal, then drops the lowest-scoring words until `target_ratio` is met. Fenced code blocks, inline code, URLs, numbers, `snake_case`/identifier tokens, uppercase acronyms, and negations (`not`, `never`, `cannot`, …) are always preserved. Token counts are estimated (~4 characters per token); no model tokenizer is embedded.
 
 Runs after `compression` so opt-in request decompression exposes plaintext prompt JSON before this plugin rewrites the authoritative request body. Its per-request gate buffers candidate JSON `POST` bodies; `before_proxy` rewrites `ctx.metadata["request_body"]` for already-plaintext compatibility and stores bounded private stage state; `transform_request_body_with_context` owns the authoritative upstream bytes and counters; and `on_final_request_body_with_context` rejects an unsanitizable decoded marker-bearing surface before dispatch. `ai_federation` consumes that final body after the transform, so plaintext and opt-in compressed uploads use the same governed representation. Only `messages[].content` and the legacy `prompt` are compressed; embeddings `input` and Anthropic top-level `system` are deliberately left intact. When a field is statistically rewritten, it records `ai_prompt_compressor.original_tokens`, `.compressed_tokens`, `.tokens_saved`, and `.fields_compressed` metadata for logging. See [`ai_prompt_compressor.md`](ai_prompt_compressor.md) for the full reference.
+
+When bounded work or output limits select the representation-preserving marker
+fallback, sanitation is value-only: configured markers are removed from JSON
+string values, while every object member name remains byte-for-byte unchanged,
+including escaped spellings, duplicate members, nesting, and surrounding
+whitespace. Invalid or truncated JSON is not admitted and is left untouched.
 
 ```yaml
 plugin_name: ai_prompt_compressor
@@ -4779,6 +4829,7 @@ Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm 
 | `redis_password` | String (optional) | — | Redis password |
 
 At least one of `datagrams_per_second` or `bytes_per_second` must be set; if both are configured each is enforced independently and the first to trip drops the datagram.
+IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 once at UDP/DTLS session admission, before local or Redis key construction, so both textual forms share one datagram and byte budget without adding per-datagram allocation.
 
 **Counter storage** (`sync_mode`): UDP rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode centralizes datagram and byte counters across data planes and falls back to local counters while Redis is unavailable.
 

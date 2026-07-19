@@ -1,6 +1,13 @@
 //! Tests for PluginCache — pre-resolved plugin instances per proxy
 
 use chrono::Utc;
+use ferrum_edge::_test_support::{
+    incremental_plugin_rebuild_targets_for_test, plugin_cache_with_real_ip_header_for_test,
+    reconcile_fault_plugin_generations_for_test, run_after_proxy_hooks_for_test,
+    set_grpc_deadline_budget_for_test, transform_buffered_response_body_with_deadline_for_test,
+    validate_correlation_id_composition_with_real_ip_header_for_test,
+    validate_plugin_composition_candidate_with_real_ip_header_for_test,
+};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
     PluginScope, Proxy,
@@ -29,12 +36,50 @@ impl Plugin for LegacyAuthorizePlugin {
     }
 }
 
+struct RawCorrelationClaimPlugin {
+    claim: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Plugin for RawCorrelationClaimPlugin {
+    fn name(&self) -> &str {
+        "raw_correlation_claim"
+    }
+
+    fn correlation_id_header_name(&self) -> Option<&str> {
+        Some(self.claim)
+    }
+}
+
+struct StalledDeadlineResponseTransformer;
+
+#[async_trait::async_trait]
+impl Plugin for StalledDeadlineResponseTransformer {
+    fn name(&self) -> &str {
+        "stalled_deadline_response_transformer"
+    }
+
+    async fn transform_response_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        std::future::pending().await
+    }
+}
+
 /// Returns the minimal valid config for a given plugin name so that `create_plugin` succeeds.
 pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
     match plugin_name {
         "access_control" => json!({"allowed_consumers": ["testuser"]}),
         "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
         "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
+        "geo_restriction" => json!({
+            "db_path": "/nonexistent/GeoIP2-Country.mmdb",
+            "allow_countries": ["US"]
+        }),
         "rate_limiting" => json!({
             "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
         }),
@@ -67,6 +112,10 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
         }
         "request_mirror" => json!({"mirror_host": "mirror.local"}),
+        "fault_injection" => json!({
+            "abort": {"status_code": 503, "percentage": 100.0},
+            "runtime_overlay_scope": "checkout"
+        }),
         "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
         "kafka_logging" => json!({"broker_list": "localhost:9092", "topic": "test-logs"}),
         "request_deduplication" => json!({}),
@@ -163,28 +212,15 @@ fn make_udp_proxy(id: &str, plugin_ids: Vec<&str>, scheme: BackendScheme) -> Pro
 }
 
 fn make_tcp_stream_context(ip: &str) -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: ip.to_string(),
-        direct_client_ip: ip.to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "p1".to_string(),
-        proxy_name: Some("Proxy p1".to_string()),
-        listen_port: 15432,
-        backend_scheme: BackendScheme::Tcp,
-        consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    StreamConnectionContext::new(
+        ip.to_string(),
+        ip.to_string(),
+        "p1".to_string(),
+        Some("Proxy p1".to_string()),
+        15432,
+        BackendScheme::Tcp,
+        Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    )
 }
 
 async fn run_tcp_connect_chain(
@@ -701,7 +737,8 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
         ],
     );
     let stream_delta = ConfigDelta::compute(&initial, &stream_interleaved);
-    let stream_proxy_ids = stream_delta.proxy_ids_needing_plugin_rebuild(&stream_interleaved);
+    let stream_proxy_ids =
+        stream_delta.proxy_ids_needing_plugin_rebuild(&initial, &stream_interleaved);
     cache
         .apply_delta(
             &stream_interleaved,
@@ -735,7 +772,8 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
         ],
     );
     let http_delta = ConfigDelta::compute(&stream_interleaved, &http_interleaved);
-    let http_proxy_ids = http_delta.proxy_ids_needing_plugin_rebuild(&http_interleaved);
+    let http_proxy_ids =
+        http_delta.proxy_ids_needing_plugin_rebuild(&stream_interleaved, &http_interleaved);
     let err = cache
         .apply_delta(
             &http_interleaved,
@@ -804,7 +842,7 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
         ],
     );
     let composed_delta = ConfigDelta::compute(&initial, &composed);
-    let composed_proxy_ids = composed_delta.proxy_ids_needing_plugin_rebuild(&composed);
+    let composed_proxy_ids = composed_delta.proxy_ids_needing_plugin_rebuild(&initial, &composed);
     cache
         .apply_delta(
             &composed,
@@ -829,7 +867,7 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
         vec![cors_config("cors-narrow", &["GET"], &["X-Test"], None)],
     );
     let reduced_delta = ConfigDelta::compute(&composed, &reduced);
-    let reduced_proxy_ids = reduced_delta.proxy_ids_needing_plugin_rebuild(&reduced);
+    let reduced_proxy_ids = reduced_delta.proxy_ids_needing_plugin_rebuild(&composed, &reduced);
     cache
         .apply_delta(
             &reduced,
@@ -1847,6 +1885,387 @@ fn test_multiple_global_and_proxy_plugins() {
     assert!(names.contains(&"key_auth"));
 }
 
+#[tokio::test]
+async fn serverless_instances_keep_independent_transaction_metadata() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let first_server = MockServer::start().await;
+    let second_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "metadata": {"decision": "first"}
+        })))
+        .mount(&first_server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "metadata": {"decision": "second"}
+        })))
+        .mount(&second_server)
+        .await;
+
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["policy.primary", "policy-secondary"],
+        )],
+        vec![
+            make_plugin_config_with_json(
+                "policy.primary",
+                "serverless_function",
+                json!({
+                    "provider": "azure_functions",
+                    "function_url": format!("{}/first", first_server.uri())
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "policy-secondary",
+                "serverless_function",
+                json!({
+                    "provider": "azure_functions",
+                    "function_url": format!("{}/second", second_server.uri())
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy%2Eprimary.metadata.decision")
+            .map(String::as_str),
+        Some("first")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy-secondary.metadata.decision")
+            .map(String::as_str),
+        Some("second")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy%2Eprimary.status")
+            .map(String::as_str),
+        Some("200")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy-secondary.status")
+            .map(String::as_str),
+        Some("200")
+    );
+}
+
+#[test]
+fn serverless_body_egress_rejects_request_body_transform_composition() {
+    let mut transform_cases = vec![
+        (
+            "body-transform",
+            "request_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "trusted",
+                    "value": true
+                }]
+            }),
+        ),
+        (
+            "request-decompression",
+            "compression",
+            json!({"decompress_request": true}),
+        ),
+    ];
+    if ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        transform_cases.push((
+            "custom-body-transform",
+            "example_plugin",
+            json!({"request_body_prefix": "governed:"}),
+        ));
+    }
+
+    for (transform_id, transform_name, transform_config) in transform_cases {
+        let config = make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                vec!["external-policy", transform_id],
+            )],
+            vec![
+                make_plugin_config_with_json(
+                    "external-policy",
+                    "serverless_function",
+                    json!({
+                        "provider": "azure_functions",
+                        "function_url": "https://example.com/policy",
+                        "forward_body": true
+                    }),
+                    PluginScope::Proxy,
+                    Some("p1"),
+                ),
+                make_plugin_config_with_json(
+                    transform_id,
+                    transform_name,
+                    transform_config,
+                    PluginScope::Proxy,
+                    Some("p1"),
+                ),
+            ],
+        );
+
+        let error = match PluginCache::new(&config) {
+            Ok(_) => panic!("serverless body egress plus {transform_name} must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("request-body") || error.contains("validation"),
+            "transform={transform_name}, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn candidate_security_validation_constructs_custom_capabilities_without_builtin_gate() {
+    let source = include_str!("../../../src/plugin_cache.rs");
+    let start = source
+        .find("pub(crate) fn validate_plugin_security_composition_candidate(")
+        .expect("candidate security validator must exist");
+    let end = source[start..]
+        .find("\nfn remove_shadowed_global_plugin(")
+        .map(|offset| start + offset)
+        .expect("candidate security validator boundary must exist");
+    let candidate = &source[start..end];
+
+    assert!(candidate.contains("crate::custom_plugins::custom_plugin_names()"));
+    assert!(candidate.contains("is_security_composition_candidate_plugin("));
+    assert!(candidate.contains("security_composition_capabilities("));
+    assert!(candidate.contains("ServerlessSecurityCompositionPlugin"));
+    assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
+    assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
+}
+
+#[test]
+fn candidate_serverless_composition_uses_pure_capabilities_not_runtime_credentials() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "function"])],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "function",
+                "serverless_function",
+                json!({
+                    "provider": "aws_lambda",
+                    "mode": "terminate",
+                    // Pin an explicit region so runtime construction reaches the
+                    // malformed-credential check deterministically instead of
+                    // depending on an ambient AWS_REGION / AWS_DEFAULT_REGION.
+                    "aws_region": "us-east-1",
+                    "aws_access_key_id": 7
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+        .expect("candidate composition must not construct an environment-bound AWS client");
+    let runtime_error = PluginCache::new(&config)
+        .err()
+        .expect("runtime construction must still reject malformed credentials");
+    assert!(
+        runtime_error.contains("aws_access_key_id"),
+        "{runtime_error}"
+    );
+}
+
+#[test]
+fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egress() {
+    let mut terminal = make_plugin_config_with_json(
+        "function",
+        "serverless_function",
+        json!({
+            "provider": "aws_lambda",
+            "mode": "terminate",
+            "aws_access_key_id": 7
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    terminal.priority_override = Some(2700);
+    let unsafe_order = make_config(
+        vec![make_proxy("p1", "/api", vec!["function", "dedup"])],
+        vec![
+            terminal,
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let order_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&unsafe_order, None)
+            .expect_err("pure terminate capability must retain dedup ordering enforcement");
+    assert!(
+        order_error.contains("request_deduplication"),
+        "{order_error}"
+    );
+
+    let unsafe_body = make_config(
+        vec![make_proxy("p1", "/api", vec!["function", "transform"])],
+        vec![
+            make_plugin_config_with_json(
+                "function",
+                "serverless_function",
+                json!({
+                    "provider": "aws_lambda",
+                    "forward_body": true,
+                    "aws_access_key_id": 7
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "x",
+                        "value": true
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let body_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&unsafe_body, None)
+            .expect_err("pure forward_body capability must retain body-view enforcement");
+    assert!(body_error.contains("request-body"), "{body_error}");
+}
+
+#[test]
+fn terminate_serverless_must_run_after_every_request_deduplication_instance() {
+    for serverless_priority in [2700, 2750] {
+        let mut serverless = make_plugin_config_with_json(
+            "terminal-function",
+            "serverless_function",
+            json!({
+                "provider": "azure_functions",
+                "function_url": "https://example.com/function",
+                "mode": "terminate"
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        serverless.priority_override = Some(serverless_priority);
+        let config = make_config(
+            vec![make_proxy("p1", "/api", vec!["dedup", "terminal-function"])],
+            vec![
+                make_plugin_config(
+                    "dedup",
+                    "request_deduplication",
+                    PluginScope::Proxy,
+                    Some("p1"),
+                    true,
+                ),
+                serverless,
+            ],
+        );
+
+        let error = PluginCache::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("unsafe serverless priority {serverless_priority} admitted"));
+        assert!(error.contains("serverless_function"), "{error}");
+        assert!(error.contains("request_deduplication"), "{error}");
+    }
+}
+
+#[test]
+fn safe_serverless_dedup_order_and_pre_proxy_override_are_admitted() {
+    let terminate_default = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "terminal-function"])],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "terminal-function",
+                "serverless_function",
+                json!({
+                    "provider": "azure_functions",
+                    "function_url": "https://example.com/function",
+                    "mode": "terminate"
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    PluginCache::new(&terminate_default).expect("default dedup order is safe");
+
+    let mut pre_proxy = make_plugin_config_with_json(
+        "policy-function",
+        "serverless_function",
+        json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/function",
+            "mode": "pre_proxy"
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    pre_proxy.priority_override = Some(2700);
+    let pre_proxy_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "policy-function"])],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            pre_proxy,
+        ],
+    );
+    PluginCache::new(&pre_proxy_config)
+        .expect("pre_proxy serverless does not produce a terminal replay obligation");
+}
+
 #[test]
 fn test_proxy_count() {
     let config = make_config(
@@ -2682,7 +3101,7 @@ fn test_apply_delta_global_to_proxy_scope_refreshes_all_proxy_views() {
         vec![proxy_scoped],
     );
     let delta = ConfigDelta::compute(&old_config, &new_config);
-    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
 
     assert!(delta.global_plugin_configs_changed);
     cache
@@ -2704,6 +3123,346 @@ fn test_apply_delta_global_to_proxy_scope_refreshes_all_proxy_views() {
     assert!(
         cache.get_plugins("unknown").is_empty(),
         "global fallback must drop plugins that changed away from global scope"
+    );
+}
+
+#[test]
+fn fault_delta_proxy_id_move_rebuilds_former_and_new_placements() {
+    let old_fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    let p1 = make_proxy("p1", "/one", vec!["fault"]);
+    let p2 = make_proxy("p2", "/two", vec![]);
+    let old_config = make_config(vec![p1.clone(), p2.clone()], vec![old_fault.clone()]);
+    let cache = PluginCache::new(&old_config).expect("initial fault cache");
+    assert_eq!(cache.get_plugins("p1")[0].name(), "fault_injection");
+    assert!(cache.get_plugins("p2").is_empty());
+
+    let mut moved_from = p1;
+    moved_from.plugins.clear();
+    let mut moved_to = p2;
+    moved_to.plugins.push(PluginAssociation {
+        plugin_config_id: "fault".to_string(),
+    });
+    let mut moved_fault = old_fault;
+    moved_fault.proxy_id = Some("p2".to_string());
+    moved_fault.updated_at += chrono::Duration::seconds(1);
+    let new_config = make_config(vec![moved_from, moved_to], vec![moved_fault]);
+
+    let delta = ConfigDelta::compute(&old_config, &new_config);
+    assert!(delta.modified_proxies.is_empty());
+    assert_eq!(delta.modified_plugin_configs.len(), 1);
+    assert_eq!(
+        delta
+            .plugin_association_changed_proxy_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>(),
+        HashSet::from(["p1".to_string(), "p2".to_string()])
+    );
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
+    assert_eq!(
+        proxy_ids,
+        HashSet::from(["p1".to_string(), "p2".to_string()])
+    );
+
+    cache
+        .apply_delta(
+            &new_config,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect("proxy_id move should rebuild both placements");
+
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "former proxy must not retain the moved fault plugin"
+    );
+    assert_eq!(cache.get_plugins("p2")[0].name(), "fault_injection");
+}
+
+#[test]
+fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
+    let proxy_fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    let p1 = make_proxy("p1", "/one", vec!["fault"]);
+    let p2 = make_proxy("p2", "/two", vec![]);
+    let p3 = make_proxy("p3", "/three", vec![]);
+    let proxy_config = make_config(
+        vec![p1.clone(), p2.clone(), p3.clone()],
+        vec![proxy_fault.clone()],
+    );
+    let cache = PluginCache::new(&proxy_config).expect("initial proxy-scoped fault cache");
+
+    let mut former_proxy = p1.clone();
+    former_proxy.plugins.clear();
+    let mut group_member_one = p2.clone();
+    group_member_one.plugins.push(PluginAssociation {
+        plugin_config_id: "fault".to_string(),
+    });
+    let mut group_member_two = p3.clone();
+    group_member_two.plugins.push(PluginAssociation {
+        plugin_config_id: "fault".to_string(),
+    });
+    let mut group_fault = proxy_fault;
+    group_fault.scope = PluginScope::ProxyGroup;
+    group_fault.proxy_id = None;
+    group_fault.updated_at += chrono::Duration::seconds(1);
+    let group_config = make_config(
+        vec![former_proxy, group_member_one, group_member_two],
+        vec![group_fault.clone()],
+    );
+    let to_group = ConfigDelta::compute(&proxy_config, &group_config);
+    let to_group_ids = to_group.proxy_ids_needing_plugin_rebuild(&proxy_config, &group_config);
+    assert_eq!(
+        to_group_ids,
+        HashSet::from(["p1".to_string(), "p2".to_string(), "p3".to_string()])
+    );
+    cache
+        .apply_delta(
+            &group_config,
+            &to_group_ids,
+            &to_group.removed_proxy_ids,
+            to_group.global_plugin_configs_changed,
+        )
+        .expect("proxy-to-group scope move");
+    assert!(cache.get_plugins("p1").is_empty());
+    assert_eq!(cache.get_plugins("p2")[0].name(), "fault_injection");
+    assert_eq!(cache.get_plugins("p3")[0].name(), "fault_injection");
+
+    let mut new_proxy = p1;
+    new_proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "fault".to_string(),
+    }];
+    let former_group_one = p2;
+    let former_group_two = p3;
+    let mut moved_back = group_fault;
+    moved_back.scope = PluginScope::Proxy;
+    moved_back.proxy_id = Some("p1".to_string());
+    moved_back.updated_at += chrono::Duration::seconds(1);
+    let moved_back_config = make_config(
+        vec![new_proxy, former_group_one, former_group_two],
+        vec![moved_back],
+    );
+    let from_group = ConfigDelta::compute(&group_config, &moved_back_config);
+    let from_group_ids =
+        from_group.proxy_ids_needing_plugin_rebuild(&group_config, &moved_back_config);
+    assert_eq!(
+        from_group_ids,
+        HashSet::from(["p1".to_string(), "p2".to_string(), "p3".to_string()])
+    );
+    cache
+        .apply_delta(
+            &moved_back_config,
+            &from_group_ids,
+            &from_group.removed_proxy_ids,
+            from_group.global_plugin_configs_changed,
+        )
+        .expect("group-to-proxy scope move");
+    assert_eq!(cache.get_plugins("p1")[0].name(), "fault_injection");
+    assert!(cache.get_plugins("p2").is_empty());
+    assert!(cache.get_plugins("p3").is_empty());
+}
+
+#[test]
+fn fault_delta_group_membership_move_and_removal_invalidate_former_associations() {
+    let group_fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::ProxyGroup,
+        None,
+        true,
+    );
+    let p1 = make_proxy("p1", "/one", vec!["fault"]);
+    let p2 = make_proxy("p2", "/two", vec!["fault"]);
+    let p3 = make_proxy("p3", "/three", vec![]);
+    let old_config = make_config(
+        vec![p1.clone(), p2.clone(), p3.clone()],
+        vec![group_fault.clone()],
+    );
+    let cache = PluginCache::new(&old_config).expect("initial group fault cache");
+    let unchanged_before = cache.get_plugins("p2");
+
+    let mut former_member = p1;
+    former_member.plugins.clear();
+    let unchanged_member = p2;
+    let mut new_member = p3;
+    new_member.plugins.push(PluginAssociation {
+        plugin_config_id: "fault".to_string(),
+    });
+    let moved_config = make_config(
+        vec![former_member, unchanged_member, new_member],
+        vec![group_fault],
+    );
+    let moved_delta = ConfigDelta::compute(&old_config, &moved_config);
+    assert!(moved_delta.modified_plugin_configs.is_empty());
+    assert!(!moved_delta.is_empty());
+    let moved_ids = moved_delta.proxy_ids_needing_plugin_rebuild(&old_config, &moved_config);
+    assert_eq!(
+        moved_ids,
+        HashSet::from(["p1".to_string(), "p3".to_string()])
+    );
+    cache
+        .apply_delta(
+            &moved_config,
+            &moved_ids,
+            &moved_delta.removed_proxy_ids,
+            moved_delta.global_plugin_configs_changed,
+        )
+        .expect("group association move");
+    assert!(cache.get_plugins("p1").is_empty());
+    assert!(Arc::ptr_eq(&unchanged_before, &cache.get_plugins("p2")));
+    assert_eq!(cache.get_plugins("p3")[0].name(), "fault_injection");
+
+    let mut removed_proxies = moved_config.proxies.clone();
+    for proxy in &mut removed_proxies {
+        proxy.plugins.clear();
+    }
+    let removed_config = make_config(removed_proxies, vec![]);
+    let removed_delta = ConfigDelta::compute(&moved_config, &removed_config);
+    let removed_ids =
+        removed_delta.proxy_ids_needing_plugin_rebuild(&moved_config, &removed_config);
+    cache
+        .apply_delta(
+            &removed_config,
+            &removed_ids,
+            &removed_delta.removed_proxy_ids,
+            removed_delta.global_plugin_configs_changed,
+        )
+        .expect("fault plugin removal");
+    assert!(cache.get_plugins("p2").is_empty());
+    assert!(cache.get_plugins("p3").is_empty());
+}
+
+#[test]
+fn fault_delta_priority_change_is_targeted_and_unchanged_config_is_noop() {
+    let fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/one", vec!["fault"]),
+            make_proxy("p2", "/two", vec![]),
+        ],
+        vec![fault],
+    );
+    let cache = PluginCache::new(&config).expect("initial priority fault cache");
+    let p1_before = cache.get_plugins("p1");
+    let p2_before = cache.get_plugins("p2");
+
+    let unchanged = ConfigDelta::compute(&config, &config);
+    assert!(unchanged.is_empty());
+    assert!(
+        unchanged
+            .proxy_ids_needing_plugin_rebuild(&config, &config)
+            .is_empty()
+    );
+    assert!(Arc::ptr_eq(&p1_before, &cache.get_plugins("p1")));
+
+    let mut reprioritized = config.clone();
+    reprioritized.plugin_configs[0].priority_override = Some(42);
+    reprioritized.plugin_configs[0].updated_at += chrono::Duration::seconds(1);
+    let delta = ConfigDelta::compute(&config, &reprioritized);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config, &reprioritized);
+    assert_eq!(proxy_ids, HashSet::from(["p1".to_string()]));
+    cache
+        .apply_delta(
+            &reprioritized,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect("fault priority change");
+
+    let p1_after = cache.get_plugins("p1");
+    assert!(!Arc::ptr_eq(&p1_before[0], &p1_after[0]));
+    assert!(Arc::ptr_eq(&p2_before, &cache.get_plugins("p2")));
+}
+
+#[test]
+fn fault_reconciliation_scope_move_advances_the_actual_generation() {
+    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let mut fault = make_plugin_config("fault", "fault_injection", PluginScope::Global, None, true);
+    fault.created_at = generation;
+    fault.updated_at = generation;
+    let accepted = make_config(vec![], vec![fault]);
+
+    let mut candidate = accepted.clone();
+    candidate.plugin_configs[0].scope = PluginScope::Proxy;
+    candidate.plugin_configs[0].proxy_id = Some("p1".to_string());
+    reconcile_fault_plugin_generations_for_test(&mut candidate, &accepted);
+
+    assert!(candidate.plugin_configs[0].updated_at > generation);
+    let delta = ConfigDelta::compute(&accepted, &candidate);
+    assert_eq!(delta.modified_plugin_configs.len(), 1);
+    assert!(delta.global_plugin_configs_changed);
+}
+
+#[test]
+fn fault_reconciliation_priority_change_advances_the_actual_generation() {
+    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let mut fault = make_plugin_config(
+        "fault",
+        "fault_injection",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    fault.created_at = generation;
+    fault.updated_at = generation;
+    let accepted = make_config(vec![make_proxy("p1", "/one", vec!["fault"])], vec![fault]);
+
+    let mut candidate = accepted.clone();
+    candidate.plugin_configs[0].priority_override = Some(42);
+    reconcile_fault_plugin_generations_for_test(&mut candidate, &accepted);
+
+    assert!(candidate.plugin_configs[0].updated_at > generation);
+    let delta = ConfigDelta::compute(&accepted, &candidate);
+    assert_eq!(delta.modified_plugin_configs.len(), 1);
+    assert_eq!(
+        incremental_plugin_rebuild_targets_for_test(&accepted, &candidate),
+        HashSet::from(["p1".to_string()]),
+        "the staged rebuild count and targets must come from this accepted snapshot"
+    );
+}
+
+#[test]
+fn fault_reconciliation_comparison_is_schema_complete_and_normalizes_only_timestamps() {
+    let generation = Utc::now() - chrono::Duration::seconds(10);
+    let mut fault = make_plugin_config("fault", "fault_injection", PluginScope::Global, None, true);
+    fault.created_at = generation;
+    fault.updated_at = generation;
+    let accepted = make_config(vec![], vec![fault]);
+
+    let mut persistence_only = accepted.clone();
+    persistence_only.plugin_configs[0].created_at += chrono::Duration::seconds(1);
+    reconcile_fault_plugin_generations_for_test(&mut persistence_only, &accepted);
+    assert_eq!(persistence_only.plugin_configs[0].updated_at, generation);
+
+    let mut metadata_changed = accepted.clone();
+    metadata_changed.plugin_configs[0].api_spec_id = Some("spec-owner".to_string());
+    reconcile_fault_plugin_generations_for_test(&mut metadata_changed, &accepted);
+    assert!(metadata_changed.plugin_configs[0].updated_at > generation);
+    assert_eq!(
+        ConfigDelta::compute(&accepted, &metadata_changed)
+            .modified_plugin_configs
+            .len(),
+        1,
+        "a field outside the former hand-written list must not retain a stale generation"
     );
 }
 
@@ -2747,7 +3506,7 @@ fn test_apply_delta_invalid_optional_proxy_scoped_plugin_shadows_global() {
         ],
     );
     let delta = ConfigDelta::compute(&config1, &config2);
-    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config2);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config1, &config2);
 
     cache
         .apply_delta(
@@ -2809,7 +3568,7 @@ fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
         ],
     );
     let delta = ConfigDelta::compute(&config1, &config2);
-    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config2);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config1, &config2);
 
     cache
         .apply_delta(
@@ -2938,7 +3697,7 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
     new_schema.updated_at += chrono::Duration::seconds(1);
     let new_config = make_config(vec![make_proxy("p1", "/api", vec![])], vec![new_schema]);
     let delta = ConfigDelta::compute(&old_config, &new_config);
-    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
     cache
         .apply_delta(
             &new_config,
@@ -3618,6 +4377,90 @@ fn test_multiple_same_type_proxy_plugins_both_present() {
     assert_eq!(plugins[1].name(), "stdout_logging");
 }
 
+#[tokio::test]
+async fn correlation_id_priority_overrides_select_canonical_without_collapsing_instances() {
+    for internal_priority in [40, 60] {
+        let external_priority = if internal_priority == 40 { 60 } else { 40 };
+        let mut internal = make_plugin_config_with_priority(
+            "internal-correlation",
+            "correlation_id",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(internal_priority),
+        );
+        internal.config = json!({"header_name": "x-internal-request-id"});
+        let mut external = make_plugin_config_with_priority(
+            "external-correlation",
+            "correlation_id",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(external_priority),
+        );
+        external.config = json!({"header_name": "x-external-request-id"});
+        let config = make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                vec!["external-correlation", "internal-correlation"],
+            )],
+            vec![external, internal],
+        );
+        let cache = PluginCache::new(&config).expect("multi-instance correlation cache");
+        let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(
+            plugins[0].priority(),
+            internal_priority.min(external_priority)
+        );
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.headers.insert(
+            "x-external-request-id".to_string(),
+            "priority-preserved-id".to_string(),
+        );
+        assert!(matches!(
+            run_request_received_chain(&plugins, &mut ctx).await,
+            PluginResult::Continue
+        ));
+
+        let internal_id = ctx.headers.get("x-internal-request-id").unwrap();
+        assert!(uuid::Uuid::parse_str(internal_id).is_ok());
+        assert_ne!(internal_id, "priority-preserved-id");
+        let expected_canonical = if internal_priority < external_priority {
+            internal_id.as_str()
+        } else {
+            "priority-preserved-id"
+        };
+        assert_eq!(
+            ctx.metadata
+                .get(ferrum_edge::plugins::REQUEST_ID_METADATA_KEY)
+                .map(String::as_str),
+            Some(expected_canonical)
+        );
+
+        let mut handshake_headers = HashMap::new();
+        for plugin in plugins.iter() {
+            plugin.apply_websocket_handshake_response_headers(&ctx, 101, &mut handshake_headers);
+        }
+        assert_eq!(
+            handshake_headers.get("x-internal-request-id"),
+            Some(internal_id)
+        );
+        assert_eq!(
+            handshake_headers
+                .get("x-external-request-id")
+                .map(String::as_str),
+            Some("priority-preserved-id")
+        );
+    }
+}
+
 #[test]
 fn test_proxy_scoped_plugin_removes_only_global_of_same_name() {
     // A global stdout_logging and two proxy-scoped stdout_logging instances.
@@ -3730,6 +4573,78 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
     assert_eq!(plugins[0].name(), "stdout_logging");
+}
+
+#[tokio::test]
+async fn priority_overridden_correlation_retains_owned_deadline_header() {
+    let mut correlation = make_plugin_config_with_json(
+        "correlation",
+        "correlation_id",
+        json!({ "header_name": "x-correlation-id" }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    correlation.priority_override = Some(777);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["correlation"])],
+        vec![correlation],
+    );
+    let cache = PluginCache::new(&config).expect("priority-overridden correlation cache");
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 777);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers.insert(
+        "x-correlation-id".to_string(),
+        "client-request-id".to_string(),
+    );
+    assert!(matches!(
+        run_request_received_chain(&plugins, &mut ctx).await,
+        PluginResult::Continue
+    ));
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
+
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (
+            "x-correlation-id".to_string(),
+            "client-request-id".to_string(),
+        ),
+    ]);
+    assert!(
+        !run_after_proxy_hooks_for_test(&plugins, &mut ctx, 200, &mut headers).await,
+        "correlation decoration must not reject the backend response"
+    );
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    let mut status = 200;
+    let mut body = b"discarded backend response".to_vec();
+    let transform_plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(StalledDeadlineResponseTransformer)];
+
+    assert!(
+        transform_buffered_response_body_with_deadline_for_test(
+            &transform_plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+        )
+        .await
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-correlation-id").map(String::as_str),
+        Some("client-request-id"),
+        "the real priority wrapper must delegate exact-value deadline ownership"
+    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert!(body.is_empty());
 }
 
 #[tokio::test]
@@ -5165,6 +6080,322 @@ fn test_hmac_auth_allows_header_only_request_transformer() {
     );
 
     assert!(PluginCache::new(&config).is_ok());
+}
+
+#[test]
+fn test_duplicate_effective_correlation_headers_are_rejected() {
+    let first = make_plugin_config_with_json(
+        "corr-first",
+        "correlation_id",
+        json!({}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let mut second = make_plugin_config_with_json(
+        "corr-second",
+        "correlation_id",
+        json!({"header_name": " X-Request-ID "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second.priority_override = Some(75);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr-first", "corr-second"])],
+        vec![first, second],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("duplicate normalized correlation headers must fail closed");
+    assert!(error.contains("duplicate effective header_name \"x-request-id\""));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
+fn test_real_ip_header_collision_is_rejected_by_candidate_and_runtime_cache() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr"])],
+        vec![make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": " CF-Connecting-IP "}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    let candidate_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &config,
+        Some("cf-connecting-ip"),
+    )
+    .expect_err("candidate admission must reject the real-IP header collision");
+    assert!(candidate_error.contains("FERRUM_REAL_IP_HEADER"));
+
+    let cache_error = plugin_cache_with_real_ip_header_for_test(&config, Some("cf-connecting-ip"))
+        .err()
+        .expect("runtime cache construction must reject the real-IP header collision");
+    assert!(cache_error.contains("FERRUM_REAL_IP_HEADER"));
+}
+
+#[test]
+fn test_real_ip_header_non_collision_is_accepted_by_candidate_and_runtime_cache() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["corr"])],
+        vec![make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": "X-Request-ID"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &config,
+        Some("cloudfront-viewer-address"),
+    )
+    .expect("distinct candidate headers must be accepted");
+    plugin_cache_with_real_ip_header_for_test(&config, Some("cloudfront-viewer-address"))
+        .expect("distinct runtime headers must be accepted");
+}
+
+#[test]
+fn test_equal_effective_correlation_priorities_are_rejected() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["corr-internal", "corr-external"],
+        )],
+        vec![
+            make_plugin_config_with_json(
+                "corr-internal",
+                "correlation_id",
+                json!({"header_name": "x-internal-request-id"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "corr-external",
+                "correlation_id",
+                json!({"header_name": "x-external-request-id"}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("equal correlation priorities must fail closed");
+    assert!(error.contains("duplicate effective priority 50"));
+    assert!(error.contains("priority_override"));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
+fn test_same_correlation_header_on_disjoint_proxy_chains_is_allowed() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/one", vec!["corr-one"]),
+            make_proxy("p2", "/two", vec!["corr-two"]),
+        ],
+        vec![
+            make_plugin_config(
+                "corr-one",
+                "correlation_id",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "corr-two",
+                "correlation_id",
+                PluginScope::Proxy,
+                Some("p2"),
+                true,
+            ),
+        ],
+    );
+
+    assert!(PluginCache::new(&config).is_ok());
+}
+
+#[test]
+fn test_custom_only_duplicate_effective_correlation_headers_are_rejected() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    // The example plugin retains configured whitespace and casing at the
+    // capability boundary, modeling a third-party implementation that did not
+    // pre-normalize its correlation_id_header_name() result. Core validation
+    // must still trim and compare these two claims case-insensitively.
+    let first = make_plugin_config_with_json(
+        "custom-corr-first",
+        "example_plugin",
+        json!({"correlation_header_name": "x-custom-correlation-id"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let mut second = make_plugin_config_with_json(
+        "custom-corr-second",
+        "example_plugin",
+        json!({"correlation_header_name": " X-Custom-Correlation-ID "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second.priority_override = Some(5001);
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["custom-corr-first", "custom-corr-second"],
+        )],
+        vec![first, second],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("mixed-whitespace/case correlation claims must fail closed");
+    assert!(error.contains("duplicate effective header_name \"x-custom-correlation-id\""));
+    assert!(error.contains("proxy_id=p1"));
+}
+
+#[test]
+fn test_empty_third_party_correlation_capability_claims_fail_closed_clearly() {
+    for claim in ["", " \t "] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin { claim })];
+        let error =
+            ferrum_edge::_test_support::validate_correlation_id_composition_for_test(&plugins)
+                .expect_err("one empty normalized capability claim must fail closed");
+
+        assert!(
+            error.contains("plugin \"raw_correlation_claim\" returned an empty correlation_id_header_name capability claim"),
+            "unexpected empty-claim error for {claim:?}: {error}"
+        );
+        assert!(error.contains("return None"), "got: {error}");
+        assert!(
+            !error.contains("duplicate effective header_name"),
+            "got: {error}"
+        );
+    }
+}
+
+#[test]
+fn test_third_party_correlation_capability_cannot_claim_real_ip_header() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin {
+        claim: " CF-Connecting-IP ",
+    })];
+    let error = validate_correlation_id_composition_with_real_ip_header_for_test(
+        &plugins,
+        Some("cf-connecting-ip"),
+    )
+    .expect_err("third-party real-IP header collision must fail closed");
+    assert!(error.contains("FERRUM_REAL_IP_HEADER"), "got: {error}");
+    assert!(error.contains("cf-connecting-ip"), "got: {error}");
+}
+
+#[test]
+fn test_third_party_correlation_capability_cannot_claim_reserved_header() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin {
+        claim: " AuThOrIzAtIoN ",
+    })];
+    let error = ferrum_edge::_test_support::validate_correlation_id_composition_for_test(&plugins)
+        .expect_err("third-party reserved header ownership must fail closed");
+
+    assert!(
+        error.contains("effective header_name \"authorization\""),
+        "got: {error}"
+    );
+    assert!(
+        error.contains("plugin \"raw_correlation_claim\""),
+        "got: {error}"
+    );
+    assert!(error.contains("protocol Http"), "got: {error}");
+    assert!(
+        error.contains("reserved protocol-managed or security-sensitive header ownership"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn test_shipped_custom_correlation_plugin_cannot_claim_reserved_header() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let custom_owner = make_plugin_config_with_json(
+        "custom-corr-reserved",
+        "example_plugin",
+        json!({"correlation_header_name": " AuThOrIzAtIoN "}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["custom-corr-reserved"])],
+        vec![custom_owner],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("shipped custom plugin must not claim reserved correlation headers");
+    assert!(
+        error.contains("effective header_name \"authorization\""),
+        "got: {error}"
+    );
+    assert!(error.contains("plugin \"example_plugin\""), "got: {error}");
+    assert!(error.contains("protocol Http"), "got: {error}");
+    assert!(error.contains("proxy_id=p1"), "got: {error}");
+    assert!(error.contains("reserved"), "got: {error}");
+}
+
+#[test]
+fn test_custom_correlation_owners_on_disjoint_protocols_are_allowed() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let http_owner = make_plugin_config_with_json(
+        "custom-corr-http",
+        "example_plugin",
+        json!({"correlation_header_name": "x-custom-correlation-id"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let tcp_owner = make_plugin_config_with_json(
+        "custom-corr-tcp",
+        "example_plugin",
+        json!({
+            "correlation_header_name": " X-Custom-Correlation-ID ",
+            "protocol": "tcp"
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["custom-corr-http", "custom-corr-tcp"],
+        )],
+        vec![http_owner, tcp_owner],
+    );
+
+    let cache = PluginCache::new(&config)
+        .expect("disjoint protocol owners cannot contend for correlation ownership");
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("p1", ProxyProtocol::Http)
+            .len(),
+        1
+    );
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("p1", ProxyProtocol::Tcp)
+            .len(),
+        1
+    );
 }
 
 #[test]

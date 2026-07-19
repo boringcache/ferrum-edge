@@ -864,14 +864,21 @@ pub struct EnvConfig {
     /// namespaces are ignored. Default: "ferrum".
     pub namespace: String,
     pub log_level: String,
-    /// Maximum number of buffered log lines in the non-blocking writer's channel.
-    /// When the buffer is full, new log events are dropped (lossy mode) to avoid
-    /// backpressure on request-processing threads. Larger values reduce the chance
-    /// of log loss under extreme throughput but consume more memory. Default: 128000.
+    /// Per-sink admitted record limit for process logging. Stdout/access logs
+    /// share one sink and stderr owns another. Default: 4096.
     /// Note: consumed in main() before EnvConfig is constructed (tracing must init
     /// first), but stored here for completeness alongside other FERRUM_* vars.
     #[allow(dead_code)]
     pub log_buffer_capacity: usize,
+    /// Per-sink aggregate reserved-byte budget. Default: 32 MiB.
+    #[allow(dead_code)]
+    pub log_buffer_bytes: usize,
+    /// Maximum serialized bytes in one process log record. Default: 64 KiB.
+    #[allow(dead_code)]
+    pub log_max_record_bytes: usize,
+    /// Bounded per-sink shutdown drain timeout. Default: 2000 ms.
+    #[allow(dead_code)]
+    pub log_shutdown_drain_timeout_ms: u64,
     /// Default poll interval in seconds for external TLS material sources
     /// (`vault://`, `aws://`, `azure://`, `gcp://`, `k8s://`, `managed://`) when a source URI does not
     /// include its own `?poll=` option. Clamped to 1 second minimum and 24 hours
@@ -991,7 +998,16 @@ pub struct EnvConfig {
     #[allow(dead_code)]
     pub admin_jwt_issuer: String,
     /// Maximum accepted TTL in seconds for externally minted Admin API JWT tokens.
-    /// Tokens with `exp - iat` above this value are rejected. Default: 3600.
+    ///
+    /// Enforced against verifier time, with the 60s clock-skew leeway counted
+    /// exactly once: the nominal lifetime (`exp - iat`) must be positive and
+    /// within this value, `iat` must not be later than `now + leeway`, the
+    /// remaining lifetime (`exp - now`) must be within this value plus that
+    /// leeway, and `exp` must still be in the future at verifier time (no
+    /// additional expiry grace). Effective maximum real validity is therefore
+    /// `max_ttl + 60s`. `0` is an intentional disable sentinel that skips the
+    /// lifetime cap entirely; a value above `i64::MAX` is rejected as invalid
+    /// rather than treated as unlimited. Default: 3600.
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
     #[allow(dead_code)]
     pub admin_jwt_max_ttl: u64,
@@ -2212,7 +2228,11 @@ impl Default for EnvConfig {
             mode: OperatingMode::File,
             namespace: "ferrum".into(),
             log_level: "error".into(),
-            log_buffer_capacity: 128_000,
+            log_buffer_capacity: crate::logging::LOG_BUFFER_CAPACITY_DEFAULT,
+            log_buffer_bytes: crate::logging::LOG_BUFFER_BYTES_DEFAULT,
+            log_max_record_bytes: crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT,
+            log_shutdown_drain_timeout_ms: crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT
+                as u64,
             secret_refresh_interval_seconds:
                 crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS,
             acme_auto_renew_enabled: false,
@@ -2539,7 +2559,10 @@ impl EnvConfig {
             dns_overrides: HashMap<String, String> = "FERRUM_DNS_OVERRIDES" => HashMap::new();
             namespace: String = "FERRUM_NAMESPACE" => "ferrum".to_string();
             log_level: String = "FERRUM_LOG_LEVEL" => "warn".to_string();
-            log_buffer_capacity: usize = "FERRUM_LOG_BUFFER_CAPACITY" => 128_000usize;
+            log_buffer_capacity: usize = "FERRUM_LOG_BUFFER_CAPACITY" => crate::logging::LOG_BUFFER_CAPACITY_DEFAULT, clamp(crate::logging::LOG_BUFFER_CAPACITY_MIN, crate::logging::LOG_BUFFER_CAPACITY_MAX);
+            log_buffer_bytes: usize = "FERRUM_LOG_BUFFER_BYTES" => crate::logging::LOG_BUFFER_BYTES_DEFAULT, clamp(crate::logging::LOG_BUFFER_BYTES_MIN, crate::logging::LOG_BUFFER_BYTES_MAX);
+            log_max_record_bytes: usize = "FERRUM_LOG_MAX_RECORD_BYTES" => crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT, clamp(crate::logging::LOG_MAX_RECORD_BYTES_MIN, crate::logging::LOG_MAX_RECORD_BYTES_MAX);
+            log_shutdown_drain_timeout_ms: u64 = "FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS" => crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT as u64, clamp(crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MIN as u64, crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MAX as u64);
             secret_refresh_interval_seconds: u64 = "FERRUM_SECRET_REFRESH_INTERVAL_SECONDS" => crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS, clamp(1u64, 86_400u64);
             acme_auto_renew_enabled: bool = "FERRUM_ACME_AUTO_RENEW_ENABLED" => false;
             acme_renew_when_remaining_days: u64 = "FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS" => 30u64, clamp(1u64, 365u64);
@@ -2550,6 +2573,7 @@ impl EnvConfig {
             acme_dns01_propagation_seconds: u64 = "FERRUM_ACME_DNS01_PROPAGATION_SECONDS" => 60u64, clamp(0u64, 3600u64);
             enable_streaming_latency_tracking: bool = "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING" => false;
         }
+        let log_buffer_bytes = log_buffer_bytes.max(log_max_record_bytes);
 
         env_config! {
             conf = conf, mode = &mode;
@@ -3236,6 +3260,9 @@ impl EnvConfig {
             namespace,
             log_level,
             log_buffer_capacity,
+            log_buffer_bytes,
+            log_max_record_bytes,
+            log_shutdown_drain_timeout_ms,
             secret_refresh_interval_seconds,
             acme_auto_renew_enabled,
             acme_renew_when_remaining_days,
@@ -4612,6 +4639,20 @@ impl EnvConfig {
                 .map_err(|e| e.to_string())?;
         }
 
+        // The admin JWT lifetime cap is a security control: `0` is the only
+        // documented way to disable it, so a value that cannot be represented
+        // as a JWT `NumericDate` bound (i64 seconds) is a misconfiguration
+        // and must not silently degrade into an effectively unlimited cap.
+        // `JwtManager::verify_token()` fails closed on the same condition.
+        if i64::try_from(self.admin_jwt_max_ttl).is_err() {
+            return Err(format!(
+                "FERRUM_ADMIN_JWT_MAX_TTL ({}) exceeds the maximum supported value ({}); \
+                 use 0 to disable the lifetime cap",
+                self.admin_jwt_max_ttl,
+                i64::MAX
+            ));
+        }
+
         if self.http3_initial_mtu < crate::http3::config::QUIC_INITIAL_MTU_MIN
             || self.http3_initial_mtu > crate::http3::config::QUIC_INITIAL_MTU_MAX
         {
@@ -4812,6 +4853,16 @@ impl EnvConfig {
 
         Ok(())
     }
+}
+
+/// Resolve the effective authoritative client-IP header for cold paths that
+/// do not own an `EnvConfig` (notably CP snapshot and admin admission). This
+/// uses the same env-over-conf precedence as startup and matches the lowercase
+/// normalization stored in `EnvConfig::real_ip_header`. CP config sync rejects
+/// DPs that do not explicitly advertise this same cluster ownership value.
+pub(crate) fn resolve_real_ip_header() -> Option<String> {
+    crate::config::conf_file::resolve_ferrum_var("FERRUM_REAL_IP_HEADER")
+        .map(|header| header.to_ascii_lowercase())
 }
 
 #[cfg(test)]

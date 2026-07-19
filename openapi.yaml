@@ -1379,7 +1379,8 @@ paths:
         Returns a JWT-authenticated JSON snapshot for "how is this host doing
         right now?": process CPU and memory, file descriptors, ephemeral-port
         pressure, HTTP status rates, error classes, DNS cache outcomes, pool
-        churn, TCP resets, log-event counters, and the inline overload state.
+        churn, TCP resets, log-event counters, bounded stdout/stderr sink
+        health/loss/last-failure diagnostics, and the inline overload state.
 
         The response is cached briefly (default 1000 ms, configurable with
         `FERRUM_METRICS_RUNTIME_CACHE_MS`) because system metrics are sampled in
@@ -3537,12 +3538,32 @@ paths:
     delete:
       operationId: deleteProxy
       summary: Delete a proxy
+      description: |
+        Deletes the proxy and its proxy-owned cascade resources. If the proxy is
+        owned by an API spec, the spec row and spec-owned resources are also
+        deleted. When namespace admission is lost after that deletion commits,
+        SQL backends and replica-set MongoDB use the API-spec compensation
+        transaction to restore the stamped spec resources, an orphaned
+        hand-owned upstream, hand-owned cascade plugins, associations, and
+        config-change records together. Before persistence, the namespace
+        snapshot is used only to discover affected IDs; the current upstream
+        and cascade plugins are re-read with ownership metadata intact.
+        Hand-owned rows remain hand-owned, the API-spec snapshot supplies
+        stamped bundle rows, and foreign ownership or an unrestorable ownership
+        shape returns 400 without deleting the proxy. A shared hand-owned
+        upstream that remained live is reused rather than inserted again only
+        when its stable creation identity and ownership match the pre-delete
+        snapshot; a same-ID replacement rejects recovery. The recovered proxy
+        graph's current upstream, plugin-composition, and named-schema
+        dependencies are revalidated before commit with the configured backend
+        egress policy and real-IP header. Standalone MongoDB fails closed before
+        multi-document compensation writes.
       tags: [Proxies]
       responses:
         "204":
           description: Proxy deleted
         "400":
-          description: Deletion would leave an invalid plugin-composition graph, such as a global TCP connection throttle with no supported TCP/TCP+TLS target
+          description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely
           content:
             application/json:
               schema:
@@ -4467,6 +4488,9 @@ paths:
         separately. Plugin `config` values must not contain credential or
         consumer fields (`credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`,
         `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`).
+        `api_spec_id` is server-managed and must be omitted from
+        `x-ferrum-proxy`, `x-ferrum-upstream`, and `x-ferrum-plugins`; copied
+        ownership tags return a 422 validation response on both POST and PUT.
 
         **Content-Type detection**: `application/json` → JSON parser;
         `application/yaml` / `application/x-yaml` / `text/yaml` / `text/x-yaml` → YAML parser;
@@ -4852,8 +4876,26 @@ paths:
         left with a dangling `schema_ref`, or when the cascade would leave a
         global TCP connection throttle without a supported TCP/TCP+TLS target.
 
+        Ferrum also validates that the complete pre-delete compensation snapshot
+        is owned and shaped so it can be restored atomically. A cascade plugin
+        owned by another API spec, an explicitly associated global plugin, a
+        proxy-scoped association targeting another proxy, a global plugin carrying
+        the deleted proxy ID, a proxy-group plugin carrying `proxy_id`, or an
+        embedded proxy association naming a missing plugin config returns a
+        structured 422 validation failure without deleting anything.
+
+        If namespace admission is lost after deletion commits, SQL backends and
+        replica-set MongoDB compensate in one transaction: the spec-owned and
+        current hand-owned upstream snapshots, proxy, spec-owned and hand-owned
+        cascade plugins, associations, API-spec row, and config-change records
+        are all restored or all remain deleted. The
+        recovered proxy's current upstream, plugin-composition, and named-schema
+        dependencies are revalidated before commit. A standalone MongoDB
+        deployment fails closed before compensation writes because it cannot
+        provide that multi-document atomic boundary.
+
         Returns 204 on success, 404 if the spec does not exist, or 422 when the
-        prospective deletion fails plugin-graph validation.
+        prospective deletion fails plugin-graph or restore-snapshot validation.
 
         This mutation requires the `admin` role.
       tags: [API Specs]
@@ -4880,7 +4922,11 @@ paths:
             Deleting the spec and its cascaded resources would leave an invalid
             aggregate plugin-composition graph in the namespace, such as a dangling
             transaction-log `schema_ref` or a global TCP connection throttle
-            with no supported TCP/TCP+TLS target. No resources are deleted.
+            with no supported TCP/TCP+TLS target, or the pre-delete compensation
+            snapshot contains foreign ownership, an unrestorable plugin scope/proxy
+            association, or an embedded proxy association naming a missing plugin
+            config. The response identifies the offending restore-snapshot
+            resource and validation details. No resources are deleted.
           content:
             application/json:
               schema:
@@ -4992,13 +5038,23 @@ components:
         |----------|---------|-------------|
         | `FERRUM_ADMIN_JWT_SECRET` | *(required)* | Signing key (minimum 32 characters) |
         | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
-        | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds) |
+        | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds); `0` disables the cap |
 
         Tokens must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a
-        string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER`; `exp -
-        iat` must not exceed `FERRUM_ADMIN_JWT_MAX_TTL`; `nbf` and `exp` are
-        validated. Required `role` claim values are `viewer`, `operator`, and
-        `admin`. Tokens without a valid `role` claim are rejected.
+        string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER`; `nbf`
+        and `exp` are validated. `FERRUM_ADMIN_JWT_MAX_TTL` is enforced against
+        verifier time, not just the claims, counting the accepted clock-skew
+        leeway (60 seconds) exactly once: `exp - iat` must be positive and
+        within the maximum, `iat` must not be later than verifier time plus the
+        leeway, `exp - now` must stay within the maximum plus that same leeway,
+        and `exp` must still be in the future at verifier time (no expiry
+        grace on the cap path). Effective maximum real validity is
+        `FERRUM_ADMIN_JWT_MAX_TTL + 60s`, so future-shifted timestamps cannot
+        extend a token's real lifetime. A configured value above
+        `9223372036854775807` is rejected at startup as invalid rather than
+        treated as unlimited. Required `role` claim values are `viewer`,
+        `operator`, and `admin`. Tokens without a valid `role` claim are
+        rejected.
 
     metricsBearerAuth:
       type: http
@@ -6342,10 +6398,12 @@ components:
           description: |
             Maximum allowed response amplification factor for UDP proxies.
             When set, backend→client datagrams are dropped if their size exceeds
-            `last_request_size * factor`. Protects against UDP amplification
-            attacks (e.g., spoofed-source reflection). When omitted (default),
-            no per-datagram amplification cap is applied. Only applicable for
-            `udp` / `dtls` proxies.
+            `payload_size * factor`. A zero-length request receives an explicit
+            one-byte reply allowance so it cannot black-hole the session;
+            nonempty requests retain the exact configured payload ratio. This
+            protects against UDP amplification attacks (e.g., spoofed-source
+            reflection). When omitted (default), no per-datagram amplification
+            cap is applied. Only applicable for `udp` / `dtls` proxies.
         allowed_methods:
           oneOf:
             - type: array
@@ -7071,6 +7129,7 @@ components:
               plugin_name:
                 const: correlation_id
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/CorrelationIdConfig"
@@ -8939,7 +8998,7 @@ components:
         Tiered: unauthenticated callers receive only `status` and `ready`. The
         remaining detailed fields (`timestamp`, `mode`, `database`,
         `admin_writes_enabled`, `cached_config`, `database_polling`,
-        `config_rejected`, `mesh`, `listener_failures`) are
+        `config_rejected`, `mesh`, `listener_failures`, `logging`) are
         present only when the caller is authenticated (admin JWT, metrics bearer
         token, or allowlisted CIDR).
       required: [status, ready]
@@ -9085,6 +9144,8 @@ components:
           $ref: "#/components/schemas/MeshHealthResponse"
         listener_failures:
           $ref: "#/components/schemas/ServingListenerFailureSnapshot"
+        logging:
+          $ref: "#/components/schemas/LoggingSinkSnapshot"
 
     ServingListenerFailureSnapshot:
       type: object
@@ -9506,7 +9567,7 @@ components:
 
     RuntimeLogsSnapshot:
       type: object
-      description: Ferrum project tracing event counters after applying the output log-level filter.
+      description: Ferrum project tracing event counters and bounded process-sink health/loss telemetry.
       properties:
         by_level:
           type: object
@@ -9520,6 +9581,89 @@ components:
             additionalProperties:
               type: integer
               format: uint64
+        sinks:
+          $ref: "#/components/schemas/LoggingSinkSnapshot"
+
+    LoggingSinkSnapshot:
+      type: object
+      description: >-
+        Authenticated stdout/stderr diagnostics. Stdout combines runtime
+        stdout events and stdout_logging access records because both use the
+        same bounded queue; stderr is independent.
+      required: [stdout, stderr]
+      properties:
+        stdout:
+          oneOf:
+            - $ref: "#/components/schemas/LoggingSinkState"
+            - type: "null"
+        stderr:
+          oneOf:
+            - $ref: "#/components/schemas/LoggingSinkState"
+            - type: "null"
+
+    LoggingSinkState:
+      type: object
+      required:
+        - sink
+        - healthy
+        - accepting
+        - queue_capacity_records
+        - queue_capacity_bytes
+        - max_record_bytes
+        - queued_records
+        - reserved_bytes
+        - queued_bytes
+        - accepted_records_total
+        - saturation_dropped_records_total
+        - oversized_dropped_records_total
+        - closed_dropped_records_total
+        - writer_failures_total
+        - flush_failures_total
+        - shutdown_timeouts_total
+        - shutdown_incomplete_records_total
+        - last_failure
+      properties:
+        sink: { type: string, enum: [stdout, stderr] }
+        healthy: { type: boolean }
+        accepting: { type: boolean }
+        queue_capacity_records:
+          type: integer
+          description: Hard admitted-record limit; the byte budget may limit admission first.
+        queue_capacity_bytes:
+          type: integer
+          description: Aggregate per-sink serialized-payload reservation limit for admitted records.
+        max_record_bytes:
+          type: integer
+          description: Per-record serialization limit and provisional pre-serialization reservation.
+        queued_records:
+          type: integer
+          description: Records admitted but not yet completed by the writer.
+        reserved_bytes:
+          type: integer
+          description: >-
+            Current byte reservations. A producer initially reserves
+            max_record_bytes; after serialization an exact-sized payload is
+            queued and this shrinks to the record length until write completion.
+        queued_bytes:
+          type: integer
+          description: Actual serialized bytes admitted but not yet completed by the writer.
+        accepted_records_total: { type: integer, format: uint64 }
+        saturation_dropped_records_total: { type: integer, format: uint64 }
+        oversized_dropped_records_total: { type: integer, format: uint64 }
+        closed_dropped_records_total: { type: integer, format: uint64 }
+        writer_failures_total: { type: integer, format: uint64 }
+        flush_failures_total: { type: integer, format: uint64 }
+        shutdown_timeouts_total: { type: integer, format: uint64 }
+        shutdown_incomplete_records_total: { type: integer, format: uint64 }
+        last_failure:
+          oneOf:
+            - type: object
+              required: [operation, error_kind, occurred_at]
+              properties:
+                operation: { type: string, enum: [write, flush, shutdown] }
+                error_kind: { type: string }
+                occurred_at: { type: string, format: date-time }
+            - type: "null"
 
     DatabaseDeltaPollingDegraded:
       type: object
@@ -10164,7 +10308,11 @@ components:
         cannot be introduced via `static_fields` or `derived_fields`
         (rejected at construction). This object, each `derived_fields`
         entry, and `metadata` are strict fixed shapes: unknown keys are
-        rejected with a nested path. See docs/log_schema.md.
+        rejected with a nested path.
+        HTTP summaries include the normalized terminal `grpc_status` field
+        (separate from `response_status_code`) when the request is gRPC. It
+        can be renamed, omitted, or ordered like every other native field.
+        See docs/log_schema.md.
       additionalProperties: false
       properties:
         summary_type:
@@ -10259,11 +10407,13 @@ components:
     # accepts one of these depending on the `plugin_name` value.
 
     StdoutLoggingConfig:
-      type: object
-      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to stdout through the non-blocking writer, so logging never blocks request-processing threads. Independent of FERRUM_LOG_LEVEL: enabling the plugin is the on/off switch. The optional filter (when present) runs before schema application. Mesh mode injects this plugin to honor a Telemetry CRD's accessLogging configuration."
+      type: [object, "null"]
+      additionalProperties: false
+      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to the bounded non-blocking stdout writer. Independent of FERRUM_LOG_LEVEL. Accepted keys are filter, schema, and schema_ref; null or an empty object uses defaults. The optional filter runs before schema application."
       properties:
         filter:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
           description: >-
             Optional predicate that suppresses log entries before they are
             serialized. All present fields must match for an entry to be
@@ -10286,7 +10436,13 @@ components:
             errors_only:
               type: boolean
               default: false
-              description: Skip summaries with no error_class (and no connection_error for streams).
+              description: >-
+                HTTP-family summaries require an authoritative terminal
+                failure: dispatch/error_class, body failure, incomplete body,
+                client disconnect, gateway rejection, or nonzero final
+                grpc_status. Stream summaries require error_class or
+                connection_error. Status and latency predicates remain
+                independent and must also match.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -10829,16 +10985,26 @@ components:
 
     CorrelationIdConfig:
       type: object
-      description: "Plugin: correlation_id — Generates a UUID v4 per request when missing, preserves client-supplied IDs (truncating values longer than 256 chars to a fresh UUID), and propagates the value to backends and response headers."
+      additionalProperties: false
+      description: "Plugin: correlation_id — Preserves a non-empty inbound ID only when it is at most 256 bytes and matches [A-Za-z0-9._-]+; every missing or rejected value is replaced (never truncated) with UUID v4. Multiple instances retain independent authoritative values in private typed request/session state. The first instance in priority order owns the canonical request_id, while every instance forwards and echoes only its own private value, including on successful H1/H2/H3 WebSocket handshakes. Public request_id and correlation_id.instance.* metadata are compatibility projections; later plugin writes cannot change authoritative forwarding, echo, or logged values. Effective instances on one proxy chain that overlap on any supported protocol must normalize to distinct header_name values and have distinct effective priorities; use priority_override to make canonical ownership deterministic. Disjoint protocol owners do not conflict. Admission and reload reject either overlapping ambiguous composition. Runtime admission also rejects the deployment-specific effective FERRUM_REAL_IP_HEADER value case-insensitively; that dynamic exclusion cannot be expressed by this static schema. CP/DP config sync requires every DP to advertise the same effective value as the CP before configuration is distributed. The top-level config must be an object; null fields select defaults."
       properties:
         header_name:
-          type: string
+          type: [string, "null"]
           default: x-request-id
-          description: "Header name (lowercased internally). Used for both the inbound preserved value and the outbound/echoed value. Defaults to x-request-id; common alternatives include x-correlation-id, x-trace-id."
+          minLength: 1
+          pattern: "^\\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+\\s*$"
+          not:
+            type: string
+            pattern: "^\\s*(?:[Ee][Aa][Rr][Ll][Yy]-[Dd][Aa][Tt][Aa]|[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Xx]-[Gg][Rr][Pp][Cc]-[Ww][Ee][Bb]-[Mm][Oo][Dd][Ee]|[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ii][Oo][Nn]-[Ii][Nn][Ff][Oo]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Cc][Oo][Oo][Kk][Ii][Ee]|[Ee][Xx][Pp][Ee][Cc][Tt]|[Gg][Rr][Pp][Cc]-[Mm][Ee][Ss][Ss][Aa][Gg][Ee]|[Gg][Rr][Pp][Cc]-[Ss][Tt][Aa][Tt][Uu][Ss]|[Gg][Rr][Pp][Cc]-[Ss][Tt][Aa][Tt][Uu][Ss]-[Dd][Ee][Tt][Aa][Ii][Ll][Ss]-[Bb][Ii][Nn]|[Hh][Oo][Ss][Tt]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ii][Oo][Nn]-[Ii][Nn][Ff][Oo]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Aa][Cc][Cc][Ee][Pp][Tt]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Ee][Xx][Tt][Ee][Nn][Ss][Ii][Oo][Nn][Ss]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Kk][Ee][Yy]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Pp][Rr][Oo][Tt][Oo][Cc][Oo][Ll]|[Ss][Ee][Cc]-[Ww][Ee][Bb][Ss][Oo][Cc][Kk][Ee][Tt]-[Vv][Ee][Rr][Ss][Ii][Oo][Nn]|[Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]|[Tt][Ee]|[Tt][Rr][Aa][Cc][Ee][Pp][Aa][Rr][Ee][Nn][Tt]|[Tt][Rr][Aa][Cc][Ee][Ss][Tt][Aa][Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Ww][Ww][Ww]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Xx]-[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Xx]-[Aa][Uu][Tt][Hh]-[Tt][Oo][Kk][Ee][Nn]|[Xx]-[Cc][Ss][Rr][Ff]-[Tt][Oo][Kk][Ee][Nn]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Ff][Oo][Rr]|[Xx]-[Gg][Oo][Oo][Gg]-[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Xx]-[Xx][Ss][Rr][Ff]-[Tt][Oo][Kk][Ee][Nn])\\s*$"
+          allOf:
+            - not:
+                type: string
+                pattern: "^\\s*(?:[Ee][Aa][Rr][Ll][Yy]-[Dd][Aa][Tt][Aa]|[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-[Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Xx]-[Gg][Rr][Pp][Cc]-[Ww][Ee][Bb]-[Mm][Oo][Dd][Ee]|[Tt][Rr][Aa][Cc][Ee][Pp][Aa][Rr][Ee][Nn][Tt]|[Tt][Rr][Aa][Cc][Ee][Ss][Tt][Aa][Tt][Ee]|[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]|[Vv][Ii][Aa]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Hh][Oo][Ss][Tt]|[Xx]-[Ff][Oo][Rr][Ww][Aa][Rr][Dd][Ee][Dd]-[Pp][Rr][Oo][Tt][Oo])\\s*$"
+          description: "Header name (surrounding whitespace trimmed and lowercased internally). Used for the inbound preserved value and this instance's outbound/echoed value. Protocol-managed request, forwarding, framing, connection, content-coding, W3C tracing context (traceparent and tracestate), gRPC status, WebSocket handshake, and internal marker names (including early-data, x-grpc-web-mode, and x-ferrum-original-content-encoding), plus security-sensitive credential/authentication names, are rejected case-insensitively. Runtime also rejects the effective deployment-specific FERRUM_REAL_IP_HEADER value case-insensitively; CP/DP config sync enforces one matching value across the cluster before distribution. Null selects x-request-id."
         echo_downstream:
-          type: boolean
+          type: [boolean, "null"]
           default: true
-          description: When true, the resolved correlation ID is added to client response headers (and on rejected responses too)
+          description: When true, this instance's resolved ID is added to ordinary responses, rejection responses, and successful H1 Upgrade/H2-H3 Extended CONNECT WebSocket handshakes. Null selects true.
 
     PrometheusMetricsConfig:
       type: object
@@ -15540,6 +15706,7 @@ components:
 
     ServerlessFunctionConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: serverless_function — Invokes AWS Lambda, Azure Functions, or
         Google Cloud Functions as middleware in the proxy pipeline. In
@@ -15548,7 +15715,78 @@ components:
         response is returned directly to the client (HTTP only — gRPC
         rejection normalization would drop the body, so terminate mode on
         gRPC requests is rejected with 500). Cloud credential fields fall
-        back to well-known environment variables.
+        back to well-known environment variables. Terminate mode forwards
+        applicable end-to-end response headers, preserving repeated Set-Cookie
+        and list-valued Link while requiring Location, Content-Location, and
+        Refresh to remain singleton,
+        while stripping hop-by-hop, Connection-listed, transport-managed,
+        provider-control, and credential-bearing fields. URL-valued Location,
+        Content-Location, Refresh (url= and bare URI forms after semicolon,
+        comma, or ASCII-whitespace delay separators), and every Link target are removed
+        when a relative, absolute, encoded, or nested target exposes the
+        configured signed function path/query. Duplicate singleton URL-valued
+        fields fail closed instead of being comma-folded; repeated Link lines
+        are revalidated as the exact combined list returned downstream.
+        Complete signed paths match at
+        slash-delimited segment boundaries even with added prefix or descendant
+        segments, not inside arbitrary substrings. The complete slash-trimmed
+        signed path is also protected when copied exactly into either side of a
+        decoded query pair; longer scalar lookalikes remain observable. Both
+        non-empty components of every configured query pair are protected
+        credential scalars: a key
+        remains protected whether it is key-only (`?SIGNED_TOKEN=`) or paired
+        with a value (`?SIGNED_TOKEN=1`), and a non-empty value is protected
+        independently. Exact ASCII-case-insensitive URI scheme copies are also
+        governed. Leading and trailing slashes remain part of each scalar;
+        a slash-only scalar remains protected and makes ambiguous URL-path
+        surfaces fail closed. Each scalar remains protected if copied into
+        either side of another query pair or into decoded paths at URI-component
+        boundaries (including path-parameter/query delimiters), and decoded fragments are checked
+        directly at URI-component boundaries even when they are scalar rather
+        than URI-shaped. Query comparison
+        percent-decodes generic URI components but preserves literal `+` characters
+        instead of applying form-data space conversion. Inspection checks
+        explicit numeric authority ports before normalization can erase default
+        ports, and is bounded to 16 KiB per field, 32 Link targets, 32 embedded
+        path URI references, eight percent-decoding transforms, and two nested
+        URI-reference hops. URI userinfo, residual
+        encoding, malformed target syntax, malformed percent triplets,
+        percent-decoded non-UTF-8 bytes, budget overflow, or another structural
+        URI reference at the nesting boundary fails closed even for root
+        function destinations, while unrelated URL targets, non-URL
+        Refresh directives, quoted Link parameters, and scalar labels without
+        signed components remain observable.
+        Later body rewrites invalidate ranges, validators, integrity metadata,
+        and content-bound signatures while unmodified responses retain them;
+        206 Partial Content and 226 IM Used responses skip rewriting to preserve
+        range and delta semantics; transform-dependent header hooks also decline
+        them rather than relabelling untouched bytes. Inspection still runs,
+        and enforcing
+        redaction-dependent plugins reject governed content when those bytes
+        cannot be safely rewritten.
+        Proven pre-invocation payload-validation, unsupported-gRPC, DNS-policy,
+        and literal-IP-policy rejections release every acquired deduplication
+        owner after commit. Real remote 502 responses remain application
+        responses; uncertain post-invocation failures retain their protection.
+        Deduplicated terminal replays preserve the final status/body but use
+        sanitized headers: session/authentication fields, Retry-After,
+        trace/correlation fields, and rate-limit counters are not replayed. The
+        stored body is already finalized and bypasses ordinary presentation
+        transforms on replay while remaining subject to response inspection and
+        final-body validation. A current-policy redaction decision runs only its
+        required transform and fails closed with 502 if rewriting cannot
+        complete.
+        If request_deduplication is attached, every same-protocol instance must
+        have a strictly lower effective priority than terminate mode; candidate
+        admission rejects equal or reversed ordering before persistence. This
+        candidate check derives static serverless capabilities without resolving
+        CP-local cloud credentials; runtime construction still validates the
+        node-local credentials and environment fail closed.
+        HEAD/204/205/304 bodies are empty. Automatic redirects are disabled;
+        pre_proxy accepts only 2xx as approval, while terminate may
+        intentionally return only final 2xx-5xx statuses (200-599).
+        Informational and out-of-range three-digit function statuses follow the
+        configured error path.
       required:
         - provider
       properties:
@@ -15566,8 +15804,8 @@ components:
         function_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#\\s]+"
-          description: "HTTP(S) trigger URL. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied."
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^@/?#\\s]+(?:[/?][^#\\s]*)?$"
+          description: "HTTP(S) trigger URL without URL userinfo or a fragment. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied. Path/query credentials are structurally redacted from diagnostics and non-admin/audit projections."
         aws_region:
           type: string
           description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars."
@@ -15589,10 +15827,11 @@ components:
         aws_endpoint_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#\\s]+"
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^@/?#\\s]+/?$"
           description: >-
             Optional HTTP(S) Lambda endpoint override for LocalStack or a
-            VPC-internal endpoint. Falls back to `AWS_LAMBDA_ENDPOINT_URL`.
+            VPC-internal endpoint. Must be an origin without userinfo, path,
+            query, or fragment. Falls back to `AWS_LAMBDA_ENDPOINT_URL`.
         azure_function_key:
           type: string
           description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var."
@@ -15602,7 +15841,7 @@ components:
         forward_body:
           type: boolean
           default: false
-          description: "Include request body in function payload (forces request-body buffering for JSON POST requests)."
+          description: "Include one authoritative lossless request-body representation in the function payload for every HTTP method. Ferrum never parses JSON into a structured value: exact UTF-8 bytes are carried as a string with body_encoding=utf8, arbitrary bytes are base64 with body_encoding=base64, and the active hook Content-Type is carried separately as body_content_type. The plugin buffers before invocation and fails closed if bytes are unavailable or the active request headers use a non-identity Content-Encoding. Candidate admission and runtime cache construction reject combination with a request-body transformer on the same protocol chain."
         forward_headers:
           type: array
           items:
@@ -15611,7 +15850,7 @@ components:
         forward_query_params:
           type: boolean
           default: false
-          description: "Include query parameters in function payload."
+          description: "Include decoded query parameters in the function payload after omitting credentials that an earlier auth plugin marked for backend stripping. Duplicate decoded names, invalid percent-encoded UTF-8, raw '+' ambiguity, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
         timeout_ms:
           type: integer
           format: uint64
@@ -15632,10 +15871,10 @@ components:
         error_status_code:
           type: integer
           format: uint16
-          minimum: 100
+          minimum: 400
           maximum: 599
           default: 502
-          description: "HTTP status when rejecting on error. Must be in range 100-599."
+          description: "Final HTTP error status when rejecting an invocation or pre_proxy non-2xx response. Must be in range 400-599."
       allOf:
         - if:
             required: [provider]
@@ -16584,12 +16823,18 @@ components:
 
     AiTokenMetricsConfig:
       type: object
-      description: "Plugin: ai_token_metrics — Extracts token usage from LLM response bodies."
+      additionalProperties: false
+      description: >-
+        Plugin: ai_token_metrics — Extracts token usage from HTTP JSON/SSE LLM
+        response bodies. Native gRPC protobuf messages are unsupported and the
+        plugin is not registered for the Grpc protocol view. Unknown keys are
+        rejected.
       properties:
         provider:
           type: string
           default: auto
-          description: "LLM provider format (auto, openai, anthropic, google, cohere, mistral, bedrock)"
+          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock]
+          description: "Exact lowercase LLM provider format; surrounding whitespace and alternate casing are rejected"
         include_model:
           type: boolean
           default: true
@@ -16601,6 +16846,9 @@ components:
         metadata_prefix:
           type: string
           default: ai
+          minLength: 1
+          maxLength: 64
+          pattern: '^[A-Za-z0-9_.-]+$'
           description: Prefix for metadata keys
         buffer_streaming_responses:
           type: boolean
@@ -16609,11 +16857,15 @@ components:
         cost_per_prompt_token:
           type: number
           format: double
-          description: Calculate estimated cost per request (prompt tokens)
+          minimum: 0
+          maximum: 18446744073709.55
+          description: Calculate estimated cost per request from prompt tokens; maximum 18446744073709.55
         cost_per_completion_token:
           type: number
           format: double
-          description: Calculate estimated cost per request (completion tokens)
+          minimum: 0
+          maximum: 18446744073709.55
+          description: Calculate estimated cost per request from completion tokens; maximum 18446744073709.55
 
     AiRequestGuardConfig:
       type: object
@@ -16908,7 +17160,7 @@ components:
           minLength: 1
           maxLength: 64
           pattern: '^[A-Za-z0-9_-]+$'
-          description: "Optional marker name. Text wrapped in <TAG>...</TAG> is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Nested spans are flattened while preserving their text; unmatched and JSON-escaped markers are stripped deterministically from every admitted request family even when statistical compression is skipped. Name may contain at most 64 ASCII letters, digits, '-', and '_'."
+          description: "Optional marker name. Text wrapped in <TAG>...</TAG> in JSON string values is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Preserve-marker sanitation applies only to string values: object member-name bytes are preserved and names are never sanitized, including marker-shaped or escaped content. Nested spans are flattened while preserving their text; unmatched and JSON-escaped markers in values are stripped deterministically from every admitted request family even when statistical compression is skipped. Name may contain at most 64 ASCII letters, digits, '-', and '_'."
         request_family:
           type: string
           enum: [auto, chat_completions, text_completions]
@@ -18423,7 +18675,7 @@ components:
 
     RequestDeduplicationConfig:
       type: object
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed ai_federation provider call publishes a small non-replayable 409 tombstone so an identical idempotency-key retry cannot repeat the billable external operation or double-apply response transforms; this provenance contract does not yet cover other externally executed synthetic plugins. Completed response retention is bounded by per-entry and exact local total byte limits; ordinary size-skipped responses return normally and are not retained. If a federation tombstone cannot fit, in-flight ownership remains until inflight_ttl_seconds rather than failing open immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and are not backward-compatible with pre-fingerprint values. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
       properties:
         header_name:
           type: string
@@ -18446,7 +18698,7 @@ components:
           type: integer
           minimum: 1
           default: 10000
-          description: Maximum number of tracked local deduplication entries. Active in-flight entries count but are not evicted while live.
+          description: Maximum number of tracked local deduplication entries. Active in-flight entries and fail-closed terminal tombstones count but are not evicted while live, so security state may temporarily exceed the cap.
         max_entry_size_bytes:
           type: integer
           minimum: 1
@@ -18508,26 +18760,57 @@ components:
 
     GeoRestrictionConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: geo_restriction — country-level access control backed by a
-        MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is mmap'd at
-        construction time for zero-copy lookups; the file dependency is
-        validated per-mode (fatal in file mode, warn in db mode, skipped on
-        the data plane so a missing file degrades to `on_lookup_failure`
-        instead of rejecting the whole config). `allow_countries` and
-        `deny_countries` are mutually exclusive; at least one must be
-        non-empty. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
+        MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is fully verified
+        and loaded into bounded owned immutable memory at construction. Files
+        larger than 512 MiB, aggregate verified MMDB content above 512 MiB per
+        validation generation/cache build, and records containing unsupported
+        country codes are rejected before publication. File dependency
+        validation is fatal in file mode and warns for absent/unreadable files
+        in database mode. CP performs structure-only validation without opening
+        node-local files; DP validates and refreshes its node-local files for
+        full snapshots and affected incremental rebuilds. On runtime nodes that
+        construct the plugin, a missing file uses
+        `on_lookup_failure`, while a readable corrupt, incompatible, or
+        wrong-product database is rejected.
+        Exactly one of `allow_countries` and `deny_countries` must be non-empty.
+        Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
       required: [db_path]
+      oneOf:
+        - title: Allow-list mode
+          required: [allow_countries]
+          properties:
+            allow_countries:
+              minItems: 1
+            deny_countries:
+              maxItems: 0
+        - title: Deny-list mode
+          required: [deny_countries]
+          properties:
+            allow_countries:
+              maxItems: 0
+            deny_countries:
+              minItems: 1
       properties:
         db_path:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: >-
-            Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database.
-            Required.
+            Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database no
+            larger than 512 MiB. Across one validation generation/cache build,
+            the verified sizes of all distinct content snapshots must also total
+            no more than 512 MiB; equivalent path spellings with identical
+            verified content are charged once. A changed candidate overlaps the live snapshot;
+            when their combined size exceeds 512 MiB, hot replacement is
+            rejected and the installed database must be loaded by restarting
+            the gateway. Required.
         allow_countries:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/GeoRestrictionCountryCode"
           default: []
           description: >-
             ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
@@ -18536,7 +18819,7 @@ components:
         deny_countries:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/GeoRestrictionCountryCode"
           default: []
           description: >-
             ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
@@ -18548,7 +18831,12 @@ components:
           description: >-
             When true, inject the resolved country code into the proxied
             request as the `x-geo-country` header (uppercase ISO 3166-1
-            alpha-2). HTTP-family proxies only — ignored on TCP/UDP streams.
+            alpha-2). Central header materialization strips any client-supplied
+            value even when no geo plugin is attached. The header remains
+            absent on fail-open lookup paths unless an earlier geo instance
+            already emitted an authoritative value; later non-injecting
+            instances preserve that value. HTTP-family proxies only — ignored
+            on TCP/UDP streams.
         on_lookup_failure:
           type: string
           enum: [allow, deny]
@@ -18562,6 +18850,17 @@ components:
             disables the geo gate. Set this explicitly to `deny` for fail-closed
             behaviour. When the default is used, a one-time warning is logged at
             startup, and the first request-time fail-open is logged at warn.
+
+    GeoRestrictionCountryCode:
+      type: string
+      minLength: 2
+      maxLength: 2
+      pattern: '^(?:[Aa][DdEeFfGgIiLlMmOoQqRrSsTtUuWwXxZz]|[Bb][AaBbDdEeFfGgHhIiJjLlMmNnOoQqRrSsTtVvWwYyZz]|[Cc][AaCcDdFfGgHhIiKkLlMmNnOoRrUuVvWwXxYyZz]|[Dd][EeJjKkMmOoZz]|[Ee][CcEeGgHhRrSsTt]|[Ff][IiJjKkMmOoRr]|[Gg][AaBbDdEeFfGgHhIiLlMmNnPpQqRrSsTtUuWwYy]|[Hh][KkMmNnRrTtUu]|[Ii][DdEeLlMmNnOoQqRrSsTt]|[Jj][EeMmOoPp]|[Kk][EeGgHhIiMmNnPpRrWwYyZz]|[Ll][AaBbCcIiKkRrSsTtUuVvYy]|[Mm][AaCcDdEeFfGgHhKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz]|[Nn][AaCcEeFfGgIiLlOoPpRrUuZz]|[Oo][Mm]|[Pp][AaEeFfGgHhKkLlMmNnRrSsTtWwYy]|[Qq][Aa]|[Rr][EeOoSsUuWw]|[Ss][AaBbCcDdEeGgHhIiJjKkLlMmNnOoRrSsTtVvXxYyZz]|[Tt][CcDdFfGgHhJjKkLlMmNnOoRrTtVvWwZz]|[Uu][AaGgMmSsYyZz]|[Vv][AaCcEeGgIiNnUu]|[Ww][FfSs]|[Xx][Kk]|[Yy][EeTt]|[Zz][AaMmWw])$'
+      description: >-
+        A currently assigned ISO 3166-1 alpha-2 country code, or XK (the
+        user-assigned Kosovo code emitted by MaxMind). Matching is
+        case-insensitive and runtime storage is normalized to uppercase. Other
+        reserved, user-assigned, deleted, and alias codes are rejected.
 
     RateSpec:
       type: object
@@ -19065,8 +19364,9 @@ components:
         or database cross-checks (e.g., duplicate `listen_path`, invalid plugin
         config). For DELETE, removing the spec-owned and cascaded resources
         would leave an invalid transaction-log schema graph or TCP-throttle
-        plugin composition. An authoritative in-transaction rejection may omit
-        `spec_version` and the failure `id`.
+        plugin composition, or the compensation snapshot contains an
+        unrestorable resource. An authoritative in-transaction rejection may
+        omit `spec_version` and the failure `id`.
       properties:
         error:
           type: string
@@ -19082,8 +19382,8 @@ components:
             properties:
               resource_type:
                 type: string
-                enum: [proxy, upstream, plugin, plugin_composition, plugin_graph]
-                description: Kind of resource or aggregate plugin composition that failed
+                enum: [proxy, upstream, upstream_graph, plugin, plugin_composition, plugin_graph, restore_snapshot]
+                description: Kind of resource, upstream/plugin graph, or pre-delete restore snapshot that failed
               id:
                 type: string
                 description: ID of the resource (from the extension object)

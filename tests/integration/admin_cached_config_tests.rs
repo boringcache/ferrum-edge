@@ -330,6 +330,7 @@ async fn test_list_proxies_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -385,6 +386,7 @@ async fn test_list_consumers_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -435,6 +437,7 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -487,6 +490,7 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -534,6 +538,7 @@ async fn test_get_proxy_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -579,6 +584,7 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -626,6 +632,7 @@ async fn test_get_consumer_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -671,6 +678,7 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -719,6 +727,7 @@ async fn test_get_plugin_config_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -764,6 +773,7 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -812,6 +822,7 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -860,6 +871,7 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -912,6 +924,7 @@ async fn test_health_endpoint_shows_cached_config_info() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -970,6 +983,7 @@ async fn test_health_endpoint_shows_no_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -1025,6 +1039,7 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -1088,6 +1103,7 @@ async fn test_cached_config_reflects_live_updates() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -1200,6 +1216,7 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -1433,6 +1450,7 @@ fn db_admin_state(
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -1785,6 +1803,7 @@ async fn create_db_admin_state_with_availability(
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -2153,6 +2172,183 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[tokio::test]
+async fn test_admin_create_rejects_malformed_correlation_id_configs() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (id, config, expected_error) in [
+        (
+            "correlation-non-object",
+            json!([]),
+            "correlation_id: config must be a JSON object",
+        ),
+        (
+            "correlation-unknown-key",
+            json!({"echo_downsteam": false}),
+            "correlation_id: unknown config field(s): echo_downsteam",
+        ),
+        (
+            "correlation-managed-header",
+            json!({"header_name": "Content-Length"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+        (
+            "correlation-internal-grpc-web-marker",
+            json!({"header_name": "X-Grpc-Web-Mode"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+        (
+            "correlation-internal-compression-marker",
+            json!({"header_name": "X-Ferrum-Original-Content-Encoding"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+        (
+            "correlation-early-data-marker",
+            json!({"header_name": "Early-Data"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+        (
+            "correlation-traceparent",
+            json!({"header_name": "Traceparent"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+        (
+            "correlation-tracestate",
+            json!({"header_name": "Tracestate"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+        (
+            "correlation-credential-header",
+            json!({"header_name": "Authorization"}),
+            "correlation_id: 'header_name' is protocol-managed or security-sensitive",
+        ),
+    ] {
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "correlation_id",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+        assert_eq!(
+            status, 400,
+            "malformed correlation config was admitted: {body}"
+        );
+        assert!(
+            body.to_string().contains(expected_error),
+            "unexpected admin validation response: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn batch_admission_rejects_duplicate_effective_correlation_headers() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let candidate = json!({
+        "proxies": [{
+            "id": "duplicate-correlation-proxy",
+            "listen_path": "/duplicate-correlation",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "duplicate-correlation-first"},
+                {"plugin_config_id": "duplicate-correlation-second"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "duplicate-correlation-first",
+                "plugin_name": "correlation_id",
+                "scope": "proxy",
+                "proxy_id": "duplicate-correlation-proxy",
+                "enabled": true,
+                "config": {}
+            },
+            {
+                "id": "duplicate-correlation-second",
+                "plugin_name": "correlation_id",
+                "scope": "proxy",
+                "proxy_id": "duplicate-correlation-proxy",
+                "enabled": true,
+                "priority_override": 75,
+                "config": {"header_name": " X-Request-ID "}
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &candidate).await;
+
+    assert_eq!(
+        status, 400,
+        "duplicate correlation writers were admitted: {body}"
+    );
+    assert!(
+        body.to_string().contains("duplicate effective header_name"),
+        "unexpected duplicate-correlation admission response: {body}"
+    );
+}
+
+#[tokio::test]
+async fn batch_admission_rejects_equal_effective_correlation_priorities() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let candidate = json!({
+        "proxies": [{
+            "id": "equal-correlation-priority-proxy",
+            "listen_path": "/equal-correlation-priority",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "equal-correlation-priority-first"},
+                {"plugin_config_id": "equal-correlation-priority-second"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "equal-correlation-priority-first",
+                "plugin_name": "correlation_id",
+                "scope": "proxy",
+                "proxy_id": "equal-correlation-priority-proxy",
+                "enabled": true,
+                "config": {"header_name": "x-internal-request-id"}
+            },
+            {
+                "id": "equal-correlation-priority-second",
+                "plugin_name": "correlation_id",
+                "scope": "proxy",
+                "proxy_id": "equal-correlation-priority-proxy",
+                "enabled": true,
+                "config": {"header_name": "x-external-request-id"}
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &candidate).await;
+
+    assert_eq!(
+        status, 400,
+        "equal correlation priorities were admitted: {body}"
+    );
+    assert!(
+        body.to_string().contains("duplicate effective priority 50"),
+        "unexpected correlation-priority admission response: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
@@ -2278,6 +2474,7 @@ async fn test_batch_create_read_only_rejected() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -2684,6 +2881,212 @@ async fn admin_rejects_custom_request_body_transformer_beside_hmac() {
     assert!(
         body.to_string().contains("example_plugin"),
         "composition error must identify the custom transformer: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn admin_rejects_custom_only_correlation_collision_before_persistence() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let batch = json!({
+        "proxies": [{
+            "id": "custom-correlation-proxy",
+            "listen_path": "/custom-correlation",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "custom-correlation-first"},
+                {"plugin_config_id": "custom-correlation-second"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "custom-correlation-first",
+                "plugin_name": "example_plugin",
+                "scope": "proxy",
+                "proxy_id": "custom-correlation-proxy",
+                "enabled": true,
+                "config": {"correlation_header_name": "x-custom-correlation-id"}
+            },
+            {
+                "id": "custom-correlation-second",
+                "plugin_name": "example_plugin",
+                "scope": "proxy",
+                "proxy_id": "custom-correlation-proxy",
+                "enabled": true,
+                "priority_override": 5001,
+                "config": {"correlation_header_name": " X-Custom-Correlation-ID "}
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+
+    assert_eq!(
+        status, 400,
+        "custom correlation collision was admitted: {body:?}"
+    );
+    assert!(
+        body["validation_errors"].as_array().is_some_and(|errors| {
+            errors.iter().filter_map(Value::as_str).any(|error| {
+                error.contains("duplicate effective header_name \"x-custom-correlation-id\"")
+            })
+        }),
+        "unexpected custom correlation admission response: {body:?}"
+    );
+    for id in ["custom-correlation-first", "custom-correlation-second"] {
+        let (status, _, _) = admin_get(&base_url, &format!("/plugins/config/{id}"), &token).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::NOT_FOUND,
+            "rejected custom correlation config {id} was persisted"
+        );
+    }
+    let (status, _, _) = admin_get(&base_url, "/proxies/custom-correlation-proxy", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "rejected custom correlation proxy was persisted"
+    );
+}
+
+#[tokio::test]
+async fn admin_rejects_reserved_custom_correlation_claim_before_persistence() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let batch = json!({
+        "proxies": [{
+            "id": "reserved-custom-correlation-proxy",
+            "listen_path": "/reserved-custom-correlation",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [{"plugin_config_id": "reserved-custom-correlation"}]
+        }],
+        "plugin_configs": [{
+            "id": "reserved-custom-correlation",
+            "plugin_name": "example_plugin",
+            "scope": "proxy",
+            "proxy_id": "reserved-custom-correlation-proxy",
+            "enabled": true,
+            "config": {"correlation_header_name": " AuThOrIzAtIoN "}
+        }]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+
+    assert_eq!(status, 400, "reserved custom claim was admitted: {body:?}");
+    assert!(
+        body["validation_errors"].as_array().is_some_and(|errors| {
+            errors.iter().filter_map(Value::as_str).any(|error| {
+                error.contains("effective header_name \"authorization\"")
+                    && error.contains("plugin \"example_plugin\"")
+                    && error.contains("protocol Http")
+                    && error.contains("reserved")
+            })
+        }),
+        "unexpected reserved custom correlation admission response: {body:?}"
+    );
+    let (status, _, _) = admin_get(
+        &base_url,
+        "/plugins/config/reserved-custom-correlation",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "rejected reserved custom correlation config was persisted"
+    );
+    let (status, _, _) = admin_get(
+        &base_url,
+        "/proxies/reserved-custom-correlation-proxy",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "rejected reserved custom correlation proxy was persisted"
+    );
+}
+
+#[tokio::test]
+async fn admin_allows_custom_correlation_owners_on_disjoint_protocols() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let batch = json!({
+        "proxies": [{
+            "id": "disjoint-correlation-proxy",
+            "listen_path": "/disjoint-correlation",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "disjoint-correlation-http"},
+                {"plugin_config_id": "disjoint-correlation-tcp"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "disjoint-correlation-http",
+                "plugin_name": "example_plugin",
+                "scope": "proxy",
+                "proxy_id": "disjoint-correlation-proxy",
+                "enabled": true,
+                "config": {"correlation_header_name": "x-custom-correlation-id"}
+            },
+            {
+                "id": "disjoint-correlation-tcp",
+                "plugin_name": "example_plugin",
+                "scope": "proxy",
+                "proxy_id": "disjoint-correlation-proxy",
+                "enabled": true,
+                "config": {
+                    "correlation_header_name": " X-Custom-Correlation-ID ",
+                    "protocol": "tcp"
+                }
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(
+        status, 201,
+        "disjoint custom correlation owners were rejected: {body:?}"
+    );
+    for id in ["disjoint-correlation-http", "disjoint-correlation-tcp"] {
+        let (status, _, _) = admin_get(&base_url, &format!("/plugins/config/{id}"), &token).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "admitted custom correlation config {id} was not persisted"
+        );
+    }
+    let (status, _, _) = admin_get(&base_url, "/proxies/disjoint-correlation-proxy", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "admitted custom correlation proxy was not persisted"
     );
 }
 
@@ -3781,6 +4184,7 @@ async fn test_restore_read_only_rejected() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -3962,6 +4366,7 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4017,6 +4422,7 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4064,6 +4470,7 @@ async fn test_get_upstream_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4107,6 +4514,7 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4155,6 +4563,7 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4728,6 +5137,7 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4780,6 +5190,7 @@ async fn test_backup_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4831,6 +5242,7 @@ async fn test_create_proxy_returns_503_when_no_db() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4879,6 +5291,7 @@ async fn test_create_upstream_returns_503_when_no_db() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -4973,6 +5386,7 @@ async fn test_cached_config_reflects_upstream_updates() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -5516,6 +5930,7 @@ async fn test_health_endpoint_shows_db_availability() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -5688,6 +6103,7 @@ async fn test_cluster_endpoint_requires_auth() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,
@@ -5735,6 +6151,7 @@ async fn test_cluster_endpoint_cp_mode_empty_registry() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: Some(registry),
         mesh_registry: None,
         cp_connection_state: None,
@@ -5797,6 +6214,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: Some(registry),
         mesh_registry: None,
         cp_connection_state: None,
@@ -5863,6 +6281,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_mesh_nodes() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: Some(registry),
         cp_connection_state: None,
@@ -5924,6 +6343,7 @@ async fn test_cluster_endpoint_dp_mode_connected() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: Some(conn_state),
@@ -5973,6 +6393,7 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: Some(conn_state),
@@ -6018,6 +6439,7 @@ async fn test_cluster_endpoint_database_mode() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         dp_registry: None,
         mesh_registry: None,
         cp_connection_state: None,

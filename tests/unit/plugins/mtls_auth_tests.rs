@@ -374,28 +374,17 @@ fn create_stream_ctx_with_cert(
     cert_der: Vec<u8>,
     consumers: Vec<Consumer>,
 ) -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "tcp-proxy".to_string(),
-        proxy_name: Some("TCP Proxy".to_string()),
-        listen_port: 5432,
-        backend_scheme: ferrum_edge::config::types::BackendScheme::Tcp,
-        consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: Some(Arc::new(cert_der)),
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    let mut ctx = StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "tcp-proxy".to_string(),
+        Some("TCP Proxy".to_string()),
+        5432,
+        ferrum_edge::config::types::BackendScheme::Tcp,
+        Arc::new(ConsumerIndex::new(&consumers)),
+    );
+    ctx.tls_client_cert_der = Some(Arc::new(cert_der));
+    ctx
 }
 
 // --- Basic auth flow tests ---
@@ -1565,53 +1554,29 @@ fn create_udp_stream_ctx_with_cert(
     cert_der: Vec<u8>,
     consumers: Vec<Consumer>,
 ) -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "udp-proxy".to_string(),
-        proxy_name: Some("UDP Proxy".to_string()),
-        listen_port: 5353,
-        backend_scheme: ferrum_edge::config::types::BackendScheme::Dtls,
-        consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: Some(Arc::new(cert_der)),
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    let mut ctx = StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "udp-proxy".to_string(),
+        Some("UDP Proxy".to_string()),
+        5353,
+        ferrum_edge::config::types::BackendScheme::Dtls,
+        Arc::new(ConsumerIndex::new(&consumers)),
+    );
+    ctx.tls_client_cert_der = Some(Arc::new(cert_der));
+    ctx
 }
 
 fn create_udp_stream_ctx_no_cert(consumers: Vec<Consumer>) -> StreamConnectionContext {
-    StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "udp-proxy".to_string(),
-        proxy_name: Some("UDP Proxy".to_string()),
-        listen_port: 5353,
-        backend_scheme: ferrum_edge::config::types::BackendScheme::Udp,
-        consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    }
+    StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "udp-proxy".to_string(),
+        Some("UDP Proxy".to_string()),
+        5353,
+        ferrum_edge::config::types::BackendScheme::Udp,
+        Arc::new(ConsumerIndex::new(&consumers)),
+    )
 }
 
 #[tokio::test]
@@ -1658,30 +1623,18 @@ async fn test_mtls_auth_dtls_with_allowed_issuer() {
         "allowed_issuers": [issuer_filter(&ca_der, Some("Test CA"), Some("TestOrg"), None)]
     }))
     .unwrap();
-    let mut ctx = StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "udp-proxy".to_string(),
-        proxy_name: Some("UDP Proxy".to_string()),
-        listen_port: 5353,
-        backend_scheme: ferrum_edge::config::types::BackendScheme::Dtls,
-        consumer_index: Arc::new(ConsumerIndex::new(&[consumer])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: Some(Arc::new(client_der)),
-        // The DTLS implementation exposes the leaf only. The configured CA pin
-        // still verifies the leaf signature without requiring the root in-chain.
-        tls_client_cert_chain_der: None,
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    let mut ctx = StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "udp-proxy".to_string(),
+        Some("UDP Proxy".to_string()),
+        5353,
+        ferrum_edge::config::types::BackendScheme::Dtls,
+        Arc::new(ConsumerIndex::new(&[consumer])),
+    );
+    ctx.tls_client_cert_der = Some(Arc::new(client_der));
+    // The DTLS implementation exposes the leaf only. The configured CA pin
+    // still verifies the leaf signature without requiring the root in-chain.
 
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert_continue(result);
@@ -1699,28 +1652,17 @@ async fn test_mtls_auth_dtls_allowed_issuer_rejects_mismatch() {
         "allowed_issuers": [issuer_filter(&other_ca_der, Some("Other CA"), None, None)]
     }))
     .unwrap();
-    let mut ctx = StreamConnectionContext {
-        client_ip: "127.0.0.1".to_string(),
-        direct_client_ip: "127.0.0.1".to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: "udp-proxy".to_string(),
-        proxy_name: Some("UDP Proxy".to_string()),
-        listen_port: 5353,
-        backend_scheme: ferrum_edge::config::types::BackendScheme::Dtls,
-        consumer_index: Arc::new(ConsumerIndex::new(&[consumer])),
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: Some(Arc::new(client_der)),
-        tls_client_cert_chain_der: Some(Arc::new(vec![ca_der])),
-        sni_hostname: None,
-        mesh_direction: None,
-        node_waypoint_policy_scope: None,
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    let mut ctx = StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "udp-proxy".to_string(),
+        Some("UDP Proxy".to_string()),
+        5353,
+        ferrum_edge::config::types::BackendScheme::Dtls,
+        Arc::new(ConsumerIndex::new(&[consumer])),
+    );
+    ctx.tls_client_cert_der = Some(Arc::new(client_der));
+    ctx.tls_client_cert_chain_der = Some(Arc::new(vec![ca_der]));
 
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert_reject(result, Some(403));

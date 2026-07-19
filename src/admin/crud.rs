@@ -19,8 +19,9 @@ use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
     PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_admission_unavailable,
-    is_mtls_dns_identity_conflict, mark_mtls_dns_admission_unavailable,
-    tcp_connection_throttle_attachment_conflict,
+    is_mtls_dns_identity_conflict, mark_mtls_dns_admission_unavailable, mtls_dns_identity_conflict,
+    tcp_connection_throttle_attachment_conflict, validate_api_spec_proxy_plugin_association,
+    validate_api_spec_restore_inputs,
 };
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
@@ -71,8 +72,25 @@ pub(crate) enum InterveningWriteRecovery {
 
 pub(crate) struct ApiSpecDeleteSnapshot {
     spec: crate::config::types::ApiSpec,
-    upstreams: Vec<Upstream>,
+    upstream: Option<Upstream>,
     plugins: Vec<PluginConfig>,
+    additional_upstreams: Vec<Upstream>,
+    additional_plugins: Vec<PluginConfig>,
+}
+
+#[derive(Debug)]
+struct ApiSpecRestoreSnapshotValidation(String);
+
+impl std::fmt::Display for ApiSpecRestoreSnapshotValidation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ApiSpecRestoreSnapshotValidation {}
+
+fn api_spec_restore_snapshot_validation(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ApiSpecRestoreSnapshotValidation(message.into()))
 }
 
 #[derive(Clone, Copy)]
@@ -173,7 +191,7 @@ fn validate_candidate_plugin_graph(
     candidate: &GatewayConfig,
     http_client: &crate::plugins::PluginHttpClient,
 ) -> Result<(), AfterValidateError> {
-    crate::plugin_cache::validate_hmac_request_transform_candidate(candidate, http_client)
+    crate::plugin_cache::validate_plugin_composition_candidate(candidate, http_client)
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))?;
     crate::plugin_cache::validate_tcp_connection_throttle_attachments(candidate)
         .map_err(AfterValidateError::BadRequest)
@@ -324,11 +342,9 @@ impl Drop for NamespaceConfigAdmissionGuard {
                 .await
                 {
                     Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            namespace = %namespace,
-                            %error,
-                            "Failed to release namespace config admission lease; expiry will recover it"
+                    Ok(Err(_error)) => {
+                        super::warn_persistence_failure_redacted(
+                            "namespace_admission_lease_release",
                         );
                     }
                     Err(_) => {
@@ -357,11 +373,9 @@ async fn release_namespace_config_admission_claim(
     .await
     {
         Ok(Ok(_)) => {}
-        Ok(Err(error)) => tracing::warn!(
-            %namespace,
-            %error,
-            "Failed to release {context}; expiry will recover it"
-        ),
+        Ok(Err(_error)) => {
+            super::warn_persistence_failure_redacted("namespace_admission_claim_release");
+        }
         Err(_) => tracing::warn!(
             %namespace,
             "Timed out releasing {context}; expiry will recover it"
@@ -515,21 +529,17 @@ pub(crate) async fn lock_namespace_config_admission(
                         );
                         return;
                     }
-                    Err(error) => {
+                    Err(_error) => {
                         if Instant::now() + CONFIG_ADMISSION_LEASE_RETRY_INTERVAL >= valid_until {
                             renew_valid.store(false, Ordering::Release);
                             let _ = lease_state_tx.send(0);
-                            tracing::error!(
-                                namespace = %renew_namespace,
-                                %error,
-                                "Namespace config admission lease expired after renewal failures"
+                            super::error_persistence_failure_redacted(
+                                "namespace_admission_lease_renewal_expired",
                             );
                             return;
                         }
-                        tracing::debug!(
-                            namespace = %renew_namespace,
-                            %error,
-                            "Namespace config admission lease renewal failed; retrying before expiry"
+                        super::debug_persistence_failure_redacted(
+                            "namespace_admission_lease_renewal_retry",
                         );
                         tokio::select! {
                             changed = stop_rx.changed() => {
@@ -711,6 +721,7 @@ async fn recover_late_resource_write<R: AdminResource>(
                         recovery
                             .delete_snapshots
                             .and_then(|snapshots| snapshots.api_spec),
+                        http_client,
                     )
                     .await?;
                 }
@@ -757,7 +768,7 @@ async fn persist_create_to_settlement<R: AdminResource>(
         .await
     {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
             Ok(()) => {
                 let lost_generation = guard
                     .as_ref()
@@ -780,11 +791,11 @@ async fn persist_create_to_settlement<R: AdminResource>(
                 {
                     Ok(true) => Ok(()),
                     Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                        "namespace config admission was lost during create; the late write was compensated: {error}"
+                        "namespace config admission was lost during create; the late write was compensated"
                     ))),
-                    Err(recovery_error) => {
+                    Err(_recovery_error) => {
                         Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                            "namespace config admission was lost during create and recovery failed: {recovery_error}; original error: {error}"
+                            "namespace config admission was lost during create and recovery failed"
                         )))
                     }
                 }
@@ -827,7 +838,7 @@ async fn persist_update_to_settlement<R: AdminResource>(
         .await
     {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
             Ok(false) => Ok(false),
             Ok(true) => {
                 let lost_generation = guard
@@ -851,11 +862,11 @@ async fn persist_update_to_settlement<R: AdminResource>(
                 {
                     Ok(true) => Ok(true),
                     Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                        "namespace config admission was lost during update; the late write was compensated: {error}"
+                        "namespace config admission was lost during update; the late write was compensated"
                     ))),
-                    Err(recovery_error) => {
+                    Err(_recovery_error) => {
                         Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                            "namespace config admission was lost during update and recovery failed: {recovery_error}; original error: {error}"
+                            "namespace config admission was lost during update and recovery failed"
                         )))
                     }
                 }
@@ -900,7 +911,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
     .await
     {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
             Ok(false) => Ok(false),
             Ok(true) => {
                 let lost_generation = guard
@@ -929,11 +940,11 @@ async fn persist_delete_to_settlement<R: AdminResource>(
                 {
                     Ok(true) => Ok(true),
                     Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                        "namespace config admission was lost during delete; the late write was compensated: {error}"
+                        "namespace config admission was lost during delete; the late write was compensated"
                     ))),
-                    Err(recovery_error) => {
+                    Err(_recovery_error) => {
                         Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                            "namespace config admission was lost during delete and recovery failed: {recovery_error}; original error: {error}"
+                            "namespace config admission was lost during delete and recovery failed"
                         )))
                     }
                 }
@@ -967,15 +978,10 @@ async fn finish_write_success<R: AdminResource>(
     existing: Option<&R>,
     action: WriteAction<'_>,
 ) {
-    if let Err(error) =
+    if let Err(_error) =
         R::after_write(db.as_ref(), state, namespace, resource, existing, action).await
     {
-        tracing::warn!(
-            "Post-write hook failed for {} '{}': {}",
-            R::RESOURCE_NAME,
-            resource.id(),
-            error
-        );
+        super::warn_persistence_failure_redacted("admin_resource_post_write_hook");
     }
 
     let (audit_action, diff) = match action {
@@ -1172,6 +1178,104 @@ pub(crate) async fn validate_plugin_graph_proxy_deletion_candidate(
 
     let http_client = super::plugin_validation_http_client(state);
     validate_candidate_plugin_graph(&candidate, &http_client)
+}
+
+/// A direct proxy delete can cascade resources that the runtime snapshot
+/// deliberately exposes without API-spec ownership metadata. Re-read every
+/// resource that compensation would classify as hand-owned before persistence,
+/// while namespace admission is still held, so a foreign spec's resource can
+/// never be restored with its ownership stripped.
+async fn validate_direct_api_spec_proxy_delete_restore_ownership(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &Proxy,
+) -> Result<(), AfterValidateError> {
+    let spec = db
+        .get_api_spec_by_proxy(namespace, &proxy.id)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let Some(spec) = spec else {
+        if let Some(owner) = proxy.api_spec_id.as_deref() {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' is stamped to API spec '{}' but its owning API-spec metadata is missing",
+                proxy.id, owner
+            )]));
+        }
+        return Ok(());
+    };
+    if let Some(owner) = proxy.api_spec_id.as_deref()
+        && owner != spec.id
+    {
+        return Err(AfterValidateError::BadRequest(vec![format!(
+            "proxy '{}' is stamped to API spec '{}' but its owning metadata identifies API spec '{}'",
+            proxy.id, owner, spec.id
+        )]));
+    }
+    let snapshot = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let associated_ids = proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect::<HashSet<_>>();
+    let other_associated_ids = snapshot
+        .proxies
+        .iter()
+        .filter(|candidate| candidate.id != proxy.id)
+        .flat_map(|candidate| candidate.plugins.iter())
+        .map(|association| association.plugin_config_id.as_str())
+        .collect::<HashSet<_>>();
+
+    for snapshot_plugin in snapshot.plugin_configs.iter().filter(|plugin| {
+        plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+            || (plugin.scope == PluginScope::ProxyGroup
+                && associated_ids.contains(plugin.id.as_str())
+                && !other_associated_ids.contains(plugin.id.as_str()))
+    }) {
+        let Some(plugin) = db
+            .get_plugin_config(namespace, &snapshot_plugin.id)
+            .await
+            .map_err(AfterValidateError::Db)?
+        else {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' cascade plugin '{}' disappeared before API-spec restore ownership validation",
+                proxy.id, snapshot_plugin.id
+            )]));
+        };
+        if let Some(owner) = plugin.api_spec_id.as_deref()
+            && owner != spec.id
+        {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' cascade plugin '{}' is owned by API spec '{}', not owning API spec '{}'",
+                proxy.id, plugin.id, owner, spec.id
+            )]));
+        }
+    }
+
+    if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+        let Some(upstream) = db
+            .get_upstream(namespace, upstream_id)
+            .await
+            .map_err(AfterValidateError::Db)?
+        else {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' upstream '{}' disappeared before API-spec restore ownership validation",
+                proxy.id, upstream_id
+            )]));
+        };
+        if let Some(owner) = upstream.api_spec_id.as_deref()
+            && owner != spec.id
+        {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "proxy '{}' upstream '{}' is owned by API spec '{}', not owning API spec '{}'",
+                proxy.id, upstream.id, owner, spec.id
+            )]));
+        }
+    }
+
+    Ok(())
 }
 
 /// Validate the post-mutation named log-schema graph for one namespace.
@@ -1604,11 +1708,23 @@ pub(crate) trait AdminResource:
         // raceable, so the DB constraint is the authoritative backstop (e.g.
         // reusing a proxy/upstream id that exists in another namespace, or a
         // concurrent create winning the race after the precheck passed).
-        // Surface the constraint message (it names the conflicting key);
-        // everything else stays a redacted 500.
-        let message = error.to_string();
-        if is_mtls_dns_identity_conflict(error) || super::is_unique_constraint_violation(&message) {
-            super::json_response(StatusCode::CONFLICT, &json!({ "error": message }))
+        // Preserve the 409 disposition without surfacing driver-owned
+        // constraint, key, schema, or duplicate-value text.
+        if let Some(conflict) = mtls_dns_identity_conflict(error) {
+            // Typed conflicts are classified anywhere in the chain, so render
+            // the conflict itself: `error.to_string()` is the chain's outermost
+            // message and would echo any driver/DSN/schema context a store
+            // wrapped above it.
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({ "error": conflict.to_string() }),
+            );
+        }
+        if super::chain_has_unique_constraint_violation(error) {
+            super::json_response(
+                StatusCode::CONFLICT,
+                &json!({ "error": super::RESOURCE_IDENTITY_CONFLICT_MESSAGE }),
+            )
         } else {
             super::json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1622,8 +1738,13 @@ pub(crate) trait AdminResource:
             super::mtls_dns_admission_unavailable_response()
         } else if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
             Self::map_after_validate_errors(conflict.errors())
-        } else if is_mtls_dns_identity_conflict(error) {
-            super::json_response(StatusCode::CONFLICT, &json!({"error": error.to_string()}))
+        } else if let Some(conflict) = mtls_dns_identity_conflict(error) {
+            // Render the typed conflict rather than the chain's outermost
+            // message; see `map_persist_db_error` above.
+            super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": conflict.to_string()}),
+            )
         } else {
             super::json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1665,6 +1786,7 @@ pub(crate) trait AdminResource:
         previous: &Self,
         _previous_snapshot: Option<&GatewayConfig>,
         _previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+        _http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<()> {
         Self::db_create(db, previous).await
     }
@@ -1682,6 +1804,7 @@ pub(crate) trait AdminResource:
         _db: &dyn DatabaseBackend,
         _namespace: &str,
         _previous: &Self,
+        _previous_snapshot: Option<&GatewayConfig>,
     ) -> DbResult<Option<ApiSpecDeleteSnapshot>> {
         Ok(None)
     }
@@ -1758,11 +1881,7 @@ pub(crate) async fn handle_list<R: AdminResource>(
                 if !R::allow_cached_read_fallback(&error) {
                     return Ok(R::map_precheck_db_error(&error));
                 }
-                tracing::warn!(
-                    "Database unavailable for list {}, falling back to cached config: {}",
-                    R::RESOURCE_NAME,
-                    error
-                );
+                super::warn_persistence_failure_redacted("admin_resource_list_cached_fallback");
             }
         }
     }
@@ -1809,11 +1928,7 @@ pub(crate) async fn handle_get<R: AdminResource>(
                 if !R::allow_cached_read_fallback(&error) {
                     return Ok(R::map_precheck_db_error(&error));
                 }
-                tracing::warn!(
-                    "Database unavailable for get {}, falling back to cached config: {}",
-                    R::RESOURCE_NAME,
-                    error
-                );
+                super::warn_persistence_failure_redacted("admin_resource_get_cached_fallback");
             }
         }
     }
@@ -1908,7 +2023,14 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     } else {
         None
     };
-    let previous_api_spec = match R::late_delete_api_spec_snapshot(db, namespace, &existing).await {
+    let previous_api_spec = match R::late_delete_api_spec_snapshot(
+        db,
+        namespace,
+        &existing,
+        previous_snapshot.as_ref(),
+    )
+    .await
+    {
         Ok(snapshot) => snapshot,
         Err(error) => return Ok(R::map_precheck_db_error(&error)),
     };
@@ -1998,8 +2120,8 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     if is_mtls_dns_admission_unavailable(error) {
         return super::mtls_dns_admission_unavailable_response();
     }
-    let unique_conflict = is_mtls_dns_identity_conflict(error)
-        || super::is_unique_constraint_violation(&error.to_string());
+    let unique_conflict =
+        is_mtls_dns_identity_conflict(error) || super::chain_has_unique_constraint_violation(error);
     let message = consumer_persist_error_message(error);
     let status = if unique_conflict {
         StatusCode::CONFLICT
@@ -2009,20 +2131,28 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     super::json_response(status, &json!({"error": message}))
 }
 
-/// Redact persistence-level uniqueness diagnostics before they reach an admin
-/// response. MongoDB duplicate-key errors can echo indexed credential-derived
-/// values; callers need the conflict disposition, never credential or index
-/// metadata.
+/// Redact persistence-level diagnostics before they reach an admin response.
+/// MongoDB duplicate-key errors can echo indexed credential-derived values;
+/// callers need the conflict disposition, never credential or index metadata.
+/// Every branch renders a constant or an internally constructed typed message,
+/// and the fallback logs no error text at all, so neither the wire nor the
+/// admin log carries driver-provided material.
 pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
     if is_mtls_dns_admission_unavailable(error) {
         MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
-    } else if is_mtls_dns_identity_conflict(error) {
-        error.to_string()
-    } else if super::is_unique_constraint_violation(&error.to_string()) {
+    } else if let Some(conflict) = mtls_dns_identity_conflict(error) {
+        // Render the typed conflict, not the chain's outermost message: the
+        // identities it names are internally constructed and not secrets, but
+        // any driver context wrapped above it would be.
+        conflict.to_string()
+    } else if super::chain_has_unique_constraint_violation(error) {
+        // Chain-aware: a MongoDB replica-set write wraps the inner E11000 in
+        // transaction context, so matching only the outermost message would
+        // drop a credential-index conflict into the branch below.
         "Consumer identity or credential conflicts with another Consumer in the namespace"
             .to_string()
     } else {
-        error.to_string()
+        super::redacted_persistence_error_message("consumer_persist", error).to_string()
     }
 }
 
@@ -2641,6 +2771,18 @@ async fn mesh_route_dispatch_override_destinations(
 fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
     let mut body = json!(resource);
     if let Some(config) = body.get_mut("config") {
+        if resource.plugin_name == "serverless_function"
+            && let Some(url) = config.get_mut("function_url")
+        {
+            *url = match url.as_str() {
+                Some(raw) => {
+                    json!(crate::plugins::serverless_function::redact_serverless_url(
+                        raw
+                    ))
+                }
+                None => json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER),
+            };
+        }
         redact_sensitive_plugin_config_fields(config);
         if resource.plugin_name == "loki_logging" {
             redact_loki_logging_config_projection(config);
@@ -2738,6 +2880,7 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
         || normalized.contains("api_key")
         || normalized.contains("apikey")
         || normalized.contains("access_key")
+        || normalized.contains("function_key")
         || normalized.contains("client_secret")
         || normalized.contains("credential")
         || normalized.contains("private_key")
@@ -2917,13 +3060,21 @@ impl AdminResource for Upstream {
         if is_mtls_dns_admission_unavailable(error) {
             return super::mtls_dns_admission_unavailable_response();
         }
-        let error_text = error.to_string();
-        if error_text.contains("referenced by one or more proxies")
-            || error_text.contains("referenced by mesh_route_dispatch plugin_config")
-        {
+        let error_chain_contains = |needle| {
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains(needle))
+        };
+        if error_chain_contains("referenced by one or more proxies") {
             return super::json_response(
                 StatusCode::CONFLICT,
-                &json!({"error": format!("{}", error)}),
+                &json!({"error": "Upstream is referenced by one or more proxies and cannot be deleted"}),
+            );
+        }
+        if error_chain_contains("referenced by mesh_route_dispatch plugin_config") {
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"}),
             );
         }
         super::json_response(
@@ -3222,6 +3373,7 @@ impl AdminResource for PluginConfig {
         previous: &Self,
         previous_snapshot: Option<&GatewayConfig>,
         _previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+        _http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<()> {
         let snapshot = previous_snapshot.ok_or_else(|| {
             anyhow::anyhow!("late plugin delete recovery is missing the namespace snapshot")
@@ -3743,7 +3895,25 @@ impl AdminResource for Proxy {
         previous: &Self,
         previous_snapshot: Option<&GatewayConfig>,
         previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+        http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<()> {
+        if let Some(api_spec_snapshot) = previous_api_spec {
+            let bundle = crate::admin::api_specs::ExtractedBundle {
+                proxy: previous.clone(),
+                upstream: api_spec_snapshot.upstream.clone(),
+                plugins: api_spec_snapshot.plugins.clone(),
+            };
+            db.restore_api_spec_bundle(
+                &bundle,
+                &api_spec_snapshot.spec,
+                &api_spec_snapshot.additional_upstreams,
+                &api_spec_snapshot.additional_plugins,
+                &http_client,
+            )
+            .await?;
+            return Ok(());
+        }
+
         let snapshot = previous_snapshot.ok_or_else(|| {
             anyhow::anyhow!("late proxy delete recovery is missing the namespace snapshot")
         })?;
@@ -3759,7 +3929,7 @@ impl AdminResource for Proxy {
             .flat_map(|proxy| proxy.plugins.iter())
             .map(|association| association.plugin_config_id.as_str())
             .collect();
-        let mut affected_plugins = snapshot
+        let affected_plugins = snapshot
             .plugin_configs
             .iter()
             .filter(|plugin| {
@@ -3770,81 +3940,20 @@ impl AdminResource for Proxy {
             })
             .cloned()
             .collect::<Vec<_>>();
-        if let Some(api_spec_snapshot) = previous_api_spec {
-            for plugin in &api_spec_snapshot.plugins {
-                if !affected_plugins
-                    .iter()
-                    .any(|affected| affected.id == plugin.id)
-                {
-                    affected_plugins.push(plugin.clone());
-                }
-            }
-        }
-
-        let mut affected_upstreams = snapshot
+        let affected_upstreams = snapshot
             .upstreams
             .iter()
             .filter(|upstream| previous.upstream_id.as_deref() == Some(upstream.id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        if let Some(api_spec_snapshot) = previous_api_spec {
-            for upstream in &api_spec_snapshot.upstreams {
-                if !affected_upstreams
-                    .iter()
-                    .any(|affected| affected.id == upstream.id)
-                {
-                    affected_upstreams.push(upstream.clone());
-                }
+        for upstream in &affected_upstreams {
+            if db.get_upstream(namespace, &upstream.id).await?.is_none() {
+                db.create_upstream(upstream).await?;
             }
         }
-
-        if let Some(api_spec_snapshot) = previous_api_spec {
-            let spec = &api_spec_snapshot.spec;
-            let spec_plugins = api_spec_snapshot.plugins.clone();
-            let spec_plugin_ids = spec_plugins
-                .iter()
-                .map(|plugin| plugin.id.as_str())
-                .collect::<HashSet<_>>();
-            let bundle_upstream = affected_upstreams
-                .iter()
-                .find(|upstream| {
-                    upstream.api_spec_id.as_deref() == Some(spec.id.as_str())
-                        && previous.upstream_id.as_deref() == Some(upstream.id.as_str())
-                })
-                .or_else(|| {
-                    affected_upstreams
-                        .iter()
-                        .find(|upstream| upstream.api_spec_id.as_deref() == Some(spec.id.as_str()))
-                })
-                .cloned();
-            for upstream in &affected_upstreams {
-                if bundle_upstream.as_ref().map(|item| item.id.as_str())
-                    != Some(upstream.id.as_str())
-                    && db.get_upstream(namespace, &upstream.id).await?.is_none()
-                {
-                    db.create_upstream(upstream).await?;
-                }
-            }
-            let mut base_proxy = previous.clone();
-            base_proxy.plugins.retain(|association| {
-                spec_plugin_ids.contains(association.plugin_config_id.as_str())
-            });
-            let bundle = crate::admin::api_specs::ExtractedBundle {
-                proxy: base_proxy,
-                upstream: bundle_upstream,
-                plugins: spec_plugins,
-            };
-            db.submit_api_spec_bundle(&bundle, spec).await?;
-        } else {
-            for upstream in &affected_upstreams {
-                if db.get_upstream(namespace, &upstream.id).await?.is_none() {
-                    db.create_upstream(upstream).await?;
-                }
-            }
-            let mut proxy_without_associations = previous.clone();
-            proxy_without_associations.plugins.clear();
-            db.create_proxy(&proxy_without_associations).await?;
-        }
+        let mut proxy_without_associations = previous.clone();
+        proxy_without_associations.plugins.clear();
+        db.create_proxy(&proxy_without_associations).await?;
         for plugin in affected_plugins {
             if db.get_plugin_config(namespace, &plugin.id).await?.is_none() {
                 db.create_plugin_config(&plugin).await?;
@@ -3860,6 +3969,7 @@ impl AdminResource for Proxy {
         db: &dyn DatabaseBackend,
         namespace: &str,
         previous: &Self,
+        previous_snapshot: Option<&GatewayConfig>,
     ) -> DbResult<Option<ApiSpecDeleteSnapshot>> {
         let Some(spec) = db.get_api_spec_by_proxy(namespace, &previous.id).await? else {
             return Ok(None);
@@ -3868,10 +3978,139 @@ impl AdminResource for Proxy {
         let plugins = db
             .list_spec_owned_plugin_configs(namespace, &spec.id)
             .await?;
+        let upstream = match upstreams.as_slice() {
+            [] => None,
+            [upstream] => Some(upstream.clone()),
+            _ => {
+                return Err(api_spec_restore_snapshot_validation(format!(
+                    "API spec '{}' owns multiple upstreams, which direct proxy delete recovery cannot reproduce safely",
+                    spec.id
+                )));
+            }
+        };
+        let mut additional_upstreams = Vec::new();
+        if let Some(current_upstream_id) = previous.upstream_id.as_deref()
+            && upstream.as_ref().map(|item| item.id.as_str()) != Some(current_upstream_id)
+        {
+            match db.get_upstream(namespace, current_upstream_id).await? {
+                Some(current) if current.api_spec_id.is_none() => {
+                    additional_upstreams.push(current);
+                }
+                Some(current) => {
+                    return Err(api_spec_restore_snapshot_validation(format!(
+                        "API spec '{}' cannot snapshot proxy '{}' current upstream '{}': it is owned by API spec '{}'",
+                        spec.id,
+                        previous.id,
+                        current.id,
+                        current.api_spec_id.as_deref().unwrap_or("<unknown>")
+                    )));
+                }
+                None => {
+                    return Err(api_spec_restore_snapshot_validation(format!(
+                        "API spec '{}' proxy '{}' references missing upstream '{}'",
+                        spec.id, previous.id, current_upstream_id
+                    )));
+                }
+            }
+        }
+
+        let snapshot = previous_snapshot.ok_or_else(|| {
+            anyhow::anyhow!("direct API-spec proxy delete is missing the namespace snapshot")
+        })?;
+        let owned_plugin_ids: HashSet<&str> =
+            plugins.iter().map(|plugin| plugin.id.as_str()).collect();
+        let associated_ids: HashSet<&str> = previous
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.as_str())
+            .collect();
+        let other_associated_ids: HashSet<&str> = snapshot
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id != previous.id)
+            .flat_map(|proxy| proxy.plugins.iter())
+            .map(|association| association.plugin_config_id.as_str())
+            .collect();
+        let additional_plugin_ids = snapshot
+            .plugin_configs
+            .iter()
+            .filter(|plugin| !owned_plugin_ids.contains(plugin.id.as_str()))
+            .filter(|plugin| {
+                plugin.proxy_id.as_deref() == Some(previous.id.as_str())
+                    || (plugin.scope == PluginScope::ProxyGroup
+                        && associated_ids.contains(plugin.id.as_str())
+                        && !other_associated_ids.contains(plugin.id.as_str()))
+            })
+            .map(|plugin| plugin.id.clone())
+            .collect::<Vec<_>>();
+        let mut additional_plugins = Vec::with_capacity(additional_plugin_ids.len());
+        for plugin_id in &additional_plugin_ids {
+            let plugin = db
+                .get_plugin_config(namespace, plugin_id)
+                .await?
+                .ok_or_else(|| {
+                    api_spec_restore_snapshot_validation(format!(
+                        "API spec '{}' direct proxy delete snapshot lost plugin '{}' before persistence",
+                        spec.id, plugin_id
+                    ))
+                })?;
+            if let Some(owner) = plugin.api_spec_id.as_deref() {
+                return Err(api_spec_restore_snapshot_validation(format!(
+                    "API spec '{}' cannot delete proxy '{}': cascade plugin '{}' is owned by API spec '{}'",
+                    spec.id, previous.id, plugin.id, owner
+                )));
+            }
+            validate_api_spec_proxy_plugin_association(&plugin, &previous.id)
+                .map_err(|error| api_spec_restore_snapshot_validation(error.to_string()))?;
+            additional_plugins.push(plugin);
+        }
+
+        let additional_plugin_id_set: HashSet<&str> =
+            additional_plugin_ids.iter().map(String::as_str).collect();
+        for association in &previous.plugins {
+            let plugin_id = association.plugin_config_id.as_str();
+            if owned_plugin_ids.contains(plugin_id) || additional_plugin_id_set.contains(plugin_id)
+            {
+                continue;
+            }
+            let plugin = db
+                .get_plugin_config(namespace, plugin_id)
+                .await?
+                .ok_or_else(|| {
+                    api_spec_restore_snapshot_validation(format!(
+                        "API spec '{}' proxy association references missing plugin '{}'",
+                        spec.id, plugin_id
+                    ))
+                })?;
+            if let Some(owner) = plugin.api_spec_id.as_deref() {
+                return Err(api_spec_restore_snapshot_validation(format!(
+                    "API spec '{}' cannot delete proxy '{}': associated plugin '{}' is owned by API spec '{}'",
+                    spec.id, previous.id, plugin.id, owner
+                )));
+            }
+            validate_api_spec_proxy_plugin_association(&plugin, &previous.id)
+                .map_err(|error| api_spec_restore_snapshot_validation(error.to_string()))?;
+        }
+
+        let bundle = crate::admin::api_specs::ExtractedBundle {
+            proxy: previous.clone(),
+            upstream: upstream.clone(),
+            plugins: plugins.clone(),
+        };
+        validate_api_spec_restore_inputs(
+            &bundle,
+            &spec,
+            &additional_upstreams,
+            &additional_plugins,
+            true,
+        )
+        .map_err(|error| api_spec_restore_snapshot_validation(error.to_string()))?;
         Ok(Some(ApiSpecDeleteSnapshot {
             spec,
-            upstreams,
+            upstream,
             plugins,
+            additional_upstreams,
+            additional_plugins,
         }))
     }
 
@@ -3931,6 +4170,19 @@ impl AdminResource for Proxy {
         Ok(None)
     }
 
+    fn map_precheck_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+        if let Some(validation) = error.downcast_ref::<ApiSpecRestoreSnapshotValidation>() {
+            return super::json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": validation.to_string()}),
+            );
+        }
+        super::json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &super::db_error_response(error),
+        )
+    }
+
     fn map_persist_db_error(
         error: &anyhow::Error,
         _action: WriteAction<'_>,
@@ -3941,15 +4193,25 @@ impl AdminResource for Proxy {
         if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
             return Self::map_after_validate_errors(conflict.errors());
         }
-        let message = error.to_string();
-        if message.contains(PROXY_ROUTE_CONFLICT_ERROR) {
+        if super::chain_has_proxy_route_conflict(error) {
             return super::json_response(
                 StatusCode::CONFLICT,
                 &json!({"error": PROXY_ROUTE_CONFLICT_ERROR}),
             );
         }
-        if is_mtls_dns_identity_conflict(error) || super::is_unique_constraint_violation(&message) {
-            return super::json_response(StatusCode::CONFLICT, &json!({ "error": message }));
+        if let Some(conflict) = mtls_dns_identity_conflict(error) {
+            // Typed, chain-deep classification must render the typed message,
+            // not the outermost context; see the default `map_persist_db_error`.
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({ "error": conflict.to_string() }),
+            );
+        }
+        if super::chain_has_unique_constraint_violation(error) {
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({ "error": super::RESOURCE_IDENTITY_CONFLICT_MESSAGE }),
+            );
         }
 
         super::json_response(
@@ -4154,6 +4416,7 @@ impl AdminResource for Proxy {
         existing: &Self,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
+        validate_direct_api_spec_proxy_delete_restore_ownership(db, namespace, existing).await?;
         validate_plugin_graph_proxy_deletion_candidate(db, state, namespace, &existing.id).await
     }
 

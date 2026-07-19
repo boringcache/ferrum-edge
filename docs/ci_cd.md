@@ -38,6 +38,7 @@ adding, removing, or materially changing a workflow.
 | `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs. |
+| `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface; `Trusted Cross Build Policy` must be directly required after the bootstrap workflow merges. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | Path-filtered PRs, manual | Live multicluster federation datapath validation. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
@@ -56,6 +57,9 @@ adding, removing, or materially changing a workflow.
 
 ```
 Pull Request
+    ├─► Trusted Cross Build Policy (`pull_request_target`, base code only)
+            └─► Validate proposed Cross/Cargo config, workflows, repo-local
+                actions, and referenced scripts as hostile data
     ├─► CI plan
             ├─► Docs/license/agent-only: lightweight Tests aggregate
             └─► Full CI
@@ -72,7 +76,7 @@ Pull Request
 
 Push to main
     ├─► Full required validation gate
-    └─► Five target release builds
+    └─► Four native release builds + isolated Linux ARM64 Cross build
             └─► Tests aggregate passes
                     ├─► Replace latest GitHub prerelease
                     └─► Push per-arch Docker images to Docker Hub and GHCR
@@ -85,8 +89,8 @@ Push to main
 Push tag v* (e.g., v0.2.0)
     └─► Validate tag matches the Cargo.toml package version
             └─► Validate tag target has successful CI and Coverage runs for the exact SHA
-            └─► Five target release builds (matrix: linux-x86_64 / linux-aarch64 /
-                macos-x86_64 / macos-aarch64 / windows-x86_64)
+            └─► Four-target native matrix (linux-x86_64 / macos-x86_64 /
+                macos-aarch64 / windows-x86_64) + isolated linux-aarch64 Cross job
                     └─► Push versioned Docker images to Docker Hub and GHCR
                             └─► Create Docker manifest tags
                                     └─► Create GitHub Release with binaries and checksums
@@ -127,14 +131,20 @@ and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
 
-Branch protection must require four independent PR checks: the unchanged `Tests`
-aggregate from `ci.yml`, plus `Merge Coverage` from `coverage.yml`, `Gateway API
-Conformance` from `gateway-api-conformance.yml`, and `Mesh E2E Sidecar Live`
-from `mesh-e2e-sidecar-live.yml`. Each dedicated workflow triggers on every
-pull request, performs its path filtering internally, and terminates in an
-`if: always()` job that passes a legitimate internal skip and fails on planning
-or validation failures. They are required directly rather than mirrored by
-runner-holding polling jobs in `ci.yml`.
+Branch protection must require five independent PR checks: the unchanged `Tests`
+aggregate from `ci.yml`, `Merge Coverage` from `coverage.yml`, `Gateway API
+Conformance` from `gateway-api-conformance.yml`, `Mesh E2E Sidecar Live` from
+`mesh-e2e-sidecar-live.yml`, and `Trusted Cross Build Policy` from
+`cross-build-policy.yml`. Each dedicated workflow triggers on every pull
+request and fails closed on planning or validation failures. They are required
+directly rather than mirrored by runner-holding polling jobs in `ci.yml`.
+
+`cross-build-policy.yml` is bootstrapped by the change that introduces it, so
+it cannot emit a `pull_request_target` check until it exists on the default
+branch. After that change merges and the first check is visible, a repository
+administrator must add `Trusted Cross Build Policy` to the required checks for
+`main`. Ordinary pull requests must not modify the trusted verifier or its
+workflow; such maintenance requires an explicit branch-protection bypass.
 
 CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation. If the cancellation left publishing incomplete, re-run the newest workflow attempt (the one for the latest `main` SHA) — re-running the older, canceled run would re-publish stale binaries and images as `latest`.
 
@@ -322,24 +332,492 @@ python3 tests/performance/ci_overhead_bench.py \
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
-Builds cross-platform verification binaries on full-mode PRs and optimized
-release binaries on pushes to `main` for Linux x86_64, Linux ARM64, macOS
-x86_64, macOS ARM64, and Windows x86_64. The job installs the same
-prerequisites as the Release pipeline matrix — `protoc` on every OS,
-`libcurl4-openssl-dev` on Linux, and NASM on Windows — and builds with
-`--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included.
-Linux ARM64 downloads the checksum-verified `cross` 0.2.5 release through the
-repository's pinned installer action instead of compiling the tool from source.
-The macOS x86_64 build targets `x86_64-apple-darwin` with the standard
-Apple/Rust toolchain (no `cross` needed) and runs on whichever host architecture
-GitHub maps `macos-latest` to today (currently ARM64); pin to a concrete runner
-image such as `macos-14` if the host architecture must be guaranteed.
+Full-mode PRs build the native Linux x86_64 verification binary. Pushes to
+`main` build optimized release binaries for Linux x86_64, Linux ARM64, macOS
+x86_64, macOS ARM64, and Windows x86_64. Native targets share the ordinary
+matrix; Linux ARM64 runs only after code reaches `main`, in the isolated
+`build-arm64-cross` job described below. The jobs install the same prerequisites
+as the Release pipeline — `protoc` on every OS, `libcurl4-openssl-dev` on Linux,
+and NASM on Windows — and build with `--features cloud-secrets` so
+Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build targets
+`x86_64-apple-darwin` with the standard Apple/Rust toolchain (no `cross` needed)
+and runs on whichever host architecture GitHub maps `macos-latest` to today
+(currently ARM64); pin to a concrete runner image such as `macos-14` if the
+host architecture must be guaranteed.
+
+##### Trusted ARM64 Cross boundary
+
+Cross 0.2.5 merges `[package.metadata.cross]` from `Cargo.toml` with the selected
+Cross config file, gives `Cross.toml` precedence over Cargo metadata, and then
+allows target/build environment variables to override those values. It also
+accepts executable or privileged behavior through global Dockerfile,
+pre-build, build-mode, and env settings; target-specific image, Dockerfile,
+pre-build, runner, build-mode, and env settings; plus container-engine,
+container-option, custom-toolchain, and alternate-config inputs. The ARM64
+boundary therefore uses a complete allowlist rather than a field denylist:
+
+- `Cross.toml` may contain only the `aarch64-unknown-linux-gnu` target, its exact
+  `ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5` image, the ordered seven
+  approved pre-build commands, and the exact fixed-value passthrough entries.
+  Global build settings, extra targets/keys, Dockerfiles, runners, build modes,
+  volumes, and unfixed passthroughs are rejected.
+- `Cargo.toml` must not contain `package.metadata.cross` or
+  `workspace.metadata.cross` in table, dotted-key, quoted-key, or inline-table
+  form. Unrelated package/workspace metadata, dependency, and version edits
+  remain permitted.
+- `.cargo/config` is forbidden, and `.cargo/config.toml` is parsed as a complete
+  allowlist. The existing build wrapper/incremental values and every target
+  linker/rustflags table are exact; only bounded retry and boolean HTTP
+  multiplexing transport tuning may vary. Extra build, target, runner, rustc,
+  workspace-wrapper, env, alias, credential, registry, or future root keys fail
+  closed instead of becoming an alternate executable/toolchain surface.
+- `build-arm64-cross` in `ci.yml` and `build-release-arm64-cross` in
+  `release.yml` are isolated from the shared native matrix. Their exact job
+  blocks, inherited top-level `env` mappings, and workflow trigger blocks are
+  hashed by the trusted verifier, and comparison with the current trusted base
+  tip rejects any PR-authored mutation while allowing unrelated workflow jobs
+  to evolve. Every
+  `.yml` and `.yaml` file directly under `.github/workflows`, plus every regular
+  file recursively under `.github/actions`, is also compared as a collection.
+  The complete `.github/scripts`, `comparison`, `scripts`, `tests/k8s`, and
+  `tests/performance` automation roots are semantically compared, and literal
+  repo-script edges are resolved transitively; local actions outside
+  `.github/actions` and repo commands outside those scanned roots are rejected.
+  This prevents moving an invocation into another workflow, action, or helper
+  script without freezing benign script edits. Any new or changed Cross
+  executable/configuration token outside the isolated jobs is rejected,
+  including `env`-wrapped and Cargo-subcommand forms, quoted or nested
+  shell/GitHub-interpolated executable spellings, custom step/default `shell`
+  templates, YAML block-scalar variants, interpreter input redirection, Python
+  process-API positional/keyword forms, literal or command-position
+  dynamic GitHub expressions before any Cargo-compatible subcommand or
+  toolchain selector, shell-variable executable indirection, partial or whole
+  opaque command substitutions, Bash brace expansions and ANSI-C escapes, and
+  Cross environment aliases; Bash backslash-newline continuations are
+  normalized before scanning. Executable slots are recognized wherever the
+  shell creates one, so nested `sh -c`/`bash -lc` scripts, `$(...)`, backtick
+  and `<(...)`/`>(...)` substitutions, single-line `case` arms, wrapper
+  end-of-options markers (`sudo -- cross`), absolute or home-relative tool
+  paths (`/usr/bin/cargo cross`, `~/.cargo/bin/cross`), and Bash aliases bound
+  to Cross under `expand_aliases` all resolve to the Cross command word. Because
+  an unquoted expansion is word-split before dispatch, each expansion is also
+  read as a word separator, so `cross${IFS}build` and
+  `cargo${IFS}+stable${IFS}cross build` resolve exactly like literal
+  whitespace at the executable, toolchain-selector, and subcommand boundaries.
+  A shell can also move Cross out of the command word entirely and still run it
+  by dispatching an argument vector that holds it, so a function whose body
+  executes its arguments (`run() { "$@"; }`, `go() { exec "$@"; }`, `only() {
+  "$1"; }`) makes every call site's argument list a command line, and a command
+  line loaded into the positional parameters (`set -- cross build --target
+  ...`) is read as one wherever it appears. Which names dispatch their argument
+  vector is resolved from the whole program rather than from the line being
+  scanned, so a definition and its call site may sit on different lines. A
+  function that merely *forwards* its arguments to a named command
+  (`f() { curl "$@"; }`) does not dispatch them and stays editable.
+  A dynamic expression that occupies a whole command word is replaced by a
+  whole command, not just by an executable name, so `run: ${{
+  steps.plan.outputs.cmd }}`, a composite action's `run: ${{ inputs.cmd }}`,
+  `run: $CMD`, and `run: $(plan)` all fail closed even though no literal
+  `build --target` text is left on the line; an expression that is an argument
+  to a named command, or that is only data, does not occupy a command word and
+  stays editable. Substituting a whole command needs both a line a shell
+  evaluates and a slot on it. A raw line scan also reads a workflow's non-`run`
+  block scalars and a script's heredoc bodies, and those are never evaluated, so
+  no slot on them counts: an expression inside a `prompt: |` block, a `cat <<EOF`
+  configuration body, or a `python3 <<'PYEOF'` body is data the runner never
+  dispatches, backticks there being Markdown rather than substitutions. On a line
+  a shell does evaluate, an explicit executable slot — `run:`, a statement
+  separator, `$(`, a backtick, a conditional keyword — counts, and so does a bare
+  line start, so the same expression alone on its own line inside a `run: |`
+  block still fails closed. A raw source line that a backslash continuation
+  joins onto the previous one has no line start of its own — `$(printf
+  'ferrumedge/ferrum-edge@sha256:%s ' *)` under `docker buildx imagetools create
+  ... \` is that command's last argument — so only the bare-line-start allowance
+  is withdrawn there; an explicit slot on the continuation line still counts, and
+  the joined logical line is scanned in its own right.
+  A block-scalar body is one string value rather than YAML structure, so prose in
+  an action input declares no mapping key, alias, or merge key: `--allowedTools
+  "Bash(gh pr comment:*)"` inside a `claude_args: |` body is not a `comment:` key
+  aliased to `*)`. The body's text still reaches the action and is still searched
+  for the Cross executable, the Cross image, and the protected target.
+  A backslash-escaped backtick is literal text and
+  opens no slot, so ``echo "- Test: \`${{ matrix.test }}\`"`` writes Markdown in a
+  real `run:` block and stays editable. An executable heredoc is unaffected
+  throughout: it is extracted and rescanned as its own program, where its lines
+  are command lines again.
+  Binding Cross to another executable name is itself a Cross surface: linking,
+  copying, moving, or installing the Cross binary under a new name, and writing
+  a wrapper script whose body runs Cross, are all detected, and every later
+  command-start dispatch through that name — including PATH-prepended,
+  `./bin/`-relative, and assignment-prefixed forms — is expanded back to the
+  Cross command word. A dynamic shim name fails closed. Shim sources are
+  tokenized before the Cross token is required, so a quote- or escape-split
+  source (`ln -s ~/.cargo/bin/cr"oss" bin/cr`) still binds the shim. Python
+  helpers are analyzed through local process-API aliases (`run =
+  subprocess.run`) and shell-wrapper argv (`subprocess.run(['sh', '-c', ...])`).
+  `asyncio.create_subprocess_shell`/`create_subprocess_exec`, including their
+  imported and renamed forms, are tracked alongside `os` and `subprocess`, and
+  the variadic-argv APIs (`create_subprocess_exec`, `os.execl*`, `os.spawnl*`)
+  have their spread arguments joined into the single command they dispatch.
+  In JavaScript, importing `child_process` at all is the dispatch surface, so a
+  destructured or renamed binding (`const {execSync} = require('child_process')`,
+  `import {spawn as run} from 'node:child_process'`) is protected exactly like
+  a `child_process.exec(...)` member call.
+  Workflow `run` bodies are dispatched through their effective step, job, or
+  workflow-level shell; Python shells and executable Python heredocs therefore
+  receive the same AST analysis, while dynamic or unsupported shells fail
+  closed. Shell, Python, Perl, PHP, R, JavaScript/TypeScript, PowerShell, awk,
+  and BusyBox script launchers are recognized when resolving repository paths.
+  Inline interpreter source is dispatched the same way: a `run:` step that
+  hands a program to Python (`-c`), PowerShell (`-Command`, any unambiguous
+  prefix), Node, Deno, Bun, Perl, Ruby, PHP, Lua, R, Julia, Elixir, Groovy,
+  Scala, osascript, awk, or Tcl has that program inspected rather than skipped,
+  so `perl -e 'system("cross build ...")'` and `node -e ...` are rejected.
+  Python inline source gets the same AST analysis as a Python shell; other
+  languages have their string literals read as command text and any other
+  process dispatch inside inline source treated as an unresolvable executable.
+  Shell-assembled inline source (`perl -e "$PROGRAM"`) and a PowerShell
+  `-EncodedCommand` fail closed, while a field reference such as awk's `$1` or
+  a Perl `$name` sigil stays readable so ordinary one-liners are not frozen.
+  Because shell variables are case-sensitive but equally executable, source
+  that is nothing but one parameter expansion (`python3 -c "$cmd"`) and source
+  referencing any name — lowercase included — that the enclosing shell program
+  assigns are both treated as generated. An inline-source operand attached to
+  its option letter (`perl -e'print "safe"'`) or to a single-dash long option
+  is parsed as the program it is, rather than being frozen as a missing
+  operand. An interpreter that reads its program from stdin is dispatched the
+  same way as a shell that does, so `python3 <<< '<source>'` and
+  `python3 < <(printf '<source>')` are inspected in the interpreter's own
+  language instead of only in POSIX shell.
+  A `shell: pwsh`/`powershell` body, a PowerShell `-Command` operand, a
+  PowerShell heredoc, and a `SHELL ["pwsh", ...]` Dockerfile selection are
+  parsed as PowerShell rather than as POSIX shell: `Start-Process`,
+  `Start-Job`, `Start-ThreadJob`, and `Invoke-Command` process operands and the
+  `&`/`.` call operators resolve to the executable word, while
+  `Invoke-Expression`/`iex`, a computed call-operator target, a
+  `[Diagnostics.Process]::Start` dispatch, and an unreadable process operand
+  fail closed. A bare `$variable` stays a value expression, because PowerShell
+  requires a call operator to execute a computed word.
+  `env -S`/`--split-string` operands are tokenized into the argv they become
+  rather than discarded as option arguments, in separated, joined
+  (`--split-string=...`), and attached (`-S...`) spellings. `flock` and
+  `script` are followed to their process operands, both the positional argv
+  form after `flock`'s lock operand and the `-c`/`--command` shell-program
+  form.
+  A remote (non-`./`) `uses:` step is code this repository does not own, so a
+  step whose action reference names Cross, whose inputs include a Cross-enabling
+  key (`use-cross`, `cross-version`, and equivalents under case and separator
+  normalization, in block or flow mappings), or whose input values carry the
+  protected ARM64 target, the pinned Cross image, or the `cross` executable is a
+  build-execution surface; a dynamic `uses:` reference fails closed. Benign
+  pinned actions with unrelated inputs stay editable. A local (`./`) action is
+  extracted and scanned as a file of its own, but the workflow's `with:` values
+  are part of its executable surface too — a composite action with
+  `run: ${{ inputs.cmd }}` executes whatever the call site passes — so a local
+  step's inputs are held to the same Cross-input, target, and expression rules;
+  only the `./` reference itself is exempt from the literal-reference check.
+  The step is read as the
+  single YAML mapping it is, so key order does not matter: a `with:` block
+  written **above** the `uses:` line is scanned exactly like one written below
+  it. Keys and values are read the way the runner parses them, not as raw
+  source text: quoted spellings (`'use-cross'`, `"use-cross"`) and
+  double-quoted escape sequences (`"use-cross"`, `"uses"` written with an
+  escape, `args: "build --target aarch64-unknown-linux-gnu"`, and matrix
+  values collected from quoted scalars) are all decoded before any Cross or
+  target token is searched for. A double-quoted scalar continued with
+  a trailing backslash is folded the way the runner folds it, so a target split
+  across two source lines is still detected. A YAML merge key
+  (`with: {<<: *cross_inputs}`) supplies inputs the step never spells, and a
+  YAML alias, anchor, or tag resolves outside the step in a `uses:` reference
+  (`uses: *cargo_action`) and in any value position alike (`with:
+  *cargo_inputs`, `args: *arm_target`), so all of them fail closed rather than
+  being read as the literal text they appear to be — the runner expands an
+  aliased input map into the action's inputs before it runs, so a step that
+  spells neither `use-cross: true` nor the protected target can still deliver
+  both. A step written entirely as a YAML flow mapping
+  (`- {uses: actions-rs/cargo@<sha>, with: {use-cross: true}}`) is the same step
+  to the runner, including when the entry spans several source lines, so those
+  sequence entries are entered and held to the identical reference and input
+  rules instead of being skipped for not starting a line with a key. Input values are resolved rather
+  than compared as literal text: an expression such as
+  `args: build --target ${{ matrix.target }}` is expanded against the enclosing
+  job's `matrix`, `env`, and `inputs` **declarations** — a step's `with:` keys
+  are arguments to an action, never definitions, so a self-referential input
+  such as `target: ${{ matrix.target }}` cannot shadow the real matrix value.
+  Every expression on a line is expanded *together*, because the runner
+  concatenates them all before the action sees the value, so
+  `--target ${{ matrix.arch }}-${{ matrix.rest }}` assembled from literal
+  fragments is caught; a line with more combinations than the enumeration limit
+  fails closed. Any expansion reaching the protected target is a surface.
+  A value this scanner cannot see is *unknown*, not empty: `secrets.*`,
+  `github.*`, `runner.*`, `steps.*`, and `needs.*` are not author-populated
+  value sets, and a prior step or job output can be set to the ARM64 target,
+  so an unknown value fails closed whenever the same input already declares a
+  `--target` argument. Ordinary credential and context inputs carry no target
+  argument and stay editable. One narrow exception
+  exists so release downloads can be isolated to exact artifact names, which
+  necessarily name the protected target: for `actions/upload-artifact` and
+  `actions/download-artifact` **pinned to a full commit SHA**, the target
+  string in an artifact `name`/`path`/`pattern` input is not a surface, because
+  those two actions only move files between jobs and cannot start a build. That
+  carve-out accepts the block and flow spellings of the same YAML
+  (`with: {name: ...}`) equally, and applies only when every key on the line is
+  one of those closed artifact inputs. The
+  Cross image, a `cross` executable token, every Cross-enabling input key, any
+  other input key, an unpinned reference, and any other action are all still
+  surfaces; self-test fixtures assert each of those boundaries.
+  Heredoc parsing is quote-aware and rejects unterminated bodies. Repository
+  working-directory state changes only after each `cd` execution point and is
+  rejected when conditional or loop control flow makes it ambiguous. Dockerfile
+  instruction parsing is enabled only for Dockerfile-named inputs containing a
+  real `FROM` instruction, so ordinary Python beginning with `from` remains
+  Python. Baseline and proposed automation diagnostics are aggregated before
+  surface comparison, ensuring a malformed baseline cannot suppress proposed
+  findings. Generated-artifact exemptions are limited to an exact allowlist of
+  literal build outputs; variable-prefixed pseudo-paths are not allowlisted,
+  and a generated-looking *directory prefix* confers no exemption of its own.
+  None of `target/`, `results/`, `coverage-report/`, `benchmark-results/`,
+  `comparison-results/`, or `tmp/` is ignored by git, so a pull request can
+  commit a script under any of them; such a script is ordinary repository code
+  and is reported as outside the scanned automation roots unless it is one of
+  the exact allowlisted build outputs. Those exact allowlisted outputs are
+  exempt only while nothing commits them, so the pull-request comparison
+  additionally requires the full proposed repository tree listing
+  (`--proposed-tree-listing`, a `git ls-tree -rz --name-only` enumeration of the
+  proposed commit) and rejects any commit that adds a file at one of them.
+  Checking the materialized `--automation-dir` instead would be vacuous: that
+  directory is reconstructed from the approved automation roots alone and could
+  never show a committed executable at a repository-root path such as
+  `conformance` or `ferrum-edge-linux-x86_64`. The extraction contract requires
+  the listing to be passed, so a policy workflow that drops the flag is
+  rejected.
+  Repo-controlled build dispatchers are followed rather than trusted: a step
+  running `make`, `npm`/`pnpm`/`yarn`, `just`, or `task` resolves to the
+  matching root or `-C`-relocated `Makefile`, `package.json` `scripts`,
+  `justfile`, or `Taskfile`, which is then scanned and frozen like any
+  referenced script, and a dispatcher whose manifest is not in the scanned set
+  fails closed. Make recipes are read as the shell text make emits rather than
+  as raw shell: variables the makefile assigns are substituted with their real
+  values, which catches `CARGO = cross` followed by `$(CARGO) build ...`, and
+  `$(MAKE)`/`$(MAKE_COMMAND)` resolve to the make executable so an ordinary
+  recursive-make recipe is followed as a dispatcher instead of being frozen as
+  an opaque command substitution. Every other `$(...)`, including
+  `$(shell ...)` and other make functions, stays opaque and keeps failing
+  closed. Detection stays anchored to command positions, so prose or a
+  comment mentioning `cargo install cross` does not freeze unrelated edits.
+  Cross-sensitive jobs, local-action files, and
+  reachable scripts are represented by full digests, while unrelated workflow,
+  action, and script additions or edits remain permitted. The isolated jobs use
+  only pinned external setup actions before revalidation.
+- The `needs` fields that connect ARM64 artifacts to `latest-release`, CI and
+  release Docker publishing, and `create-release` are separately protected;
+  the CI publishers' success conditions are protected too. Only those direct
+  publication-control fields are frozen, so unrelated implementation changes
+  inside the publishing jobs remain permitted.
+- The Docker jobs never name the ARM64 artifact literally; they select it
+  through matrix values. Their `strategy` block and the two steps that consume
+  it — `Download Linux binary` (`name: binary-${{ matrix.binary_target }}` /
+  `release-binaries-${{ matrix.binary_target }}`) and `Prepare Docker context`
+  (which copies `${{ matrix.binary_asset }}` and `${{ matrix.cni_asset }}` into
+  `${{ matrix.arch_dir }}`) — are therefore frozen as one artifact-selection
+  contract in both workflows. Without it a pull request could repoint the
+  `linux/arm64` row at the x86_64 artifact and publish an ARM64 image
+  containing the wrong binary while the protected ARM64 build still succeeded.
+  Freezing those two steps alone would still leave the rest of the job able to
+  rewrite the context they prepared: a pull request could keep the matrix and
+  both steps byte-for-byte identical, add a second download of the x86_64
+  artifact, and copy it over `docker-context/bin/arm64/ferrum-edge` before the
+  image is built. The **entire `steps:` list** of each Docker publishing job is
+  therefore frozen as well, in both workflows and against both the pinned
+  contract and the merge base, so no later step — including one that assembles
+  the context path out of shell variables, or repoints the build's `context:`
+  input — can touch the prepared per-arch binaries. Editing a Docker publishing
+  job requires updating `PUBLISH_CONTROL_CONTRACTS` in the same commit; the
+  remaining publishing jobs stay editable.
+- The manifest jobs that assemble the published tags select their inputs by
+  **wildcard**, not by name: `docker-manifest` and `docker-ebpf-manifest`
+  download `docker-digest-*`/`docker-ebpf-digest-*` into `/tmp/digests` and
+  hand every file in that directory to `docker buildx imagetools create`.
+  Freezing the per-platform producers alone therefore left the published
+  `latest` and release tags reachable, because artifacts are scoped to the
+  **workflow run** rather than to `needs`: a pull request could add an unrelated
+  push-only job that uploads one more matching digest and have it collected with
+  no edge in the job graph at all. Each manifest job's `needs`, its gating
+  condition, its `Download digests` step, and the `imagetools create` commands
+  are frozen, `docker-ebpf`'s `needs`, `strategy`, and `Upload digest` step are
+  frozen alongside the other producers, and — because freezing the job graph
+  cannot stop an *added* job — the digest artifact **name space itself is
+  owned**: only `docker` may produce a `docker-digest-*` name and only
+  `docker-ebpf` may produce a `docker-ebpf-digest-*` one. A name assembled by an
+  expression is ruled out only when its literal prefix already disagrees with
+  the wildcard, so `docker-digest-${{ github.actor }}` from any other job is
+  rejected while `binary-${{ matrix.target }}` and unrelated artifact names stay
+  editable. This is checked against both the pinned contract and the proposed
+  tree, so an added job is caught even though it changes no frozen field.
+  Ownership does not depend on how the uploading step is written: every
+  `actions/upload-artifact` reference is checked whatever its ref (tag, branch,
+  SHA, or none), and a repo-local composite action may not produce a digest
+  artifact at all, because the job that calls it — and therefore whether it is
+  the frozen owner — is not knowable from the action file.
+- Every job that publishes by **wildcard** freezes its whole `steps:` list, not
+  only the download that feeds it. `latest-release` and `create-release` publish
+  whatever is left in `release-assets/` (`files: release-assets/*` and
+  `gh release create ... release-assets/*`), and the manifest jobs publish
+  whatever digests the download produced. Freezing only the download list or the
+  `needs` graph therefore left every other step of those jobs — including one
+  whose stated purpose is release notes — free to add a wildcard download, copy
+  an extra file into `release-assets`, or hard-code an additional digest into a
+  published tag. The frozen step lists are `latest-release` and `docker-manifest`
+  in CI and `create-release`, `docker-manifest`, and `docker-ebpf-manifest` in
+  the release workflow. Changing one is a trusted-base change on `main`, exactly
+  like the protected ARM64 build job; the published outputs themselves are
+  unchanged.
+- Flow-spelled YAML is normalized before scanning. `- {uses: ./evil-action}`,
+  `- {run: ./evil.sh}`, `with: {name: docker-digest-evil}`, and
+  `defaults: {run: {shell: python}}` are the same documents to the runner as
+  their block spellings, but every line-oriented scan — local-action roots,
+  repository-script following, artifact-name ownership, and workflow shell
+  selection — independently loses sight of them. Rather than teach each scan a
+  second syntax, one shared layer renders the flow spellings into the block lines
+  they stand for and the existing scans are repeated over that rendering, with
+  reported line numbers mapped back to the physical source line. The raw pass is
+  unchanged, so the normalized pass can only add findings: no anchor, alias,
+  merge-key, expression, literal-value-set, shell, local-action, artifact
+  ownership, generated-command, or frozen-contract protection is replaced by it.
+  Block-scalar bodies are left alone — `- {a: b}` inside a `run: |` script is a
+  shell argument, not a step — and a malformed flow collection is reported rather
+  than read as an absent one.
+- The two protected workflows reach the trusted pull-request gate only through
+  their own comparison, because `ci.yml` and `release.yml` are excluded from the
+  generic workflow collection. That comparison read only the raw rendering, so a
+  flow-spelled step outside the protected ARM64 job produced no surface on either
+  side and compared equal. The proposed and merge-base copies of both workflows
+  are now scanned through the same flow-normalized second pass the absolute
+  contract uses, and the digest-ownership scan the comparison already ran against
+  the proposed tree is repeated over that rendering. **Deliberate boundary:** the
+  hash-frozen protected job, top-level `env`, and trigger stay *comparisons*
+  against the live trusted base rather than absolute re-validations of the
+  proposed file, so a base that predates the contract — or the bootstrap commit
+  that introduces it — is not retroactively frozen. Everything that is a policy
+  rule rather than a base-relative digest is enforced against the proposed tree
+  directly.
+- A repo-local composite action is checked for digest uploads on the **proposed**
+  side of a pull request, not only in the trusted baseline. Adding an
+  `actions/upload-artifact` step named `docker-digest-*` to an existing action
+  such as `setup-sccache` introduces no Cross token, so the Cross-surface
+  comparison sees no change; the action would pass the gate and then contribute
+  an extra digest to the wildcard manifest job on the next `main` or tag run. The
+  guard is absolute rather than compared, because a local action may never own a
+  digest name at all, and it runs over the flow rendering as well.
+- Committed Python bytecode is rejected instead of being skipped by suffix. A
+  `.pyc` under a scanned automation root is executable automation that no reader
+  here can inspect, and `cd scripts && python evil.pyc` is a spelling the command
+  scanner did not even recognize, so Cross or publishing code inside the bytecode
+  was never examined. Bytecode operands are now recognized and rejected wherever
+  they are invoked, committed `.pyc`/`.pyo` paths are rejected from the proposed
+  tree listing and from every git-reconstructed automation tree — including
+  nested `__pycache__` directories — and the live working copy still ignores the
+  interpreter's own untracked cache, which `git ls-tree` never reports, so a
+  generated file cannot produce a false positive.
+- A relative command operand is resolved from the directory the shell is
+  actually in. `cd docs; bash scripts/coverage.sh` runs `docs/scripts/coverage.sh`,
+  but the tracked directory was previously applied only to slashless names, so
+  the policy recorded and scanned the approved-root `scripts/coverage.sh` while
+  the runner executed an unscanned same-name path. Every relative repository
+  command now inherits the tracked directory, `..` is normalized across nested
+  and repeated `cd`s instead of discarding the directory state, and anything that
+  leaves the tree — an absolute path, `~`, `cd -`, an expansion, a conditional
+  `cd`, or a traversal above the repository root — fails closed. Absolute
+  handling and correct root-relative resolution are unchanged.
+- `python -m <module>` is an executable repository dispatch. Only inline `-c`
+  programs were extracted, so `python -m cross build --target
+  aarch64-unknown-linux-gnu` read as a benign Python invocation even though
+  Python loads a module from the checkout. Interpreter options are now parsed
+  through `-m` — including bundled clusters (`-Im`), attached modules (`-mpkg`),
+  and operand-taking options (`-W`, `-X`) — and a literal module is resolved
+  against the tracked directory to `<module>.py` or `<module>/__main__.py`, which
+  must be a scanned automation file. A computed module name, an unmodeled option
+  that could move the module slot, an unknown working directory, or a module that
+  resolves outside the approved roots all fail closed. Modules that ship with the
+  interpreter or an installed tool (`py_compile`, `pip`, `venv`, `unittest`,
+  `json.tool`, and the rest of the allowlist) stay usable, and `-c`, `-`, and
+  ordinary script-path invocations are untouched.
+- `rustup run <toolchain> <command>` executes its command operand like `nice` or
+  `timeout`, with a mandatory toolchain operand in between, so executable
+  dispatch follows it: `rustup run stable ./cross build --target ...` is read as
+  the `./cross` invocation it is. Subcommands that only manage toolchains and
+  components (`component`, `toolchain`, `target`, `update`, and the rest) execute
+  nothing the caller named and are not followed, so ordinary
+  `rustup component add clippy` stays editable and no trust is extended to
+  repository executables outside the approved automation roots.
+- `latest-release` and `create-release` download the five build artifacts by
+  exact name instead of by a `binary-*`/`release-binaries-*` wildcard, so an
+  unrelated job cannot contribute a colliding upload to a published release.
+  Each then copies a closed, auditable list of exact trusted files, asserts
+  that the published set equals that list exactly, and verifies every `.sha256`
+  sidecar before publishing. Native and protected ARM64 publishing are both
+  preserved: the ARM64 artifact is downloaded under its own exact name.
+- The Cross process starts through `env -i` with an explicit minimal host
+  environment and fixed compiler variables. This removes `CROSS_CONFIG`, every
+  `CROSS_BUILD_*`/`CROSS_TARGET_*` alias, image/Dockerfile/pre-build/runner
+  overrides, custom-toolchain and compatibility flags, Docker/Podman engine and
+  option overrides, remote mode, Cargo default-target overrides, and arbitrary
+  inherited `CARGO_*` passthrough values before Cross reads configuration.
+
+The trusted `pull_request_target` job checks out only the base SHA with
+read-only contents permission, and verifies that the checkout is exactly the
+triggering base SHA because it is the only code the job executes. Because
+`main` can advance after the event is created, the job then fetches the live
+base branch tip into a fixed local ref, requires it to descend from the
+triggering base SHA, and pins it to one immutable commit SHA that every
+baseline extraction and comparison reads; a live tip that does not descend from
+the triggering base is a rewritten or confused ref and fails closed. It fetches
+the PR head without checking it out,
+requires the fetched object to equal the immutable head SHA from the triggering
+event, then extracts `Cross.toml`, `Cargo.toml`, `.cargo/config.toml`, the
+complete proposed and live-base workflow and repo-local action directories,
+and the approved automation roots plus the root build-dispatcher manifests as
+hostile data. The verifier it executes, and every trusted contract that
+verifier reads — `ci.yml`, `release.yml`, the workflow, local-action, and
+automation baselines, and the trusted policy workflow itself — are all
+extracted from that one pinned live trusted tip, never from the possibly stale
+event-base checkout, so a Cross surface that only the newer live-base verifier
+recognizes is still enforced. GitHub loads the policy workflow file itself from
+the event base and it therefore cannot be re-executed from the live tip; that
+extraction contract is instead authenticated by comparison and fails closed
+when the trusted tip has moved it, which self-heals as soon as the pull
+request's base is updated. Each NUL-delimited
+`git ls-tree` result is materialized and its status checked before consumption;
+regular blobs may use letters, digits, `.`, `_`, `+`, `@`, `~`, spaces, and
+`-`, while dot-dot components, symlinks, gitlinks, and NULs fail closed. A
+proposed legacy `.cargo/config` is surfaced and rejected. Proposed executable
+and configuration surfaces are compared with the live trusted base tip,
+preventing both a stale branch and a stale event base from restoring a surface
+removed from main. The verifier and trusted workflow themselves are compared
+with `<live base>...<PR head>`, preserving merge-base behavior only for the
+question of whether the PR authored a protected-file modification, mode change,
+rename, or deletion. The verifier enforces this shape on the trusted workflow
+itself, rejecting a baseline read from the stale event-base checkout as well as
+an unfetched, unpinned, or unauthenticated live base. On pull
+requests, the ordinary `CI Plan` executes the base branch's
+trusted verifier when it exists and never imports or runs the proposed script.
+For this one bootstrap PR, where no base verifier or base-loaded trusted
+workflow can exist yet, CI syntax-compiles and executes the reviewed proposed
+verifier; all later PRs necessarily execute the protected base copy. Every
+verifier invocation uses Python isolated mode so the script directory,
+`PYTHONPATH`, and user site cannot redirect its standard-library imports. This
+policy step runs before every other repository Python entry point in the plan
+job, and the subsequent planner self-test and its imported live-suite path
+filter are also extracted from the base branch on pull requests. The planner
+example consumes the exact `origin/${BASE_REF}` fetched by the immediately
+preceding policy step, so those adjacent steps have an intentional ordering
+dependency.
 
 #### 8. Latest Release and Docker Jobs
 
 **Runs**: `ubuntu-latest`
 
-On pushes to `main`, the `main-publish-gate` job first waits for the completed build matrix, the `Tests` aggregate, and successful push runs of the dedicated Coverage, Gateway API Conformance, and Mesh E2E Sidecar Live Datapath workflows for the same commit. The `latest-release` job and the per-architecture Linux Docker publishing job can run in parallel only after that gate passes; the `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease, but neither publish path can start until every release check passes. Version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
+On pushes to `main`, the `main-publish-gate` job runs after the native build matrix and the `Tests` aggregate, then waits for successful same-commit push runs of the dedicated Coverage, Gateway API Conformance, and Mesh E2E Sidecar Live Datapath workflows. A missing, failed, cancelled, or timed-out dedicated run fails the gate closed. The `latest-release` job and the per-architecture Linux Docker publishing job keep their direct dependencies on the `Tests` aggregate, the native build matrix, and the protected `build-arm64-cross` job, and additionally require a successful `main-publish-gate`; they can run in parallel only once all four succeed. The `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease, but neither publish path can start until every release check passes. Version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
 
 ## Release Pipeline (release.yml)
 
@@ -384,7 +862,8 @@ before publishing binaries or registry tags if it still has no success.
 
 ### Release Build Job
 
-**Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest` (matrix)
+**Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest` (four-target native
+matrix plus the isolated Linux ARM64 job)
 
 Depends on `Validate release SHA`, then builds optimized release binaries for all target platforms:
 
@@ -404,7 +883,7 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 6. Upload artifact
 
 **Cross-Compilation**:
-- Linux ARM64 uses `cross` tool for seamless compilation; `cross` requires Docker or Podman on the build host.
+- Linux ARM64 uses checksum-verified `cross` 0.2.5 in the isolated protected invocation job; `cross` requires Docker on the build host.
 - Other targets use standard `cargo build`; macOS x86_64 builds on the `macos-latest` runner (currently ARM64) with the standard Apple/Rust target tooling — pin to a concrete runner image such as `macos-14` if the host architecture must be guaranteed.
 
 **Output**:
@@ -593,11 +1072,13 @@ If automatic release fails:
 ```bash
 # Build binaries manually with the same release features as CI. Install protoc
 # for every host first. Linux hosts also need libcurl4-openssl-dev, Windows
-# MSVC builds need NASM in PATH, and Linux ARM64 uses cross (`cargo install cross`)
-# with Docker or Podman running.
+# MSVC builds need NASM in PATH. For Linux ARM64, install the pinned Cross 0.2.5
+# binary and copy the exact `env -i` invocation from build-release-arm64-cross;
+# do not substitute an unpinned `cargo install cross` or inherited environment.
 # On a Linux host:
 cargo build --features cloud-secrets --release --target x86_64-unknown-linux-gnu
-cross build --features cloud-secrets --release --target aarch64-unknown-linux-gnu
+# Then run the complete pinned ARM64 command from build-release-arm64-cross in
+# .github/workflows/release.yml (including its revalidation and `env -i` block).
 
 # On a macOS host:
 cargo build --features cloud-secrets --release --target x86_64-apple-darwin
@@ -797,7 +1278,9 @@ gh secret set DOCKERHUB_TOKEN --body "your-token"
 
 ### Adding New Targets
 
-Edit both `.github/workflows/ci.yml` (`build-binaries`) and `.github/workflows/release.yml` (`build-release-binaries`):
+For a new native target, edit both `.github/workflows/ci.yml`
+(`build-binaries`) and `.github/workflows/release.yml`
+(`build-release-binaries`):
 
 ```yaml
 strategy:
@@ -811,8 +1294,10 @@ strategy:
 ```
 
 Musl targets need their own toolchain setup. Add `musl-tools` before a native
-`cargo build`, or route the target through `cross build` and install `cross`
-in the workflow the same way the ARM64 Linux target does.
+`cargo build`. A Cross-backed target requires a separate isolated invocation
+job, a complete Cross configuration allowlist, fixed empty environment, and an
+updated trusted verifier contract; do not add an unguarded Cross invocation to
+the native matrix.
 
 ### Skipping Steps
 

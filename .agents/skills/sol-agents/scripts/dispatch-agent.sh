@@ -5,7 +5,7 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
-    '                         --effort high|xhigh|max' >&2
+    '                         --effort medium|high|xhigh' >&2
 }
 
 worktree=''
@@ -54,7 +54,7 @@ while (($#)); do
 done
 
 case "$effort" in
-  high|xhigh|max) ;;
+  medium|high|xhigh) ;;
   *)
     printf 'Invalid effort: %s\n' "${effort:-<empty>}" >&2
     usage

@@ -11,6 +11,13 @@ The customization layer is purely a serialization-time wrapper. Existing
 deployments are unaffected — when no `schema` / `schema_ref` is set, the
 plugin emits native field names exactly as before.
 
+HTTP-family schemas include `grpc_status` as a native numeric field. It is the
+final gRPC application status and remains separate from
+`response_status_code`; missing terminal status on a known gRPC transaction
+normalizes to UNKNOWN (`2`), while malformed input retains the existing
+`u32::MAX` invalid-status sentinel. It can be omitted, renamed, or placed in
+`order` like any other HTTP native field.
+
 ## Quick Start
 
 ```yaml
@@ -223,7 +230,7 @@ schema raises.)
 | `status_class` | `"1xx"` / `"2xx"` / `"3xx"` / `"4xx"` / `"5xx"` / `"other"` from `response_status_code` | always `"none"` | always `"none"` |
 | `backend_host` | hostname from `backend_target` (port stripped, IPv6 brackets honored) | hostname from `backend_target` (port stripped, IPv6 brackets honored) | hostname from `backend_target` (port stripped, IPv6 brackets honored) |
 | `summary_kind` | `"http"` | `"websocket_disconnect"` | `"stream"` |
-| `outcome` | `"error"` when `response_status_code >= 500` or any error_class is set; else `"ok"` | `"error"` when `error_class` is set; else `"ok"` | `"error"` when `connection_error`, `error_class`, or `disconnect_cause: backend_error` is set; else `"ok"` |
+| `outcome` | `"error"` when `response_status_code >= 500` or the authoritative terminal predicate matches (dispatch/body/incomplete/disconnect/rejection/nonzero gRPC status); else `"ok"` | `"error"` when `error_class` is set; else `"ok"` | `"error"` when `connection_error`, `error_class`, or `disconnect_cause: backend_error` is set; else `"ok"` |
 
 ### Metadata Modes
 
@@ -294,7 +301,7 @@ reload.
 
 | Plugin | Schema-aware output | Notes |
 |---|---|---|
-| `stdout_logging` | Full | Writes one JSON line per summary to stdout through the non-blocking writer, independent of `FERRUM_LOG_LEVEL`. Optional filter (`status_code_min/max`, `min_latency_ms`, `errors_only`) runs before schema application. |
+| `stdout_logging` | Full | Reserves bounded stdout queue capacity before serialization; independent of `FERRUM_LOG_LEVEL`. Optional filter (`status_code_min/max`, `min_latency_ms`, `errors_only`) runs before schema application. |
 | `http_logging` | Full | Batched JSON array. |
 | `tcp_logging` | Full | NDJSON, one line per entry. |
 | `udp_logging` | Full | Batched JSON array per UDP datagram. Operators should keep per-summary size under MTU. |

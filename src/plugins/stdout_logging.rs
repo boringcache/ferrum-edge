@@ -7,21 +7,21 @@
 //! Writes go through the process-global non-blocking stdout writer installed
 //! by `init_logging` (see [`crate::logging::access_log_writer`]). That keeps
 //! the proxy hot path free of synchronous `stdout().lock()` writes — each log
-//! line is a bounded-channel send handled off-thread — and decouples access
-//! logging from `FERRUM_LOG_LEVEL`: enabling this plugin is the only on/off
-//! switch, and lowering runtime verbosity never silences it. When no global
-//! writer is installed (in-process unit tests that never call `init_logging`)
-//! it falls back to a direct synchronous write so output is still produced.
+//! line is admitted to bounded record and byte budgets before serialization,
+//! then handled off-thread — and decouples access logging from
+//! `FERRUM_LOG_LEVEL`: enabling this plugin is the only on/off switch. When no
+//! global writer is installed (in-process unit tests that never call
+//! `init_logging`) it returns without performing blocking I/O.
 //!
 //! An optional `filter` (status-code range, minimum latency, errors-only)
 //! gates which transactions are logged; it runs before schema application.
 //! This is also the sink mesh mode injects to honor a Telemetry CRD's
 //! `accessLogging` configuration.
 
-use std::io::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::warn;
 
@@ -46,9 +46,26 @@ impl StdoutLogging {
         if !(config.is_object() || config.is_null()) {
             return Err("stdout_logging: config must be an object".to_string());
         }
+        if let Some(config) = config.as_object() {
+            reject_unknown_keys(
+                config,
+                "stdout_logging",
+                &["filter", "schema", "schema_ref"],
+            )?;
+        }
         let filter = match config.get("filter") {
             Some(Value::Null) | None => None,
             Some(Value::Object(filter_config)) => {
+                reject_unknown_keys(
+                    filter_config,
+                    "stdout_logging.filter",
+                    &[
+                        "status_code_min",
+                        "status_code_max",
+                        "min_latency_ms",
+                        "errors_only",
+                    ],
+                )?;
                 let status_code_min = parse_optional_u16(filter_config, "status_code_min")?;
                 let status_code_max = parse_optional_u16(filter_config, "status_code_max")?;
                 if let (Some(min), Some(max)) = (status_code_min, status_code_max)
@@ -73,7 +90,8 @@ impl StdoutLogging {
         Ok(Self { filter, schema })
     }
 
-    fn should_log_http(&self, summary: &TransactionSummary) -> bool {
+    /// Apply the configured HTTP-family predicates to a finalized summary.
+    pub fn should_log_transaction(&self, summary: &TransactionSummary) -> bool {
         let Some(filter) = &self.filter else {
             return true;
         };
@@ -92,13 +110,14 @@ impl StdoutLogging {
         {
             return false;
         }
-        if filter.errors_only && summary.error_class.is_none() {
+        if filter.errors_only && !summary.is_terminal_failure() {
             return false;
         }
         true
     }
 
-    fn should_log_stream(&self, summary: &StreamTransactionSummary) -> bool {
+    /// Apply the configured stream-family predicates to a finalized summary.
+    pub fn should_log_stream_transaction(&self, summary: &StreamTransactionSummary) -> bool {
         let Some(filter) = &self.filter else {
             return true;
         };
@@ -116,6 +135,26 @@ impl StdoutLogging {
         }
         true
     }
+}
+
+fn reject_unknown_keys(
+    config: &Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let mut unknown: Vec<String> = config
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .map(|key| format!("{path}.{key}"))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    Err(format!(
+        "stdout_logging: unknown configuration key(s): {}",
+        unknown.join(", ")
+    ))
 }
 
 fn parse_optional_u16(config: &Map<String, Value>, key: &str) -> Result<Option<u16>, String> {
@@ -150,26 +189,17 @@ fn parse_optional_bool(config: &Map<String, Value>, key: &str) -> Result<Option<
         .ok_or_else(|| format!("stdout_logging: filter.{key} must be a boolean"))
 }
 
-/// Write one access-log line to the non-blocking stdout sink.
-///
-/// The full line (JSON + trailing newline) is built once and emitted with a
-/// single `write_all`, so it reaches the non-blocking writer's worker thread
-/// as one channel message and never interleaves with concurrent log output.
-fn write_access_log_line(mut json: String) {
-    json.push('\n');
-    match crate::logging::access_log_writer() {
-        Some(writer) => {
-            let mut writer = writer.clone();
-            let _ = writer.write_all(json.as_bytes());
-        }
-        // No global writer installed (in-process unit tests that never call
-        // `init_logging`): fall back to a direct synchronous write so output
-        // still appears. `validate` mode does call `init_logging`, so the
-        // global writer is present there.
-        None => {
-            let _ = std::io::stdout().write_all(json.as_bytes());
-        }
+/// Serialize and enqueue one access-log line after capacity reservation.
+fn write_access_log_line<T: Serialize + ?Sized>(value: &T) -> Result<(), serde_json::Error> {
+    if let Some(writer) = crate::logging::access_log_writer() {
+        // Saturation and oversize outcomes are accounted by the sink and
+        // intentionally do not log into either potentially degraded sink.
+        let _ = writer.try_write_json(value)?;
     }
+    // The gateway treats process-sink initialization failure as fatal. A
+    // missing writer therefore only occurs in library/unit contexts; never
+    // add a synchronous stdout fallback here because plugin hooks are hot paths.
+    Ok(())
 }
 
 #[async_trait]
@@ -187,30 +217,28 @@ impl Plugin for StdoutLogging {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        if !self.should_log_http(summary) {
+        if !self.should_log_transaction(summary) {
             return;
         }
         let result = match self.schema.as_ref().filter(|s| s.applies_to_http()) {
-            Some(schema) => serde_json::to_string(&SchemaView { summary, schema }),
-            None => serde_json::to_string(summary),
+            Some(schema) => write_access_log_line(&SchemaView { summary, schema }),
+            None => write_access_log_line(summary),
         };
-        match result {
-            Ok(json) => write_access_log_line(json),
-            Err(e) => warn!("stdout_logging: failed to serialize transaction summary: {e}"),
+        if let Err(error) = result {
+            warn!("stdout_logging: failed to serialize transaction summary: {error}");
         }
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        if !self.should_log_stream(summary) {
+        if !self.should_log_stream_transaction(summary) {
             return;
         }
         let result = match self.schema.as_ref().filter(|s| s.applies_to_stream()) {
-            Some(schema) => serde_json::to_string(&SchemaView { summary, schema }),
-            None => serde_json::to_string(summary),
+            Some(schema) => write_access_log_line(&SchemaView { summary, schema }),
+            None => write_access_log_line(summary),
         };
-        match result {
-            Ok(json) => write_access_log_line(json),
-            Err(e) => warn!("stdout_logging: failed to serialize stream summary: {e}"),
+        if let Err(error) = result {
+            warn!("stdout_logging: failed to serialize stream summary: {error}");
         }
     }
 }
@@ -266,7 +294,7 @@ mod tests {
     #[test]
     fn no_filter_logs_everything() {
         let plugin = StdoutLogging::new(&json!({})).expect("plugin config");
-        assert!(plugin.should_log_stream(&stream_summary()));
+        assert!(plugin.should_log_stream_transaction(&stream_summary()));
     }
 
     #[test]
@@ -276,7 +304,7 @@ mod tests {
         }))
         .expect("plugin config");
 
-        assert!(!plugin.should_log_stream(&stream_summary()));
+        assert!(!plugin.should_log_stream_transaction(&stream_summary()));
     }
 
     #[test]
@@ -286,7 +314,7 @@ mod tests {
         }))
         .expect("plugin config");
 
-        assert!(!plugin.should_log_stream(&stream_summary()));
+        assert!(!plugin.should_log_stream_transaction(&stream_summary()));
     }
 
     #[test]
@@ -296,7 +324,7 @@ mod tests {
         }))
         .expect("plugin config");
 
-        assert!(!plugin.should_log_stream(&stream_summary()));
+        assert!(!plugin.should_log_stream_transaction(&stream_summary()));
     }
 
     #[test]
@@ -366,28 +394,28 @@ mod tests {
         }))
         .expect("plugin config");
 
-        assert!(plugin.should_log_http(&http_summary(
+        assert!(plugin.should_log_transaction(&http_summary(
             503,
             250.0,
             Some(ErrorClass::ConnectionTimeout)
         )));
         // Below the status floor, above the ceiling, under the latency floor, and
         // without an error class are each individually excluded.
-        assert!(!plugin.should_log_http(&http_summary(
+        assert!(!plugin.should_log_transaction(&http_summary(
             499,
             250.0,
             Some(ErrorClass::ConnectionTimeout)
         )));
-        assert!(!plugin.should_log_http(&http_summary(
+        assert!(!plugin.should_log_transaction(&http_summary(
             600,
             250.0,
             Some(ErrorClass::ConnectionTimeout)
         )));
-        assert!(!plugin.should_log_http(&http_summary(
+        assert!(!plugin.should_log_transaction(&http_summary(
             503,
             249.0,
             Some(ErrorClass::ConnectionTimeout)
         )));
-        assert!(!plugin.should_log_http(&http_summary(503, 250.0, None)));
+        assert!(!plugin.should_log_transaction(&http_summary(503, 250.0, None)));
     }
 }

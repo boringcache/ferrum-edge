@@ -4,6 +4,7 @@ use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
     ai_rate_limiter::AiRateLimiter,
 };
+use ferrum_edge::proxy::client_ip::{TrustedProxies, resolve_client_ip};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -929,6 +930,27 @@ async fn test_tracked_keys_count_grows_with_distinct_keys() {
         .before_proxy(&mut ctx_a_again, &mut headers_a_again)
         .await;
     assert_eq!(plugin.tracked_keys_count(), Some(2));
+}
+
+#[tokio::test]
+async fn test_tracked_keys_count_uses_canonical_ingress_identity() {
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut native = create_test_context();
+    native.client_ip = "192.0.2.10".to_string();
+    let mut native_headers = HashMap::new();
+    plugin.before_proxy(&mut native, &mut native_headers).await;
+
+    let mut mapped = create_test_context();
+    mapped.client_ip = resolve_client_ip("::ffff:192.0.2.10", None, &TrustedProxies::parse(""));
+    let mut mapped_headers = HashMap::new();
+    plugin.before_proxy(&mut mapped, &mut mapped_headers).await;
+
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
 }
 
 // ─── SSE token accounting: absent vs zero (#53, #54) ───────────────────

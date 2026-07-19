@@ -91,6 +91,93 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    pub fn validate_correlation_id_composition_for_test(
+        plugins: &[Arc<dyn Plugin>],
+    ) -> Result<(), String> {
+        crate::plugin_cache::validate_correlation_id_composition(plugins, None)
+    }
+
+    pub fn validate_correlation_id_composition_with_real_ip_header_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        real_ip_header: Option<&str>,
+    ) -> Result<(), String> {
+        crate::plugin_cache::validate_correlation_id_composition(plugins, real_ip_header)
+    }
+
+    pub fn correlation_id_with_real_ip_header_for_test(
+        config: &serde_json::Value,
+        real_ip_header: Option<&str>,
+    ) -> Result<crate::plugins::correlation_id::CorrelationId, String> {
+        crate::plugins::correlation_id::CorrelationId::new_with_real_ip_header(
+            config,
+            real_ip_header,
+        )
+    }
+
+    pub fn udp_dtls_disconnect_metadata_after_datagram_metadata_for_test(
+        ctx: &mut crate::plugins::StreamConnectionContext,
+        datagram_metadata: HashMap<String, String>,
+    ) -> (HashMap<String, String>, HashMap<String, String>) {
+        let (connect_metadata, correlation_ids) = ctx.take_metadata_with_correlation_ids();
+
+        let udp_metadata = std::sync::Mutex::new(connect_metadata.clone());
+        crate::plugins::UdpMetadataSink::new(&udp_metadata).update(|metadata| {
+            metadata.extend(datagram_metadata.clone());
+        });
+        let udp_metadata = crate::proxy::udp_proxy::finalize_stream_summary_metadata(
+            udp_metadata
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            &correlation_ids,
+        );
+
+        let mut dtls_metadata = connect_metadata;
+        dtls_metadata.extend(datagram_metadata);
+        let dtls_metadata = crate::proxy::udp_proxy::finalize_stream_summary_metadata(
+            dtls_metadata,
+            &correlation_ids,
+        );
+
+        (udp_metadata, dtls_metadata)
+    }
+
+    pub fn plugin_cache_with_real_ip_header_for_test(
+        config: &crate::config::types::GatewayConfig,
+        real_ip_header: Option<&str>,
+    ) -> Result<crate::PluginCache, String> {
+        let http_client = crate::plugins::PluginHttpClient::default()
+            .with_real_ip_header(real_ip_header.map(str::to_string));
+        crate::PluginCache::with_http_client(config, http_client)
+    }
+
+    pub fn validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        config: &crate::config::types::GatewayConfig,
+        real_ip_header: Option<&str>,
+    ) -> Result<(), String> {
+        let http_client = crate::plugins::PluginHttpClient::default()
+            .with_real_ip_header(real_ip_header.map(str::to_string));
+        crate::plugin_cache::validate_plugin_composition_candidate(config, &http_client)
+    }
+
+    /// Exercise the mesh RTDS generation reconciliation boundary without
+    /// widening its runtime API beyond the crate.
+    pub fn reconcile_fault_plugin_generations_for_test(
+        candidate: &mut crate::config::types::GatewayConfig,
+        previous: &crate::config::types::GatewayConfig,
+    ) {
+        crate::modes::mesh::reconcile_fault_plugin_generations(candidate, previous);
+    }
+
+    /// Return the exact proxy targets used by incremental plugin-cache staging.
+    pub fn incremental_plugin_rebuild_targets_for_test(
+        current: &crate::config::types::GatewayConfig,
+        candidate: &crate::config::types::GatewayConfig,
+    ) -> HashSet<String> {
+        let delta = crate::config_delta::ConfigDelta::compute(current, candidate);
+        crate::proxy::plugin_rebuild_targets_for_incremental_stage(current, candidate, &delta)
+    }
+
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
     pub fn grpc_deadline_duration_millis_ceil_saturating_for_test(
         duration: std::time::Duration,
@@ -121,7 +208,7 @@ pub mod _test_support {
         }
     }
 
-    pub async fn finalize_plugin_rejection_for_test(
+    pub async fn finalize_plugin_rejection_parts_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
         status_code: u16,
@@ -491,6 +578,46 @@ pub mod _test_support {
     }
 
     // ── plugins/request_deduplication ─────────────────────────────────────────
+    pub fn request_deduplication_with_instance_id_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        instance_id: &str,
+    ) -> Result<crate::plugins::request_deduplication::RequestDeduplication, String> {
+        crate::plugins::request_deduplication::RequestDeduplication::new_with_instance_id(
+            config,
+            http_client,
+            instance_id,
+        )
+    }
+
+    pub async fn finalize_plugin_rejection_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        rejection: crate::plugins::PluginResult,
+    ) -> crate::plugins::PluginResult {
+        let Some(parts) = crate::proxy::plugin_result_into_reject_parts(rejection) else {
+            return crate::plugins::PluginResult::Continue;
+        };
+        let mut status = parts.status_code;
+        let mut headers = parts.headers;
+        let mut body = parts.body;
+        crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+            plugins,
+            ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            false,
+            false,
+        )
+        .await;
+        crate::plugins::PluginResult::RejectBinary {
+            status_code: status,
+            body: bytes::Bytes::from(body),
+            headers,
+        }
+    }
+
     pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)
     }
@@ -499,6 +626,31 @@ pub mod _test_support {
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
     ) -> (usize, usize) {
         plugin.completed_size_snapshot_for_tests()
+    }
+
+    pub fn request_deduplication_request_identity_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<(String, String)> {
+        plugin.request_identity_for_tests(ctx)
+    }
+
+    pub fn request_deduplication_set_request_state_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        ctx: &mut crate::plugins::RequestContext,
+        key: &str,
+        fingerprint: &str,
+        local_inflight_owner_token: &str,
+        redis_lock_token: Option<&str>,
+    ) {
+        crate::plugins::request_deduplication::set_request_state_for_test(
+            plugin,
+            ctx,
+            key,
+            fingerprint,
+            local_inflight_owner_token,
+            redis_lock_token,
+        );
     }
 
     pub fn request_deduplication_expire_completed_entries_for_test(
@@ -1035,6 +1187,67 @@ pub mod _test_support {
         crate::admin::crud::consumer_persist_error_response(&error)
     }
 
+    pub fn admin_consumer_persistence_response_for_test(
+        raw_backend_detail: &str,
+    ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+        let error = anyhow::anyhow!(raw_backend_detail.to_string());
+        crate::admin::crud::consumer_persist_error_response(&error)
+    }
+
+    pub fn admin_batch_persistence_message_for_test(raw_backend_detail: &str) -> String {
+        let error = anyhow::anyhow!(raw_backend_detail.to_string());
+        crate::admin::payload_persist_error_message(&error)
+    }
+
+    pub fn admin_recovery_persistence_message_for_test(raw_backend_detail: &str) -> String {
+        let error = anyhow::anyhow!(raw_backend_detail.to_string());
+        crate::admin::redacted_recovery_error_message(
+            "external_recovery_regression",
+            "failed to clear existing config",
+            &error,
+        )
+    }
+
+    pub fn admin_database_error_body_for_test(raw_backend_detail: &str) -> serde_json::Value {
+        crate::admin::db_error_response(&raw_backend_detail)
+    }
+
+    pub fn admin_wrapped_mtls_conflict_message_for_test(raw_backend_detail: &str) -> String {
+        let conflict = crate::config::db_backend::MtlsDnsIdentityConflict::new(vec![
+            "consumers edge-a and edge-b share mTLS DNS identity svc.internal".to_string(),
+        ]);
+        let error = anyhow::Error::new(conflict).context(raw_backend_detail.to_string());
+        crate::admin::payload_persist_error_message(&error)
+    }
+
+    pub fn admin_wrapped_mtls_conflict_response_for_test(
+        raw_backend_detail: &str,
+    ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+        let conflict = crate::config::db_backend::MtlsDnsIdentityConflict::new(vec![
+            "consumers edge-a and edge-b share mTLS DNS identity svc.internal".to_string(),
+        ]);
+        let error = anyhow::Error::new(conflict).context(raw_backend_detail.to_string());
+        crate::admin::crud::consumer_persist_error_response(&error)
+    }
+
+    pub fn admin_throttle_conflict_message_for_test(raw_backend_detail: &str) -> String {
+        let conflict =
+            crate::config::db_backend::TcpConnectionThrottleAttachmentConflict::new(vec![
+                "PluginConfig 'throttle-a' cannot attach to UDP proxy 'edge-a'".to_string(),
+            ]);
+        let error = anyhow::Error::new(conflict).context(raw_backend_detail.to_string());
+        crate::admin::payload_persist_error_message(&error)
+    }
+
+    pub fn admin_proxy_route_conflict_message_for_test(raw_backend_detail: &str) -> String {
+        let error = anyhow::anyhow!(
+            "{}: {}",
+            crate::config::db_backend::PROXY_ROUTE_CONFLICT_ERROR,
+            raw_backend_detail
+        );
+        crate::admin::payload_persist_error_message(&error)
+    }
+
     pub fn mysql_mtls_dns_admission_lock_insert_sql() -> &'static str {
         crate::config::db_loader::MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL
     }
@@ -1100,6 +1313,9 @@ pub mod _test_support {
         body: &[u8],
         headers: &HashMap<String, String>,
     ) -> bool {
+        // No provenance seeding here: the production delegate seeds it, so this
+        // shim stays a pure pass-through and tests observe the real behavior of
+        // direct H3 reject callers rather than a test-only head start.
         crate::http3::server::run_h3_reject_response_committed_hooks(
             plugins,
             ctx,
@@ -1113,6 +1329,27 @@ pub mod _test_support {
     }
 
     // ── proxy/mod ────────────────────────────────────────────────────────────
+    pub fn apply_effective_backend_scheme_headers_for_test(
+        headers: &mut HashMap<String, String>,
+        client_ip: &str,
+        request_is_secure: bool,
+        add_forwarded_header: bool,
+    ) {
+        crate::proxy::apply_effective_backend_scheme_headers(
+            headers,
+            client_ip,
+            request_is_secure,
+            add_forwarded_header,
+        );
+    }
+
+    pub fn collect_forwardable_websocket_headers_for_test(
+        raw_headers: &hyper::HeaderMap,
+        proxy_headers: &HashMap<String, String>,
+    ) -> Vec<(String, String)> {
+        crate::proxy::collect_forwardable_websocket_headers(raw_headers, proxy_headers)
+    }
+
     pub struct NormalizedRejectResponse {
         pub http_status: StatusCode,
         pub headers: HashMap<String, String>,
@@ -1147,6 +1384,29 @@ pub mod _test_support {
         }
     }
 
+    /// The production buffered-H3 sticky-affinity injector: writes the cookie
+    /// and, on injection, records `set-cookie` as gRPC-deadline gateway-owned.
+    /// This is the exact function the buffered H3 call sites invoke, so a test
+    /// through it covers the inject-then-record ordering itself rather than
+    /// re-implementing it.
+    pub fn h3_inject_sticky_cookie_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        epoch: &crate::request_epoch::RequestEpoch,
+        proxy: &crate::config::types::Proxy,
+        upstream_target: Option<&crate::config::types::UpstreamTarget>,
+        sticky_cookie_needed: bool,
+        response_headers: &mut HashMap<String, String>,
+    ) -> bool {
+        crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
+            ctx,
+            epoch,
+            proxy,
+            upstream_target,
+            sticky_cookie_needed,
+            response_headers,
+        )
+    }
+
     pub fn h3_buffered_grpc_deadline_replacement_for_test(
         grpc_web_response_content_type: Option<&str>,
     ) -> NormalizedRejectResponse {
@@ -1155,10 +1415,17 @@ pub mod _test_support {
             "POST".to_string(),
             "/test.Service/Call".to_string(),
         );
+        ctx.set_grpc_deadline_budget(Some(1_000));
         let mut headers = HashMap::from([
             ("content-type".to_string(), "application/json".to_string()),
-            ("x-correlation-id".to_string(), "request-123".to_string()),
+            ("tracestate".to_string(), "backend=spoof".to_string()),
+            ("x-backend-secret".to_string(), "secret".to_string()),
+            ("set-cookie".to_string(), "session=secret".to_string()),
+            ("vary".to_string(), "Accept-Encoding, Origin".to_string()),
         ]);
+        ctx.begin_buffered_deadline_response_header_provenance(&headers);
+        headers.insert("x-correlation-id".to_string(), "request-123".to_string());
+        ctx.record_deadline_response_header_mutations(&headers);
         let mut body = b"backend response".to_vec();
         let http_status = crate::http3::server::replace_buffered_h3_response_with_grpc_deadline(
             &mut ctx,
@@ -1181,7 +1448,8 @@ pub mod _test_support {
 
     pub fn buffered_grpc_deadline_replacement_for_test(
         grpc_web_response_content_type: Option<&str>,
-        mut headers: HashMap<String, String>,
+        mut backend_headers: HashMap<String, String>,
+        gateway_headers: HashMap<String, String>,
         mut body: Vec<u8>,
     ) -> NormalizedRejectResponse {
         let mut ctx = crate::plugins::RequestContext::new(
@@ -1189,16 +1457,20 @@ pub mod _test_support {
             "POST".to_string(),
             "/test.Service/Call".to_string(),
         );
+        ctx.set_grpc_deadline_budget(Some(1_000));
+        ctx.begin_buffered_deadline_response_header_provenance(&backend_headers);
+        backend_headers.extend(gateway_headers);
+        ctx.record_deadline_response_header_mutations(&backend_headers);
         let http_status = crate::proxy::replace_buffered_grpc_response_with_deadline(
             &mut ctx,
             grpc_web_response_content_type,
-            &mut headers,
+            &mut backend_headers,
             &mut body,
             &[],
         );
         NormalizedRejectResponse {
             http_status,
-            headers,
+            headers: backend_headers,
             body,
             grpc_status: ctx
                 .metadata
@@ -1226,6 +1498,60 @@ pub mod _test_support {
         .await
     }
 
+    pub async fn run_after_proxy_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
+            .await
+            .is_some()
+    }
+
+    /// Like [`run_after_proxy_hooks_for_test`] but surfaces the terminal
+    /// rejection parts (status, body, headers) when an `after_proxy` hook
+    /// rejects or exhausts the RPC deadline, so tests can assert which gateway
+    /// decorations survive onto the synthesized DEADLINE_EXCEEDED response.
+    pub async fn run_after_proxy_hooks_reject_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
+        crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
+            .await
+            .map(|reject| (reject.status_code, reject.body, reject.headers))
+    }
+
+    /// Declare response-header keys a trusted hook wrote as a WHOLE-VALUE
+    /// REPLACEMENT (a `response_transformer` `update`/`rename` destination, or
+    /// an `add` into a slot a `remove` cleared), mirroring the declaration
+    /// `response_transformer` makes. Lets tests exercise the
+    /// owned-replacement-then-deadline path without a full proxy request.
+    ///
+    /// This is NOT the sticky-affinity cookie path — that is an APPEND and uses
+    /// [`record_deadline_response_header_mutations_for_test`].
+    pub fn record_deadline_owned_response_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        owned_header_names: &[&str],
+        response_headers: &HashMap<String, String>,
+    ) {
+        ctx.record_deadline_owned_response_headers(owned_header_names, response_headers);
+    }
+
+    /// Record a gateway-authored response-header APPEND into deadline
+    /// provenance without claiming ownership, mirroring what proxy core does
+    /// after injecting the sticky-session affinity `Set-Cookie` outside any
+    /// plugin mutation. Lets tests exercise the sticky-cookie-then-deadline
+    /// path without a full proxy request.
+    pub fn record_deadline_response_header_mutations_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) {
+        ctx.record_deadline_response_header_mutations(response_headers);
+    }
+
     pub async fn transform_buffered_response_body_with_deadline_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -1234,7 +1560,7 @@ pub mod _test_support {
         response_body: &mut Vec<u8>,
         grpc_web_response_content_type: Option<&str>,
     ) -> bool {
-        crate::proxy::transform_buffered_response_body_with_deadline(
+        transform_buffered_response_body_with_deadline_and_policy_for_test(
             plugins,
             ctx,
             response_status,
@@ -1242,6 +1568,27 @@ pub mod _test_support {
             response_body,
             grpc_web_response_content_type,
             &[],
+        )
+        .await
+    }
+
+    pub async fn transform_buffered_response_body_with_deadline_and_policy_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut Vec<u8>,
+        grpc_web_response_content_type: Option<&str>,
+        initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    ) -> bool {
+        crate::proxy::transform_buffered_response_body_with_deadline(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            grpc_web_response_content_type,
+            initial_response_header_policy_plugins,
         )
         .await
         .0
@@ -1448,6 +1795,14 @@ pub mod _test_support {
 
     pub fn clone_log_metadata(ctx: &crate::plugins::RequestContext) -> HashMap<String, String> {
         crate::proxy::clone_log_metadata(ctx)
+    }
+
+    pub fn ai_prompt_compressor_marker_scan_work_for_test(
+        body: &[u8],
+        tag: &str,
+    ) -> Option<(Vec<u8>, usize, usize)> {
+        let tags = (format!("<{tag}>"), format!("</{tag}>"));
+        crate::plugins::ai_prompt_compressor::preserve_marker_sanitizer_work_for_test(body, &tags)
     }
 
     // ── plugins/ai_semantic_cache staging fields ─────────────────────────────

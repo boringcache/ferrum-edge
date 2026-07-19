@@ -785,6 +785,7 @@ fn build_plain_request_builder(
     effective_host: &str,
     client_ip: &str,
     xff_append_ip: &str,
+    request_is_secure: bool,
     is_early_data: bool,
 ) -> reqwest::RequestBuilder {
     let mut req_builder = client.request(req_method, backend_url);
@@ -831,8 +832,9 @@ fn build_plain_request_builder(
         xff_append_ip,
         &state.trusted_proxies,
     );
+    let request_scheme = if request_is_secure { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
-    req_builder = req_builder.header("X-Forwarded-Proto", "https");
+    req_builder = req_builder.header("X-Forwarded-Proto", request_scheme);
     if let Some(host) = original_host_header {
         req_builder = req_builder.header("X-Forwarded-Host", host);
     }
@@ -842,7 +844,7 @@ fn build_plain_request_builder(
     if state.add_forwarded_header {
         req_builder = req_builder.header(
             "Forwarded",
-            crate::proxy::build_forwarded_value(client_ip, "https", original_host_header),
+            crate::proxy::build_forwarded_value(client_ip, request_scheme, original_host_header),
         );
     }
     // RFC 8470 §5.2: signal to the origin that this request was carried
@@ -1708,6 +1710,7 @@ where
                             effective_host,
                             client_ip,
                             xff_append_ip,
+                            ctx.request_is_secure,
                             ctx.is_early_data,
                         )
                         .body(buffered_body.clone())
@@ -2157,6 +2160,7 @@ where
                     effective_host,
                     client_ip,
                     xff_append_ip,
+                    ctx.request_is_secure,
                     ctx.is_early_data,
                 );
 
@@ -2632,7 +2636,13 @@ where
 
     // Sticky session cookie injection — only runs if the LB selected a
     // sticky target.
-    crate::http3::server::inject_sticky_cookie(
+    // `run_after_proxy_hooks` above already armed deadline provenance, so the
+    // buffered variant can claim the affinity cookie as gateway-owned. The
+    // buffered branch below hands this response to `response_committed` hooks
+    // under `grpc_web_deadline_at`; a deadline rebuild there keeps gateway-owned
+    // headers only, and an unrecorded cookie would be dropped.
+    crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
+        ctx,
         epoch,
         proxy,
         current_target.as_deref(),
@@ -2741,6 +2751,7 @@ where
                     response_status,
                     &mut response_headers,
                     &mut response_body,
+                    initial_response_header_policy_plugins,
                 )
                 .await;
                 for plugin in plugins {
@@ -2765,20 +2776,32 @@ where
                     }
                 }
 
-                for plugin in plugins {
-                    if let Some(transformed) = plugin
-                        .transform_response_body_with_context(
-                            &mut *ctx,
-                            &response_body,
-                            content_type_of(&response_headers),
+                if crate::plugins::response_body_rewrite_allowed(response_status) {
+                    for plugin in plugins {
+                        if let Some(transformed) = plugin
+                            .transform_response_body_with_context(
+                                &mut *ctx,
+                                &response_body,
+                                content_type_of(&response_headers),
+                                &response_headers,
+                            )
+                            .await
+                        {
+                            response_headers.insert(
+                                "content-length".to_string(),
+                                transformed.len().to_string(),
+                            );
+                            response_body = transformed;
+                            crate::plugins::finalize_response_body_transformation(
+                                plugin.as_ref(),
+                                ctx,
+                                &mut response_headers,
+                            );
+                        }
+                        ctx.record_deadline_response_header_plugin(
+                            plugin.as_ref(),
                             &response_headers,
-                        )
-                        .await
-                    {
-                        response_headers
-                            .insert("content-length".to_string(), transformed.len().to_string());
-                        response_body = transformed;
-                        plugin.on_response_body_transformed(ctx, &mut response_headers);
+                        );
                     }
                 }
 
@@ -3208,6 +3231,7 @@ fn build_h3_grpc_backend_headers(
     proxy_headers: &HashMap<String, String>,
     client_ip: &str,
     xff_append_ip: &str,
+    request_is_secure: bool,
     is_early_data: bool,
 ) -> HeaderMap {
     let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
@@ -3243,9 +3267,11 @@ fn build_h3_grpc_backend_headers(
     if let Ok(val) = HeaderValue::from_str(&xff_val) {
         hmap.insert("x-forwarded-for", val);
     }
-    // `x-forwarded-proto=https` is identical across H3 requests (H3 is
-    // always TLS) — use `from_static` to skip the header-value parse.
-    hmap.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    let request_scheme = if request_is_secure { "https" } else { "http" };
+    hmap.insert(
+        "x-forwarded-proto",
+        HeaderValue::from_static(request_scheme),
+    );
     if let Some(host) = original_host_header
         && let Ok(val) = HeaderValue::from_str(host)
     {
@@ -3257,7 +3283,8 @@ fn build_h3_grpc_backend_headers(
         hmap.insert(hyper::header::VIA, val);
     }
     if state.add_forwarded_header {
-        let fwd = crate::proxy::build_forwarded_value(client_ip, "https", original_host_header);
+        let fwd =
+            crate::proxy::build_forwarded_value(client_ip, request_scheme, original_host_header);
         if let Ok(val) = HeaderValue::from_str(&fwd) {
             hmap.insert(hyper::header::FORWARDED, val);
         }
@@ -3273,9 +3300,9 @@ fn build_h3_grpc_backend_headers(
     hmap
 }
 
-/// Extract the gateway-trusted consumer-identity headers (`x-consumer-username`
-/// / `x-consumer-custom-id`) from the materialised `proxy_headers` into a
-/// minimal map.
+/// Extract the gateway-trusted plugin assertions (`x-consumer-username`,
+/// `x-consumer-custom-id`, and `x-geo-country`) from the materialised
+/// `proxy_headers` into a minimal map.
 ///
 /// The H3 gRPC dispatch builds its backend header set up-front
 /// ([`build_h3_grpc_backend_headers`]) and passes empty `proxy_headers` to the
@@ -3284,31 +3311,32 @@ fn build_h3_grpc_backend_headers(
 /// `merge_proxy_headers_and_strip_for_grpc` strips reserved identity headers
 /// from the base map and re-adds them ONLY from its `proxy_headers` arg (so a
 /// client cannot forge a principal). An empty arg therefore drops the
-/// gateway-verified `x-consumer-*` that `build_h3_grpc_backend_headers` copied
-/// in, hiding the authenticated principal from the backend. Passing this minimal
-/// map preserves the trusted identity while still keeping the forwarding headers
-/// from being re-merged. Empty when no principal was resolved — the merge then
-/// strips any client-forged value and adds nothing, preserving the spoof
-/// protection (codex P2).
-fn trusted_identity_proxy_headers(
+/// gateway-verified assertions that `build_h3_grpc_backend_headers` copied in,
+/// hiding the authenticated principal or geo result from the backend. Passing
+/// this minimal map preserves those trusted assertions while still keeping the
+/// forwarding headers from being re-merged. Empty when no assertion was
+/// produced — the merge then strips any client-forged value and adds nothing,
+/// preserving the spoof protection.
+fn trusted_plugin_assertion_proxy_headers(
     proxy_headers: &HashMap<String, String>,
 ) -> HashMap<String, String> {
-    let mut identity = HashMap::new();
+    let mut assertions = HashMap::new();
     // The H3 server injects these post-auth as `X-Consumer-Username` /
     // `X-Consumer-Custom-Id` (capitalised — see `src/http3/server.rs`), so match
     // CASE-INSENSITIVELY: a case-sensitive lowercase lookup would miss them and
     // still drop the authenticated principal (codex P2). Stored lowercase — the
     // gRPC core's merge re-parses the name via `HeaderName` (which lowercases)
     // regardless. The reserved set mirrors
-    // `proxy::headers::strip_reserved_consumer_identity_headers`.
+    // `proxy::headers::strip_reserved_gateway_assertion_headers`.
     for (key, value) in proxy_headers {
         if key.eq_ignore_ascii_case("x-consumer-username")
             || key.eq_ignore_ascii_case("x-consumer-custom-id")
+            || key.eq_ignore_ascii_case("x-geo-country")
         {
-            identity.insert(key.to_ascii_lowercase(), value.clone());
+            assertions.insert(key.to_ascii_lowercase(), value.clone());
         }
     }
-    identity
+    assertions
 }
 
 /// Stream a live gRPC backend response (`GrpcResponseKind::Streaming`) onto an
@@ -4024,6 +4052,7 @@ where
         proxy_headers,
         client_ip,
         xff_append_ip,
+        ctx.request_is_secure,
         ctx.is_early_data,
     );
 
@@ -4089,10 +4118,11 @@ where
     // headers synthesized by this bridge). Passing the original
     // `proxy_headers` again would let the shared gRPC core overwrite
     // canonical forwarding values (`x-forwarded-*`, `via`, `forwarded`), so
-    // pass ONLY the gateway-trusted consumer identity: the core's merge strips
-    // reserved `x-consumer-*` from `hmap` and re-adds them solely from this arg,
-    // so an empty map would drop the authenticated principal (codex P2).
-    let identity_proxy_headers = trusted_identity_proxy_headers(proxy_headers);
+    // pass ONLY the gateway-trusted plugin assertions: the core's merge strips
+    // reserved `x-consumer-*` and `x-geo-country` from `hmap` and re-adds them
+    // solely from this arg, so an empty map would drop the authenticated
+    // principal and authoritative geo result.
+    let trusted_assertion_headers = trusted_plugin_assertion_proxy_headers(proxy_headers);
     let grpc_connection_proxy =
         crate::proxy::resolve_backend_connection_proxy_for_target(proxy, current_target.as_deref());
     let grpc_dispatch_proxy = grpc_connection_proxy.as_ref();
@@ -4104,7 +4134,7 @@ where
         &current_url,
         &state.grpc_pool,
         &state.dns_cache,
-        &identity_proxy_headers,
+        &trusted_assertion_headers,
         stream_grpc_response,
         state.max_response_body_size_bytes,
         ctx.grpc_deadline_at(),
@@ -4294,7 +4324,7 @@ where
                 &current_url,
                 &state.grpc_pool,
                 &state.dns_cache,
-                &identity_proxy_headers,
+                &trusted_assertion_headers,
                 stream_grpc_response,
                 state.max_response_body_size_bytes,
                 ctx.grpc_deadline_at(),
@@ -4469,6 +4499,7 @@ where
                 response_status,
                 &mut plugin_response_headers,
                 &mut response_body,
+                initial_response_header_policy_plugins,
             )
             .await
             {
@@ -4523,36 +4554,46 @@ where
             // while the wire trailers stay separate for the split H3 wire shape.
             // content-length updates land on the view and flow into the wire
             // headers after reconciliation below.
-            for plugin in plugins.iter() {
-                let transformed = match crate::plugins::await_grpc_deadline(
-                    ctx.grpc_deadline_at(),
-                    plugin.transform_response_body_with_context(
-                        &mut *ctx,
-                        &response_body,
-                        content_type_of(&plugin_response_headers),
-                        &plugin_response_headers,
-                    ),
-                )
-                .await
-                {
-                    Ok(transformed) => transformed,
-                    Err(()) => {
-                        replace_buffered_grpc_response_with_deadline(
+            if crate::plugins::response_body_rewrite_allowed(response_status) {
+                for plugin in plugins.iter() {
+                    let transformed = match crate::plugins::await_grpc_deadline(
+                        ctx.grpc_deadline_at(),
+                        plugin.transform_response_body_with_context(
+                            &mut *ctx,
+                            &response_body,
+                            content_type_of(&plugin_response_headers),
+                            &plugin_response_headers,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(transformed) => transformed,
+                        Err(()) => {
+                            replace_buffered_grpc_response_with_deadline(
+                                ctx,
+                                &mut response_status,
+                                &mut plugin_response_headers,
+                                &mut response_body,
+                                &mut response_trailers,
+                                initial_response_header_policy_plugins,
+                            );
+                            break;
+                        }
+                    };
+                    if let Some(transformed) = transformed {
+                        plugin_response_headers
+                            .insert("content-length".to_string(), transformed.len().to_string());
+                        response_body = transformed;
+                        crate::plugins::finalize_response_body_transformation(
+                            plugin.as_ref(),
                             ctx,
-                            &mut response_status,
                             &mut plugin_response_headers,
-                            &mut response_body,
-                            &mut response_trailers,
-                            initial_response_header_policy_plugins,
                         );
-                        break;
                     }
-                };
-                if let Some(transformed) = transformed {
-                    plugin_response_headers
-                        .insert("content-length".to_string(), transformed.len().to_string());
-                    response_body = transformed;
-                    plugin.on_response_body_transformed(ctx, &mut plugin_response_headers);
+                    ctx.record_deadline_response_header_plugin(
+                        plugin.as_ref(),
+                        &plugin_response_headers,
+                    );
                 }
             }
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
@@ -4650,7 +4691,12 @@ where
             // the merged view ensures it lands in the wire HEADERS frame even when
             // the backend sent a trailer-only `set-cookie` (a non-shadowed trailer
             // key that the strip loop above just removed from the headers).
-            crate::http3::server::inject_sticky_cookie(
+            // The buffered variant also records the affinity cookie as
+            // gateway-owned before the `response_committed` hooks below can
+            // rebuild this response as a gRPC deadline error, which retains
+            // gateway-owned headers only.
+            crate::http3::server::inject_sticky_cookie_with_deadline_provenance(
+                ctx,
                 epoch,
                 proxy,
                 current_target.as_deref(),
@@ -5127,6 +5173,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         proxy_headers,
         client_ip,
         xff_append_ip,
+        ctx.request_is_secure,
         ctx.is_early_data,
     );
 
@@ -5245,12 +5292,12 @@ pub(crate) async fn dispatch_grpc_streaming(
     // Dispatch with the channel-backed streaming body. No retry: the request
     // body is consumed on the wire. `hmap` already carries the canonical
     // forwarding headers, so don't re-pass the full `proxy_headers` (the core
-    // would re-merge and overwrite them) — pass only the gateway-trusted consumer
-    // identity, since the core's merge strips reserved `x-consumer-*` from `hmap`
-    // and re-adds them solely from this arg, so an empty map would drop the
-    // authenticated principal (codex P2).
+    // would re-merge and overwrite them) — pass only the gateway-trusted plugin
+    // assertions, since the core's merge strips reserved `x-consumer-*` and
+    // `x-geo-country` from `hmap` and re-adds them solely from this arg. An empty
+    // map would drop the authenticated principal and authoritative geo result.
     let body_size_exceeded = Arc::new(AtomicBool::new(false));
-    let identity_proxy_headers = trusted_identity_proxy_headers(proxy_headers);
+    let trusted_assertion_headers = trusted_plugin_assertion_proxy_headers(proxy_headers);
     let grpc_connection_proxy =
         crate::proxy::resolve_backend_connection_proxy_for_target(proxy, current_target.as_deref());
     let grpc_dispatch_proxy = grpc_connection_proxy.as_ref();
@@ -5261,7 +5308,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         grpc_dispatch_proxy,
         backend_url,
         &state.grpc_pool,
-        &identity_proxy_headers,
+        &trusted_assertion_headers,
         state.max_grpc_recv_size_bytes,
         Arc::clone(&body_size_exceeded),
         None,
@@ -7164,7 +7211,7 @@ mod tests {
 
     use super::{
         apply_buffered_grpc_plugin_reject, apply_buffered_plain_plugin_reject,
-        apply_h3_grpc_reject_metadata, build_plain_request_builder,
+        apply_h3_grpc_reject_metadata, build_h3_grpc_backend_headers, build_plain_request_builder,
         cross_protocol_header_write_disconnect_outcome, inspected_emitted_response_limit_exceeded,
         normalize_h3_grpc_reject, record_cross_protocol_client_acquire_failure,
         record_cross_protocol_connection_start, reject_body_as_h3_grpc_message,
@@ -8187,6 +8234,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn h3_cross_protocol_forwarding_uses_effective_request_scheme() {
+        let mut state = minimal_proxy_state();
+        state.add_forwarded_header = true;
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+        let headers = HashMap::from([("host".to_string(), "api.example".to_string())]);
+
+        let request = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            "203.0.113.1",
+            /* request_is_secure = */ false,
+            /* is_early_data = */ false,
+        )
+        .build()
+        .expect("request should build");
+        assert_eq!(
+            header_value(&request, "x-forwarded-proto"),
+            Some(&b"http"[..])
+        );
+        assert_eq!(
+            header_value(&request, "forwarded"),
+            Some(&b"for=203.0.113.1;proto=http;host=api.example"[..])
+        );
+
+        let grpc_headers = build_h3_grpc_backend_headers(
+            &state,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            /* request_is_secure = */ false,
+            /* is_early_data = */ false,
+        );
+        assert_eq!(
+            grpc_headers
+                .get("x-forwarded-proto")
+                .map(|value| value.as_bytes()),
+            Some(&b"http"[..])
+        );
+        assert_eq!(
+            grpc_headers.get("forwarded").map(|value| value.as_bytes()),
+            Some(&b"for=203.0.113.1;proto=http;host=api.example"[..])
+        );
+    }
+
+    #[tokio::test]
     async fn build_plain_request_builder_injects_early_data_header_when_zero_rtt() {
         let state = minimal_proxy_state();
         let proxy = minimal_proxy();
@@ -8205,6 +8304,7 @@ mod tests {
             "backend.example",
             "203.0.113.1",
             "203.0.113.1",
+            /* request_is_secure = */ true,
             /* is_early_data = */ true,
         );
 
@@ -8240,6 +8340,7 @@ mod tests {
             "backend.example",
             "203.0.113.1",
             "203.0.113.1",
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -8273,6 +8374,7 @@ mod tests {
             "backend.example",
             "203.0.113.1",
             "203.0.113.1",
+            /* request_is_secure = */ true,
             /* is_early_data = */ true,
         );
 
@@ -8312,6 +8414,7 @@ mod tests {
             "backend.example",
             "203.0.113.1",
             "203.0.113.1",
+            /* request_is_secure = */ true,
             /* is_early_data = */ false,
         );
 
@@ -8347,6 +8450,7 @@ mod tests {
             "backend.example",
             "198.51.100.7", // resolved client (already in the chain)
             "10.0.0.7",     // immediate QUIC peer (the LB)
+            true,
             false,
         )
         .build()
@@ -8370,6 +8474,7 @@ mod tests {
             "backend.example",
             "203.0.113.9", // resolved from FERRUM_REAL_IP_HEADER
             "10.0.0.7",    // immediate QUIC peer (the LB)
+            true,
             false,
         )
         .build()
@@ -8391,6 +8496,7 @@ mod tests {
             "backend.example",
             "203.0.113.1",
             "203.0.113.1",
+            true,
             false,
         )
         .build()
@@ -8544,19 +8650,18 @@ mod tests {
         );
     }
 
-    /// Regression guard (codex P2): the H3 gRPC dispatch must forward the
-    /// gateway-trusted consumer identity (`x-consumer-*`) to the backend. The
-    /// shared gRPC core's `merge_proxy_headers_and_strip_for_grpc` strips reserved
-    /// identity headers from the pre-built header map and re-adds them ONLY from
-    /// its proxy_headers arg, so passing an empty map drops the authenticated
-    /// principal. Both the buffered and streaming H3 gRPC paths must pass the
-    /// trusted-identity map instead.
+    /// Regression guard: the H3 gRPC dispatch must forward gateway-trusted
+    /// consumer identity and geo assertions to the backend. The shared gRPC
+    /// core's `merge_proxy_headers_and_strip_for_grpc` strips these reserved
+    /// headers from the pre-built map and re-adds them ONLY from its
+    /// proxy_headers arg, so passing an empty map drops the assertions. Both the
+    /// buffered and streaming paths must pass the trusted-assertion map instead.
     #[test]
-    fn h3_grpc_dispatch_preserves_trusted_consumer_identity() {
+    fn h3_grpc_dispatch_preserves_trusted_plugin_assertions() {
         let src = include_str!("cross_protocol.rs");
         assert!(
-            src.contains("fn trusted_identity_proxy_headers"),
-            "the trusted-identity extraction helper must exist"
+            src.contains("fn trusted_plugin_assertion_proxy_headers"),
+            "the trusted-assertion extraction helper must exist"
         );
         // Build the forbidden pattern from parts so this assertion's own source
         // text does not trip the `include_str!` self-scan.
@@ -8564,47 +8669,50 @@ mod tests {
         assert!(
             !src.contains(&forbidden_empty),
             "regression: an H3 gRPC dispatch declares an empty proxy_headers map for the \
-             gRPC core, whose merge would then DROP the authenticated x-consumer-* \
-             identity — pass trusted_identity_proxy_headers(proxy_headers) instead"
+             gRPC core, whose merge would then DROP the trusted x-consumer-* and \
+             x-geo-country assertions"
         );
     }
 
-    /// The H3 server injects the trusted principal as `X-Consumer-Username` /
-    /// `X-Consumer-Custom-Id` (capitalised), so the extraction must match
-    /// case-insensitively — a case-sensitive lowercase lookup would silently drop
-    /// the authenticated identity for every H3 gRPC request (codex P2).
+    /// The H3 server and plugins may materialise trusted assertions with
+    /// capitalised names, so extraction must match case-insensitively.
     #[test]
-    fn trusted_identity_proxy_headers_matches_case_insensitively() {
+    fn trusted_plugin_assertion_headers_match_case_insensitively() {
         let mut proxy_headers = HashMap::new();
         proxy_headers.insert("X-Consumer-Username".to_string(), "alice".to_string());
         proxy_headers.insert("X-Consumer-Custom-Id".to_string(), "cid-1".to_string());
+        proxy_headers.insert("X-Geo-Country".to_string(), "SE".to_string());
         proxy_headers.insert("x-forwarded-for".to_string(), "1.2.3.4".to_string());
 
-        let identity = super::trusted_identity_proxy_headers(&proxy_headers);
+        let assertions = super::trusted_plugin_assertion_proxy_headers(&proxy_headers);
 
         assert_eq!(
-            identity.get("x-consumer-username").map(String::as_str),
+            assertions.get("x-consumer-username").map(String::as_str),
             Some("alice"),
             "capitalised X-Consumer-Username must be matched case-insensitively"
         );
         assert_eq!(
-            identity.get("x-consumer-custom-id").map(String::as_str),
+            assertions.get("x-consumer-custom-id").map(String::as_str),
             Some("cid-1")
         );
-        assert!(
-            !identity.contains_key("x-forwarded-for"),
-            "only the reserved identity headers are extracted"
+        assert_eq!(
+            assertions.get("x-geo-country").map(String::as_str),
+            Some("SE")
         );
-        assert_eq!(identity.len(), 2);
+        assert!(
+            !assertions.contains_key("x-forwarded-for"),
+            "only reserved plugin assertions are extracted"
+        );
+        assert_eq!(assertions.len(), 3);
     }
 
     #[test]
-    fn trusted_identity_proxy_headers_empty_without_principal() {
-        // No resolved principal: the merge then strips any client-forged value and
+    fn trusted_plugin_assertion_headers_empty_without_assertions() {
+        // No resolved assertion: the merge strips client-forged values and
         // re-adds nothing, preserving the spoof protection.
         let mut proxy_headers = HashMap::new();
         proxy_headers.insert("host".to_string(), "example.test".to_string());
-        assert!(super::trusted_identity_proxy_headers(&proxy_headers).is_empty());
+        assert!(super::trusted_plugin_assertion_proxy_headers(&proxy_headers).is_empty());
     }
 
     /// Regression guard (codex P2): a late client-upload overflow on the streaming

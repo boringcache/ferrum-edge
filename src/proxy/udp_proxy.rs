@@ -30,15 +30,33 @@ use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
-    Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
-    StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
-    UdpMetadataSink,
+    CorrelationIdState, Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind,
+    StreamConnectionContext, StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection,
+    UdpDatagramVerdict, UdpMetadataSink,
 };
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
 /// Maximum datagram size for UDP forwarding.
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
+
+/// Canonical identity used at every UDP/DTLS session-admission boundary.
+pub fn udp_session_client_ip(client_addr: SocketAddr) -> Arc<str> {
+    Arc::from(client_addr.ip().to_canonical().to_string())
+}
+
+/// Maximum response payload allowed by the UDP amplification guard.
+///
+/// A zero-length request receives an explicit one-byte reply allowance so the
+/// legal datagram does not create a black-holed session. Nonempty requests keep
+/// the configured payload ratio exactly.
+pub fn udp_amplification_response_budget(request_size: u64, factor: f32) -> u64 {
+    if request_size == 0 {
+        1
+    } else {
+        (request_size as f64 * factor as f64) as u64
+    }
+}
 
 /// Metrics for a single UDP proxy listener.
 #[derive(Default)]
@@ -74,8 +92,10 @@ struct UdpSession {
     expired: std::sync::atomic::AtomicBool,
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
-    /// Size of the last client→backend datagram for amplification factor checking.
-    /// Updated on each forwarded request; read on each backend→client response.
+    /// Size of the latest accepted client→backend datagram for amplification
+    /// factor checking. Published before the backend send so a loopback reply
+    /// cannot race ahead of the response budget.
+    /// Updated on each policy-accepted request; read on each backend→client response.
     last_request_size: AtomicU64,
     /// Backend target for logging (e.g., "10.0.2.10:5353").
     backend_target: String,
@@ -98,6 +118,10 @@ struct UdpSession {
     auth_method: Option<&'static str>,
     /// Plugin metadata from on_stream_connect, carried to on_stream_disconnect.
     metadata: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Immutable authoritative correlation ownership captured after admission.
+    /// Per-datagram hooks mutate only `metadata`; disconnect-summary construction
+    /// re-projects this state after cloning that final writable map.
+    correlation_ids: CorrelationIdState,
     /// Plugins and proxy metadata resolved from the RequestEpoch used to create this session.
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     datagram_plugins: Arc<[Arc<dyn Plugin>]>,
@@ -590,20 +614,32 @@ fn rfc3339_from_epoch_millis(ms: u64) -> String {
         .unwrap_or_default()
 }
 
+/// Restore private correlation ownership after every plugin-writable metadata
+/// merge and immediately before the disconnect summary becomes observable.
+pub(crate) fn finalize_stream_summary_metadata(
+    mut metadata: std::collections::HashMap<String, String>,
+    correlation_ids: &CorrelationIdState,
+) -> std::collections::HashMap<String, String> {
+    correlation_ids.project_correlation_ids(&mut metadata);
+    metadata
+}
+
 fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransactionSummary {
     let created_ms = context.session.created_at.load(Ordering::Relaxed);
-    let metadata = context
+    let writable_metadata = context
         .session
         .metadata
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let metadata =
+        finalize_stream_summary_metadata(writable_metadata, &context.session.correlation_ids);
 
     StreamTransactionSummary {
         namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
         proxy_name: context.proxy_name.map(|name| name.to_string()),
-        client_ip: context.client_addr.ip().to_string(),
+        client_ip: context.client_addr.ip().to_canonical().to_string(),
         consumer_username: context.session.consumer_username.clone(),
         auth_method: context.session.auth_method,
         backend_target: context.session.backend_target.clone(),
@@ -662,14 +698,18 @@ struct DtlsDisconnectContext<'a> {
     disconnect_direction: Option<crate::plugins::Direction>,
     disconnect_cause: Option<crate::plugins::DisconnectCause>,
     metadata: &'a std::collections::HashMap<String, String>,
+    correlation_ids: &'a CorrelationIdState,
 }
 
 fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransactionSummary {
+    let metadata =
+        finalize_stream_summary_metadata(context.metadata.clone(), context.correlation_ids);
+
     StreamTransactionSummary {
         namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
         proxy_name: context.proxy_name.map(|name| name.to_string()),
-        client_ip: context.client_addr.ip().to_string(),
+        client_ip: context.client_addr.ip().to_canonical().to_string(),
         consumer_username: context.consumer_username,
         auth_method: context.auth_method,
         backend_target: context.backend_target.to_string(),
@@ -686,7 +726,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         timestamp_connected: context.connected_at.to_rfc3339(),
         timestamp_disconnected: context.disconnected_at.to_rfc3339(),
         sni_hostname: None,
-        metadata: context.metadata.clone(),
+        metadata,
     }
 }
 
@@ -1912,7 +1952,7 @@ async fn process_new_session_datagram(
         std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
     if !udp_datagram_allowed(
         &view.datagram_plugins,
-        Arc::from(client_addr.ip().to_string()),
+        udp_session_client_ip(client_addr),
         Arc::from(view.proxy.id.as_str()),
         view.proxy.name.as_deref().map(Arc::from),
         listen_port,
@@ -2066,6 +2106,15 @@ async fn forward_client_datagram_to_backend(
     session: &Arc<UdpSession>,
     data: &[u8],
 ) -> Result<(), anyhow::Error> {
+    // Publish the response budget before the send. In particular, a loopback
+    // backend can receive and answer between the send syscall and this task
+    // being polled again; publishing only after send completion lets that first
+    // response bypass the amplification guard. A failed send still leaves a
+    // conservative budget based on bytes accepted from the client.
+    session
+        .last_request_size
+        .store(data.len() as u64, Ordering::Release);
+
     let send_result = if let Some(ref dtls) = session.dtls_conn {
         dtls.send(data)
             .await
@@ -2085,9 +2134,6 @@ async fn forward_client_datagram_to_backend(
             session
                 .bytes_sent
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
-            session
-                .last_request_size
-                .store(data.len() as u64, Ordering::Relaxed);
             Ok(())
         }
         Err(e) => Err(anyhow::anyhow!("send to backend failed: {}", e)),
@@ -2310,50 +2356,41 @@ async fn start_dtls_frontend_listener(
                 let proxy_name = proxy.name.clone();
                 let proxy_namespace = proxy.namespace.clone();
                 let backend_scheme = proxy.effective_scheme();
+                let client_ip = udp_session_client_ip(client_addr);
 
                 // Run on_stream_connect plugins (with DTLS client cert if available)
-                let mut stream_ctx = StreamConnectionContext {
-                    client_ip: client_addr.ip().to_string(),
+                let stream_client_ip = client_ip.to_string();
+                let mut stream_ctx = StreamConnectionContext::new(
+                    stream_client_ip.clone(),
                     // PROXY protocol is not supported on UDP/DTLS (TCP-borne only);
                     // direct_client_ip always equals client_ip for UDP sessions.
-                    direct_client_ip: client_addr.ip().to_string(),
-                    canonical_client_ip: Default::default(),
-                    proxy_id: proxy.id.clone(),
-                    proxy_name: proxy_name.clone(),
-                    listen_port: port,
+                    stream_client_ip,
+                    proxy.id.clone(),
+                    proxy_name.clone(),
+                    port,
                     backend_scheme,
                     consumer_index,
-                    identified_consumer: None,
-                    authenticated_identity: None,
-                    auth_method: None,
-                    metadata: None,
-                    admission_permits: Vec::new(),
-                    tls_client_cert_der: client_conn.tls_client_cert_der.clone(),
-                    tls_client_cert_chain_der: client_conn.tls_client_cert_chain_der.clone(),
-                    sni_hostname: client_conn.sni_hostname.clone(),
-                    mesh_direction: None,
-                    // Node-waypoint per-pod policy scoping is intentionally not
-                    // wired for UDP/DTLS and cannot be without a new capture
-                    // path. Identity is keyed by the per-connection socket
-                    // cookie (`SO_COOKIE`), which node-agent eBPF stamps from
-                    // the source pod via the `connect4`/`connect6` cgroup hooks;
-                    // there are no UDP capture hooks, and a UDP stream proxy
-                    // serves all clients from one shared frontend socket with a
-                    // single cookie, so there is no per-source-pod cookie to
-                    // resolve here. With `per_pod_policy_scoping` on
-                    // (node-waypoint topology), `mesh_authz` stamps
-                    // `mesh_authz.scope_missing` and, because the per-pod scope is
-                    // always absent here, fails closed (rejects the stream, 403)
-                    // when any namespace/selector-scoped policy is configured;
-                    // with only mesh-wide policies it evaluates them normally.
-                    // Per-pod scoped enforcement is unavailable for DTLS streams
-                    // (TCP and HTTP/HBONE have it). See docs/mesh.md.
-                    node_waypoint_policy_scope: None,
-                    // UDP inspects payload per-datagram via on_udp_datagram, not
-                    // via first_bytes (which is a TCP-stream concept).
-                    first_bytes: None,
-                    first_bytes_kind: None,
-                };
+                );
+                stream_ctx.tls_client_cert_der = client_conn.tls_client_cert_der.clone();
+                stream_ctx.tls_client_cert_chain_der =
+                    client_conn.tls_client_cert_chain_der.clone();
+                stream_ctx.sni_hostname = client_conn.sni_hostname.clone();
+                // The constructor intentionally leaves node-waypoint per-pod
+                // policy scope absent: UDP/DTLS cannot wire it without a new
+                // capture path. Identity is keyed by the per-connection socket
+                // cookie (`SO_COOKIE`), which node-agent eBPF stamps from
+                // the source pod via the `connect4`/`connect6` cgroup hooks;
+                // there are no UDP capture hooks, and a UDP stream proxy
+                // serves all clients from one shared frontend socket with a
+                // single cookie, so there is no per-source-pod cookie to
+                // resolve here. With `per_pod_policy_scoping` on
+                // (node-waypoint topology), `mesh_authz` stamps
+                // `mesh_authz.scope_missing` and, because the per-pod scope is
+                // always absent here, fails closed (rejects the stream, 403)
+                // when any namespace/selector-scoped policy is configured;
+                // with only mesh-wide policies it evaluates them normally.
+                // Per-pod scoped enforcement is unavailable for DTLS streams
+                // (TCP and HTTP/HBONE have it). See docs/mesh.md.
                 let mut rejected = false;
                 for plugin in plugins.iter() {
                     if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
@@ -2410,8 +2447,8 @@ async fn start_dtls_frontend_listener(
                     None
                 };
                 let handler_auth_method = stream_ctx.auth_method;
-                let handler_metadata = if handler_has_plugins {
-                    stream_ctx.take_metadata()
+                let (handler_metadata, handler_correlation_ids) = if handler_has_plugins {
+                    stream_ctx.take_metadata_with_correlation_ids()
                 } else {
                     Default::default()
                 };
@@ -2509,6 +2546,7 @@ async fn start_dtls_frontend_listener(
                             disconnect_direction,
                             disconnect_cause,
                             metadata: &merged_metadata,
+                            correlation_ids: &handler_correlation_ids,
                         });
                         crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
 
@@ -2993,7 +3031,7 @@ async fn handle_dtls_client_inner(
     let dgram_plugins = Arc::clone(datagram_plugins);
     // Pre-compute context strings as Arc<str> — per-datagram "clone" is a pointer
     // bump (~5ns) instead of heap allocation + memcpy.
-    let dgram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_string());
+    let dgram_client_ip = udp_session_client_ip(client_addr);
     let dgram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let dgram_proxy_name: Option<Arc<str>> = proxy_name.map(Arc::from);
     let dgram_listen_port = listen_port;
@@ -3050,6 +3088,9 @@ async fn handle_dtls_client_inner(
                 }
             }
 
+            // Publish before sending so a fast backend reply cannot observe a
+            // zero or stale amplification budget.
+            last_request_size_fwd.store(len as u64, Ordering::Release);
             let send_ok = if let Some(ref dtls) = backend_dtls_write {
                 dtls.send(&data).await.map_err(|e| e.to_string())
             } else if let Some(ref sock) = backend_udp_write {
@@ -3074,7 +3115,6 @@ async fn handle_dtls_client_inner(
                 .bytes_out
                 .fetch_add(len as u64, Ordering::Relaxed);
             bytes_sent_fwd.fetch_add(len as u64, Ordering::Relaxed);
-            last_request_size_fwd.store(len as u64, Ordering::Relaxed);
             activity_fwd.store(coarse_epoch_millis(), Ordering::Relaxed);
         }
     });
@@ -3114,12 +3154,10 @@ async fn handle_dtls_client_inner(
 
             // Amplification factor check for DTLS path
             if let Some(factor) = amplification_factor_rev {
-                let req_size = last_request_size_rev.load(Ordering::Relaxed);
-                if req_size > 0 {
-                    let max_response = (req_size as f64 * factor as f64) as u64;
-                    if len as u64 > max_response {
-                        continue; // Drop oversized response
-                    }
+                let req_size = last_request_size_rev.load(Ordering::Acquire);
+                let max_response = udp_amplification_response_budget(req_size, factor);
+                if len as u64 > max_response {
+                    continue; // Drop oversized response
                 }
             }
 
@@ -3201,7 +3239,7 @@ async fn create_session(
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
     crls: &crate::tls::CrlList,
-    _initial_data: &[u8],
+    initial_data: &[u8],
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
     listener_shutdown: &watch::Receiver<bool>,
@@ -3222,47 +3260,35 @@ async fn create_session(
     let proxy_namespace = proxy.namespace.clone();
     let backend_scheme = proxy.effective_scheme();
     let is_passthrough = proxy.passthrough;
+    let client_ip = udp_session_client_ip(client_addr);
 
     // Run on_stream_connect plugins before creating backend connection
-    let mut stream_ctx = StreamConnectionContext {
-        client_ip: client_addr.ip().to_string(),
+    let stream_client_ip = client_ip.to_string();
+    let mut stream_ctx = StreamConnectionContext::new(
+        stream_client_ip.clone(),
         // PROXY protocol is not supported on plain UDP (TCP-borne only);
         // direct_client_ip always equals client_ip for UDP sessions.
-        direct_client_ip: client_addr.ip().to_string(),
-        canonical_client_ip: Default::default(),
-        proxy_id: proxy_id.to_string(),
-        proxy_name: proxy_name.clone(),
+        stream_client_ip,
+        proxy_id.to_string(),
+        proxy_name.clone(),
         listen_port,
         backend_scheme,
         consumer_index,
-        identified_consumer: None,
-        authenticated_identity: None,
-        auth_method: None,
-        metadata: None,
-        admission_permits: Vec::new(),
-        tls_client_cert_der: None,
-        tls_client_cert_chain_der: None,
-        sni_hostname,
-        mesh_direction: None,
-        // Node-waypoint per-pod policy scoping is intentionally not wired for
-        // plain UDP and cannot be without a new capture path. Identity is keyed
-        // by the per-connection socket cookie (`SO_COOKIE`) that node-agent
-        // eBPF stamps from the source pod via the `connect4`/`connect6` cgroup
-        // hooks; there are no UDP capture hooks, and this UDP proxy demultiplexes
-        // every client off one shared frontend socket with a single cookie, so
-        // there is no per-source-pod cookie to resolve here. With
-        // `per_pod_policy_scoping` on (node-waypoint topology), `mesh_authz`
-        // stamps `mesh_authz.scope_missing` and, because the per-pod scope is
-        // always absent here, fails closed (rejects the stream, 403) when any
-        // namespace/selector-scoped policy is configured; with only mesh-wide
-        // policies it evaluates them normally. Per-pod scoped enforcement is
-        // unavailable for UDP streams (TCP and HTTP/HBONE have it). See docs/mesh.md.
-        node_waypoint_policy_scope: None,
-        // UDP inspects payload per-datagram via on_udp_datagram, not via
-        // first_bytes (which is a TCP-stream concept).
-        first_bytes: None,
-        first_bytes_kind: None,
-    };
+    );
+    stream_ctx.sni_hostname = sni_hostname;
+    // The constructor intentionally leaves node-waypoint per-pod policy scope
+    // absent: plain UDP cannot wire it without a new capture path. Identity is
+    // keyed by the per-connection socket cookie (`SO_COOKIE`) that node-agent
+    // eBPF stamps from the source pod via the `connect4`/`connect6` cgroup
+    // hooks; there are no UDP capture hooks, and this UDP proxy demultiplexes
+    // every client off one shared frontend socket with a single cookie, so
+    // there is no per-source-pod cookie to resolve here. With
+    // `per_pod_policy_scoping` on (node-waypoint topology), `mesh_authz`
+    // stamps `mesh_authz.scope_missing` and, because the per-pod scope is
+    // always absent here, fails closed (rejects the stream, 403) when any
+    // namespace/selector-scoped policy is configured; with only mesh-wide
+    // policies it evaluates them normally. Per-pod scoped enforcement is
+    // unavailable for UDP streams (TCP and HTTP/HBONE have it). See docs/mesh.md.
     for plugin in plugins.iter() {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
             return Err(
@@ -3470,9 +3496,10 @@ async fn create_session(
     let now = coarse_epoch_millis();
     let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
     let auth_method = stream_ctx.auth_method;
-    let datagram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_string());
+    let datagram_client_ip = Arc::clone(&client_ip);
     let datagram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let datagram_proxy_name: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
+    let (metadata, correlation_ids) = stream_ctx.take_metadata_with_correlation_ids();
     let session = Arc::new(UdpSession {
         backend_socket: backend_socket.clone(),
         dtls_conn: dtls_conn.clone(),
@@ -3481,13 +3508,16 @@ async fn create_session(
         expired: std::sync::atomic::AtomicBool::new(false),
         bytes_sent: AtomicU64::new(0),
         bytes_received: AtomicU64::new(0),
-        last_request_size: AtomicU64::new(0),
+        // Establish the first response budget before the reply task is spawned.
+        // The caller has already accepted this datagram through policy hooks.
+        last_request_size: AtomicU64::new(initial_data.len() as u64),
         backend_target: format!("{}:{}", backend_host, backend_port),
         backend_resolved_ip: resolved_ip.to_string(),
         sni_hostname: stream_ctx.sni_hostname.clone(),
         consumer_username,
         auth_method,
-        metadata: std::sync::Mutex::new(stream_ctx.take_metadata()),
+        metadata: std::sync::Mutex::new(metadata),
+        correlation_ids,
         local_addr: std::sync::OnceLock::new(),
         plugins: Arc::clone(&plugins),
         datagram_plugins: Arc::clone(&datagram_plugins),
@@ -3687,20 +3717,18 @@ async fn create_session(
             // Amplification factor check: drop backend responses that exceed
             // the configured ratio relative to the last client request size.
             if let Some(factor) = reply_amplification_factor {
-                let req_size = reply_session.last_request_size.load(Ordering::Relaxed);
-                if req_size > 0 {
-                    let max_response = (req_size as f64 * factor as f64) as u64;
-                    if len as u64 > max_response {
-                        warn!(
-                            proxy_id = %reply_proxy_id,
-                            client = %client_addr,
-                            response_size = len,
-                            request_size = req_size,
-                            factor = factor,
-                            "UDP response dropped: exceeds amplification factor"
-                        );
-                        continue; // Drop this response datagram, continue receiving
-                    }
+                let req_size = reply_session.last_request_size.load(Ordering::Acquire);
+                let max_response = udp_amplification_response_budget(req_size, factor);
+                if len as u64 > max_response {
+                    warn!(
+                        proxy_id = %reply_proxy_id,
+                        client = %client_addr,
+                        response_size = len,
+                        request_size = req_size,
+                        factor = factor,
+                        "UDP response dropped: exceeds amplification factor"
+                    );
+                    continue; // Drop this response datagram, continue receiving
                 }
             }
 
@@ -3806,12 +3834,11 @@ async fn create_session(
                             // Amplification check on batched response datagram
                             if let Some(factor) = reply_amplification_factor {
                                 let req_size =
-                                    reply_session.last_request_size.load(Ordering::Relaxed);
-                                if req_size > 0 {
-                                    let max_response = (req_size as f64 * factor as f64) as u64;
-                                    if len2 as u64 > max_response {
-                                        continue; // Drop oversized response
-                                    }
+                                    reply_session.last_request_size.load(Ordering::Acquire);
+                                let max_response =
+                                    udp_amplification_response_budget(req_size, factor);
+                                if len2 as u64 > max_response {
+                                    continue; // Drop oversized response
                                 }
                             }
                             // Backend→client plugin hooks on batched datagram
@@ -4360,6 +4387,7 @@ mod tests {
                 "request_id".to_string(),
                 "stream-123".to_string(),
             )])),
+            correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
@@ -4382,7 +4410,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_backend_forward_does_not_refresh_last_activity() {
+    async fn failed_backend_forward_preserves_activity_and_response_budget() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut raw_session = make_udp_session();
         raw_session.backend_socket = Some(socket);
@@ -4412,8 +4440,8 @@ mod tests {
         );
         assert_eq!(
             session.last_request_size.load(Ordering::Relaxed),
-            64,
-            "failed sends must not update last_request_size"
+            b"payload".len() as u64,
+            "accepted client datagrams must establish the amplification budget before send"
         );
     }
 
@@ -4501,6 +4529,7 @@ backend_tls_verify_server_cert: false
         let connected_at = chrono::Utc::now() - chrono::TimeDelta::milliseconds(750);
         let disconnected_at = chrono::Utc::now();
         let metadata = HashMap::from([("request_id".to_string(), "dtls-123".to_string())]);
+        let correlation_ids = Default::default();
 
         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
             namespace: "ferrum",
@@ -4522,6 +4551,7 @@ backend_tls_verify_server_cert: false
             disconnect_direction: None,
             disconnect_cause: Some(crate::plugins::DisconnectCause::RecvError),
             metadata: &metadata,
+            correlation_ids: &correlation_ids,
         });
 
         assert_eq!(summary.proxy_id, "dtls-proxy");
@@ -4540,7 +4570,10 @@ backend_tls_verify_server_cert: false
             Some(crate::retry::ErrorClass::TlsError)
         );
         assert_eq!(
-            summary.metadata.get("request_id").map(String::as_str),
+            summary
+                .metadata
+                .get(crate::plugins::REQUEST_ID_METADATA_KEY)
+                .map(String::as_str),
             Some("dtls-123")
         );
         assert!(summary.duration_ms >= 0.0);
@@ -4604,7 +4637,10 @@ backend_tls_verify_server_cert: false
             Some(crate::retry::ErrorClass::ConnectionReset)
         );
         assert_eq!(
-            summary.metadata.get("request_id").map(String::as_str),
+            summary
+                .metadata
+                .get(crate::plugins::REQUEST_ID_METADATA_KEY)
+                .map(String::as_str),
             Some("stream-123")
         );
         assert!(
@@ -4970,6 +5006,7 @@ backend_tls_verify_server_cert: false
             consumer_username: None,
             auth_method: None,
             metadata: std::sync::Mutex::new(HashMap::new()),
+            correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
