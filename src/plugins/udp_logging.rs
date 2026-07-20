@@ -428,6 +428,7 @@ pub(crate) fn dtls_file_dependency_cache_key(
 
 /// Validate enabled `udp_logging` DTLS file/provider sources for the shared
 /// plugin file-dependency phase (file-mode fatal, DB warning, DP skip).
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn validate_dtls_file_dependencies(config: &Map<String, Value>) -> Result<(), String> {
     let Some(key) = dtls_file_dependency_cache_key(config)? else {
         return Ok(());
