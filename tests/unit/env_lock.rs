@@ -27,3 +27,50 @@
 use std::sync::Mutex;
 
 pub static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Poison-tolerant RAII guard for tests that read or mutate process environment.
+///
+/// The guard owns [`ENV_LOCK`], snapshots the named variables, and restores
+/// their exact `OsString` values on drop so failures cannot leak test state.
+pub struct EnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    pub fn new(keys: &[&'static str]) -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = keys
+            .iter()
+            .map(|&key| (key, std::env::var_os(key)))
+            .collect();
+        Self { _lock: lock, saved }
+    }
+
+    pub fn set(&self, key: &str, value: &str) {
+        // SAFETY: this guard owns the process-wide environment lock.
+        unsafe { std::env::set_var(key, value) }
+    }
+
+    pub fn unset(&self, key: &str) {
+        // SAFETY: this guard owns the process-wide environment lock.
+        unsafe { std::env::remove_var(key) }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            // SAFETY: `_lock` is declared before `saved`, so it remains held
+            // while every original value is restored.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(*key, value),
+                    None => std::env::remove_var(*key),
+                }
+            }
+        }
+    }
+}

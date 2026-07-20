@@ -191,6 +191,8 @@ fn test_valid_config_with_every_supported_field() {
 
 #[test]
 fn test_optional_null_fields_still_select_defaults() {
+    let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTP_PORT"]);
+    env.unset("FERRUM_PROXY_HTTP_PORT");
     let config = json!({
         "key": "null-defaults-key",
         "concurrent_clients": 5,
@@ -198,7 +200,7 @@ fn test_optional_null_fields_still_select_defaults() {
         "ramp": null,
         "request_timeout_ms": null,
         "max_response_body_bytes": null,
-        "gateway_port": 8000,
+        "gateway_port": null,
         "gateway_tls": null,
         "gateway_tls_no_verify": null,
         "gateway_addresses": null
@@ -422,12 +424,9 @@ fn test_self_loopback_gateway_address_is_rejected() {
 }
 
 #[test]
-#[serial_test::serial(load_testing_listener_env)]
 fn test_env_derived_disabled_http_port_is_rejected() {
-    // SAFETY: serialized against other load_testing listener env tests.
-    unsafe {
-        std::env::set_var("FERRUM_PROXY_HTTP_PORT", "0");
-    }
+    let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTP_PORT"]);
+    env.set("FERRUM_PROXY_HTTP_PORT", "0");
     let config = json!({
         "key": VALID_KEY,
         "concurrent_clients": 1,
@@ -438,17 +437,12 @@ fn test_env_derived_disabled_http_port_is_rejected() {
         .expect("disabled HTTP listener must fail closed");
     assert!(err.contains("resolved gateway port is 0"), "got: {err}");
     assert!(err.contains("HTTP (FERRUM_PROXY_HTTP_PORT)"), "got: {err}");
-    unsafe {
-        std::env::remove_var("FERRUM_PROXY_HTTP_PORT");
-    }
 }
 
 #[test]
-#[serial_test::serial(load_testing_listener_env)]
 fn test_env_derived_disabled_https_port_is_rejected() {
-    unsafe {
-        std::env::set_var("FERRUM_PROXY_HTTPS_PORT", "0");
-    }
+    let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTPS_PORT"]);
+    env.set("FERRUM_PROXY_HTTPS_PORT", "0");
     let config = json!({
         "key": VALID_KEY,
         "concurrent_clients": 1,
@@ -463,17 +457,12 @@ fn test_env_derived_disabled_https_port_is_rejected() {
         err.contains("HTTPS (FERRUM_PROXY_HTTPS_PORT)"),
         "got: {err}"
     );
-    unsafe {
-        std::env::remove_var("FERRUM_PROXY_HTTPS_PORT");
-    }
 }
 
 #[test]
-#[serial_test::serial(load_testing_listener_env)]
 fn test_explicit_port_overrides_disabled_env_default() {
-    unsafe {
-        std::env::set_var("FERRUM_PROXY_HTTP_PORT", "0");
-    }
+    let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTP_PORT"]);
+    env.set("FERRUM_PROXY_HTTP_PORT", "0");
     let config = json!({
         "key": VALID_KEY,
         "concurrent_clients": 1,
@@ -481,26 +470,18 @@ fn test_explicit_port_overrides_disabled_env_default() {
         "gateway_port": 18080
     });
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
-    unsafe {
-        std::env::remove_var("FERRUM_PROXY_HTTP_PORT");
-    }
 }
 
 #[test]
-#[serial_test::serial(load_testing_listener_env)]
 fn test_env_derived_enabled_http_port_is_accepted() {
-    unsafe {
-        std::env::set_var("FERRUM_PROXY_HTTP_PORT", "18081");
-    }
+    let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTP_PORT"]);
+    env.set("FERRUM_PROXY_HTTP_PORT", "18081");
     let config = json!({
         "key": VALID_KEY,
         "concurrent_clients": 1,
         "duration_seconds": 1
     });
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
-    unsafe {
-        std::env::remove_var("FERRUM_PROXY_HTTP_PORT");
-    }
 }
 
 #[test]
