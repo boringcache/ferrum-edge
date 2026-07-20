@@ -11439,14 +11439,21 @@ def block_automation_references(
                         f"unsupported explicit interpreter "
                         f"{unsupported_interpreter!r}"
                     )
-                position = normalized_line.find(raw_command_path)
-                if position < 0 and directory_matches:
+                positions: list[int] = []
+                cursor = 0
+                while (
+                    position := normalized_line.find(raw_command_path, cursor)
+                ) >= 0:
+                    positions.append(position)
+                    cursor = position + max(len(raw_command_path), 1)
+                if directory_matches and len(positions) != 1:
                     errors.append(
                         f"{source}:{line_number} quote-assembled repository "
                         "command has ambiguous working-directory state"
                     )
                     continue
-                effective_directory = directory_before(max(position, 0))
+                position = positions[0] if positions else 0
+                effective_directory = directory_before(position)
                 if effective_directory is None:
                     errors.append(
                         f"{source}:{line_number} repository command has ambiguous "
