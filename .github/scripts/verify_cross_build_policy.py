@@ -1760,6 +1760,19 @@ SHELL_SOURCE_ASSIGNMENT = re.compile(
     r"(?:\s+--?[A-Za-z]+)*\s+)?"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
 )
+# After the first assignment word, further assignment words need no fresh
+# command-start marker. Consume one bounded shell word at a time so
+# `prefix=trusted source="$(./generator)"` records `source`, but stop before a
+# real command name: `prefix=trusted printf ... source=...` makes the latter an
+# argv word, not a binding. Quoted atoms may contain whitespace; unquoted atoms
+# stop on every outer command/pipeline separator.
+SHELL_SOURCE_ASSIGNMENT_VALUE_ATOM = (
+    r"(?:[^\s'\";&|]+|'[^']*'|\"(?:[^\"\\]|\\.)*\")"
+)
+SHELL_SOURCE_CHAINED_ASSIGNMENT = re.compile(
+    rf"(?:{SHELL_SOURCE_ASSIGNMENT_VALUE_ATOM})*\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+)
 SHELL_ASSIGNMENT_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=.*", re.DOTALL)
 WHOLE_SHELL_PARAMETER = re.compile(r"\s*\$[A-Za-z_][A-Za-z0-9_]*\s*")
 _shell_assigned_names: frozenset[str] = frozenset()
@@ -3464,9 +3477,8 @@ def shell_source_variable_names(lines: tuple[str, ...]) -> frozenset[str]:
                 opaque.group(0)
             ):
                 evaluated.add(parameter.group("braced") or parameter.group("bare"))
-        for bound in SHELL_SOURCE_ASSIGNMENT.finditer(line):
-            if shell_quote_at(line, bound.start("name")) is None:
-                assignments.append((bound.group("name"), line[bound.end() :]))
+        for name, value_start in shell_source_assignments(line):
+            assignments.append((name, line[value_start:]))
 
     changed = True
     while changed:
@@ -3482,6 +3494,23 @@ def shell_source_variable_names(lines: tuple[str, ...]) -> frozenset[str]:
     return frozenset(evaluated)
 
 
+def shell_source_assignments(line: str) -> tuple[tuple[str, int], ...]:
+    """Return source-variable bindings and the start of each assigned value."""
+
+    bindings: list[tuple[str, int]] = []
+    for bound in SHELL_SOURCE_ASSIGNMENT.finditer(line):
+        if shell_quote_at(line, bound.start("name")) is not None:
+            continue
+        bindings.append((bound.group("name"), bound.end()))
+        cursor = bound.end()
+        while chained := SHELL_SOURCE_CHAINED_ASSIGNMENT.match(line, cursor):
+            if shell_quote_at(line, chained.start("name")) is not None:
+                break
+            bindings.append((chained.group("name"), chained.end()))
+            cursor = chained.end()
+    return tuple(dict.fromkeys(bindings))
+
+
 def generated_shell_assignment_spans(
     line: str,
     evaluated_variables: frozenset[str],
@@ -3491,10 +3520,9 @@ def generated_shell_assignment_spans(
     if not evaluated_variables:
         return ()
     assignments = tuple(
-        match
-        for match in SHELL_SOURCE_ASSIGNMENT.finditer(line)
-        if match.group("name") in evaluated_variables
-        and shell_quote_at(line, match.start("name")) is None
+        value_start
+        for name, value_start in shell_source_assignments(line)
+        if name in evaluated_variables
     )
     if not assignments:
         return ()
@@ -3506,7 +3534,7 @@ def generated_shell_assignment_spans(
     return tuple(
         (start, end)
         for start, end in sorted(candidates)
-        if any(match.end() <= start for match in assignments)
+        if any(value_start <= start for value_start in assignments)
     )
 
 
@@ -18573,6 +18601,10 @@ pre_build = []
             'if true; then generated="$(./scripts/build)"; fi; '
             'eval "$generated"',
         ),
+        "eval through chained assignment words": extensionless_workflow.replace(
+            "./scripts/build",
+            'prefix=trusted generated="$(./scripts/build)"; eval "$generated"',
+        ),
         "shell -c through assignment aliases": extensionless_workflow.replace(
             "./scripts/build",
             "|-\n"
@@ -18637,6 +18669,11 @@ pre_build = []
         "assignment-shaped quoted data": extensionless_workflow.replace(
             "./scripts/build",
             "printf '%s\\n' \"then evaluated=$(./scripts/build)\"; "
+            "evaluated='echo safe'; eval \"$evaluated\"",
+        ),
+        "assignment-shaped command argument": extensionless_workflow.replace(
+            "./scripts/build",
+            "printf '%s\\n' evaluated=\"$(./scripts/build)\"; "
             "evaluated='echo safe'; eval \"$evaluated\"",
         ),
     }
