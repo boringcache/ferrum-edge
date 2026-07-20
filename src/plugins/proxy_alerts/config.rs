@@ -303,9 +303,9 @@ fn parse_rule(
         .ok_or_else(|| format!("proxy_alerts: rule[{id}] must be an object"))?;
     let name = match obj.get("name") {
         Some(v) => {
-            let s = v.as_str().ok_or_else(|| {
-                format!("proxy_alerts: rule[{id}]: 'name' must be a string")
-            })?;
+            let s = v
+                .as_str()
+                .ok_or_else(|| format!("proxy_alerts: rule[{id}]: 'name' must be a string"))?;
             if s.is_empty() {
                 return Err(format!(
                     "proxy_alerts: rule[{id}]: 'name' must not be empty"
@@ -322,9 +322,9 @@ fn parse_rule(
         }
     };
     let kind = match obj.get("type") {
-        Some(v) => v.as_str().ok_or_else(|| {
-            format!("proxy_alerts: rule '{name}': 'type' must be a string")
-        })?,
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| format!("proxy_alerts: rule '{name}': 'type' must be a string"))?,
         None => {
             return Err(missing_required_key_error(
                 obj,
@@ -338,50 +338,22 @@ fn parse_rule(
     match kind {
         "error_rate" => {
             reject_unknown_keys(obj, &rule_path, ERROR_RATE_KEYS, "proxy_alerts: ")?;
-            let common = build_rule_common(
-                id,
-                &name,
-                raw,
-                channel_id_by_name,
-                channels,
-                defaults,
-            )?;
+            let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_error_rate(common, raw, defaults).map(Rule::ErrorRate)
         }
         "status_code_count" => {
             reject_unknown_keys(obj, &rule_path, STATUS_CODE_COUNT_KEYS, "proxy_alerts: ")?;
-            let common = build_rule_common(
-                id,
-                &name,
-                raw,
-                channel_id_by_name,
-                channels,
-                defaults,
-            )?;
+            let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_status_code_count(common, raw).map(Rule::StatusCodeCount)
         }
         "latency_percentile" => {
             reject_unknown_keys(obj, &rule_path, LATENCY_PERCENTILE_KEYS, "proxy_alerts: ")?;
-            let common = build_rule_common(
-                id,
-                &name,
-                raw,
-                channel_id_by_name,
-                channels,
-                defaults,
-            )?;
+            let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_latency_percentile(common, raw, defaults).map(Rule::LatencyPercentile)
         }
         "error_class" => {
             reject_unknown_keys(obj, &rule_path, ERROR_CLASS_KEYS, "proxy_alerts: ")?;
-            let common = build_rule_common(
-                id,
-                &name,
-                raw,
-                channel_id_by_name,
-                channels,
-                defaults,
-            )?;
+            let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_error_class(common, raw).map(Rule::ErrorClass)
         }
         "stream_disconnect_cause" => {
@@ -391,14 +363,7 @@ fn parse_rule(
                 STREAM_DISCONNECT_CAUSE_KEYS,
                 "proxy_alerts: ",
             )?;
-            let common = build_rule_common(
-                id,
-                &name,
-                raw,
-                channel_id_by_name,
-                channels,
-                defaults,
-            )?;
+            let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_stream_disconnect_cause(common, raw).map(Rule::StreamDisconnectCause)
         }
         other => Err(format!(
@@ -466,8 +431,7 @@ fn parse_error_rate(
             common.name
         ));
     }
-    let min_request_count =
-        read_min_request_count(raw, &common.name, defaults.min_request_count)?;
+    let min_request_count = read_min_request_count(raw, &common.name, defaults.min_request_count)?;
     Ok(ErrorRateRule {
         common,
         status_codes,
@@ -548,8 +512,7 @@ fn parse_latency_percentile(
             common.name, MAX_FINITE_LATENCY_BOUND_MS
         ));
     }
-    let min_request_count =
-        read_min_request_count(raw, &common.name, defaults.min_request_count)?;
+    let min_request_count = read_min_request_count(raw, &common.name, defaults.min_request_count)?;
     Ok(LatencyPercentileRule {
         common,
         metric,

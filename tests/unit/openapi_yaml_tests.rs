@@ -3899,8 +3899,7 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
         json!("#/components/schemas/ProxyAlertsDisabledDraftRule")
     );
     assert_eq!(
-        spec["components"]["schemas"]["ProxyAlertsDisabledDraftRule"]["properties"]["enabled"]
-            ["const"],
+        spec["components"]["schemas"]["ProxyAlertsDisabledDraftRule"]["properties"]["enabled"]["const"],
         json!(false)
     );
     assert_eq!(

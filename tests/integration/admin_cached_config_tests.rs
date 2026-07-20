@@ -2585,7 +2585,10 @@ async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
         });
         let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
 
-        assert_eq!(status, 400, "invalid proxy_alerts config was admitted: {body}");
+        assert_eq!(
+            status, 400,
+            "invalid proxy_alerts config was admitted: {body}"
+        );
         assert!(
             body.to_string().contains(needle),
             "unexpected admin validation response for {needle}: {body}"

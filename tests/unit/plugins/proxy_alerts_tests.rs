@@ -806,10 +806,7 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
     ] {
         let err = ProxyAlerts::new(&config, http_client())
             .expect_err("malformed optional values must fail closed");
-        assert!(
-            err.contains(needle),
-            "expected `{needle}` in error: {err}"
-        );
+        assert!(err.contains(needle), "expected `{needle}` in error: {err}");
     }
 }
 
