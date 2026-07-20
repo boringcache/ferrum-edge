@@ -861,6 +861,31 @@ mod tests {
     }
 
     #[test]
+    fn grpc_status_assertion_rejects_no_error_body_reset_without_grpc_status() {
+        // Control: the #2057 residual signature without an explicit
+        // grpc-status must still fail. The client helper suppresses NO_ERROR
+        // only when Trailers-Only metadata is already present.
+        let response = MatrixResponse::Grpc(GrpcResponse {
+            http_status: 200,
+            headers: http::HeaderMap::new(),
+            messages: Vec::new(),
+            raw_body_frames: Vec::new(),
+            trailers: None,
+            stream_error: Some(
+                "body error: stream error received: not a result of an error".into(),
+            ),
+            request_send_error: Some("request body error: user error: inactive stream".into()),
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            FrontendKind::Grpc.assert_status(&response, 502);
+        }));
+        assert!(
+            result.is_err(),
+            "HTTP 200 + NO_ERROR reset without grpc-status must not pass assert_status(502)"
+        );
+    }
+
+    #[test]
     fn yaml_files_are_per_backend_kind() {
         let h1 = BackendKind::H1.file_mode_yaml(8000);
         assert!(h1.contains("listen_path: /api"), "got {h1}");
