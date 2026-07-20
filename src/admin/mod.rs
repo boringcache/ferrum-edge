@@ -1404,6 +1404,8 @@ pub async fn handle_admin_request(
         if detailed {
             health_status["logging"] =
                 serde_json::to_value(crate::logging::snapshot()).unwrap_or_default();
+            health_status["kafka_logging"] =
+                serde_json::to_value(crate::plugins::kafka_logging::snapshots()).unwrap_or_default();
         }
 
         let response_code = if !ready {
@@ -1491,6 +1493,7 @@ pub async fn handle_admin_request(
         registry.refresh_tls_certificate_inventory(&inventory);
         let mut metrics_output = registry.render();
         metrics_output.push_str(&crate::logging::render_prometheus());
+        metrics_output.push_str(&crate::plugins::kafka_logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
         let resp = Response::builder()
             .status(StatusCode::OK)

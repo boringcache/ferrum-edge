@@ -82,12 +82,13 @@ cloud-SDK variant):
 
 ### Candidates / roadmap
 
-- **Kafka** (`kafka_logging`, `rdkafka` producer) — broker publish is untested.
-  Use `apache/kafka` (KRaft, no ZooKeeper). The one wrinkle is the dynamic
-  advertised-listener / host-port mapping (the broker must advertise the
-  host-mapped port to the client); pin the host port for the dedicated matrix
-  shard, or replicate the testcontainers-java startup-script approach. Verify
-  against a real broker before landing — it is the trickiest of the set.
+- **Kafka** (`kafka_logging`, `rdkafka` producer) — covered by deterministic
+  unit tests for admission, delivery accounting, CRL fail-closed behavior,
+  unknown-key rejection, queue budgets, and owned finalize. Hosted
+  service-integration broker publish remains a roadmap item (use
+  `apache/kafka` KRaft or Redpanda; advertised-listener host-port mapping is
+  the main wrinkle). Unit coverage asserts terminal counters and shutdown
+  ownership without requiring Docker.
 - **OIDC relying party / OAuth2 introspection** — login/session/introspection
   flows. Use `ory/hydra` or `keycloak`.
 

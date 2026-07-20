@@ -39,6 +39,7 @@ mod grpc_proxy_tests;
 mod http2_pool_tests;
 mod http3_integration_tests;
 mod injector_admission_tests;
+mod kafka_logging_broker_tests;
 mod k8s_controller_gateway_status_tests;
 mod k8s_controller_istio_status_tests;
 mod log_schema_integration_tests;

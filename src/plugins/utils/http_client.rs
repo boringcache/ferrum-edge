@@ -108,6 +108,10 @@ pub struct PluginHttpClient {
     /// matching the policy applied to the proxy backend / DTLS / frontend mTLS surfaces.
     /// Empty when `FERRUM_TLS_CRL_FILE_PATH` is unset.
     tls_crls: CrlList,
+    /// Absolute filesystem identity of `FERRUM_TLS_CRL_FILE_PATH` when loaded.
+    /// librdkafka cannot consume the parsed DER CRLs above and must be pointed
+    /// at the same PEM file via `ssl.crl.location`.
+    tls_crl_file_path: Option<String>,
     /// The gateway's namespace (`FERRUM_NAMESPACE`). Used by plugins that store
     /// state in external systems (Redis, Prometheus, StatsD) to prevent key/metric
     /// collisions when multiple gateway instances with different namespaces share
@@ -392,6 +396,7 @@ impl PluginHttpClient {
             tls_no_verify,
             tls_ca_bundle_path: tls_ca_bundle_path.map(|s| s.to_string()),
             tls_crls,
+            tls_crl_file_path: None,
             namespace: namespace.to_string(),
             real_ip_header: None,
             backend_allow_ips,
@@ -477,6 +482,7 @@ impl PluginHttpClient {
             tls_no_verify: false,
             tls_ca_bundle_path: None,
             tls_crls: Arc::new(Vec::new()),
+            tls_crl_file_path: None,
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
             real_ip_header: None,
             backend_allow_ips: BackendEgressPolicy::unrestricted(),
@@ -545,6 +551,14 @@ impl PluginHttpClient {
         self
     }
 
+    /// Carry the gateway CRL file identity so non-rustls sinks (Kafka /
+    /// librdkafka) can enforce the same revocation baseline via
+    /// `ssl.crl.location`.
+    pub fn with_tls_crl_file_path(mut self, tls_crl_file_path: Option<String>) -> Self {
+        self.tls_crl_file_path = tls_crl_file_path;
+        self
+    }
+
     /// Effective authoritative real-IP header for cold-path plugin validation.
     pub(crate) fn real_ip_header(&self) -> Option<&str> {
         self.real_ip_header.as_deref()
@@ -604,6 +618,13 @@ impl PluginHttpClient {
     /// configuration.
     pub fn tls_crls(&self) -> &[rustls::pki_types::CertificateRevocationListDer<'static>] {
         &self.tls_crls
+    }
+
+    /// Filesystem path for `FERRUM_TLS_CRL_FILE_PATH` when a gateway CRL was
+    /// loaded. Used by librdkafka (`ssl.crl.location`); rustls sinks consume
+    /// [`Self::tls_crls`] instead.
+    pub fn tls_crl_file_path(&self) -> Option<&str> {
+        self.tls_crl_file_path.as_deref()
     }
 
     /// The gateway's namespace (`FERRUM_NAMESPACE`).

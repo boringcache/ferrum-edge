@@ -440,3 +440,185 @@ async fn test_kafka_logging_supported_protocols() {
 
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
+
+#[tokio::test]
+async fn test_kafka_logging_rejects_unknown_root_keys() {
+    let result = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "security_protcol": "sasl_ssl"
+        }),
+        &default_http_client(),
+    );
+    match result {
+        Err(e) => {
+            assert!(
+                e.contains("unknown configuration key") && e.contains("security_protcol"),
+                "expected unknown-key rejection for security_protcol, got: {e}"
+            );
+            assert!(
+                e.contains("security_protocol") || e.contains("did you mean"),
+                "expected near-miss hint toward security_protocol, got: {e}"
+            );
+        }
+        Ok(_) => panic!("misspelled security_protocol must not construct"),
+    }
+}
+
+#[tokio::test]
+async fn test_kafka_logging_rejects_oversized_buffer_capacity() {
+    let result = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "buffer_capacity": 1_000_001
+        }),
+        &default_http_client(),
+    );
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_kafka_logging_rejects_oversized_producer_queue_budget() {
+    let result = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "producer_config": {
+                "queue.buffering.max.kbytes": "1048576"
+            }
+        }),
+        &default_http_client(),
+    );
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_kafka_logging_rejects_conflicting_crl_override() {
+    let client =
+        default_http_client().with_tls_crl_file_path(Some("/etc/ferrum/gateway.crl".to_string()));
+    let result = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "security_protocol": "ssl",
+            "producer_config": {
+                "ssl.crl.location": "/tmp/other.crl"
+            }
+        }),
+        &client,
+    );
+    match result {
+        Err(e) => assert!(
+            e.contains("ssl.crl.location") && e.contains("conflicts"),
+            "expected CRL conflict error, got: {e}"
+        ),
+        Ok(_) => panic!("conflicting CRL override must be rejected"),
+    }
+}
+
+#[tokio::test]
+async fn test_kafka_logging_allows_matching_crl_override() {
+    let client =
+        default_http_client().with_tls_crl_file_path(Some("/etc/ferrum/gateway.crl".to_string()));
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "security_protocol": "ssl",
+            "producer_config": {
+                "ssl.crl.location": "/etc/ferrum/gateway.crl"
+            }
+        }),
+        &client,
+    )
+    .unwrap();
+    assert_eq!(plugin.name(), "kafka_logging");
+}
+
+#[tokio::test]
+async fn test_kafka_logging_no_verify_skips_crl_conflict() {
+    let client =
+        default_http_client().with_tls_crl_file_path(Some("/etc/ferrum/gateway.crl".to_string()));
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "ssl_no_verify": true,
+            "producer_config": {
+                "ssl.crl.location": "/tmp/other.crl"
+            }
+        }),
+        &client,
+    )
+    .unwrap();
+    assert_eq!(plugin.name(), "kafka_logging");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_kafka_logging_finalize_is_exact_once() {
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:19092",
+            "topic": "test",
+            "flush_timeout_seconds": 1
+        }),
+        &default_http_client(),
+    )
+    .unwrap();
+    let before = plugin.snapshot();
+    assert!(before.accepting);
+    assert!(!before.finalized);
+    plugin.finalize().await;
+    let after = plugin.snapshot();
+    assert!(after.finalized);
+    assert!(!after.accepting);
+    // Second finalize is a no-op and must not panic.
+    plugin.finalize().await;
+    assert!(plugin.snapshot().finalized);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_kafka_logging_snapshot_counters_start_at_zero() {
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:19092",
+            "topic": "test",
+            "flush_timeout_seconds": 1
+        }),
+        &default_http_client(),
+    )
+    .unwrap();
+    let snap = plugin.snapshot();
+    assert_eq!(snap.admitted_total, 0);
+    assert_eq!(snap.delivered_total, 0);
+    assert_eq!(snap.delivery_failed_total, 0);
+    assert_eq!(snap.queue_rejected_total, 0);
+    plugin.finalize().await;
+}
+
+#[test]
+fn docs_do_not_require_undeclared_kafka_cargo_feature() {
+    let cargo = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+    let docs = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/plugins.md"));
+    let features_idx = cargo
+        .find("[features]")
+        .expect("Cargo.toml must declare [features]");
+    let features = &cargo[features_idx..];
+    assert!(
+        !features
+            .lines()
+            .any(|line| line.trim_start().starts_with("kafka")),
+        "Cargo.toml must not declare a kafka feature while docs claim unconditional availability"
+    );
+    assert!(
+        !docs.contains("--features kafka"),
+        "docs/plugins.md must not instruct operators to pass --features kafka"
+    );
+    assert!(
+        docs.contains("unconditional dependency")
+            || docs.contains("Built into every default Ferrum Edge binary"),
+        "docs/plugins.md must describe the unconditional Kafka build contract"
+    );
+}

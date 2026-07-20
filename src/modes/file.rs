@@ -273,6 +273,7 @@ impl ServeHandles {
         let mut background_handles = self.background_handles;
         background_handles.extend(self.proxy_state.health_checker.take_active_check_handles());
         join_background_handles(background_handles, self.background_drain_timeout).await;
+        crate::plugins::kafka_logging::finalize_all_generations().await;
         listener_result
     }
 

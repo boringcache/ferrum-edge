@@ -635,19 +635,21 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 
 **Priority:** 9150
 
-**Requires:** The `kafka` cargo feature (`--features kafka` or `--all-features`). Without it, plugin creation returns an error at runtime.
+**Availability:** Built into every default Ferrum Edge binary. `rdkafka` / librdkafka is an unconditional dependency — there is no `kafka` Cargo feature to enable or disable.
+
+Local `ThreadedProducer::send` success only means the record was admitted to librdkafka's in-memory queue. Terminal broker acknowledgement (including the local completion semantics of `acks: 0`) is observed through a delivery callback and exported as authenticated `kafka_logging` diagnostics/metrics. Graceful shutdown and reload close Ferrum admission, await the batching worker, then await one bounded `flush_timeout_seconds` producer flush.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `broker_list` | String | *(required)* | Comma-separated Kafka broker addresses (e.g., `broker1:9092,broker2:9092`) |
 | `topic` | String | *(required)* | Kafka topic to produce messages to |
 | `key_field` | String | `"client_ip"` | Partition key field: `client_ip`, `proxy_id`, or `none` (round-robin). Any other value is rejected at plugin construction time so operator typos surface immediately instead of silently falling back to `client_ip` |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full. Each entry is a serialized JSON `TransactionSummary` (~1-2 KB), so the default 10,000 entries may use ~10-20 MB of memory |
+| `buffer_capacity` | Integer | `10000` | Ferrum userspace channel capacity — new entries are dropped when full. Hard maximum `100000` |
 | `compression` | String | `"lz4"` | Compression: `none`, `gzip`, `snappy`, `lz4`, `zstd` |
-| `flush_timeout_seconds` | Integer | `5` | Seconds to wait for librdkafka to flush pending messages during graceful shutdown |
-| `acks` | String | *(librdkafka default)* | Delivery acknowledgment: `0`, `1`, `all` (or `-1`) |
+| `flush_timeout_seconds` | Integer | `5` | Bounded seconds to await librdkafka `flush` during graceful shutdown and reload disposal after Ferrum admission is closed |
+| `acks` | String | *(librdkafka default)* | Delivery acknowledgment: `0` (broker may never persist; Ferrum still observes the local delivery callback), `1`, `all` (or `-1`) |
 | `message_timeout_ms` | Integer | *(librdkafka default)* | Timeout for message delivery in milliseconds |
-| `security_protocol` | String | *(none)* | Protocol: `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl` |
+| `security_protocol` | String | *(none)* | Protocol: `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl`. Unknown root keys (for example a misspelled `security_protcol`) are rejected so PLAINTEXT cannot be selected by typo |
 | `sasl_mechanism` | String | *(none)* | SASL mechanism (e.g., `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`) |
 | `sasl_username` | String | *(none)* | SASL username |
 | `sasl_password` | String | *(none)* | SASL password |
@@ -655,7 +657,7 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 | `ssl_no_verify` | Boolean | *(gateway default)* | Skip broker TLS certificate verification. Falls back to `FERRUM_TLS_NO_VERIFY` |
 | `ssl_certificate_location` | String | *(none)* | Path to client certificate for mTLS |
 | `ssl_key_location` | String | *(none)* | Path to client private key for mTLS |
-| `producer_config` | Object | *(none)* | Escape hatch: arbitrary librdkafka producer properties as key-value pairs |
+| `producer_config` | Object | *(none)* | Escape hatch: additional librdkafka producer properties as string key-value pairs. Cannot override `bootstrap.servers`. Queue/message byte budgets cannot exceed Ferrum hard maxima. `ssl.crl.location` cannot conflict with the gateway CRL baseline |
 
 #### Gateway TLS Integration
 
@@ -663,11 +665,10 @@ Kafka uses its own binary protocol over TCP/TLS (not HTTP), so TLS is handled by
 
 - **`FERRUM_TLS_CA_BUNDLE_PATH`** is applied as `ssl.ca.location` when `ssl_ca_location` is not set in the plugin config
 - **`FERRUM_TLS_NO_VERIFY`** is applied as `enable.ssl.certificate.verification=false` when `ssl_no_verify` is not set in the plugin config
-- Plugin-level fields always override the gateway defaults
+- **`FERRUM_TLS_CRL_FILE_PATH`** is applied as `ssl.crl.location` whenever certificate verification is enabled. A conflicting `producer_config.ssl.crl.location` is rejected fail-closed; reload keeps last-known-good configuration
+- Plugin-level fields always override the gateway defaults except for the CRL baseline conflict rule above
 
-This means operators who have already configured `FERRUM_TLS_CA_BUNDLE_PATH` for internal CAs do not need to duplicate the CA path in the kafka_logging plugin config.
-
-**Note:** `FERRUM_TLS_CRL_FILE_PATH` is **not** applied to Kafka connections — librdkafka manages CRL checking independently via its own `ssl.crl.location` property (configurable via `producer_config`).
+This means operators who have already configured `FERRUM_TLS_CA_BUNDLE_PATH` / `FERRUM_TLS_CRL_FILE_PATH` for internal CAs do not need to duplicate those paths in the kafka_logging plugin config.
 
 ```yaml
 plugin_name: kafka_logging
@@ -677,6 +678,7 @@ config:
   compression: "lz4"
   acks: "1"
   key_field: "client_ip"
+  security_protocol: "ssl"
 ```
 
 #### Kafka with SASL/SSL Authentication
@@ -703,7 +705,7 @@ config:
   producer_config:
     linger.ms: "50"
     batch.num.messages: "1000"
-    queue.buffering.max.kbytes: "1048576"
+    queue.buffering.max.kbytes: "65536"
 ```
 
 ### Transaction Summary Reference

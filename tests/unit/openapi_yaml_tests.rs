@@ -3044,6 +3044,37 @@ fn stdout_logging_schema_rejects_unknown_outer_and_filter_keys() {
     }
 }
 
+
+#[test]
+fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/KafkaLoggingConfig")
+        .expect("KafkaLoggingConfig exists");
+    assert_eq!(schema.get("additionalProperties"), Some(&json!(false)));
+
+    for valid in [
+        json!({"broker_list": "localhost:9092", "topic": "logs"}),
+        json!({
+            "broker_list": "localhost:9092",
+            "topic": "logs",
+            "security_protocol": "ssl",
+            "buffer_capacity": 1000,
+            "flush_timeout_seconds": 5
+        }),
+    ] {
+        assert_component_validity(&spec, "KafkaLoggingConfig", &valid, true);
+    }
+    for invalid in [
+        json!({"broker_list": "localhost:9092", "topic": "logs", "security_protcol": "ssl"}),
+        json!({"broker_list": "localhost:9092", "topic": "logs", "unknown": true}),
+        json!({"topic": "logs"}),
+    ] {
+        assert_component_validity(&spec, "KafkaLoggingConfig", &invalid, false);
+    }
+}
+
 #[test]
 fn correlation_id_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::correlation_id::CorrelationId;

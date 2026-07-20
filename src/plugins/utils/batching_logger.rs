@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 const DROP_WARN_EVERY: u64 = 100;
@@ -103,7 +104,8 @@ pub struct BatchConfig {
 }
 
 pub struct BatchingLogger<T: Send + 'static> {
-    sender: mpsc::Sender<T>,
+    sender: Option<mpsc::Sender<T>>,
+    worker: Option<JoinHandle<()>>,
     plugin_name: &'static str,
     dropped_count: Arc<AtomicU64>,
     queue_depth: Arc<AtomicUsize>,
@@ -205,7 +207,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
         };
         let (sender, receiver) = mpsc::channel(cfg.buffer_capacity);
         let queue_depth = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(run_flush_loop_with_hooks(
+        let worker = tokio::spawn(run_flush_loop_with_hooks(
             cfg,
             receiver,
             Arc::clone(&queue_depth),
@@ -214,7 +216,8 @@ impl<T: Send + 'static> BatchingLogger<T> {
         ));
 
         Self {
-            sender,
+            sender: Some(sender),
+            worker: Some(worker),
             plugin_name: cfg.plugin_name,
             dropped_count: Arc::new(AtomicU64::new(0)),
             queue_depth,
@@ -223,9 +226,23 @@ impl<T: Send + 'static> BatchingLogger<T> {
         }
     }
 
+    /// Close admission and await the flush worker so pending Ferrum-side
+    /// batches finish before a downstream sink (for example librdkafka) is
+    /// flushed. Exact-once: subsequent calls are no-ops.
+    pub async fn close_and_await(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.await;
+        }
+    }
+
     /// Non-blocking send. On full buffer, logs a warning once per N drops and
     /// silently drops intermediate entries so the hot path never blocks.
     pub fn try_send(&self, item: T) -> bool {
+        let Some(sender) = self.sender.as_ref() else {
+            self.record_drop("worker unavailable during shutdown");
+            return false;
+        };
         let depth = self.queue_depth.load(Ordering::Relaxed);
         if self.is_high_water(depth) {
             if let Some(on_high_water) = self.hooks.on_high_water.as_ref() {
@@ -238,7 +255,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
         }
 
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
-        match self.sender.try_send(item) {
+        match sender.try_send(item) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(item)) => {
                 decrement_queue_depth(&self.queue_depth);
@@ -261,8 +278,12 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// capacity before a response becomes immutable, while filling the record
     /// only after later validators determine the final status and body.
     pub fn try_reserve(&self) -> Option<BatchingLoggerPermit<T>> {
+        let Some(sender) = self.sender.as_ref() else {
+            self.record_drop("worker unavailable while reserving a commit slot");
+            return None;
+        };
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
-        match self.sender.clone().try_reserve_owned() {
+        match sender.clone().try_reserve_owned() {
             Ok(permit) => Some(BatchingLoggerPermit {
                 permit: Some(permit),
                 queue_depth: Arc::clone(&self.queue_depth),
