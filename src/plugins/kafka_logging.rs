@@ -654,92 +654,32 @@ impl KafkaLogging {
         }
 
         let gateway_crl_path = resolve_gateway_crl_path(http_client)?;
-        let mut producer_queue_messages = DEFAULT_QUEUE_MAX_MESSAGES;
-        let mut producer_queue_kbytes = DEFAULT_QUEUE_MAX_KBYTES;
-        let mut producer_message_max_bytes = DEFAULT_MESSAGE_MAX_BYTES;
-        let mut producer_set_crl: Option<String> = None;
-
-        if let Some(producer_config) = config.get("producer_config") {
-            let props = producer_config
-                .as_object()
-                .ok_or_else(|| "kafka_logging: 'producer_config' must be an object".to_string())?;
-            for (key, value) in props {
-                if key.trim().is_empty() {
-                    return Err(
-                        "kafka_logging: 'producer_config' keys must not be empty".to_string()
-                    );
-                }
-                let prop = value.as_str().ok_or_else(|| {
-                    format!("kafka_logging: 'producer_config.{key}' must be a string")
-                })?;
-                if prop.trim().is_empty() {
-                    return Err(format!(
-                        "kafka_logging: 'producer_config.{key}' must not be empty"
-                    ));
-                }
-                if key.eq_ignore_ascii_case("bootstrap.servers")
-                    || key.eq_ignore_ascii_case("metadata.broker.list")
-                {
-                    return Err(format!(
-                        "kafka_logging: 'producer_config.{key}' is not allowed"
-                    ));
-                }
-                if key.eq_ignore_ascii_case("ssl.crl.location") {
-                    if !ssl_no_verify {
-                        if let Some(ref gateway) = gateway_crl_path {
-                            if prop != gateway.as_str() {
-                                return Err(
-                                    "kafka_logging: 'producer_config.ssl.crl.location' conflicts with gateway FERRUM_TLS_CRL_FILE_PATH"
-                                        .to_string(),
-                                );
-                            }
-                        }
-                    }
-                    producer_set_crl = Some(prop.to_string());
-                    continue;
-                }
-                if key.eq_ignore_ascii_case("queue.buffering.max.messages") {
-                    producer_queue_messages = parse_bounded_u32(
-                        prop,
-                        "producer_config.queue.buffering.max.messages",
-                        HARD_MAX_QUEUE_MAX_MESSAGES,
-                    )?;
-                    continue;
-                }
-                if key.eq_ignore_ascii_case("queue.buffering.max.kbytes") {
-                    producer_queue_kbytes = parse_bounded_u32(
-                        prop,
-                        "producer_config.queue.buffering.max.kbytes",
-                        HARD_MAX_QUEUE_MAX_KBYTES,
-                    )?;
-                    continue;
-                }
-                if key.eq_ignore_ascii_case("message.max.bytes") {
-                    producer_message_max_bytes = parse_bounded_u32(
-                        prop,
-                        "producer_config.message.max.bytes",
-                        HARD_MAX_MESSAGE_MAX_BYTES,
-                    )?;
-                    continue;
-                }
-                kafka_config.set(key, prop);
-            }
+        let admitted = admit_producer_config(
+            config.get("producer_config"),
+            ssl_no_verify,
+            gateway_crl_path.as_deref(),
+        )?;
+        for (key, value) in &admitted.extra_props {
+            kafka_config.set(key, value);
         }
 
         kafka_config.set(
             "queue.buffering.max.messages",
-            producer_queue_messages.to_string(),
+            admitted.queue_messages.to_string(),
         );
         kafka_config.set(
             "queue.buffering.max.kbytes",
-            producer_queue_kbytes.to_string(),
+            admitted.queue_kbytes.to_string(),
         );
-        kafka_config.set("message.max.bytes", producer_message_max_bytes.to_string());
+        kafka_config.set(
+            "message.max.bytes",
+            admitted.message_max_bytes.to_string(),
+        );
 
         if !ssl_no_verify {
             if let Some(gateway) = gateway_crl_path.as_ref() {
                 kafka_config.set("ssl.crl.location", gateway);
-            } else if let Some(override_path) = producer_set_crl {
+            } else if let Some(override_path) = admitted.producer_set_crl {
                 kafka_config.set("ssl.crl.location", override_path);
             }
         }
@@ -844,17 +784,17 @@ impl Drop for KafkaLogging {
         // process lifetime. Multi-thread runtimes can await the worker;
         // current-thread test runtimes close admission and flush without
         // `block_in_place` (which would panic there).
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                let generation = Arc::clone(&self.generation);
-                tokio::task::block_in_place(|| {
-                    handle.block_on(async move {
-                        generation.finalize().await;
-                        unregister_generation(generation.state.metrics.generation_id);
-                    });
+        if let Ok(handle) = tokio::runtime::Handle::try_current()
+            && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            let generation = Arc::clone(&self.generation);
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    generation.finalize().await;
+                    unregister_generation(generation.state.metrics.generation_id);
                 });
-                return;
-            }
+            });
+            return;
         }
         let _ = self
             .generation
@@ -883,6 +823,124 @@ fn resolve_gateway_crl_path(http_client: &PluginHttpClient) -> Result<Option<Str
         );
     }
     Ok(from_env)
+}
+
+/// Pure producer-configuration admission used by construction and exposed to
+/// external unit tests through `_test_support`. Keeps CRL conflict / budget
+/// policy coverage independent of librdkafka OpenSSL availability.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn validate_producer_admission(
+    config: &Value,
+    http_client: &PluginHttpClient,
+) -> Result<(), String> {
+    let ssl_no_verify =
+        optional_bool(config, "ssl_no_verify")?.unwrap_or(http_client.tls_no_verify());
+    let gateway_crl_path = resolve_gateway_crl_path(http_client)?;
+    admit_producer_config(
+        config.get("producer_config"),
+        ssl_no_verify,
+        gateway_crl_path.as_deref(),
+    )
+    .map(|_| ())
+}
+
+struct AdmittedProducerConfig {
+    queue_messages: u32,
+    queue_kbytes: u32,
+    message_max_bytes: u32,
+    producer_set_crl: Option<String>,
+    extra_props: Vec<(String, String)>,
+}
+
+/// Admit `producer_config` overrides (budgets, forbidden keys, CRL conflict)
+/// without constructing a Kafka producer.
+fn admit_producer_config(
+    producer_config: Option<&Value>,
+    ssl_no_verify: bool,
+    gateway_crl_path: Option<&str>,
+) -> Result<AdmittedProducerConfig, String> {
+    let mut admitted = AdmittedProducerConfig {
+        queue_messages: DEFAULT_QUEUE_MAX_MESSAGES,
+        queue_kbytes: DEFAULT_QUEUE_MAX_KBYTES,
+        message_max_bytes: DEFAULT_MESSAGE_MAX_BYTES,
+        producer_set_crl: None,
+        extra_props: Vec::new(),
+    };
+    let Some(producer_config) = producer_config else {
+        return Ok(admitted);
+    };
+    let props = producer_config
+        .as_object()
+        .ok_or_else(|| "kafka_logging: 'producer_config' must be an object".to_string())?;
+    for (key, value) in props {
+        if key.trim().is_empty() {
+            return Err("kafka_logging: 'producer_config' keys must not be empty".to_string());
+        }
+        let prop = value.as_str().ok_or_else(|| {
+            format!("kafka_logging: 'producer_config.{key}' must be a string")
+        })?;
+        if prop.trim().is_empty() {
+            return Err(format!(
+                "kafka_logging: 'producer_config.{key}' must not be empty"
+            ));
+        }
+        if key.eq_ignore_ascii_case("bootstrap.servers")
+            || key.eq_ignore_ascii_case("metadata.broker.list")
+        {
+            return Err(format!(
+                "kafka_logging: 'producer_config.{key}' is not allowed"
+            ));
+        }
+        if key.eq_ignore_ascii_case("ssl.crl.location") {
+            admit_producer_crl_location(ssl_no_verify, gateway_crl_path, prop)?;
+            admitted.producer_set_crl = Some(prop.to_string());
+            continue;
+        }
+        if key.eq_ignore_ascii_case("queue.buffering.max.messages") {
+            admitted.queue_messages = parse_bounded_u32(
+                prop,
+                "producer_config.queue.buffering.max.messages",
+                HARD_MAX_QUEUE_MAX_MESSAGES,
+            )?;
+            continue;
+        }
+        if key.eq_ignore_ascii_case("queue.buffering.max.kbytes") {
+            admitted.queue_kbytes = parse_bounded_u32(
+                prop,
+                "producer_config.queue.buffering.max.kbytes",
+                HARD_MAX_QUEUE_MAX_KBYTES,
+            )?;
+            continue;
+        }
+        if key.eq_ignore_ascii_case("message.max.bytes") {
+            admitted.message_max_bytes = parse_bounded_u32(
+                prop,
+                "producer_config.message.max.bytes",
+                HARD_MAX_MESSAGE_MAX_BYTES,
+            )?;
+            continue;
+        }
+        admitted.extra_props.push((key.clone(), prop.to_string()));
+    }
+    Ok(admitted)
+}
+
+/// Fail-closed CRL override check shared by construction and pure admission.
+fn admit_producer_crl_location(
+    ssl_no_verify: bool,
+    gateway_crl_path: Option<&str>,
+    producer_crl: &str,
+) -> Result<(), String> {
+    if ssl_no_verify {
+        return Ok(());
+    }
+    if gateway_crl_path.is_some_and(|gateway| producer_crl != gateway) {
+        return Err(
+            "kafka_logging: 'producer_config.ssl.crl.location' conflicts with gateway FERRUM_TLS_CRL_FILE_PATH"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn near_miss_hint(object: &Map<String, Value>, required: &str, fallback: &str) -> String {

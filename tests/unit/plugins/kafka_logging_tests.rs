@@ -1,5 +1,6 @@
 //! Tests for kafka_logging plugin
 
+use ferrum_edge::_test_support::kafka_logging_validate_producer_admission_for_test;
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, kafka_logging::KafkaLogging};
 use serde_json::json;
@@ -498,7 +499,9 @@ async fn test_kafka_logging_rejects_oversized_producer_queue_budget() {
 async fn test_kafka_logging_rejects_conflicting_crl_override() {
     let client =
         default_http_client().with_tls_crl_file_path(Some("/etc/ferrum/gateway.crl".to_string()));
-    let result = KafkaLogging::new(
+    // Assert the pure admission boundary (same path construction uses) so
+    // CRL conflict coverage does not depend on librdkafka/OpenSSL.
+    let result = kafka_logging_validate_producer_admission_for_test(
         &json!({
             "broker_list": "localhost:9092",
             "topic": "test",
@@ -514,7 +517,7 @@ async fn test_kafka_logging_rejects_conflicting_crl_override() {
             e.contains("ssl.crl.location") && e.contains("conflicts"),
             "expected CRL conflict error, got: {e}"
         ),
-        Ok(_) => panic!("conflicting CRL override must be rejected"),
+        Ok(()) => panic!("conflicting CRL override must be rejected"),
     }
 }
 
@@ -522,7 +525,9 @@ async fn test_kafka_logging_rejects_conflicting_crl_override() {
 async fn test_kafka_logging_allows_matching_crl_override() {
     let client =
         default_http_client().with_tls_crl_file_path(Some("/etc/ferrum/gateway.crl".to_string()));
-    let plugin = KafkaLogging::new(
+    // Matching CRL overrides are admitted without constructing a producer
+    // (CI librdkafka builds may lack OpenSSL).
+    kafka_logging_validate_producer_admission_for_test(
         &json!({
             "broker_list": "localhost:9092",
             "topic": "test",
@@ -533,15 +538,16 @@ async fn test_kafka_logging_allows_matching_crl_override() {
         }),
         &client,
     )
-    .unwrap();
-    assert_eq!(plugin.name(), "kafka_logging");
+    .expect("matching gateway CRL override must be admitted");
 }
 
 #[tokio::test]
 async fn test_kafka_logging_no_verify_skips_crl_conflict() {
     let client =
         default_http_client().with_tls_crl_file_path(Some("/etc/ferrum/gateway.crl".to_string()));
-    let plugin = KafkaLogging::new(
+    // ssl_no_verify disables verification, so a divergent CRL path is not a
+    // conflict; assert via pure admission (no producer / OpenSSL required).
+    kafka_logging_validate_producer_admission_for_test(
         &json!({
             "broker_list": "localhost:9092",
             "topic": "test",
@@ -552,8 +558,7 @@ async fn test_kafka_logging_no_verify_skips_crl_conflict() {
         }),
         &client,
     )
-    .unwrap();
-    assert_eq!(plugin.name(), "kafka_logging");
+    .expect("ssl_no_verify must skip CRL conflict admission");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
