@@ -1328,6 +1328,10 @@ APPROVED_AUTOMATION_ROOTS = (
     "tests/k8s/",
     "tests/performance/",
 )
+# A repository program whose stdout becomes shell source is still executed in
+# its own language, but every edit can change the generated program. Carry this
+# extra provenance alongside (never instead of) the ordinary interpreter hint.
+GENERATED_SHELL_OUTPUT_PROVENANCE = "generated-shell-output"
 GENERATED_COMMAND_PATHS = frozenset(
     {
         "target/ci-release/ferrum-edge",
@@ -1413,11 +1417,9 @@ LOCAL_ACTION_CANDIDATE = re.compile(
     r"^\s*(?:-\s*)?(?:uses|'uses'|\"uses\")\s*:\s*['\"]?\./"
 )
 LOCAL_COMMAND_REFERENCE = re.compile(
-    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\$\(\s*|"
-    r"(?:<|>)\(\s*|\{\s+|"
-    r"\b(?:if|elif|while|until|then|do|else)\s+)"
-    r"(?:!\s*)?"
-    r"(?:\(\s*)?"
+    COMMAND_START_CONTEXT
+    + SUBSHELL_OPENERS
+    + r"(?:!\s*)?"
     # The same interleaved wrapper/`env`/assignment layer the opaque executable
     # scanners use. The older wrapper-then-`env` ordering could not describe
     # `env sudo bash scripts/unsafe.sh` or `sudo FOO=bar bash scripts/unsafe.sh`,
@@ -1739,6 +1741,34 @@ _inline_program_depth = 0
 # shell program assigns it, so the names a program binds are tracked while that
 # program is scanned and consulted when inline interpreter source is read.
 SHELL_PARAMETER_REFERENCE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+# Match the variable name at the start of a braced parameter expansion without
+# consuming the rest of that expansion. The evaluated source may use default,
+# length, slicing, removal, replacement, array, case, or indirect operators,
+# and nested references inside the operator word must remain visible to the
+# same scan.
+SHELL_SOURCE_PARAMETER_REFERENCE = re.compile(
+    r"\$(?:\{[!#]?(?P<braced>[A-Za-z_][A-Za-z0-9_]*)|"
+    r"(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+)
+# Generated-program variables can be assigned anywhere a shell command begins,
+# including after control keywords and group openers. Keeping this on the same
+# command-start vocabulary as the executable scanners prevents
+# `if ...; then source="$(./generator)"; fi; eval "$source"` from dropping the
+# generator's full-digest provenance. Matches are additionally filtered through
+# `shell_quote_at()` at their use sites so assignment-shaped quoted data does
+# not become a synthetic binding.
+SHELL_SOURCE_ASSIGNMENT_TARGET = (
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\[[^\]\n]*\])?\s*\+?=\s*"
+)
+SHELL_SOURCE_ASSIGNMENT = re.compile(
+    COMMAND_START_CONTEXT
+    + SUBSHELL_OPENERS
+    + r"(?:(?:export|readonly|local|declare|typeset)"
+    r"(?:\s+(?:--[A-Za-z][A-Za-z-]*|[+-][A-Za-z]+|--))*\s+)?"
+    + SHELL_SOURCE_ASSIGNMENT_TARGET
+)
+SHELL_SOURCE_NEXT_ASSIGNMENT = re.compile(SHELL_SOURCE_ASSIGNMENT_TARGET)
 SHELL_ASSIGNMENT_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=.*", re.DOTALL)
 WHOLE_SHELL_PARAMETER = re.compile(r"\s*\$[A-Za-z_][A-Za-z0-9_]*\s*")
 _shell_assigned_names: frozenset[str] = frozenset()
@@ -3289,16 +3319,40 @@ def replace_github_expressions(line: str, *, literal: bool) -> str:
     return "".join(parts)
 
 
+def shell_marker_is_escaped(line: str, position: int) -> bool:
+    """Return whether one shell marker has an odd backslash prefix."""
+
+    cursor = position
+    while cursor > 0 and line[cursor - 1] == "\\":
+        cursor -= 1
+    return (position - cursor) % 2 == 1
+
+
+def shell_single_quote_end(line: str, position: int) -> int | None:
+    """Return the enclosing single quote's end, if the marker is quoted."""
+
+    if shell_quote_at(line, position) != "'":
+        return None
+    end = line.find("'", position)
+    return len(line) if end < 0 else end
+
+
 def command_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
     """Locate complete outer $(...) spans, including nested parentheses."""
 
     spans: list[tuple[int, int]] = []
     cursor = 0
     while (start := line.find("$(", cursor)) >= 0:
+        while start >= 0 and shell_marker_is_escaped(line, start):
+            start = line.find("$(", start + 2)
+        if start < 0:
+            break
+        quote_end = shell_single_quote_end(line, start)
+        scan_end = quote_end if quote_end is not None else len(line)
         depth = 1
         quote: str | None = None
         index = start + 2
-        while index < len(line) and depth:
+        while index < scan_end and depth:
             character = line[index]
             if quote is not None:
                 if character == "\\" and quote == '"':
@@ -3319,12 +3373,628 @@ def command_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
                 depth -= 1
             index += 1
 
-        # An unterminated substitution cannot execute as a valid shell word,
-        # but consume it to the line end so partial content is not trusted.
+        # An unmatched marker inside inert single-quoted data must not consume
+        # a later executable substitution after the quote. A complete marker is
+        # retained because a literal `eval '$(...)'` executes it in the nested
+        # shell reader. Outside single quotes, consume malformed input to the
+        # line end rather than trusting a partial program.
+        if depth and quote_end is not None:
+            cursor = min(quote_end + 1, len(line))
+            continue
         end = index if depth == 0 else len(line)
         spans.append((start, end))
         cursor = end
     return tuple(spans)
+
+
+def backtick_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
+    """Locate outer legacy command substitutions without decoding them."""
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        start = line.find("`", cursor)
+        while start >= 0 and shell_marker_is_escaped(line, start):
+            start = line.find("`", start + 1)
+        if start < 0:
+            break
+        quote_end = shell_single_quote_end(line, start)
+        end = line.find("`", start + 1)
+        while end >= 0 and shell_marker_is_escaped(line, end):
+            end = line.find("`", end + 1)
+        if quote_end is not None and (end < 0 or end >= quote_end):
+            cursor = min(quote_end + 1, len(line))
+            continue
+        end = len(line) if end < 0 else end + 1
+        spans.append((start, end))
+        cursor = end
+    return tuple(spans)
+
+
+def process_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
+    """Locate outer <(...) and >(...) spans, including balanced nesting."""
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        candidates: list[int] = []
+        for marker in ("<(", ">("):
+            position = line.find(marker, cursor)
+            while position >= 0 and shell_marker_is_escaped(line, position):
+                position = line.find(marker, position + 2)
+            if position >= 0:
+                candidates.append(position)
+        if not candidates:
+            break
+        start = min(candidates)
+        quote_end = shell_single_quote_end(line, start)
+        scan_end = quote_end if quote_end is not None else len(line)
+        depth = 1
+        quote: str | None = None
+        index = start + 2
+        while index < scan_end and depth:
+            character = line[index]
+            if quote is not None:
+                if character == "\\" and quote == '"':
+                    index += 2
+                    continue
+                if character == quote:
+                    quote = None
+                index += 1
+                continue
+            if character in "'\"":
+                quote = character
+            elif character == "\\":
+                index += 2
+                continue
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            index += 1
+        if depth and quote_end is not None:
+            cursor = min(quote_end + 1, len(line))
+            continue
+        spans.append((start, index if depth == 0 else len(line)))
+        cursor = spans[-1][1]
+    return tuple(spans)
+
+
+def generated_shell_expansion_spans(line: str) -> tuple[tuple[int, int], ...]:
+    """Return expansions whose bytes become source for an opaque shell eval.
+
+    The existing opaque-inline-shell expression decides whether an expansion
+    occupies a generated-code slot. Extending each matched opener through its
+    balanced body lets reachability attribute repository programs inside that
+    producer without broadening the decision to ordinary command substitutions
+    used as data.
+    """
+
+    candidates = [
+        *((start, end, 2) for start, end in command_substitution_spans(line)),
+        *((start, end, 1) for start, end in backtick_substitution_spans(line)),
+        *((start, end, 2) for start, end in process_substitution_spans(line)),
+    ]
+    generated: list[tuple[int, int]] = []
+    for start, end, opener_length in sorted(candidates):
+        probe = line[: start + opener_length]
+        if any(
+            match.end() == len(probe)
+            for match in OPAQUE_INLINE_SHELL.finditer(probe)
+        ):
+            generated.append((start, end))
+    return tuple(generated)
+
+
+def shell_assignment_value_end(line: str, start: int) -> int:
+    """Return the outer shell-word boundary for one assignment value.
+
+    The value may contain quoted whitespace and nested command, parameter,
+    arithmetic, or process substitutions. Only whitespace or shell punctuation
+    at the value's outer level ends the assignment word. An unbalanced construct
+    conservatively owns the remainder of the line instead of withdrawing a
+    possible generated-program producer.
+    """
+
+    quote: str | None = None
+    escaped = False
+    pending: list[tuple[str, str | None]] = []
+    index = start
+    while index < len(line):
+        character = line[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote != "'" and (
+            line.startswith("$(", index)
+            or line.startswith("${", index)
+            or character == "`"
+        ):
+            if character == "`":
+                if pending and pending[-1][0] == "`":
+                    _, quote = pending.pop()
+                else:
+                    pending.append(("`", quote))
+                    quote = None
+                index += 1
+                continue
+            pending.append(("}" if line.startswith("${", index) else ")", quote))
+            quote = None
+            index += 2
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in "'\"":
+            quote = character
+            index += 1
+            continue
+        if pending and character == pending[-1][0]:
+            _, quote = pending.pop()
+            index += 1
+            continue
+        if character == "(" or (
+            character in "<>" and line.startswith("(", index + 1)
+        ):
+            if not pending and character == "(":
+                if index != start:
+                    return index
+            pending.append((")", quote))
+            index += 2 if character in "<>" else 1
+            continue
+        if pending:
+            index += 1
+            continue
+        if character.isspace() or character in ";&|<>)":
+            return index
+        index += 1
+    return len(line)
+
+
+def shell_source_evaluator_segments(line: str) -> tuple[str, ...]:
+    """Return individual shell commands for evaluator-variable discovery.
+
+    The opaque evaluator expression deliberately scans a complete command,
+    because every `eval` argument contributes source. Applying its greedy
+    expansion branch to a whole physical line also consumed parameters in a
+    later statement or pipeline stage and froze unrelated data producers.
+    Tokenization failure keeps the old whole-line, fail-closed fallback.
+    """
+
+    tokens = shell_tokens(line)
+    if tokens is None:
+        return (line,)
+    commands = tuple(
+        " ".join(segment)
+        for statement in shell_statement_groups(tokens)
+        for segment in split_shell_pipeline(statement)
+    )
+    return commands or (line,)
+
+
+def shell_capture_variable_aliases(line: str) -> tuple[tuple[str, str], ...]:
+    """Return capture-target to contributing-variable provenance edges."""
+
+    tokens = shell_tokens(line)
+    if tokens is None:
+        return ()
+    aliases: list[tuple[str, str]] = []
+    for statement in shell_statement_groups(tokens):
+        pipeline = split_shell_pipeline(statement)
+        for position, segment in enumerate(pipeline):
+            targets = shell_capture_target_names(segment)
+            if not targets:
+                continue
+            sources = {
+                parameter.group("braced") or parameter.group("bare")
+                for contributing in (*pipeline[:position], segment)
+                for word in contributing
+                for parameter in SHELL_SOURCE_PARAMETER_REFERENCE.finditer(word)
+            }
+            aliases.extend(
+                (target, source)
+                for target in targets
+                for source in sources
+                if source != target
+            )
+    return tuple(dict.fromkeys(aliases))
+
+
+def shell_source_variable_names(lines: tuple[str, ...]) -> frozenset[str]:
+    """Return shell variables whose values later become opaque program source.
+
+    Directly nested expansions are handled by
+    `generated_shell_expansion_spans()`. This bounded data-flow pass covers the
+    ordinary two-step spelling instead: `code=$(./helper); eval "$code"` (and
+    shell `-c "$code"`). Without it, an unchanged trusted evaluator froze only
+    its caller while a helper-only edit still changed the executed program.
+
+    Assignment and bounded capture aliases are followed to a fixed point, so
+    both `a=$(helper); b=$a; eval "$b"` and
+    `read a < <(helper); read b <<< "$a"; eval "$b"` retain the original
+    producer. The analysis only accumulates names and therefore terminates
+    after at most the number of referenced variables.
+    """
+
+    evaluated: set[str] = set()
+    assignments: list[tuple[str, str]] = []
+    capture_aliases: list[tuple[str, str]] = []
+    for line in lines:
+        for statement in shell_source_evaluator_segments(line):
+            for opaque in OPAQUE_INLINE_SHELL.finditer(statement):
+                for parameter in SHELL_SOURCE_PARAMETER_REFERENCE.finditer(
+                    opaque.group(0)
+                ):
+                    evaluated.add(
+                        parameter.group("braced") or parameter.group("bare")
+                    )
+        for name, value_start in shell_source_assignments(line):
+            value_end = shell_assignment_value_end(line, value_start)
+            assignments.append((name, line[value_start:value_end]))
+        capture_aliases.extend(shell_capture_variable_aliases(line))
+
+    changed = True
+    while changed:
+        changed = False
+        for name, value in assignments:
+            if name not in evaluated:
+                continue
+            for parameter in SHELL_SOURCE_PARAMETER_REFERENCE.finditer(value):
+                source_name = parameter.group("braced") or parameter.group("bare")
+                if source_name not in evaluated:
+                    evaluated.add(source_name)
+                    changed = True
+        for target, source in capture_aliases:
+            if target in evaluated and source not in evaluated:
+                evaluated.add(source)
+                changed = True
+    return frozenset(evaluated)
+
+
+def shell_source_assignments(line: str) -> tuple[tuple[str, int], ...]:
+    """Return source-variable bindings and the start of each assigned value."""
+
+    bindings: list[tuple[str, int]] = []
+    for bound in SHELL_SOURCE_ASSIGNMENT.finditer(line):
+        if shell_quote_at(line, bound.start("name")) is not None:
+            continue
+        bindings.append((bound.group("name"), bound.end()))
+        cursor = shell_assignment_value_end(line, bound.end())
+        while True:
+            cursor += len(line[cursor:]) - len(line[cursor:].lstrip())
+            chained = SHELL_SOURCE_NEXT_ASSIGNMENT.match(line, cursor)
+            if chained is None:
+                break
+            if shell_quote_at(line, chained.start("name")) is not None:
+                break
+            bindings.append((chained.group("name"), chained.end()))
+            cursor = shell_assignment_value_end(line, chained.end())
+    return tuple(dict.fromkeys(bindings))
+
+
+def generated_shell_assignment_spans(
+    line: str,
+    evaluated_variables: frozenset[str],
+) -> tuple[tuple[int, int], ...]:
+    """Return substitutions assigned to a variable later used as source."""
+
+    if not evaluated_variables:
+        return ()
+    assignments = tuple(
+        (value_start, shell_assignment_value_end(line, value_start))
+        for name, value_start in shell_source_assignments(line)
+        if name in evaluated_variables
+    )
+    if not assignments:
+        return ()
+    candidates = (
+        *command_substitution_spans(line),
+        *backtick_substitution_spans(line),
+        *process_substitution_spans(line),
+    )
+    return tuple(
+        (start, end)
+        for start, end in sorted(candidates)
+        if any(
+            value_start <= start < value_end
+            for value_start, value_end in assignments
+        )
+    )
+
+
+def shell_capture_target_name(target: str) -> str | None:
+    """Return the base variable name of a scalar or indexed capture target."""
+
+    matched = re.fullmatch(
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]\n]*\])?",
+        target,
+    )
+    return matched.group("name") if matched is not None else None
+
+
+def shell_capture_target_names(segment: tuple[str, ...]) -> frozenset[str]:
+    """Return variables populated by a bounded shell capture builtin."""
+
+    index, executes = executable_index(segment)
+    if not executes or index >= len(segment):
+        return frozenset()
+    command = tool_name(segment[index])
+    if command == "builtin" and index + 1 < len(segment):
+        index += 1
+        command = tool_name(segment[index])
+    arguments = segment[index + 1 :]
+    names: set[str] = set()
+    if command == "printf":
+        for position, argument in enumerate(arguments):
+            if argument == "-v" and position + 1 < len(arguments):
+                target = arguments[position + 1]
+            elif argument.startswith("-v") and len(argument) > 2:
+                target = argument[2:]
+            else:
+                continue
+            if (name := shell_capture_target_name(target)) is not None:
+                names.add(name)
+        return frozenset(names)
+    if command not in {"mapfile", "read", "readarray"}:
+        return frozenset()
+    names.update(
+        name
+        for argument in arguments
+        if (name := shell_capture_target_name(argument)) is not None
+    )
+    # These are the documented implicit destinations when no explicit variable
+    # is supplied. Retaining them unconditionally is conservative when options
+    # carry identifier-shaped operands and avoids mistaking one for a target.
+    names.add("REPLY" if command == "read" else "MAPFILE")
+    return frozenset(names)
+
+
+def generated_shell_capture_operands(
+    line: str,
+    evaluated_variables: frozenset[str],
+) -> frozenset[str]:
+    """Return repository commands whose output enters an evaluated variable."""
+
+    if not evaluated_variables:
+        return frozenset()
+    tokens = shell_tokens(line)
+    if tokens is None:
+        return frozenset()
+    operands: set[str] = set()
+    for statement in shell_statement_groups(tokens):
+        pipeline = split_shell_pipeline(statement)
+        for position, segment in enumerate(pipeline):
+            if not (
+                shell_capture_target_names(segment) & evaluated_variables
+            ):
+                continue
+            # An earlier pipeline stage feeds `read`, while command/process
+            # substitutions used by `printf -v` or a redirected capture remain
+            # in the capture segment itself. Every literal repository command in
+            # either position can therefore influence the evaluated bytes.
+            for contributing in (*pipeline[:position], segment):
+                for word in contributing:
+                    candidates = [word]
+                    # `shlex` keeps a command substitution inside double quotes
+                    # as one word, so normalizing that whole word cannot recover
+                    # `./scripts/generator` from `"$(./scripts/generator)"`.
+                    # Reuse the command-reference boundary already responsible
+                    # for deciding which nested words are repository executions;
+                    # this is only reached for a capture target later evaluated
+                    # as program source.
+                    for reference in LOCAL_COMMAND_REFERENCE.finditer(word):
+                        candidates.append(
+                            reference.group("redirected")
+                            or reference.group("interpreted")
+                            or reference.group("direct")
+                            or reference.group("bare")
+                        )
+                    for candidate in candidates:
+                        normalized = normalize_repository_path(candidate)
+                        if normalized is not None:
+                            operands.add(normalized)
+    return frozenset(operands)
+
+
+def generated_source_output_references(
+    program: str,
+    evaluator_prefix: str,
+) -> tuple[tuple[str, str | None, str | None], ...]:
+    """Return repository producers in substitutions of generated shell source.
+
+    The raw span pass deliberately leaves an unmatched marker inside inert
+    single-quoted data behind. Adjacent quoted fragments in one evaluator word
+    are different: `eval '$(''./scripts/build)'` removes both quote boundaries
+    before `eval` parses the resulting `$(./scripts/build)`. `shlex` exposes the
+    assembled word, so replay the existing generated-source classifier over
+    that value and recover only repository commands inside the classified
+    substitution spans. The evaluator prefix retains the same decision boundary
+    as `generated_shell_expansion_spans()`; this helper does not make ordinary
+    quoted data executable.
+    """
+
+    synthetic = f"{evaluator_prefix}{program}"
+    generated_spans = generated_shell_expansion_spans(synthetic)
+    if not generated_spans:
+        return ()
+    references: list[tuple[str, str | None, str | None]] = []
+    for reference in LOCAL_COMMAND_REFERENCE.finditer(synthetic):
+        if not any(
+            start <= reference.start() < end for start, end in generated_spans
+        ):
+            continue
+        raw_path = (
+            reference.group("redirected")
+            or reference.group("interpreted")
+            or reference.group("direct")
+            or reference.group("bare")
+        )
+        normalized = normalize_repository_path(raw_path)
+        if normalized is None:
+            continue
+        interpreter_word = reference.group("interpreter") or reference.group(
+            "redirected_interpreter"
+        )
+        reference_interpreter: str | None = None
+        unsupported_interpreter: str | None = None
+        if interpreter_word:
+            interpreter_words = tuple(interpreter_word.split())
+            reference_interpreter = (
+                "shell"
+                if interpreter_words[0] in {"source", "."}
+                else interpreter_kind(interpreter_words)
+            )
+            if reference_interpreter is None:
+                unsupported_interpreter = interpreter_words[0]
+        references.append(
+            (normalized, reference_interpreter, unsupported_interpreter)
+        )
+    return tuple(dict.fromkeys(references))
+
+
+def generated_shell_evaluator_references(
+    line: str,
+) -> tuple[tuple[str, str | None, str | None], ...]:
+    """Recover generated-output producers after outer-shell quote removal."""
+
+    tokens = shell_tokens(line)
+    if tokens is None:
+        return ()
+    references: list[tuple[str, str | None, str | None]] = []
+    for statement in shell_statement_groups(tokens):
+        for segment in split_shell_pipeline(statement):
+            index, executes = executable_index(segment)
+            if not executes or index >= len(segment):
+                continue
+            command = tool_name(segment[index])
+            if command == "builtin" and index + 1 < len(segment):
+                index += 1
+                command = tool_name(segment[index])
+            if command == "eval":
+                program = " ".join(segment[index + 1 :])
+                if program:
+                    references.extend(
+                        generated_source_output_references(program, "eval ")
+                    )
+                continue
+            if command not in SHELL_INTERPRETER_NAMES:
+                continue
+            program, _opaque_options, _stdin_mode = shell_invocation_mode(
+                segment,
+                index,
+            )
+            if program is not None:
+                references.extend(
+                    generated_source_output_references(
+                        program,
+                        f"{command} -c ",
+                    )
+                )
+    return tuple(dict.fromkeys(references))
+
+
+def generated_shell_assignment_references(
+    line: str,
+    evaluated_variables: frozenset[str],
+) -> tuple[tuple[str, str | None, str | None], ...]:
+    """Recover quoted-fragment producers assigned to evaluated variables."""
+
+    if not evaluated_variables:
+        return ()
+    references: list[tuple[str, str | None, str | None]] = []
+    for name, value_start in shell_source_assignments(line):
+        if name not in evaluated_variables:
+            continue
+        value_end = shell_assignment_value_end(line, value_start)
+        tokens = shell_tokens(line[value_start:value_end])
+        if tokens is None:
+            continue
+        # A scalar assignment normally yields one assembled word. Array and
+        # declaration spellings can expose several tokens; inspect each element
+        # and their shell-joined view so a quoted fragment cannot withdraw the
+        # producer merely by moving across an array/declaration boundary.
+        variants = tuple(dict.fromkeys((*tokens, " ".join(tokens))))
+        for program in variants:
+            references.extend(
+                generated_source_output_references(program, "eval ")
+            )
+    return tuple(dict.fromkeys(references))
+
+
+def shell_statement_groups(
+    tokens: tuple[str, ...],
+) -> tuple[tuple[str, ...], ...]:
+    """Split commands at outer statement boundaries while retaining pipelines."""
+
+    statements: list[tuple[str, ...]] = []
+    current: list[str] = []
+    depth = 0
+    for token in tokens:
+        if token == "(":
+            depth += 1
+        elif token == ")" and depth:
+            depth -= 1
+        if token in STATEMENT_SEPARATOR_TOKENS and depth == 0:
+            if current:
+                statements.append(tuple(current))
+            current = []
+        else:
+            current.append(token)
+    if current:
+        statements.append(tuple(current))
+    return tuple(statements)
+
+
+def generated_stdin_program_operands(line: str) -> frozenset[str]:
+    """Return path words whose stdout can become interpreter source on stdin.
+
+    The Cross scanner already treats an undecodable interpreter stdin program
+    as opaque at the caller. That protects a newly added pipeline, but it does
+    not protect a helper-only edit when the trusted caller already contains
+    `./scripts/generator | bash`: the caller surface stays byte-identical while
+    the generated program changes. Record the repository command words in every
+    contributing pipeline stage, plus an opaque interpreter segment itself for
+    process-substitution/here-string input, so reachability can freeze those
+    producers without treating ordinary data pipelines as executable source.
+
+    Tokenization is deliberately the same shell model used by
+    `shell_stdin_program()`. A line it cannot tokenize contributes no optimistic
+    classification here; the existing opaque caller checks still fail closed.
+    """
+
+    tokens = shell_tokens(line)
+    if tokens is None:
+        return frozenset()
+    operands: set[str] = set()
+    # Keep each pipeline intact until the receiving interpreter is identified.
+    # `shell_statement_segments()` deliberately flattens pipelines into the
+    # individual commands a shell dispatches; using it here erased the producer
+    # / interpreter relationship before `split_shell_pipeline()` could inspect
+    # it, so `./scripts/generator | bash` marked neither helper provenance nor
+    # the equivalent Python-stdin path.
+    for statement in shell_statement_groups(tokens):
+        pipeline = split_shell_pipeline(statement)
+        for position, segment in enumerate(pipeline):
+            language, _program, opaque = shell_stdin_program(segment)
+            if language is None or not opaque:
+                continue
+            # Every earlier stage contributes to the bytes the interpreter
+            # receives. The interpreter segment is included as well because a
+            # process substitution (`bash < <(./helper)`) or dynamic here-string
+            # carries its producer inside that same segment.
+            for contributing in (*pipeline[:position], segment):
+                for word in contributing:
+                    normalized = normalize_repository_path(word)
+                    if normalized is not None:
+                        operands.add(normalized)
+    return frozenset(operands)
 
 
 def flattened_command_substitutions(line: str) -> str:
@@ -5416,6 +6086,91 @@ def shell_quote_at(value: str, position: int) -> str | None:
     return quote
 
 
+def separate_unquoted_shell_newlines(value: str) -> str:
+    """Preserve multiline words while making real new commands explicit.
+
+    `shlex` retains a newline inside a quoted inline program, which lets the
+    language-specific reader inspect `python -c '\n...\n'` as one operand. It
+    otherwise treats an unquoted newline as ordinary whitespace and can merge
+    the next physical command into the preceding argv. Append a separator only
+    after newlines outside shell-data quotes; retaining the newline itself also
+    keeps shell-comment termination intact.
+    """
+
+    rendered: list[str] = []
+    quote: str | None = None
+    escaped = False
+    comment = False
+    pending: list[tuple[str, str | None]] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        rendered.append(character)
+        if comment:
+            if character == "\n":
+                rendered.append(";")
+                comment = False
+            index += 1
+            continue
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote != "'" and value.startswith("$(", index):
+            rendered.append("(")
+            pending.append((")", quote))
+            quote = None
+            index += 2
+            continue
+        if quote != "'" and character == "`":
+            if pending and pending[-1][0] == "`":
+                _, quote = pending.pop()
+            else:
+                pending.append(("`", quote))
+                quote = None
+            index += 1
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in "'\"":
+            quote = character
+            index += 1
+            continue
+        if character == "#" and (
+            index == 0
+            or value[index - 1].isspace()
+            or value[index - 1] in ";&|()<>"
+        ):
+            comment = True
+            index += 1
+            continue
+        if pending and character == pending[-1][0]:
+            _, quote = pending.pop()
+            index += 1
+            continue
+        if character == "(" or (
+            character in "<>" and value.startswith("(", index + 1)
+        ):
+            pending.append((")", quote))
+            if character in "<>":
+                rendered.append("(")
+                index += 2
+            else:
+                index += 1
+            continue
+        if character == "\n":
+            rendered.append(";")
+        index += 1
+    return "".join(rendered)
+
+
 def has_cross_command_context(
     candidate: str,
     *,
@@ -5929,25 +6684,9 @@ def literal_command_text_has_cross(
 def shell_statement_segments(tokens: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
     """Split a token stream into the individual commands a shell dispatches."""
 
-    statements: list[tuple[str, ...]] = []
-    current: list[str] = []
-    depth = 0
-    for token in tokens:
-        if token == "(":
-            depth += 1
-        elif token == ")" and depth:
-            depth -= 1
-        if token in STATEMENT_SEPARATOR_TOKENS and depth == 0:
-            if current:
-                statements.append(tuple(current))
-            current = []
-        else:
-            current.append(token)
-    if current:
-        statements.append(tuple(current))
     return tuple(
         segment
-        for statement in statements
+        for statement in shell_statement_groups(tokens)
         for segment in split_shell_pipeline(statement)
     )
 
@@ -7688,7 +8427,13 @@ def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
         # Inline foreign interpreters can dispatch Cross or evaluate generated
         # code without putting a Cross word in the surrounding shell command.
         # Reuse their token model here so reached trusted shell scripts enforce
-        # the same boundary as workflow `run:` fields.
+        # the same boundary as workflow `run:` fields. The full program pass
+        # retains quoted inline operands that span physical lines; explicit
+        # separators on every unquoted newline keep adjacent shell commands
+        # from being combined into one synthetic interpreter argv.
+        or shell_inline_interpreter_has_cross(
+            separate_unquoted_shell_newlines(command_text)
+        )
         or any(
             shell_inline_interpreter_has_cross(line)
             for line, shell_evaluated, _ in logical_scan_lines(command_text)
@@ -7877,6 +8622,22 @@ def automation_file_cross_surfaces(
         if shell_reading
         else []
     )
+    # Python and PowerShell source is intentionally not interpreted as POSIX
+    # shell, but its language-specific process readers do not represent
+    # standalone Cross environment/configuration inputs. Preserve that policy
+    # surface with the same full-file digest used for shell-sensitive files so
+    # a pull request cannot add, remove, or alter one while keeping an otherwise
+    # benign process command.
+    if not shell_reading and CROSS_ENVIRONMENT.search(contents):
+        digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+        surfaces.append(f"cross-environment:{digest}")
+    if GENERATED_SHELL_OUTPUT_PROVENANCE in interpreters:
+        # The caller evaluates this file's stdout as shell source. The file is
+        # still parsed and traversed in its real language, but comparison must
+        # freeze its complete output-producing implementation because static
+        # source inspection cannot prove which bytes it will emit.
+        digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+        surfaces.append(f"generated-shell-output:{digest}")
     # Nested heredocs belong to this reading too. A suffixless file only needs
     # the fallback shell interpretation when its own contents name no language;
     # an explicit Python/PowerShell shebang remains authoritative unless the
@@ -8647,6 +9408,18 @@ def tokenized_stdin_interpreter_language(
         return None
 
     command = expanded[index]
+    if (
+        command == "$"
+        and index + 1 < len(expanded)
+        and expanded[index + 1] == "("
+    ):
+        # `shlex` separates the punctuation in a command-substitution command
+        # word (`$(select_interpreter)` becomes `$`, `(`, ...). The substitution
+        # can emit any executable name, including a supported interpreter that
+        # consumes this heredoc body, so it is opaque rather than a literal `$`
+        # command. The raw outer-pipeline projection already proves this is a
+        # real command slot rather than a quoted or nested pipe.
+        return "opaque"
     if command == "." or tool_name(command) == "source":
         if index + 1 >= len(expanded):
             return None
@@ -8676,22 +9449,11 @@ def tokenized_stdin_interpreter_language(
 def executable_heredoc_language(line: str, start: int) -> str | None:
     """Classify the interpreter that receives one heredoc body, if any."""
 
-    # Both sides of the opener are evidence. The piped interpreter is appended
-    # last because it receives the body when both spellings appear.
-    interpreters = [
-        match.group("interpreter")
-        for match in HEREDOC_EXECUTABLE.finditer(line[:start])
-    ] + [
-        match.group("interpreter")
-        for match in HEREDOC_PIPED_INTERPRETER.finditer(
-            heredoc_pipeline_tail(line, start)
-        )
-    ]
-    if interpreters:
-        executable = tool_name(interpreters[-1])
-        if PYTHON_INTERPRETER.fullmatch(executable):
+    def named_language(executable: str) -> str:
+        name = tool_name(executable)
+        if PYTHON_INTERPRETER.fullmatch(name):
             return "python"
-        if executable.lower() in {"pwsh", "powershell"}:
+        if name.lower() in {"pwsh", "powershell"}:
             return "powershell"
         return "shell"
 
@@ -8701,13 +9463,18 @@ def executable_heredoc_language(line: str, start: int) -> str | None:
     # stdin-program scanner already understands every supported interpreter and
     # expands `env -S`; without this fallback it deferred a real heredoc here,
     # then this classifier withdrew the body as template data.
+    prefix_language: str | None = None
     prefix_tokens = shell_tokens(line[:start])
     if prefix_tokens is not None:
         prefix_segments = shell_statement_segments(prefix_tokens)
         if prefix_segments:
-            language = tokenized_stdin_interpreter_language(prefix_segments[-1])
-            if language is not None:
-                return language
+            prefix_language = tokenized_stdin_interpreter_language(
+                prefix_segments[-1]
+            )
+            if prefix_language == "opaque":
+                # A computed direct receiver executes the body before any later
+                # pipeline stage can make its language appear decidable.
+                return "opaque"
 
     # Preserve raw quote content while limiting the token fallback to the same
     # outer pipeline the quote-aware tail scanner approved. The visible tail
@@ -8742,8 +9509,34 @@ def executable_heredoc_language(line: str, start: int) -> str | None:
             language = tokenized_stdin_interpreter_language(segment)
             if language is not None:
                 tail_languages.append(language)
-    if tail_languages:
-        return tail_languages[-1]
+    # Preserve the bounded regex path when tokenization found no interpreter on
+    # that side. Do not append duplicate token/regex readings of the same stage:
+    # the count below represents distinct executable stages, not detectors.
+    if prefix_language is None:
+        prefix_interpreters = [
+            match.group("interpreter")
+            for match in HEREDOC_EXECUTABLE.finditer(line[:start])
+        ]
+        if prefix_interpreters:
+            prefix_language = named_language(prefix_interpreters[-1])
+    if not tail_languages:
+        tail_languages.extend(
+            named_language(match.group("interpreter"))
+            for match in HEREDOC_PIPED_INTERPRETER.finditer(visible_tail)
+        )
+
+    observed_languages = [
+        *([prefix_language] if prefix_language is not None else []),
+        *tail_languages,
+    ]
+    if "opaque" in observed_languages or len(observed_languages) > 1:
+        # Every interpreter stage executes concurrently. An opaque stage may
+        # select any reader, and even two literal readers form a generated-code
+        # chain: the later stage receives the earlier one's output, not the raw
+        # heredoc. No single language can safely represent that union.
+        return "opaque"
+    if observed_languages:
+        return observed_languages[0]
     return None
 
 
@@ -10117,6 +10910,11 @@ def automation_command_scripts(
             for script in dispatcher_manifest_scripts(source, contents)
         ], []
     language = automation_language(source, contents)
+    if interpreter_hint == GENERATED_SHELL_OUTPUT_PROVENANCE:
+        # This is additional output provenance, not the language that executes
+        # the file. Its ordinary bare/explicit hint is recorded alongside it
+        # and performs the real traversal, so this replay owes no second parse.
+        return [], []
     if interpreter_hint is not None:
         # The interpreter a call site names is what actually executes the file,
         # so it outranks the file's own suffix and shebang rather than only
@@ -10322,6 +11120,10 @@ def block_automation_references(
             errors.extend(heredoc_failures)
             pending_programs.extend(heredoc_programs)
 
+        generated_source_variables = shell_source_variable_names(
+            tuple(command_line.text for command_line in command_lines)
+        )
+
         working_directory: str | None = ""
         control_stack: list[str | None] = []
         # A substitution group runs in a subshell, so its `if`/`else` blocks open
@@ -10369,6 +11171,39 @@ def block_automation_references(
                 inside_subshell = True
                 subshell_control_stack.clear()
             normalized_line = repository_command_line(line)
+            generated_shell_spans = tuple(
+                dict.fromkeys(
+                    (
+                        *generated_shell_expansion_spans(normalized_line),
+                        *generated_shell_assignment_spans(
+                            normalized_line,
+                            generated_source_variables,
+                        ),
+                    )
+                )
+            )
+            dequoted_generated_references = tuple(
+                dict.fromkeys(
+                    (
+                        *generated_shell_evaluator_references(normalized_line),
+                        *generated_shell_assignment_references(
+                            normalized_line,
+                            generated_source_variables,
+                        ),
+                    )
+                )
+            )
+            generated_output_operands = (
+                generated_stdin_program_operands(normalized_line)
+                | generated_shell_capture_operands(
+                    normalized_line,
+                    generated_source_variables,
+                )
+                | frozenset(
+                    raw_path
+                    for raw_path, _, _ in dequoted_generated_references
+                )
+            )
             directory_matches = list(CD_COMMAND.finditer(normalized_line))
             opened_controls = len(
                 re.findall(r"\b(?:if|while|until|for|case)\b", normalized_line)
@@ -10415,7 +11250,18 @@ def block_automation_references(
                     [match for match in directory_matches if match.start() < position],
                 )
 
+            handled_dequoted_references: set[
+                tuple[str, str | None, str | None]
+            ] = set()
             for match in LOCAL_COMMAND_REFERENCE.finditer(normalized_line):
+                generated_shell_output = any(
+                    # The repository-reference expression consumes the command
+                    # substitution opener as its command-start context, so a
+                    # producer immediately inside `$(`, a backtick, or `<(`
+                    # begins at the span boundary rather than one byte after it.
+                    start <= match.start() < end
+                    for start, end in generated_shell_spans
+                )
                 enclosing_quote = shell_quote_at(normalized_line, match.start())
                 if enclosing_quote is not None and not (
                     enclosing_quote == '"'
@@ -10423,7 +11269,7 @@ def block_automation_references(
                         normalized_line.startswith("$(", match.start())
                         or normalized_line.startswith("`", match.start())
                     )
-                ):
+                ) and not generated_shell_output:
                     # Shell-looking separators inside a quoted regex/string are
                     # data. The old raw regex treated the `|tests/...` fragment
                     # of a grep pattern as a new pipeline command and queued a
@@ -10445,6 +11291,16 @@ def block_automation_references(
                     or match.group("direct")
                     or match.group("bare")
                 )
+                normalized_raw_command_path = normalize_repository_path(
+                    raw_command_path
+                )
+                if normalized_raw_command_path in generated_output_operands:
+                    # A literal repository program whose stdout enters an
+                    # interpreter stdin is an output generator just as surely
+                    # as one nested directly inside `eval "$(...)"`. Keep its
+                    # ordinary interpreter provenance too; this marker adds a
+                    # full-digest boundary and never replaces real traversal.
+                    generated_shell_output = True
                 # An explicit interpreter names the language of the file it
                 # runs, and that is the only evidence there is when the file
                 # carries neither a suffix nor a shebang. `python3 ci/unsafe`
@@ -10457,6 +11313,7 @@ def block_automation_references(
                     "redirected_interpreter"
                 )
                 reference_interpreter: str | None = None
+                unsupported_reference_interpreter: str | None = None
                 if interpreter_word:
                     interpreter_words = tuple(interpreter_word.split())
                     reference_interpreter = (
@@ -10465,6 +11322,7 @@ def block_automation_references(
                         else interpreter_kind(interpreter_words)
                     )
                     if reference_interpreter is None:
+                        unsupported_reference_interpreter = interpreter_words[0]
                         # The edge is real but its language is outside the
                         # scanners this policy can interpret. Recording it as a
                         # bare read makes a suffixless Node/Ruby/etc. helper fall
@@ -10530,13 +11388,108 @@ def block_automation_references(
                     # `python3 scripts/poly` edge erase the bare `run:
                     # scripts/poly` one, so the shell-only edges the bare read
                     # really executes were never followed.
-                    interpreters.setdefault(command_path, set()).add(
-                        reference_interpreter
+                    recorded_interpreters = interpreters.setdefault(
+                        command_path,
+                        set(),
                     )
+                    recorded_interpreters.add(reference_interpreter)
+                    if generated_shell_output:
+                        recorded_interpreters.add(
+                            GENERATED_SHELL_OUTPUT_PROVENANCE
+                        )
+                        handled_dequoted_references.update(
+                            {
+                                (
+                                    normalized_raw_command_path,
+                                    reference_interpreter,
+                                    unsupported_reference_interpreter,
+                                )
+                            }
+                            & set(dequoted_generated_references)
+                        )
                 else:
                     errors.append(
                         f"{source}:{line_number} repository command {command_path!r} "
                         "is outside the scanned automation roots"
+                    )
+
+            # A generated program can assemble a substitution and its
+            # repository operand from adjacent quoted fragments. The raw regex
+            # either sees that path as inert quoted data or cannot span the
+            # removed quote boundary at all, so record the dequoted reference
+            # directly when the ordinary pass above did not. If the original
+            # path position cannot be recovered in a line that also changes
+            # directory, fail closed rather than resolving it from the wrong
+            # directory.
+            for (
+                raw_command_path,
+                reference_interpreter,
+                unsupported_interpreter,
+            ) in dequoted_generated_references:
+                reference = (
+                    raw_command_path,
+                    reference_interpreter,
+                    unsupported_interpreter,
+                )
+                if reference in handled_dequoted_references:
+                    continue
+                if unsupported_interpreter is not None:
+                    errors.append(
+                        f"{source}:{line_number} repository command uses "
+                        f"unsupported explicit interpreter "
+                        f"{unsupported_interpreter!r}"
+                    )
+                positions: list[int] = []
+                cursor = 0
+                while (
+                    position := normalized_line.find(raw_command_path, cursor)
+                ) >= 0:
+                    positions.append(position)
+                    cursor = position + max(len(raw_command_path), 1)
+                if directory_matches and len(positions) != 1:
+                    errors.append(
+                        f"{source}:{line_number} quote-assembled repository "
+                        "command has ambiguous working-directory state"
+                    )
+                    continue
+                position = positions[0] if positions else 0
+                effective_directory = directory_before(position)
+                if effective_directory is None:
+                    errors.append(
+                        f"{source}:{line_number} repository command has ambiguous "
+                        "working-directory state"
+                    )
+                    continue
+                command_path = raw_command_path
+                if effective_directory:
+                    command_path = (
+                        PurePosixPath(effective_directory) / command_path
+                    ).as_posix()
+                if command_path in GENERATED_COMMAND_PATHS:
+                    continue
+                if PurePosixPath(command_path).suffix.lower() in (
+                    PYTHON_BYTECODE_SUFFIXES
+                ):
+                    errors.append(
+                        f"{source}:{line_number} runs Python bytecode "
+                        f"{command_path!r}; compiled automation cannot be scanned "
+                        "for Cross or publishing surfaces"
+                    )
+                    continue
+                if command_path.startswith(APPROVED_AUTOMATION_ROOTS):
+                    references.add(command_path)
+                    recorded_interpreters = interpreters.setdefault(
+                        command_path,
+                        set(),
+                    )
+                    recorded_interpreters.add(reference_interpreter)
+                    recorded_interpreters.add(
+                        GENERATED_SHELL_OUTPUT_PROVENANCE
+                    )
+                else:
+                    errors.append(
+                        f"{source}:{line_number} repository command "
+                        f"{command_path!r} is outside the scanned automation roots"
                     )
 
             # `python -m pkg` runs repository code chosen by module name rather
@@ -10768,7 +11721,12 @@ def reachable_automation_references(
         # directly, so the bare reading is keyed rather than compared.
         return tuple(sorted(kinds, key=lambda kind: (kind is not None, kind or "")))
 
-    def follow_dispatchers(groups: set[str], origin: str) -> None:
+    def follow_dispatchers(
+        groups: set[str],
+        origin: str,
+        *,
+        generated_shell_output: bool = False,
+    ) -> None:
         """Resolve each dispatch to whichever of its candidate files exists.
 
         Build dispatchers name a manifest and `python -m` names a module, but
@@ -10780,6 +11738,11 @@ def reachable_automation_references(
             candidates = group.split("|")
             present = [name for name in candidates if name in automation]
             if present:
+                if generated_shell_output:
+                    for name in present:
+                        interpreters.setdefault(name, set()).add(
+                            GENERATED_SHELL_OUTPUT_PROVENANCE
+                        )
                 pending.extend(present)
                 continue
             errors.append(
@@ -10852,13 +11815,28 @@ def reachable_automation_references(
                 interpreter_hint=hint,
             )
             errors.extend(failures)
+            generated_shell_output = (
+                GENERATED_SHELL_OUTPUT_PROVENANCE
+                in interpreters.get(name, set())
+            )
+            if generated_shell_output:
+                # A marked program's stdout is shell source. Any repository
+                # program it dispatches can contribute bytes through inherited
+                # stdout, so carry the same provenance through the reachable
+                # graph instead of protecting only the first producer.
+                for kinds in discovered.values():
+                    kinds.add(GENERATED_SHELL_OUTPUT_PROVENANCE)
             record(discovered)
             # Not `references - reachable`: an already-reached path must be
             # re-queued so the loop above can notice that this edge gave it a
             # new interpreter. The outstanding-hint set, not the filter, is what
             # stops the walk.
             pending.extend(sorted(references))
-            follow_dispatchers(dispatchers, f"{label}/{name}")
+            follow_dispatchers(
+                dispatchers,
+                f"{label}/{name}",
+                generated_shell_output=generated_shell_output,
+            )
     return reachable, interpreters, list(dict.fromkeys(errors))
 
 
@@ -13766,6 +14744,39 @@ pre_build = []
     ):
         failures.append("transitive referenced-script Cross invocation was not rejected")
 
+    for reference_label, reference_command in {
+        "nested subshell": "( (bash scripts/safe.sh) )",
+        "negated subshell": "( ! bash scripts/safe.sh )",
+        "case arm": "case safe in safe) bash scripts/safe.sh;; esac",
+    }.items():
+        nested_reference_workflow = referenced_workflow.replace(
+            "bash scripts/safe.sh",
+            reference_command,
+        )
+        if not compare_pr_automation_collection(
+            {"ci.yml": nested_reference_workflow},
+            {"ci.yml": nested_reference_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            safe_automation,
+            cross_automation,
+            "self-test automation directory",
+        ):
+            failures.append(
+                f"a helper reached through a {reference_label} changed without "
+                "moving its protected surface"
+            )
+        if not validate_automation_collection(
+            {"ci.yml": nested_reference_workflow},
+            {"setup/action.yml": safe_action},
+            cross_automation,
+            "self-test automation directory",
+        ):
+            failures.append(
+                f"trusted revalidation allowed Cross automation reached through "
+                f"a {reference_label}"
+            )
+
     python_workflow = referenced_workflow.replace(
         "bash scripts/safe.sh",
         "python3 scripts/safe.py",
@@ -13793,6 +14804,150 @@ pre_build = []
             "self-test automation directory",
         ):
             failures.append(f"{label} was not rejected by tree validation")
+
+    def automation_surface_change_is_rejected(
+        label: str,
+        workflow: str,
+        baseline: dict[str, str],
+        proposed: dict[str, str],
+    ) -> None:
+        if not compare_pr_automation_collection(
+            {"ci.yml": workflow},
+            {"ci.yml": workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            baseline,
+            proposed,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} was not rejected by PR comparison")
+
+    def automation_surface_change_is_accepted(
+        label: str,
+        workflow: str,
+        baseline: dict[str, str],
+        proposed: dict[str, str],
+    ) -> None:
+        errors = compare_pr_automation_collection(
+            {"ci.yml": workflow},
+            {"ci.yml": workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            baseline,
+            proposed,
+            "self-test automation directory",
+        )
+        if errors:
+            failures.append(f"{label} was rejected: {errors!r}")
+
+    powershell_file_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "pwsh scripts/safe.ps1",
+    )
+    powershell_file_baseline = {
+        "scripts/safe.ps1": "#!/usr/bin/env pwsh\nWrite-Output 'safe'\n"
+    }
+    cross_configuration_names = (
+        "CROSS_CONTAINER_IN_CONTAINER",
+        "DOCKER_OPTS",
+        "QEMU_STRACE",
+        "CARGO_BUILD_TARGET",
+    )
+    for configuration_name in cross_configuration_names:
+        automation_surface_change_is_rejected(
+            f"Python {configuration_name} assignment",
+            python_workflow,
+            python_baseline,
+            {
+                "scripts/safe.py": (
+                    "import os\n"
+                    f"os.environ[{configuration_name!r}] = 'proposed'\n"
+                    "print('safe')\n"
+                )
+            },
+        )
+        automation_surface_change_is_rejected(
+            f"PowerShell {configuration_name} assignment",
+            powershell_file_workflow,
+            powershell_file_baseline,
+            {
+                "scripts/safe.ps1": (
+                    "#!/usr/bin/env pwsh\n"
+                    f"$env:{configuration_name} = 'proposed'\n"
+                    "Write-Output 'safe'\n"
+                )
+            },
+        )
+
+    # Once a configuration surface exists, changing its value must also move
+    # the protected digest. This distinguishes the intended freeze from an
+    # add-only check.
+    automation_surface_change_is_rejected(
+        "existing Python Cross configuration value change",
+        python_workflow,
+        {
+            "scripts/safe.py": (
+                "import os\n"
+                "os.environ['CROSS_BUILD_OPTS'] = 'baseline'\n"
+            )
+        },
+        {
+            "scripts/safe.py": (
+                "import os\n"
+                "os.environ['CROSS_BUILD_OPTS'] = 'proposed'\n"
+            )
+        },
+    )
+    automation_surface_change_is_rejected(
+        "existing PowerShell Cross configuration value change",
+        powershell_file_workflow,
+        {
+            "scripts/safe.ps1": (
+                "#!/usr/bin/env pwsh\n"
+                "$env:CROSS_BUILD_OPTS = 'baseline'\n"
+            )
+        },
+        {
+            "scripts/safe.ps1": (
+                "#!/usr/bin/env pwsh\n"
+                "$env:CROSS_BUILD_OPTS = 'proposed'\n"
+            )
+        },
+    )
+
+    # Identifier boundaries remain significant: adjacent names are ordinary
+    # application configuration, not Cross policy inputs.
+    benign_configuration_names = (
+        "CROSSWALK_MODE",
+        "DOCKER_OPTS_EXTRA",
+        "QEMU_STRACE_LOG",
+        "CARGO_BUILD_TARGET_DIR",
+    )
+    for configuration_name in benign_configuration_names:
+        automation_surface_change_is_accepted(
+            f"benign Python {configuration_name} assignment",
+            python_workflow,
+            python_baseline,
+            {
+                "scripts/safe.py": (
+                    "import os\n"
+                    f"os.environ[{configuration_name!r}] = 'safe'\n"
+                    "print('safe')\n"
+                )
+            },
+        )
+        automation_surface_change_is_accepted(
+            f"benign PowerShell {configuration_name} assignment",
+            powershell_file_workflow,
+            powershell_file_baseline,
+            {
+                "scripts/safe.ps1": (
+                    "#!/usr/bin/env pwsh\n"
+                    f"$env:{configuration_name} = 'safe'\n"
+                    "Write-Output 'safe'\n"
+                )
+            },
+        )
 
     arm_arguments = "'build', '--target', 'aarch64-unknown-linux-gnu'"
     python_automation_escapes(
@@ -14842,6 +15997,169 @@ pre_build = []
             "a generated inline shell surface inside a piped heredoc did not "
             "fail closed"
         )
+    # A computed pipeline stage can select any interpreter. It stays opaque even
+    # when wrapped, assembled by command substitution, separated from the pipe
+    # by nested syntax, or followed by a literal interpreter whose language
+    # would otherwise overwrite the opaque stage. Mapping such a receiver to
+    # POSIX shell would miss Python/PowerShell dispatch; selecting the last
+    # literal stage would miss a dynamic Bash that already executed the body.
+    dynamic_piped_programs = (
+        (
+            "cat <<'EOF' | \"$interp\"\n"
+            f"cross build --target {TARGET}\n"
+            "EOF\n",
+            "quoted command word",
+        ),
+        (
+            "cat <<'EOF' | env FOO=bar \"$interp\"\n"
+            f"cross build --target {TARGET}\n"
+            "EOF\n",
+            "env assignment prefix",
+        ),
+        (
+            "cat <<'EOF' $(true; true) | sudo \"$interp\"\n"
+            f"cross build --target {TARGET}\n"
+            "EOF\n",
+            "wrapper past nested separator",
+        ),
+        (
+            "cat <<'EOF' | $(select_interpreter)\n"
+            f"cross build --target {TARGET}\n"
+            "EOF\n",
+            "command-substitution command word",
+        ),
+        (
+            "cat <<'EOF' | \"$interp\" | python3\n"
+            f"cross build --target {TARGET}\n"
+            "EOF\n",
+            "opaque stage before literal interpreter",
+        ),
+        (
+            "cat <<'EOF' | python3 | \"$interp\"\n"
+            f"cross build --target {TARGET}\n"
+            "EOF\n",
+            "opaque stage after literal interpreter",
+        ),
+    )
+    for dynamic_program, dynamic_label in dynamic_piped_programs:
+        programs, errors = executable_heredocs(
+            dynamic_program,
+            f"self-test {dynamic_label} piped heredoc",
+        )
+        if errors or not any(language == "opaque" for language, _ in programs):
+            failures.append(
+                f"a {dynamic_label} piped heredoc lost its opaque provenance"
+            )
+            continue
+        sensitive, runtime_errors = runtime_program_cross_surface(
+            list(programs),
+            f"self-test {dynamic_label} piped heredoc",
+            include_opaque_shell_executable=True,
+        )
+        if sensitive or not runtime_errors:
+            failures.append(
+                f"a {dynamic_label} piped heredoc did not fail closed"
+            )
+        if not contains_direct_trusted_shell_cross_surface(dynamic_program):
+            failures.append(
+                f"a {dynamic_label} piped heredoc escaped trusted-shell policy"
+            )
+
+    # Literal interpreter stages are not interchangeable either. The first
+    # executes the heredoc, while every later interpreter executes generated
+    # output. Even repeated instances of one language are therefore a code-
+    # generation chain that no single body reader can represent safely.
+    for mixed_program, mixed_label in (
+        (
+            "cat <<'EOF' | python3 | bash\n"
+            "print('echo safe')\n"
+            "EOF\n",
+            "Python then shell",
+        ),
+        (
+            "cat <<'EOF' | bash | python3\n"
+            "echo 'print(\"safe\")'\n"
+            "EOF\n",
+            "shell then Python",
+        ),
+        (
+            "python3 <<'EOF' | bash\n"
+            "print('echo safe')\n"
+            "EOF\n",
+            "direct Python then piped shell",
+        ),
+        (
+            "cat <<'EOF' | bash | bash\n"
+            "echo 'echo safe'\n"
+            "EOF\n",
+            "repeated shell interpreters",
+        ),
+    ):
+        programs, errors = executable_heredocs(
+            mixed_program,
+            f"self-test {mixed_label} heredoc",
+        )
+        if errors or [language for language, _ in programs] != ["opaque"]:
+            failures.append(
+                f"a {mixed_label} heredoc collapsed to one literal language"
+            )
+            continue
+        sensitive, runtime_errors = runtime_program_cross_surface(
+            list(programs),
+            f"self-test {mixed_label} heredoc",
+            include_opaque_shell_executable=True,
+        )
+        if sensitive or not runtime_errors:
+            failures.append(
+                f"a {mixed_label} heredoc did not fail closed"
+            )
+
+    single_interpreter_program = (
+        "python3 <<'EOF' | tee generated.txt\n"
+        "print('safe')\n"
+        "EOF\n"
+    )
+    programs, errors = executable_heredocs(
+        single_interpreter_program,
+        "self-test single interpreter with inert tail",
+    )
+    if errors or [language for language, _ in programs] != ["python"]:
+        failures.append(
+            "an inert pipeline stage made one literal heredoc interpreter opaque"
+        )
+
+    # Pipes in quoted arguments or later statements do not receive the heredoc,
+    # while a literal non-interpreter may consume it only as data. The dynamic
+    # fail-closed rule must not turn any of those controls into executable source.
+    for inert_dynamic_program, inert_dynamic_label in (
+        (
+            "cat <<'DOC' 'text | \"$interp\"'; echo done\n"
+            "key: value\n"
+            "DOC\n",
+            "quoted pipe",
+        ),
+        (
+            "cat <<'DOC'; printf safe | \"$interp\"\n"
+            "key: value\n"
+            "DOC\n",
+            "later-statement pipe",
+        ),
+        (
+            "cat <<'DOC' | grep safe\n"
+            "key: value\n"
+            "DOC\n",
+            "literal data consumer",
+        ),
+    ):
+        programs, errors = executable_heredocs(
+            inert_dynamic_program,
+            f"self-test inert {inert_dynamic_label} heredoc",
+        )
+        if errors or programs:
+            failures.append(
+                f"an inert {inert_dynamic_label} was treated as an executable "
+                "heredoc"
+            )
     # The benign control redirects the same body to a file, where it really is
     # data the script only writes.
     written_program = (
@@ -17393,6 +18711,53 @@ pre_build = []
             "quoted heredoc data was reported as a generated inline shell "
             "surface"
         )
+    # An inline interpreter operand may itself span physical shell lines. The
+    # full-program token pass must retain that quoted operand for its real
+    # language reader, while treating unquoted physical newlines as statement
+    # boundaries so unrelated commands are never appended to its argv.
+    multiline_inline_interpreters = {
+        "Ruby": "ruby -e '\nsystem(\"cross build\")\n'\n",
+        "Python": (
+            "python3 -c '\n"
+            "import subprocess\n"
+            "subprocess.run([\"cross\", \"build\"])\n"
+            "'\n"
+        ),
+    }
+    for label, program in multiline_inline_interpreters.items():
+        if not contains_direct_trusted_shell_cross_surface(program):
+            failures.append(
+                f"a multiline {label} inline interpreter Cross surface was missed"
+            )
+    for label, program in {
+        "separate Python and prose commands": (
+            "python3 -c 'print(\"safe\")'\n"
+            "printf '%s\\n' 'cross build documentation'\n"
+        ),
+        "quote marker inside a shell comment": (
+            "python3 -c 'print(\"safe\")' # unmatched ' is comment data\n"
+            "printf '%s\\n' 'cross build documentation'\n"
+        ),
+    }.items():
+        if contains_direct_trusted_shell_cross_surface(program):
+            failures.append(
+                f"benign multiline boundary {label!r} was read as one inline "
+                "interpreter command"
+            )
+    later_inline_option = (
+        "python3 --version\n"
+        "-c '\n"
+        "import subprocess\n"
+        "subprocess.run([\"cross\", \"build\"])\n"
+        "'\n"
+    )
+    if shell_inline_interpreter_has_cross(
+        separate_unquoted_shell_newlines(later_inline_option)
+    ):
+        failures.append(
+            "an inline-source option on a later command was appended to the "
+            "preceding interpreter argv"
+        )
     # The discriminating control puts the identical words on a real command
     # line, where the inline shell really is generated and must fail closed.
     if not contains_direct_trusted_shell_cross_surface('bash -c "$(render)"\n'):
@@ -17709,6 +19074,394 @@ pre_build = []
         failures.append(
             "heredoc-looking extensionless Python data changed the PR Cross surface"
         )
+    # The Python template stays data when the file is executed normally. If a
+    # caller evaluates that stdout as shell, the caller is the opaque execution
+    # boundary and must fail closed; interpreting all suffixless Python source
+    # as POSIX shell would instead reject the benign direct invocation above.
+    extensionless_eval_workflow = extensionless_workflow.replace(
+        "./scripts/build",
+        'eval "$(./scripts/build)"',
+    )
+    if not validate_workflow_collection(
+        {"generated.yml": extensionless_eval_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append(
+            "dynamic evaluation of extensionless Python output was accepted"
+        )
+    if not compare_pr_workflow_collection(
+        {"generated.yml": extensionless_workflow},
+        {"generated.yml": extensionless_eval_workflow},
+        "self-test workflow directory",
+    ):
+        failures.append(
+            "a newly added dynamic evaluation of extensionless Python output "
+            "did not change the PR Cross surface"
+        )
+    # A trusted caller may already evaluate one helper's output. In that case a
+    # later pull request changes only the helper, so the workflow digest does
+    # not move. Carrying generated-output provenance to the referenced file
+    # freezes that implementation without pretending its Python text is shell.
+    command_span_control = "\\$(ignored) '$(quoted' eval \"$(./scripts/build)\""
+    if tuple(
+        command_span_control[start:end]
+        for start, end in command_substitution_spans(command_span_control)
+    ) != ("$(./scripts/build)",):
+        failures.append(
+            "escaped or single-quoted command-substitution openers displaced "
+            "the later executable span"
+        )
+    process_span_control = "\\<(ignored) '<(quoted' source <(./scripts/build)"
+    if tuple(
+        process_span_control[start:end]
+        for start, end in process_substitution_spans(process_span_control)
+    ) != ("<(./scripts/build)",):
+        failures.append(
+            "escaped or single-quoted process-substitution openers displaced "
+            "the later executable span"
+        )
+    backtick_span_control = "\\`escaped\\` '`quoted' eval \"`./scripts/build`\""
+    if tuple(
+        backtick_span_control[start:end]
+        for start, end in backtick_substitution_spans(backtick_span_control)
+    ) != ("`./scripts/build`",):
+        failures.append(
+            "escaped or single-quoted backtick openers displaced the later "
+            "executable span"
+        )
+    generated_shell_workflows = {
+        "eval command substitution": extensionless_eval_workflow,
+        "eval single-quoted command substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval '$(./scripts/build)'",
+            )
+        ),
+        "eval quote-assembled command substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval '$(''./scripts/build)'",
+            )
+        ),
+        "eval command substitution after an inert opener": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "printf '%s\\n' '$(inert'; eval \"$(./scripts/build)\"",
+            )
+        ),
+        "shell -c command substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            'bash -c "$(./scripts/build)"',
+        ),
+        "shell -c quote-assembled command substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "bash -c '$(''./scripts/build)'",
+            )
+        ),
+        "eval backtick substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            'eval "`./scripts/build`"',
+        ),
+        "eval single-quoted backtick substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval '`./scripts/build`'",
+            )
+        ),
+        "eval quote-assembled backtick substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval '`''./scripts/build`'",
+            )
+        ),
+        "eval backtick substitution after an inert opener": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "printf '%s\\n' '`inert'; eval \"`./scripts/build`\"",
+            )
+        ),
+        "source process substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            "source <(./scripts/build)",
+        ),
+        "eval single-quoted process substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval 'source <(./scripts/build)'",
+            )
+        ),
+        "eval quote-assembled process substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval 'source <(''./scripts/build)'",
+            )
+        ),
+        "source process substitution after an inert opener": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "printf '%s\\n' '<(inert'; source <(./scripts/build)",
+            )
+        ),
+        "shell interpreter pipeline": extensionless_workflow.replace(
+            "./scripts/build",
+            "./scripts/build | bash --norc",
+        ),
+        "Python interpreter pipeline": extensionless_workflow.replace(
+            "./scripts/build",
+            "./scripts/build | python3",
+        ),
+        "shell process-substitution stdin": extensionless_workflow.replace(
+            "./scripts/build",
+            "bash --norc < <(./scripts/build)",
+        ),
+        "eval through read process substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            'IFS= read -r generated < <(./scripts/build); eval "$generated"',
+        ),
+        "eval through a read pipeline": extensionless_workflow.replace(
+            "./scripts/build",
+            './scripts/build | read generated; eval "$generated"',
+        ),
+        "eval through chained read captures": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'IFS= read -r first < <(./scripts/build); '
+                'IFS= read -r second <<< "$first"; eval "$second"',
+            )
+        ),
+        "eval through mapfile capture": extensionless_workflow.replace(
+            "./scripts/build",
+            'mapfile -t generated < <(./scripts/build); eval "${generated[*]}"',
+        ),
+        "eval through printf-v capture": extensionless_workflow.replace(
+            "./scripts/build",
+            'printf -v generated \'%s\' "$(./scripts/build)"; '
+            'eval "$generated"',
+        ),
+        "eval through indexed printf-v capture": extensionless_workflow.replace(
+            "./scripts/build",
+            'printf -v \'generated[0]\' \'%s\' "$(./scripts/build)"; '
+            'eval "${generated[0]}"',
+        ),
+        "eval through an assigned variable": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated="$(./scripts/build)"; eval "$generated"',
+        ),
+        "eval through a quote-assembled assigned variable": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "generated='$(''./scripts/build)'; eval \"$generated\"",
+            )
+        ),
+        "eval through an append assignment": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated="echo "; generated+="$(./scripts/build)"; '
+            'eval "$generated"',
+        ),
+        "eval through an indexed assignment": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated[0]="$(./scripts/build)"; eval "${generated[0]}"',
+        ),
+        "eval through an array assignment": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated=("$(./scripts/build)"); eval "${generated[*]}"',
+        ),
+        "eval through a declaration option": extensionless_workflow.replace(
+            "./scripts/build",
+            'declare -- generated="$(./scripts/build)"; eval "$generated"',
+        ),
+        "eval through a plus declaration option": extensionless_workflow.replace(
+            "./scripts/build",
+            'typeset +x generated="$(./scripts/build)"; eval "$generated"',
+        ),
+        "eval through a parameter-default assignment": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'generated="$(./scripts/build)"; '
+                'eval "${generated:-echo safe}"',
+            )
+        ),
+        "eval through a parameter-length assignment": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'generated="$(./scripts/build)"; eval "${#generated}"',
+            )
+        ),
+        "eval through a control-flow assignment": extensionless_workflow.replace(
+            "./scripts/build",
+            'if true; then generated="$(./scripts/build)"; fi; '
+            'eval "$generated"',
+        ),
+        "eval through a bare-subshell assignment": extensionless_workflow.replace(
+            "./scripts/build",
+            '( generated="$(./scripts/build)"; eval "$generated" )',
+        ),
+        "eval through chained assignment words": extensionless_workflow.replace(
+            "./scripts/build",
+            'prefix=trusted generated="$(./scripts/build)"; eval "$generated"',
+        ),
+        "eval through spaced chained assignment words": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'prefix="$(printf \'%s\' trusted)" '
+                'generated="$(./scripts/build)"; eval "$generated"',
+            )
+        ),
+        "shell -c through assignment aliases": extensionless_workflow.replace(
+            "./scripts/build",
+            "|-\n"
+            '          first="$(./scripts/build)"\n'
+            '          second="$first"\n'
+            '          bash -c "$second"',
+        ),
+        "shell -c through parameter-default aliases": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "|-\n"
+                '          first="$(./scripts/build)"\n'
+                '          second="${first:-echo safe}"\n'
+                '          bash -c "$second"',
+            )
+        ),
+    }
+    for generated_label, generated_workflow in generated_shell_workflows.items():
+        if not compare_pr_automation_collection(
+            {"ci.yml": generated_workflow},
+            {"ci.yml": generated_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            extensionless_baseline,
+            extensionless_python_template,
+            "self-test automation directory",
+        ):
+            failures.append(
+                f"a Python output generator behind {generated_label} changed "
+                "without moving its protected surface"
+            )
+    transitive_generator = (
+        "#!/usr/bin/env -S python3 -I\n"
+        "import subprocess\n"
+        "subprocess.run(['scripts/emitter'], check=True)\n"
+    )
+    transitive_generated_baseline = {
+        "scripts/build": transitive_generator,
+        "scripts/emitter": "#!/usr/bin/env -S python3 -I\nprint('echo safe')\n",
+    }
+    transitive_generated_proposed = {
+        "scripts/build": transitive_generator,
+        "scripts/emitter": extensionless_python_template["scripts/build"],
+    }
+    if not compare_pr_automation_collection(
+        {"ci.yml": extensionless_eval_workflow},
+        {"ci.yml": extensionless_eval_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        transitive_generated_baseline,
+        transitive_generated_proposed,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "a transitive Python output generator changed without moving its "
+            "protected surface"
+        )
+    extensionless_data_substitution_workflows = {
+        "command substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated="$(./scripts/build)"; printf \'%s\\n\' "$generated"',
+        ),
+        "backtick substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated=`./scripts/build`; printf \'%s\\n\' "$generated"',
+        ),
+        "non-interpreter pipeline": extensionless_workflow.replace(
+            "./scripts/build",
+            "./scripts/build | cat >/dev/null",
+        ),
+        "quote-assembled substitution used as literal data": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "printf '%s\\n' '$(''./scripts/build)'",
+            )
+        ),
+        "quote-assembled substitution in an unevaluated assignment": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "data='$(''./scripts/build)'; printf '%s\\n' \"$data\"",
+            )
+        ),
+        "assignment-shaped quoted data": extensionless_workflow.replace(
+            "./scripts/build",
+            "printf '%s\\n' \"then evaluated=$(./scripts/build)\"; "
+            "evaluated='echo safe'; eval \"$evaluated\"",
+        ),
+        "assignment-shaped command argument": extensionless_workflow.replace(
+            "./scripts/build",
+            "printf '%s\\n' evaluated=\"$(./scripts/build)\"; "
+            "evaluated='echo safe'; eval \"$evaluated\"",
+        ),
+        "later-statement command substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            "evaluated='echo safe'; printf '%s\\n' \"$(./scripts/build)\"; "
+            "eval \"$evaluated\"",
+        ),
+        "later-statement assignment alias": extensionless_workflow.replace(
+            "./scripts/build",
+            "evaluated='echo safe'; printf '%s\\n' \"$unrelated\"; "
+            "unrelated=\"$(./scripts/build)\"; eval \"$evaluated\"",
+        ),
+        "capture into an unevaluated variable": extensionless_workflow.replace(
+            "./scripts/build",
+            "IFS= read -r data < <(./scripts/build); "
+            "evaluated='echo safe'; eval \"$evaluated\"",
+        ),
+        "capture chain into an unevaluated variable": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'IFS= read -r first < <(./scripts/build); '
+                'IFS= read -r second <<< "$first"; '
+                'evaluated=\'echo safe\'; eval "$evaluated"',
+            )
+        ),
+        "later statement variable after eval": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'unrelated="$(./scripts/build)"; '
+                'evaluated=\'echo safe\'; eval "$evaluated"; '
+                'printf \'%s\\n\' "$unrelated"',
+            )
+        ),
+        "later pipeline variable after eval": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'unrelated="$(./scripts/build)"; '
+                'evaluated=\'echo safe\'; '
+                'eval "$evaluated" | printf \'%s\\n\' "$unrelated"',
+            )
+        ),
+        "printf capture into an unevaluated variable": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "printf -v data '%s' \"$(./scripts/build)\"; "
+                "evaluated='echo safe'; eval \"$evaluated\"",
+            )
+        ),
+    }
+    for data_label, data_workflow in extensionless_data_substitution_workflows.items():
+        data_substitution_errors = compare_pr_automation_collection(
+            {"ci.yml": data_workflow},
+            {"ci.yml": data_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            extensionless_baseline,
+            extensionless_python_template,
+            "self-test automation directory",
+        )
+        if data_substitution_errors:
+            failures.append(
+                f"a {data_label} used only as data froze its Python producer: "
+                f"{data_substitution_errors!r}"
+            )
     for label, proposed in (
         ("extensionless Python", extensionless_python_cross),
         ("extensionless shell", extensionless_shell_cross),
