@@ -1597,6 +1597,66 @@ fn test_example_plugin_rebuild_rejects_malformed_config_and_keeps_prior_instance
 }
 
 #[test]
+fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec!["rc-1"])],
+        vec![make_plugin_config_with_json(
+            "rc-1",
+            "response_caching",
+            json!({
+                "ttl_seconds": 60,
+                "vary_by_headers": ["x-tenant"],
+                "cache_key_include_consumer": true
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid response_caching must admit");
+    let before = cache.get_plugins("p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "response_caching");
+
+    let malformed = make_config(
+        vec![make_proxy("p1", "/api", vec!["rc-1"])],
+        vec![make_plugin_config_with_json(
+            "rc-1",
+            "response_caching",
+            json!({
+                "ttl_seconds": 60,
+                "vary_by_header": ["x-tenant"],
+                "cache_key_include_consumr": true
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let error = cache
+        .rebuild(&malformed)
+        .expect_err("unknown response_caching keys must reject reload");
+    assert!(
+        error.contains("unknown configuration key"),
+        "unexpected reload error: {error}"
+    );
+    assert!(
+        error.contains("'config.vary_by_header'"),
+        "reload error must path-qualify Vary typo: {error}"
+    );
+    assert!(
+        error.contains("'config.cache_key_include_consumr'"),
+        "reload error must path-qualify consumer typo: {error}"
+    );
+
+    let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].name(), "response_caching");
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted response_caching instance"
+    );
+}
+
+#[test]
 fn test_proxy_alerts_rebuild_omits_malformed_optional_values() {
     let valid_cfg = json!({
         "channels": {

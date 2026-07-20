@@ -5359,6 +5359,115 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
 }
 
 #[test]
+fn response_caching_schema_matches_strict_runtime_contract() {
+    use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/ResponseCachingConfig")
+        .expect("ResponseCachingConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    let schema_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("ResponseCachingConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fields: BTreeSet<_> = RESPONSE_CACHING_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(
+        schema_fields, runtime_fields,
+        "response_caching OpenAPI/runtime key drift"
+    );
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let docs = plugin_docs
+        .split("### `response_caching`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("response_caching docs section");
+    for key in RESPONSE_CACHING_CONFIG_KEYS {
+        assert!(
+            docs.contains(&format!("`{key}`")),
+            "docs/plugins.md response_caching section missing `{key}`"
+        );
+    }
+    assert!(docs.contains("KeepLastKnownGood"));
+    assert!(docs.contains("Unknown keys are rejected"));
+
+    for valid in [
+        json!({}),
+        json!({"ttl_seconds": 60}),
+        json!({
+            "ttl_seconds": 60,
+            "max_entries": 100,
+            "max_entry_size_bytes": 1024,
+            "max_total_size_bytes": 4096,
+            "cacheable_methods": ["GET", "HEAD"],
+            "cacheable_status_codes": [200, 404],
+            "respect_cache_control": true,
+            "respect_no_cache": false,
+            "vary_by_headers": ["x-tenant"],
+            "cache_key_include_query": true,
+            "cache_key_include_consumer": true,
+            "add_cache_status_header": true,
+            "invalidate_on_unsafe_methods": false
+        }),
+    ] {
+        assert_component_validity(&spec, "ResponseCachingConfig", &valid, true);
+        ResponseCaching::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+        validate_plugin_config("response_caching", &valid)
+            .unwrap_or_else(|error| panic!("shared admission rejected schema-valid {valid}: {error}"));
+    }
+
+    for invalid in [
+        json!({"vary_by_header": ["x-tenant"]}),
+        json!({"cache_key_include_consumr": true}),
+        json!({"cache_key_include_quer": false}),
+        json!({"respect_cache_contro": true}),
+        json!({"respect_no_cach": true}),
+        json!({"cacheable_status_code": [200]}),
+        json!({"cacheable_method": ["GET"]}),
+        json!({"ttl_second": 60}),
+        json!({"max_entrie": 10}),
+        json!({"max_entry_size_byte": 1024}),
+        json!({"max_total_size_byte": 4096}),
+        json!({"add_cache_status_heade": true}),
+        json!({"invalidate_on_unsafe_method": true}),
+        json!({
+            "ttl_seconds": 60,
+            "aaa_extra": true,
+            "zzz_extra": false
+        }),
+    ] {
+        assert_component_validity(&spec, "ResponseCachingConfig", &invalid, false);
+        assert!(
+            ResponseCaching::new(&invalid).is_err(),
+            "runtime accepted OpenAPI-invalid response_caching config: {invalid}"
+        );
+        assert!(
+            validate_plugin_config("response_caching", &invalid).is_err(),
+            "shared admission accepted OpenAPI-invalid response_caching config: {invalid}"
+        );
+    }
+
+    // OpenAPI rejects typed nulls on declared properties. Runtime scalar helpers
+    // still treat null as "use default"; unknown-key closure is the advisory
+    // contract under test here.
+    for key in RESPONSE_CACHING_CONFIG_KEYS {
+        let mut config = json!({});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert((*key).to_string(), serde_json::Value::Null);
+        assert_component_validity(&spec, "ResponseCachingConfig", &config, false);
+    }
+}
+
+#[test]
 fn response_mock_schema_matches_strict_runtime_contract() {
     use ferrum_edge::plugins::response_mock::{
         RESPONSE_MOCK_CONFIG_KEYS, RESPONSE_MOCK_RULE_KEYS, ResponseMock,
