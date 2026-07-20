@@ -50,10 +50,80 @@ use url::Host;
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::cache_headers::sanitize_cached_headers;
-use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
+use super::utils::redis_rate_limiter::{
+    REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
+};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use crate::util::unknown_keys::reject_unknown_keys;
 
 const AI_CACHE_KEY_METADATA: &str = "_ai_cache_key";
+
+/// Fixed-shape retention, isolation, size, and keying fields at the plugin root.
+pub const AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS: &[&str] = &[
+    "ttl_seconds",
+    "max_entries",
+    "max_entry_size_bytes",
+    "max_total_size_bytes",
+    "include_model_in_key",
+    "include_params_in_key",
+    "scope_by_consumer",
+    "cache_multimodal",
+];
+
+/// Fixed-shape semantic similarity / embedding policy fields at the plugin root.
+pub const AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS: &[&str] = &[
+    "semantic_similarity_enabled",
+    "semantic_embedding_provider",
+    "semantic_embedding_endpoint",
+    "semantic_embedding_model",
+    "semantic_embedding_input_type",
+    "semantic_embedding_output_dimension",
+    "semantic_embedding_api_key",
+    "semantic_embedding_auth_header",
+    "semantic_embedding_auth_scheme",
+    "semantic_similarity_threshold",
+    "semantic_vector_max_candidates",
+    "semantic_embedding_timeout_ms",
+];
+
+/// Every accepted top-level `ai_semantic_cache` configuration property.
+///
+/// Union of root retention/isolation/size keys, semantic-policy keys, and the
+/// shared Redis sync keys. There are no intentionally open maps on this plugin.
+pub const AI_SEMANTIC_CACHE_CONFIG_KEYS: &[&str] = &[
+    // Root retention / isolation / size / keying
+    "ttl_seconds",
+    "max_entries",
+    "max_entry_size_bytes",
+    "max_total_size_bytes",
+    "include_model_in_key",
+    "include_params_in_key",
+    "scope_by_consumer",
+    "cache_multimodal",
+    // Semantic policy
+    "semantic_similarity_enabled",
+    "semantic_embedding_provider",
+    "semantic_embedding_endpoint",
+    "semantic_embedding_model",
+    "semantic_embedding_input_type",
+    "semantic_embedding_output_dimension",
+    "semantic_embedding_api_key",
+    "semantic_embedding_auth_header",
+    "semantic_embedding_auth_scheme",
+    "semantic_similarity_threshold",
+    "semantic_vector_max_candidates",
+    "semantic_embedding_timeout_ms",
+    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    "sync_mode",
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
 
 const VECTOR_REBUILD_INTERVAL_SECONDS: u64 = 30;
 
@@ -135,6 +205,14 @@ impl MultimodalCacheMode {
                 "ai_semantic_cache: unknown 'cache_multimodal' value '{other}' \
                  (expected reject, exact_only, or include_fingerprints)"
             )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+            Self::ExactOnly => "exact_only",
+            Self::IncludeFingerprints => "include_fingerprints",
         }
     }
 }
@@ -322,9 +400,28 @@ struct SerializableCacheEntry {
 
 impl AiSemanticCache {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("ai_semantic_cache: config must be an object".to_string());
-        }
+        let object = config
+            .as_object()
+            .ok_or_else(|| "ai_semantic_cache: config must be an object".to_string())?;
+        // Debug assertion keeps the documented key groups aligned with the
+        // closed root allowlist used for admission and OpenAPI parity.
+        debug_assert!(
+            AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS
+                .iter()
+                .chain(AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS.iter())
+                .chain(REDIS_PLUGIN_CONFIG_KEYS.iter())
+                .all(|key| AI_SEMANTIC_CACHE_CONFIG_KEYS.contains(key))
+                && AI_SEMANTIC_CACHE_CONFIG_KEYS.len()
+                    == AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS.len()
+                        + AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS.len()
+                        + REDIS_PLUGIN_CONFIG_KEYS.len()
+        );
+        reject_unknown_keys(
+            object,
+            "config",
+            AI_SEMANTIC_CACHE_CONFIG_KEYS,
+            "ai_semantic_cache: ",
+        )?;
 
         let ttl_seconds = optional_positive_u64(config, "ttl_seconds")?.unwrap_or(300);
         let ttl = Duration::from_secs(ttl_seconds);
@@ -350,7 +447,9 @@ impl AiSemanticCache {
         let cache_multimodal = parse_multimodal_cache_mode(config)?;
         let semantic = parse_semantic_config(config, http_client.backend_allow_ips())?;
 
-        // Build optional Redis client
+        // Build optional Redis client. Unknown Redis key typos are rejected by
+        // the root allowlist above; the shared parser does not close the object
+        // so other Redis-backed plugins keep their own root keys.
         let default_redis_prefix = default_redis_key_prefix(http_client.namespace());
         let redis_client =
             RedisConfig::from_plugin_config(config, &default_redis_prefix)?.map(|redis_config| {
@@ -364,6 +463,26 @@ impl AiSemanticCache {
                     tls_ca_bundle_path,
                 ))
             });
+
+        let sync_mode = if redis_client.is_some() {
+            "redis"
+        } else {
+            "local"
+        };
+        let semantic_similarity_enabled = semantic.is_some();
+        debug!(
+            ttl_seconds,
+            max_entries,
+            max_entry_size_bytes,
+            max_total_size_bytes,
+            include_model_in_key,
+            include_params_in_key,
+            scope_by_consumer,
+            cache_multimodal = cache_multimodal.as_str(),
+            semantic_similarity_enabled,
+            sync_mode,
+            "ai_semantic_cache: admitted with effective retention and storage posture"
+        );
 
         Ok(Self {
             ttl,

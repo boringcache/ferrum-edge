@@ -48,6 +48,27 @@ use std::time::Duration;
 use tracing::{info, warn};
 use url::{Host, Url};
 
+/// Redis sync fields read from a plugin's root JSON object.
+///
+/// Callers that close their own root allowlist must include these keys (or an
+/// equivalent union) so misspelled Redis/storage fields fail admission. This
+/// shared parser intentionally does **not** reject unknown root keys itself:
+/// every Redis-backed plugin mixes these fields with plugin-specific properties,
+/// and an independent Redis-only allowlist would reject legitimate plugin keys
+/// (for example `ttl_seconds` on `ai_semantic_cache` or `window_seconds` on
+/// `rate_limiting`).
+pub const REDIS_PLUGIN_CONFIG_KEYS: &[&str] = &[
+    "sync_mode",
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
+
 /// Configuration parsed from a plugin's JSON config for Redis connectivity.
 ///
 /// TLS verification uses the gateway-level settings (`FERRUM_TLS_CA_BUNDLE_PATH`,
@@ -89,6 +110,11 @@ impl RedisConfig {
     /// Parse Redis configuration from a plugin's JSON config.
     ///
     /// Returns `Ok(None)` if `sync_mode` is absent or `"local"`.
+    ///
+    /// Unknown root keys are left for the calling plugin to reject against its
+    /// own allowlist unioned with [`REDIS_PLUGIN_CONFIG_KEYS`]. This function
+    /// only reads the Redis fields listed there and must not impose a
+    /// caller-specific allowlist on unrelated plugins.
     pub fn from_plugin_config(
         config: &serde_json::Value,
         default_prefix: &str,
@@ -1369,6 +1395,43 @@ mod tests {
         // `-i64::MIN` overflows; the helper must saturate to `i64::MAX` rather
         // than panic on overflow.
         assert_eq!(floor_zero_compensation(i64::MIN), Some(i64::MAX));
+    }
+
+    #[test]
+    fn from_plugin_config_ignores_unrelated_plugin_root_keys() {
+        use super::RedisConfig;
+        use serde_json::json;
+
+        // Shared Redis admission must not reject plugin-specific root keys;
+        // each caller closes its own allowlist (unioned with REDIS_PLUGIN_CONFIG_KEYS).
+        assert!(
+            RedisConfig::from_plugin_config(
+                &json!({
+                    "sync_mode": "local",
+                    "ttl_seconds": 60,
+                    "cache_multimodal": "reject",
+                    "window_seconds": 10,
+                    "max_requests": 100,
+                }),
+                "test",
+            )
+            .expect("local mode with plugin keys must parse")
+            .is_none()
+        );
+
+        let redis = RedisConfig::from_plugin_config(
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "ttl_seconds": 60,
+                "window_seconds": 10,
+                "max_requests": 100,
+            }),
+            "test",
+        )
+        .expect("redis mode with plugin keys must parse")
+        .expect("redis mode must produce a config");
+        assert_eq!(redis.url, "redis://127.0.0.1:6379/0");
     }
 
     #[test]
