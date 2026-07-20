@@ -112,10 +112,44 @@ fn file_mode_yaml_for_h3_with_terminal_security(port: u16, remove_terminal: bool
             "backend_read_timeout_ms": 5000,
             "backend_write_timeout_ms": 5000,
             "backend_tls_verify_server_cert": false,
+            "auth_mode": "single",
+            "plugins": [
+                {"plugin_config_id": "native-h3-key-auth"},
+                {"plugin_config_id": "native-h3-chargeback"}
+            ],
         }],
-        "consumers": [],
+        "consumers": [{
+            "id": "native-h3-chargeback-consumer",
+            "username": "native-h3-chargeback-user",
+            "credentials": {
+                "keyauth": [{"key": "native-h3-chargeback-key-99887766"}]
+            }
+        }],
         "upstreams": [],
         "plugin_configs": [
+            {
+                "id": "native-h3-key-auth",
+                "plugin_name": "key_auth",
+                "scope": "proxy",
+                "proxy_id": "scripted-h3",
+                "enabled": true,
+                "config": {"key_location": "header:x-api-key"},
+            },
+            {
+                "id": "native-h3-chargeback",
+                "plugin_name": "api_chargeback",
+                "scope": "proxy",
+                "proxy_id": "scripted-h3",
+                "enabled": true,
+                "config": {
+                    "pricing_tiers": [
+                        {"status_codes": [403], "price_per_call": 0.007}
+                    ],
+                    "render_cache_ttl_seconds": 0,
+                    "cache_invalidation_min_age_ms": 0,
+                    "cleanup_interval_seconds": 0,
+                },
+            },
             {
                 "id": "native-h3-terminal-security",
                 "plugin_name": "security_headers",
@@ -2887,14 +2921,26 @@ async fn h3_grpc_post(
     path: &str,
     request_frame: Vec<u8>,
 ) -> Result<crate::scaffolding::clients::Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+    h3_grpc_post_with_headers(harness, path, request_frame, &[]).await
+}
+
+async fn h3_grpc_post_with_headers(
+    harness: &GatewayHarness,
+    path: &str,
+    request_frame: Vec<u8>,
+    extra_headers: &[(&str, &str)],
+) -> Result<crate::scaffolding::clients::Http3Response, Box<dyn std::error::Error + Send + Sync>> {
     let client = Http3Client::insecure()?;
     let https_port = harness_proxy_https_port(harness)?;
     let url = format!("https://127.0.0.1:{https_port}{path}");
-    let opts = crate::scaffolding::clients::GetOptions::default()
+    let mut opts = crate::scaffolding::clients::GetOptions::default()
         .method(http::Method::POST)
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(bytes::Bytes::from(request_frame));
+    for (name, value) in extra_headers {
+        opts = opts.header(*name, *value);
+    }
     client.get_with_options(&url, opts).await
 }
 
@@ -3065,7 +3111,14 @@ async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(remove_
         "expected native H3 dispatch; entry: {entry:#?}"
     );
 
-    let resp = match h3_grpc_post(&harness, "/api/echo.Echo/Denied", grpc_frame(b"ping")).await {
+    let resp = match h3_grpc_post_with_headers(
+        &harness,
+        "/api/echo.Echo/Denied",
+        grpc_frame(b"ping"),
+        &[("x-api-key", "native-h3-chargeback-key-99887766")],
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err(error) => {
             let logs = harness.captured_combined().unwrap_or_default();
@@ -3131,6 +3184,36 @@ async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(remove_
     );
     assert_eq!(access_logs[0]["response_status_code"], 200);
     assert_eq!(access_logs[0]["grpc_status"], 7);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let charges = loop {
+        let charges = harness
+            .get_admin_json("/charges?format=json")
+            .await
+            .expect("fetch native H3 chargeback JSON");
+        if charges["consumers"]["native-h3-chargeback-user"]["proxies"]["scripted-h3"]
+            ["by_status"]["403"]["calls"]
+            .as_u64()
+            == Some(1)
+        {
+            break charges;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "native H3 chargeback did not settle: {charges:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let by_status = &charges["consumers"]["native-h3-chargeback-user"]["proxies"]
+        ["scripted-h3"]["by_status"];
+    let denied_charge = by_status["403"]["charges"]
+        .as_f64()
+        .expect("status 403 charge");
+    assert!((denied_charge - 0.007).abs() < 1e-12);
+    assert!(
+        by_status.get("200").is_none(),
+        "terminal gRPC status 7 must not be billed as HTTP 200: {charges:#?}"
+    );
 
     let received = h3_backend.received_requests().await;
     assert!(

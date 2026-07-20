@@ -202,6 +202,99 @@ fn grpc_file_config_with_log_config(port: u16, overrides: Value, log_config: Val
     serde_yaml::to_string(&config).expect("serialize yaml")
 }
 
+fn grpc_chargeback_file_config(port: u16, overrides: Value) -> String {
+    let mut proxy = json!({
+        "id": "grpc-chargeback",
+        "listen_path": "/grpc",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": port,
+        "strip_listen_path": true,
+        "backend_connect_timeout_ms": 2000,
+        "backend_read_timeout_ms": 5000,
+        "backend_write_timeout_ms": 5000,
+        "auth_mode": "single",
+        "plugins": [
+            {"plugin_config_id": "grpc-chargeback-key-auth"},
+            {"plugin_config_id": "grpc-chargeback-pricing"}
+        ],
+    });
+    if let (Some(proxy_obj), Some(overrides_obj)) = (proxy.as_object_mut(), overrides.as_object()) {
+        for (key, value) in overrides_obj {
+            proxy_obj.insert(key.clone(), value.clone());
+        }
+    }
+    let config = json!({
+        "version": "1",
+        "proxies": [proxy],
+        "consumers": [{
+            "id": "grpc-chargeback-consumer",
+            "username": "grpc-chargeback-user",
+            "credentials": {
+                "keyauth": [{"key": "grpc-chargeback-key-99887766"}]
+            }
+        }],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "grpc-chargeback-key-auth",
+                "plugin_name": "key_auth",
+                "scope": "proxy",
+                "proxy_id": "grpc-chargeback",
+                "enabled": true,
+                "config": {"key_location": "header:x-api-key"},
+            },
+            {
+                "id": "grpc-chargeback-pricing",
+                "plugin_name": "api_chargeback",
+                "scope": "proxy",
+                "proxy_id": "grpc-chargeback",
+                "enabled": true,
+                "config": {
+                    "pricing_tiers": [
+                        {"status_codes": [200], "price_per_call": 0.001},
+                        {"status_codes": [503], "price_per_call": 0.009}
+                    ],
+                    "render_cache_ttl_seconds": 0,
+                    "cache_invalidation_min_age_ms": 0,
+                    "cleanup_interval_seconds": 0,
+                },
+            }
+        ],
+    });
+    serde_yaml::to_string(&config).expect("serialize gRPC chargeback yaml")
+}
+
+async fn wait_for_chargeback_statuses(
+    harness: &GatewayHarness,
+    consumer: &str,
+    proxy_id: &str,
+    expected: &[(u16, u64)],
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let charges = harness
+            .get_admin_json("/charges?format=json")
+            .await
+            .expect("fetch chargeback JSON");
+        let by_status = &charges["consumers"][consumer]["proxies"][proxy_id]["by_status"];
+        if expected.iter().all(|(status, calls)| {
+            let status = status.to_string();
+            by_status
+                .get(status.as_str())
+                .and_then(|entry| entry["calls"].as_u64())
+                == Some(*calls)
+        }) {
+            return charges;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "chargeback statuses did not settle: expected={expected:?}, charges={charges:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// gRPC scripted-backend config with one proxy-scoped `grpc_deadline`
 /// policy. Kept separate from `grpc_file_config` so the broad scripted H2
 /// suite retains its existing stdout-only plugin chain.
@@ -1351,6 +1444,95 @@ async fn assert_errors_only_grpc_output(overrides: Value, case: &str) {
 async fn stdout_errors_only_covers_streamed_and_buffered_h2_grpc_status() {
     assert_errors_only_grpc_output(Value::Null, "streamed_h2").await;
     assert_errors_only_grpc_output(
+        json!({
+            "retry": {
+                "max_retries": 1,
+                "retry_on_connect_failure": true,
+            }
+        }),
+        "buffered_h2",
+    )
+    .await;
+}
+
+async fn assert_api_chargeback_uses_terminal_grpc_status(overrides: Value, case: &str) {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondStatus {
+            code: 14,
+            message: "unavailable",
+        })
+        .spawn()
+        .expect("spawn backend");
+    let harness = GatewayHarness::builder()
+        .file_config(grpc_chargeback_file_config(backend_port, overrides))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gRPC chargeback gateway");
+    let gateway_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gateway_port}"));
+    let auth = [("x-api-key", "grpc-chargeback-key-99887766".to_string())];
+
+    let success = client
+        .unary_with_headers("/grpc/echo.Echo/Success", Bytes::new(), &auth)
+        .await
+        .expect("successful RPC");
+    assert_eq!(success.http_status, 200, "{case}: {success:?}");
+    assert_eq!(success.grpc_status(), Some(0), "{case}: {success:?}");
+
+    let failure = client
+        .unary_with_headers("/grpc/echo.Echo/Failure", Bytes::new(), &auth)
+        .await
+        .expect("failed-status RPC response");
+    assert_eq!(failure.http_status, 200, "{case}: {failure:?}");
+    assert_eq!(failure.grpc_status(), Some(14), "{case}: {failure:?}");
+
+    let charges = wait_for_chargeback_statuses(
+        &harness,
+        "grpc-chargeback-user",
+        "grpc-chargeback",
+        &[(200, 1), (503, 1)],
+    )
+    .await;
+    let by_status = &charges["consumers"]["grpc-chargeback-user"]["proxies"]
+        ["grpc-chargeback"]["by_status"];
+    let ok_charge = by_status["200"]["charges"]
+        .as_f64()
+        .expect("status 200 charge");
+    let unavailable_charge = by_status["503"]["charges"]
+        .as_f64()
+        .expect("status 503 charge");
+    assert!((ok_charge - 0.001).abs() < 1e-12, "{case}: {charges:#?}");
+    assert!(
+        (unavailable_charge - 0.009).abs() < 1e-12,
+        "{case}: {charges:#?}"
+    );
+    assert_eq!(
+        charges["consumers"]["grpc-chargeback-user"]["total_calls"].as_u64(),
+        Some(2),
+        "{case}: {charges:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn api_chargeback_prices_streamed_and_buffered_h2_grpc_terminal_status() {
+    assert_api_chargeback_uses_terminal_grpc_status(Value::Null, "streamed_h2").await;
+    assert_api_chargeback_uses_terminal_grpc_status(
         json!({
             "retry": {
                 "max_retries": 1,

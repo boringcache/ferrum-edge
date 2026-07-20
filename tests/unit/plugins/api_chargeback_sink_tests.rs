@@ -52,6 +52,8 @@ fn sample_event(id: &str) -> ChargeEvent {
         proxy_name: "Payments".to_string(),
         route_id: None,
         status_code: 200,
+        http_status_code: Some(200),
+        grpc_status: None,
         protocol: "http".to_string(),
         call_count: 1,
         charge_call: 0.01,
@@ -68,6 +70,24 @@ fn sample_event(id: &str) -> ChargeEvent {
     }
 }
 
+fn grpc_summary(proxy_id: &str, grpc_status: &str) -> TransactionSummary {
+    let mut summary = TransactionSummary {
+        namespace: "ferrum".to_string(),
+        consumer_username: Some("alice".to_string()),
+        proxy_id: Some(proxy_id.to_string()),
+        proxy_name: Some("gRPC API".to_string()),
+        response_status_code: 200,
+        ..TransactionSummary::default()
+    };
+    summary
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    summary
+        .metadata
+        .insert("grpc_status".to_string(), grpc_status.to_string());
+    summary
+}
+
 async fn wait_for_requests(server: &MockServer, at_least: usize) -> Vec<wiremock::Request> {
     for _ in 0..40 {
         if let Some(requests) = server.received_requests().await
@@ -78,6 +98,76 @@ async fn wait_for_requests(server: &MockServer, at_least: usize) -> Vec<wiremock
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("mock server did not receive {at_least} request(s)");
+}
+
+#[tokio::test]
+async fn grpc_per_event_exports_billable_and_raw_terminal_statuses() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+    config["batch"]["size"] = json!(1);
+    config["pricing_tiers"] = json!([
+        {"status_codes": [200], "price_per_call": 0.01},
+        {"status_codes": [503], "price_per_call": 0.09}
+    ]);
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+
+    plugin.log(&grpc_summary("grpc-ok", "0")).await;
+    plugin.log(&grpc_summary("grpc-unavailable", "14")).await;
+
+    let requests = wait_for_requests(&server, 2).await;
+    let mut events: Vec<Value> = requests
+        .iter()
+        .map(|request| request.body_json().expect("charge event JSON"))
+        .collect();
+    events.sort_by_key(|event| event["status_code"].as_u64());
+
+    assert_eq!(events[0]["status_code"], 200);
+    assert_eq!(events[0]["http_status_code"], 200);
+    assert_eq!(events[0]["grpc_status"], 0);
+    assert!((events[0]["charge_call"].as_f64().unwrap() - 0.01).abs() < 1e-12);
+
+    assert_eq!(events[1]["status_code"], 503);
+    assert_eq!(events[1]["http_status_code"], 200);
+    assert_eq!(events[1]["grpc_status"], 14);
+    assert!((events[1]["charge_call"].as_f64().unwrap() - 0.09).abs() < 1e-12);
+}
+
+#[test]
+fn grpc_snapshot_keeps_terminal_statuses_that_share_a_billing_bucket_separate() {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = ChargeComputation {
+        call_count: 1,
+        charge_call: 0.08,
+        charge_total: 0.08,
+        ..ChargeComputation::default()
+    };
+
+    accumulator.record_http_for_test(&grpc_summary("grpc-shared-500", "2"), "alice", charge);
+    accumulator.record_http_for_test(&grpc_summary("grpc-shared-500", "13"), "alice", charge);
+
+    let mut events = accumulator.compute_deltas(&config, "node-a", 100, "snap-grpc");
+    events.sort_by_key(|event| event.grpc_status);
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.status_code == 500 && event.http_status_code == Some(200))
+    );
+    assert_eq!(events[0].grpc_status, Some(2));
+    assert_eq!(events[1].grpc_status, Some(13));
 }
 
 #[tokio::test]
@@ -192,7 +282,10 @@ fn json_each_row_serialization_is_line_delimited_and_omits_none() {
     assert_eq!(lines.len(), 2);
     let first: Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(first["event_id"], "evt-1");
+    assert_eq!(first["status_code"], 200);
+    assert_eq!(first["http_status_code"], 200);
     assert!(first.get("consumer_name").is_none());
+    assert!(first.get("grpc_status").is_none());
     assert!(first.get("trace_id").is_none());
 }
 
@@ -435,6 +528,9 @@ async fn connect_method_is_not_classified_as_websocket() {
     let requests = wait_for_requests(&server, 1).await;
     let body: Value = requests[0].body_json().unwrap();
     assert_eq!(body["protocol"], "http");
+    assert_eq!(body["status_code"], 200);
+    assert_eq!(body["http_status_code"], 200);
+    assert!(body.get("grpc_status").is_none());
 }
 
 #[test]
