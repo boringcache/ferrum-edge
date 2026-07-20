@@ -2255,8 +2255,7 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
         .as_str()
         .unwrap_or("");
     assert!(
-        placeholder_desc.contains("Unicode characters")
-            && placeholder_desc.contains("UTF-8 byte"),
+        placeholder_desc.contains("Unicode characters") && placeholder_desc.contains("UTF-8 byte"),
         "redaction_placeholder must document OpenAPI character vs runtime byte caps: {placeholder_desc}"
     );
     assert_eq!(

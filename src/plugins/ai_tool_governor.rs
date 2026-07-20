@@ -900,11 +900,10 @@ impl GovernorEngine {
             .checked_add(MAX_APPROVAL_BATCH_DEADLINE)
             .unwrap_or_else(|| self.approval_now());
 
-        for ((call, (outcome, matched, risk)), amplification) in
-            calls
-                .iter()
-                .zip(evaluations)
-                .zip(redaction_amplification.iter().copied())
+        for ((call, (outcome, matched, risk)), amplification) in calls
+            .iter()
+            .zip(evaluations)
+            .zip(redaction_amplification.iter().copied())
         {
             let arguments_hash = self
                 .observability
@@ -2090,21 +2089,20 @@ impl AiToolGovernor {
             value => Cow::Owned(value.to_string()),
         };
         let memo_key = redaction_memo_key(name, &args);
-        let (redacted, changed) = if let Some(redacted) =
-            redaction_memos.and_then(|memos| memos.get(&memo_key))
-        {
-            // Preflight already enforced per-call and aggregate bounds.
-            (redacted.clone(), true)
-        } else {
-            let Ok(result) = redact_arguments(
-                &args,
-                &policy.blocked_arg_patterns,
-                &self.redaction_placeholder,
-            ) else {
-                return RedactTransform::AmplificationFailed;
+        let (redacted, changed) =
+            if let Some(redacted) = redaction_memos.and_then(|memos| memos.get(&memo_key)) {
+                // Preflight already enforced per-call and aggregate bounds.
+                (redacted.clone(), true)
+            } else {
+                let Ok(result) = redact_arguments(
+                    &args,
+                    &policy.blocked_arg_patterns,
+                    &self.redaction_placeholder,
+                ) else {
+                    return RedactTransform::AmplificationFailed;
+                };
+                result
             };
-            result
-        };
         if changed {
             let Some(next_total) = redacted_argument_bytes.checked_add(redacted.len()) else {
                 return RedactTransform::AmplificationFailed;
@@ -2967,9 +2965,7 @@ impl Plugin for AiToolGovernor {
         // their transform instead of multiplying per-request memory.
         ctx.ai_tool_governor_redaction_memos
             .remove(&self.instance_id);
-        if !batch.redaction_memos.is_empty()
-            && ctx.ai_tool_governor_redaction_memos.is_empty()
-        {
+        if !batch.redaction_memos.is_empty() && ctx.ai_tool_governor_redaction_memos.is_empty() {
             ctx.ai_tool_governor_redaction_memos
                 .insert(self.instance_id, batch.redaction_memos);
         }
