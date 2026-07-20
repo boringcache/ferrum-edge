@@ -5478,7 +5478,11 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         ResponseCaching::new(&config)
             .unwrap_or_else(|error| panic!("nullable scalar {key} failed runtime: {error}"));
     }
-    for key in ["cacheable_methods", "cacheable_status_codes", "vary_by_headers"] {
+    for key in [
+        "cacheable_methods",
+        "cacheable_status_codes",
+        "vary_by_headers",
+    ] {
         let mut config = json!({});
         config
             .as_object_mut()
