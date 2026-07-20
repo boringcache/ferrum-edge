@@ -1,9 +1,10 @@
 //! Local container fixtures for the external middleware that Ferrum integrates
 //! with but which can only be validated against the REAL third-party software:
-//! a service registry (HashiCorp Consul) and an LDAP directory server
-//! (OpenLDAP). Both run locally via `testcontainers` (Docker) — no managed or
-//! cloud service is ever involved, and the fixtures seed their own fully
-//! controlled data so the assertions are deterministic.
+//! a service registry (HashiCorp Consul), an LDAP directory server (OpenLDAP),
+//! and a Kafka-compatible broker (Redpanda). All run locally via
+//! `testcontainers` (Docker) — no managed or cloud service is ever involved,
+//! and the fixtures seed their own fully controlled data so the assertions are
+//! deterministic.
 //!
 //! This mirrors `tests/secrets_functional/common/containers.rs` (Vault /
 //! LocalStack): when Docker is not available the `start_*` helpers return
@@ -241,4 +242,208 @@ impl ExecOutput {
             (false, false) => format!("{}\n{}", self.stdout, self.stderr),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Redpanda (Kafka API) — real broker for kafka_logging
+// ---------------------------------------------------------------------------
+
+/// A single-node Redpanda broker with a host-routable Kafka listener.
+///
+/// Advertised listeners need the host-mapped port up front, so the helper binds
+/// an ephemeral local port, pins that mapping, and advertises
+/// `127.0.0.1:<host-port>` on the external Kafka listener. Readiness is polled
+/// via librdkafka metadata (not a log line).
+pub struct RedpandaContainer {
+    _container: ContainerAsync<GenericImage>,
+    /// `127.0.0.1:<mapped-port>` — pass as `kafka_logging.broker_list`.
+    pub bootstrap: String,
+}
+
+/// Bind an ephemeral localhost TCP port for a deterministic host→container map.
+fn free_localhost_port() -> Result<u16, BoxError> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+/// Start a single-node Redpanda with auto-topic-create disabled.
+///
+/// Disabling auto-create keeps unknown-topic rejection deterministic for the
+/// real-broker acceptance suite.
+pub async fn start_redpanda_container() -> Result<RedpandaContainer, BoxError> {
+    let host_port = free_localhost_port()?;
+    let advertise = format!("internal://127.0.0.1:9092,external://127.0.0.1:{host_port}");
+
+    let container = GenericImage::new("redpandadata/redpanda", "v24.2.4")
+        .with_exposed_port(9093.tcp())
+        .with_mapped_port(host_port, 9093.tcp())
+        .with_cmd([
+            "redpanda".to_string(),
+            "start".to_string(),
+            "--overprovisioned".to_string(),
+            "--smp".to_string(),
+            "1".to_string(),
+            "--memory".to_string(),
+            "512M".to_string(),
+            "--reserve-memory".to_string(),
+            "0M".to_string(),
+            "--node-id".to_string(),
+            "0".to_string(),
+            "--check=false".to_string(),
+            "--kafka-addr".to_string(),
+            "internal://0.0.0.0:9092,external://0.0.0.0:9093".to_string(),
+            "--advertise-kafka-addr".to_string(),
+            advertise,
+            "--set".to_string(),
+            "redpanda.auto_create_topics_enabled=false".to_string(),
+        ])
+        .start()
+        .await?;
+
+    let bootstrap = format!("127.0.0.1:{host_port}");
+    wait_redpanda_ready(&bootstrap).await?;
+
+    Ok(RedpandaContainer {
+        _container: container,
+        bootstrap,
+    })
+}
+
+/// Poll librdkafka metadata until the broker answers (or 30s elapses).
+async fn wait_redpanda_ready(bootstrap: &str) -> Result<(), BoxError> {
+    for _ in 0..60 {
+        let bootstrap = bootstrap.to_string();
+        let ready = tokio::task::spawn_blocking(move || redpanda_metadata_ok(&bootstrap))
+            .await
+            .unwrap_or(false);
+        if ready {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err("Redpanda did not become metadata-ready within 30s".into())
+}
+
+fn redpanda_metadata_ok(bootstrap: &str) -> bool {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::ClientConfig;
+
+    let consumer: Result<BaseConsumer, _> = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", "ferrum-redpanda-ready")
+        .set("socket.timeout.ms", "1500")
+        .set("api.version.request.timeout.ms", "1500")
+        .set("log_level", "0")
+        .create();
+    let Ok(consumer) = consumer else {
+        return false;
+    };
+    consumer
+        .fetch_metadata(None, Duration::from_secs(2))
+        .map(|meta| !meta.brokers().is_empty())
+        .unwrap_or(false)
+}
+
+impl RedpandaContainer {
+    /// Create a single-partition topic, optionally with broker topic configs
+    /// (`max.message.bytes`, `min.insync.replicas`, …). Retries while the
+    /// admin path is still warming up.
+    pub async fn create_topic(
+        &self,
+        name: &str,
+        configs: &[(&str, &str)],
+    ) -> Result<(), BoxError> {
+        let mut script = format!("rpk topic create {name} -p 1 -r 1");
+        for (key, value) in configs {
+            script.push_str(&format!(" --config {key}={value}"));
+        }
+
+        let mut last = String::new();
+        for _ in 0..40 {
+            let out = self.exec_sh(&script).await?;
+            let combined = out.combined();
+            if out.exit_code == Some(0)
+                || combined.contains("already exists")
+                || combined.contains("TOPIC_ALREADY_EXISTS")
+            {
+                return Ok(());
+            }
+            last = combined;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Err(format!("rpk topic create never succeeded for {name}; last output: {last}").into())
+    }
+
+    /// Consume one record from `topic` (earliest), returning `(key, payload)`.
+    /// Payload is returned only for assertion against known test markers —
+    /// callers must not log it.
+    pub async fn consume_one(
+        &self,
+        topic: &str,
+        timeout: Duration,
+    ) -> Result<Option<(Option<String>, String)>, BoxError> {
+        let bootstrap = self.bootstrap.clone();
+        let topic = topic.to_string();
+        tokio::task::spawn_blocking(move || consume_one_blocking(&bootstrap, &topic, timeout))
+            .await
+            .map_err(|error| -> BoxError { format!("consume task join failed: {error}").into() })?
+    }
+
+    async fn exec_sh(&self, script: &str) -> Result<ExecOutput, BoxError> {
+        let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let mut result = self._container.exec(ExecCommand::new(cmd)).await?;
+        let stdout = result.stdout_to_vec().await?;
+        let stderr = result.stderr_to_vec().await?;
+        Ok(ExecOutput {
+            exit_code: result.exit_code().await?,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        })
+    }
+}
+
+fn consume_one_blocking(
+    bootstrap: &str,
+    topic: &str,
+    timeout: Duration,
+) -> Result<Option<(Option<String>, String)>, BoxError> {
+    use rdkafka::config::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::{Message, Offset, TopicPartitionList};
+
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set(
+            "group.id",
+            format!("ferrum-si-{}-{}", std::process::id(), topic),
+        )
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .set("socket.timeout.ms", "2000")
+        .set("log_level", "0")
+        .create()?;
+
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(topic, 0, Offset::Beginning)?;
+    consumer.assign(&tpl)?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let poll_timeout = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .min(Duration::from_millis(200));
+        match consumer.poll(poll_timeout) {
+            Some(Ok(message)) => {
+                let key = message
+                    .key()
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+                let payload = String::from_utf8_lossy(message.payload().unwrap_or(b"")).into_owned();
+                return Ok(Some((key, payload)));
+            }
+            Some(Err(_)) | None => continue,
+        }
+    }
+    Ok(None)
 }

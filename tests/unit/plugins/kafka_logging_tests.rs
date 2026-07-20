@@ -601,10 +601,7 @@ async fn test_kafka_logging_allows_matching_crl_override() {
 async fn test_kafka_logging_normalizes_file_uri_gateway_crl_source() {
     let client = default_http_client()
         .with_tls_crl_source(Some("file:///etc/ferrum/gateway.crl".to_string()));
-    assert_eq!(
-        client.tls_crl_file_path(),
-        Some("/etc/ferrum/gateway.crl")
-    );
+    assert_eq!(client.tls_crl_file_path(), Some("/etc/ferrum/gateway.crl"));
     kafka_logging_validate_producer_admission_for_test(
         &json!({
             "broker_list": "localhost:9092",

@@ -1805,9 +1805,7 @@ async fn send_batch(
         drop(record.lease.take());
         if let Err(error) = join_result {
             metrics.record_producer_task_join_failure();
-            return Err(format!(
-                "kafka_logging: producer task join failed: {error}"
-            ));
+            return Err(format!("kafka_logging: producer task join failed: {error}"));
         }
     }
 

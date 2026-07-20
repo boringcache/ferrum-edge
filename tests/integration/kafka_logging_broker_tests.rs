@@ -1,15 +1,16 @@
-//! Optional real-broker exercises for `kafka_logging`.
+//! Optional external-broker smoke for `kafka_logging`.
 //!
-//! These tests are ignored by default. Set `FERRUM_TEST_KAFKA_BOOTSTRAP` to a
-//! reachable `host:port` (for example a local Redpanda/Kafka listener) and run:
+//! Hosted CI proves real-broker acceptance in
+//! `tests/service_integration/kafka.rs` (Redpanda via the Service Integration
+//! job). This ignored harness remains for developers who already have a broker
+//! and set `FERRUM_TEST_KAFKA_BOOTSTRAP`:
 //!
 //! ```text
 //! cargo test --test integration_tests kafka_logging_broker -- --ignored --nocapture
 //! ```
 //!
-//! Hosted CI does not currently provision a Kafka broker for this filter; the
-//! deterministic unit suite covers admission, delivery accounting, CRL
-//! fail-closed behavior, budgets, unknown keys, and owned finalize.
+//! Unlike the historical vacuous check, this requires successful delivery
+//! (`delivered_total >= 1` with zero failures) against that external broker.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -19,7 +20,7 @@ use ferrum_edge::plugins::kafka_logging::KafkaLogging;
 use ferrum_edge::plugins::utils::PluginHttpClient;
 use ferrum_edge::plugins::{Plugin, TransactionSummary};
 use serde_json::json;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 fn bootstrap() -> Option<String> {
     std::env::var("FERRUM_TEST_KAFKA_BOOTSTRAP")
@@ -64,7 +65,7 @@ fn summary() -> TransactionSummary {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires FERRUM_TEST_KAFKA_BOOTSTRAP real broker"]
+#[ignore = "requires FERRUM_TEST_KAFKA_BOOTSTRAP real broker; hosted CI uses service_integration/kafka"]
 async fn kafka_logging_broker_delivers_and_finalizes() {
     let Some(bootstrap) = bootstrap() else {
         eprintln!("SKIP: set FERRUM_TEST_KAFKA_BOOTSTRAP to exercise real broker delivery");
@@ -86,17 +87,26 @@ async fn kafka_logging_broker_delivers_and_finalizes() {
     .expect("construct kafka_logging against real broker");
 
     plugin.log(&summary()).await;
-    // Allow librdkafka delivery callback to fire.
-    sleep(Duration::from_secs(3)).await;
-    let mid = plugin.snapshot();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mid = loop {
+        let snap = plugin.snapshot();
+        if snap.delivered_total >= 1 || Instant::now() >= deadline {
+            break snap;
+        }
+        sleep(Duration::from_millis(100)).await;
+    };
     assert!(
         mid.admitted_total >= 1,
-        "expected local admission against real broker, got {mid:?}"
+        "expected local admission against real broker, got admitted={} delivered={} failed={}",
+        mid.admitted_total, mid.delivered_total, mid.delivery_failed_total
     );
     assert!(
-        mid.delivered_total >= 1 || mid.delivery_failed_total >= 1,
-        "expected terminal delivery callback against real broker, got {mid:?}"
+        mid.delivered_total >= 1,
+        "expected successful terminal delivery against real broker, got delivered={} failed={}",
+        mid.delivered_total, mid.delivery_failed_total
     );
+    assert_eq!(mid.delivery_failed_total, 0);
+    assert_eq!(mid.queue_rejected_total, 0);
 
     plugin.finalize().await;
     let end = plugin.snapshot();
