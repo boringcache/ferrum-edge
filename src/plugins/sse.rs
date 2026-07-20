@@ -55,9 +55,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
+use super::utils::sse::is_text_event_stream_media_type;
 use super::{PluginResult, RequestContext};
-
-const TEXT_EVENT_STREAM: &str = "text/event-stream";
 
 pub struct SsePlugin {
     // ── Request validation ───────────────────────────────────────────────
@@ -155,11 +154,6 @@ fn optional_positive_u64_config(config: &Value, key: &str) -> Result<Option<u64>
             "sse: '{key}' must be an unsigned integer, got: {other}"
         )),
     }
-}
-
-fn is_text_event_stream_media_type(value: &str) -> bool {
-    let media_type = value.split(';').next().unwrap_or(value).trim_end();
-    media_type.eq_ignore_ascii_case(TEXT_EVENT_STREAM)
 }
 
 #[async_trait]

@@ -2,10 +2,12 @@
 //!
 //! SSE responses (`text/event-stream`) are inherently unbounded streams. Plugins
 //! that buffer the response body (e.g., `response_caching`, `body_validator`,
-//! `response_transformer`, `response_size_limiting`) MUST skip buffering for
-//! SSE — otherwise the buffer collects events forever and the gateway returns
-//! 502 once `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` is hit, instead of streaming
-//! events to the client.
+//! `response_size_limiting`) MUST skip buffering for SSE — otherwise the buffer
+//! collects events forever and the gateway returns 502 once
+//! `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` is hit, instead of streaming events to
+//! the client. A policy plugin such as `response_transformer` cannot safely use
+//! client intent for that decision: it buffers conservatively before headers,
+//! then releases only when the backend response itself declares event-stream.
 //!
 //! The proxy handler already has a response-side bypass via
 //! `is_streaming_content_type()` (checks the backend's `Content-Type`), but
@@ -14,9 +16,11 @@
 //! escape hatch never runs.
 //!
 //! These helpers operate on the request-side `Accept` header (the canonical
-//! SSE intent signal per the WHATWG EventSource spec). Plugins call
-//! `is_sse_request(ctx)` from `should_buffer_response_body()` to opt out of
-//! buffering before the response-side check happens.
+//! SSE intent signal per the WHATWG EventSource spec). Plugins whose scope is
+//! inherently streaming may call `is_sse_request(ctx)` from
+//! `should_buffer_response_body()`. Outbound body-policy plugins must instead
+//! wait for the response-header refinement; request intent alone is not proof
+//! that the backend selected an event stream.
 //!
 //! Backends may legitimately return `text/event-stream` for non-SSE-aware
 //! clients — in those cases the proxy's response-side `is_streaming_content_type`
@@ -45,6 +49,19 @@ pub fn headers_accept_sse(headers: &HashMap<String, String>) -> bool {
     headers
         .get("accept")
         .is_some_and(|accept| accept_includes_event_stream(accept))
+}
+
+/// Returns `true` when `value` has the exact `text/event-stream` media-type
+/// essence. Optional parameters and surrounding whitespace are ignored, while
+/// lookalike types such as `application/event-stream+json` are rejected.
+#[inline]
+pub fn is_text_event_stream_media_type(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .eq_ignore_ascii_case("text/event-stream")
 }
 
 /// Outcome of parsing a buffered SSE body, distinguishing "no data" from "data
@@ -695,12 +712,7 @@ fn index_field(value: &Value, field: &str) -> Option<usize> {
 /// is rejected, but parameters (`text/event-stream; q=1.0`) are accepted.
 #[inline]
 fn accept_includes_event_stream(accept: &str) -> bool {
-    accept.split(',').any(|part| {
-        let trimmed = part.trim();
-        // Strip optional media-type parameters (`; q=...`, `; charset=...`).
-        let media_type = trimmed.split(';').next().unwrap_or(trimmed).trim_end();
-        media_type.eq_ignore_ascii_case("text/event-stream")
-    })
+    accept.split(',').any(is_text_event_stream_media_type)
 }
 
 #[cfg(test)]

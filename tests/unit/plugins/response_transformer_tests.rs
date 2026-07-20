@@ -729,10 +729,10 @@ async fn test_response_transformer_body_update_null_value() {
 // ── SSE bypass ─────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_response_transformer_sse_request_skips_buffering() {
-    // Body transforms operate on the assembled response. SSE responses must
-    // bypass body buffering — otherwise the buffer collects events forever
-    // and the gateway 502s once max-response-body is hit.
+async fn test_response_transformer_sse_accept_stays_buffered_until_response_headers() {
+    // Client intent cannot prove what representation the backend will return.
+    // The pre-header decision therefore remains buffered even for an SSE Accept
+    // value, preventing ordinary JSON from streaming past the body policy.
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
             {"operation": "rename", "target": "body", "key": "old", "new_key": "new"}
@@ -745,7 +745,97 @@ async fn test_response_transformer_sse_request_skips_buffering() {
     ctx.headers
         .insert("accept".to_string(), "text/event-stream".to_string());
 
-    assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    let json_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &json_headers,
+    ));
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &json_headers,));
+}
+
+#[tokio::test]
+async fn test_response_transformer_backend_event_stream_releases_buffering() {
+    // Once backend headers prove that the selected representation is SSE, body
+    // transformation is out of scope and the unbounded stream must be released.
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "old", "new_key": "new"}
+        ]
+    }))
+    .unwrap();
+    let ctx = make_ctx();
+    let response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream; charset=utf-8".to_string(),
+    )]);
+
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream; charset=utf-8"),
+        200,
+        &response_headers,
+    ));
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &response_headers,));
+}
+
+#[tokio::test]
+async fn test_response_transformer_ambiguous_event_stream_types_stay_buffered() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "body", "key": "secret"}
+        ]
+    }))
+    .unwrap();
+    let ctx = make_ctx();
+
+    for content_type in [
+        "application/json; profile=event-stream",
+        "application/vnd.acme-event-stream",
+        "text/event-stream-like",
+        "application/event-stream+json",
+    ] {
+        let response_headers =
+            HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        assert!(
+            plugin.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some(content_type),
+                200,
+                &response_headers,
+            ),
+            "ambiguous media type must stay buffered: {content_type}"
+        );
+        assert!(plugin.may_release_response_body_under_retries(&ctx));
+        assert!(
+            !plugin.should_release_response_body_under_retries(&ctx, 200, &response_headers,),
+            "ambiguous media type must not release under retries: {content_type}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_response_transformer_missing_response_type_stays_fail_closed() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "body", "key": "secret"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new(),));
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &HashMap::new(),));
 }
 
 #[tokio::test]

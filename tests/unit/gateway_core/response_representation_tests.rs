@@ -2565,11 +2565,13 @@ async fn grpc_web_request_with_a_genuine_json_response_is_still_redacted() {
 // partial, or unparseable body returns `None` and is forwarded with the
 // configured redaction silently skipped.
 //
-// SSE was such a condition. `should_buffer_response_body` declines to buffer an
-// `Accept: text/event-stream` request, but that is only this plugin's buffering
-// vote: any other response-body plugin can force the buffer, and the transform
-// then runs anyway. The claim no longer declines SSE, so those buffered cases
-// are gated like any other.
+// SSE was such a condition in the legacy lifecycle. The transformer used to
+// decline buffering solely because the request carried
+// `Accept: text/event-stream`, but that was only this plugin's vote: any other
+// response-body plugin could force the buffer and the transform then ran anyway.
+// The claim no longer declines client SSE intent, and the pre-header decision is
+// now conservative until backend Content-Type can release a genuine event
+// stream, so every buffered case remains gated like any other.
 // ---------------------------------------------------------------------------
 
 /// Drive the buffered transform phase for a request carrying client headers —
