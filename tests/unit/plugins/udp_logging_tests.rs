@@ -857,6 +857,45 @@ fn test_udp_logging_dtls_docs_retain_association_when_rebuild_fails() {
     ));
 }
 
+#[test]
+fn test_udp_logging_dtls_batch_size_gate_classifies_send_reject_and_split() {
+    let max = 16_384usize;
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_classify_dtls_batch_size_for_test(
+            false, max + 1, 8, max
+        ),
+        "send_as_is",
+        "plain UDP must not apply the DTLS plaintext ceiling"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_classify_dtls_batch_size_for_test(
+            true, max, 8, max
+        ),
+        "send_as_is",
+        "in-limit DTLS batches send as one datagram"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_classify_dtls_batch_size_for_test(
+            true,
+            max + 1,
+            1,
+            max
+        ),
+        "reject_oversized_single",
+        "oversized singles fail closed into retry/final-loss"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_classify_dtls_batch_size_for_test(
+            true,
+            max + 1,
+            2,
+            max
+        ),
+        "split_per_entry",
+        "oversized multi-entry batches fan out per entry without async recursion"
+    );
+}
+
 #[tokio::test]
 async fn test_dtls_connection_send_rejects_oversized_plaintext() {
     ensure_crypto_provider();
@@ -930,6 +969,8 @@ fn test_udp_logging_docs_dns_and_delivery_contract() {
         "retains the current sender",
         "local UDP socket",
         "FERRUM_DTLS_MAX_PLAINTEXT_BYTES",
+        "split per entry",
+        "co-batched siblings",
         "OptionalFailOpen",
         "materialized at admission",
         "File mode",

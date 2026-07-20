@@ -593,38 +593,87 @@ async fn send_batch(
     result
 }
 
+/// DTLS plaintext-size gate for one already-serialized batch payload.
+///
+/// Kept pure (no async / no I/O) so the multi-entry split path can call a
+/// non-recursive single-entry helper without boxing an async recursion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DtlsBatchSizeDecision {
+    /// Payload fits the ceiling (or DTLS is off); send as one datagram.
+    SendAsIs,
+    /// Single-entry batch exceeds the ceiling — fail closed into retry/final-loss.
+    RejectOversizedSingle,
+    /// Multi-entry batch exceeds the ceiling — deliver each entry independently.
+    SplitPerEntry,
+}
+
+pub(crate) fn classify_dtls_batch_size(
+    dtls_enabled: bool,
+    payload_len: usize,
+    batch_len: usize,
+    max_plaintext: usize,
+) -> DtlsBatchSizeDecision {
+    if !dtls_enabled || payload_len <= max_plaintext {
+        return DtlsBatchSizeDecision::SendAsIs;
+    }
+    if batch_len == 1 {
+        DtlsBatchSizeDecision::RejectOversizedSingle
+    } else {
+        DtlsBatchSizeDecision::SplitPerEntry
+    }
+}
+
+fn oversized_dtls_batch_error(max_plaintext: usize, got: usize) -> String {
+    format!(
+        "udp_logging: DTLS batch exceeds max_plaintext \
+         ({max_plaintext} bytes, got {got}); local delivery rejected before driver enqueue"
+    )
+}
+
+fn serialize_batch_payload(
+    batch: &[SummaryLogEntry],
+    schema: Option<&SummarySchema>,
+) -> Option<Vec<u8>> {
+    let view = SummaryLogEntryBatchView {
+        entries: batch,
+        schema,
+    };
+    match serde_json::to_vec(&view) {
+        Ok(payload) => Some(payload),
+        Err(error) => {
+            warn!("udp_logging: failed to serialize batch: {error}");
+            None
+        }
+    }
+}
+
 async fn deliver_batch(
     cfg: &UdpFlushConfig,
     sender: &UdpSender,
     batch: &[SummaryLogEntry],
 ) -> Result<(), String> {
-    let view = SummaryLogEntryBatchView {
-        entries: batch,
-        schema: cfg.schema.as_deref(),
-    };
-    let payload = match serde_json::to_vec(&view) {
-        Ok(payload) => payload,
-        Err(error) => {
-            warn!("udp_logging: failed to serialize batch: {error}");
-            return Ok(());
-        }
+    let Some(payload) = serialize_batch_payload(batch, cfg.schema.as_deref()) else {
+        return Ok(());
     };
 
-    if cfg.dtls_enabled {
-        let max_plaintext = crate::dtls::max_plaintext_bytes();
-        if payload.len() > max_plaintext {
-            if batch.len() == 1 {
-                return Err(format!(
-                    "udp_logging: DTLS batch exceeds max_plaintext \
-                     ({max_plaintext} bytes, got {}); local delivery rejected before driver enqueue",
-                    payload.len()
-                ));
-            }
-            // Split so one oversized record cannot erase co-batched siblings.
-            // Oversized singles are discarded with an explicit warning; other
-            // local delivery failures still propagate into retry/final-loss.
+    let max_plaintext = crate::dtls::max_plaintext_bytes();
+    match classify_dtls_batch_size(
+        cfg.dtls_enabled,
+        payload.len(),
+        batch.len(),
+        max_plaintext,
+    ) {
+        DtlsBatchSizeDecision::SendAsIs => sender.send(&payload).await,
+        DtlsBatchSizeDecision::RejectOversizedSingle => {
+            Err(oversized_dtls_batch_error(max_plaintext, payload.len()))
+        }
+        DtlsBatchSizeDecision::SplitPerEntry => {
+            // Fixed one-level fan-out into the non-recursive single-entry helper
+            // so one oversized record cannot erase co-batched siblings. Oversized
+            // singles are discarded with an explicit warning; other local delivery
+            // failures still propagate into retry/final-loss.
             for entry in batch {
-                match deliver_batch(cfg, sender, std::slice::from_ref(entry)).await {
+                match deliver_one_entry(cfg, sender, entry).await {
                     Ok(()) => {}
                     Err(error) if error.contains("exceeds max_plaintext") => {
                         warn!(
@@ -635,11 +684,38 @@ async fn deliver_batch(
                     Err(error) => return Err(error),
                 }
             }
-            return Ok(());
+            Ok(())
         }
     }
+}
 
-    sender.send(&payload).await
+/// Deliver a single log entry as its own datagram. Never calls [`deliver_batch`],
+/// so the multi-entry oversized split stays a fixed-depth fan-out (no async
+/// recursion / no `Box::pin` of an unbounded path).
+async fn deliver_one_entry(
+    cfg: &UdpFlushConfig,
+    sender: &UdpSender,
+    entry: &SummaryLogEntry,
+) -> Result<(), String> {
+    let Some(payload) =
+        serialize_batch_payload(std::slice::from_ref(entry), cfg.schema.as_deref())
+    else {
+        return Ok(());
+    };
+
+    let max_plaintext = crate::dtls::max_plaintext_bytes();
+    match classify_dtls_batch_size(cfg.dtls_enabled, payload.len(), 1, max_plaintext) {
+        DtlsBatchSizeDecision::SendAsIs => sender.send(&payload).await,
+        DtlsBatchSizeDecision::RejectOversizedSingle => {
+            Err(oversized_dtls_batch_error(max_plaintext, payload.len()))
+        }
+        // `batch_len == 1` never selects split; keep fail-closed if the
+        // classifier contract changes.
+        DtlsBatchSizeDecision::SplitPerEntry => Err(oversized_dtls_batch_error(
+            max_plaintext,
+            payload.len(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
