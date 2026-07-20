@@ -2955,12 +2955,18 @@ impl Plugin for AiToolGovernor {
             ctx.ai_tool_governor_replay_redactions
                 .insert(self.instance_id);
         }
-        // Stage preflighted redaction rewrites for the transform hook. Aggregate
-        // value bytes were already capped at MAX_PARSE_BYTES during govern_calls.
-        if batch.redaction_memos.is_empty() {
-            ctx.ai_tool_governor_redaction_memos
-                .remove(&self.instance_id);
-        } else {
+        // Stage preflighted redaction rewrites for the transform hook. One
+        // instance's aggregate value bytes are capped at MAX_PARSE_BYTES during
+        // govern_calls, and the context retains at most ONE instance's memo set
+        // at a time. Otherwise many configured governor instances could each
+        // stage another inspectable window before any transform hook runs.
+        // Instances that do not win this bounded slot safely recompute during
+        // their transform instead of multiplying per-request memory.
+        ctx.ai_tool_governor_redaction_memos
+            .remove(&self.instance_id);
+        if !batch.redaction_memos.is_empty()
+            && ctx.ai_tool_governor_redaction_memos.is_empty()
+        {
             ctx.ai_tool_governor_redaction_memos
                 .insert(self.instance_id, batch.redaction_memos);
         }

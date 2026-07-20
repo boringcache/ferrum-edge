@@ -1748,8 +1748,9 @@ pub struct RequestContext {
     /// Per-instance buffered `redact_args` rewrites computed during governance
     /// amplification preflight and consumed by the response-body transform.
     /// Keys are digests of `(tool name, raw args)`; aggregate value bytes are
-    /// capped at the plugin's 4 MiB inspectable window so hostile argument sets
-    /// cannot retain more than one inspectable body between hooks.
+    /// capped at the plugin's 4 MiB inspectable window, and at most one plugin
+    /// instance may stage a memo set at once, so multiple configured governors
+    /// cannot multiply that retained window between hooks.
     pub(crate) ai_tool_governor_redaction_memos: HashMap<u64, HashMap<String, String>>,
     /// Per-`ai_semantic_firewall`-instance hashes of request bodies already
     /// inspected before request transforms. Kept outside serialized metadata so
