@@ -3783,8 +3783,7 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
         json!("type")
     );
     assert_eq!(
-        spec["components"]["schemas"]["ProxyAlertsWebhookChannel"]["properties"]["headers"]
-            ["additionalProperties"],
+        spec["components"]["schemas"]["ProxyAlertsWebhookChannel"]["properties"]["headers"]["additionalProperties"],
         json!({"type": "string"})
     );
 

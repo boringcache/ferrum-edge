@@ -662,9 +662,9 @@ fn read_recovery(
     if rec.is_null() {
         return Ok(None);
     }
-    let rec_obj = rec.as_object().ok_or_else(|| {
-        format!("proxy_alerts: rule '{rule_name}': 'recovery' must be an object")
-    })?;
+    let rec_obj = rec
+        .as_object()
+        .ok_or_else(|| format!("proxy_alerts: rule '{rule_name}': 'recovery' must be an object"))?;
     reject_unknown_keys(
         rec_obj,
         &format!("rules[{rule_id}].recovery"),
