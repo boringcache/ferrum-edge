@@ -196,6 +196,11 @@ pub fn validate_tag_key(key: &str) -> Result<&str, String> {
     if trimmed.is_empty() {
         return Err("statsd_logging: tag keys must not be empty".to_string());
     }
+    if trimmed != key {
+        return Err(format!(
+            "statsd_logging: tag key '{key}' must not contain leading or trailing whitespace"
+        ));
+    }
     if trimmed.len() > MAX_TAG_KEY_LEN {
         return Err(format!(
             "statsd_logging: tag key exceeds maximum length of {MAX_TAG_KEY_LEN} bytes"
@@ -1141,6 +1146,8 @@ mod tests {
         assert!(validate_tag_key("method\nrogue").is_err());
         assert!(validate_tag_key("a:b").is_err());
         assert!(validate_tag_key("a|b").is_err());
+        assert!(validate_tag_key(" method").is_err());
+        assert!(validate_tag_key("method ").is_err());
         assert!(validate_tag_key("ok_tag").is_ok());
     }
 

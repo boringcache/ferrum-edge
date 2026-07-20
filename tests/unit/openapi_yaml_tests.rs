@@ -3382,6 +3382,7 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
         json!({"host": "statsd.example.test", "port": 65536}),
         json!({"host": "statsd.example.test", "global_tags": {"env": true}}),
         json!({"host": "statsd.example.test", "global_tags": {"evil\nkey": "x"}}),
+        json!({"host": "statsd.example.test", "global_tags": {" env ": "prod"}}),
         json!({"host": "statsd.example.test", "global_tags": {"1bad": "x"}}),
         json!({"host": "statsd.example.test", "global_tags": { ("k".repeat(65)): "x" }}),
         json!({"host": "statsd.example.test", "prefix": null}),

@@ -751,6 +751,10 @@ async fn test_statsd_rejects_reserved_and_injecting_global_tags() {
             "tag key",
         ),
         (
+            json!({"host": "127.0.0.1", "global_tags": {" env ": "prod"}}),
+            "whitespace",
+        ),
+        (
             json!({
                 "host": "127.0.0.1",
                 "schema": {
@@ -759,6 +763,16 @@ async fn test_statsd_rejects_reserved_and_injecting_global_tags() {
                 }
             }),
             "tag key",
+        ),
+        (
+            json!({
+                "host": "127.0.0.1",
+                "schema": {
+                    "summary_type": "http",
+                    "rename": {"http_method": " method "}
+                }
+            }),
+            "whitespace",
         ),
         // Native-field collision is fail-closed by the shared schema compiler.
         (
