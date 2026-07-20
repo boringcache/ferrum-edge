@@ -5,7 +5,9 @@ use ferrum_edge::plugins::utils::metadata_redaction::{
     REDACTED_PLACEHOLDER, is_sensitive_metadata_key_with_extras, serialize_redacted_metadata,
 };
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
-use ferrum_edge::proxy::headers::strip_client_response_hop_by_hop_headers;
+use ferrum_edge::proxy::headers::{
+    apply_response_headers, strip_client_response_hop_by_hop_headers,
+};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -339,12 +341,14 @@ async fn test_last_event_id_redacted_from_log_metadata() {
         "opaque-resume-cursor".to_string(),
     );
     metadata.insert("sse:wrap_non_sse".to_string(), "1".to_string());
+    metadata.insert("sse:relabeled_non_sse".to_string(), "1".to_string());
     metadata.insert("safe".to_string(), "ok".to_string());
 
     redact_sse_log_metadata(&mut metadata);
 
     assert!(!metadata.contains_key(LAST_EVENT_ID_METADATA_KEY));
     assert!(!metadata.contains_key("sse:wrap_non_sse"));
+    assert!(!metadata.contains_key("sse:relabeled_non_sse"));
     assert_eq!(
         metadata.get("sse:leid_present").map(String::as_str),
         Some("1")
@@ -561,8 +565,13 @@ async fn test_h3_final_strip_removes_plugin_reintroduced_connection() {
     // Defense in depth: even if a plugin reintroduces hop-by-hop fields after
     // backend sanitation, the H3 final-field strip removes static and
     // Connection-nominated fields regardless of plugin-supplied casing.
-    let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_sse_ctx();
+    let mut headers = sse_response_headers();
+    plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+
+    // Model a later generic response-header plugin reintroducing fields after
+    // the SSE hook. The final H3 boundary must sanitize the resulting union.
     headers.insert(
         "ConNection".to_string(),
         "X-Plugin-Hop, Keep-Alive".to_string(),
@@ -592,6 +601,20 @@ async fn test_h3_final_strip_removes_plugin_reintroduced_connection() {
     }
     assert_eq!(headers.get("x-accel-buffering").unwrap(), "no");
     assert_eq!(headers.get("content-type").unwrap(), "text/event-stream");
+
+    let response = apply_response_headers(hyper::Response::builder().status(200), &headers)
+        .body(())
+        .expect("sanitized H3 response headers must build");
+    assert!(response.headers().get("connection").is_none());
+    assert!(response.headers().get("keep-alive").is_none());
+    assert!(response.headers().get("x-plugin-hop").is_none());
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
 }
 
 #[tokio::test]
@@ -833,6 +856,47 @@ async fn test_multiple_sse_instances_wrap_once_and_merge_cache_control_idempoten
         String::from_utf8(transformed).unwrap(),
         "data: {\"message\":\"hello\"}\n\n"
     );
+}
+
+#[tokio::test]
+async fn test_force_only_instance_before_wrapper_preserves_original_non_sse_provenance() {
+    let forcing = make_plugin(json!({"force_sse_content_type": true}));
+    let wrapping = make_plugin(json!({"wrap_non_sse_responses": true}));
+    let mut ctx = make_sse_ctx();
+    let mut headers = json_response_headers();
+
+    forcing.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert_eq!(headers.get("content-type").unwrap(), "text/event-stream");
+    wrapping.after_proxy(&mut ctx, 200, &mut headers).await;
+
+    let body = br#"{"message":"hello"}"#;
+    assert!(
+        forcing
+            .transform_response_body_with_context(
+                &mut ctx,
+                body,
+                Some("text/event-stream"),
+                &headers,
+            )
+            .await
+            .is_none()
+    );
+    let transformed = wrapping
+        .transform_response_body_with_context(
+            &mut ctx,
+            body,
+            Some("text/event-stream"),
+            &headers,
+        )
+        .await
+        .expect("a later wrapper must honor the original non-SSE provenance");
+
+    assert_eq!(
+        String::from_utf8(transformed).unwrap(),
+        "data: {\"message\":\"hello\"}\n\n"
+    );
+    assert!(!ctx.metadata.contains_key("sse:wrap_non_sse"));
+    assert!(!ctx.metadata.contains_key("sse:relabeled_non_sse"));
 }
 
 #[tokio::test]

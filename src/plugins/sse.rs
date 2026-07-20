@@ -77,6 +77,11 @@ pub const LAST_EVENT_ID_METADATA_KEY: &str = "sse:last_event_id";
 /// already relabeled) client-facing `Content-Type`.
 const WRAP_NON_SSE_METADATA_KEY: &str = "sse:wrap_non_sse";
 
+/// Request-scoped provenance marker set when an SSE plugin relabels an
+/// originally non-SSE response. A later SSE instance must not mistake that
+/// relabelled media type for a genuine upstream event stream and skip wrapping.
+const RELABELLED_NON_SSE_METADATA_KEY: &str = "sse:relabeled_non_sse";
+
 /// Maximum accepted `Last-Event-ID` byte length (hostile-input bound).
 pub const MAX_LAST_EVENT_ID_BYTES: usize = 1024;
 
@@ -216,6 +221,7 @@ pub fn redact_sse_log_metadata(metadata: &mut HashMap<String, String>) {
         metadata.insert("sse:leid_bytes".to_string(), raw.len().to_string());
     }
     metadata.remove(WRAP_NON_SSE_METADATA_KEY);
+    metadata.remove(RELABELLED_NON_SSE_METADATA_KEY);
 }
 
 fn value_kind(value: &Value) -> &'static str {
@@ -498,17 +504,22 @@ impl super::Plugin for SsePlugin {
         let is_sse = response_headers
             .get("content-type")
             .is_some_and(|ct| Self::is_sse_content_type(ct));
+        let was_relabelled_non_sse = ctx
+            .metadata
+            .get(RELABELLED_NON_SSE_METADATA_KEY)
+            .is_some_and(|value| value == "1");
+        let origin_was_sse = is_sse && !was_relabelled_non_sse;
 
         // For a non-SSE backend response, wrapping/forcing depends on the
         // configured body wrapper running. Preserved 206/226 bytes cannot be
         // wrapped, so do not relabel them as an SSE event stream.
         let wrap_allowed =
             self.wrap_non_sse_responses && super::response_body_rewrite_allowed(response_status);
-        if !is_sse && self.wrap_non_sse_responses && !wrap_allowed {
+        if !origin_was_sse && self.wrap_non_sse_responses && !wrap_allowed {
             return PluginResult::Continue;
         }
 
-        let will_wrap = !is_sse && wrap_allowed;
+        let will_wrap = !origin_was_sse && wrap_allowed;
         let will_force = !is_sse && self.force_sse_content_type;
 
         // If the backend didn't return SSE and we're neither wrapping nor
@@ -522,6 +533,13 @@ impl super::Plugin for SsePlugin {
             // we relabel the client-facing Content-Type below.
             ctx.metadata
                 .insert(WRAP_NON_SSE_METADATA_KEY.to_string(), "1".to_string());
+        }
+
+        if !is_sse && (will_wrap || will_force) {
+            ctx.metadata.insert(
+                RELABELLED_NON_SSE_METADATA_KEY.to_string(),
+                "1".to_string(),
+            );
         }
 
         // Wrapping implies a browser-consumable EventSource media type.
@@ -583,6 +601,9 @@ impl super::Plugin for SsePlugin {
             .metadata
             .remove(WRAP_NON_SSE_METADATA_KEY)
             .is_some_and(|v| v == "1");
+        if wrap_requested {
+            ctx.metadata.remove(RELABELLED_NON_SSE_METADATA_KEY);
+        }
 
         // Don't double-wrap a genuine upstream SSE response. When after_proxy
         // already decided to wrap (and may have relabeled Content-Type), honor
