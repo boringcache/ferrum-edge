@@ -696,12 +696,8 @@ fn response_transformer_sse_policy_file_config(backend_port: u16) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn response_transformer_uses_backend_representation_for_sse_buffering() {
+async fn response_transformer_buffers_json_when_client_accepts_sse() {
     const JSON_BODY: &str = r#"{"secret":"hunter2","keep":"visible"}"#;
-    const EVENT_ONE: &str = "data: {\"part\":1}\n\n";
-    const EVENT_TWO: &str = "data: {\"part\":2}\n\n";
-    const MID_STREAM_PAUSE: Duration = Duration::from_secs(5);
-    const FIRST_EVENT_DEADLINE: Duration = Duration::from_millis(2500);
 
     let reservation = reserve_port().await.expect("reserve backend port");
     let backend_port = reservation.port;
@@ -726,27 +722,11 @@ async fn response_transformer_uses_backend_representation_for_sse_buffering() {
         HttpStep::RespondBodyChunk(JSON_BODY.as_bytes().to_vec()),
         HttpStep::RespondBodyEnd,
     ];
-    let sse_script = vec![
-        HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/events")),
-        HttpStep::RespondStatus {
-            status: 200,
-            reason: "OK".into(),
-        },
-        HttpStep::RespondHeader {
-            name: "Content-Type".into(),
-            value: "text/event-stream".into(),
-        },
-        HttpStep::RespondHeader {
-            name: "Connection".into(),
-            value: "close".into(),
-        },
-        HttpStep::RespondBodyChunk(EVENT_ONE.as_bytes().to_vec()),
-        HttpStep::Sleep(MID_STREAM_PAUSE),
-        HttpStep::RespondBodyChunk(EVENT_TWO.as_bytes().to_vec()),
-        HttpStep::RespondBodyEnd,
-    ];
     let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
-        .connection_scripts([json_script, sse_script])
+        // Repeat the same contract if an unexpected connection arrives. The
+        // request-count assertion below still exposes that transport bug, while
+        // avoiding a misleading JSON-decode failure against an SSE fixture.
+        .steps(json_script)
         .spawn()
         .expect("spawn backend");
 
@@ -767,15 +747,78 @@ async fn response_transformer_uses_backend_representation_for_sse_buffering() {
         .await
         .expect("gateway returns JSON response");
     assert_eq!(json_response.status(), StatusCode::OK);
-    let json_body: serde_json::Value = json_response
-        .json()
+    let json_bytes = json_response
+        .bytes()
         .await
-        .expect("transformed response is valid JSON");
+        .expect("read transformed JSON response");
+    let json_body: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap_or_else(|error| {
+        panic!(
+            "transformed response is valid JSON: {error}; body={:?}",
+            String::from_utf8_lossy(&json_bytes)
+        )
+    });
     assert!(
         json_body.get("secret").is_none(),
         "client SSE intent must not bypass the configured redaction"
     );
     assert_eq!(json_body["keep"], "visible");
+
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "a successful JSON response must not trigger another backend attempt"
+    );
+    assert_eq!(
+        backend.accepted_connections(),
+        1,
+        "a successful JSON response must use one backend connection"
+    );
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn response_transformer_releases_backend_sse_incrementally() {
+    const EVENT_ONE: &str = "data: {\"part\":1}\n\n";
+    const EVENT_TWO: &str = "data: {\"part\":2}\n\n";
+    const MID_STREAM_PAUSE: Duration = Duration::from_secs(5);
+    const FIRST_EVENT_DEADLINE: Duration = Duration::from_millis(2500);
+
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let sse_script = vec![
+        HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/events")),
+        HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        },
+        HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "text/event-stream".into(),
+        },
+        HttpStep::RespondHeader {
+            name: "Connection".into(),
+            value: "close".into(),
+        },
+        HttpStep::RespondBodyChunk(EVENT_ONE.as_bytes().to_vec()),
+        HttpStep::Sleep(MID_STREAM_PAUSE),
+        HttpStep::RespondBodyChunk(EVENT_TWO.as_bytes().to_vec()),
+        HttpStep::RespondBodyEnd,
+    ];
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .steps(sse_script)
+        .spawn()
+        .expect("spawn backend");
+
+    let harness = GatewayHarness::builder()
+        .file_config(response_transformer_sse_policy_file_config(backend_port))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = harness.http_client().expect("client");
 
     // A real backend event stream remains incremental. Requiring the first
     // event before the backend's pause elapses proves the response was released
@@ -826,6 +869,17 @@ async fn response_transformer_uses_backend_representation_for_sse_buffering() {
     .expect("SSE stream finishes after backend closes");
     assert!(sse_body.contains("\"part\":2"));
 
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "a successful SSE response must not trigger another backend attempt"
+    );
+    assert_eq!(
+        backend.accepted_connections(),
+        1,
+        "a successful SSE response must use one backend connection"
+    );
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
 }
