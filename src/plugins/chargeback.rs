@@ -1,5 +1,32 @@
 //! Shared chargeback helpers used by in-memory and durable charge exporters.
 
+use super::TransactionSummary;
+
+/// Final status dimensions used by both chargeback implementations.
+///
+/// `status_code` is the billable/output dimension. Ordinary HTTP retains its
+/// wire status; native gRPC and translated gRPC-Web use the canonical effective
+/// HTTP mapping of the final normalized application status. The raw transport
+/// and application values remain available separately for durable exports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpBillingOutcome {
+    pub status_code: u16,
+    pub http_status_code: u16,
+    pub grpc_status: Option<u32>,
+}
+
+pub fn http_billing_outcome(summary: &TransactionSummary) -> HttpBillingOutcome {
+    let grpc_status = summary.grpc_status();
+    let status_code = grpc_status
+        .map(crate::proxy::grpc_proxy::grpc_status_to_http_status)
+        .unwrap_or(summary.response_status_code);
+    HttpBillingOutcome {
+        status_code,
+        http_status_code: summary.response_status_code,
+        grpc_status,
+    }
+}
+
 pub mod pricing {
     use serde_json::Value;
     use std::collections::HashMap;
@@ -7,7 +34,7 @@ pub mod pricing {
     /// Resolved pricing configuration for chargeback plugins.
     #[derive(Debug, Clone, Default)]
     pub struct PricingConfig {
-        /// Per-call pricing keyed by HTTP status code.
+        /// Per-call pricing keyed by billable status code.
         pub price_by_status: HashMap<u16, f64>,
         /// Per-byte bandwidth charge for client->backend bytes.
         pub bandwidth_price_sent: f64,

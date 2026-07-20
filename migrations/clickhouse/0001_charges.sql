@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS ferrum.charges_raw (
     proxy_name            LowCardinality(String),
     route_id              String,
     status_code           UInt16,
+    http_status_code      Nullable(UInt16),
+    grpc_status           Nullable(UInt32),
     protocol              LowCardinality(String),
     call_count            UInt32,
     charge_call           Float64,
