@@ -403,7 +403,7 @@ impl Plugin for StatsdLogging {
 }
 
 /// Format HTTP transaction metrics as StatsD line protocol.
-pub(crate) fn format_http_metrics(
+fn format_http_metrics(
     summary: &TransactionSummary,
     prefix: &str,
     global_tags: &str,
@@ -475,7 +475,7 @@ pub(crate) fn format_http_metrics(
 }
 
 /// Format stream transaction metrics as StatsD line protocol.
-pub(crate) fn format_stream_metrics(
+fn format_stream_metrics(
     summary: &StreamTransactionSummary,
     prefix: &str,
     global_tags: &str,
@@ -912,7 +912,10 @@ mod tests {
             http_buf.contains("ferrum.request.client_disconnect:1|c"),
             "got: {http_buf}"
         );
-        assert!(http_buf.contains("ferrum.request.count:1|c"), "got: {http_buf}");
+        assert!(
+            http_buf.contains("ferrum.request.count:1|c"),
+            "got: {http_buf}"
+        );
         assert!(
             http_buf.contains("ferrum.request.status.4xx:1|c"),
             "got: {http_buf}"
@@ -921,10 +924,8 @@ mod tests {
         let mut client_to_backend = stream_summary();
         client_to_backend.bytes_sent = 111;
         client_to_backend.bytes_received = 22;
-        client_to_backend.disconnect_direction =
-            Some(crate::plugins::Direction::ClientToBackend);
-        client_to_backend.disconnect_cause =
-            Some(crate::plugins::DisconnectCause::RecvError);
+        client_to_backend.disconnect_direction = Some(crate::plugins::Direction::ClientToBackend);
+        client_to_backend.disconnect_cause = Some(crate::plugins::DisconnectCause::RecvError);
         let mut stream_buf = String::new();
         format_stream_metrics(&client_to_backend, "ferrum", "", None, &mut stream_buf);
         assert!(
@@ -948,10 +949,8 @@ mod tests {
         let mut backend_to_client = stream_summary();
         backend_to_client.bytes_sent = 7;
         backend_to_client.bytes_received = 900;
-        backend_to_client.disconnect_direction =
-            Some(crate::plugins::Direction::BackendToClient);
-        backend_to_client.disconnect_cause =
-            Some(crate::plugins::DisconnectCause::BackendError);
+        backend_to_client.disconnect_direction = Some(crate::plugins::Direction::BackendToClient);
+        backend_to_client.disconnect_cause = Some(crate::plugins::DisconnectCause::BackendError);
         let mut reverse_buf = String::new();
         format_stream_metrics(&backend_to_client, "ferrum", "", None, &mut reverse_buf);
         assert!(

@@ -3033,8 +3033,7 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
         .expect("StatsdLoggingConfig exists");
     assert_eq!(schema["additionalProperties"], json!(false));
     assert_eq!(
-        schema["properties"]["global_tags"]["additionalProperties"]["type"],
-        "string",
+        schema["properties"]["global_tags"]["additionalProperties"]["type"], "string",
         "global_tags must remain an intentionally open string map"
     );
 

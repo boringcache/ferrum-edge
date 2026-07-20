@@ -392,10 +392,7 @@ async fn test_statsd_logging_rejects_one_character_misspellings_of_every_key() {
         let err = StatsdLogging::new(&config, default_client())
             .err()
             .unwrap_or_else(|| panic!("expected unknown-key rejection for {typo}"));
-        assert!(
-            err.contains("unknown configuration key"),
-            "got: {err}"
-        );
+        assert!(err.contains("unknown configuration key"), "got: {err}");
         assert!(err.contains(typo), "error must name the typo key: {err}");
         assert!(
             err.contains("allowed keys"),
@@ -427,7 +424,10 @@ async fn test_statsd_logging_rejects_multiple_unknown_keys_with_sorted_names() {
     assert!(err.contains("zzz_extra"), "got: {err}");
     let aaa = err.find("aaa_extra").expect("aaa_extra present");
     let zzz = err.find("zzz_extra").expect("zzz_extra present");
-    assert!(aaa < zzz, "unknown keys should be sorted in the error: {err}");
+    assert!(
+        aaa < zzz,
+        "unknown keys should be sorted in the error: {err}"
+    );
 }
 
 #[tokio::test]
