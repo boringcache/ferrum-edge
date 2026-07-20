@@ -255,6 +255,20 @@ data-leak rules.
 `scan_budget_ms` bounds total scan time; `on_scan_timeout` (`allow`, `block`,
 `log_and_allow`) decides the outcome when the budget is exceeded.
 
+For a pristine backend `text/event-stream`, request `Accept` and internal
+streaming markers cannot bypass response-body policy. Because an unbounded
+stream cannot be truncated and scanned before headers are committed,
+`on_body_too_large` supplies the explicit disposition: `skip` allows it
+uninspected; `block` rejects in enforce mode; and `scan_truncated` rejects when
+an enforcing response-body rule or anomaly-scoring policy would otherwise claim
+inspection, while monitor-only policy records and allows it. With metadata
+logging enabled, WAF writes `waf.response_stream_uninspectable=true` plus either
+`waf.action=stream_uninspected` or `waf.action=blocked` and
+`waf.block_reason=unbounded_response_stream`. `on_scan_timeout` does not apply
+because no bounded scan starts. Missing, ambiguous, or later-relabeled response
+types are never treated as proven SSE; the ordinary WAF content-type eligibility
+rules still apply, including release of types outside the configured scan scope.
+
 ### Detection limits
 
 A few detections trade exhaustiveness for bounded, attacker-resistant cost.

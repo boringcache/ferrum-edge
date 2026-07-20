@@ -24,6 +24,9 @@ use tracing::debug;
 use super::utils::size_limit::{
     SizeLimiter, content_length_over_limit, reject_with_limit, required_positive_u64,
 };
+use super::utils::sse::{
+    is_text_event_stream_media_type, original_response_is_event_stream,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct ResponseSizeLimiting {
@@ -84,21 +87,51 @@ impl Plugin for ResponseSizeLimiting {
         self.require_buffered_check && self.is_enabled()
     }
 
-    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // Skip body buffering for SSE requests (`Accept: text/event-stream`).
-        // Buffering an unbounded event stream is exactly what this plugin
-        // would otherwise reject — at `max_size_bytes` the buffer would 502
-        // instead of streaming events. The Content-Length fast path in
-        // `after_proxy` still runs (an SSE backend with an oversized
-        // Content-Length is rejected pre-streaming); per-frame size
-        // enforcement on a streaming response is out of scope for the
-        // current buffered design.
-        self.require_buffered_check && self.is_enabled() && !super::utils::sse::is_sse_request(ctx)
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        // A request Accept value cannot waive the configured route ceiling.
+        // Buffer ordinary responses conservatively until pristine backend
+        // headers are available.
+        self.require_buffered_check && self.is_enabled()
+    }
+
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+    }
+
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && !content_type.is_some_and(is_text_event_stream_media_type)
     }
 
     async fn after_proxy(
         &self,
-        _ctx: &mut RequestContext,
+        ctx: &mut RequestContext,
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
@@ -115,6 +148,18 @@ impl Plugin for ResponseSizeLimiting {
                 "Response rejected: Content-Length exceeds limit"
             );
             return reject_with_limit(502, "Response body too large", self.max_size_bytes());
+        }
+
+        if self.require_buffered_check && original_response_is_event_stream(ctx, response_headers) {
+            // The strict route limit is a whole-body policy. Until it has an
+            // event-aware streaming counter, fail before committing headers
+            // rather than silently fall back to the generally larger global
+            // streaming ceiling or collect an unbounded event stream.
+            return reject_with_limit(
+                502,
+                "Streaming response size cannot be verified",
+                self.max_size_bytes(),
+            );
         }
 
         PluginResult::Continue

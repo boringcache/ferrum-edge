@@ -23,8 +23,8 @@ use tracing::{debug, warn};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
-    SseReassembler, SseTextKind, is_sse_request, parse_sse_data_frames,
-    parse_sse_data_frames_checked,
+    SseReassembler, SseTextKind, is_text_event_stream_media_type,
+    original_response_is_event_stream, parse_sse_data_frames, parse_sse_data_frames_checked,
 };
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -1398,10 +1398,67 @@ impl Plugin for AiResponseGuard {
         self.has_validation_rules
     }
 
-    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        // Client-controlled streaming intent is not response evidence. Buffer
+        // conservatively until the pristine backend Content-Type is known.
         self.has_validation_rules
-            && !is_sse_request(ctx)
-            && ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
+    }
+
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+    }
+
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && !content_type.is_some_and(is_text_event_stream_media_type)
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+        {
+            // This plugin's buffered SSE parser cannot safely decide an
+            // unbounded stream before any bytes are committed. Reject for every
+            // enforcing/redacting policy; warn-only configurations retain their
+            // documented pass-through posture and record the explicit skip.
+            return self.respond_to_uninspectable(
+                ctx,
+                "streaming_response_requires_bounded_inspection",
+                "event-stream responses cannot be fully inspected before delivery",
+            );
+        }
+        PluginResult::Continue
     }
 
     async fn on_response_body(

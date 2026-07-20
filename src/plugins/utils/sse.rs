@@ -64,6 +64,30 @@ pub fn is_text_event_stream_media_type(value: &str) -> bool {
         .eq_ignore_ascii_case("text/event-stream")
 }
 
+/// Returns `true` only when the response selected by the backend is an SSE
+/// representation. Once the proxy has stamped pristine response metadata, an
+/// absent original `Content-Type` stays absent: a later response-header plugin
+/// must not be able to manufacture or erase the evidence used by the
+/// buffer/stream security decision. Synthetic responses, which have no backend
+/// stamp, use their live header map.
+#[inline]
+pub fn original_response_is_event_stream(
+    ctx: &RequestContext,
+    response_headers: &HashMap<String, String>,
+) -> bool {
+    let content_type = if ctx
+        .metadata
+        .contains_key(crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY)
+    {
+        ctx.metadata
+            .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
+            .map(String::as_str)
+    } else {
+        response_headers.get("content-type").map(String::as_str)
+    };
+    content_type.is_some_and(is_text_event_stream_media_type)
+}
+
 /// Outcome of parsing a buffered SSE body, distinguishing "no data" from "data
 /// we could not parse" so callers that promise inspection (e.g. the AI firewall
 /// `buffer` mode) can fail closed on uninspectable input rather than deliver it.
@@ -712,7 +736,61 @@ fn index_field(value: &Value, field: &str) -> Option<usize> {
 /// is rejected, but parameters (`text/event-stream; q=1.0`) are accepted.
 #[inline]
 fn accept_includes_event_stream(accept: &str) -> bool {
-    accept.split(',').any(is_text_event_stream_media_type)
+    accept.split(',').any(|media_range| {
+        let mut parts = media_range.split(';');
+        if !parts
+            .next()
+            .is_some_and(is_text_event_stream_media_type)
+        {
+            return false;
+        }
+
+        let mut quality_seen = false;
+        for parameter in parts {
+            let Some((name, value)) = parameter.split_once('=') else {
+                // A malformed bare quality parameter must not retain the
+                // default affirmative qvalue. Unknown extension parameters
+                // remain irrelevant to the request-side hint.
+                if parameter.trim().eq_ignore_ascii_case("q") {
+                    return false;
+                }
+                continue;
+            };
+            if !name.trim().eq_ignore_ascii_case("q") {
+                continue;
+            }
+            if quality_seen {
+                return false;
+            }
+            quality_seen = true;
+            if !quality_value_is_positive(value.trim()) {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+/// Parse the RFC 9110 `qvalue` grammar without floating-point ambiguity. An
+/// invalid value is not affirmative streaming intent, which is the safe side
+/// of the request-side hint used by non-policy streaming plugins.
+fn quality_value_is_positive(value: &str) -> bool {
+    if value == "0" {
+        return false;
+    }
+    if value == "1" {
+        return true;
+    }
+    if let Some(fraction) = value.strip_prefix("0.") {
+        return fraction.len() <= 3
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.bytes().any(|byte| byte != b'0');
+    }
+    if let Some(fraction) = value.strip_prefix("1.") {
+        return fraction.len() <= 3
+            && fraction.bytes().all(|byte| byte == b'0');
+    }
+    false
 }
 
 #[cfg(test)]
@@ -748,6 +826,83 @@ mod tests {
         assert!(is_sse_request(&ctx_with_accept(Some(
             "text/event-stream; q=1.0"
         ))));
+    }
+
+    #[test]
+    fn rejects_event_stream_with_zero_quality() {
+        for value in [
+            "text/event-stream; q=0",
+            "text/event-stream; q=0.0",
+            "text/event-stream; q=0.000",
+            "text/event-stream; Q=0",
+        ] {
+            assert!(!is_sse_request(&ctx_with_accept(Some(value))), "{value}");
+        }
+    }
+
+    #[test]
+    fn rejects_event_stream_with_invalid_quality() {
+        for value in [
+            "text/event-stream; q=",
+            "text/event-stream; q=2",
+            "text/event-stream; q=0.0001",
+            "text/event-stream; q=1.1",
+            "text/event-stream; q=1; q=0",
+            "text/event-stream; q",
+            "text/event-stream; Q ",
+        ] {
+            assert!(!is_sse_request(&ctx_with_accept(Some(value))), "{value}");
+        }
+    }
+
+    #[test]
+    fn pristine_response_content_type_wins_over_live_relabel() {
+        let mut ctx = ctx_with_accept(None);
+        ctx.metadata.insert(
+            crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY.to_string(),
+            "true".to_string(),
+        );
+        ctx.metadata.insert(
+            crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
+            "text/event-stream; charset=utf-8".to_string(),
+        );
+        let live_headers = HashMap::from([(
+            "content-type".to_string(),
+            "application/json".to_string(),
+        )]);
+        assert!(original_response_is_event_stream(&ctx, &live_headers));
+    }
+
+    #[test]
+    fn stamped_missing_content_type_does_not_trust_live_injection() {
+        let mut ctx = ctx_with_accept(None);
+        ctx.metadata.insert(
+            crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY.to_string(),
+            "true".to_string(),
+        );
+        let live_headers = HashMap::from([(
+            "content-type".to_string(),
+            "text/event-stream".to_string(),
+        )]);
+        assert!(!original_response_is_event_stream(&ctx, &live_headers));
+    }
+
+    #[test]
+    fn stamped_ambiguous_content_type_is_not_event_stream() {
+        let mut ctx = ctx_with_accept(None);
+        ctx.metadata.insert(
+            crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY.to_string(),
+            "true".to_string(),
+        );
+        ctx.metadata.insert(
+            crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
+            "application/event-stream+json".to_string(),
+        );
+        let live_headers = HashMap::from([(
+            "content-type".to_string(),
+            "text/event-stream".to_string(),
+        )]);
+        assert!(!original_response_is_event_stream(&ctx, &live_headers));
     }
 
     #[test]

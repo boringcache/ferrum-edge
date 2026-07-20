@@ -36,7 +36,9 @@ use self::scan::ScanOutcome;
 use self::stream::{
     StreamWafConfig, TLS_CLIENT_HELLO_MIN_PREFIX, looks_like_tls_client_hello, parse_stream_config,
 };
-use super::utils::sse::is_sse_request;
+use super::utils::sse::{
+    is_text_event_stream_media_type, original_response_is_event_stream,
+};
 use super::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
     StreamBytesKind, StreamConnectionContext, UdpDatagramContext, UdpDatagramDirection,
@@ -132,6 +134,48 @@ pub struct Waf {
 impl Waf {
     fn body_encoding_specials_active(&self) -> bool {
         self.specials.encoding.is_some() || self.specials.overlong_utf8.is_some()
+    }
+
+    fn has_enforcing_response_body_policy(&self) -> bool {
+        if self.config.mode != GlobalMode::Enforce {
+            return false;
+        }
+        if self.config.scoring.is_some() {
+            return true;
+        }
+        let encoding = self.specials.encoding;
+        let overlong_utf8 = self.specials.overlong_utf8;
+        self.compiled.rules.iter().enumerate().any(|(index, rule)| {
+            rule.action == RuleAction::Enforce
+                && (matches!(rule.target, self::rules::RuleTarget::ResponseBody)
+                    || encoding == Some(index)
+                    || overlong_utf8 == Some(index))
+        })
+    }
+
+    fn handle_unbounded_response_stream(&self, ctx: &mut RequestContext) -> PluginResult {
+        if self.config.log_to_metadata {
+            ctx.set_waf_metadata("waf.response_stream_uninspectable", "true");
+        }
+        let should_block = match self.config.on_body_too_large {
+            TooLargeAction::Skip => false,
+            TooLargeAction::Block => self.config.mode == GlobalMode::Enforce,
+            TooLargeAction::ScanTruncated => self.has_enforcing_response_body_policy(),
+        };
+        if should_block {
+            if self.config.log_to_metadata {
+                ctx.set_waf_metadata("waf.action", "blocked");
+                ctx.set_waf_metadata_if_absent(
+                    "waf.block_reason",
+                    "unbounded_response_stream",
+                );
+            }
+            return self.reject();
+        }
+        if self.config.log_to_metadata {
+            ctx.set_waf_metadata("waf.action", "stream_uninspected");
+        }
+        PluginResult::Continue
     }
 
     pub fn new(config: &Value) -> Result<Self, String> {
@@ -1020,14 +1064,24 @@ impl Plugin for Waf {
         }
         if !self.active
             || !self.config.response_inspection
-            || !self.compiled.response_header_rules_active
             || self.exemptions.request_short_circuits(ctx)
         {
             return PluginResult::Continue;
         }
-        let outcome =
-            self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
-        self.finish_scan(ctx, outcome)
+        if self.compiled.response_header_rules_active {
+            let outcome =
+                self.run_cheap_with_budget(|| self.run_response_header_scan(ctx, response_headers));
+            let result = self.finish_scan(ctx, outcome);
+            if !matches!(&result, PluginResult::Continue) {
+                return result;
+            }
+        }
+        if self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+        {
+            return self.handle_unbounded_response_stream(ctx);
+        }
+        PluginResult::Continue
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -1039,8 +1093,31 @@ impl Plugin for Waf {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
-            && !is_sse_request(ctx)
             && !self.exemptions.request_short_circuits(ctx)
+    }
+
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+    }
+
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1055,7 +1132,9 @@ impl Plugin for Waf {
         // scanning (non-allowlisted / binary with `inspect_binary_body=false`)
         // would be buffered and then skipped by `on_final_response_body`, so let
         // the proxy stream it instead of collecting bytes nothing will inspect.
-        self.should_buffer_response_body(ctx) && self.response_body_eligible_for_scan(content_type)
+        self.should_buffer_response_body(ctx)
+            && !content_type.is_some_and(is_text_event_stream_media_type)
+            && self.response_body_eligible_for_scan(content_type)
     }
 
     async fn on_final_response_body(

@@ -1479,9 +1479,12 @@ fn response_body_buffering_narrows_to_inspectable_content_types() {
         "response_body_inspection": true,
     }))
     .unwrap();
-    let ctx = ctx("GET", "/download");
+    let mut ctx = ctx("GET", "/download");
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
 
-    // Pre-flight (content-type-agnostic) decision buffers.
+    // Pre-flight (content-type-agnostic) decision buffers even when the client
+    // asks for SSE; only the pristine response representation may release it.
     assert!(plugin.should_buffer_response_body(&ctx));
     let headers = HashMap::new();
 
@@ -1495,6 +1498,12 @@ fn response_body_buffering_narrows_to_inspectable_content_types() {
     assert!(plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("application/json"),
+        200,
+        &headers
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json; profile=event-stream"),
         200,
         &headers
     ));
@@ -1513,7 +1522,135 @@ fn response_body_buffering_narrows_to_inspectable_content_types() {
         200,
         &headers
     ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &headers
+    ));
     assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &headers));
+}
+
+#[tokio::test]
+async fn enforcing_waf_fails_closed_on_unbounded_event_stream() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [{
+            "id": "R-SSE",
+            "name": "response secret",
+            "category": "test",
+            "severity": "high",
+            "target": "response_body",
+            "match_kind": "contains",
+            "pattern": "secret",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/events");
+    let mut response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream".to_string(),
+    )]);
+
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Reject { status_code: 403, .. }
+    ));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("unbounded_response_stream")
+    );
+}
+
+#[tokio::test]
+async fn explicit_skip_allows_unbounded_event_stream_with_metadata() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "on_body_too_large": "skip",
+        "custom_rules": [{
+            "id": "R-SSE-SKIP",
+            "name": "response secret",
+            "category": "test",
+            "severity": "high",
+            "target": "response_body",
+            "match_kind": "contains",
+            "pattern": "secret",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/events");
+    let mut response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream".to_string(),
+    )]);
+
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.response_stream_uninspectable")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("stream_uninspected")
+    );
+}
+
+#[tokio::test]
+async fn monitor_only_waf_allows_unbounded_event_stream_with_metadata() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "mode": "monitor",
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [{
+            "id": "R-SSE-MONITOR",
+            "name": "response secret",
+            "category": "test",
+            "severity": "high",
+            "target": "response_body",
+            "match_kind": "contains",
+            "pattern": "secret",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/events");
+    let mut response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream".to_string(),
+    )]);
+
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.response_stream_uninspectable")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("stream_uninspected")
+    );
 }
 
 #[tokio::test]

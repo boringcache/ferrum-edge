@@ -741,8 +741,8 @@ fn test_requires_response_body_buffering() {
         .headers
         .insert("accept".to_string(), "text/event-stream".to_string());
     assert!(
-        !plugin.should_buffer_response_body(&sse_accept),
-        "SSE clients must keep the response streaming instead of forcing a full-body buffer"
+        plugin.should_buffer_response_body(&sse_accept),
+        "client Accept must not release an ordinary backend response"
     );
 
     let mut stream_true = ctx_with_content_type("POST", "application/json");
@@ -750,9 +750,116 @@ fn test_requires_response_body_buffering() {
         .metadata
         .insert("ai_request_streaming".to_string(), "true".to_string());
     assert!(
-        !plugin.should_buffer_response_body(&stream_true),
-        "prompt-shield stream:true metadata must prevent unbounded response buffering"
+        plugin.should_buffer_response_body(&stream_true),
+        "request-side stream metadata must not release an ordinary backend response"
     );
+
+    let sse_headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream; charset=utf-8".to_string(),
+    )]);
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &sse_accept,
+        Some("text/event-stream; charset=utf-8"),
+        200,
+        &sse_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &sse_accept,
+        None,
+        200,
+        &HashMap::new(),
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &sse_accept,
+        Some("application/json; profile=event-stream"),
+        200,
+        &HashMap::new(),
+    ));
+}
+
+#[tokio::test]
+async fn test_event_stream_fails_closed_before_ai_guard_delivery() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+    let mut response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream".to_string(),
+    )]);
+
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut response_headers).await,
+        PluginResult::Reject {
+            status_code: 502,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_response_guard_rejected")
+            .map(String::as_str),
+        Some("streaming_response_requires_bounded_inspection")
+    );
+}
+
+#[tokio::test]
+async fn test_warn_only_event_stream_records_uninspectable_and_continues() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "warn"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let mut response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream".to_string(),
+    )]);
+
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut response_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_response_guard_warning")
+            .map(String::as_str),
+        Some("streaming_response_requires_bounded_inspection")
+    );
+}
+
+#[tokio::test]
+async fn test_pristine_event_stream_relabel_still_fails_closed() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.metadata.insert(
+        "ferrum:original_response_metadata_stamped".to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata.insert(
+        "ferrum:original_response_content_type".to_string(),
+        "text/event-stream".to_string(),
+    );
+    let mut relabeled_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/json".to_string(),
+    )]);
+
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut relabeled_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 502,
+            ..
+        }
+    ));
 }
 
 #[test]

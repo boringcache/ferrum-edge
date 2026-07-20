@@ -529,8 +529,8 @@ Given all built-in plugins enabled, the execution order is:
 | 37 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
 | 38 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
 | 39 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
-| 40 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
-| 41 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, on_final_response_body |
+| 40 | `body_validator` | 2950 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
+| 41 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
 | 42 | `ai_semantic_firewall` | 2968 | before_proxy, on_final_request_body, on_response_body, on_final_response_body, response_stream_inspector |
 | 43 | `ai_request_guard` | 2975 | before_proxy, transform_request_body, on_final_request_body |
 | 44 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
@@ -551,7 +551,7 @@ Given all built-in plugins enabled, the execution order is:
 | 59 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
 | 60 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 61 | `ai_federation` | 4060 | final request body (HTTP only) |
-| 62 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
+| 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body |
 | 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |

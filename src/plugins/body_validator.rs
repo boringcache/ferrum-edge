@@ -19,6 +19,9 @@ use std::collections::HashMap;
 use std::io::Read as _;
 use tracing::debug;
 
+use super::utils::sse::{
+    is_text_event_stream_media_type, original_response_is_event_stream,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 /// Per-method message type descriptors for protobuf validation.
@@ -1886,15 +1889,68 @@ impl Plugin for BodyValidator {
         self.has_response_validation
     }
 
-    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // Skip body buffering for SSE requests (`Accept: text/event-stream`).
-        // Buffering an unbounded event stream would 502 once the gateway's
-        // max-response-body limit is reached. Validating SSE event-by-event
-        // is out of scope for this plugin's design (validation runs once on
-        // the assembled body); operators should disable response validation
-        // on SSE proxies or filter at the proxy level if event-level
-        // validation is required.
-        self.has_response_validation && !super::utils::sse::is_sse_request(ctx)
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        // Request Accept is only client intent. Keep ordinary backend JSON/XML
+        // and protobuf responses on the validator path until response headers
+        // prove that the backend selected an event stream.
+        self.has_response_validation
+    }
+
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+    }
+
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && !content_type.is_some_and(is_text_event_stream_media_type)
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+        {
+            return PluginResult::Reject {
+                status_code: 502,
+                body: serde_json::json!({
+                    "error": "Response body validation failed",
+                    "details": "event-stream responses require a bounded streaming validator"
+                })
+                .to_string(),
+                headers: HashMap::new(),
+            };
+        }
+        PluginResult::Continue
     }
 
     async fn on_final_response_body(

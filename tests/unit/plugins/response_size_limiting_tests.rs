@@ -234,13 +234,10 @@ async fn test_large_content_length_rejects() {
     }
 }
 
-// === SSE bypass ===
+// === SSE policy boundary ===
 
 #[tokio::test]
-async fn test_sse_request_skips_response_buffering() {
-    // SSE clients (`Accept: text/event-stream`) must skip body buffering
-    // even when require_buffered_check is on — buffering an unbounded
-    // event stream would 502 once max_bytes is hit instead of streaming.
+async fn test_sse_request_intent_cannot_skip_strict_response_limit() {
     let plugin =
         ResponseSizeLimiting::new(&json!({"max_bytes": 1024, "require_buffered_check": true}))
             .unwrap();
@@ -250,7 +247,29 @@ async fn test_sse_request_skips_response_buffering() {
     ctx.headers
         .insert("accept".to_string(), "text/event-stream".to_string());
 
-    assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(plugin.should_buffer_response_body(&ctx));
+    let response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream".to_string(),
+    )]);
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &response_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        None,
+        200,
+        &HashMap::new(),
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json; profile=event-stream"),
+        200,
+        &HashMap::new(),
+    ));
 }
 
 #[tokio::test]
@@ -282,9 +301,8 @@ async fn test_buffering_disabled_stays_disabled_for_sse() {
 
 #[tokio::test]
 async fn test_sse_content_length_fast_path_still_runs() {
-    // The Content-Length fast path in after_proxy is unaffected by the
-    // SSE bypass — backends that advertise a Content-Length larger than
-    // the limit are still rejected pre-streaming, even for SSE.
+    // Backends that advertise a Content-Length larger than the limit retain
+    // the ordinary fast-path rejection before the SSE-specific boundary.
     let plugin =
         ResponseSizeLimiting::new(&json!({"max_bytes": 1024, "require_buffered_check": true}))
             .unwrap();
@@ -299,5 +317,28 @@ async fn test_sse_content_length_fast_path_still_runs() {
             assert_eq!(status_code, 502);
         }
         _ => panic!("Expected Reject when Content-Length exceeds limit"),
+    }
+}
+
+#[tokio::test]
+async fn test_genuine_sse_fails_closed_at_strict_route_limit() {
+    let plugin =
+        ResponseSizeLimiting::new(&json!({"max_bytes": 1024, "require_buffered_check": true}))
+            .unwrap();
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream".to_string(),
+    )]);
+
+    match plugin.after_proxy(&mut ctx, 200, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("Streaming response size cannot be verified"));
+            assert!(body.contains("1024"));
+        }
+        _ => panic!("Expected fail-closed event-stream rejection"),
     }
 }

@@ -913,6 +913,308 @@ async fn response_transformer_releases_backend_sse_incrementally_without_retries
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Outbound response policies — client SSE intent cannot waive enforcement.
+// ────────────────────────────────────────────────────────────────────────────
+
+fn composed_response_policy_file_config(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "composed-response-policy",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "response_body_mode": "stream",
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "plugins": [
+                {"plugin_config_id": "validate-response"},
+                {"plugin_config_id": "guard-response"}
+            ]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "validate-response",
+                "proxy_id": "composed-response-policy",
+                "plugin_name": "body_validator",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {"response_required_fields": ["id"]}
+            },
+            {
+                "id": "guard-response",
+                "proxy_id": "composed-response-policy",
+                "plugin_name": "ai_response_guard",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {"pii_patterns": ["email"], "action": "reject"}
+            }
+        ]
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+fn strict_response_size_file_config(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "strict-response-size",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "response_body_mode": "stream",
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "plugins": [{"plugin_config_id": "strict-response-limit"}]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "strict-response-limit",
+            "proxy_id": "strict-response-size",
+            "plugin_name": "response_size_limiting",
+            "scope": "proxy",
+            "enabled": true,
+            "config": {"max_bytes": 32, "require_buffered_check": true}
+        }]
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn composed_response_policies_reject_guarded_json_despite_sse_accept() {
+    const JSON_BODY: &str =
+        r#"{"id":"ok","choices":[{"message":{"content":"alice@example.com"}}]}"#;
+
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .steps(vec![
+            HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/ordinary")),
+            HttpStep::RespondStatus {
+                status: 200,
+                reason: "OK".into(),
+            },
+            HttpStep::RespondHeader {
+                name: "Content-Type".into(),
+                value: "application/json; profile=event-stream".into(),
+            },
+            HttpStep::RespondHeader {
+                name: "Content-Length".into(),
+                value: JSON_BODY.len().to_string(),
+            },
+            HttpStep::RespondHeader {
+                name: "Connection".into(),
+                value: "close".into(),
+            },
+            HttpStep::RespondBodyChunk(JSON_BODY.as_bytes().to_vec()),
+            HttpStep::RespondBodyEnd,
+        ])
+        .spawn()
+        .expect("spawn backend");
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(composed_response_policy_file_config(backend_port))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let response = harness
+        .http_client()
+        .expect("client")
+        .request(reqwest::Method::GET, &harness.proxy_url("/api/ordinary"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("gateway response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("read rejection body");
+    assert!(
+        body.contains("AI response blocked by content guard"),
+        "the body validator must not mask the active AI guard, body={body:?}"
+    );
+
+    assert_eq!(backend.received_requests().await.len(), 1);
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn composed_response_policies_reject_genuine_sse_before_commit() {
+    const SSE_BODY: &str = "data: {\"id\":\"ok\"}\n\n";
+
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .steps(vec![
+            HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/events")),
+            HttpStep::RespondStatus {
+                status: 200,
+                reason: "OK".into(),
+            },
+            HttpStep::RespondHeader {
+                name: "Content-Type".into(),
+                value: "text/event-stream".into(),
+            },
+            HttpStep::RespondHeader {
+                name: "Connection".into(),
+                value: "close".into(),
+            },
+            HttpStep::RespondBodyChunk(SSE_BODY.as_bytes().to_vec()),
+            HttpStep::RespondBodyEnd,
+        ])
+        .spawn()
+        .expect("spawn backend");
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(composed_response_policy_file_config(backend_port))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let response = harness
+        .http_client()
+        .expect("client")
+        .request(reqwest::Method::GET, &harness.proxy_url("/api/events"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("gateway response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("read rejection body");
+    assert!(
+        body.contains("event-stream responses require a bounded streaming validator"),
+        "genuine SSE must fail before either complete-body policy is waived, body={body:?}"
+    );
+
+    assert_eq!(backend.received_requests().await.len(), 1);
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn composed_response_policies_do_not_leak_truncated_json_on_backend_disconnect() {
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .steps(vec![
+            HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/truncated")),
+            HttpStep::CloseMidBody {
+                status: 200,
+                reason: "OK".into(),
+                headers: vec![
+                    ("Content-Length".into(), "256".into()),
+                    (
+                        "Content-Type".into(),
+                        "application/json; profile=event-stream".into(),
+                    ),
+                ],
+                body_prefix: br#"{"id":"ok","choices":[{"message":{"content":"alice@example.com""#
+                    .to_vec(),
+                reset: false,
+            },
+        ])
+        .spawn()
+        .expect("spawn backend");
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(composed_response_policy_file_config(backend_port))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let response = harness
+        .http_client()
+        .expect("client")
+        .request(reqwest::Method::GET, &harness.proxy_url("/api/truncated"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("gateway response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("read gateway error body");
+    assert!(
+        !body.contains("alice@example.com"),
+        "a buffered backend disconnect must not expose the partial governed body: {body:?}"
+    );
+
+    assert_eq!(backend.received_requests().await.len(), 1);
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn strict_route_response_limit_rejects_unknown_length_json_despite_sse_accept() {
+    const JSON_BODY: &str =
+        r#"{"payload":"this body is deliberately larger than thirty-two bytes"}"#;
+
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .steps(vec![
+            HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/large")),
+            HttpStep::RespondStatus {
+                status: 200,
+                reason: "OK".into(),
+            },
+            HttpStep::RespondHeader {
+                name: "Content-Type".into(),
+                value: "application/json; profile=event-stream".into(),
+            },
+            // Deliberately omit Content-Length so only whole-body enforcement
+            // can distinguish the strict 32-byte route ceiling from the much
+            // larger global streaming response limit.
+            HttpStep::RespondHeader {
+                name: "Connection".into(),
+                value: "close".into(),
+            },
+            HttpStep::RespondBodyChunk(JSON_BODY.as_bytes().to_vec()),
+            HttpStep::RespondBodyEnd,
+        ])
+        .spawn()
+        .expect("spawn backend");
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(strict_response_size_file_config(backend_port))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let response = harness
+        .http_client()
+        .expect("client")
+        .request(reqwest::Method::GET, &harness.proxy_url("/api/large"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("gateway response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("read rejection body");
+    assert!(body.contains("Response body too large"), "body={body:?}");
+    assert!(body.contains("32"), "route limit must be reported: {body:?}");
+
+    assert_eq!(backend.received_requests().await.len(), 1);
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // a2a_gateway + retries — unexpected SSE must stream incrementally (#2169).
 // ────────────────────────────────────────────────────────────────────────────
 //
