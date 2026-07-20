@@ -882,6 +882,15 @@ async fn test_ws_logging_write_timeout_against_slow_reader_then_recovers() {
         // First connection: handshake then stop reading so write buffers fill
         // and write_timeout_ms fires on the client.
         let (stream, _) = listener.accept().await.expect("accept #1");
+        // Hosted runners autotune localhost TCP buffers into the multi-MiB
+        // range. Without a tight SO_RCVBUF, a handful of large frames can still
+        // land entirely in the kernel and `write_timeout_ms` never arms -- the
+        // client never reconnects and the recovery assertion times out. Cap the
+        // slow peer's receive buffer so backpressure (and thus the production
+        // write-timeout -> invalidate -> reconnect path) engages deterministically.
+        stream
+            .set_recv_buffer_size(8 * 1024)
+            .expect("cap slow-peer SO_RCVBUF");
         let ws = tokio_tungstenite::accept_async(stream)
             .await
             .expect("handshake #1");
@@ -914,20 +923,26 @@ async fn test_ws_logging_write_timeout_against_slow_reader_then_recovers() {
             "reconnect_delay_ms": 50,
             "write_timeout_ms": 200,
             "connect_timeout_ms": 1000,
+            "max_entry_bytes": 96_000,
             "buffer_capacity": 64,
         }),
         default_client(),
     )
     .expect("build plugin");
 
-    // Large payloads help fill socket buffers quickly under a non-reading peer.
+    // Large payloads against the capped peer recv buffer fill the socket quickly.
     let mut summary = create_test_transaction_summary();
-    summary.request_path = format!("/{}", "x".repeat(32_768));
-    for _ in 0..8 {
+    summary.request_path = format!("/{}", "x".repeat(48_000));
+    for _ in 0..4 {
         plugin.log(&summary).await;
         // Pace above the admitted flush interval so each enqueue can flush.
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+
+    // One more enqueue after the induced stall window: proves the logger
+    // reconnects and delivers a subsequent batch on the fresh connection.
+    summary.request_path = "/recovered-after-write-timeout".into();
+    plugin.log(&summary).await;
 
     let payload = await_within("recovered batch after write timeout", second_rx)
         .await
