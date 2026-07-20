@@ -3189,6 +3189,21 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     assert_component_validity(&spec, "LoadTestingConfig", &valid_minima, true);
     assert!(LoadTesting::new(&valid_minima, PluginHttpClient::default()).is_ok());
 
+    let valid_null_defaults = json!({
+        "key": "null-defaults",
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "ramp": null,
+        "request_timeout_ms": null,
+        "max_response_body_bytes": null,
+        "gateway_port": null,
+        "gateway_tls": null,
+        "gateway_tls_no_verify": null,
+        "gateway_addresses": null
+    });
+    assert_component_validity(&spec, "LoadTestingConfig", &valid_null_defaults, true);
+    assert!(LoadTesting::new(&valid_null_defaults, PluginHttpClient::default()).is_ok());
+
     let runtime_and_schema_invalid = [
         json!({
             "key": "k",
@@ -3230,13 +3245,12 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
         );
     }
 
-    // Empty `key` is runtime-rejected but not expressible as OpenAPI minLength
-    // without breaking intentional whitespace-only operator mistakes differently.
     let empty_key = json!({
         "key": "",
         "concurrent_clients": 1,
         "duration_seconds": 1
     });
+    assert_component_validity(&spec, "LoadTestingConfig", &empty_key, false);
     assert!(
         LoadTesting::new(&empty_key, PluginHttpClient::default()).is_err(),
         "runtime must still reject empty key"

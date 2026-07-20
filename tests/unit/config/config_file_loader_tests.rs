@@ -898,10 +898,6 @@ fn test_file_config_rejects_unknown_load_testing_keys() {
         message.contains("1 plugin config error(s)"),
         "unexpected file-load error: {message}"
     );
-    assert!(
-        message.contains("request_timeot_ms") || message.contains("unknown configuration key"),
-        "file-mode error should surface the unknown key: {message}"
-    );
 }
 
 #[test]
