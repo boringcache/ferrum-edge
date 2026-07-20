@@ -923,7 +923,9 @@ async fn redacts_matched_args_and_never_leaks_secret_in_metadata() {
             .contains_key("ai_tool_governor.arguments_hashes")
     );
 
-    // The transform rewrites the secret out of the delivered body.
+    // The transform rewrites the secret out of the delivered body. Preflight
+    // already computed the rewrite once; the transform must reuse that result
+    // (or an equivalent fresh compute on memo miss) without changing output.
     let transformed = plugin
         .transform_response_body_with_context(
             &mut ctx,
@@ -8357,6 +8359,60 @@ fn rejects_zero_width_redaction_regex_and_oversized_placeholder() {
     .expect("placeholder length must be bounded");
     assert!(err.contains("redaction_placeholder"));
 
+    // OpenAPI maxLength counts Unicode characters; runtime counts UTF-8 bytes.
+    let multibyte_placeholder = "é".repeat(129); // 258 bytes, 129 chars
+    assert_eq!(multibyte_placeholder.chars().count(), 129);
+    assert!(multibyte_placeholder.len() > 256);
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "sk-[a-z0-9]+" }]
+            }
+        },
+        "response": { "redaction_placeholder": multibyte_placeholder }
+    }))
+    .err()
+    .expect("multibyte placeholder over 256 UTF-8 bytes must be rejected");
+    assert!(err.contains("redaction_placeholder") && err.contains("UTF-8 bytes"));
+
+    assert!(
+        try_make(json!({
+            "tools": {
+                "search": {
+                    "action": "redact_args",
+                    "blocked_arg_patterns": [{ "name": "X".repeat(256), "regex": "tok" }]
+                }
+            }
+        }))
+        .is_ok(),
+        "256 ASCII-byte pattern names are admitted"
+    );
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "X".repeat(257), "regex": "tok" }]
+            }
+        }
+    }))
+    .err()
+    .expect("257 ASCII-byte pattern names must be rejected");
+    assert!(err.contains("blocked_arg_patterns") && err.contains("name"));
+
+    let multibyte_name = "é".repeat(129); // 258 bytes, 129 chars
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": multibyte_name, "regex": "tok" }]
+            }
+        }
+    }))
+    .err()
+    .expect("multibyte pattern names over 256 UTF-8 bytes must be rejected");
+    assert!(err.contains("blocked_arg_patterns") && err.contains("UTF-8 bytes"));
+
     let too_many: Vec<Value> = (0..33)
         .map(|i| json!({ "name": format!("p{i}"), "regex": format!("token{i}") }))
         .collect();
@@ -8789,6 +8845,69 @@ async fn duplicate_choice_index_and_malformed_call_id_fail_closed() {
     assert!(!String::from_utf8_lossy(&out).contains("danger"));
 }
 
+/// JSON `null` for `tool_calls[].id` is omission (like a missing field), while
+/// empty-string and non-string ids remain malformed. Live stream and buffered
+/// SSE must agree.
+#[tokio::test]
+async fn stream_null_call_id_is_omission_but_empty_string_fails_closed() {
+    let plugin = make(streaming_config(
+        json!({ "danger": { "action": "deny" } }),
+        "allow",
+    ));
+    let ctx = create_test_context();
+
+    let null_id = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":null,\"function\":{\"name\":\"safe\",\"arguments\":\"{\"}}",
+        "]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"function\":{\"arguments\":\"}\"}}",
+        "]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (_out, terminated) = drive_stream(&mut inspector, &[null_id.as_bytes()]).await;
+    assert!(
+        !terminated,
+        "null call id must be treated as omitted continuation, not malformed"
+    );
+
+    let buffered = make(json!({
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" } }
+    }));
+    let mut buffered_ctx = create_test_context();
+    assert_continue(
+        buffered
+            .on_response_body(&mut buffered_ctx, 200, &sse_headers(), null_id.as_bytes())
+            .await,
+    );
+
+    let empty_id = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"\",\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}",
+        "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[empty_id.as_bytes()]).await;
+    assert!(terminated, "empty-string call id must fail closed");
+    assert!(!String::from_utf8_lossy(&out).contains("danger"));
+
+    let mut buffered_ctx = create_test_context();
+    assert_reject(
+        buffered
+            .on_response_body(&mut buffered_ctx, 200, &sse_headers(), empty_id.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
 /// Dry-run still evaluates ambiguous stream identity without cutting traffic
 /// when mode is dry_run — but the held bytes of an enforce cut must not leak.
 #[tokio::test]
@@ -9117,26 +9236,24 @@ async fn buffered_legacy_function_call_redact_amplification_fails_closed() {
     );
 }
 
-/// `{name}` expansion that itself exceeds the inspectable window fails closed.
-#[tokio::test]
-async fn redact_placeholder_name_expansion_fails_closed() {
-    let huge = "N".repeat(4 * 1024 * 1024 + 1);
-    let plugin = make(json!({
+/// Pattern names used in `{name}` expansion are admission-capped at 256 UTF-8
+/// bytes so a hostile config cannot stage multi-MiB substitutions.
+#[test]
+fn blocked_arg_pattern_name_admission_rejects_oversized_names() {
+    let err = try_make(json!({
         "tools": {
             "search": {
                 "action": "redact_args",
-                "blocked_arg_patterns": [{ "name": huge, "regex": "tok" }]
+                "blocked_arg_patterns": [{ "name": "N".repeat(4 * 1024 * 1024 + 1), "regex": "tok" }]
             }
         },
         "response": { "redaction_placeholder": "{name}" }
-    }));
-    let body = response_with_tool_call("search", r#"{"x":"tok"}"#);
-    let mut ctx = create_test_context();
-    assert_reject(
-        plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
-            .await,
-        Some(502),
+    }))
+    .err()
+    .expect("multi-MiB pattern names must fail at admission");
+    assert!(
+        err.contains("blocked_arg_patterns") && err.contains("UTF-8 bytes"),
+        "unexpected admission error: {err}"
     );
 }
 

@@ -51,9 +51,11 @@ changing `tool_calls[].id` values for the same `(choice, index)` slot, are
 **ungovernable** and fail closed in enforce mode on both the live inspector and
 buffered-SSE extraction — they are never concatenated into a synthetic
 allowed identity. Duplicate `choices[].index` entries and explicitly empty or
-non-string call IDs are likewise malformed. Introducing an ID only after an
-untagged fragment is an identity change and fails closed; an omitted ID remains
-valid on continuation fragments after a stable ID was established.
+non-string call IDs are likewise malformed. JSON `null` for `tool_calls[].id`
+is treated as omitted (same as a missing field), matching nearby null-as-absent
+conventions. Introducing an ID only after an untagged fragment is an identity
+change and fails closed; an omitted / null ID remains valid on continuation
+fragments after a stable ID was established.
 Ordinary content/role deltas stream through live **until a tool-call batch
 opens**; once a batch is pending, ALL subsequent events (other choices'
 content, keepalives) are held too and released in original arrival order when
@@ -188,6 +190,11 @@ Per tool (`tools.<name>.action`): `allow`, `deny`, `redact_args`,
 `require_approval`, `dry_run`. `default_action` (`allow` / `deny` /
 `require_approval`) applies to any tool without an explicit entry.
 
+Every governed request, response, or SSE batch evaluates at most **64 concrete
+tool calls**, unconditionally — the cap applies to `allow`, `deny`,
+`redact_args`, `require_approval`, and `dry_run`, not only approval fan-out.
+Batches above the limit fail closed in enforce mode.
+
 Argument checks (`max_arg_bytes`, `required_args`, `json_schema`,
 `blocked_arg_patterns`) apply to the `allow`, `require_approval`, and
 `redact_args` actions. A blocked-pattern match denies under
@@ -197,16 +204,20 @@ path). A `redact_args` policy must configure at least one
 silently turning the tool into an allowlist entry. Regexes that match empty
 input are rejected at config load; a contextual zero-length match that can
 occur only beside non-empty input also fails closed at runtime. Pattern lists
-are capped at 32 entries per tool, `response.redaction_placeholder` is capped
-at 256 bytes, and every append is checked before allocation so redacted output
-cannot grow past the 4 MiB inspectable body limit. On paths
-where arguments cannot be redacted in place — the **streaming** path, the
-**request** body (no request-body transform), and the post-transform **final
-response** re-check — a `redact_args` match fails closed rather than forwarding
-an unredacted secret. A successful buffered redaction rewrite invalidates
-origin representation validators / integrity headers (`ETag`, `Content-Digest`,
-`Repr-Digest`, `Digest`, `Content-MD5`, `Last-Modified`, and related checksum /
-signature fields) so clients never validate against pre-redaction bytes.
+are capped at 32 entries per tool. Each `blocked_arg_patterns[].name` is capped
+at 256 UTF-8 bytes (OpenAPI `maxLength: 256` counts Unicode characters; runtime
+admission is the stricter byte cap) because names are substituted into
+redaction output. `response.redaction_placeholder` is likewise capped at 256
+UTF-8 bytes under the same OpenAPI character / runtime byte distinction, and
+every append is checked before allocation so redacted output cannot grow past
+the 4 MiB inspectable body limit. On paths where arguments cannot be redacted
+in place — the **streaming** path, the **request** body (no request-body
+transform), and the post-transform **final response** re-check — a
+`redact_args` match fails closed rather than forwarding an unredacted secret. A
+successful buffered redaction rewrite invalidates origin representation
+validators / integrity headers (`ETag`, `Content-Digest`, `Repr-Digest`,
+`Digest`, `Content-MD5`, `Last-Modified`, and related checksum / signature
+fields) so clients never validate against pre-redaction bytes.
 
 A per-tool **`dry_run`** action is purely observational: it forwards the call
 and records `ai_tool_governor.decision=dry_run` for concrete calls and exposed

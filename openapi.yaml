@@ -18370,11 +18370,11 @@ components:
             response_tool_calls:
               type: boolean
               default: true
-              description: "Govern tool calls in buffered (non-streaming) responses."
+              description: "Govern tool calls in buffered (non-streaming) responses. At most 64 concrete tool calls are governed per request/response/SSE batch (unconditional; applies to allow/deny/redact_args/require_approval/dry_run)."
             streaming_response_tool_calls:
               type: boolean
               default: false
-              description: "Govern OpenAI SSE tool-call deltas. Held tool-call frames are released only after policy/approval clears the call; a block cuts the stream with a terminal SSE error event. Duplicate choice/tool indexes, malformed IDs, conflicting IDs, or an ID introduced after an untagged fragment are ungovernable and fail closed in enforce mode. In streaming, a redact_args match fails closed (denies) since mid-stream surgical redaction of split-JSON arguments is out of scope."
+              description: "Govern OpenAI SSE tool-call deltas. Held tool-call frames are released only after policy/approval clears the call; a block cuts the stream with a terminal SSE error event. Duplicate choice/tool indexes, empty-string or non-string IDs, conflicting IDs, or an ID introduced after an untagged fragment are ungovernable and fail closed in enforce mode. JSON null for tool_calls[].id is treated as omitted (same as a missing field). At most 64 concrete tool calls are governed per SSE batch. In streaming, a redact_args match fails closed (denies) since mid-stream surgical redaction of split-JSON arguments is out of scope."
             mcp_tool_calls:
               type: boolean
               default: false
@@ -18407,7 +18407,7 @@ components:
               action:
                 type: string
                 enum: [allow, deny, redact_args, require_approval, dry_run]
-                description: "allow forwards; deny blocks; redact_args replaces blocked_arg_patterns matches with redaction_placeholder (buffered path); require_approval calls the approval webhook; dry_run forwards and records ai_tool_governor.decision=dry_run distinctly from a real allow."
+                description: "allow forwards; deny blocks; redact_args replaces blocked_arg_patterns matches with redaction_placeholder (buffered path); require_approval calls the approval webhook; dry_run forwards and records ai_tool_governor.decision=dry_run distinctly from a real allow. At most 64 concrete tool calls are governed per request/response/SSE batch regardless of action."
               risk:
                 type: string
                 enum: [low, medium, high, critical]
@@ -18434,7 +18434,8 @@ components:
                     name:
                       type: string
                       minLength: 1
-                      description: "Pattern identifier; substituted into redaction_placeholder {name}."
+                      maxLength: 256
+                      description: "Pattern identifier; substituted into redaction_placeholder {name}. OpenAPI maxLength: 256 counts Unicode characters; runtime admission enforces a stricter 256 UTF-8 byte cap."
                     regex:
                       type: string
                       minLength: 1
@@ -18490,7 +18491,7 @@ components:
               type: string
               maxLength: 256
               default: "[REDACTED_TOOL_ARG:{name}]"
-              description: "Template for redacted argument matches; {name} is replaced with the matched pattern name. Capped at 256 bytes; redacted argument output is capped at the 4 MiB inspectable body limit."
+              description: "Template for redacted argument matches; {name} is replaced with the matched pattern name. OpenAPI maxLength: 256 counts Unicode characters; runtime admission enforces a stricter 256 UTF-8 byte cap. Redacted argument output is capped at the 4 MiB inspectable body limit."
             streaming_deny_event:
               type: boolean
               default: true

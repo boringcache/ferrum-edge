@@ -2250,10 +2250,41 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
         enabled["properties"]["response"]["properties"]["redaction_placeholder"]["maxLength"],
         json!(256)
     );
+    let placeholder_desc = enabled["properties"]["response"]["properties"]["redaction_placeholder"]
+        ["description"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        placeholder_desc.contains("Unicode characters")
+            && placeholder_desc.contains("UTF-8 byte"),
+        "redaction_placeholder must document OpenAPI character vs runtime byte caps: {placeholder_desc}"
+    );
     assert_eq!(
         enabled["properties"]["tools"]["additionalProperties"]["properties"]["blocked_arg_patterns"]
             ["maxItems"],
         json!(32)
+    );
+    assert_eq!(
+        enabled["properties"]["tools"]["additionalProperties"]["properties"]["blocked_arg_patterns"]
+            ["items"]["properties"]["name"]["maxLength"],
+        json!(256)
+    );
+    let pattern_name_desc = enabled["properties"]["tools"]["additionalProperties"]["properties"]
+        ["blocked_arg_patterns"]["items"]["properties"]["name"]["description"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        pattern_name_desc.contains("Unicode characters")
+            && pattern_name_desc.contains("UTF-8 byte"),
+        "blocked_arg_patterns[].name must document OpenAPI character vs runtime byte caps: {pattern_name_desc}"
+    );
+    let action_desc = enabled["properties"]["tools"]["additionalProperties"]["properties"]
+        ["action"]["description"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        action_desc.contains("64 concrete tool calls"),
+        "action description must surface the unconditional 64-call batch bound: {action_desc}"
     );
 
     for config in [

@@ -1745,6 +1745,12 @@ pub struct RequestContext {
     /// markers (a hash over the raw request body including tool-call arguments),
     /// so they remain off `metadata` too.
     pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
+    /// Per-instance buffered `redact_args` rewrites computed during governance
+    /// amplification preflight and consumed by the response-body transform.
+    /// Keys are digests of `(tool name, raw args)`; aggregate value bytes are
+    /// capped at the plugin's 4 MiB inspectable window so hostile argument sets
+    /// cannot retain more than one inspectable body between hooks.
+    pub(crate) ai_tool_governor_redaction_memos: HashMap<u64, HashMap<String, String>>,
     /// Per-`ai_semantic_firewall`-instance hashes of request bodies already
     /// inspected before request transforms. Kept outside serialized metadata so
     /// prompt-derived digests never enter transaction logs.
@@ -2163,6 +2169,7 @@ impl RequestContext {
             ai_tool_governor_replay_redactions: HashSet::new(),
             ai_tool_governor_call_hashes: HashMap::new(),
             ai_tool_governor_request_hashes: HashMap::new(),
+            ai_tool_governor_redaction_memos: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
             request_deduplication_states: HashMap::new(),
@@ -2772,6 +2779,7 @@ impl RequestContext {
             ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
+            ai_tool_governor_redaction_memos: self.ai_tool_governor_redaction_memos.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             request_deduplication_states: self.request_deduplication_states.clone(),
