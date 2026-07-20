@@ -2290,6 +2290,7 @@ impl SnapshotAccumulator {
     }
 
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn record_http_for_test(
         &self,
         summary: &TransactionSummary,
