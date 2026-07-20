@@ -36,7 +36,10 @@ use async_trait::async_trait;
 use ring::rand::SecureRandom;
 use serde_json::{Map, Value};
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tracing::warn;
+use tracing::callsite::{Callsite, DefaultCallsite, Identifier};
+use tracing::field::FieldSet;
+use tracing::metadata::Kind;
+use tracing::{Level, Metadata, warn};
 
 use super::{
     Direction, Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection,
@@ -79,12 +82,101 @@ impl LogLevel {
         }
     }
 
+    /// Hot-path preview gate. Uses `tracing::enabled!` (callsite-cached); fine
+    /// under the process-global gateway subscriber where `LevelFilter::current`
+    /// matches the EnvFilter.
     fn is_enabled(self) -> bool {
         match self {
-            Self::Trace => tracing::enabled!(target: "ws_frame_log", tracing::Level::TRACE),
-            Self::Debug => tracing::enabled!(target: "ws_frame_log", tracing::Level::DEBUG),
-            Self::Info => tracing::enabled!(target: "ws_frame_log", tracing::Level::INFO),
-            Self::Warn => tracing::enabled!(target: "ws_frame_log", tracing::Level::WARN),
+            Self::Trace => tracing::enabled!(target: "ws_frame_log", Level::TRACE),
+            Self::Debug => tracing::enabled!(target: "ws_frame_log", Level::DEBUG),
+            Self::Info => tracing::enabled!(target: "ws_frame_log", Level::INFO),
+            Self::Warn => tracing::enabled!(target: "ws_frame_log", Level::WARN),
+        }
+    }
+
+    /// Construction-time admission probe for the *active* dispatcher only.
+    ///
+    /// `tracing::enabled!` is not suitable here: it consults the process-global
+    /// callsite interest cache and `LevelFilter::current()`, which under
+    /// parallel tests (and per-layer EnvFilters) can report a filtered `info`
+    /// level as enabled. `Dispatch::register_callsite` asks only the current
+    /// thread's subscriber — the same EnvFilter stack the gateway installs —
+    /// without depending on other dispatchers' aggregated interest.
+    fn is_admitted_by_active_dispatcher(self) -> bool {
+        let meta = self.filter_probe_metadata();
+        tracing::dispatcher::get_default(|dispatch| {
+            let interest = dispatch.register_callsite(meta);
+            if interest.is_never() {
+                false
+            } else if interest.is_always() {
+                true
+            } else {
+                dispatch.enabled(meta)
+            }
+        })
+    }
+
+    /// Static `ws_frame_log` metadata used only for construction-time filter
+    /// probes. Not registered in the global callsite cache; passed directly to
+    /// the active dispatcher's `register_callsite`.
+    fn filter_probe_metadata(self) -> &'static Metadata<'static> {
+        match self {
+            Self::Trace => {
+                static CALLSITE: DefaultCallsite = DefaultCallsite::new(&META);
+                static META: Metadata<'static> = Metadata::new(
+                    "ws_frame_logging.filter_probe",
+                    "ws_frame_log",
+                    Level::TRACE,
+                    None,
+                    None,
+                    None,
+                    FieldSet::new(&[], Identifier(&CALLSITE)),
+                    Kind::HINT,
+                );
+                &META
+            }
+            Self::Debug => {
+                static CALLSITE: DefaultCallsite = DefaultCallsite::new(&META);
+                static META: Metadata<'static> = Metadata::new(
+                    "ws_frame_logging.filter_probe",
+                    "ws_frame_log",
+                    Level::DEBUG,
+                    None,
+                    None,
+                    None,
+                    FieldSet::new(&[], Identifier(&CALLSITE)),
+                    Kind::HINT,
+                );
+                &META
+            }
+            Self::Info => {
+                static CALLSITE: DefaultCallsite = DefaultCallsite::new(&META);
+                static META: Metadata<'static> = Metadata::new(
+                    "ws_frame_logging.filter_probe",
+                    "ws_frame_log",
+                    Level::INFO,
+                    None,
+                    None,
+                    None,
+                    FieldSet::new(&[], Identifier(&CALLSITE)),
+                    Kind::HINT,
+                );
+                &META
+            }
+            Self::Warn => {
+                static CALLSITE: DefaultCallsite = DefaultCallsite::new(&META);
+                static META: Metadata<'static> = Metadata::new(
+                    "ws_frame_logging.filter_probe",
+                    "ws_frame_log",
+                    Level::WARN,
+                    None,
+                    None,
+                    None,
+                    FieldSet::new(&[], Identifier(&CALLSITE)),
+                    Kind::HINT,
+                );
+                &META
+            }
         }
     }
 }
@@ -206,9 +298,11 @@ impl WsFrameLogging {
         };
 
         // Surface a construction-time warning when the active tracing
-        // subscriber filters the configured level. With no subscriber the
+        // subscriber filters the configured level. Probe the active dispatcher
+        // directly (not `tracing::enabled!`) so parallel interest/LevelFilter
+        // aggregation cannot suppress the diagnostic. With no subscriber the
         // warning macro is a no-op, while scoped subscribers can observe it.
-        if !log_level.is_enabled() {
+        if !log_level.is_admitted_by_active_dispatcher() {
             warn!(
                 target: "ws_frame_log",
                 configured_level = log_level.as_str(),
