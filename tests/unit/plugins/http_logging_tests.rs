@@ -1,7 +1,13 @@
 //! Tests for http_logging plugin
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, http_logging::HttpLogging};
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use super::plugin_utils::{
     create_test_stream_transaction_summary, create_test_transaction_summary,
@@ -9,6 +15,82 @@ use super::plugin_utils::{
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+async fn read_headers(socket: &mut tokio::net::TcpStream) -> bool {
+    let mut request = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = match socket.read(&mut buf).await {
+            Ok(0) => return false,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        request.extend_from_slice(&buf[..n]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            return true;
+        }
+        if request.len() > 64 * 1024 {
+            return false;
+        }
+    }
+}
+
+async fn spawn_http_logging_keepalive_server(
+    responses: Vec<(u16, &'static [u8])>,
+) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let connections_task = Arc::clone(&connections);
+    let requests_task = Arc::clone(&requests);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            connections_task.fetch_add(1, Ordering::SeqCst);
+            let responses = responses.clone();
+            let requests = Arc::clone(&requests_task);
+            tokio::spawn(async move {
+                let mut index = 0usize;
+                loop {
+                    if !read_headers(&mut socket).await {
+                        break;
+                    }
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let (status, body) = responses[index % responses.len()];
+                    index = index.saturating_add(1);
+                    let headers = format!(
+                        "HTTP/1.1 {status} Status\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                        body.len()
+                    );
+                    if socket.write_all(headers.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    if socket.write_all(body).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}/logs"), connections, requests)
+}
+
+async fn wait_for_count(counter: &AtomicUsize, expected: usize) {
+    for _ in 0..100 {
+        if counter.load(Ordering::SeqCst) >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "timed out waiting for {expected} events; saw {}",
+        counter.load(Ordering::SeqCst)
+    );
 }
 
 #[tokio::test]
@@ -377,4 +459,89 @@ async fn test_http_logging_stream_disconnect_does_not_panic() {
 
     plugin.on_stream_disconnect(&summary).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_http_logging_reuses_http11_connection_across_successful_batches() {
+    let (endpoint, connections, requests) =
+        spawn_http_logging_keepalive_server(vec![(200, b"OK")]).await;
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 0,
+            "retry_delay_ms": 1,
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let summary = create_test_transaction_summary();
+    plugin.log(&summary).await;
+    plugin.log(&summary).await;
+    wait_for_count(&requests, 2).await;
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "http_logging must drain ACK bodies and reuse the pooled HTTP/1.1 connection"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_http_logging_reuses_http11_connection_across_retry() {
+    let (endpoint, connections, requests) =
+        spawn_http_logging_keepalive_server(vec![(503, b"no"), (200, b"OK")]).await;
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 1,
+            "retry_delay_ms": 1,
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.log(&create_test_transaction_summary()).await;
+    wait_for_count(&requests, 2).await;
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "http_logging must drain retryable response bodies before retrying on keep-alive"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_http_logging_oversized_ack_does_not_block_flush_worker() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let _ = read_headers(&mut socket).await;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            ferrum_edge::plugins::utils::HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES + 1
+        );
+        let _ = socket.write_all(headers.as_bytes()).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    });
+    let started = std::time::Instant::now();
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": format!("http://{addr}/logs"),
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 0,
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.log(&create_test_transaction_summary()).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "oversized ACK must not pin the http_logging flush worker"
+    );
 }

@@ -25,6 +25,7 @@ use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3985,5 +3986,204 @@ async fn fail_closed_rejected_then_unsampled_keeps_rejected_sink_status() {
     assert!(
         saw_reject,
         "the unhealthy sink under on_sink_error=reject must fail closed for this candidate"
+    );
+}
+
+async fn read_audit_headers(socket: &mut tokio::net::TcpStream) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = match socket.read(&mut buf).await {
+            Ok(0) => return false,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        request.extend_from_slice(&buf[..n]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            return true;
+        }
+        if request.len() > 64 * 1024 {
+            return false;
+        }
+    }
+}
+
+async fn spawn_audit_keepalive_server(
+    responses: Vec<(u16, &'static [u8])>,
+) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let connections_task = Arc::clone(&connections);
+    let requests_task = Arc::clone(&requests);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            connections_task.fetch_add(1, Ordering::SeqCst);
+            let responses = responses.clone();
+            let requests = Arc::clone(&requests_task);
+            tokio::spawn(async move {
+                let mut index = 0usize;
+                loop {
+                    if !read_audit_headers(&mut socket).await {
+                        break;
+                    }
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let (status, body) = responses[index % responses.len()];
+                    index = index.saturating_add(1);
+                    let headers = format!(
+                        "HTTP/1.1 {status} Status\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                        body.len()
+                    );
+                    if socket.write_all(headers.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                    if socket.write_all(body).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}/ingest"), connections, requests)
+}
+
+async fn wait_for_audit_count(counter: &AtomicUsize, expected: usize) {
+    for _ in 0..100 {
+        if counter.load(Ordering::SeqCst) >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!(
+        "timed out waiting for {expected} audit sink requests; saw {}",
+        counter.load(Ordering::SeqCst)
+    );
+}
+
+async fn audit_roundtrip(plugin: &AiTranscriptAudit) {
+    let headers = json_headers();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ai_transcript_audit_reuses_http11_connection_across_successful_batches() {
+    let (endpoint, connections, requests) =
+        spawn_audit_keepalive_server(vec![(200, b"OK")]).await;
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "metadata_only",
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    // Ensure sink batching settings from config_with_sink (batch_size 1).
+    audit_roundtrip(&plugin).await;
+    audit_roundtrip(&plugin).await;
+    wait_for_audit_count(&requests, 2).await;
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "ai_transcript_audit must drain sink ACKs through the shared helper and reuse HTTP/1.1"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ai_transcript_audit_reuses_http11_connection_across_retry() {
+    let (endpoint, connections, requests) =
+        spawn_audit_keepalive_server(vec![(503, b"no"), (200, b"OK")]).await;
+    let config = json!({
+        "mode": "metadata_only",
+        "sink": {
+            "type": "http",
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 1,
+            "retry_delay_ms": 1,
+        }
+    });
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    audit_roundtrip(&plugin).await;
+    wait_for_audit_count(&requests, 2).await;
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "ai_transcript_audit must drain retryable sink bodies before reusing the connection"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ai_transcript_audit_chunked_oversized_ack_is_capped() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let finished = Arc::new(AtomicUsize::new(0));
+    let finished_task = Arc::clone(&finished);
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let _ = read_audit_headers(&mut socket).await;
+        let _ = socket
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+            .await;
+        let chunk = vec![b'x'; 64 * 1024];
+        let header = format!("{:x}\r\n", chunk.len());
+        for _ in 0..((ferrum_edge::plugins::utils::HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES
+            / chunk.len())
+            + 2)
+        {
+            if socket.write_all(header.as_bytes()).await.is_err() {
+                break;
+            }
+            if socket.write_all(&chunk).await.is_err() {
+                break;
+            }
+            if socket.write_all(b"\r\n").await.is_err() {
+                break;
+            }
+        }
+        finished_task.store(1, Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &format!("http://{addr}/ingest"),
+            json!({ "mode": "metadata_only" }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    audit_roundtrip(&plugin).await;
+    for _ in 0..100 {
+        if finished.load(Ordering::SeqCst) == 1 || started.elapsed() > std::time::Duration::from_secs(4)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "chunked oversized audit ACK must abort at the shared drain cap"
     );
 }

@@ -48,8 +48,9 @@ pub use batching_logger::{
 };
 pub use http_client::PluginHttpClient;
 pub use log_helpers::{
-    BatchConfigDefaults, SummaryLogEntry, build_batch_config, handle_http_batch_response,
-    parse_custom_headers, parse_http_endpoint, validate_batch_config,
+    BatchConfigDefaults, HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT,
+    HttpBatchDrainOutcome, SummaryLogEntry, build_batch_config, drain_http_batch_response_body,
+    handle_http_batch_response, parse_custom_headers, parse_http_endpoint, validate_batch_config,
 };
 pub use socket_host::{parse_socket_host, socket_addr_lookup_input};
 pub use tcp_endpoint::resolve_tcp_endpoint;

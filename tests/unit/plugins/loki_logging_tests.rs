@@ -1199,3 +1199,150 @@ async fn test_loki_logging_removed_listen_path_key_rejected() {
     let err = result.err().expect("removed key should be rejected");
     assert!(err.contains("include_listen_path_label"), "got: {err}");
 }
+
+async fn read_loki_headers(socket: &mut tokio::net::TcpStream) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = match socket.read(&mut buf).await {
+            Ok(0) => return false,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        request.extend_from_slice(&buf[..n]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            return true;
+        }
+        if request.len() > 64 * 1024 {
+            return false;
+        }
+    }
+}
+
+async fn spawn_loki_keepalive_server(
+    responses: Vec<(u16, &'static [u8])>,
+) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let connections_task = Arc::clone(&connections);
+    let requests_task = Arc::clone(&requests);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            connections_task.fetch_add(1, Ordering::SeqCst);
+            let responses = responses.clone();
+            let requests = Arc::clone(&requests_task);
+            tokio::spawn(async move {
+                let mut index = 0usize;
+                loop {
+                    if !read_loki_headers(&mut socket).await {
+                        break;
+                    }
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let (status, body) = responses[index % responses.len()];
+                    index = index.saturating_add(1);
+                    let headers = format!(
+                        "HTTP/1.1 {status} Status\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                        body.len()
+                    );
+                    if socket.write_all(headers.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    if socket.write_all(body).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (
+        format!("http://{addr}/loki/api/v1/push"),
+        connections,
+        requests,
+    )
+}
+
+async fn wait_for_loki_count(counter: &AtomicUsize, expected: usize) {
+    for _ in 0..100 {
+        if counter.load(Ordering::SeqCst) >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "timed out waiting for {expected} Loki requests; saw {}",
+        counter.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_loki_reuses_http11_connection_across_successful_batches() {
+    let (endpoint, connections, requests) =
+        spawn_loki_keepalive_server(vec![(204, b"OK")]).await;
+    let mut config = delivery_config(endpoint);
+    config["max_retries"] = json!(0);
+    let plugin = LokiLogging::new(&config, default_client()).unwrap();
+    plugin.log(&create_test_transaction_summary()).await;
+    plugin.log(&create_test_transaction_summary()).await;
+    wait_for_loki_count(&requests, 2).await;
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "loki_logging must drain ACK bodies through the shared helper and reuse HTTP/1.1"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_loki_reuses_http11_connection_across_retry() {
+    let (endpoint, connections, requests) =
+        spawn_loki_keepalive_server(vec![(503, b"no"), (204, b"")]).await;
+    let mut config = delivery_config(endpoint);
+    config["max_retries"] = json!(1);
+    config["retry_delay_ms"] = json!(1);
+    let plugin = LokiLogging::new(&config, default_client()).unwrap();
+    plugin.log(&create_test_transaction_summary()).await;
+    wait_for_loki_count(&requests, 2).await;
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "loki_logging must drain retryable bodies before reusing the pooled connection"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_loki_stalled_ack_drain_timeout_does_not_block_indefinitely() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let _ = read_loki_headers(&mut socket).await;
+        let _ = socket
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+            .await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    let started = std::time::Instant::now();
+    let mut config = delivery_config(format!("http://{addr}/loki/api/v1/push"));
+    config["max_retries"] = json!(0);
+    let plugin = LokiLogging::new(&config, default_client()).unwrap();
+    plugin.log(&create_test_transaction_summary()).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "stalled Loki ACK must be bounded by the shared drain timeout"
+    );
+}
