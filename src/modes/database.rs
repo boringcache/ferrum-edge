@@ -2573,8 +2573,7 @@ fn initial_db_available(
     plugin_migration_reconcile_state: u8,
 ) -> bool {
     !bootstrap_from_backup
-        || (config_rejected
-            && plugin_migration_reconcile_state == PLUGIN_MIGRATIONS_RECONCILED)
+        || (config_rejected && plugin_migration_reconcile_state == PLUGIN_MIGRATIONS_RECONCILED)
 }
 
 async fn mark_db_available_after_successful_poll_load(
