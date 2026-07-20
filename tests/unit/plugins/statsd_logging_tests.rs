@@ -16,8 +16,9 @@ use ferrum_edge::plugins::{
 use ferrum_edge::retry::ErrorClass;
 use serde_json::json;
 use std::collections::HashMap;
-use std::net::UdpSocket;
 use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::time::timeout;
 
 use super::plugin_utils::{create_test_context, create_test_transaction_summary};
 
@@ -716,6 +717,8 @@ fn test_statsd_namespace_tag_collision_resistance_and_reserved_keys() {
     assert!(validate_tag_key("method\nrogue").is_err());
     assert!(validate_tag_key("bad:key").is_err());
     assert_eq!(sanitize_tag_value("x\0y\x1bz"), "x_y_z");
+    // Representative ASCII + Unicode control values (NUL / ESC / BEL / NEL).
+    assert_eq!(sanitize_tag_value("a\0b\x1bc\x07d\u{0085}e"), "a_b_c_d_e");
 }
 
 #[tokio::test]
@@ -728,6 +731,20 @@ async fn test_statsd_rejects_reserved_and_injecting_global_tags() {
         (
             json!({"host": "127.0.0.1", "global_tags": {"status": "spoof"}}),
             "reserved",
+        ),
+        // Case-insensitive reserved-key collision.
+        (
+            json!({"host": "127.0.0.1", "global_tags": {"Status": "spoof"}}),
+            "reserved",
+        ),
+        (
+            json!({"host": "127.0.0.1", "global_tags": {"NAMESPACE": "victim"}}),
+            "reserved",
+        ),
+        // Post-normalization duplicate keys (Env / env).
+        (
+            json!({"host": "127.0.0.1", "global_tags": {"Env": "a", "env": "b"}}),
+            "duplicate",
         ),
         (
             json!({"host": "127.0.0.1", "global_tags": {"evil\nkey": "x"}}),
@@ -743,12 +760,35 @@ async fn test_statsd_rejects_reserved_and_injecting_global_tags() {
             }),
             "tag key",
         ),
+        // Native-field collision is fail-closed by the shared schema compiler.
         (
             json!({
                 "host": "127.0.0.1",
                 "schema": {
                     "summary_type": "http",
                     "rename": {"proxy_id": "namespace"}
+                }
+            }),
+            "duplicate",
+        ),
+        // StatsD-reserved tag that is not a native summary out_key.
+        (
+            json!({
+                "host": "127.0.0.1",
+                "schema": {
+                    "summary_type": "http",
+                    "rename": {"proxy_id": "status_class"}
+                }
+            }),
+            "reserved",
+        ),
+        // Case-insensitive reserved rename target.
+        (
+            json!({
+                "host": "127.0.0.1",
+                "schema": {
+                    "summary_type": "http",
+                    "rename": {"proxy_id": "Status_Class"}
                 }
             }),
             "reserved",
@@ -766,10 +806,11 @@ async fn test_statsd_rejects_reserved_and_injecting_global_tags() {
 
 #[tokio::test]
 async fn test_statsd_udp_payload_ceiling_and_collector_capture() {
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind collector");
-    socket
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .expect("read timeout");
+    // Use Tokio UDP + bounded timeouts so the default single-thread test
+    // runtime cannot starve the batching task behind a blocking recv_from.
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
     let port = socket.local_addr().expect("local addr").port();
 
     let plugin = StatsdLogging::new(
@@ -794,7 +835,10 @@ async fn test_statsd_udp_payload_ceiling_and_collector_capture() {
     plugin.log(&mirror).await;
 
     let mut buf = [0u8; 2048];
-    let (n, _) = socket.recv_from(&mut buf).expect("receive statsd datagram");
+    let (n, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for statsd datagram")
+        .expect("receive statsd datagram");
     assert!(n <= MAX_UDP_PAYLOAD, "datagram exceeded ceiling: {n}");
     let payload = std::str::from_utf8(&buf[..n]).expect("utf8");
     assert!(payload.contains("ferrum.request.count:1|c"), "{payload}");
@@ -803,9 +847,9 @@ async fn test_statsd_udp_payload_ceiling_and_collector_capture() {
         "authoritative namespace tag must be present: {payload}"
     );
     // Mirror must not produce a second client datagram with ordinary request metrics.
-    // Allow a short window; absence is success.
-    let second = socket.recv_from(&mut buf);
-    if let Ok((n2, _)) = second {
+    // Bounded absence window; timeout (no datagram) is success.
+    let second = timeout(Duration::from_millis(200), socket.recv_from(&mut buf)).await;
+    if let Ok(Ok((n2, _))) = second {
         let extra = std::str::from_utf8(&buf[..n2]).unwrap_or("");
         panic!("unexpected second datagram after mirror skip: {extra}");
     }
@@ -821,28 +865,46 @@ async fn test_statsd_udp_payload_ceiling_and_collector_capture() {
 }
 
 #[tokio::test]
-async fn test_statsd_ws_disconnect_enqueues_without_panic() {
+async fn test_statsd_ws_disconnect_collector_emits_session_once() {
+    // #2555 composition evidence: core H1 Upgrade, H2 Extended CONNECT, and
+    // native H3 paths already dispatch `on_ws_disconnect` exactly once to
+    // plugins that return `requires_ws_disconnect_hooks()` (gateway_core
+    // websocket tunnel / relay / http3 websocket coverage). This test proves
+    // statsd_logging opts in and formats the terminal websocket.* set into
+    // one collector-visible datagram — without duplicating those harnesses.
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
+    let port = socket.local_addr().expect("local addr").port();
+
     let plugin = StatsdLogging::new(
         &json!({
             "host": "127.0.0.1",
-            "port": 1,
-            "flush_interval_ms": 50
+            "port": port,
+            "prefix": "ferrum",
+            "flush_interval_ms": 50,
+            "max_batch_lines": 16
         }),
         default_client(),
     )
-    .unwrap();
+    .expect("construct statsd");
+    assert!(
+        plugin.requires_ws_disconnect_hooks(),
+        "statsd_logging must opt into terminal WS disconnect dispatch"
+    );
+
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "ws-1".to_string(),
-        proxy_name: None,
+        proxy_name: Some("WS".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "http://127.0.0.1:9/".to_string(),
         listen_port: 8080,
-        duration_ms: 10.0,
-        frames_client_to_backend: 0,
-        frames_backend_to_client: 0,
-        bytes_client_to_backend: 0,
-        bytes_backend_to_client: 0,
+        duration_ms: 42.0,
+        frames_client_to_backend: 1,
+        frames_backend_to_client: 2,
+        bytes_client_to_backend: 10,
+        bytes_backend_to_client: 20,
         direction: None,
         io_side: None,
         error_class: None,
@@ -851,4 +913,31 @@ async fn test_statsd_ws_disconnect_enqueues_without_panic() {
         metadata: HashMap::new(),
     };
     plugin.on_ws_disconnect(&ctx).await;
+
+    let mut buf = [0u8; 2048];
+    let (n, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for websocket statsd datagram")
+        .expect("receive websocket statsd datagram");
+    assert!(n <= MAX_UDP_PAYLOAD, "datagram exceeded ceiling: {n}");
+    let payload = std::str::from_utf8(&buf[..n]).expect("utf8");
+    assert_eq!(
+        payload.matches("ferrum.websocket.session.count:1|c").count(),
+        1,
+        "terminal WS session count must appear exactly once: {payload}"
+    );
+    assert!(
+        payload.contains("ferrum.websocket.session.duration_ms:42.00|ms"),
+        "{payload}"
+    );
+    assert!(
+        !payload.contains("request.latency_total_ms"),
+        "WS session metrics must not mix into HTTP latency families: {payload}"
+    );
+
+    let second = timeout(Duration::from_millis(200), socket.recv_from(&mut buf)).await;
+    if let Ok(Ok((n2, _))) = second {
+        let extra = std::str::from_utf8(&buf[..n2]).unwrap_or("");
+        panic!("unexpected second datagram after single WS disconnect: {extra}");
+    }
 }

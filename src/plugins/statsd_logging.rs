@@ -1071,6 +1071,8 @@ mod tests {
         assert_eq!(sanitize_tag_value("foo\0bar"), "foo_bar");
         assert_eq!(sanitize_tag_value("foo\x1bbar"), "foo_bar");
         assert_eq!(sanitize_tag_value("foo\x07bar"), "foo_bar");
+        // Unicode Cc control (NEXT LINE / NEL).
+        assert_eq!(sanitize_tag_value("foo\u{0085}bar"), "foo_bar");
     }
 
     #[test]
@@ -1280,6 +1282,45 @@ mod tests {
         });
         match StatsdLogging::new(&cfg, PluginHttpClient::default()) {
             Ok(_) => panic!("injecting rename target must be rejected"),
+            Err(err) => assert!(
+                err.contains("tag key") || err.contains("characters"),
+                "got: {err}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn statsd_rejects_schema_ref_rename_line_injection() {
+        // Advisory coverage for named `schema_ref` reuse: an unsafe rename that
+        // compiles under the shared log-schema registry must still be rejected
+        // by statsd admission. Serialized via lock_for_tests to avoid
+        // process-global registry races with other tests.
+        use crate::plugins::utils::log_schema::{SchemaCapabilities, SummarySchema, registry};
+        use std::sync::Arc;
+
+        let _g = registry::lock_for_tests();
+        registry::reset_for_tests();
+        registry::begin_reload().expect("reload bracket opens");
+        let raw = serde_json::json!({
+            "summary_type": "http",
+            "rename": { "http_method": "method\nrogue.metric:1|c\nx" }
+        });
+        let compiled = SummarySchema::compile(
+            &raw,
+            "transaction_log_schema[statsd_inject]",
+            SchemaCapabilities::BASE,
+        )
+        .expect("named schema compiles under shared log-schema rules");
+        registry::register_named("statsd_inject", Arc::new(raw), compiled)
+            .expect("register named schema");
+        registry::commit_reload().expect("reload bracket commits");
+
+        let cfg = serde_json::json!({
+            "host": "127.0.0.1",
+            "schema_ref": "statsd_inject"
+        });
+        match StatsdLogging::new(&cfg, PluginHttpClient::default()) {
+            Ok(_) => panic!("schema_ref injecting rename must be rejected"),
             Err(err) => assert!(
                 err.contains("tag key") || err.contains("characters"),
                 "got: {err}"

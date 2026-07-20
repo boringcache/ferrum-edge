@@ -11664,15 +11664,29 @@ components:
           maxLength: 256
           description: >-
             Metric name prefix (e.g., ferrum.request.count). Sanitized for
-            StatsD line-protocol safety; max 256 bytes after sanitization.
+            StatsD line-protocol safety. OpenAPI `maxLength` counts Unicode
+            characters; runtime admission separately enforces at most 256
+            UTF-8 bytes after sanitization, so multibyte prefixes may be
+            rejected below 256 characters.
         global_tags:
           type: object
+          propertyNames:
+            type: string
+            minLength: 1
+            maxLength: 64
+            pattern: '^[A-Za-z_][A-Za-z0-9_.-]*$'
+            description: >-
+              Tag keys are restricted to the ASCII grammar
+              `[A-Za-z_][A-Za-z0-9_.-]*`, so OpenAPI `maxLength: 64`
+              matches the runtime 64-byte key ceiling.
           additionalProperties:
             type: string
           description: >-
-            Extra DogStatsD tags appended to every metric. Keys cannot override
-            reserved runtime tags. Encoded global_tags (+ authoritative
-            namespace) are capped at 400 bytes.
+            Extra DogStatsD tags appended to every metric. Keys must match
+            `[A-Za-z_][A-Za-z0-9_.-]*` (max 64 ASCII bytes) and cannot
+            override reserved runtime tags (enforced at construction).
+            Encoded global_tags (+ authoritative namespace) are capped at
+            400 bytes.
         flush_interval_ms:
           type: integer
           default: 500
