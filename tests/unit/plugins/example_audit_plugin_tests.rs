@@ -300,8 +300,7 @@ fn test_logger_startup_is_lock_free_after_start() {
         "enqueue must read the logger through OnceLock::get"
     );
     assert!(
-        source.contains("logger.try_reserve()")
-            && source.contains("permit.send(build_record())"),
+        source.contains("logger.try_reserve()") && source.contains("permit.send(build_record())"),
         "queue capacity must be reserved before constructing an audit record"
     );
     assert!(
@@ -826,14 +825,14 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     .expect("bounded TCP audit row");
     let bounded_client_ip: String = bounded_stream.get("client_ip");
     let bounded_proxy_id: Option<String> = bounded_stream.try_get("proxy_id").ok().flatten();
-    let bounded_connection_error: Option<String> = bounded_stream
-        .try_get("connection_error")
-        .ok()
-        .flatten();
+    let bounded_connection_error: Option<String> =
+        bounded_stream.try_get("connection_error").ok().flatten();
     assert_eq!(bounded_client_ip.chars().count(), 255);
     assert!(bounded_client_ip.chars().all(|c| c == 'I'));
     assert_eq!(
-        bounded_proxy_id.as_deref().map(|value| value.chars().count()),
+        bounded_proxy_id
+            .as_deref()
+            .map(|value| value.chars().count()),
         Some(255)
     );
     assert_eq!(
