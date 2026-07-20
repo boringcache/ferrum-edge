@@ -947,8 +947,7 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
     let err = client
         .send(&oversized)
         .await
-        .err()
-        .expect("oversized plaintext must fail");
+        .expect_err("oversized plaintext must fail");
     assert!(err.to_string().contains("max_plaintext"), "got: {err}");
 
     client
