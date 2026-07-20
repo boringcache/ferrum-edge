@@ -18,6 +18,7 @@ Reusable, plugin-agnostic notification infrastructure. Lives at `src/notificatio
 
 ### Common rules
 - Channel name matches `[A-Za-z0-9_-]+`.
+- Unknown properties on a selected channel variant are rejected (including fields that belong only to a different channel type). Generic webhook `headers` remain an open string map.
 - `webhook_url` (Slack/Teams/Discord) and `url` (generic webhook) MUST be `http://` or `https://` with a host and no `user:pass@` userinfo segment.
 - For each URL field there is a sibling `*_env` form (`webhook_url_env: "MY_ENV"`) that resolves via `std::env::var()` at construction. Combine with the gateway's secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP` env-var suffixes) to keep credentials out of config files.
 - Dispatch slow-call/error logs redact endpoint paths, query strings, and userinfo because incoming webhook credentials commonly live inside the URL.

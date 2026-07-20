@@ -2428,6 +2428,196 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[tokio::test]
+async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (id, config, needle) in [
+        (
+            "proxy-alerts-enabled-typo",
+            json!({
+                "enabledd": false,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "config.enabledd",
+        ),
+        (
+            "proxy-alerts-rule-cross-variant",
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "threshold_count": 10,
+                    "channels": ["ops"]
+                }]
+            }),
+            "rules[0].threshold_count",
+        ),
+        (
+            "proxy-alerts-channel-typo",
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x",
+                        "channel_overide": "#alerts"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "channels.ops.channel_overide",
+        ),
+        (
+            "proxy-alerts-enabled-wrong-type",
+            json!({
+                "enabled": "false",
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "'enabled' must be a boolean",
+        ),
+        (
+            "proxy-alerts-max-concurrent-zero",
+            json!({
+                "max_concurrent_dispatches": 0,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "'max_concurrent_dispatches' must be >= 1",
+        ),
+        (
+            "proxy-alerts-min-request-count-wrong-type",
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "min_request_count": "100",
+                    "channels": ["ops"]
+                }]
+            }),
+            "'min_request_count' must be an unsigned integer",
+        ),
+        (
+            "proxy-alerts-quiet-hours-null",
+            json!({
+                "quiet_hours_utc": null,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "'quiet_hours_utc' must be an array",
+        ),
+        (
+            "proxy-alerts-unused-default-resolved-window-out-of-range",
+            json!({
+                "default_resolved_window_seconds": 4,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"],
+                    "recovery": {"resolved_window_seconds": 300}
+                }]
+            }),
+            "'default_resolved_window_seconds' must be in [5, 86400]",
+        ),
+    ] {
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "proxy_alerts",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+        assert_eq!(
+            status, 400,
+            "invalid proxy_alerts config was admitted: {body}"
+        );
+        assert!(
+            body.to_string().contains(needle),
+            "unexpected admin validation response for {needle}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_admin_create_rejects_unknown_mesh_route_dispatch_nested_policy_keys() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

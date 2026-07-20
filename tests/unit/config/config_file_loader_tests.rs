@@ -865,6 +865,158 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[test]
+fn test_file_config_admits_invalid_optional_proxy_alerts_configs_for_cache_omission() {
+    for (id, config) in [
+        (
+            "proxy-alerts-enabled-typo",
+            serde_json::json!({
+                "enabledd": false,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+        ),
+        (
+            "proxy-alerts-cross-variant",
+            serde_json::json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x",
+                        "channel_overide": "#alerts"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "threshold_count": 10,
+                    "channels": ["ops"]
+                }]
+            }),
+        ),
+        (
+            "proxy-alerts-enabled-wrong-type",
+            serde_json::json!({
+                "enabled": "false",
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+        ),
+        (
+            "proxy-alerts-max-concurrent-zero",
+            serde_json::json!({
+                "max_concurrent_dispatches": 0,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+        ),
+        (
+            "proxy-alerts-quiet-hours-null",
+            serde_json::json!({
+                "quiet_hours_utc": null,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+        ),
+        (
+            "proxy-alerts-unused-default-window-out-of-range",
+            serde_json::json!({
+                "default_window_seconds": 4,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "window_seconds": 60,
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "proxy_alerts",
+                "config": config.clone(),
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let loaded = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect("OptionalFailOpen proxy_alerts validation must not abort file-mode loading");
+        assert_eq!(loaded.plugin_configs.len(), 1);
+        assert_eq!(loaded.plugin_configs[0].id, id);
+        assert_eq!(loaded.plugin_configs[0].plugin_name, "proxy_alerts");
+        assert_eq!(
+            loaded.plugin_configs[0].config, config,
+            "file loading must preserve the invalid config for PluginCache to warn and omit"
+        );
+    }
+}
+
+#[test]
 fn test_file_config_rejects_unknown_mesh_route_dispatch_nested_policy_keys() {
     for (id, config) in [
         (

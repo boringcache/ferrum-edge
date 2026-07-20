@@ -14,6 +14,7 @@ use url::Url;
 
 use crate::plugins::utils::http_client::PluginHttpClient;
 use crate::plugins::utils::response_body::{BoundedReadError, measure_response_body_bounded};
+use crate::util::unknown_keys::{near_miss_for_missing_key, reject_unknown_keys};
 
 use super::notification::Notification;
 
@@ -33,6 +34,25 @@ pub mod webhook;
 /// value that has no operator-meaningful target.
 const RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64: u64 = 1024 * 1024;
 const RESPONSE_BODY_DRAIN_LIMIT_BYTES: usize = RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64 as usize;
+
+const SLACK_CHANNEL_KEYS: &[&str] = &[
+    "type",
+    "webhook_url",
+    "webhook_url_env",
+    "channel_override",
+    "username",
+    "icon_emoji",
+];
+const TEAMS_CHANNEL_KEYS: &[&str] = &["type", "webhook_url", "webhook_url_env"];
+const DISCORD_CHANNEL_KEYS: &[&str] = &["type", "webhook_url", "webhook_url_env", "username"];
+const WEBHOOK_CHANNEL_KEYS: &[&str] = &[
+    "type",
+    "url",
+    "url_env",
+    "method",
+    "headers",
+    "body_template",
+];
 
 #[allow(unused_imports)]
 pub use discord::DiscordChannel;
@@ -151,19 +171,41 @@ fn build_channel(name: &str, def: &Value) -> Result<NotificationChannel, String>
     let obj = def
         .as_object()
         .ok_or_else(|| format!("channel '{name}': definition must be an object"))?;
-    let kind = obj
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("channel '{name}': 'type' is required"))?;
+    let kind = match obj.get("type") {
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| format!("channel '{name}': 'type' must be a string"))?,
+        None => {
+            return Err(match near_miss_for_missing_key(obj, "type") {
+                Some(typo) => format!(
+                    "channel '{name}': 'type' is required (did you mean 'type' instead of '{typo}'?)"
+                ),
+                None => format!("channel '{name}': 'type' is required"),
+            });
+        }
+    };
+    let path = format!("channels.{name}");
     match kind {
-        "slack" => Ok(NotificationChannel::Slack(SlackChannel::new(name, def)?)),
-        "teams" => Ok(NotificationChannel::Teams(TeamsChannel::new(name, def)?)),
-        "discord" => Ok(NotificationChannel::Discord(DiscordChannel::new(
-            name, def,
-        )?)),
-        "webhook" => Ok(NotificationChannel::Webhook(WebhookChannel::new(
-            name, def,
-        )?)),
+        "slack" => {
+            reject_unknown_keys(obj, &path, SLACK_CHANNEL_KEYS, "")?;
+            Ok(NotificationChannel::Slack(SlackChannel::new(name, def)?))
+        }
+        "teams" => {
+            reject_unknown_keys(obj, &path, TEAMS_CHANNEL_KEYS, "")?;
+            Ok(NotificationChannel::Teams(TeamsChannel::new(name, def)?))
+        }
+        "discord" => {
+            reject_unknown_keys(obj, &path, DISCORD_CHANNEL_KEYS, "")?;
+            Ok(NotificationChannel::Discord(DiscordChannel::new(
+                name, def,
+            )?))
+        }
+        "webhook" => {
+            reject_unknown_keys(obj, &path, WEBHOOK_CHANNEL_KEYS, "")?;
+            Ok(NotificationChannel::Webhook(WebhookChannel::new(
+                name, def,
+            )?))
+        }
         other => Err(format!(
             "channel '{name}': unknown 'type' '{other}' (expected one of: slack, teams, discord, webhook)"
         )),
