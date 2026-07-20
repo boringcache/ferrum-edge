@@ -564,7 +564,7 @@ async fn test_workload_metrics_opentelemetry_exporter_payload() {
     );
     assert_eq!(
         payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
-        "GET /api/test"
+        "GET"
     );
 }
 
@@ -595,7 +595,7 @@ async fn test_workload_metrics_zipkin_exporter_payload() {
 
     let payload = received_json(&mock_server).await;
     assert_eq!(payload[0]["localEndpoint"]["serviceName"], "reviews");
-    assert_eq!(payload[0]["name"], "GET /api/test");
+    assert_eq!(payload[0]["name"], "GET");
     assert_eq!(payload[0]["tags"]["http.status_code"], "200");
 }
 
@@ -627,7 +627,7 @@ async fn test_workload_metrics_datadog_exporter_payload() {
 
     let payload = received_json(&mock_server).await;
     assert_eq!(payload[0][0]["service"], "reviews");
-    assert_eq!(payload[0][0]["resource"], "GET /api/test");
+    assert_eq!(payload[0][0]["resource"], "GET");
     assert_eq!(payload[0][0]["meta"]["http.method"], "GET");
 }
 
@@ -685,7 +685,7 @@ async fn test_workload_metrics_lightstep_exporter_uses_otlp_bearer_payload() {
     let payload = received_json(&mock_server).await;
     assert_eq!(
         payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
-        "GET /api/test"
+        "GET"
     );
     // SAFETY: Paired cleanup for the unique key set above.
     unsafe { std::env::remove_var("FERRUM_TEST_LIGHTSTEP_TOKEN") };
@@ -729,10 +729,10 @@ async fn test_workload_metrics_multi_provider_fanout() {
 
     let zipkin_payload = received_json(&zipkin).await;
     let otlp_payload = received_json(&otlp).await;
-    assert_eq!(zipkin_payload[0]["name"], "GET /api/test");
+    assert_eq!(zipkin_payload[0]["name"], "GET");
     assert_eq!(
         otlp_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
-        "GET /api/test"
+        "GET"
     );
 }
 

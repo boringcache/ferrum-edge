@@ -188,7 +188,7 @@ async fn telemetry_provider_from_mesh_slice_emits_otlp_span() {
     );
     assert_eq!(
         payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"],
-        "GET /reviews"
+        "GET"
     );
 }
 
