@@ -1200,24 +1200,51 @@ async fn test_loki_logging_removed_listen_path_key_rejected() {
     assert!(err.contains("include_listen_path_label"), "got: {err}");
 }
 
+/// Read one HTTP/1.1 request and discard its body through `Content-Length`.
+///
+/// Keep-alive fixtures must drain the request body before responding; leaving
+/// unread body bytes on the socket breaks reuse for later POSTs on the connection.
 async fn read_loki_headers(socket: &mut tokio::net::TcpStream) -> bool {
     use tokio::io::AsyncReadExt;
     let mut request = Vec::new();
     let mut buf = [0u8; 1024];
-    loop {
+    let header_end = loop {
         let n = match socket.read(&mut buf).await {
             Ok(0) => return false,
             Ok(n) => n,
             Err(_) => return false,
         };
         request.extend_from_slice(&buf[..n]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            return true;
+        if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break pos + 4;
         }
         if request.len() > 64 * 1024 {
             return false;
         }
+    };
+
+    let content_length = std::str::from_utf8(&request[..header_end])
+        .ok()
+        .and_then(|headers| {
+            headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+        })
+        .unwrap_or(0);
+
+    let mut body_read = request.len().saturating_sub(header_end);
+    while body_read < content_length {
+        let want = (content_length - body_read).min(buf.len());
+        match socket.read(&mut buf[..want]).await {
+            Ok(0) => return false,
+            Ok(n) => body_read += n,
+            Err(_) => return false,
+        }
     }
+    true
 }
 
 async fn spawn_loki_keepalive_server(
