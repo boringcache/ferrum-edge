@@ -3592,10 +3592,148 @@ jobs:
           name: binary-aarch64-unknown-linux-gnu
           path: release-assets/
 
+  main-publish-gate:
+    name: Main Publish Gate
+    needs: [test, build-binaries]
+    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # The polling loop stops at its own 60-minute deadline, so the fail-closed
+    # timeout below is always the branch that fires. This job-level ceiling is
+    # only a backstop against a wedged runner and bounds runner occupancy.
+    timeout-minutes: 75
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for dedicated release checks
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Each record binds the API endpoint, the run-reported workflow path,
+          # and the display name. A display name alone is not an identity: a
+          # second workflow can reuse it and must never satisfy publication for
+          # a missing canonical run.
+          required_workflow_specs=(
+            "coverage.yml|.github/workflows/coverage.yml|Coverage"
+            "gateway-api-conformance.yml|.github/workflows/gateway-api-conformance.yml|Gateway API Conformance"
+            "mesh-e2e-sidecar-live.yml|.github/workflows/mesh-e2e-sidecar-live.yml|Mesh E2E Sidecar Live Datapath"
+          )
+
+          # Bound the wait inside `timeout-minutes` so the runner is never held
+          # past this deadline and the diagnostic below stays reachable.
+          deadline=$((SECONDS + 3600))
+
+          while :; do
+            pending=0
+
+            for specification in "${required_workflow_specs[@]}"; do
+              IFS='|' read -r workflow_file workflow_path workflow <<<"$specification"
+
+              # Query the canonical workflow endpoint, not the repository-wide
+              # run list. The endpoint identity prevents a different workflow
+              # with the same display name from satisfying this requirement.
+              # The remaining fields independently bind the run to this exact
+              # file, name, commit, push event, and branch.
+              runs=""
+              api_succeeded=0
+              for attempt in 1 2 3; do
+                if runs="$(
+                  gh api --paginate \
+                    -H "Accept: application/vnd.github+json" \
+                    "/repos/${REPOSITORY}/actions/workflows/${workflow_file}/runs?head_sha=${HEAD_SHA}&event=push&branch=${BRANCH_NAME}&per_page=100" \
+                    --jq '.workflow_runs[] | [.name, .path, .status, (.conclusion // ""), .head_branch, .event, .head_sha] | @tsv'
+                )"; then
+                  api_succeeded=1
+                  break
+                fi
+                if [ "$attempt" -lt 3 ]; then
+                  echo "::warning::Actions API query failed for ${workflow_path}; retrying (${attempt}/3)."
+                  sleep $((attempt * 5))
+                fi
+              done
+              if [ "$api_succeeded" -ne 1 ]; then
+                echo "::error::Actions API query failed for ${workflow_path} after 3 attempts."
+                exit 1
+              fi
+
+              # A record that does not carry exactly seven fields cannot be
+              # matched field by field. Reject malformed data instead of
+              # silently treating the canonical workflow as absent.
+              if awk -F '\t' 'NF > 0 && NF != 7 { found = 1 } END { exit !found }' \
+                <<<"$runs"; then
+                echo "::error::Malformed ${workflow_path} run data for ${HEAD_SHA}."
+                exit 1
+              fi
+
+              # The workflow-specific endpoint should return only this file.
+              # Verify both server-reported identity fields anyway so an API or
+              # repository identity drift fails immediately and visibly.
+              if awk -F '\t' \
+                -v name="$workflow" \
+                -v path="$workflow_path" \
+                'NF == 7 && ($1 != name || $2 != path) { found = 1 } END { exit !found }' \
+                <<<"$runs"; then
+                echo "::error::Workflow identity mismatch for ${workflow_path}."
+                exit 1
+              fi
+
+              # Every matching run must succeed. Selecting a single run would
+              # let one passing duplicate mask a failed run of the same
+              # workflow for this same commit and branch.
+              matching="$(awk -F '\t' \
+                -v name="$workflow" \
+                -v path="$workflow_path" \
+                -v branch="$BRANCH_NAME" \
+                -v sha="$HEAD_SHA" \
+                'NF == 7 && $1 == name && $2 == path && $5 == branch && $6 == "push" && $7 == sha { print $3 "\t" $4 }' \
+                <<<"$runs")"
+              if [ -z "$matching" ]; then
+                echo "Waiting for ${workflow} to start for ${HEAD_SHA}."
+                pending=1
+                continue
+              fi
+
+              workflow_pending=0
+              # A here-string keeps this loop in the current shell so the flag
+              # it sets, and any `exit`, take effect for the whole step.
+              while IFS=$'\t' read -r status conclusion; do
+                if [ "$status" != "completed" ]; then
+                  echo "Waiting for ${workflow}: ${status}."
+                  workflow_pending=1
+                elif [ "$conclusion" != "success" ]; then
+                  echo "::error::${workflow} concluded ${conclusion:-unknown} for ${HEAD_SHA}."
+                  exit 1
+                fi
+              done <<<"$matching"
+
+              if [ "$workflow_pending" -eq 1 ]; then
+                pending=1
+              else
+                echo "${workflow} passed."
+              fi
+            done
+
+            if [ "$pending" -eq 0 ]; then
+              exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              break
+            fi
+            sleep 30
+          done
+
+          echo "::error::Timed out waiting for dedicated release checks for ${HEAD_SHA}."
+          exit 1
+
   latest-release:
     name: Update Latest Release
-    needs: [test, build-binaries, build-arm64-cross]
-    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && needs.build-arm64-cross.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, build-binaries, build-arm64-cross, main-publish-gate]
+    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && needs.build-arm64-cross.result == 'success' && needs.main-publish-gate.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -3729,8 +3867,8 @@ jobs:
 
   docker:
     name: Docker (${{ matrix.platform }})
-    needs: [test, build-binaries, build-arm64-cross]
-    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && needs.build-arm64-cross.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, build-binaries, build-arm64-cross, main-publish-gate]
+    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && needs.build-arm64-cross.result == 'success' && needs.main-publish-gate.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read

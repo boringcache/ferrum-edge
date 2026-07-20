@@ -804,26 +804,193 @@ RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
 """
 
+# The main-branch publication gate is itself a release-integrity boundary. Its
+# complete job is frozen rather than selected fields so an ordinary pull
+# request cannot add `continue-on-error`, widen permissions, weaken a retry or
+# identity check, or otherwise change job semantics while preserving a partial
+# contract.
+CI_MAIN_PUBLISH_GATE_JOB = r"""  main-publish-gate:
+    name: Main Publish Gate
+    needs: [test, build-binaries]
+    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # The polling loop stops at its own 60-minute deadline, so the fail-closed
+    # timeout below is always the branch that fires. This job-level ceiling is
+    # only a backstop against a wedged runner and bounds runner occupancy.
+    timeout-minutes: 75
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for dedicated release checks
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Each record binds the API endpoint, the run-reported workflow path,
+          # and the display name. A display name alone is not an identity: a
+          # second workflow can reuse it and must never satisfy publication for
+          # a missing canonical run.
+          required_workflow_specs=(
+            "coverage.yml|.github/workflows/coverage.yml|Coverage"
+            "gateway-api-conformance.yml|.github/workflows/gateway-api-conformance.yml|Gateway API Conformance"
+            "mesh-e2e-sidecar-live.yml|.github/workflows/mesh-e2e-sidecar-live.yml|Mesh E2E Sidecar Live Datapath"
+          )
+
+          # Bound the wait inside `timeout-minutes` so the runner is never held
+          # past this deadline and the diagnostic below stays reachable.
+          deadline=$((SECONDS + 3600))
+
+          while :; do
+            pending=0
+
+            for specification in "${required_workflow_specs[@]}"; do
+              IFS='|' read -r workflow_file workflow_path workflow <<<"$specification"
+
+              # Query the canonical workflow endpoint, not the repository-wide
+              # run list. The endpoint identity prevents a different workflow
+              # with the same display name from satisfying this requirement.
+              # The remaining fields independently bind the run to this exact
+              # file, name, commit, push event, and branch.
+              runs=""
+              api_succeeded=0
+              for attempt in 1 2 3; do
+                if runs="$(
+                  gh api --paginate \
+                    -H "Accept: application/vnd.github+json" \
+                    "/repos/${REPOSITORY}/actions/workflows/${workflow_file}/runs?head_sha=${HEAD_SHA}&event=push&branch=${BRANCH_NAME}&per_page=100" \
+                    --jq '.workflow_runs[] | [.name, .path, .status, (.conclusion // ""), .head_branch, .event, .head_sha] | @tsv'
+                )"; then
+                  api_succeeded=1
+                  break
+                fi
+                if [ "$attempt" -lt 3 ]; then
+                  echo "::warning::Actions API query failed for ${workflow_path}; retrying (${attempt}/3)."
+                  sleep $((attempt * 5))
+                fi
+              done
+              if [ "$api_succeeded" -ne 1 ]; then
+                echo "::error::Actions API query failed for ${workflow_path} after 3 attempts."
+                exit 1
+              fi
+
+              # A record that does not carry exactly seven fields cannot be
+              # matched field by field. Reject malformed data instead of
+              # silently treating the canonical workflow as absent.
+              if awk -F '\t' 'NF > 0 && NF != 7 { found = 1 } END { exit !found }' \
+                <<<"$runs"; then
+                echo "::error::Malformed ${workflow_path} run data for ${HEAD_SHA}."
+                exit 1
+              fi
+
+              # The workflow-specific endpoint should return only this file.
+              # Verify both server-reported identity fields anyway so an API or
+              # repository identity drift fails immediately and visibly.
+              if awk -F '\t' \
+                -v name="$workflow" \
+                -v path="$workflow_path" \
+                'NF == 7 && ($1 != name || $2 != path) { found = 1 } END { exit !found }' \
+                <<<"$runs"; then
+                echo "::error::Workflow identity mismatch for ${workflow_path}."
+                exit 1
+              fi
+
+              # Every matching run must succeed. Selecting a single run would
+              # let one passing duplicate mask a failed run of the same
+              # workflow for this same commit and branch.
+              matching="$(awk -F '\t' \
+                -v name="$workflow" \
+                -v path="$workflow_path" \
+                -v branch="$BRANCH_NAME" \
+                -v sha="$HEAD_SHA" \
+                'NF == 7 && $1 == name && $2 == path && $5 == branch && $6 == "push" && $7 == sha { print $3 "\t" $4 }' \
+                <<<"$runs")"
+              if [ -z "$matching" ]; then
+                echo "Waiting for ${workflow} to start for ${HEAD_SHA}."
+                pending=1
+                continue
+              fi
+
+              workflow_pending=0
+              # A here-string keeps this loop in the current shell so the flag
+              # it sets, and any `exit`, take effect for the whole step.
+              while IFS=$'\t' read -r status conclusion; do
+                if [ "$status" != "completed" ]; then
+                  echo "Waiting for ${workflow}: ${status}."
+                  workflow_pending=1
+                elif [ "$conclusion" != "success" ]; then
+                  echo "::error::${workflow} concluded ${conclusion:-unknown} for ${HEAD_SHA}."
+                  exit 1
+                fi
+              done <<<"$matching"
+
+              if [ "$workflow_pending" -eq 1 ]; then
+                pending=1
+              else
+                echo "${workflow} passed."
+              fi
+            done
+
+            if [ "$pending" -eq 0 ]; then
+              exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              break
+            fi
+            sleep 30
+          done
+
+          echo "::error::Timed out waiting for dedicated release checks for ${HEAD_SHA}."
+          exit 1
+"""
+
+PUBLISH_EXACT_JOB_CONTRACTS = {
+    "CI workflow": {
+        "main-publish-gate": CI_MAIN_PUBLISH_GATE_JOB,
+    },
+}
+
+# Workflow-level run defaults are inherited by every publishing shell step. A
+# custom default such as a shell wrapper ending in `|| true` could change the
+# failure semantics of otherwise frozen jobs, so protected publication
+# workflows must keep this mapping absent.
+PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS = {
+    "CI workflow": ("defaults",),
+    "release workflow": ("defaults",),
+}
+
 # The publication-control fields that gate the protected ARM64 artifacts are
 # frozen, and so is the full step list of every job that publishes by wildcard.
 PUBLISH_CONTROL_CONTRACTS = {
     "CI workflow": {
         "latest-release": {
-            "needs": "    needs: [test, build-binaries, build-arm64-cross]\n",
+            "needs": (
+                "    needs: [test, build-binaries, build-arm64-cross, "
+                "main-publish-gate]\n"
+            ),
             "if": (
                 "    if: always() && needs.test.result == 'success' && "
                 "needs.build-binaries.result == 'success' && "
                 "needs.build-arm64-cross.result == 'success' && "
+                "needs.main-publish-gate.result == 'success' && "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
             ),
             "steps": CI_LATEST_RELEASE_STEPS,
         },
         "docker": {
-            "needs": "    needs: [test, build-binaries, build-arm64-cross]\n",
+            "needs": (
+                "    needs: [test, build-binaries, build-arm64-cross, "
+                "main-publish-gate]\n"
+            ),
             "if": (
                 "    if: always() && needs.test.result == 'success' && "
                 "needs.build-binaries.result == 'success' && "
                 "needs.build-arm64-cross.result == 'success' && "
+                "needs.main-publish-gate.result == 'success' && "
                 "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
             ),
             "strategy": DOCKER_ARTIFACT_MATRIX,
@@ -2760,6 +2927,32 @@ def digest_artifact_ownership_errors(contents: str, source: str) -> list[str]:
 def validate_publish_control_contract(contents: str, source: str) -> list[str]:
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
     errors: list[str] = []
+    for key_name in PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS.get(source, ()):
+        block, failures = extract_top_level_block(
+            contents,
+            source,
+            key_name,
+            required=False,
+        )
+        errors.extend(failures)
+        if not failures and block is not None:
+            errors.append(
+                f"{source} must not define top-level {key_name!r}; protected "
+                "publication jobs may not inherit workflow run defaults"
+            )
+    for job_name, expected in PUBLISH_EXACT_JOB_CONTRACTS.get(source, {}).items():
+        actual, failures = extract_job_block(
+            contents,
+            source,
+            job_name,
+            required=True,
+        )
+        errors.extend(failures)
+        if not failures and actual != expected:
+            errors.append(
+                f"{source} job {job_name!r} differs from the trusted "
+                "publication exact-job contract"
+            )
     for job_name, fields in contracts.items():
         for field_name, expected in fields.items():
             actual, failures = extract_job_field_block(
@@ -2811,6 +3004,48 @@ def compare_pr_publish_control_contract(
 ) -> list[str]:
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
     errors: list[str] = []
+    for key_name in PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS.get(source, ()):
+        baseline, baseline_failures = extract_top_level_block(
+            merge_base_contents,
+            f"merge-base {source}",
+            key_name,
+            required=False,
+        )
+        proposed, proposed_failures = extract_top_level_block(
+            proposed_contents,
+            f"proposed {source}",
+            key_name,
+            required=False,
+        )
+        errors.extend(baseline_failures)
+        errors.extend(proposed_failures)
+        if not baseline_failures and not proposed_failures:
+            if baseline != proposed:
+                errors.append(
+                    f"{source} top-level {key_name!r} cannot be changed by a "
+                    "pull request because protected publication jobs inherit it"
+                )
+    for job_name in PUBLISH_EXACT_JOB_CONTRACTS.get(source, {}):
+        baseline, baseline_failures = extract_job_block(
+            merge_base_contents,
+            f"merge-base {source}",
+            job_name,
+            required=False,
+        )
+        proposed, proposed_failures = extract_job_block(
+            proposed_contents,
+            f"proposed {source}",
+            job_name,
+            required=False,
+        )
+        errors.extend(baseline_failures)
+        errors.extend(proposed_failures)
+        if not baseline_failures and not proposed_failures:
+            if baseline != proposed:
+                errors.append(
+                    f"{source} job {job_name!r} publication contract cannot "
+                    "be changed by a pull request"
+                )
     for job_name, fields in contracts.items():
         for field_name in fields:
             baseline, baseline_failures = extract_job_field_block(
@@ -17677,6 +17912,7 @@ pre_build = []
     ):
         failures.append("opaque shell stdin program edit was not rejected")
 
+    ci_exact_publish_jobs = PUBLISH_EXACT_JOB_CONTRACTS["CI workflow"]
     ci_publish_contract = PUBLISH_CONTROL_CONTRACTS["CI workflow"]
     ci_publish_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["CI workflow"]["docker"]
     ci_manifest_steps = PUBLISH_ARTIFACT_STEP_CONTRACTS["CI workflow"][
@@ -17686,7 +17922,9 @@ pre_build = []
         "name: Publish fixture\n"
         "on: [push]\n"
         "jobs:\n"
-        "  latest-release:\n"
+        + ci_exact_publish_jobs["main-publish-gate"]
+        + "\n"
+        + "  latest-release:\n"
         + ci_publish_contract["latest-release"]["needs"]
         + ci_publish_contract["latest-release"]["if"]
         + "    runs-on: ubuntu-latest\n"
@@ -17720,7 +17958,62 @@ pre_build = []
                 "by the frozen manifest step list"
             )
     if validate_publish_control_contract(publish_workflow, "CI workflow"):
-        failures.append("valid ARM64 publication dependency controls were rejected")
+        failures.append("valid publication controls were rejected")
+
+    # The gate must be protected as one job, not as a selection of fields. A
+    # job-level escape hatch, widened permission, or weakened retry would alter
+    # publication semantics without necessarily touching `needs`, `if`, or the
+    # named step boundary.
+    exact_gate_edits = {
+        "publish gate permission widened": (
+            "      actions: read\n",
+            "      actions: write\n",
+        ),
+        "publish gate made non-blocking": (
+            "    runs-on: ubuntu-latest\n",
+            "    runs-on: ubuntu-latest\n    continue-on-error: true\n",
+        ),
+        "publish gate shell changed": (
+            "        shell: bash\n",
+            "        shell: python\n",
+        ),
+        "publish gate retry weakened": (
+            "              for attempt in 1 2 3; do\n",
+            "              for attempt in 1; do\n",
+        ),
+    }
+    for label, (original, replacement) in exact_gate_edits.items():
+        tampered = publish_workflow.replace(original, replacement, 1)
+        if tampered == publish_workflow:
+            failures.append(f"{label} fixture did not change the workflow")
+            continue
+        if not validate_publish_control_contract(tampered, "CI workflow"):
+            failures.append(f"{label} was not rejected")
+        if not compare_pr_publish_control_contract(
+            publish_workflow,
+            tampered,
+            "CI workflow",
+        ):
+            failures.append(f"{label} was allowed by the merge-base comparison")
+
+    inherited_run_defaults = publish_workflow.replace(
+        "jobs:\n",
+        "defaults:\n  run:\n    shell: python\njobs:\n",
+        1,
+    )
+    if not validate_publish_control_contract(
+        inherited_run_defaults,
+        "CI workflow",
+    ):
+        failures.append("inherited publication run defaults were not rejected")
+    if not compare_pr_publish_control_contract(
+        publish_workflow,
+        inherited_run_defaults,
+        "CI workflow",
+    ):
+        failures.append(
+            "inherited publication run defaults were allowed by the comparison"
+        )
 
     # The Docker jobs never name the ARM64 artifact literally, so repointing the
     # `linux/arm64` matrix row or rewriting either consuming step would publish
