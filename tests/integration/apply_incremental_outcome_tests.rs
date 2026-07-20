@@ -1390,10 +1390,7 @@ async fn load_testing_unknown_key_reload_keeps_last_known_good_generation() {
         state.config.load().plugin_configs[0].config["key"],
         "stable-key"
     );
-    assert_eq!(
-        state.config.load().plugin_configs[0].config["ramp"],
-        true
-    );
+    assert_eq!(state.config.load().plugin_configs[0].config["ramp"], true);
     assert!(
         state
             .plugin_cache

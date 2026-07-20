@@ -2456,13 +2456,11 @@ async fn test_admin_create_rejects_unknown_load_testing_keys() {
         "unexpected admin validation response: {body}"
     );
     assert!(
-        body_text.contains("config.gateway_adresses")
-            || body_text.contains("gateway_adresses"),
+        body_text.contains("config.gateway_adresses") || body_text.contains("gateway_adresses"),
         "admin response must name gateway_adresses: {body}"
     );
     assert!(
-        body_text.contains("config.request_timeot_ms")
-            || body_text.contains("request_timeot_ms"),
+        body_text.contains("config.request_timeot_ms") || body_text.contains("request_timeot_ms"),
         "admin response must name request_timeot_ms: {body}"
     );
 }
