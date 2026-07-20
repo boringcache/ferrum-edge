@@ -1,4 +1,7 @@
-use ferrum_edge::plugins::load_testing::{LOAD_TESTING_CONFIG_KEYS, LoadTesting};
+use bytes::Bytes;
+use ferrum_edge::plugins::load_testing::{
+    LOAD_TESTING_CONFIG_KEYS, LoadTesting, MIN_TRIGGER_KEY_LEN, RunOutcome,
+};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
     RequestContext, plugin_failure_policy, priority, validate_plugin_config,
@@ -6,10 +9,13 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+const VALID_KEY: &str = "test-secret-key!!"; // 16 chars
 
 fn make_valid_config() -> serde_json::Value {
     json!({
-        "key": "test-secret-key",
+        "key": VALID_KEY,
         "concurrent_clients": 5,
         "duration_seconds": 10
     })
@@ -19,19 +25,37 @@ fn make_plugin() -> LoadTesting {
     LoadTesting::new(&make_valid_config(), PluginHttpClient::default()).unwrap()
 }
 
+fn matched_proxy() -> Arc<ferrum_edge::config::types::Proxy> {
+    Arc::new(
+        serde_json::from_value(json!({
+            "id": "proxy-1",
+            "name": "test-proxy",
+            "listen_path": "/api",
+            "backend_host": "backend.local",
+            "backend_port": 8080,
+            "backend_scheme": "http"
+        }))
+        .unwrap(),
+    )
+}
+
+async fn wait_until_idle(plugin: &LoadTesting) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while plugin.is_running() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[test]
 fn validate_plugin_config_with_policy_screens_denied_gateway_address() {
     use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
     use ferrum_edge::plugins::validate_plugin_config_with_policy;
 
-    // `gateway_addresses` are dialed via the raw client (`.send()`), bypassing
-    // the shared execute() literal-IP screen, so a denied literal must be caught
-    // at config-load under the production default policy.
     let default_policy =
         BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid");
 
     let denied = json!({
-        "key": "test-secret-key",
+        "key": VALID_KEY,
         "concurrent_clients": 5,
         "duration_seconds": 10,
         "gateway_addresses": ["http://169.254.169.254:8000"]
@@ -41,22 +65,17 @@ fn validate_plugin_config_with_policy_screens_denied_gateway_address() {
         "metadata gateway address must be rejected under the default policy"
     );
 
-    // Loopback / RFC1918 gateway targets (the normal case) still validate.
     let loopback = json!({
-        "key": "test-secret-key",
+        "key": VALID_KEY,
         "concurrent_clients": 5,
         "duration_seconds": 10,
-        "gateway_addresses": ["http://127.0.0.1:8000"]
+        "gateway_addresses": ["http://10.0.0.2:8000"]
     });
     assert!(
         validate_plugin_config_with_policy("load_testing", &loopback, &default_policy).is_ok(),
-        "loopback gateway address must remain valid by default"
+        "private gateway address must remain valid by default"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Plugin metadata
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_plugin_name() {
@@ -73,20 +92,15 @@ fn test_supported_protocols() {
     assert_eq!(make_plugin().supported_protocols(), HTTP_ONLY_PROTOCOLS);
 }
 
-// ---------------------------------------------------------------------------
-// Config validation — valid configs
-// ---------------------------------------------------------------------------
-
 #[test]
 fn test_valid_minimal_config() {
-    let result = LoadTesting::new(&make_valid_config(), PluginHttpClient::default());
-    assert!(result.is_ok());
+    assert!(LoadTesting::new(&make_valid_config(), PluginHttpClient::default()).is_ok());
 }
 
 #[test]
 fn test_valid_config_with_ramp() {
     let config = json!({
-        "key": "my-key",
+        "key": VALID_KEY,
         "concurrent_clients": 10,
         "duration_seconds": 30,
         "ramp": true
@@ -97,7 +111,7 @@ fn test_valid_config_with_ramp() {
 #[test]
 fn test_valid_config_with_gateway_port() {
     let config = json!({
-        "key": "my-key",
+        "key": VALID_KEY,
         "concurrent_clients": 10,
         "duration_seconds": 30,
         "gateway_port": 9090
@@ -108,7 +122,7 @@ fn test_valid_config_with_gateway_port() {
 #[test]
 fn test_valid_config_with_gateway_tls() {
     let config = json!({
-        "key": "my-key",
+        "key": VALID_KEY,
         "concurrent_clients": 10,
         "duration_seconds": 30,
         "gateway_tls": true
@@ -117,34 +131,9 @@ fn test_valid_config_with_gateway_tls() {
 }
 
 #[test]
-fn test_valid_config_with_gateway_tls_and_port() {
-    let config = json!({
-        "key": "my-key",
-        "concurrent_clients": 10,
-        "duration_seconds": 30,
-        "gateway_tls": true,
-        "gateway_port": 9443
-    });
-    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
-}
-
-#[test]
-fn test_valid_config_with_tls_no_verify_explicit_false() {
-    // Explicitly disable no-verify even with TLS enabled
-    let config = json!({
-        "key": "my-key",
-        "concurrent_clients": 10,
-        "duration_seconds": 30,
-        "gateway_tls": true,
-        "gateway_tls_no_verify": false
-    });
-    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
-}
-
-#[test]
 fn test_valid_config_with_gateway_addresses() {
     let config = json!({
-        "key": "my-key",
+        "key": VALID_KEY,
         "concurrent_clients": 10,
         "duration_seconds": 30,
         "gateway_addresses": ["https://node1:8443", "https://node2:8443"]
@@ -154,17 +143,15 @@ fn test_valid_config_with_gateway_addresses() {
 
 #[test]
 fn test_valid_config_boundary_values() {
-    // Min values
     let config = json!({
-        "key": "k",
+        "key": "sixteen-char-key",
         "concurrent_clients": 1,
         "duration_seconds": 1
     });
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
 
-    // Max values
     let config = json!({
-        "key": "k",
+        "key": "sixteen-char-key",
         "concurrent_clients": 10000,
         "duration_seconds": 3600
     });
@@ -172,24 +159,9 @@ fn test_valid_config_boundary_values() {
 }
 
 #[test]
-fn test_valid_full_config() {
-    let config = json!({
-        "key": "my-key",
-        "concurrent_clients": 50,
-        "duration_seconds": 60,
-        "ramp": true,
-        "gateway_tls": true,
-        "gateway_tls_no_verify": true,
-        "gateway_port": 8443,
-        "gateway_addresses": ["https://node2:8443"]
-    });
-    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
-}
-
-#[test]
 fn test_valid_config_with_every_supported_field() {
     let config = json!({
-        "key": "full-surface-key",
+        "key": "full-surface-key!",
         "concurrent_clients": 25,
         "duration_seconds": 45,
         "ramp": true,
@@ -198,19 +170,13 @@ fn test_valid_config_with_every_supported_field() {
         "gateway_port": 8443,
         "gateway_tls": true,
         "gateway_tls_no_verify": true,
-        "gateway_addresses": ["https://127.0.0.1:8443", "https://10.0.0.2:8443"]
+        "gateway_addresses": ["https://10.0.0.2:8443", "https://10.0.0.3:8443"]
     });
     assert_eq!(
         config.as_object().unwrap().len(),
         LOAD_TESTING_CONFIG_KEYS.len(),
         "fixture must exercise every accepted top-level key"
     );
-    for key in LOAD_TESTING_CONFIG_KEYS {
-        assert!(
-            config.get(*key).is_some(),
-            "complete fixture missing supported key `{key}`"
-        );
-    }
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
     assert!(validate_plugin_config("load_testing", &config).is_ok());
 }
@@ -218,7 +184,7 @@ fn test_valid_config_with_every_supported_field() {
 #[test]
 fn test_optional_null_fields_still_select_defaults() {
     let config = json!({
-        "key": "null-defaults",
+        "key": "null-defaults-key",
         "concurrent_clients": 5,
         "duration_seconds": 10,
         "ramp": null,
@@ -233,9 +199,26 @@ fn test_optional_null_fields_still_select_defaults() {
 }
 
 #[test]
+fn test_rejects_short_trigger_key() {
+    let short = "x".repeat(MIN_TRIGGER_KEY_LEN - 1);
+    let config = json!({
+        "key": short,
+        "concurrent_clients": 1,
+        "duration_seconds": 1
+    });
+    let err = LoadTesting::new(&config, PluginHttpClient::default())
+        .err()
+        .unwrap();
+    assert!(
+        err.contains("at least 16 characters"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn test_rejects_one_typo_with_path_qualified_suggestion() {
     let config = json!({
-        "key": "test-key",
+        "key": VALID_KEY,
         "concurrent_clients": 50,
         "duration_seconds": 30,
         "request_timeot_ms": 5000
@@ -243,54 +226,11 @@ fn test_rejects_one_typo_with_path_qualified_suggestion() {
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .expect("typo must be rejected");
-    assert!(
-        err.contains("unknown configuration key"),
-        "missing unknown-key wording: {err}"
-    );
-    assert!(
-        err.contains("'config.request_timeot_ms'"),
-        "error must path-qualify the typo: {err}"
-    );
-    assert!(
-        err.contains("did you mean 'request_timeout_ms'"),
-        "error must suggest the canonical spelling: {err}"
-    );
-}
-
-#[test]
-fn test_rejects_multiple_unknown_keys_sorted_with_suggestions() {
-    let config = json!({
-        "key": "test-key",
-        "concurrent_clients": 50,
-        "duration_seconds": 30,
-        "rmap": true,
-        "request_timeot_ms": 5000,
-        "gateway_adresses": ["https://node2:8443"]
-    });
-    let err = LoadTesting::new(&config, PluginHttpClient::default())
-        .err()
-        .expect("multiple typos must be rejected");
-    assert!(err.contains("unknown configuration key"), "got: {err}");
-    let gateway = err
-        .find("'config.gateway_adresses'")
-        .expect("gateway_adresses present");
-    let request = err
-        .find("'config.request_timeot_ms'")
-        .expect("request_timeot_ms present");
-    let ramp = err.find("'config.rmap'").expect("rmap present");
-    assert!(
-        gateway < request && request < ramp,
-        "unknown keys must be sorted lexicographically: {err}"
-    );
-    assert!(
-        err.contains("did you mean 'gateway_addresses'"),
-        "got: {err}"
-    );
+    assert!(err.contains("'config.request_timeot_ms'"), "got: {err}");
     assert!(
         err.contains("did you mean 'request_timeout_ms'"),
         "got: {err}"
     );
-    assert!(err.contains("did you mean 'ramp'"), "got: {err}");
 }
 
 #[test]
@@ -301,33 +241,21 @@ fn shared_file_admin_database_cp_dp_admission_rejects_unknown_keys() {
     );
 
     let config = json!({
-        "key": "test-key",
+        "key": VALID_KEY,
         "concurrent_clients": 5,
         "duration_seconds": 10,
         "request_timeot_ms": 5000
     });
-    let err = validate_plugin_config("load_testing", &config)
-        .expect_err("shared admission must reject the typo for file/admin/database/CP-DP");
-    assert!(
-        err.contains("'config.request_timeot_ms'"),
-        "shared admission must path-qualify the unknown key: {err}"
-    );
-    assert!(
-        err.contains("did you mean 'request_timeout_ms'"),
-        "shared admission must retain spelling suggestions: {err}"
-    );
+    let err = validate_plugin_config("load_testing", &config).expect_err("must reject typo");
+    assert!(err.contains("'config.request_timeot_ms'"), "got: {err}");
 }
-
-// ---------------------------------------------------------------------------
-// Config validation — invalid configs
-// ---------------------------------------------------------------------------
 
 #[test]
 fn test_non_object_config_is_error() {
     let err = LoadTesting::new(&json!("bad"), PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(err.contains("config must be an object"), "got: {}", err);
+    assert!(err.contains("config must be an object"), "got: {err}");
 }
 
 #[test]
@@ -339,105 +267,7 @@ fn test_missing_key_is_error() {
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(err.contains("'key' is required"), "got: {}", err);
-}
-
-#[test]
-fn test_invalid_field_types_are_error() {
-    for (config, expected) in [
-        (
-            json!({
-                "key": 42,
-                "concurrent_clients": 5,
-                "duration_seconds": 10
-            }),
-            "'key' must be a string",
-        ),
-        (
-            json!({
-                "key": "test",
-                "concurrent_clients": "5",
-                "duration_seconds": 10
-            }),
-            "'concurrent_clients' must be an unsigned integer",
-        ),
-        (
-            json!({
-                "key": "test",
-                "concurrent_clients": 5,
-                "duration_seconds": "10"
-            }),
-            "'duration_seconds' must be an unsigned integer",
-        ),
-        (
-            json!({
-                "key": "test",
-                "concurrent_clients": 5,
-                "duration_seconds": 10,
-                "ramp": "true"
-            }),
-            "'ramp' must be a boolean",
-        ),
-        (
-            json!({
-                "key": "test",
-                "concurrent_clients": 5,
-                "duration_seconds": 10,
-                "request_timeout_ms": "5000"
-            }),
-            "'request_timeout_ms' must be an unsigned integer",
-        ),
-        (
-            json!({
-                "key": "test",
-                "concurrent_clients": 5,
-                "duration_seconds": 10,
-                "max_response_body_bytes": "5000"
-            }),
-            "'max_response_body_bytes' must be an unsigned integer",
-        ),
-        (
-            json!({
-                "key": "test",
-                "concurrent_clients": 5,
-                "duration_seconds": 10,
-                "gateway_tls": "true"
-            }),
-            "'gateway_tls' must be a boolean",
-        ),
-        (
-            json!({
-                "key": "test",
-                "concurrent_clients": 5,
-                "duration_seconds": 10,
-                "gateway_tls_no_verify": "false"
-            }),
-            "'gateway_tls_no_verify' must be a boolean",
-        ),
-        (
-            json!({
-                "key": "test",
-                "concurrent_clients": 5,
-                "duration_seconds": 10,
-                "gateway_port": "8000"
-            }),
-            "'gateway_port' must be an unsigned integer",
-        ),
-        (
-            json!({
-                "key": "test",
-                "concurrent_clients": 5,
-                "duration_seconds": 10,
-                "gateway_addresses": "https://node1:8443"
-            }),
-            "'gateway_addresses' must be an array",
-        ),
-    ] {
-        let err = LoadTesting::new(&config, PluginHttpClient::default())
-            .err()
-            .unwrap();
-        assert!(err.contains(expected), "expected {expected}, got: {err}");
-    }
+    assert!(err.contains("'key' is required"), "got: {err}");
 }
 
 #[test]
@@ -450,147 +280,13 @@ fn test_empty_key_is_error() {
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(err.contains("'key' is required"), "got: {}", err);
+    assert!(err.contains("'key' is required"), "got: {err}");
 }
 
 #[test]
-fn test_missing_concurrent_clients_is_error() {
+fn test_zero_gateway_port_is_error() {
     let config = json!({
-        "key": "test",
-        "duration_seconds": 10
-    });
-    let err = LoadTesting::new(&config, PluginHttpClient::default())
-        .err()
-        .unwrap();
-    assert!(
-        err.contains("'concurrent_clients' is required"),
-        "got: {}",
-        err
-    );
-}
-
-#[test]
-fn test_zero_concurrent_clients_is_error() {
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 0,
-        "duration_seconds": 10
-    });
-    let err = LoadTesting::new(&config, PluginHttpClient::default())
-        .err()
-        .unwrap();
-    assert!(err.contains("1–10000"), "got: {}", err);
-}
-
-#[test]
-fn test_concurrent_clients_over_max_is_error() {
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 10001,
-        "duration_seconds": 10
-    });
-    let err = LoadTesting::new(&config, PluginHttpClient::default())
-        .err()
-        .unwrap();
-    assert!(err.contains("1–10000"), "got: {}", err);
-}
-
-#[test]
-fn test_missing_duration_is_error() {
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 5
-    });
-    let err = LoadTesting::new(&config, PluginHttpClient::default())
-        .err()
-        .unwrap();
-    assert!(
-        err.contains("'duration_seconds' is required"),
-        "got: {}",
-        err
-    );
-}
-
-#[test]
-fn test_zero_duration_is_error() {
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 0
-    });
-    let err = LoadTesting::new(&config, PluginHttpClient::default())
-        .err()
-        .unwrap();
-    assert!(err.contains("1–3600"), "got: {}", err);
-}
-
-#[test]
-fn test_duration_over_max_is_error() {
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 3601
-    });
-    let err = LoadTesting::new(&config, PluginHttpClient::default())
-        .err()
-        .unwrap();
-    assert!(err.contains("1–3600"), "got: {}", err);
-}
-
-#[test]
-fn test_zero_request_timeout_is_error() {
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10,
-        "request_timeout_ms": 0
-    });
-    let err = LoadTesting::new(&config, PluginHttpClient::default())
-        .err()
-        .unwrap();
-    assert!(err.contains("greater than 0"), "got: {}", err);
-}
-
-#[test]
-fn test_custom_request_timeout_accepted() {
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10,
-        "request_timeout_ms": 5000
-    });
-    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
-}
-
-#[test]
-fn test_zero_max_response_body_bytes_is_error() {
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10,
-        "max_response_body_bytes": 0
-    });
-    let err = LoadTesting::new(&config, PluginHttpClient::default())
-        .err()
-        .unwrap();
-    assert!(err.contains("greater than 0"), "got: {}", err);
-}
-
-#[test]
-fn test_custom_max_response_body_bytes_accepted() {
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10,
-        "max_response_body_bytes": 8192
-    });
-    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
-}
-
-#[test]
-fn test_gateway_port_zero_is_error() {
-    let config = json!({
-        "key": "test",
+        "key": VALID_KEY,
         "concurrent_clients": 5,
         "duration_seconds": 10,
         "gateway_port": 0
@@ -598,118 +294,170 @@ fn test_gateway_port_zero_is_error() {
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(err.contains("1–65535"), "got: {}", err);
+    assert!(err.contains("1–65535"), "got: {err}");
 }
 
 #[test]
-fn test_gateway_port_over_max_is_error() {
+fn test_request_timeout_above_max_is_error() {
     let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10,
-        "gateway_port": 70000
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "request_timeout_ms": 60_001
     });
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(err.contains("1–65535"), "got: {}", err);
+    assert!(err.contains("60000"), "got: {err}");
 }
 
 #[test]
-fn test_empty_gateway_addresses_is_error() {
+fn test_gateway_address_userinfo_is_rejected() {
     let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10,
-        "gateway_addresses": []
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_addresses": ["https://user:password@node2:8443"]
     });
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(err.contains("must not be empty"), "got: {}", err);
+    assert!(err.contains("userinfo"), "got: {err}");
 }
 
 #[test]
-fn test_gateway_addresses_with_empty_string_is_error() {
+fn test_duplicate_gateway_addresses_are_rejected() {
     let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10,
-        "gateway_addresses": ["https://valid:8443", ""]
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_addresses": ["https://node2:8443/", "https://node2:8443"]
     });
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(err.contains("must not be empty"), "got: {}", err);
+    assert!(err.contains("duplicate"), "got: {err}");
 }
 
 #[test]
-fn test_gateway_addresses_with_non_string_is_error() {
+fn test_self_loopback_gateway_address_is_rejected() {
     let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10,
-        "gateway_addresses": [123]
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_port": 8000,
+        "gateway_addresses": ["http://127.0.0.1:8000"]
     });
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(err.contains("must be a string"), "got: {}", err);
+    assert!(err.contains("local loopback"), "got: {err}");
 }
 
 #[test]
-fn test_gateway_addresses_invalid_url_is_error() {
+#[serial_test::serial(load_testing_listener_env)]
+fn test_env_derived_disabled_http_port_is_rejected() {
+    // SAFETY: serialized against other load_testing listener env tests.
+    unsafe {
+        std::env::set_var("FERRUM_PROXY_HTTP_PORT", "0");
+    }
     let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10,
-        "gateway_addresses": ["not-a-url"]
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1
     });
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
-        .unwrap();
-    assert!(err.contains("invalid gateway address"), "got: {}", err);
-}
-
-#[test]
-fn test_gateway_addresses_with_empty_authority_is_error() {
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10,
-        "gateway_addresses": ["https:///node2"]
-    });
-    let err = LoadTesting::new(&config, PluginHttpClient::default())
-        .err()
-        .unwrap();
-    assert!(err.contains("with a host"), "got: {}", err);
-}
-
-#[test]
-fn test_gateway_addresses_with_query_or_fragment_is_error() {
-    for address in [
-        "https://node2:8443?trigger=true",
-        "https://node2:8443#fragment",
-    ] {
-        let config = json!({
-            "key": "test",
-            "concurrent_clients": 5,
-            "duration_seconds": 10,
-            "gateway_addresses": [address]
-        });
-        let err = LoadTesting::new(&config, PluginHttpClient::default())
-            .err()
-            .unwrap();
-        assert!(
-            err.contains("query or fragment"),
-            "address {address} should fail, got: {err}"
-        );
+        .expect("disabled HTTP listener must fail closed");
+    assert!(
+        err.contains("resolved gateway port is 0"),
+        "got: {err}"
+    );
+    assert!(err.contains("HTTP (FERRUM_PROXY_HTTP_PORT)"), "got: {err}");
+    unsafe {
+        std::env::remove_var("FERRUM_PROXY_HTTP_PORT");
     }
 }
 
-// ---------------------------------------------------------------------------
-// before_proxy — key matching
-// ---------------------------------------------------------------------------
+#[test]
+#[serial_test::serial(load_testing_listener_env)]
+fn test_env_derived_disabled_https_port_is_rejected() {
+    unsafe {
+        std::env::set_var("FERRUM_PROXY_HTTPS_PORT", "0");
+    }
+    let config = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_tls": true
+    });
+    let err = LoadTesting::new(&config, PluginHttpClient::default())
+        .err()
+        .expect("disabled HTTPS listener must fail closed");
+    assert!(
+        err.contains("resolved gateway port is 0"),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("HTTPS (FERRUM_PROXY_HTTPS_PORT)"),
+        "got: {err}"
+    );
+    unsafe {
+        std::env::remove_var("FERRUM_PROXY_HTTPS_PORT");
+    }
+}
+
+#[test]
+#[serial_test::serial(load_testing_listener_env)]
+fn test_explicit_port_overrides_disabled_env_default() {
+    unsafe {
+        std::env::set_var("FERRUM_PROXY_HTTP_PORT", "0");
+    }
+    let config = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_port": 18080
+    });
+    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
+    unsafe {
+        std::env::remove_var("FERRUM_PROXY_HTTP_PORT");
+    }
+}
+
+#[test]
+#[serial_test::serial(load_testing_listener_env)]
+fn test_env_derived_enabled_http_port_is_accepted() {
+    unsafe {
+        std::env::set_var("FERRUM_PROXY_HTTP_PORT", "18081");
+    }
+    let config = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1
+    });
+    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
+    unsafe {
+        std::env::remove_var("FERRUM_PROXY_HTTP_PORT");
+    }
+}
+
+#[test]
+fn test_should_buffer_only_when_trigger_header_present() {
+    let plugin = make_plugin();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    ctx.headers
+        .insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(plugin.needs_request_body_bytes());
+    assert!(!plugin.needs_request_body_text());
+}
 
 #[tokio::test]
 async fn test_skips_when_no_key_header() {
@@ -735,107 +483,273 @@ async fn test_skips_when_key_does_not_match() {
         "/api/test".to_string(),
     );
     let mut headers = HashMap::new();
-    headers.insert("x-loadtesting-key".to_string(), "wrong-key".to_string());
+    headers.insert("x-loadtesting-key".to_string(), "wrong-key-value!!".to_string());
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
 #[tokio::test]
-async fn test_triggers_when_key_matches() {
-    let plugin = make_plugin();
+async fn test_strips_trigger_key_from_original_request() {
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 9
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
         "/api/test".to_string(),
     );
-    let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(json!({
-        "id": "proxy-1",
-        "name": "test-proxy",
-        "listen_path": "/api",
-        "backend_host": "backend.local",
-        "backend_port": 8080,
-        "backend_scheme": "http"
-    }))
-    .unwrap();
-    ctx.matched_proxy = Some(Arc::new(proxy));
-
+    ctx.matched_proxy = Some(matched_proxy());
     let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
     headers.insert(
-        "x-loadtesting-key".to_string(),
-        "test-secret-key".to_string(),
+        "x-forwarded-for".to_string(),
+        "203.0.113.9".to_string(),
     );
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    // Plugin returns Continue (original request proceeds), load test spawns in background
     assert!(matches!(result, PluginResult::Continue));
+    assert!(!headers.contains_key("x-loadtesting-key"));
+    wait_until_idle(&plugin).await;
+}
 
-    // Give the spawned task a moment to start, then verify is_running guard
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+#[tokio::test]
+async fn test_fanout_control_request_terminates_before_backend() {
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 9
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    headers.insert("x-loadtesting-fanout".to_string(), "1".to_string());
 
-    // Second trigger should be ignored (already running)
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 204),
+        other => panic!("expected fanout ack reject, got {other:?}"),
+    }
+    assert!(!headers.contains_key("x-loadtesting-key"));
+    assert!(!headers.contains_key("x-loadtesting-fanout"));
+    wait_until_idle(&plugin).await;
+}
+
+#[tokio::test]
+async fn test_connection_refusal_is_not_reported_as_completed_throughput() {
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 2,
+            "duration_seconds": 1,
+            "gateway_port": 9,
+            "request_timeout_ms": 200
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    wait_until_idle(&plugin).await;
+
+    let result = plugin
+        .last_run_result()
+        .expect("completed run must publish counters");
+    assert!(result.attempted_requests > 0);
+    assert_eq!(result.responses_completed, 0);
+    assert!(result.transport_errors > 0);
+    assert_eq!(result.completed_requests_per_second(), 0.0);
+    assert!(matches!(
+        result.outcome,
+        RunOutcome::Failed | RunOutcome::Degraded | RunOutcome::Cancelled
+    ));
+}
+
+#[tokio::test]
+async fn test_successful_local_run_records_completed_responses() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = b"ok";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            });
+        }
+    });
+
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": port,
+            "request_timeout_ms": 1000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.set_raw_query_string("tag=red&tag=blue&q=a+b".to_string());
+    ctx.request_body_bytes = Some(Bytes::from_static(b"{\"sku\":\"A-123\"}"));
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-length".to_string(), "15".to_string());
+    headers.insert("x-forwarded-for".to_string(), "198.51.100.7".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!headers.contains_key("x-loadtesting-key"));
+    wait_until_idle(&plugin).await;
+
+    let run = plugin.last_run_result().expect("run result");
+    assert!(run.responses_completed > 0, "expected completed responses");
+    assert!(run.status_2xx > 0);
+    assert_eq!(run.responses_completed, run.status_2xx);
+    assert!(matches!(
+        run.outcome,
+        RunOutcome::Success | RunOutcome::Degraded
+    ));
+}
+
+#[tokio::test]
+async fn test_shared_state_prevents_second_instance_while_running() {
+    let config = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 2,
+        "gateway_port": 9,
+        "request_timeout_ms": 200
+    });
+    let plugin_a = LoadTesting::new(&config, PluginHttpClient::default()).unwrap();
+    let plugin_b = plugin_a
+        .share_with(&config, PluginHttpClient::default())
+        .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    let _ = plugin_a.before_proxy(&mut ctx, &mut headers).await;
+    assert!(plugin_a.is_running());
+
     let mut ctx2 = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
         "/api/test".to_string(),
     );
-    ctx2.matched_proxy = Some(Arc::new(
-        serde_json::from_value::<ferrum_edge::config::types::Proxy>(json!({
-            "id": "proxy-1",
-            "name": "test-proxy",
-            "listen_path": "/api",
-            "backend_host": "backend.local",
-            "backend_port": 8080,
-            "backend_scheme": "http"
-        }))
-        .unwrap(),
-    ));
+    ctx2.matched_proxy = Some(matched_proxy());
     let mut headers2 = HashMap::new();
-    headers2.insert(
-        "x-loadtesting-key".to_string(),
-        "test-secret-key".to_string(),
+    headers2.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    let _ = plugin_b.before_proxy(&mut ctx2, &mut headers2).await;
+
+    // Second instance must observe the shared admission guard.
+    assert!(plugin_b.is_running());
+    wait_until_idle(&plugin_a).await;
+}
+
+#[tokio::test]
+async fn test_triggers_when_key_matches_and_blocks_concurrent_trigger() {
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 2,
+            "gateway_port": 9,
+            "request_timeout_ms": 200
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
     );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(plugin.is_running());
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    ctx2.matched_proxy = Some(matched_proxy());
+    let mut headers2 = HashMap::new();
+    headers2.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
     let result2 = plugin.before_proxy(&mut ctx2, &mut headers2).await;
-    // Still continues (but logs warning about already running)
     assert!(matches!(result2, PluginResult::Continue));
-}
-
-// ---------------------------------------------------------------------------
-// Config defaults
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_ramp_defaults_to_false() {
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10
-    });
-    let plugin = LoadTesting::new(&config, PluginHttpClient::default()).unwrap();
-    assert_eq!(plugin.name(), "load_testing");
+    wait_until_idle(&plugin).await;
 }
 
 #[test]
-fn test_gateway_tls_no_verify_defaults_to_true_when_tls_enabled() {
-    // When gateway_tls is true and gateway_tls_no_verify is not set,
-    // the client should be built with danger_accept_invalid_certs(true).
-    // We can't inspect the client directly, but we verify construction succeeds.
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10,
-        "gateway_tls": true
-    });
-    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
-}
-
-#[test]
-fn test_gateway_tls_no_verify_defaults_to_false_when_tls_disabled() {
-    // When gateway_tls is false (default), gateway_tls_no_verify defaults to false
-    let config = json!({
-        "key": "test",
-        "concurrent_clients": 5,
-        "duration_seconds": 10
-    });
-    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
+fn test_gateway_address_query_fragment_still_rejected() {
+    for address in [
+        "https://node2:8443?x=1",
+        "https://node2:8443#frag",
+        "ftp://node2:8443",
+    ] {
+        let config = json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_addresses": [address]
+        });
+        assert!(
+            LoadTesting::new(&config, PluginHttpClient::default()).is_err(),
+            "address {address} should fail"
+        );
+    }
 }

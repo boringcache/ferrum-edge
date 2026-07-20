@@ -2440,11 +2440,11 @@ async fn test_admin_create_rejects_unknown_load_testing_keys() {
         "scope": "global",
         "enabled": true,
         "config": {
-            "key": "test-key",
+            "key": "test-key-16chars!",
             "concurrent_clients": 5,
             "duration_seconds": 10,
             "request_timeot_ms": 5000,
-            "gateway_adresses": ["https://127.0.0.1:8443"]
+            "gateway_adresses": ["https://10.0.0.2:8443"]
         }
     });
     let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;

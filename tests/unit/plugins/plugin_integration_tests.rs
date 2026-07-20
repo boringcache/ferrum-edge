@@ -331,7 +331,7 @@ async fn test_plugin_creation_all_plugins() {
             }
             "request_mirror" => json!({"mirror_host": "mirror.local"}),
             "load_testing" => {
-                json!({"key": "test-key", "concurrent_clients": 5, "duration_seconds": 10})
+                json!({"key": "test-key-16chars!", "concurrent_clients": 5, "duration_seconds": 10})
             }
             "response_mock" => json!({"rules": [{"path": "/test", "body": "mock"}]}),
             "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),

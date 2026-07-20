@@ -2714,7 +2714,7 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         (
             "load_testing",
             json!({
-                "key": "test-key",
+                "key": "test-key-16chars!",
                 "concurrent_clients": 1,
                 "duration_seconds": 1,
                 "max_response_body_bytes": 1024
@@ -3454,7 +3454,7 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     assert!(load_testing_docs.contains("Unknown top-level keys"));
 
     let valid = json!({
-        "key": "parity-key",
+        "key": "parity-key-16chr",
         "concurrent_clients": 10,
         "duration_seconds": 30,
         "ramp": true,
@@ -3463,13 +3463,13 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
         "gateway_port": 8443,
         "gateway_tls": true,
         "gateway_tls_no_verify": true,
-        "gateway_addresses": ["https://127.0.0.1:8443"]
+        "gateway_addresses": ["https://10.0.0.2:8443"]
     });
     assert_component_validity(&spec, "LoadTestingConfig", &valid, true);
     assert!(LoadTesting::new(&valid, PluginHttpClient::default()).is_ok());
 
     let valid_minima = json!({
-        "key": "min-key",
+        "key": "sixteen-char-key",
         "concurrent_clients": 1,
         "duration_seconds": 1
     });
@@ -3477,7 +3477,7 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     assert!(LoadTesting::new(&valid_minima, PluginHttpClient::default()).is_ok());
 
     let valid_null_defaults = json!({
-        "key": "null-defaults",
+        "key": "null-defaults-key",
         "concurrent_clients": 1,
         "duration_seconds": 1,
         "ramp": null,
@@ -3493,20 +3493,20 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
 
     let runtime_and_schema_invalid = [
         json!({
-            "key": "k",
+            "key": "sixteen-char-key",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "request_timeot_ms": 5000
         }),
         json!({
-            "key": "k",
+            "key": "sixteen-char-key",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "rmap": true,
-            "gateway_adresses": ["https://127.0.0.1:8443"]
+            "gateway_adresses": ["https://10.0.0.2:8443"]
         }),
         json!({
-            "key": "k",
+            "key": "sixteen-char-key",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "aaa_extra": 1,
@@ -3514,14 +3514,31 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
         }),
         json!({}),
         json!({
-            "key": "k",
+            "key": "sixteen-char-key",
             "concurrent_clients": 0,
             "duration_seconds": 1
         }),
         json!({
-            "key": "k",
+            "key": "sixteen-char-key",
             "concurrent_clients": 1,
             "duration_seconds": 0
+        }),
+        json!({
+            "key": "short-key",
+            "concurrent_clients": 1,
+            "duration_seconds": 1
+        }),
+        json!({
+            "key": "sixteen-char-key",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "request_timeout_ms": 60001
+        }),
+        json!({
+            "key": "sixteen-char-key",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 0
         }),
     ];
     for config in runtime_and_schema_invalid {

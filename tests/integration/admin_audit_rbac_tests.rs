@@ -375,7 +375,7 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
     let (base, _shutdown) = start_admin(state).await;
     let admin = token("security-admin", Some("admin"));
 
-    let secret_key = "super-secret-load-test-key";
+    let secret_key = "super-secret-load-test-key!";
     let plugin = json!({
         "id": "audit-plugin-secret",
         "plugin_name": "load_testing",
@@ -420,7 +420,7 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
     let viewer = token("view-only", Some("viewer"));
     let operator = token("mesh-operator", Some("operator"));
 
-    let secret_key = "read-secret-load-test-key";
+    let secret_key = "read-secret-load-test-key!";
     let plugin = json!({
         "id": "read-plugin-secret",
         "plugin_name": "load_testing",

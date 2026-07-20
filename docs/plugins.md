@@ -3600,31 +3600,35 @@ config:
 
 ### `load_testing`
 
-Enables on-demand load testing of a proxy's backend by sending concurrent requests through the gateway's own proxy listener. Triggered when a request includes an `X-Loadtesting-Key` header matching the configured secret key. The triggering request proceeds normally; the load test runs in the background.
+Enables on-demand load testing of a proxy's backend by sending concurrent requests through the gateway's own proxy listener. Triggered when a request includes an `X-Loadtesting-Key` header matching the configured secret key. The triggering request proceeds normally after the key is stripped; the load test runs in the background.
 
 **Priority:** 3080
 **Protocols:** HTTP
 
-Synthetic requests are sent to `127.0.0.1:{gateway_port}` without the `X-Loadtesting-Key` header, so they flow through the full proxy pipeline (routing, auth, rate limiting, backend dispatch, logging) without re-triggering the load test. The gateway's native transaction logging captures every synthetic request automatically. An `AtomicBool` guard prevents concurrent load tests on the same proxy.
+Synthetic requests are sent to `127.0.0.1:{gateway_port}` without the `X-Loadtesting-Key` header, so they flow through the full proxy pipeline (routing, auth, rate limiting, backend dispatch, logging) without re-triggering the load test. The gateway's native transaction logging captures every synthetic request automatically. Shared run-admission state (keyed by plugin-config identity) prevents concurrent cohorts across reload generations for the same instance, and a process-wide active-client budget caps aggregate detached work.
 
-For multi-node deployments, `gateway_addresses` fans out the trigger (WITH the key) to remote gateway nodes, so each starts its own independent local load test.
+For multi-node deployments, `gateway_addresses` fans out once from the originating controller (WITH the key plus `X-Loadtesting-Fanout: 1`). Peer receivers start a local cohort only, never re-fanout, and terminate the control request with `204` before backend dispatch.
 
-For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: true`. Since the gateway's frontend cert typically won't match `127.0.0.1`, `gateway_tls_no_verify` defaults to `true` when TLS is enabled. This only affects the loopback connection — backend TLS uses the normal CA trust chain.
+For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: true`. A resolved gateway port of `0` (Ferrum's disabled-listener sentinel from `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`) is rejected at admission. Since the gateway's frontend cert typically won't match `127.0.0.1`, `gateway_tls_no_verify` defaults to `true` when TLS is enabled. This only affects the loopback connection — backend TLS uses the normal CA trust chain.
+
+**Request fidelity:** Matching triggers buffer the request body (binary-safe via `request_body_bytes`) and replay the original raw query string on every synthetic and fan-out request. Non-trigger requests stay on the ordinary no-buffer hot path. Synthetic/fan-out headers use Ferrum's canonical backend strip predicates and omit client-supplied `X-Forwarded-*` identity; `Content-Length` is never copied — reqwest derives framing from the attached body.
+
+**Completion metrics:** The finish log reports unambiguous counters — `attempted_requests`, `responses_received`, `responses_completed`, `responses_truncated`, `response_body_errors`, `transport_errors`, HTTP status classes, `worker_failures`, `cancelled_workers`, and separate `completed_requests_per_second` / `attempted_requests_per_second`. Outcome is `Success`, `Degraded`, `Failed`, or `Cancelled`. Attempt-only loops are never labeled as completed throughput.
 
 **Strict config admission:** Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions when the typo is close enough (for example `request_timeot_ms` → `request_timeout_ms`). File mode, admin/database writes, and CP/DP distribution share the same constructor validation via `validate_plugin_config`. The plugin is registered as `KeepLastKnownGood`: an invalid reload or DP candidate is rejected and the previously published generation stays active. Optional recognized fields may still be omitted or set to `null` to select defaults; wrong types and out-of-range values continue to fail closed.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `key` | String | **(required)** | Value that `X-Loadtesting-Key` must match to trigger |
+| `key` | String | **(required)** | Value that `X-Loadtesting-Key` must match (≥16 chars). Stripped from the original request before backend dispatch |
 | `concurrent_clients` | Integer | **(required)** | Number of concurrent virtual clients (1–10,000) |
-| `duration_seconds` | Integer | **(required)** | How long the test runs in seconds (1–3,600) |
+| `duration_seconds` | Integer | **(required)** | Absolute run deadline in seconds (1–3,600). In-flight attempts are capped to the remaining deadline |
 | `ramp` | Boolean | `false` | Gradually start clients over the duration instead of all at once (see ramp example below) |
-| `request_timeout_ms` | Integer | `30000` | Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll) |
+| `request_timeout_ms` | Integer | `30000` | Per-request timeout in milliseconds (1–60,000), further capped to the remaining run deadline |
 | `max_response_body_bytes` | Integer | `1048576` (1 MiB) | Maximum response bytes the synthetic client consumes per request; must be greater than zero. The client stops reading at the cap, bounding its own work and memory without changing the backend response |
-| `gateway_port` | Integer | env or 8000/8443 | Local gateway port for synthetic requests. Reads `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls` is enabled) |
+| `gateway_port` | Integer | env or 8000/8443 | Local gateway port for synthetic requests (1–65535). Reads `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls` is enabled). Resolved `0` is rejected |
 | `gateway_tls` | Boolean | `false` | Use HTTPS for local loopback synthetic requests |
 | `gateway_tls_no_verify` | Boolean | `true` when `gateway_tls` on | Skip TLS cert verification for loopback only |
-| `gateway_addresses` | Array | _(none)_ | Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header |
+| `gateway_addresses` | Array | _(none)_ | Unique remote gateway URLs for one-hop fan-out. No userinfo/query/fragment; self/loopback duplicates of the local target are rejected |
 
 **Ramp behavior:** When `ramp: true`, all client tasks are spawned immediately but each sleeps a stagger delay before sending requests. The delay for client _i_ is `duration * i / concurrent_clients`. All clients share the same deadline, so later clients get less sending time.
 
@@ -3657,6 +3661,7 @@ config:
   concurrent_clients: 50
   duration_seconds: 30
   ramp: true
+  request_timeout_ms: 30000
   max_response_body_bytes: 1048576
   gateway_tls: true
   gateway_port: 8443

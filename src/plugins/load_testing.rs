@@ -6,25 +6,24 @@
 //!
 //! ## How it works
 //!
-//! When a matching key is received in `before_proxy`, the plugin spawns a
-//! background load test that sends concurrent requests back through the
-//! gateway's local listener (`127.0.0.1:{gateway_port}`). Because synthetic
-//! requests omit the `X-Loadtesting-Key` header, they flow through the full
-//! proxy pipeline (routing, auth, rate limiting, backend dispatch, logging)
-//! without re-triggering the load test — the gateway's native transaction
-//! logging captures every synthetic request automatically.
+//! When a matching key is received in `before_proxy`, the plugin strips the
+//! trigger key from the original request (so backends and earlier mirrors that
+//! already copied headers cannot reuse a post-trigger observation from this
+//! request path), then spawns a background load test that sends concurrent
+//! requests back through the gateway's local listener
+//! (`127.0.0.1:{gateway_port}`). Synthetic requests omit the trigger key, so
+//! they flow through the full proxy pipeline without re-triggering the load
+//! test. Native transaction logging captures every synthetic request.
 //!
 //! The triggering request itself proceeds normally through the proxy pipeline
 //! and is not blocked by the load test.
 //!
 //! ## Multi-node fan-out
 //!
-//! When `gateway_addresses` is configured, the plugin forwards the trigger
-//! request (WITH the `X-Loadtesting-Key` header) to each remote gateway node
-//! as a fire-and-forget call. Each remote node's `load_testing` plugin
-//! instance picks up the key and starts its own independent local load test.
-//! This way, a single trigger request fans out to all nodes and each node
-//! tests its own backend connections locally.
+//! When `gateway_addresses` is configured, the originating controller fans out
+//! once with `X-Loadtesting-Fanout: 1`. Peer nodes that accept a fan-out
+//! trigger start a local cohort only — they never re-fanout — and terminate
+//! the control request before backend dispatch.
 //!
 //! ## HTTPS loopback
 //!
@@ -33,73 +32,42 @@
 //! Since the gateway's frontend TLS cert is typically issued for an external
 //! domain (not `127.0.0.1`), `gateway_tls_no_verify` (default `true` when
 //! `gateway_tls` is enabled) skips certificate verification for the loopback
-//! connection only. This does NOT affect the backend TLS path — the proxy
-//! pipeline's backend connection uses the normal CA trust chain regardless.
+//! connection only.
 //!
 //! ## Caveats
 //!
 //! - **Auth forwarding**: Synthetic requests forward the triggering request's
-//!   headers (minus `X-Loadtesting-Key` and hop-by-hop headers). For auth
-//!   schemes with short-lived tokens (e.g., HMAC with timestamps), tokens may
+//!   headers (minus the trigger key, hop-by-hop headers, and client-supplied
+//!   forwarding identity). For auth schemes with short-lived tokens, tokens may
 //!   expire during long-duration tests.
 //! - **Rate limiting**: Synthetic requests pass through rate limiting plugins
 //!   on the proxy. High `concurrent_clients` values may trigger rate limits.
-//!   This is realistic (tests the full pipeline) but may reduce effective
-//!   throughput if rate limits are tight.
 //!
-//! ## Configuration
-//!
-//! ```json
-//! {
-//!   "key": "my-secret-load-test-key",
-//!   "concurrent_clients": 10,
-//!   "duration_seconds": 30,
-//!   "ramp": false,
-//!   "gateway_port": 8443,
-//!   "gateway_tls": true,
-//!   "gateway_tls_no_verify": true,
-//!   "gateway_addresses": ["https://node2:8443", "https://node3:8443"]
-//! }
-//! ```
-//!
-//! | Field | Type | Default | Description |
-//! |-------|------|---------|-------------|
-//! | `key` | string | **(required)** | Value that `X-Loadtesting-Key` must match to trigger |
-//! | `concurrent_clients` | u64 | **(required)** | Number of concurrent virtual clients (1–10,000) |
-//! | `duration_seconds` | u64 | **(required)** | How long the test runs (1–3,600) |
-//! | `ramp` | bool | `false` | When true, clients start gradually over the duration instead of all at once |
-//! | `gateway_port` | u16 | `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls`) or 8000/8443 | Local gateway port for synthetic requests |
-//! | `gateway_tls` | bool | `false` | Use HTTPS for local loopback synthetic requests |
-//! | `gateway_tls_no_verify` | bool | `true` when `gateway_tls` is enabled | Skip TLS certificate verification for loopback connections (the gateway cert typically won't match `127.0.0.1`) |
-//! | `request_timeout_ms` | u64 | `30000` | Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll). Must be > 0 |
-//! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Maximum response bytes the synthetic client consumes per request; must be greater than zero. The client stops reading at the cap, bounding per-worker work and memory without changing the backend response |
-//! | `gateway_addresses` | string[] | (none) | Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header so it starts its own local load test |
-//!
-//! Unknown top-level keys are rejected with path-qualified diagnostics (and
-//! spelling suggestions when close). File, admin/database, and CP/DP admission
-//! share `validate_plugin_config` / constructor validation. Serving-mode
-//! publication uses `KeepLastKnownGood`: an invalid candidate generation is
-//! rejected and the prior valid plugin generation remains active.
+//! Unknown top-level keys are rejected with path-qualified diagnostics.
+//! Serving-mode publication uses `KeepLastKnownGood`.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
-use url::{Url, form_urlencoded};
+use url::Url;
 
 use super::utils::auth_flow::constant_time_eq;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::dns::DnsCacheResolver;
+use crate::proxy::headers::{
+    is_backend_request_strip_header, is_proxy_generated_forwarding_header,
+};
+use crate::retry::classify_reqwest_error;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Authoritative closed set of top-level `load_testing` configuration keys.
-///
-/// Constructor admission, OpenAPI `LoadTestingConfig`, and operator docs must
-/// stay in lockstep with this list.
 pub const LOAD_TESTING_CONFIG_KEYS: &[&str] = &[
     "concurrent_clients",
     "duration_seconds",
@@ -113,30 +81,244 @@ pub const LOAD_TESTING_CONFIG_KEYS: &[&str] = &[
     "request_timeout_ms",
 ];
 
+/// Minimum accepted trigger-key length. Short reusable keys are rejected at
+/// admission so a weak shared secret is harder to guess or leak into logs.
+pub const MIN_TRIGGER_KEY_LEN: usize = 16;
+
+/// Hard ceiling for per-request timeout (independent of run duration).
+pub const MAX_REQUEST_TIMEOUT_MS: u64 = 60_000;
+
+/// Process-wide admission budget across every effective load_testing instance.
+const MAX_PROCESS_ACTIVE_CLIENTS: u64 = 10_000;
+
+const HEADER_TRIGGER_KEY: &str = "x-loadtesting-key";
+const HEADER_FANOUT: &str = "x-loadtesting-fanout";
+const FANOUT_MARKER: &str = "1";
+
+static PROCESS_ACTIVE_CLIENTS: AtomicU64 = AtomicU64::new(0);
+static SHARED_STATES: OnceLock<Mutex<HashMap<String, Weak<LoadTestingState>>>> = OnceLock::new();
+
+/// Stable run-admission state shared across compatible plugin-cache generations
+/// for one plugin-config identity.
+pub(crate) struct LoadTestingState {
+    is_running: AtomicBool,
+    run_cancel: Mutex<CancellationToken>,
+    last_result: Mutex<Option<RunResult>>,
+}
+
+impl LoadTestingState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            is_running: AtomicBool::new(false),
+            run_cancel: Mutex::new(CancellationToken::new()),
+            last_result: Mutex::new(None),
+        })
+    }
+
+    fn begin_run(&self) -> Option<CancellationToken> {
+        if self
+            .is_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        let token = CancellationToken::new();
+        let mut guard = self
+            .run_cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Cancel any residual token from a prior generation edge case.
+        guard.cancel();
+        *guard = token.clone();
+        Some(token)
+    }
+
+    fn end_run(&self, result: RunResult) {
+        if let Ok(mut guard) = self.last_result.lock() {
+            *guard = Some(result);
+        }
+        self.is_running.store(false, Ordering::Release);
+    }
+
+    fn cancel_active_run(&self) {
+        let guard = self
+            .run_cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.cancel();
+    }
+}
+
+impl Drop for LoadTestingState {
+    fn drop(&mut self) {
+        self.cancel_active_run();
+        self.is_running.store(false, Ordering::Release);
+    }
+}
+
+/// Aggregated completion counters for one load-test cohort.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunResult {
+    pub outcome: RunOutcome,
+    pub attempted_requests: u64,
+    pub responses_received: u64,
+    pub responses_completed: u64,
+    pub responses_truncated: u64,
+    pub response_body_errors: u64,
+    pub transport_errors: u64,
+    pub status_2xx: u64,
+    pub status_3xx: u64,
+    pub status_4xx: u64,
+    pub status_5xx: u64,
+    pub status_other: u64,
+    pub worker_failures: u64,
+    pub cancelled_workers: u64,
+    pub aggregation_saturated: bool,
+    pub elapsed_ms: u64,
+}
+
+impl RunResult {
+    pub fn completed_requests_per_second(&self) -> f64 {
+        if self.elapsed_ms == 0 {
+            return 0.0;
+        }
+        self.responses_completed as f64 / (self.elapsed_ms as f64 / 1000.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunOutcome {
+    #[default]
+    Success,
+    Degraded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Default)]
+struct WorkerCounters {
+    attempted_requests: u64,
+    responses_received: u64,
+    responses_completed: u64,
+    responses_truncated: u64,
+    response_body_errors: u64,
+    transport_errors: u64,
+    status_2xx: u64,
+    status_3xx: u64,
+    status_4xx: u64,
+    status_5xx: u64,
+    status_other: u64,
+}
+
+impl WorkerCounters {
+    fn saturating_add_into(&self, total: &mut Self) -> bool {
+        let mut saturated = false;
+        saturated |= saturating_add_assign(&mut total.attempted_requests, self.attempted_requests);
+        saturated |= saturating_add_assign(&mut total.responses_received, self.responses_received);
+        saturated |=
+            saturating_add_assign(&mut total.responses_completed, self.responses_completed);
+        saturated |=
+            saturating_add_assign(&mut total.responses_truncated, self.responses_truncated);
+        saturated |=
+            saturating_add_assign(&mut total.response_body_errors, self.response_body_errors);
+        saturated |= saturating_add_assign(&mut total.transport_errors, self.transport_errors);
+        saturated |= saturating_add_assign(&mut total.status_2xx, self.status_2xx);
+        saturated |= saturating_add_assign(&mut total.status_3xx, self.status_3xx);
+        saturated |= saturating_add_assign(&mut total.status_4xx, self.status_4xx);
+        saturated |= saturating_add_assign(&mut total.status_5xx, self.status_5xx);
+        saturated |= saturating_add_assign(&mut total.status_other, self.status_other);
+        saturated
+    }
+}
+
+fn saturating_add_assign(dst: &mut u64, src: u64) -> bool {
+    let (sum, overflow) = dst.overflowing_add(src);
+    *dst = if overflow { u64::MAX } else { sum };
+    overflow
+}
+
+enum BodyConsumeOutcome {
+    Completed,
+    Truncated,
+    StreamError,
+}
+
 pub struct LoadTesting {
-    /// Shared plugin HTTP client — used for fan-out trigger requests to remote
-    /// nodes (respects global gateway TLS settings for inter-node communication).
     http_client: PluginHttpClient,
-    /// Dedicated reqwest client for local synthetic load test requests. When
-    /// `gateway_tls_no_verify` is true, this client skips TLS cert verification
-    /// so loopback HTTPS works even when the gateway cert doesn't cover `127.0.0.1`.
     load_test_client: reqwest::Client,
     key: String,
     concurrent_clients: u32,
     duration_seconds: u64,
+    request_timeout_ms: u64,
     ramp: bool,
     max_response_body_bytes: u64,
-    /// Local base URL for synthetic requests (e.g., `http://127.0.0.1:8000`
-    /// or `https://127.0.0.1:8443`).
     gateway_base_url: String,
-    /// Remote gateway URLs for multi-node fan-out. Each receives the trigger
-    /// request WITH the key header to start its own local load test.
     gateway_addresses: Vec<String>,
-    is_running: Arc<AtomicBool>,
+    state: Arc<LoadTestingState>,
 }
 
 impl LoadTesting {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::from_parts(config, http_client, LoadTestingState::new())
+    }
+
+    /// Construct with state shared across reload generations for one plugin
+    /// config identity (`namespace` + `id`).
+    pub(crate) fn new_with_instance_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        plugin_config_id: &str,
+    ) -> Result<Self, String> {
+        let identity = format!("{namespace}\0{plugin_config_id}");
+        let state = retain_shared_state(&identity);
+        Self::from_parts(config, http_client, state)
+    }
+
+    pub(crate) fn with_shared_state(
+        config: &Value,
+        http_client: PluginHttpClient,
+        state: Arc<LoadTestingState>,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, state)
+    }
+
+    /// Construct another instance that shares this plugin's run-admission state.
+    ///
+    /// Used by unit tests (and mirrors plugin-cache reload sharing) so two
+    /// `LoadTesting` values observe the same `is_running` guard.
+    pub fn share_with(
+        &self,
+        config: &Value,
+        http_client: PluginHttpClient,
+    ) -> Result<Self, String> {
+        Self::with_shared_state(config, http_client, Arc::clone(&self.state))
+    }
+
+    pub(crate) fn shared_state(&self) -> Arc<LoadTestingState> {
+        Arc::clone(&self.state)
+    }
+
+    /// Whether a cohort is currently admitted on this plugin identity.
+    pub fn is_running(&self) -> bool {
+        self.state.is_running.load(Ordering::Acquire)
+    }
+
+    /// Most recent completed cohort result for this plugin identity, if any.
+    pub fn last_run_result(&self) -> Option<RunResult> {
+        self.state
+            .last_result
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        state: Arc<LoadTestingState>,
+    ) -> Result<Self, String> {
         let config_obj = config
             .as_object()
             .ok_or_else(|| "load_testing: config must be an object".to_string())?;
@@ -152,6 +334,11 @@ impl LoadTesting {
             .ok_or_else(|| {
                 "load_testing: 'key' is required and must be a non-empty string".to_string()
             })?;
+        if key.len() < MIN_TRIGGER_KEY_LEN {
+            return Err(format!(
+                "load_testing: 'key' must be at least {MIN_TRIGGER_KEY_LEN} characters"
+            ));
+        }
 
         let concurrent_clients = optional_u64(config, "concurrent_clients")?
             .ok_or_else(|| "load_testing: 'concurrent_clients' is required".to_string())?;
@@ -177,6 +364,11 @@ impl LoadTesting {
         if request_timeout_ms == 0 {
             return Err("load_testing: 'request_timeout_ms' must be greater than 0".to_string());
         }
+        if request_timeout_ms > MAX_REQUEST_TIMEOUT_MS {
+            return Err(format!(
+                "load_testing: 'request_timeout_ms' must be <= {MAX_REQUEST_TIMEOUT_MS} (got {request_timeout_ms})"
+            ));
+        }
 
         let max_response_body_bytes =
             optional_u64(config, "max_response_body_bytes")?.unwrap_or(1_048_576);
@@ -187,18 +379,20 @@ impl LoadTesting {
         }
 
         let gateway_tls = optional_bool(config, "gateway_tls")?.unwrap_or(false);
-
-        // Default to true when TLS is enabled — the gateway cert won't match 127.0.0.1
         let gateway_tls_no_verify =
             optional_bool(config, "gateway_tls_no_verify")?.unwrap_or(gateway_tls);
 
-        // Determine local gateway port with smart env-var defaults
         let default_env_var = if gateway_tls {
             "FERRUM_PROXY_HTTPS_PORT"
         } else {
             "FERRUM_PROXY_HTTP_PORT"
         };
         let default_port: u16 = if gateway_tls { 8443 } else { 8000 };
+        let listener_name = if gateway_tls {
+            "HTTPS (FERRUM_PROXY_HTTPS_PORT)"
+        } else {
+            "HTTP (FERRUM_PROXY_HTTP_PORT)"
+        };
 
         let gateway_port = optional_u64(config, "gateway_port")?
             .map(|p| {
@@ -219,27 +413,19 @@ impl LoadTesting {
                     .unwrap_or(default_port)
             });
 
+        if gateway_port == 0 {
+            return Err(format!(
+                "load_testing: resolved gateway port is 0 because the selected {listener_name} \
+listener is disabled; set gateway_tls to select an enabled listener and/or set an explicit \
+gateway_port in 1–65535"
+            ));
+        }
+
         let scheme = if gateway_tls { "https" } else { "http" };
         let gateway_base_url = format!("{}://127.0.0.1:{}", scheme, gateway_port);
 
-        // Build dedicated reqwest client for load test traffic, with optional
-        // TLS no-verify scoped only to this client (not the global gateway).
-        // The timeout prevents workers from hanging on streaming/long-lived
-        // responses (SSE, long-poll) that never complete.
-        //
-        // Local synthetic requests target `127.0.0.1` (no DNS lookup needed),
-        // but `gateway_addresses` fan-out is handled by the shared
-        // `PluginHttpClient` rather than this client. We still install the
-        // gateway's `DnsCache` resolver here so this builder honours the
-        // project-wide invariant ("every reqwest::Client::builder must use the
-        // shared cache") and stays correct if a future change repurposes this
-        // client for hostname targets.
         let mut load_test_builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(gateway_tls_no_verify)
-            // Do not follow redirects: a 3xx `Location: http://169.254.169.254/`
-            // from the target under test would otherwise bounce the synthetic
-            // request to an IP literal that skips the DnsCacheResolver, bypassing
-            // the egress baseline from the load-test worker.
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(request_timeout_ms));
         if let Some(dns_cache) = http_client.dns_cache() {
@@ -250,50 +436,7 @@ impl LoadTesting {
             .build()
             .map_err(|e| format!("load_testing: failed to build HTTP client: {}", e))?;
 
-        // Parse optional remote gateway addresses for multi-node fan-out
-        let gateway_addresses = match config.get("gateway_addresses") {
-            Some(Value::Array(addresses)) => {
-                if addresses.is_empty() {
-                    return Err(
-                        "load_testing: 'gateway_addresses' must not be empty when provided"
-                            .to_string(),
-                    );
-                }
-                let mut urls = Vec::with_capacity(addresses.len());
-                for addr in addresses {
-                    let url = addr.as_str().ok_or_else(|| {
-                        "load_testing: each 'gateway_addresses' entry must be a string".to_string()
-                    })?;
-                    if url.is_empty() {
-                        return Err(
-                            "load_testing: 'gateway_addresses' entries must not be empty"
-                                .to_string(),
-                        );
-                    }
-                    validate_gateway_address(url)?;
-                    // Screen the literal-IP target against the egress policy:
-                    // load_testing dials these via the raw client (`.send()`),
-                    // bypassing the shared execute() literal-IP screen, and
-                    // reqwest skips the resolver for IP literals. Legit gateway
-                    // addresses (loopback / RFC1918) stay allowed; a metadata/
-                    // link-local target is rejected.
-                    if let Ok(parsed) = Url::parse(url) {
-                        crate::plugins::utils::log_helpers::screen_url_host_egress(
-                            "load_testing",
-                            "gateway_addresses",
-                            &parsed,
-                            http_client.backend_allow_ips(),
-                        )?;
-                    }
-                    urls.push(url.trim_end_matches('/').to_string());
-                }
-                urls
-            }
-            Some(Value::Null) | None => Vec::new(),
-            Some(_) => {
-                return Err("load_testing: 'gateway_addresses' must be an array".to_string());
-            }
-        };
+        let gateway_addresses = parse_gateway_addresses(config, &http_client, &gateway_base_url)?;
 
         Ok(Self {
             http_client,
@@ -301,12 +444,96 @@ impl LoadTesting {
             key,
             concurrent_clients: concurrent_clients as u32,
             duration_seconds,
+            request_timeout_ms,
             ramp,
             max_response_body_bytes,
             gateway_base_url,
             gateway_addresses,
-            is_running: Arc::new(AtomicBool::new(false)),
+            state,
         })
+    }
+
+    fn trigger_key_present_and_matches(&self, headers: &HashMap<String, String>) -> bool {
+        headers
+            .get(HEADER_TRIGGER_KEY)
+            .map(|k| constant_time_eq(k.as_bytes(), self.key.as_bytes()))
+            .unwrap_or(false)
+    }
+
+    fn is_fanout_control_request(headers: &HashMap<String, String>) -> bool {
+        headers
+            .get(HEADER_FANOUT)
+            .is_some_and(|value| value == FANOUT_MARKER)
+    }
+}
+
+fn retain_shared_state(identity: &str) -> Arc<LoadTestingState> {
+    let registry = SHARED_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = guard.get(identity).and_then(|weak| weak.upgrade()) {
+        return existing;
+    }
+    let state = LoadTestingState::new();
+    guard.insert(identity.to_string(), Arc::downgrade(&state));
+    // Opportunistically prune dead weak entries.
+    guard.retain(|_, weak| weak.strong_count() > 0);
+    state
+}
+
+fn parse_gateway_addresses(
+    config: &Value,
+    http_client: &PluginHttpClient,
+    local_base_url: &str,
+) -> Result<Vec<String>, String> {
+    match config.get("gateway_addresses") {
+        Some(Value::Array(addresses)) => {
+            if addresses.is_empty() {
+                return Err(
+                    "load_testing: 'gateway_addresses' must not be empty when provided"
+                        .to_string(),
+                );
+            }
+            let mut urls = Vec::with_capacity(addresses.len());
+            let mut seen = HashSet::new();
+            let local_label = sanitize_gateway_label(local_base_url);
+            for addr in addresses {
+                let url = addr.as_str().ok_or_else(|| {
+                    "load_testing: each 'gateway_addresses' entry must be a string".to_string()
+                })?;
+                if url.is_empty() {
+                    return Err(
+                        "load_testing: 'gateway_addresses' entries must not be empty".to_string(),
+                    );
+                }
+                validate_gateway_address(url)?;
+                if let Ok(parsed) = Url::parse(url) {
+                    crate::plugins::utils::log_helpers::screen_url_host_egress(
+                        "load_testing",
+                        "gateway_addresses",
+                        &parsed,
+                        http_client.backend_allow_ips(),
+                    )?;
+                }
+                let normalized = url.trim_end_matches('/').to_string();
+                let label = sanitize_gateway_label(&normalized);
+                if label == local_label {
+                    return Err(format!(
+                        "load_testing: 'gateway_addresses' must not include this node's local loopback target ({label})"
+                    ));
+                }
+                if !seen.insert(label.clone()) {
+                    return Err(format!(
+                        "load_testing: duplicate 'gateway_addresses' entry for {label}"
+                    ));
+                }
+                urls.push(normalized);
+            }
+            Ok(urls)
+        }
+        Some(Value::Null) | None => Ok(Vec::new()),
+        Some(_) => Err("load_testing: 'gateway_addresses' must be an array".to_string()),
     }
 }
 
@@ -319,6 +546,12 @@ fn validate_gateway_address(url: &str) -> Result<(), String> {
     {
         return Err(format!(
             "load_testing: gateway address '{url}' must be an http(s) URL with a host"
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "load_testing: gateway address must not include URL userinfo (credentials); got host '{}'",
+            parsed.host_str().unwrap_or("unknown")
         ));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
@@ -334,6 +567,21 @@ fn has_non_empty_authority(raw_url: &str) -> bool {
         .split_once("://")
         .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
         .is_some_and(|authority| !authority.is_empty())
+}
+
+/// Scheme/host/port label suitable for logs — never path, query, or userinfo.
+fn sanitize_gateway_label(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(parsed) => {
+            let scheme = parsed.scheme();
+            let host = parsed.host_str().unwrap_or("invalid-host");
+            match parsed.port() {
+                Some(port) => format!("{scheme}://{host}:{port}"),
+                None => format!("{scheme}://{host}"),
+            }
+        }
+        Err(_) => "invalid-gateway-address".to_string(),
+    }
 }
 
 fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
@@ -363,6 +611,25 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
     }
 }
 
+fn try_reserve_process_clients(count: u64) -> bool {
+    loop {
+        let current = PROCESS_ACTIVE_CLIENTS.load(Ordering::Relaxed);
+        if current.saturating_add(count) > MAX_PROCESS_ACTIVE_CLIENTS {
+            return false;
+        }
+        if PROCESS_ACTIVE_CLIENTS
+            .compare_exchange_weak(current, current + count, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+fn release_process_clients(count: u64) {
+    PROCESS_ACTIVE_CLIENTS.fetch_sub(count, Ordering::SeqCst);
+}
+
 #[async_trait]
 impl Plugin for LoadTesting {
     fn name(&self) -> &str {
@@ -381,33 +648,64 @@ impl Plugin for LoadTesting {
         true
     }
 
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        true
+    }
+
+    fn needs_request_body_bytes(&self) -> bool {
+        true
+    }
+
+    fn needs_request_body_text(&self) -> bool {
+        false
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        // Preserve the ordinary non-trigger hot path: buffer only when the
+        // trigger header is present (matched later in before_proxy).
+        ctx.headers.contains_key(HEADER_TRIGGER_KEY)
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Only trigger when the key header matches. Use constant-time
-        // comparison: a recovered trigger key gives an unauthenticated
-        // attacker a high-cost privileged operation (spawns concurrent
-        // loopback requests, can fan out to peer nodes, runs for up to
-        // an hour) so timing-leak-driven discovery has real impact.
-        let key_matches = headers
-            .get("x-loadtesting-key")
-            .map(|k| constant_time_eq(k.as_bytes(), self.key.as_bytes()))
-            .unwrap_or(false);
-
+        let key_matches = self.trigger_key_present_and_matches(headers);
         if !key_matches {
             return PluginResult::Continue;
         }
 
-        // Prevent concurrent load tests on the same proxy
-        if self
-            .is_running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+        let is_fanout = Self::is_fanout_control_request(headers);
+
+        // Never forward the reusable administrative trigger key to backends.
+        headers.remove(HEADER_TRIGGER_KEY);
+        // Fanout marker is control-plane only.
+        headers.remove(HEADER_FANOUT);
+
+        let Some(run_cancel) = self.state.begin_run() else {
             tracing::warn!("load_testing: test already in progress, ignoring trigger");
-            return PluginResult::Continue;
+            return if is_fanout {
+                fanout_ack_result()
+            } else {
+                PluginResult::Continue
+            };
+        };
+
+        if !try_reserve_process_clients(u64::from(self.concurrent_clients)) {
+            tracing::warn!(
+                requested = self.concurrent_clients,
+                "load_testing: process-wide active client budget exhausted; ignoring trigger"
+            );
+            self.state.end_run(RunResult {
+                outcome: RunOutcome::Failed,
+                ..RunResult::default()
+            });
+            return if is_fanout {
+                fanout_ack_result()
+            } else {
+                PluginResult::Continue
+            };
         }
 
         let proxy_name = ctx
@@ -418,78 +716,54 @@ impl Plugin for LoadTesting {
             .to_string();
 
         let path = ctx.path.clone();
-        let query_params = ctx.query_params.clone();
+        let raw_query = ctx.raw_query_string().map(str::to_owned);
         let method = ctx.method.clone();
+        let body_bytes: Option<Bytes> = ctx.request_body_bytes.clone();
 
-        // Headers for synthetic load test requests: forward everything except
-        // the load test key (prevents recursion) and hop-by-hop headers.
-        // Keeping "host" is intentional — it ensures the gateway routes
-        // synthetic requests to the correct proxy when host-based routing is
-        // configured.
-        let synthetic_headers: Vec<(String, String)> = headers
-            .iter()
-            .filter(|(k, _)| {
-                !matches!(
-                    k.as_str(),
-                    "x-loadtesting-key"
-                        | "connection"
-                        | "keep-alive"
-                        | "transfer-encoding"
-                        | "te"
-                        | "upgrade"
-                        | "proxy-authorization"
-                        | "proxy-connection"
-                )
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        // Headers for fan-out trigger requests: same as original but KEEP the
-        // key so remote nodes trigger their own load tests.
-        let fanout_headers: Vec<(String, String)> = headers
-            .iter()
-            .filter(|(k, _)| {
-                !matches!(
-                    k.as_str(),
-                    "connection"
-                        | "keep-alive"
-                        | "transfer-encoding"
-                        | "te"
-                        | "upgrade"
-                        | "proxy-authorization"
-                        | "proxy-connection"
-                )
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let synthetic_headers = filter_outbound_headers(headers, /*keep_trigger_key=*/ false);
+        let fanout_headers = filter_outbound_headers(headers, /*keep_trigger_key=*/ true);
 
         let concurrent_clients = self.concurrent_clients;
         let duration = Duration::from_secs(self.duration_seconds);
         let duration_secs = self.duration_seconds;
         let ramp = self.ramp;
         let max_response_body_bytes = self.max_response_body_bytes;
+        let request_timeout_ms = self.request_timeout_ms;
         let gateway_base_url = self.gateway_base_url.clone();
         let load_test_client = self.load_test_client.clone();
-        let is_running = Arc::clone(&self.is_running);
+        let state = Arc::clone(&self.state);
+        let gateway_addresses = self.gateway_addresses.clone();
+        let http_client = self.http_client.clone();
+        let trigger_key = self.key.clone();
 
-        // Fan out trigger to remote gateway nodes (fire-and-forget).
-        // Each remote node receives the full request WITH the key header,
-        // so its load_testing plugin triggers an independent local load test.
-        if !self.gateway_addresses.is_empty() {
-            for addr in &self.gateway_addresses {
-                let fanout_url = build_url(addr, &path, &query_params);
+        // Originating controllers fan out once. Peer fan-out receivers never
+        // re-forward, which collapses the previous quadratic mesh amplification.
+        if !is_fanout && !gateway_addresses.is_empty() {
+            for addr in &gateway_addresses {
+                let fanout_url = build_url(addr, &path, raw_query.as_deref());
                 let fanout_method = method.clone();
-                let fanout_hdrs = fanout_headers.clone();
-                let client = self.http_client.clone();
-                let addr_log = addr.clone();
+                let mut fanout_hdrs = fanout_headers.clone();
+                fanout_hdrs.push((HEADER_TRIGGER_KEY.to_string(), trigger_key.clone()));
+                fanout_hdrs.push((HEADER_FANOUT.to_string(), FANOUT_MARKER.to_string()));
+                let client = http_client.clone();
+                let remote_label = sanitize_gateway_label(addr);
+                let body = body_bytes.clone();
 
                 tokio::spawn(async move {
-                    let req =
+                    let mut req =
                         build_request(client.get(), &fanout_method, &fanout_url, &fanout_hdrs);
-                    if let Err(e) = req.send().await {
+                    if method_allows_body(&fanout_method)
+                        && let Some(bytes) = body
+                    {
+                        req = req.body(bytes);
+                    }
+                    if let Err(err) = client
+                        .execute_redacted(req, "load_testing_fanout", &remote_label)
+                        .await
+                    {
                         tracing::warn!(
-                            remote = %addr_log,
-                            error = %e,
+                            remote = %remote_label,
+                            error = %err,
                             "load_testing: failed to fan out trigger to remote node"
                         );
                     }
@@ -502,20 +776,18 @@ impl Plugin for LoadTesting {
             concurrent_clients = concurrent_clients,
             duration_seconds = duration_secs,
             ramp = ramp,
+            fanout_control = is_fanout,
             "load_testing: starting load test"
         );
 
         tokio::spawn(async move {
+            let _client_budget = ProcessClientBudget::new(u64::from(concurrent_clients));
             let start = Instant::now();
             let deadline = start + duration;
-
             let mut handles = Vec::with_capacity(concurrent_clients as usize);
 
             for i in 0..concurrent_clients {
                 let ramp_delay = if ramp {
-                    // Stagger client starts evenly across the test duration.
-                    // Client 0 starts immediately, client N-1 starts at
-                    // duration * (N-1)/N.
                     duration * i / concurrent_clients
                 } else {
                     Duration::ZERO
@@ -524,81 +796,279 @@ impl Plugin for LoadTesting {
                 let client = load_test_client.clone();
                 let base_url = gateway_base_url.clone();
                 let path = path.clone();
-                let query_params = query_params.clone();
+                let raw_query = raw_query.clone();
                 let method = method.clone();
                 let req_headers = synthetic_headers.clone();
+                let body = body_bytes.clone();
+                let worker_cancel = run_cancel.clone();
+                let per_request_timeout = Duration::from_millis(request_timeout_ms);
 
                 let handle = tokio::spawn(async move {
                     if !ramp_delay.is_zero() {
-                        tokio::time::sleep(ramp_delay).await;
+                        tokio::select! {
+                            _ = worker_cancel.cancelled() => {
+                                return Ok(WorkerCounters::default());
+                            }
+                            _ = tokio::time::sleep(ramp_delay) => {}
+                        }
                     }
 
-                    let mut request_count: u64 = 0;
+                    let mut counters = WorkerCounters::default();
 
                     while Instant::now() < deadline {
-                        let url = build_url(&base_url, &path, &query_params);
-                        let req = build_request(&client, &method, &url, &req_headers);
-
-                        // Send request and consume response body to completion
-                        if let Ok(resp) = req.send().await {
-                            consume_response_with_cap(resp, max_response_body_bytes).await;
+                        if worker_cancel.is_cancelled() {
+                            break;
                         }
 
-                        request_count += 1;
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        let attempt_timeout = per_request_timeout.min(remaining);
+                        counters.attempted_requests = counters.attempted_requests.saturating_add(1);
+
+                        let url = build_url(&base_url, &path, raw_query.as_deref());
+                        let mut req = build_request(&client, &method, &url, &req_headers);
+                        if method_allows_body(&method)
+                            && let Some(ref bytes) = body
+                        {
+                            req = req.body(bytes.clone());
+                        }
+
+                        let send_fut = async {
+                            match req.send().await {
+                                Ok(resp) => {
+                                    counters.responses_received =
+                                        counters.responses_received.saturating_add(1);
+                                    record_status(&mut counters, resp.status().as_u16());
+                                    match consume_response_with_cap(resp, max_response_body_bytes)
+                                        .await
+                                    {
+                                        BodyConsumeOutcome::Completed => {
+                                            counters.responses_completed =
+                                                counters.responses_completed.saturating_add(1);
+                                        }
+                                        BodyConsumeOutcome::Truncated => {
+                                            counters.responses_truncated =
+                                                counters.responses_truncated.saturating_add(1);
+                                        }
+                                        BodyConsumeOutcome::StreamError => {
+                                            counters.response_body_errors =
+                                                counters.response_body_errors.saturating_add(1);
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    // Classify without logging the raw reqwest error (URL/query
+                                    // credentials must never reach structured logs).
+                                    let _ = classify_reqwest_error(&err);
+                                    counters.transport_errors =
+                                        counters.transport_errors.saturating_add(1);
+                                }
+                            }
+                        };
+
+                        tokio::select! {
+                            _ = worker_cancel.cancelled() => break,
+                            result = tokio::time::timeout(attempt_timeout, send_fut) => {
+                                if result.is_err() {
+                                    counters.transport_errors =
+                                        counters.transport_errors.saturating_add(1);
+                                }
+                            }
+                        }
                     }
 
-                    request_count
+                    Ok::<WorkerCounters, ()>(counters)
                 });
 
                 handles.push(handle);
             }
 
-            let mut total_requests: u64 = 0;
+            let mut totals = WorkerCounters::default();
+            let mut worker_failures = 0u64;
+            let mut cancelled_workers = 0u64;
+            let mut aggregation_saturated = false;
+
             for handle in handles {
-                if let Ok(count) = handle.await {
-                    total_requests += count;
+                match handle.await {
+                    Ok(Ok(counters)) => {
+                        aggregation_saturated |= counters.saturating_add_into(&mut totals);
+                    }
+                    Ok(Err(())) => {
+                        worker_failures = worker_failures.saturating_add(1);
+                    }
+                    Err(join_err) => {
+                        if join_err.is_cancelled() {
+                            cancelled_workers = cancelled_workers.saturating_add(1);
+                        } else {
+                            worker_failures = worker_failures.saturating_add(1);
+                        }
+                    }
                 }
             }
 
             let elapsed = start.elapsed();
-            let rps = if elapsed.as_secs_f64() > 0.0 {
-                total_requests as f64 / elapsed.as_secs_f64()
+            let cancelled = run_cancel.is_cancelled();
+            let outcome = if cancelled {
+                RunOutcome::Cancelled
+            } else if totals.responses_completed == 0 || worker_failures > 0 {
+                RunOutcome::Failed
+            } else if totals.transport_errors > 0
+                || totals.response_body_errors > 0
+                || totals.responses_truncated > 0
+                || cancelled_workers > 0
+                || aggregation_saturated
+                || totals.status_4xx > 0
+                || totals.status_5xx > 0
+            {
+                RunOutcome::Degraded
+            } else {
+                RunOutcome::Success
+            };
+
+            let completed_rps = if elapsed.as_secs_f64() > 0.0 {
+                totals.responses_completed as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            let attempted_rps = if elapsed.as_secs_f64() > 0.0 {
+                totals.attempted_requests as f64 / elapsed.as_secs_f64()
             } else {
                 0.0
             };
 
+            let result = RunResult {
+                outcome,
+                attempted_requests: totals.attempted_requests,
+                responses_received: totals.responses_received,
+                responses_completed: totals.responses_completed,
+                responses_truncated: totals.responses_truncated,
+                response_body_errors: totals.response_body_errors,
+                transport_errors: totals.transport_errors,
+                status_2xx: totals.status_2xx,
+                status_3xx: totals.status_3xx,
+                status_4xx: totals.status_4xx,
+                status_5xx: totals.status_5xx,
+                status_other: totals.status_other,
+                worker_failures,
+                cancelled_workers,
+                aggregation_saturated,
+                elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            };
+
             info!(
                 proxy = %proxy_name,
-                total_requests = total_requests,
+                outcome = ?result.outcome,
+                attempted_requests = result.attempted_requests,
+                responses_received = result.responses_received,
+                responses_completed = result.responses_completed,
+                responses_truncated = result.responses_truncated,
+                response_body_errors = result.response_body_errors,
+                transport_errors = result.transport_errors,
+                status_2xx = result.status_2xx,
+                status_3xx = result.status_3xx,
+                status_4xx = result.status_4xx,
+                status_5xx = result.status_5xx,
+                status_other = result.status_other,
+                worker_failures = result.worker_failures,
+                cancelled_workers = result.cancelled_workers,
+                aggregation_saturated = result.aggregation_saturated,
                 elapsed_seconds = %format_args!("{:.2}", elapsed.as_secs_f64()),
-                requests_per_second = %format_args!("{:.1}", rps),
+                completed_requests_per_second = %format_args!("{:.1}", completed_rps),
+                attempted_requests_per_second = %format_args!("{:.1}", attempted_rps),
                 max_response_body_bytes = max_response_body_bytes,
                 "load_testing: load test finished"
             );
 
-            is_running.store(false, Ordering::Release);
+            state.end_run(result);
         });
 
-        PluginResult::Continue
+        if is_fanout {
+            fanout_ack_result()
+        } else {
+            PluginResult::Continue
+        }
     }
 }
 
-/// Build a full URL from a base URL, path, and query parameters.
-fn build_url(base: &str, path: &str, query_params: &HashMap<String, String>) -> String {
-    let mut url = String::with_capacity(base.len() + path.len());
+struct ProcessClientBudget {
+    count: u64,
+}
+
+impl ProcessClientBudget {
+    fn new(count: u64) -> Self {
+        Self { count }
+    }
+}
+
+impl Drop for ProcessClientBudget {
+    fn drop(&mut self) {
+        release_process_clients(self.count);
+    }
+}
+
+fn fanout_ack_result() -> PluginResult {
+    PluginResult::Reject {
+        status_code: 204,
+        body: String::new(),
+        headers: HashMap::new(),
+    }
+}
+
+fn filter_outbound_headers(
+    headers: &HashMap<String, String>,
+    keep_trigger_key: bool,
+) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(k, _)| {
+            let name = k.as_str();
+            if name == HEADER_FANOUT {
+                return false;
+            }
+            if name == HEADER_TRIGGER_KEY {
+                return keep_trigger_key;
+            }
+            if is_backend_request_strip_header(name) || is_proxy_generated_forwarding_header(name) {
+                return false;
+            }
+            true
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+fn method_allows_body(method: &str) -> bool {
+    !matches!(
+        method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "DELETE" | "OPTIONS" | "TRACE"
+    )
+}
+
+fn record_status(counters: &mut WorkerCounters, status: u16) {
+    match status {
+        200..=299 => counters.status_2xx = counters.status_2xx.saturating_add(1),
+        300..=399 => counters.status_3xx = counters.status_3xx.saturating_add(1),
+        400..=499 => counters.status_4xx = counters.status_4xx.saturating_add(1),
+        500..=599 => counters.status_5xx = counters.status_5xx.saturating_add(1),
+        _ => counters.status_other = counters.status_other.saturating_add(1),
+    }
+}
+
+/// Build a full URL from a base URL, path, and the original raw query string.
+fn build_url(base: &str, path: &str, raw_query: Option<&str>) -> String {
+    let query_len = raw_query.map(|q| q.len() + 1).unwrap_or(0);
+    let mut url = String::with_capacity(base.len() + path.len() + query_len);
     url.push_str(base);
     url.push_str(path);
-    if !query_params.is_empty() {
+    if let Some(query) = raw_query.filter(|q| !q.is_empty()) {
         url.push('?');
-        let encoded: String = form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(query_params.iter())
-            .finish();
-        url.push_str(&encoded);
+        url.push_str(query);
     }
     url
 }
 
-/// Build a reqwest `RequestBuilder` with the given method, URL, and headers.
 fn build_request(
     client: &reqwest::Client,
     method: &str,
@@ -625,7 +1095,7 @@ fn build_request(
     req
 }
 
-async fn consume_response_with_cap(resp: reqwest::Response, max_bytes: u64) {
+async fn consume_response_with_cap(resp: reqwest::Response, max_bytes: u64) -> BodyConsumeOutcome {
     let mut stream = resp.bytes_stream();
     let mut consumed: u64 = 0;
     while let Some(chunk_result) = stream.next().await {
@@ -633,10 +1103,11 @@ async fn consume_response_with_cap(resp: reqwest::Response, max_bytes: u64) {
             Ok(chunk) => {
                 consumed = consumed.saturating_add(chunk.len() as u64);
                 if consumed >= max_bytes {
-                    break;
+                    return BodyConsumeOutcome::Truncated;
                 }
             }
-            Err(_) => break,
+            Err(_) => return BodyConsumeOutcome::StreamError,
         }
     }
+    BodyConsumeOutcome::Completed
 }
