@@ -22,7 +22,8 @@ use ferrum_edge::plugins::proxy_alerts::windows::{
 };
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Direction, Plugin, TransactionSummary, WsDisconnectContext,
+    ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, TransactionSummary,
+    WsDisconnectContext, plugin_failure_policy,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
@@ -52,6 +53,14 @@ fn minimal_config() -> serde_json::Value {
             }
         ]
     })
+}
+
+#[test]
+fn configured_proxy_alerts_is_load_bearing() {
+    assert_eq!(
+        plugin_failure_policy("proxy_alerts"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
 }
 
 // ----------------------------------------------- Construction / config validation
