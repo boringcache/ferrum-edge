@@ -4829,21 +4829,29 @@ Logs metadata for every WebSocket frame passing through the proxy. Provides fram
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `log_level` | String | `"info"` | Log level for frame entries: `trace`, `debug`, or `info` (case-sensitive — unknown values are rejected at config load time) |
-| `include_payload_preview` | bool | `false` | Emit a keyed, non-reversible payload fingerprint (`hmac-sha256:<prefix> len=<n>`) in the `preview` field. Raw frame bytes are never logged |
-| `payload_preview_bytes` | u64 | `128` | Maximum leading payload bytes folded into the fingerprint digest (clamped to 64 KiB; must be greater than zero when previews are enabled; zero is accepted when previews are disabled) |
-| `log_ping_pong` | bool | `false` | Log Ping and Pong control frames |
+| `log_level` | String | `"info"` | Log level for frame entries: `trace`, `debug`, `info`, or `warn` (case-sensitive — unknown values and explicit `null` are rejected). Healthy frame traffic remains informational; when the active filter suppresses the configured level but still admits `warn`, construction emits an actionable warning |
+| `include_payload_preview` | bool | `false` | Emit a keyed, non-reversible payload fingerprint (`hmac-sha256:<prefix> len=<n>`) in the `preview` field. Raw frame bytes are never logged. Explicit `null` is rejected |
+| `payload_preview_bytes` | u64 | `128` | Maximum leading payload bytes folded into the fingerprint digest (hard maximum 65536 — values above that are rejected, not clamped; must be greater than zero when previews are enabled; zero is accepted when previews are disabled; explicit `null` is rejected) |
+| `log_ping_pong` | bool | `false` | Log Ping and Pong control frames. Explicit `null` is rejected |
+
+Only the keys above are accepted. Unknown keys (for example a typo like `log_levle`) are rejected with a field-specific error.
 
 ```yaml
 plugin_name: ws_frame_logging
 config:
-  log_level: debug
+  log_level: info
   include_payload_preview: true
   payload_preview_bytes: 256
   log_ping_pong: false
 ```
 
-Frame log entries are emitted to the `ws_frame_log` tracing target with structured fields: `proxy_id`, `connection_id`, `direction` (`client->backend` or `backend->client`), `frame_type` (`text`, `binary`, `ping`, `pong`, `close`, `frame`), `size_bytes`, and (when `include_payload_preview` is true) `preview`. Fingerprint computation is skipped when the configured tracing level is filtered out, so disabling logging at the tracing layer eliminates per-frame work.
+Frame log entries are emitted to the `ws_frame_log` tracing target with structured fields: `proxy_id`, `connection_id`, `direction` (`client->backend` or `backend->client`), `frame_type` (`text`, `binary`, `ping`, `pong`, `close`, `frame`), `size_bytes`, and (when `include_payload_preview` is true) `preview`.
+
+**Default filter compatibility.** The plugin defaults healthy per-frame and disconnect records to `log_level: info`; it does not turn routine traffic into warnings. Under the gateway default `FERRUM_LOG_LEVEL=warn`, constructing the plugin with `config: {}` emits an actionable construction-time warning naming the filtered `info` level, while frame records remain suppressed. Validation and cache publication can construct an enabled instance separately, so the diagnostic can repeat. A filter stricter than `warn` (or a directive such as `ws_frame_log=off`) also suppresses the diagnostic; operators using such a filter must ensure it deliberately admits the configured `ws_frame_log` level. Raise `FERRUM_LOG_LEVEL` (or use an equivalent EnvFilter directive) to `info` or more verbose to admit the default records. Explicit `trace` / `debug` similarly require a sufficiently verbose filter; `warn` is available only when an operator deliberately chooses warning-level frame output.
+
+**What filtering does and does not skip.** When the configured tracing level is filtered out, fingerprint computation and tracing event construction are skipped. Frame parsing, plugin selection (`requires_ws_frame_hooks()` is always true while this plugin is attached), and `on_ws_frame` / disconnect-hook dispatch still occur. Consequently, attaching this plugin keeps the connection on the parsed WebSocket relay path and prevents the H1 raw-copy tunnel fast path even if every record is filtered.
+
+**Admission / failure policy.** `ws_frame_logging` is registered `OptionalFailOpen`. Admin API create/update still performs strict construction and returns HTTP 400 for an invalid enabled config before storing it. During file-mode load, pre-existing DB/CP snapshot application, or cache rebuild, invalid enabled configs (unknown keys, out-of-range `payload_preview_bytes`, invalid `log_level`, wrong types, or explicit `null` fields) produce a validation/construction warning and omit this plugin instance from the published cache while admitting the surrounding snapshot. This differs from FailClosed plugins, where invalid enabled config rejects file-mode startup or causes DB/CP polling to retain the prior snapshot.
 
 **Raw frame contents are never logged.** WebSocket payloads routinely carry credentials — bearer tokens, session cookies, API keys (for example a GraphQL-over-WS `connection_init` payload or a custom auth handshake). To honor the project's never-log-secrets invariant, `preview` contains only a keyed, non-reversible fingerprint of the form `hmac-sha256:<12 hex chars> len=<bytes>` (with a trailing `+` after the digest when only the first `payload_preview_bytes` of the payload were hashed). The key is generated per plugin instance and is not exposed in logs, so log access alone cannot confirm guessed payloads offline. The digest lets operators correlate identical payloads observed by that plugin instance without disclosing plaintext; the payload byte length is also always available as `size_bytes`.
 
