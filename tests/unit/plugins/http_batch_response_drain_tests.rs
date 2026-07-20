@@ -39,7 +39,12 @@ async fn read_http_request_headers(socket: &mut TcpStream) -> bool {
 /// request counters let callers assert reuse after bounded drains.
 async fn spawn_keepalive_body_server(
     responses: Vec<(u16, &'static [u8], Duration)>,
-) -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>, JoinHandle<()>) {
+) -> (
+    SocketAddr,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    JoinHandle<()>,
+) {
     assert!(!responses.is_empty());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -140,7 +145,9 @@ async fn spawn_oversized_chunked_server() -> (SocketAddr, JoinHandle<()>) {
         };
         let _ = read_http_request_headers(&mut socket).await;
         let _ = socket
-            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
             .await;
         let chunk = vec![b'x'; 64 * 1024];
         let chunk_header = format!("{:x}\r\n", chunk.len());
@@ -161,12 +168,8 @@ async fn spawn_oversized_chunked_server() -> (SocketAddr, JoinHandle<()>) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn shared_helper_reuses_http11_connection_across_successful_batches() {
-    let (addr, connections, requests, server) = spawn_keepalive_body_server(vec![(
-        200,
-        b"OK",
-        Duration::from_millis(20),
-    )])
-    .await;
+    let (addr, connections, requests, server) =
+        spawn_keepalive_body_server(vec![(200, b"OK", Duration::from_millis(20))]).await;
     let client = PluginHttpClient::default();
     let url = format!("http://{addr}/ingest");
 
@@ -336,6 +339,9 @@ async fn shared_helper_transport_failure_is_classified_without_logging_body() {
         .expect("headers must arrive");
     let outcome = drain_http_batch_response_body(result).await;
     assert_eq!(outcome, HttpBatchDrainOutcome::TransportFailure);
-    assert_eq!(outcome.diagnostic(), "response body drain had a transport failure");
+    assert_eq!(
+        outcome.diagnostic(),
+        "response body drain had a transport failure"
+    );
     server.abort();
 }

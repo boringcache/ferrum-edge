@@ -4082,8 +4082,7 @@ async fn audit_roundtrip(plugin: &AiTranscriptAudit) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn ai_transcript_audit_reuses_http11_connection_across_successful_batches() {
-    let (endpoint, connections, requests) =
-        spawn_audit_keepalive_server(vec![(200, b"OK")]).await;
+    let (endpoint, connections, requests) = spawn_audit_keepalive_server(vec![(200, b"OK")]).await;
     let plugin = AiTranscriptAudit::new(
         &config_with_sink(
             &endpoint,
@@ -4145,7 +4144,9 @@ async fn ai_transcript_audit_chunked_oversized_ack_is_capped() {
         };
         let _ = read_audit_headers(&mut socket).await;
         let _ = socket
-            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
             .await;
         let chunk = vec![b'x'; 64 * 1024];
         let header = format!("{:x}\r\n", chunk.len());
@@ -4176,7 +4177,8 @@ async fn ai_transcript_audit_chunked_oversized_ack_is_capped() {
     .unwrap();
     audit_roundtrip(&plugin).await;
     for _ in 0..100 {
-        if finished.load(Ordering::SeqCst) == 1 || started.elapsed() > std::time::Duration::from_secs(4)
+        if finished.load(Ordering::SeqCst) == 1
+            || started.elapsed() > std::time::Duration::from_secs(4)
         {
             break;
         }

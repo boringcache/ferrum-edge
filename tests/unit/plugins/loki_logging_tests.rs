@@ -1286,8 +1286,7 @@ async fn wait_for_loki_count(counter: &AtomicUsize, expected: usize) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_loki_reuses_http11_connection_across_successful_batches() {
-    let (endpoint, connections, requests) =
-        spawn_loki_keepalive_server(vec![(204, b"OK")]).await;
+    let (endpoint, connections, requests) = spawn_loki_keepalive_server(vec![(204, b"OK")]).await;
     let mut config = delivery_config(endpoint);
     config["max_retries"] = json!(0);
     let plugin = LokiLogging::new(&config, default_client()).unwrap();

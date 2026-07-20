@@ -51,9 +51,7 @@ impl HttpBatchDrainOutcome {
 ///
 /// Used by [`handle_http_batch_response`] and by Loki's delivery classifier so
 /// every HTTP log sink shares one keep-alive-safe drain contract.
-pub async fn drain_http_batch_response_body(
-    response: reqwest::Response,
-) -> HttpBatchDrainOutcome {
+pub async fn drain_http_batch_response_body(response: reqwest::Response) -> HttpBatchDrainOutcome {
     if response
         .content_length()
         .is_some_and(|length| length > HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES as u64)
