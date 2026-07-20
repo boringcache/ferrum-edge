@@ -637,6 +637,8 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 
 **Availability:** Built into every default Ferrum Edge binary. `rdkafka` / librdkafka is an unconditional dependency — there is no `kafka` Cargo feature to enable or disable.
 
+**Admission:** Kafka is `KeepLastKnownGood`: invalid startup configuration is rejected, and an invalid reload candidate is not published, so the previously accepted producer generation continues serving. This prevents a misspelled security control or conflicting TLS/CRL setting from silently removing the configured audit sink.
+
 Hot-path admission is lock-free: Ferrum reserves a bounded channel slot before serializing attacker-shaped summary fields, enforces `max_entry_bytes` and an aggregate `buffer_max_bytes` retained-byte budget, then queues a purpose-built payload/key record. Local `ThreadedProducer::send` success only means the record was admitted to librdkafka's in-memory queue (Ferrum then releases its retained-byte lease). Terminal broker acknowledgement (including the local completion semantics of `acks: 0`) is observed through a delivery callback and exported as authenticated `kafka_logging` diagnostics/metrics (fixed labels/counters only). Graceful shutdown and reload atomically stop admission, await already-reserved admits and the batching worker, then await one bounded `flush_timeout_seconds` producer flush.
 
 | Parameter | Type | Default | Description |
@@ -651,7 +653,7 @@ Hot-path admission is lock-free: Ferrum reserves a bounded channel slot before s
 | `flush_timeout_seconds` | Integer | `5` | Bounded seconds to await librdkafka `flush` during graceful shutdown and reload disposal after Ferrum admission is closed. Minimum `1` (zero is rejected). Hard maximum `300` |
 | `acks` | String | *(librdkafka default)* | Delivery acknowledgment: `0` (broker may never persist; Ferrum still observes the local delivery callback), `1`, `all` (or `-1`) |
 | `message_timeout_ms` | Integer | *(librdkafka default)* | Timeout for message delivery in milliseconds |
-| `security_protocol` | String | *(none)* | Protocol: `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl`. Unknown root keys (for example a misspelled `security_protcol`) are rejected so PLAINTEXT cannot be selected by typo |
+| `security_protocol` | String | `"plaintext"` | Protocol: `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl`. Unknown root keys (for example a misspelled `security_protcol`) are rejected so PLAINTEXT cannot be selected by typo. Explicit TLS controls require `ssl`/`sasl_ssl`; explicit SASL controls require `sasl_plaintext`/`sasl_ssl`; username and password must be paired |
 | `sasl_mechanism` | String | *(none)* | SASL mechanism (e.g., `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`) |
 | `sasl_username` | String | *(none)* | SASL username |
 | `sasl_password` | String | *(none)* | SASL password |
@@ -659,7 +661,7 @@ Hot-path admission is lock-free: Ferrum reserves a bounded channel slot before s
 | `ssl_no_verify` | Boolean | *(gateway default)* | Skip broker TLS certificate verification. Falls back to `FERRUM_TLS_NO_VERIFY` |
 | `ssl_certificate_location` | String | *(none)* | Path to client certificate for mTLS |
 | `ssl_key_location` | String | *(none)* | Path to client private key for mTLS |
-| `producer_config` | Object | *(none)* | Escape hatch: additional librdkafka producer properties as string key-value pairs. Cannot override `bootstrap.servers`. Cannot set `security.protocol`, `enable.ssl.certificate.verification`, `ssl.ca.location`, `ssl.certificate.location`, `ssl.key.location`, `sasl.mechanism`, `sasl.username`, or `sasl.password` (use the authoritative top-level fields). Queue/message byte budgets cannot exceed Ferrum hard maxima. `ssl.crl.location` cannot conflict with the gateway CRL baseline when verification is enabled |
+| `producer_config` | Object | *(none)* | Escape hatch: additional librdkafka producer properties as string key-value pairs. Cannot override `bootstrap.servers` or top-level TLS/SASL controls, including official aliases (`sasl.mechanisms`), PEM/keystore identity alternatives, or hostname-verification disablement. TLS-namespace properties require `ssl`/`sasl_ssl`; SASL/HTTPS-auth properties require `sasl_plaintext`/`sasl_ssl`. Queue/message byte budgets cannot exceed Ferrum hard maxima. `ssl.crl.location` cannot conflict with the gateway CRL baseline when verification is enabled |
 
 #### Gateway TLS Integration
 
@@ -668,7 +670,7 @@ Kafka uses its own binary protocol over TCP/TLS (not HTTP), so TLS is handled by
 - **`FERRUM_TLS_CA_BUNDLE_PATH`** is applied as `ssl.ca.location` when `ssl_ca_location` is not set in the plugin config
 - **`FERRUM_TLS_NO_VERIFY`** is applied as `enable.ssl.certificate.verification=false` when `ssl_no_verify` is not set in the plugin config
 - **`FERRUM_TLS_CRL_FILE_PATH`** is applied as `ssl.crl.location` whenever certificate verification is enabled. The gateway CRL path is resolved only when verification is effective, so `ssl_no_verify: true` does not fail merely because loaded CRLs lack a filesystem identity. A conflicting `producer_config.ssl.crl.location` is rejected fail-closed; reload keeps last-known-good configuration
-- Plugin-level fields always override the gateway defaults except for the CRL baseline conflict rule above. `producer_config` cannot silently override top-level TLS/SASL security controls after they were validated
+- Plugin-level fields always override the gateway defaults except for the CRL baseline conflict rule above. `producer_config` cannot silently override top-level TLS/SASL security controls after they were validated, including through librdkafka aliases or alternate PEM/keystore inputs
 
 This means operators who have already configured `FERRUM_TLS_CA_BUNDLE_PATH` / `FERRUM_TLS_CRL_FILE_PATH` for internal CAs do not need to duplicate those paths in the kafka_logging plugin config.
 

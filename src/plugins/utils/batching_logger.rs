@@ -262,20 +262,64 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// Callers that published [`BatchingLoggerHandle`] clones must drop those
     /// handles first; otherwise the channel stays open until every clone is
     /// released.
-    pub async fn close_and_await(&mut self) {
+    pub async fn close_and_await(&mut self) -> bool {
         drop(self.sender.take());
         if let Some(worker) = self.worker.take() {
-            let _ = worker.await;
+            return worker.await.is_ok();
+        }
+        true
+    }
+
+    /// Close admission and cancel the flush worker when no asynchronous drain
+    /// can be awaited. This is intentionally lossy; lifecycle owners must
+    /// account the abandoned work before calling it.
+    pub fn close_and_abort(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
         }
     }
 
     /// Non-blocking send. On full buffer, logs a warning once per N drops and
     /// silently drops intermediate entries so the hot path never blocks.
     pub fn try_send(&self, item: T) -> bool {
-        match self.handle() {
-            Some(handle) => handle.try_send(item),
-            None => {
-                record_drop(&self.dropped_count, self.plugin_name, "worker unavailable during shutdown");
+        let Some(sender) = self.sender.as_ref() else {
+            record_drop(
+                &self.dropped_count,
+                self.plugin_name,
+                "worker unavailable during shutdown",
+            );
+            return false;
+        };
+        let depth = self.queue_depth.load(Ordering::Relaxed);
+        if is_high_water(depth, self.buffer_capacity, self.hooks.high_watermark_percent) {
+            if let Some(on_high_water) = self.hooks.on_high_water.as_ref() {
+                on_high_water(depth, self.buffer_capacity);
+            }
+            if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
+                on_overflow(item, "queue high water");
+                return false;
+            }
+        }
+
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
+        match sender.try_send(item) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                decrement_queue_depth(&self.queue_depth);
+                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
+                if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
+                    on_overflow(item, "buffer full");
+                }
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                decrement_queue_depth(&self.queue_depth);
+                record_drop(
+                    &self.dropped_count,
+                    self.plugin_name,
+                    "worker unavailable during shutdown",
+                );
                 false
             }
         }
@@ -286,9 +330,31 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// capacity before a response becomes immutable, while filling the record
     /// only after later validators determine the final status and body.
     pub fn try_reserve(&self) -> Option<BatchingLoggerPermit<T>> {
-        match self.handle() {
-            Some(handle) => handle.try_reserve(),
-            None => {
+        let Some(sender) = self.sender.as_ref() else {
+            record_drop(
+                &self.dropped_count,
+                self.plugin_name,
+                "worker unavailable while reserving a commit slot",
+            );
+            return None;
+        };
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
+        match sender.clone().try_reserve_owned() {
+            Ok(permit) => Some(BatchingLoggerPermit {
+                permit: Some(permit),
+                queue_depth: Arc::clone(&self.queue_depth),
+            }),
+            Err(mpsc::error::TrySendError::Full(_sender)) => {
+                decrement_queue_depth(&self.queue_depth);
+                record_drop(
+                    &self.dropped_count,
+                    self.plugin_name,
+                    "buffer full while reserving a commit slot",
+                );
+                None
+            }
+            Err(mpsc::error::TrySendError::Closed(_sender)) => {
+                decrement_queue_depth(&self.queue_depth);
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,

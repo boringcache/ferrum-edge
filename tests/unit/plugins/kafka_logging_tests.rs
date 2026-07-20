@@ -9,7 +9,7 @@ use ferrum_edge::plugins::kafka_logging::{
     HARD_MAX_ENTRY_BYTES, HARD_MAX_FLUSH_TIMEOUT_SECONDS, KafkaLogging,
 };
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
-use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin};
+use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginFailurePolicy, plugin_failure_policy};
 use serde_json::json;
 use tokio::time::{Duration, sleep};
 
@@ -34,6 +34,10 @@ async fn test_kafka_logging_plugin_creation() {
     assert_eq!(plugin.name(), "kafka_logging");
     assert_eq!(plugin.priority(), 9150);
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+    assert_eq!(
+        plugin_failure_policy("kafka_logging"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
 }
 
 #[tokio::test]
@@ -603,6 +607,7 @@ async fn test_kafka_logging_no_verify_skips_crl_conflict() {
         &json!({
             "broker_list": "localhost:9092",
             "topic": "test",
+            "security_protocol": "ssl",
             "ssl_no_verify": true,
             "producer_config": {
                 "ssl.crl.location": "/tmp/other.crl"
@@ -627,11 +632,12 @@ async fn test_kafka_logging_finalize_is_exact_once() {
     let before = plugin.snapshot();
     assert!(before.accepting);
     assert!(!before.finalized);
-    plugin.finalize().await;
+    plugin.log(&create_test_transaction_summary()).await;
+    let ((), ()) = tokio::join!(plugin.finalize(), plugin.finalize());
     let after = plugin.snapshot();
     assert!(after.finalized);
     assert!(!after.accepting);
-    // Second finalize is a no-op and must not panic.
+    // Every subsequent finalize is a no-op and must not panic.
     plugin.finalize().await;
     assert!(plugin.snapshot().finalized);
 }
@@ -884,16 +890,23 @@ async fn test_kafka_logging_rejects_producer_config_security_aliases_case_insens
     let cases = [
         ("security.protocol", "security_protocol"),
         ("SECURITY.PROTOCOL", "security_protocol"),
-        (
-            "enable.ssl.certificate.verification",
-            "ssl_no_verify",
-        ),
+        ("enable.ssl.certificate.verification", "ssl_no_verify"),
         ("Enable.SSL.Certificate.Verification", "ssl_no_verify"),
+        ("ssl.endpoint.identification.algorithm", "ssl_no_verify"),
         ("ssl.ca.location", "ssl_ca_location"),
         ("SSL.CA.LOCATION", "ssl_ca_location"),
+        ("ssl.ca.pem", "ssl_ca_location"),
+        ("ssl.ca.certificate.stores", "ssl_ca_location"),
         ("ssl.certificate.location", "ssl_certificate_location"),
+        ("ssl.certificate.pem", "ssl_certificate_location"),
         ("ssl.key.location", "ssl_key_location"),
+        ("ssl.key.pem", "ssl_key_location"),
+        (
+            "ssl.keystore.location",
+            "ssl_certificate_location and ssl_key_location",
+        ),
         ("sasl.mechanism", "sasl_mechanism"),
+        ("sasl.mechanisms", "sasl_mechanism"),
         ("sasl.username", "sasl_username"),
         ("sasl.password", "sasl_password"),
         ("SASL.PASSWORD", "sasl_password"),
@@ -932,9 +945,72 @@ async fn test_kafka_logging_ssl_no_verify_skips_gateway_crl_path_requirement() {
         &json!({
             "broker_list": "localhost:9092",
             "topic": "test",
+            "security_protocol": "ssl",
             "ssl_no_verify": true
         }),
         &default_http_client(),
     )
     .expect("ssl_no_verify must skip gateway CRL path resolution");
+}
+
+#[tokio::test]
+async fn test_kafka_logging_rejects_incoherent_tls_and_sasl_controls() {
+    let cases = [
+        json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "ssl_no_verify": false
+        }),
+        json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "security_protocol": "sasl_plaintext",
+            "ssl_ca_location": "/etc/ferrum/ca.pem"
+        }),
+        json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "security_protocol": "ssl",
+            "sasl_mechanism": "PLAIN"
+        }),
+        json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "security_protocol": "sasl_ssl",
+            "sasl_username": "alice"
+        }),
+    ];
+    for config in cases {
+        let result =
+            kafka_logging_validate_producer_admission_for_test(&config, &default_http_client());
+        assert!(
+            result.is_err(),
+            "incoherent Kafka security controls must fail admission: {config}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_kafka_logging_rejects_security_namespaces_on_plaintext_escape_hatch() {
+    for producer_key in [
+        "ssl.crl.location",
+        "ssl.cipher.suites",
+        "sasl.oauthbearer.config",
+        "https.ca.location",
+    ] {
+        let result = kafka_logging_validate_producer_admission_for_test(
+            &json!({
+                "broker_list": "localhost:9092",
+                "topic": "test",
+                "producer_config": {
+                    producer_key: "must-not-be-applied"
+                }
+            }),
+            &default_http_client(),
+        );
+        assert!(
+            result.is_err(),
+            "producer_config.{producer_key} must not be ignored on plaintext transport"
+        );
+    }
 }

@@ -3073,6 +3073,10 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
         schema["properties"]["buffer_max_bytes"]["maximum"],
         json!(268435456)
     );
+    assert_eq!(
+        schema["properties"]["security_protocol"]["default"],
+        json!("plaintext")
+    );
 
     for valid in [
         json!({"broker_list": "localhost:9092", "topic": "logs"}),
@@ -3090,6 +3094,15 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
             "topic": "logs",
             "flush_timeout_seconds": 300
         }),
+        json!({
+            "broker_list": "localhost:9092",
+            "topic": "logs",
+            "security_protocol": "sasl_ssl",
+            "ssl_ca_location": "/etc/ferrum/ca.pem",
+            "sasl_mechanism": "PLAIN",
+            "sasl_username": "alice",
+            "sasl_password": "secret"
+        }),
     ] {
         assert_component_validity(&spec, "KafkaLoggingConfig", &valid, true);
     }
@@ -3102,6 +3115,11 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
         json!({"broker_list": "localhost:9092", "topic": "logs", "flush_timeout_seconds": 301}),
         json!({"broker_list": "localhost:9092", "topic": "logs", "max_entry_bytes": 0}),
         json!({"broker_list": "localhost:9092", "topic": "logs", "buffer_max_bytes": 0}),
+        json!({"broker_list": "localhost:9092", "topic": "logs", "ssl_no_verify": false}),
+        json!({"broker_list": "localhost:9092", "topic": "logs", "security_protocol": "ssl", "sasl_mechanism": "PLAIN"}),
+        json!({"broker_list": "localhost:9092", "topic": "logs", "security_protocol": "sasl_plaintext", "ssl_ca_location": "/etc/ferrum/ca.pem"}),
+        json!({"broker_list": "localhost:9092", "topic": "logs", "security_protocol": "sasl_ssl", "sasl_username": "alice"}),
+        json!({"broker_list": "localhost:9092", "topic": "logs", "security_protocol": "ssl", "ssl_certificate_location": "/etc/ferrum/client.pem"}),
     ] {
         assert_component_validity(&spec, "KafkaLoggingConfig", &invalid, false);
     }

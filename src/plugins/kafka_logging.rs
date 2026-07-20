@@ -33,12 +33,11 @@ use rdkafka::message::DeliveryResult;
 use rdkafka::producer::{BaseRecord, Producer, ProducerContext, ThreadedProducer};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::spawn_blocking;
 use tracing::warn;
 
-use super::utils::log_schema::{
-    SchemaCapabilities, SchemaView, SummarySchema, resolve_schema,
-};
+use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfig, BatchingLogger, BatchingLoggerHandle, LoggerHooks, PluginHttpClient, RetryPolicy,
 };
@@ -106,10 +105,20 @@ const ALLOWED_CONFIG_KEYS: &[&str] = &[
 const FORBIDDEN_PRODUCER_SECURITY_KEYS: &[(&str, &str)] = &[
     ("security.protocol", "security_protocol"),
     ("enable.ssl.certificate.verification", "ssl_no_verify"),
+    ("ssl.endpoint.identification.algorithm", "ssl_no_verify"),
     ("ssl.ca.location", "ssl_ca_location"),
+    ("ssl.ca.pem", "ssl_ca_location"),
+    ("ssl.ca.certificate.stores", "ssl_ca_location"),
     ("ssl.certificate.location", "ssl_certificate_location"),
+    ("ssl.certificate.pem", "ssl_certificate_location"),
     ("ssl.key.location", "ssl_key_location"),
+    ("ssl.key.pem", "ssl_key_location"),
+    (
+        "ssl.keystore.location",
+        "ssl_certificate_location and ssl_key_location",
+    ),
     ("sasl.mechanism", "sasl_mechanism"),
+    ("sasl.mechanisms", "sasl_mechanism"),
     ("sasl.username", "sasl_username"),
     ("sasl.password", "sasl_password"),
 ];
@@ -119,6 +128,123 @@ enum KeyField {
     ClientIp,
     ProxyId,
     None,
+}
+
+#[derive(Clone, Copy)]
+enum KafkaSecurityProtocol {
+    Plaintext,
+    Ssl,
+    SaslPlaintext,
+    SaslSsl,
+}
+
+impl KafkaSecurityProtocol {
+    fn parse(config: &Value) -> Result<Self, String> {
+        match optional_non_empty_string(config, "security_protocol")?
+            .unwrap_or_else(|| "plaintext".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "plaintext" => Ok(Self::Plaintext),
+            "ssl" => Ok(Self::Ssl),
+            "sasl_plaintext" => Ok(Self::SaslPlaintext),
+            "sasl_ssl" => Ok(Self::SaslSsl),
+            other => Err(format!(
+                "kafka_logging: unsupported security_protocol '{other}' \
+                 (use plaintext/ssl/sasl_plaintext/sasl_ssl)"
+            )),
+        }
+    }
+
+    fn as_librdkafka(self) -> &'static str {
+        match self {
+            Self::Plaintext => "plaintext",
+            Self::Ssl => "ssl",
+            Self::SaslPlaintext => "sasl_plaintext",
+            Self::SaslSsl => "sasl_ssl",
+        }
+    }
+
+    fn uses_tls(self) -> bool {
+        matches!(self, Self::Ssl | Self::SaslSsl)
+    }
+
+    fn uses_sasl(self) -> bool {
+        matches!(self, Self::SaslPlaintext | Self::SaslSsl)
+    }
+}
+
+struct KafkaSecuritySettings {
+    protocol: KafkaSecurityProtocol,
+    sasl_mechanism: Option<String>,
+    sasl_username: Option<String>,
+    sasl_password: Option<String>,
+    ssl_ca_location: Option<String>,
+    ssl_no_verify: bool,
+    ssl_certificate_location: Option<String>,
+    ssl_key_location: Option<String>,
+}
+
+impl KafkaSecuritySettings {
+    fn parse(config: &Value, http_client: &PluginHttpClient) -> Result<Self, String> {
+        let protocol = KafkaSecurityProtocol::parse(config)?;
+        let sasl_mechanism = optional_non_empty_string(config, "sasl_mechanism")?;
+        let sasl_username = optional_non_empty_string(config, "sasl_username")?;
+        let sasl_password = optional_non_empty_string(config, "sasl_password")?;
+        let ssl_ca_location = optional_non_empty_string(config, "ssl_ca_location")?;
+        let configured_ssl_no_verify = optional_bool(config, "ssl_no_verify")?;
+        let ssl_certificate_location =
+            optional_non_empty_string(config, "ssl_certificate_location")?;
+        let ssl_key_location = optional_non_empty_string(config, "ssl_key_location")?;
+
+        if ssl_certificate_location.is_some() != ssl_key_location.is_some() {
+            return Err(
+                "kafka_logging: 'ssl_certificate_location' and 'ssl_key_location' must be provided together"
+                    .to_string(),
+            );
+        }
+        if sasl_username.is_some() != sasl_password.is_some() {
+            return Err(
+                "kafka_logging: 'sasl_username' and 'sasl_password' must be provided together"
+                    .to_string(),
+            );
+        }
+
+        if !protocol.uses_tls() {
+            for key in [
+                "ssl_ca_location",
+                "ssl_no_verify",
+                "ssl_certificate_location",
+                "ssl_key_location",
+            ] {
+                if config.get(key).is_some() {
+                    return Err(format!(
+                        "kafka_logging: '{key}' requires security_protocol 'ssl' or 'sasl_ssl'"
+                    ));
+                }
+            }
+        }
+        if !protocol.uses_sasl() {
+            for key in ["sasl_mechanism", "sasl_username", "sasl_password"] {
+                if config.get(key).is_some() {
+                    return Err(format!(
+                        "kafka_logging: '{key}' requires security_protocol 'sasl_plaintext' or 'sasl_ssl'"
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            protocol,
+            sasl_mechanism,
+            sasl_username,
+            sasl_password,
+            ssl_ca_location,
+            ssl_no_verify: configured_ssl_no_verify.unwrap_or(http_client.tls_no_verify()),
+            ssl_certificate_location,
+            ssl_key_location,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -524,22 +650,16 @@ impl KafkaProducerState {
     }
 
     fn flush_once(&self) -> Result<(), KafkaError> {
-        if self
-            .finalized
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        if self.finalized.load(Ordering::Acquire) {
             return Ok(());
         }
         self.metrics.accepting.store(false, Ordering::Relaxed);
         let pending_before = self.producer.in_flight_count().max(0) as u64;
         let admitted = self.metrics.admitted.load(Ordering::Relaxed);
-        if pending_before == 0 && admitted == 0 {
-            return Ok(());
-        }
-        match self.producer.flush(self.flush_timeout) {
-            Ok(()) => Ok(()),
-            Err(error) => {
+        let result = if pending_before == 0 && admitted == 0 {
+            Ok(())
+        } else {
+            self.producer.flush(self.flush_timeout).inspect_err(|error| {
                 let remaining = self.producer.in_flight_count().max(0) as u64;
                 let timed_out = matches!(
                     error,
@@ -551,13 +671,17 @@ impl KafkaProducerState {
                     pending_before
                 };
                 self.metrics.record_flush_failure(
-                    safe_kafka_error_kind(&error),
+                    safe_kafka_error_kind(error),
                     timed_out,
                     incomplete,
                 );
-                Err(error)
-            }
-        }
+            })
+        };
+        // This flag means the one owned flush attempt completed, not merely
+        // that it started. Callers waiting on the lifecycle lock therefore do
+        // not hide an in-progress flush from authenticated diagnostics.
+        self.finalized.store(true, Ordering::Release);
+        result
     }
 }
 
@@ -585,10 +709,7 @@ impl KafkaAdmission {
         let key = match self.key_field {
             KeyField::None => None,
             KeyField::ClientIp => Some(Arc::<str>::from(summary.client_ip.as_str())),
-            KeyField::ProxyId => summary
-                .proxy_id
-                .as_deref()
-                .map(Arc::<str>::from),
+            KeyField::ProxyId => summary.proxy_id.as_deref().map(Arc::<str>::from),
         };
         let record = match &self.schema {
             Some(schema) => self.build_record(
@@ -636,11 +757,7 @@ impl KafkaAdmission {
         permit.send(record);
     }
 
-    fn build_record<T: Serialize>(
-        &self,
-        value: &T,
-        key: Option<Arc<str>>,
-    ) -> Option<KafkaRecord> {
+    fn build_record<T: Serialize>(&self, value: &T, key: Option<Arc<str>>) -> Option<KafkaRecord> {
         let mut writer = BoundedJsonWriter::new(self.max_entry_bytes);
         if let Err(error) = serde_json::to_writer(&mut writer, value) {
             if writer.limit_exceeded {
@@ -700,10 +817,15 @@ struct KafkaGeneration {
     /// Lifecycle-only ownership of the batching worker (not touched on hot path).
     logger: Mutex<Option<BatchingLogger<KafkaRecord>>>,
     in_flight: Arc<AtomicUsize>,
+    finalize_lock: AsyncMutex<()>,
 }
 
 impl KafkaGeneration {
     async fn finalize(&self) {
+        let _finalize_guard = self.finalize_lock.lock().await;
+        if self.state.finalized.load(Ordering::Acquire) {
+            return;
+        }
         self.metrics_accepting_off();
         // Atomically stop new hot-path admission, then await every transient
         // admit that already observed the previous handle.
@@ -718,11 +840,30 @@ impl KafkaGeneration {
             };
             guard.take()
         };
-        if let Some(mut owned) = logger {
-            owned.close_and_await().await;
+        let Some(mut owned) = logger else {
+            let incomplete = self.in_flight.load(Ordering::Acquire).max(1) as u64;
+            self.state.metrics.record_shutdown_incomplete(incomplete);
+            self.state.finalized.store(true, Ordering::Release);
+            return;
+        };
+        if !owned.close_and_await().await {
+            let incomplete = owned.queue_depth().max(1) as u64;
+            self.state.metrics.record_shutdown_incomplete(incomplete);
         }
         let state = Arc::clone(&self.state);
-        let _ = spawn_blocking(move || state.flush_once()).await;
+        let flush_state = Arc::clone(&state);
+        if spawn_blocking(move || flush_state.flush_once())
+            .await
+            .is_err()
+        {
+            let incomplete = state.producer.in_flight_count().max(0) as u64;
+            state.metrics.record_flush_failure(
+                "flush_task_join_failed",
+                false,
+                incomplete.max(1),
+            );
+            state.finalized.store(true, Ordering::Release);
+        }
     }
 
     fn metrics_accepting_off(&self) {
@@ -739,15 +880,20 @@ impl KafkaGeneration {
             .as_ref()
             .map(|admission| admission.handle.queue_depth() as u64)
             .unwrap_or(0);
+        let retained_record = u64::from(self.state.byte_budget.used() > 0);
+        let producer_pending = self.state.producer.in_flight_count().max(0) as u64;
         drop(previous);
         let mut guard = match self.logger.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        // Drop the lifecycle owner without awaiting: channel closes once the
-        // admission handle Arc above was dropped, but the worker is not joined.
-        drop(guard.take());
-        let incomplete = transient.saturating_add(queued);
+        if let Some(mut logger) = guard.take() {
+            logger.close_and_abort();
+        }
+        let incomplete = transient
+            .saturating_add(queued)
+            .max(retained_record)
+            .saturating_add(producer_pending);
         if incomplete > 0 {
             self.state.metrics.record_shutdown_incomplete(incomplete);
         }
@@ -799,8 +945,16 @@ pub async fn finalize_all_generations() {
         };
         guard.values().cloned().collect()
     };
+    // Independent producers share no lifecycle state. Finalize them
+    // concurrently so the shutdown/reload ceiling is the slowest configured
+    // producer budget, rather than the sum of every live generation's budget.
+    futures::future::join_all(
+        generations
+            .iter()
+            .map(|generation| generation.finalize()),
+    )
+    .await;
     for generation in generations {
-        generation.finalize().await;
         unregister_generation(generation.state.metrics.generation_id);
     }
 }
@@ -1028,68 +1182,48 @@ impl KafkaLogging {
             }
         }
 
-        if let Some(protocol) = optional_non_empty_string(config, "security_protocol")? {
-            match protocol.to_ascii_lowercase().as_str() {
-                value @ ("plaintext" | "ssl" | "sasl_plaintext" | "sasl_ssl") => {
-                    kafka_config.set("security.protocol", value);
-                }
-                other => {
-                    return Err(format!(
-                        "kafka_logging: unsupported security_protocol '{other}' \
-                         (use plaintext/ssl/sasl_plaintext/sasl_ssl)"
-                    ));
-                }
-            }
-        }
-        if let Some(mechanism) = optional_non_empty_string(config, "sasl_mechanism")? {
+        let security = KafkaSecuritySettings::parse(config, http_client)?;
+        kafka_config.set("security.protocol", security.protocol.as_librdkafka());
+        if let Some(mechanism) = security.sasl_mechanism.as_ref() {
             kafka_config.set("sasl.mechanism", mechanism);
         }
-        if let Some(username) = optional_non_empty_string(config, "sasl_username")? {
+        if let Some(username) = security.sasl_username.as_ref() {
             kafka_config.set("sasl.username", username);
         }
-        if let Some(password) = optional_non_empty_string(config, "sasl_password")? {
+        if let Some(password) = security.sasl_password.as_ref() {
             kafka_config.set("sasl.password", password);
         }
 
-        if let Some(ca) = optional_non_empty_string(config, "ssl_ca_location")? {
-            kafka_config.set("ssl.ca.location", ca);
-        } else if let Some(gateway_ca) = http_client.tls_ca_bundle_path() {
-            kafka_config.set("ssl.ca.location", gateway_ca);
-        }
-
-        let ssl_no_verify =
-            optional_bool(config, "ssl_no_verify")?.unwrap_or(http_client.tls_no_verify());
-        if ssl_no_verify {
-            kafka_config.set("enable.ssl.certificate.verification", "false");
-        }
-
-        let ssl_certificate_location =
-            optional_non_empty_string(config, "ssl_certificate_location")?;
-        let ssl_key_location = optional_non_empty_string(config, "ssl_key_location")?;
-        if ssl_certificate_location.is_some() != ssl_key_location.is_some() {
-            return Err(
-                "kafka_logging: 'ssl_certificate_location' and 'ssl_key_location' must be provided together"
-                    .to_string(),
-            );
-        }
-        if let Some(cert) = ssl_certificate_location {
-            kafka_config.set("ssl.certificate.location", cert);
-        }
-        if let Some(key) = ssl_key_location {
-            kafka_config.set("ssl.key.location", key);
+        if security.protocol.uses_tls() {
+            if let Some(ca) = security.ssl_ca_location.as_ref() {
+                kafka_config.set("ssl.ca.location", ca);
+            } else if let Some(gateway_ca) = http_client.tls_ca_bundle_path() {
+                kafka_config.set("ssl.ca.location", gateway_ca);
+            }
+            if security.ssl_no_verify {
+                kafka_config.set("enable.ssl.certificate.verification", "false");
+            }
+            if let Some(cert) = security.ssl_certificate_location.as_ref() {
+                kafka_config.set("ssl.certificate.location", cert);
+            }
+            if let Some(key) = security.ssl_key_location.as_ref() {
+                kafka_config.set("ssl.key.location", key);
+            }
         }
 
         // Resolve the gateway CRL filesystem identity only when verification
-        // is enabled so ssl_no_verify=true does not fail merely because loaded
-        // CRLs lack a path suitable for librdkafka.
-        let gateway_crl_path = if ssl_no_verify {
+        // is enabled on a TLS transport, so plaintext/SASL-plaintext and
+        // ssl_no_verify=true do not fail merely because loaded CRLs lack a path
+        // suitable for librdkafka.
+        let gateway_crl_path = if !security.protocol.uses_tls() || security.ssl_no_verify {
             None
         } else {
             resolve_gateway_crl_path(http_client)?
         };
         let admitted = admit_producer_config(
             config.get("producer_config"),
-            ssl_no_verify,
+            security.protocol,
+            security.ssl_no_verify,
             gateway_crl_path.as_deref(),
         )?;
         for (key, value) in &admitted.extra_props {
@@ -1106,7 +1240,7 @@ impl KafkaLogging {
         );
         kafka_config.set("message.max.bytes", admitted.message_max_bytes.to_string());
 
-        if !ssl_no_verify {
+        if security.protocol.uses_tls() && !security.ssl_no_verify {
             if let Some(gateway) = gateway_crl_path.as_ref() {
                 kafka_config.set("ssl.crl.location", gateway);
             } else if let Some(override_path) = admitted.producer_set_crl {
@@ -1202,6 +1336,7 @@ impl KafkaLogging {
             admission: Arc::new(ArcSwapOption::from(Some(admission))),
             logger: Mutex::new(Some(logger)),
             in_flight,
+            finalize_lock: AsyncMutex::new(()),
         });
         register_generation(Arc::clone(&generation));
 
@@ -1245,14 +1380,13 @@ impl Drop for KafkaLogging {
                 });
                 return;
             }
-            // Current-thread / non-multi-thread runtime: owned asynchronous
-            // handoff preserves order without blocking the runtime or claiming
-            // a synchronous graceful flush.
-            let generation = Arc::clone(&self.generation);
-            handle.spawn(async move {
-                generation.finalize().await;
-                unregister_generation(generation.state.metrics.generation_id);
-            });
+            // Serving modes use a multi-thread runtime and finalize explicitly.
+            // A current-thread runtime cannot be synchronously blocked from
+            // Drop, so close/abort admission and report any abandoned work
+            // instead of spawning an unowned task that runtime teardown may
+            // cancel before it unregisters the generation.
+            self.generation.close_admission_report_incomplete();
+            unregister_generation(self.generation.state.metrics.generation_id);
             return;
         }
         // No runtime: close admission and account incomplete local work. Do
@@ -1279,9 +1413,10 @@ fn resolve_gateway_crl_path(http_client: &PluginHttpClient) -> Result<Option<Str
     Ok(from_env)
 }
 
-/// Deterministic admission-order probe for external unit tests: a hanging
+/// Deterministic admission-order probe for external unit tests: a gated
 /// Ferrum worker keeps the channel full so a subsequent oversized summary can
-/// only observe channel rejection (never `entry_oversize`). Returns
+/// only observe channel rejection (never `entry_oversize`). The gate is then
+/// released and the worker is joined normally. Returns
 /// `(ferrum_dropped_total, entry_oversize_total)`.
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) async fn probe_reserve_before_serialize_for_test(
@@ -1290,7 +1425,9 @@ pub(crate) async fn probe_reserve_before_serialize_for_test(
     let metrics = Arc::new(KafkaDeliveryMetrics::new(u64::MAX - 7));
     let byte_budget = Arc::new(KafkaByteBudget::new(4_096));
     let in_flight = Arc::new(AtomicUsize::new(0));
-    let logger = BatchingLogger::spawn_with_hooks(
+    let worker_started = Arc::new(Semaphore::new(0));
+    let worker_release = Arc::new(Semaphore::new(0));
+    let mut logger = BatchingLogger::spawn_with_hooks(
         BatchConfig {
             batch_size: 1,
             flush_interval: Duration::from_secs(3600),
@@ -1299,12 +1436,23 @@ pub(crate) async fn probe_reserve_before_serialize_for_test(
             plugin_name: "kafka_logging",
         },
         LoggerHooks::default(),
-        move |batch| async move {
-            drop(batch);
-            // Keep the worker inside flush so it cannot drain subsequent
-            // injected records for the duration of this probe.
-            std::future::pending::<()>().await;
-            Ok(())
+        {
+            let worker_started = Arc::clone(&worker_started);
+            let worker_release = Arc::clone(&worker_release);
+            move |batch| {
+                let worker_started = Arc::clone(&worker_started);
+                let worker_release = Arc::clone(&worker_release);
+                async move {
+                    drop(batch);
+                    worker_started.add_permits(1);
+                    let permit = worker_release
+                        .acquire()
+                        .await
+                        .map_err(|_| "test worker release gate closed".to_string())?;
+                    permit.forget();
+                    Ok(())
+                }
+            }
         },
     );
     let Some(handle) = logger.handle() else {
@@ -1324,9 +1472,12 @@ pub(crate) async fn probe_reserve_before_serialize_for_test(
         })
     };
     let _ = inject(&handle, &byte_budget);
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
+    let Ok(started) = worker_started.acquire().await else {
+        worker_release.add_permits(1);
+        let _ = logger.close_and_await().await;
+        return (0, 0);
+    };
+    started.forget();
     let _ = inject(&handle, &byte_budget);
 
     let admission = KafkaAdmission {
@@ -1342,9 +1493,9 @@ pub(crate) async fn probe_reserve_before_serialize_for_test(
 
     let dropped = metrics.ferrum_dropped.load(Ordering::Relaxed);
     let oversize = metrics.entry_oversize.load(Ordering::Relaxed);
-    // Drop without awaiting: the worker is intentionally parked in pending()
-    // for this probe; the test runtime tears the detached task down.
-    drop(logger);
+    drop(admission);
+    worker_release.add_permits(2);
+    let _ = logger.close_and_await().await;
     (dropped, oversize)
 }
 
@@ -1356,16 +1507,16 @@ pub(crate) fn validate_producer_admission(
     config: &Value,
     http_client: &PluginHttpClient,
 ) -> Result<(), String> {
-    let ssl_no_verify =
-        optional_bool(config, "ssl_no_verify")?.unwrap_or(http_client.tls_no_verify());
-    let gateway_crl_path = if ssl_no_verify {
+    let security = KafkaSecuritySettings::parse(config, http_client)?;
+    let gateway_crl_path = if !security.protocol.uses_tls() || security.ssl_no_verify {
         None
     } else {
         resolve_gateway_crl_path(http_client)?
     };
     admit_producer_config(
         config.get("producer_config"),
-        ssl_no_verify,
+        security.protocol,
+        security.ssl_no_verify,
         gateway_crl_path.as_deref(),
     )
     .map(|_| ())
@@ -1383,6 +1534,7 @@ struct AdmittedProducerConfig {
 /// without constructing a Kafka producer.
 fn admit_producer_config(
     producer_config: Option<&Value>,
+    security_protocol: KafkaSecurityProtocol,
     ssl_no_verify: bool,
     gateway_crl_path: Option<&str>,
 ) -> Result<AdmittedProducerConfig, String> {
@@ -1400,8 +1552,12 @@ fn admit_producer_config(
         .as_object()
         .ok_or_else(|| "kafka_logging: 'producer_config' must be an object".to_string())?;
     for (key, value) in props {
-        if key.trim().is_empty() {
-            return Err("kafka_logging: 'producer_config' keys must not be empty".to_string());
+        let normalized = key.to_ascii_lowercase();
+        if key.trim().is_empty() || key.trim() != key {
+            return Err(
+                "kafka_logging: 'producer_config' keys must be non-empty and have no surrounding whitespace"
+                    .to_string(),
+            );
         }
         let prop = value
             .as_str()
@@ -1411,16 +1567,14 @@ fn admit_producer_config(
                 "kafka_logging: 'producer_config.{key}' must not be empty"
             ));
         }
-        if key.eq_ignore_ascii_case("bootstrap.servers")
-            || key.eq_ignore_ascii_case("metadata.broker.list")
-        {
+        if normalized == "bootstrap.servers" || normalized == "metadata.broker.list" {
             return Err(format!(
                 "kafka_logging: 'producer_config.{key}' is not allowed"
             ));
         }
         if let Some((_, authoritative)) = FORBIDDEN_PRODUCER_SECURITY_KEYS
             .iter()
-            .find(|(forbidden, _)| key.eq_ignore_ascii_case(forbidden))
+            .find(|(forbidden, _)| normalized.as_str() == *forbidden)
         {
             // Do not echo the configured value — it may be a secret
             // (sasl.password) or otherwise sensitive identity material.
@@ -1428,12 +1582,33 @@ fn admit_producer_config(
                 "kafka_logging: 'producer_config.{key}' is not allowed; use top-level '{authoritative}'"
             ));
         }
-        if key.eq_ignore_ascii_case("ssl.crl.location") {
-            admit_producer_crl_location(ssl_no_verify, gateway_crl_path, prop)?;
+        if (normalized.starts_with("ssl.") || normalized.starts_with("enable.ssl."))
+            && !security_protocol.uses_tls()
+        {
+            return Err(format!(
+                "kafka_logging: 'producer_config.{key}' requires security_protocol 'ssl' or 'sasl_ssl'"
+            ));
+        }
+        if (normalized.starts_with("sasl.")
+            || normalized.starts_with("enable.sasl.")
+            || normalized.starts_with("https."))
+            && !security_protocol.uses_sasl()
+        {
+            return Err(format!(
+                "kafka_logging: 'producer_config.{key}' requires security_protocol 'sasl_plaintext' or 'sasl_ssl'"
+            ));
+        }
+        if normalized == "ssl.crl.location" {
+            admit_producer_crl_location(
+                security_protocol.uses_tls(),
+                ssl_no_verify,
+                gateway_crl_path,
+                prop,
+            )?;
             admitted.producer_set_crl = Some(prop.to_string());
             continue;
         }
-        if key.eq_ignore_ascii_case("queue.buffering.max.messages") {
+        if normalized == "queue.buffering.max.messages" {
             admitted.queue_messages = parse_bounded_u32(
                 prop,
                 "producer_config.queue.buffering.max.messages",
@@ -1441,7 +1616,7 @@ fn admit_producer_config(
             )?;
             continue;
         }
-        if key.eq_ignore_ascii_case("queue.buffering.max.kbytes") {
+        if normalized == "queue.buffering.max.kbytes" {
             admitted.queue_kbytes = parse_bounded_u32(
                 prop,
                 "producer_config.queue.buffering.max.kbytes",
@@ -1449,7 +1624,7 @@ fn admit_producer_config(
             )?;
             continue;
         }
-        if key.eq_ignore_ascii_case("message.max.bytes") {
+        if normalized == "message.max.bytes" {
             admitted.message_max_bytes = parse_bounded_u32(
                 prop,
                 "producer_config.message.max.bytes",
@@ -1464,10 +1639,17 @@ fn admit_producer_config(
 
 /// Fail-closed CRL override check shared by construction and pure admission.
 fn admit_producer_crl_location(
+    tls_enabled: bool,
     ssl_no_verify: bool,
     gateway_crl_path: Option<&str>,
     producer_crl: &str,
 ) -> Result<(), String> {
+    if !tls_enabled {
+        return Err(
+            "kafka_logging: 'producer_config.ssl.crl.location' requires security_protocol 'ssl' or 'sasl_ssl'"
+                .to_string(),
+        );
+    }
     if ssl_no_verify {
         return Ok(());
     }
@@ -1606,7 +1788,11 @@ async fn send_batch(
             match enqueue_error {
                 Some(error) => {
                     state.metrics.record_queue_rejected(&error);
-                    Err(format!("kafka_logging: failed to enqueue message: {error}"))
+                    // The instance-scoped metric and rate-limited safe
+                    // classification above are the terminal accounting. Do not
+                    // feed the raw librdkafka error into the generic per-batch
+                    // warning path or a second retry loop.
+                    Ok(())
                 }
                 None => {
                     state.metrics.record_admitted();

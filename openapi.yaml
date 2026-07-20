@@ -11357,10 +11357,48 @@ components:
     KafkaLoggingConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds the owned shutdown/reload producer flush."
+      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload."
       required:
         - broker_list
         - topic
+      allOf:
+        - if:
+            anyOf:
+              - required: [ssl_ca_location]
+              - required: [ssl_no_verify]
+              - required: [ssl_certificate_location]
+              - required: [ssl_key_location]
+          then:
+            required: [security_protocol]
+            properties:
+              security_protocol:
+                enum: [ssl, sasl_ssl]
+        - if:
+            anyOf:
+              - required: [sasl_mechanism]
+              - required: [sasl_username]
+              - required: [sasl_password]
+          then:
+            required: [security_protocol]
+            properties:
+              security_protocol:
+                enum: [sasl_plaintext, sasl_ssl]
+        - if:
+            required: [ssl_certificate_location]
+          then:
+            required: [ssl_key_location]
+        - if:
+            required: [ssl_key_location]
+          then:
+            required: [ssl_certificate_location]
+        - if:
+            required: [sasl_username]
+          then:
+            required: [sasl_password]
+        - if:
+            required: [sasl_password]
+          then:
+            required: [sasl_username]
       properties:
         broker_list:
           type: string
@@ -11419,7 +11457,12 @@ components:
         security_protocol:
           type: string
           enum: [plaintext, ssl, sasl_plaintext, sasl_ssl]
-          description: Kafka security protocol. Unknown root keys are rejected so a misspelled control cannot silently select PLAINTEXT.
+          default: plaintext
+          description: >-
+            Kafka security protocol. Unknown root keys are rejected so a
+            misspelled control cannot silently select PLAINTEXT. Explicit TLS
+            controls require ssl/sasl_ssl; explicit SASL controls require
+            sasl_plaintext/sasl_ssl; username and password must be paired.
         sasl_mechanism:
           type: string
           description: SASL mechanism (e.g., PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
@@ -11447,13 +11490,13 @@ components:
             type: string
           description: >-
             Escape hatch: additional librdkafka producer properties as string
-            key-value pairs. Cannot override bootstrap.servers. Cannot set
-            security.protocol, enable.ssl.certificate.verification, ssl.ca.location,
-            ssl.certificate.location, ssl.key.location, sasl.mechanism,
-            sasl.username, or sasl.password (use the authoritative top-level
-            fields). Queue/message budgets cannot exceed Ferrum hard maxima.
-            ssl.crl.location cannot conflict with gateway FERRUM_TLS_CRL_FILE_PATH
-            when verification is enabled.
+            key-value pairs. Cannot override bootstrap.servers or authoritative
+            TLS/SASL controls, including official aliases, PEM/keystore identity
+            alternatives, or hostname-verification disablement. TLS-namespace
+            properties require ssl/sasl_ssl; SASL/HTTPS-auth properties require
+            sasl_plaintext/sasl_ssl. Queue/message budgets cannot exceed Ferrum
+            hard maxima. ssl.crl.location cannot conflict with gateway
+            FERRUM_TLS_CRL_FILE_PATH when verification is enabled.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:

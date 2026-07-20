@@ -6999,7 +6999,7 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("stdout_logging", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("http_logging", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("tcp_logging", PluginFailurePolicy::OptionalFailOpen),
-    builtin_plugin("kafka_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("kafka_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("ws_logging", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin(
         "transaction_debugger",
