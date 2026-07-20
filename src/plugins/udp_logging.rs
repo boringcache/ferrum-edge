@@ -490,21 +490,24 @@ pub(crate) fn duplicate_dtls_materialization_probe_for_test(
 ) -> (Result<(), String>, Result<(), String>, usize, usize) {
     let mut cache = std::collections::HashMap::new();
     let mut materialize_calls = 0usize;
-    let mut materialize = |key: &DtlsFileDependencyCacheKey| {
-        materialize_calls = materialize_calls.saturating_add(1);
-        materialize_dtls_material(
-            &key.host,
-            key.cert_path.as_deref(),
-            key.key_path.as_deref(),
-            key.ca_path.as_deref(),
-            key.no_verify,
-            &[],
+    let (first, second) = {
+        let mut materialize = |key: &DtlsFileDependencyCacheKey| {
+            materialize_calls = materialize_calls.saturating_add(1);
+            materialize_dtls_material(
+                &key.host,
+                key.cert_path.as_deref(),
+                key.key_path.as_deref(),
+                key.ca_path.as_deref(),
+                key.no_verify,
+                &[],
+            )
+            .map(|_| ())
+        };
+        (
+            validate_dtls_file_dependencies_cached_with(config, &mut cache, &mut materialize),
+            validate_dtls_file_dependencies_cached_with(config, &mut cache, &mut materialize),
         )
-        .map(|_| ())
     };
-    let first = validate_dtls_file_dependencies_cached_with(config, &mut cache, &mut materialize);
-    let second = validate_dtls_file_dependencies_cached_with(config, &mut cache, &mut materialize);
-    drop(materialize);
     (first, second, materialize_calls, cache.len())
 }
 
