@@ -3044,7 +3044,6 @@ fn stdout_logging_schema_rejects_unknown_outer_and_filter_keys() {
     }
 }
 
-
 #[test]
 fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
     let spec: serde_json::Value =

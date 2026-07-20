@@ -1405,7 +1405,8 @@ pub async fn handle_admin_request(
             health_status["logging"] =
                 serde_json::to_value(crate::logging::snapshot()).unwrap_or_default();
             health_status["kafka_logging"] =
-                serde_json::to_value(crate::plugins::kafka_logging::snapshots()).unwrap_or_default();
+                serde_json::to_value(crate::plugins::kafka_logging::snapshots())
+                    .unwrap_or_default();
         }
 
         let response_code = if !ready {

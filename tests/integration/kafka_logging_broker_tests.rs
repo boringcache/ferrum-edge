@@ -70,8 +70,8 @@ async fn kafka_logging_broker_delivers_and_finalizes() {
         eprintln!("SKIP: set FERRUM_TEST_KAFKA_BOOTSTRAP to exercise real broker delivery");
         return;
     };
-    let topic =
-        std::env::var("FERRUM_TEST_KAFKA_TOPIC").unwrap_or_else(|_| "ferrum-access-logs".to_string());
+    let topic = std::env::var("FERRUM_TEST_KAFKA_TOPIC")
+        .unwrap_or_else(|_| "ferrum-access-logs".to_string());
     let plugin = KafkaLogging::new(
         &json!({
             "broker_list": bootstrap,

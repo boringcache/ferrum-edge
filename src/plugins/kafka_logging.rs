@@ -248,7 +248,12 @@ impl KafkaDeliveryMetrics {
         }
     }
 
-    fn snapshot(&self, in_flight: i32, finalized: bool, flush_timeout_seconds: u64) -> KafkaSinkSnapshot {
+    fn snapshot(
+        &self,
+        in_flight: i32,
+        finalized: bool,
+        flush_timeout_seconds: u64,
+    ) -> KafkaSinkSnapshot {
         let last_failure = self
             .last_failure
             .lock()
@@ -356,8 +361,10 @@ impl KafkaProducerState {
             Ok(()) => Ok(()),
             Err(error) => {
                 let remaining = self.producer.in_flight_count().max(0) as u64;
-                let timed_out =
-                    matches!(error, KafkaError::Flush(RDKafkaErrorCode::OperationTimedOut));
+                let timed_out = matches!(
+                    error,
+                    KafkaError::Flush(RDKafkaErrorCode::OperationTimedOut)
+                );
                 let incomplete = if remaining > 0 {
                     remaining
                 } else {
@@ -886,9 +893,9 @@ fn near_miss_hint(object: &Map<String, Value>, required: &str, fallback: &str) -
 }
 
 fn parse_bounded_u32(raw: &str, field: &str, hard_max: u32) -> Result<u32, String> {
-    let value: u32 = raw.parse().map_err(|_| {
-        format!("kafka_logging: '{field}' must be an unsigned integer string")
-    })?;
+    let value: u32 = raw
+        .parse()
+        .map_err(|_| format!("kafka_logging: '{field}' must be an unsigned integer string"))?;
     if value == 0 {
         return Err(format!("kafka_logging: '{field}' must be >= 1"));
     }
