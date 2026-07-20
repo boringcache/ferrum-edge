@@ -446,6 +446,43 @@ plugin_configs:
         .expect("Failed to write config");
 }
 
+/// Write a WebSocket route whose response-mock plugin owns both matching and
+/// unmatched handshake responses before any backend connection is attempted.
+fn write_ws_response_mock_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-response-mock-proxy"
+    listen_path: "/ws-mock"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {}
+    strip_listen_path: true
+
+consumers: []
+plugin_configs:
+  - id: "plugin-response-mock-ws"
+    plugin_name: "response_mock"
+    config:
+      rules:
+        - path: "/match"
+          status_code: 418
+          headers:
+            content-type: "application/json"
+            x-mock: "ws"
+          body: '{{"mock":"ws-handshake"}}'
+    scope: global
+    enabled: true
+"#,
+        backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
 /// Write a WebSocket config whose backend-admission limiter holds one permit
 /// for the full upgraded session and rejects a concurrent second handshake.
 fn write_ws_backend_admission_config(config_path: &std::path::Path, backend_port: u16) {
@@ -2149,6 +2186,180 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
             .await
             .expect("H3 method-filter rejection body")
             .contains("Method Not Allowed")
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+}
+
+/// Issue #2467: response_mock intentionally participates in every WebSocket
+/// handshake frontend. Matching and default-unmatched responses must terminate
+/// H1 Upgrade and H2/H3 Extended CONNECT before any backend dial or frame relay.
+#[ignore]
+#[tokio::test]
+async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
+    use bytes::Bytes;
+    use http::{Method, Version};
+    use http_body_util::{BodyExt, Empty};
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let backend_port = free_port().await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_response_mock_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let h1_client = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .expect("H1 client");
+    let h1_match = h1_client
+        .get(format!(
+            "http://127.0.0.1:{gateway_http_port}/ws-mock/match"
+        ))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .send()
+        .await
+        .expect("matching H1 response-mock handshake");
+    assert_eq!(h1_match.status(), StatusCode::IM_A_TEAPOT);
+    assert_eq!(
+        h1_match
+            .headers()
+            .get("x-mock")
+            .and_then(|value| value.to_str().ok()),
+        Some("ws")
+    );
+    assert_eq!(
+        h1_match.text().await.expect("matching H1 mock body"),
+        r#"{"mock":"ws-handshake"}"#
+    );
+
+    let h1_miss = h1_client
+        .get(format!(
+            "http://127.0.0.1:{gateway_http_port}/ws-mock/miss"
+        ))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .send()
+        .await
+        .expect("unmatched H1 response-mock handshake");
+    assert_eq!(h1_miss.status(), StatusCode::NOT_FOUND);
+    assert!(
+        h1_miss
+            .text()
+            .await
+            .expect("unmatched H1 mock body")
+            .contains("no mock rule matched")
+    );
+
+    let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
+        .await
+        .expect("connect to gateway H2 port");
+    let h2_io = TokioIo::new(h2_stream);
+    let (mut h2_sender, h2_connection) = http2::handshake(TokioExecutor::new(), h2_io)
+        .await
+        .expect("H2 handshake");
+    let h2_connection_task = tokio::spawn(async move {
+        let _ = h2_connection.await;
+    });
+
+    let h2_match_request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!(
+            "http://127.0.0.1:{gateway_http_port}/ws-mock/match"
+        ))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build matching H2 WebSocket request");
+    let h2_match = h2_sender
+        .send_request(h2_match_request)
+        .await
+        .expect("matching H2 response-mock handshake");
+    let (h2_match_parts, h2_match_body) = h2_match.into_parts();
+    assert_eq!(h2_match_parts.status, StatusCode::IM_A_TEAPOT);
+    assert_eq!(
+        h2_match_parts
+            .headers
+            .get("x-mock")
+            .and_then(|value| value.to_str().ok()),
+        Some("ws")
+    );
+    let h2_match_body = h2_match_body
+        .collect()
+        .await
+        .expect("matching H2 mock body")
+        .to_bytes();
+    assert_eq!(h2_match_body.as_ref(), br#"{"mock":"ws-handshake"}"#);
+
+    let h2_miss_request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!(
+            "http://127.0.0.1:{gateway_http_port}/ws-mock/miss"
+        ))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build unmatched H2 WebSocket request");
+    let h2_miss = h2_sender
+        .send_request(h2_miss_request)
+        .await
+        .expect("unmatched H2 response-mock handshake");
+    let (h2_miss_parts, h2_miss_body) = h2_miss.into_parts();
+    assert_eq!(h2_miss_parts.status, StatusCode::NOT_FOUND);
+    let h2_miss_body = h2_miss_body
+        .collect()
+        .await
+        .expect("unmatched H2 mock body")
+        .to_bytes();
+    assert!(String::from_utf8_lossy(&h2_miss_body).contains("no mock rule matched"));
+    h2_connection_task.abort();
+
+    let h3_match_url = format!("https://localhost:{gateway_https_port}/ws-mock/match");
+    let h3_match_client = Http3Client::insecure().expect("matching H3 client");
+    let mut h3_match = h3_match_client
+        .websocket(&h3_match_url, WebSocketOptions::default())
+        .await
+        .expect("matching H3 response-mock handshake");
+    assert_eq!(h3_match.status, StatusCode::IM_A_TEAPOT);
+    assert_eq!(
+        h3_match
+            .headers
+            .get("x-mock")
+            .and_then(|value| value.to_str().ok()),
+        Some("ws")
+    );
+    assert_eq!(
+        h3_match.recv_body_text().await.expect("matching H3 mock body"),
+        r#"{"mock":"ws-handshake"}"#
+    );
+
+    let h3_miss_url = format!("https://localhost:{gateway_https_port}/ws-mock/miss");
+    let h3_miss_client = Http3Client::insecure().expect("unmatched H3 client");
+    let mut h3_miss = h3_miss_client
+        .websocket(&h3_miss_url, WebSocketOptions::default())
+        .await
+        .expect("unmatched H3 response-mock handshake");
+    assert_eq!(h3_miss.status, StatusCode::NOT_FOUND);
+    assert!(
+        h3_miss
+            .recv_body_text()
+            .await
+            .expect("unmatched H3 mock body")
+            .contains("no mock rule matched")
     );
 
     let _ = gateway.kill();

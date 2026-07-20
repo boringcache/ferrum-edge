@@ -16260,9 +16260,10 @@ components:
                 maximum: 599
                 description: >-
                   HTTP status code to return (default 200). Values outside
-                  100–599 are rejected. Status 101 on a WebSocket upgrade is
-                  still only a synthetic HTTP handshake response; it does not
-                  create an upgraded frame stream.
+                  100–599 are rejected. Status 101 on an HTTP/1.1 WebSocket
+                  upgrade, or a success-like 200 on HTTP/2 / HTTP/3 Extended
+                  CONNECT, is still only a synthetic HTTP handshake response;
+                  it does not create an upgraded frame stream.
               headers:
                 type: object
                 additionalProperties:

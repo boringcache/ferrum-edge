@@ -85,8 +85,14 @@ use super::{Plugin, PluginResult, RequestContext};
 pub const RESPONSE_MOCK_CONFIG_KEYS: &[&str] = &["rules", "passthrough_on_no_match"];
 
 /// Every accepted per-rule configuration property.
-pub const RESPONSE_MOCK_RULE_KEYS: &[&str] =
-    &["method", "path", "status_code", "headers", "body", "delay_ms"];
+pub const RESPONSE_MOCK_RULE_KEYS: &[&str] = &[
+    "method",
+    "path",
+    "status_code",
+    "headers",
+    "body",
+    "delay_ms",
+];
 
 /// Upper bound for a rule's `delay_ms` (1 hour). `delay_ms` feeds
 /// `tokio::time::sleep` on the request hot path, so an unbounded value
@@ -139,9 +145,9 @@ impl ResponseMock {
         let mut rules = Vec::with_capacity(rules_val.len());
 
         for (i, rule_val) in rules_val.iter().enumerate() {
-            let rule_obj = rule_val.as_object().ok_or_else(|| {
-                format!("response_mock: rule[{i}] must be an object")
-            })?;
+            let rule_obj = rule_val
+                .as_object()
+                .ok_or_else(|| format!("response_mock: rule[{i}] must be an object"))?;
             let rule_path = format!("config.rules[{i}]");
             reject_unknown_keys(rule_obj, &rule_path, RESPONSE_MOCK_RULE_KEYS)?;
 
