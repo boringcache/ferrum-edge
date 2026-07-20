@@ -3177,6 +3177,9 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
     assert!(CompressionPlugin::new(&valid).is_ok());
     assert!(CompressionPlugin::new(&json!({})).is_ok());
     assert_component_validity(&spec, "CompressionConfig", &json!({}), true);
+    let zero_gzip_level = json!({"gzip_level": 0});
+    assert_component_validity(&spec, "CompressionConfig", &zero_gzip_level, true);
+    assert!(CompressionPlugin::new(&zero_gzip_level).is_ok());
 
     for config in [
         json!({"min_content_lenght": 4096}),
