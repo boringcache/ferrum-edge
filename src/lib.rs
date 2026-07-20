@@ -2200,4 +2200,28 @@ pub mod _test_support {
     ) -> Result<(), String> {
         crate::plugins::udp_logging::validate_dtls_file_dependencies(config)
     }
+
+    pub fn udp_logging_reset_dtls_materialize_calls_for_test() {
+        crate::plugins::udp_logging::reset_dtls_materialize_calls_for_test()
+    }
+
+    pub fn udp_logging_dtls_materialize_calls_for_test() -> u64 {
+        crate::plugins::udp_logging::dtls_materialize_calls_for_test()
+    }
+
+    pub fn udp_logging_dtls_send_timeout_requires_sender_reset_for_test() -> bool {
+        crate::plugins::udp_logging::dtls_send_timeout_requires_sender_reset_for_test()
+    }
+
+    pub fn udp_logging_local_dtls_size_rejection_preserves_sender_for_test() -> bool {
+        crate::plugins::udp_logging::local_dtls_size_rejection_preserves_sender_for_test()
+    }
+
+    pub fn udp_logging_transport_dtls_failure_requires_sender_reset_for_test() -> bool {
+        crate::plugins::udp_logging::transport_dtls_failure_requires_sender_reset_for_test()
+    }
+
+    pub fn udp_logging_dtls_send_timeout_secs_for_test() -> u64 {
+        crate::plugins::udp_logging::UDP_LOGGING_DTLS_SEND_TIMEOUT.as_secs()
+    }
 }

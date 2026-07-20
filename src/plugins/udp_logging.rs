@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use rustls::pki_types::CertificateRevocationListDer;
 use serde_json::{Map, Value};
 use tokio::net::UdpSocket;
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout};
 use tracing::warn;
 
 use super::utils::log_schema::{
@@ -69,6 +69,27 @@ pub const UDP_LOGGING_CONFIG_KEYS: &[&str] = &[
 const LOCAL_RECORD_DROP_WARN_EVERY: u64 = 100;
 static LOCAL_RECORD_DROPS: AtomicU64 = AtomicU64::new(0);
 
+/// Bound for awaiting DTLS send completion in `udp_logging`.
+///
+/// Matches the plugin's historical 10-second DTLS connection budget. A stalled
+/// peer or driver must not park the flush worker forever; timeout is a
+/// transport failure that resets the sender so BatchingLogger retry/final-loss
+/// can run. The generic [`crate::dtls::DtlsConnection::send`] completion
+/// contract is intentionally not weakened.
+pub(crate) const UDP_LOGGING_DTLS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// DTLS-only configuration keys. Rejected unless effective `dtls` is true so
+/// plaintext mode cannot silently ignore encryption material / policy flags.
+const DTLS_ONLY_CONFIG_KEYS: &[&str] = &[
+    "dtls_ca_cert_path",
+    "dtls_cert_path",
+    "dtls_key_path",
+    "dtls_no_verify",
+];
+
+/// Test-only counter of DTLS materialization attempts (admission + file-deps).
+static DTLS_MATERIALIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// Pre-materialized DTLS client identity and verifier for one plugin generation.
 #[derive(Clone)]
 pub(crate) struct CachedDtlsMaterial {
@@ -89,12 +110,19 @@ struct UdpFlushConfig {
     /// empty; deterministic DNS-lifecycle tests may publish an address that
     /// the next resolve consumes exactly once.
     next_resolve_addr: Arc<Mutex<Option<SocketAddr>>>,
+    /// DTLS handshake budget. Production uses the historical 10s default;
+    /// deterministic lifecycle tests may shorten it via the shared atomic.
+    dtls_connect_timeout_ms: Arc<AtomicU64>,
 }
 
 struct UdpFlushState {
     sender: Option<UdpSender>,
     current_addr: Option<SocketAddr>,
     last_resolve: Instant,
+    /// Incremented whenever a new sender is installed (initial create or
+    /// successful address-change rebuild). Deterministic lifecycle tests use
+    /// this to prove a fresh association without comparing private Arcs.
+    sender_generation: u64,
 }
 
 pub struct UdpLogging {
@@ -108,6 +136,10 @@ pub struct UdpLogging {
     /// external unit tests. Binary target sees no readers on this field.
     #[allow(dead_code)] // used only by tests/, dead code in the bin target
     next_resolve_addr: Arc<Mutex<Option<SocketAddr>>>,
+    /// Shared DTLS handshake budget; tests may shorten it. Binary target sees
+    /// no readers on this field.
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    dtls_connect_timeout_ms: Arc<AtomicU64>,
 }
 
 impl UdpLogging {
@@ -123,6 +155,9 @@ impl UdpLogging {
         } = parse_udp_logging_config(config, &http_client)?;
 
         let next_resolve_addr = Arc::new(Mutex::new(None));
+        let dtls_connect_timeout_ms = Arc::new(AtomicU64::new(
+            UDP_LOGGING_DTLS_SEND_TIMEOUT.as_millis() as u64,
+        ));
         let flush_config = UdpFlushConfig {
             host: host.clone(),
             port,
@@ -131,11 +166,13 @@ impl UdpLogging {
             dns_cache: http_client.dns_cache().cloned(),
             schema,
             next_resolve_addr: Arc::clone(&next_resolve_addr),
+            dtls_connect_timeout_ms: Arc::clone(&dtls_connect_timeout_ms),
         };
         let state = Arc::new(Mutex::new(UdpFlushState {
             sender: None,
             current_addr: None,
             last_resolve: Instant::now(),
+            sender_generation: 0,
         }));
         let flush_state = Arc::clone(&state);
         let logger = BatchingLogger::spawn(
@@ -154,6 +191,7 @@ impl UdpLogging {
             endpoint_hostname: socket_host_warmup,
             flush_state,
             next_resolve_addr,
+            dtls_connect_timeout_ms,
         })
     }
 
@@ -211,17 +249,23 @@ fn parse_udp_logging_config(
     }
 
     let dtls_enabled = optional_bool(config, "dtls")?.unwrap_or(false);
-    let dtls_cert_path = optional_non_empty_string(config, "dtls_cert_path")?;
-    let dtls_key_path = optional_non_empty_string(config, "dtls_key_path")?;
-    let dtls_ca_cert_path = optional_non_empty_string(config, "dtls_ca_cert_path")?;
-    let dtls_no_verify = optional_bool(config, "dtls_no_verify")?.unwrap_or(false);
+    reject_dtls_only_fields_unless_enabled(object, dtls_enabled)?;
 
-    if dtls_cert_path.is_some() != dtls_key_path.is_some() {
-        return Err(
-            "udp_logging: 'dtls_cert_path' and 'dtls_key_path' must be provided together"
-                .to_string(),
-        );
-    }
+    let (dtls_cert_path, dtls_key_path, dtls_ca_cert_path, dtls_no_verify) = if dtls_enabled {
+        let cert_path = optional_non_empty_string(config, "dtls_cert_path")?;
+        let key_path = optional_non_empty_string(config, "dtls_key_path")?;
+        let ca_cert_path = optional_non_empty_string(config, "dtls_ca_cert_path")?;
+        let no_verify = optional_bool(config, "dtls_no_verify")?.unwrap_or(false);
+        if cert_path.is_some() != key_path.is_some() {
+            return Err(
+                "udp_logging: 'dtls_cert_path' and 'dtls_key_path' must be provided together"
+                    .to_string(),
+            );
+        }
+        (cert_path, key_path, ca_cert_path, no_verify)
+    } else {
+        (None, None, None, false)
+    };
 
     let batch_defaults = BatchConfigDefaults {
         batch_size_key: "batch_size",
@@ -271,6 +315,7 @@ pub(crate) fn materialize_dtls_material(
     no_verify: bool,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<CachedDtlsMaterial, String> {
+    DTLS_MATERIALIZE_CALLS.fetch_add(1, Ordering::Relaxed);
     let certificate = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
         crate::dtls::load_dtls_certificate(cert_path, key_path).map_err(|error| {
             format!("udp_logging: DTLS cert/key materialization failed: {error}")
@@ -318,16 +363,36 @@ pub(crate) fn materialize_dtls_material(
     })
 }
 
-/// Validate enabled `udp_logging` DTLS file/provider sources for the shared
-/// plugin file-dependency phase (file-mode fatal, DB warning, DP skip).
-pub(crate) fn validate_dtls_file_dependencies(config: &Map<String, Value>) -> Result<(), String> {
+/// Cache key for identical enabled DTLS validation inputs.
+///
+/// Includes every field that affects materialization / policy so identical
+/// PluginConfig rows share one provider/file read while still attaching the
+/// cached error to each affected plugin id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DtlsFileDependencyCacheKey {
+    host: String,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    ca_path: Option<String>,
+    no_verify: bool,
+}
+
+/// Build a cache key when DTLS validation should run (`dtls: true`).
+///
+/// Returns `Ok(None)` for plaintext / omitted DTLS (after rejecting DTLS-only
+/// fields). Returns `Err` for shape failures that must surface per plugin id
+/// without materialization.
+pub(crate) fn dtls_file_dependency_cache_key(
+    config: &Map<String, Value>,
+) -> Result<Option<DtlsFileDependencyCacheKey>, String> {
     let dtls_enabled = match config.get("dtls") {
         Some(Value::Bool(enabled)) => *enabled,
         Some(_) => return Err("udp_logging: 'dtls' must be a boolean".to_string()),
         None => false,
     };
+    reject_dtls_only_fields_unless_enabled(config, dtls_enabled)?;
     if !dtls_enabled {
-        return Ok(());
+        return Ok(None);
     }
 
     let cert_path = optional_non_empty_string_from_map(config, "dtls_cert_path")?;
@@ -353,17 +418,73 @@ pub(crate) fn validate_dtls_file_dependencies(config: &Map<String, Value>) -> Re
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("udp-logging.invalid");
+        .unwrap_or("udp-logging.invalid")
+        .to_string();
 
-    materialize_dtls_material(
+    Ok(Some(DtlsFileDependencyCacheKey {
         host,
-        cert_path.as_deref(),
-        key_path.as_deref(),
-        ca_path.as_deref(),
+        cert_path,
+        key_path,
+        ca_path,
         no_verify,
+    }))
+}
+
+/// Validate enabled `udp_logging` DTLS file/provider sources for the shared
+/// plugin file-dependency phase (file-mode fatal, DB warning, DP skip).
+pub(crate) fn validate_dtls_file_dependencies(config: &Map<String, Value>) -> Result<(), String> {
+    let Some(key) = dtls_file_dependency_cache_key(config)? else {
+        return Ok(());
+    };
+    materialize_dtls_material(
+        &key.host,
+        key.cert_path.as_deref(),
+        key.key_path.as_deref(),
+        key.ca_path.as_deref(),
+        key.no_verify,
         &[],
     )
     .map(|_| ())
+}
+
+/// Validate using `cache` so identical enabled DTLS input tuples materialize
+/// at most once per `validate_plugin_file_dependencies` pass.
+pub(crate) fn validate_dtls_file_dependencies_cached(
+    config: &Map<String, Value>,
+    cache: &mut std::collections::HashMap<DtlsFileDependencyCacheKey, Result<(), String>>,
+) -> Result<(), String> {
+    let Some(key) = dtls_file_dependency_cache_key(config)? else {
+        return Ok(());
+    };
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    let result = materialize_dtls_material(
+        &key.host,
+        key.cert_path.as_deref(),
+        key.key_path.as_deref(),
+        key.ca_path.as_deref(),
+        key.no_verify,
+        &[],
+    )
+    .map(|_| ());
+    cache.insert(key, result.clone());
+    result
+}
+
+fn reject_dtls_only_fields_unless_enabled(
+    config: &Map<String, Value>,
+    dtls_enabled: bool,
+) -> Result<(), String> {
+    if dtls_enabled {
+        return Ok(());
+    }
+    for key in DTLS_ONLY_CONFIG_KEYS {
+        if config.contains_key(*key) {
+            return Err(format!("udp_logging: '{key}' requires dtls: true"));
+        }
+    }
+    Ok(())
 }
 
 fn optional_non_empty_string_from_map(
@@ -517,12 +638,58 @@ impl UdpSender {
                     "UDP send error: {error}"
                 ))),
             },
-            UdpSender::Dtls(conn) => conn
-                .send(data)
-                .await
-                .map_err(|e| UdpDeliveryError::transport(format!("DTLS send error: {e}"))),
+            UdpSender::Dtls(conn) => {
+                // Bound only the plugin's await of the generic completion
+                // result; do not change `DtlsConnection::send` itself.
+                let awaited = timeout(UDP_LOGGING_DTLS_SEND_TIMEOUT, conn.send(data)).await;
+                map_dtls_send_await_result(awaited)
+            }
         }
     }
+}
+
+/// Classify a timed DTLS send await for udp_logging delivery accounting.
+///
+/// Timeout and driver/socket errors are transport failures (sender reset);
+/// this keeps BatchingLogger retry/final-loss reachable when a peer stalls.
+fn map_dtls_send_await_result(
+    awaited: Result<Result<(), anyhow::Error>, tokio::time::error::Elapsed>,
+) -> Result<(), UdpDeliveryError> {
+    match awaited {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(UdpDeliveryError::transport(format!(
+            "DTLS send error: {error}"
+        ))),
+        Err(_) => Err(dtls_send_timeout_error()),
+    }
+}
+
+fn dtls_send_timeout_error() -> UdpDeliveryError {
+    UdpDeliveryError::transport(format!(
+        "DTLS send timed out after {}s",
+        UDP_LOGGING_DTLS_SEND_TIMEOUT.as_secs()
+    ))
+}
+
+/// Test helper: timeout classification must reset the sender.
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+pub(crate) fn dtls_send_timeout_requires_sender_reset_for_test() -> bool {
+    let error = dtls_send_timeout_error();
+    error.requires_sender_reset() && error.message().contains("DTLS send timed out after")
+}
+
+/// Test helper: local deterministic rejection must not reset the sender.
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+pub(crate) fn local_dtls_size_rejection_preserves_sender_for_test() -> bool {
+    let error = UdpDeliveryError::local(oversized_dtls_batch_error(16_384, 16_385));
+    !error.requires_sender_reset()
+}
+
+/// Test helper: transport/driver failure must reset the sender.
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+pub(crate) fn transport_dtls_failure_requires_sender_reset_for_test() -> bool {
+    UdpDeliveryError::transport("DTLS send error: connection closed".to_string())
+        .requires_sender_reset()
 }
 
 async fn resolve_endpoint(
@@ -558,6 +725,7 @@ async fn build_sender_for_addr(
         let material = cfg.dtls_material.as_ref().ok_or_else(|| {
             "udp_logging: DTLS enabled but admission-cached material is missing".to_string()
         })?;
+        let connect_timeout_ms = cfg.dtls_connect_timeout_ms.load(Ordering::Relaxed);
         let params = crate::dtls::BackendDtlsParams {
             config: Arc::new(dimpl::Config::default()),
             certificate: material.certificate.clone(),
@@ -565,8 +733,9 @@ async fn build_sender_for_addr(
             server_cert_verifier: material.server_cert_verifier.clone(),
             // The udp_logging plugin doesn't expose a connect timeout config,
             // so preserve the historical 10s budget that this code path used
-            // before `BackendDtlsParams.connect_timeout_ms` existed.
-            connect_timeout_ms: 10_000,
+            // before `BackendDtlsParams.connect_timeout_ms` existed. Tests may
+            // shorten the shared atomic for deterministic lifecycle coverage.
+            connect_timeout_ms,
         };
 
         let dtls_conn = crate::dtls::DtlsConnection::connect(socket, params)
@@ -588,11 +757,16 @@ async fn send_batch(
         return Ok(());
     }
 
-    let (mut sender, mut current_addr, mut last_resolve) = {
+    let (mut sender, mut current_addr, mut last_resolve, mut sender_generation) = {
         let mut state = state
             .lock()
             .map_err(|_| "udp_logging: flush state lock poisoned".to_string())?;
-        (state.sender.take(), state.current_addr, state.last_resolve)
+        (
+            state.sender.take(),
+            state.current_addr,
+            state.last_resolve,
+            state.sender_generation,
+        )
     };
 
     if sender.is_none() {
@@ -600,6 +774,7 @@ async fn send_batch(
         last_resolve = Instant::now();
         sender = Some(new_sender);
         current_addr = Some(new_addr);
+        sender_generation = sender_generation.saturating_add(1);
     }
 
     // Periodically re-resolve DNS and rebuild the sender when the endpoint
@@ -625,6 +800,7 @@ async fn send_batch(
                     Ok(new_sender) => {
                         sender = Some(new_sender);
                         current_addr = Some(new_addr);
+                        sender_generation = sender_generation.saturating_add(1);
                     }
                     Err(error) => {
                         warn!(
@@ -670,6 +846,7 @@ async fn send_batch(
     state.sender = sender;
     state.current_addr = current_addr;
     state.last_resolve = last_resolve;
+    state.sender_generation = sender_generation;
 
     result.map_err(UdpDeliveryError::into_message)
 }
@@ -818,6 +995,14 @@ impl UdpLogging {
         }
     }
 
+    /// Shorten the DTLS handshake budget for deterministic retain-on-failure
+    /// coverage. Production code never calls this.
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    pub fn set_dtls_connect_timeout_ms_for_test(&self, timeout_ms: u64) {
+        self.dtls_connect_timeout_ms
+            .store(timeout_ms.max(1), Ordering::Relaxed);
+    }
+
     /// Snapshot of the flush worker's currently pinned destination, if any.
     #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn current_addr_for_test(&self) -> Option<SocketAddr> {
@@ -826,4 +1011,24 @@ impl UdpLogging {
             .ok()
             .and_then(|state| state.current_addr)
     }
+
+    /// Snapshot of how many times a sender has been installed. Production code
+    /// never calls this.
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    pub fn sender_generation_for_test(&self) -> u64 {
+        self.flush_state
+            .lock()
+            .map(|state| state.sender_generation)
+            .unwrap_or(0)
+    }
+}
+
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+pub(crate) fn reset_dtls_materialize_calls_for_test() {
+    DTLS_MATERIALIZE_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+pub(crate) fn dtls_materialize_calls_for_test() -> u64 {
+    DTLS_MATERIALIZE_CALLS.load(Ordering::Relaxed)
 }

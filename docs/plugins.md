@@ -591,10 +591,10 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 | `host` | String | *(required)* | UDP endpoint hostname or IP address |
 | `port` | Integer | *(required)* | UDP endpoint port (1–65535) |
 | `dtls` | Boolean | `false` | Enable DTLS encryption for log datagrams |
-| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS (materialized at admission when `dtls: true`) |
-| `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (must be paired with `dtls_cert_path`; ECDSA P-256/P-384 only) |
-| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (materialized at admission when set with `dtls: true`, even if `dtls_no_verify` disables use of the resulting verifier) |
-| `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only) |
+| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS (requires `dtls: true`; materialized at admission) |
+| `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (requires `dtls: true`; must be paired with `dtls_cert_path`; ECDSA P-256/P-384 only) |
+| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (requires `dtls: true`; materialized at admission when set, even if `dtls_no_verify` disables use of the resulting verifier) |
+| `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only; requires `dtls: true`) |
 | `batch_size` | Integer | `10` | Number of entries to buffer before sending a batch |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
 | `max_retries` | Integer | `1` | Retry attempts on failed batch delivery |
@@ -603,7 +603,7 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is serialized as a JSON array and sent as a single UDP datagram.
 
-**Delivery success contract:** A successful flush means the local UDP socket (or DTLS engine + connected socket) accepted the datagram. It does **not** mean the remote collector delivered or acknowledged the payload. Local DTLS plaintext rejection, serialization failure, DTLS engine failure, and connected-socket send failure return errors into the configured retry / final-loss accounting path; they are never treated as silent success. Deterministic local encoding/size rejection does not tear down a healthy DTLS association; transport/driver failures do.
+**Delivery success contract:** A successful flush means the local UDP socket (or DTLS engine + connected socket) accepted the datagram. It does **not** mean the remote collector delivered or acknowledged the payload. Local DTLS plaintext rejection, serialization failure, DTLS engine failure, connected-socket send failure, and a stalled DTLS send that exceeds the plugin's 10-second completion budget return errors into the configured retry / final-loss accounting path; they are never treated as silent success. Deterministic local encoding/size rejection does not tear down a healthy DTLS association; transport/driver failures (including send timeout) do.
 
 **Datagram size:** Operators should size `batch_size` to keep serialized payloads under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet). Oversized plain-UDP datagrams may be fragmented or dropped by the network. For DTLS, the effective plaintext ceiling is `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default **16,384**). A single-entry batch that exceeds that ceiling fails closed into retry/final-loss. A multi-entry batch that exceeds the ceiling is split per entry so one oversized record cannot erase co-batched siblings; each oversized single is discarded with explicit, rate-limited loss accounting.
 

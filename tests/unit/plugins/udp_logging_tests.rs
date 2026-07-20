@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
@@ -13,7 +13,7 @@ use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, validate_plu
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256, PKCS_RSA_SHA256,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::net::UdpSocket;
 
 use super::plugin_utils::{
@@ -22,6 +22,52 @@ use super::plugin_utils::{
 
 fn test_client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+async fn poll_until<F>(mut condition: F, timeout: Duration, label: &str)
+where
+    F: FnMut() -> bool,
+{
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{label}: condition not met within {timeout:?}");
+}
+
+async fn spawn_dtls_server() -> (Arc<ferrum_edge::dtls::DtlsServer>, SocketAddr) {
+    ensure_crypto_provider();
+    let server_cert = dimpl::certificate::generate_self_signed_certificate().expect("server cert");
+    let server_config = dimpl::Config::builder()
+        .build()
+        .expect("build server config");
+    let frontend = ferrum_edge::dtls::FrontendDtlsConfig {
+        dimpl_config: Arc::new(server_config),
+        certificate: server_cert,
+        client_cert_verifier: None,
+    };
+    let server = Arc::new(
+        ferrum_edge::dtls::DtlsServer::bind("127.0.0.1:0".parse().unwrap(), frontend)
+            .await
+            .expect("dtls server"),
+    );
+    let addr = server.local_addr();
+    let runner = server.clone();
+    tokio::spawn(async move {
+        let _ = runner.run().await;
+    });
+    let acceptor = server.clone();
+    tokio::spawn(async move {
+        loop {
+            if acceptor.accept().await.is_err() {
+                break;
+            }
+        }
+    });
+    (server, addr)
 }
 
 fn ensure_crypto_provider() {
@@ -401,6 +447,46 @@ async fn test_udp_logging_dtls_cert_key_pairing_required() {
             e
         ),
         Ok(_) => panic!("Expected Err when key is provided without cert"),
+    }
+}
+
+#[tokio::test]
+async fn test_udp_logging_rejects_dtls_only_fields_unless_dtls_true() {
+    let dtls_only_cases = [
+        json!({"host": "127.0.0.1", "port": 9514, "dtls_cert_path": "/c.pem", "dtls_key_path": "/k.pem"}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls": false, "dtls_cert_path": "/c.pem", "dtls_key_path": "/k.pem"}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls_ca_cert_path": "/ca.pem"}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls": false, "dtls_ca_cert_path": "/ca.pem"}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls_no_verify": true}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls": false, "dtls_no_verify": false}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls": false, "dtls_no_verify": true}),
+    ];
+    for config in dtls_only_cases {
+        let err = UdpLogging::new(&config, test_client())
+            .err()
+            .unwrap_or_else(|| panic!("expected DTLS-only rejection for {config}"));
+        assert!(
+            err.contains("requires dtls: true"),
+            "config {config} got: {err}"
+        );
+        let err = validate_plugin_config("udp_logging", &config)
+            .err()
+            .unwrap_or_else(|| panic!("shared validation must reject {config}"));
+        assert!(
+            err.contains("requires dtls: true"),
+            "shared validation {config} got: {err}"
+        );
+        if let Some(object) = config.as_object() {
+            let err = ferrum_edge::_test_support::udp_logging_validate_dtls_file_dependencies_for_test(
+                object,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("file-deps validation must reject {config}"));
+            assert!(
+                err.contains("requires dtls: true"),
+                "file-deps {config} got: {err}"
+            );
+        }
     }
 }
 
@@ -812,6 +898,73 @@ fn test_udp_logging_file_dependency_phase_reports_bad_dtls_material() {
 }
 
 #[test]
+fn test_udp_logging_file_dependency_duplicate_sources_materialize_once() {
+    ferrum_edge::_test_support::udp_logging_reset_dtls_materialize_calls_for_test();
+    let shared = json!({
+        "host": "127.0.0.1",
+        "port": 9514,
+        "dtls": true,
+        "dtls_cert_path": "/missing/shared-udp-cert.pem",
+        "dtls_key_path": "/missing/shared-udp-key.pem",
+        "dtls_no_verify": true
+    });
+    let config = GatewayConfig {
+        plugin_configs: vec![
+            PluginConfig {
+                id: "udp-deps-a".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
+                plugin_name: "udp_logging".to_string(),
+                config: shared.clone(),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            PluginConfig {
+                id: "udp-deps-b".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
+                plugin_name: "udp_logging".to_string(),
+                config: shared,
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ],
+        ..GatewayConfig::default()
+    };
+    let errors = config.validate_plugin_file_dependencies();
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_dtls_materialize_calls_for_test(),
+        1,
+        "identical DTLS validation inputs must materialize once"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("udp-deps-a") && e.contains("DTLS")),
+        "cached error must attach to first plugin id: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("udp-deps-b") && e.contains("DTLS")),
+        "cached error must attach to second plugin id: {errors:?}"
+    );
+    // Never log source path contents in assertions beyond the stable error class.
+    assert!(
+        errors.iter().all(|e| e.contains("DTLS")),
+        "duplicate-source errors must stay on the DTLS failure class"
+    );
+}
+
+#[test]
 fn test_udp_logging_dns_lifecycle_predicate() {
     let addr_a: SocketAddr = "127.0.0.1:9514".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:9515".parse().unwrap();
@@ -868,25 +1021,142 @@ async fn test_udp_logging_plain_udp_dns_address_change_rebuilds_sender() {
 
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(plugin.current_addr_for_test(), Some(addr_a));
+    poll_until(
+        || plugin.current_addr_for_test() == Some(addr_a),
+        Duration::from_secs(2),
+        "plain UDP pin to addr_a",
+    )
+    .await;
+    let generation_a = plugin.sender_generation_for_test();
+    assert!(generation_a >= 1);
 
     plugin.set_next_resolve_addr_for_test(addr_b);
     plugin.age_last_resolve_for_test(Duration::from_secs(61));
     plugin.log(&summary).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    poll_until(
+        || {
+            plugin.current_addr_for_test() == Some(addr_b)
+                && plugin.sender_generation_for_test() > generation_a
+        },
+        Duration::from_secs(2),
+        "plain UDP rebuild to addr_b",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_udp_logging_dtls_dns_address_change_rebuilds_association() {
+    let (_server_a, addr_a) = spawn_dtls_server().await;
+    let (_server_b, addr_b) = spawn_dtls_server().await;
+
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": addr_a.port(),
+            "dtls": true,
+            "dtls_no_verify": true,
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 0,
+            "buffer_capacity": 16
+        }),
+        test_client(),
+    )
+    .expect("construct dtls logger");
+
+    // Force the first resolve through the one-shot hook so the bind port in
+    // config cannot race with the DTLS server's ephemeral port.
+    plugin.set_next_resolve_addr_for_test(addr_a);
+    let summary = create_test_transaction_summary();
+    plugin.log(&summary).await;
+    poll_until(
+        || plugin.current_addr_for_test() == Some(addr_a),
+        Duration::from_secs(3),
+        "DTLS pin to addr_a",
+    )
+    .await;
+    let generation_a = plugin.sender_generation_for_test();
+    assert!(generation_a >= 1, "initial DTLS association must install a sender");
+
+    plugin.set_next_resolve_addr_for_test(addr_b);
+    plugin.age_last_resolve_for_test(Duration::from_secs(61));
+    plugin.log(&summary).await;
+    poll_until(
+        || {
+            plugin.current_addr_for_test() == Some(addr_b)
+                && plugin.sender_generation_for_test() > generation_a
+        },
+        Duration::from_secs(3),
+        "DTLS rebuild to addr_b with fresh association",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_udp_logging_dtls_retains_association_when_replacement_handshake_fails() {
+    let (_server_a, addr_a) = spawn_dtls_server().await;
+    // Plain UDP listener: DTLS handshake cannot complete here.
+    let plain_b = UdpSocket::bind("127.0.0.1:0").await.expect("plain b");
+    let addr_b = plain_b.local_addr().expect("addr b");
+
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": addr_a.port(),
+            "dtls": true,
+            "dtls_no_verify": true,
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 0,
+            "buffer_capacity": 16
+        }),
+        test_client(),
+    )
+    .expect("construct dtls logger");
+
+    plugin.set_next_resolve_addr_for_test(addr_a);
+    let summary = create_test_transaction_summary();
+    plugin.log(&summary).await;
+    poll_until(
+        || plugin.current_addr_for_test() == Some(addr_a),
+        Duration::from_secs(3),
+        "DTLS pin before failed rebuild",
+    )
+    .await;
+    let generation_a = plugin.sender_generation_for_test();
+
+    // Shorten only the replacement handshake so a non-DTLS peer fails quickly
+    // without waiting on the production 10s connect budget.
+    plugin.set_dtls_connect_timeout_ms_for_test(200);
+    plugin.set_next_resolve_addr_for_test(addr_b);
+    plugin.age_last_resolve_for_test(Duration::from_secs(61));
+    plugin.log(&summary).await;
+
+    // Bounded observation window covering the shortened handshake budget:
+    // the pinned address must never move to B, and generation must stay put.
+    let observe_deadline = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < observe_deadline {
+        assert_ne!(
+            plugin.current_addr_for_test(),
+            Some(addr_b),
+            "failed replacement must not publish the new address"
+        );
+        assert_eq!(
+            plugin.sender_generation_for_test(),
+            generation_a,
+            "failed replacement must not install a new sender"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(
         plugin.current_addr_for_test(),
-        Some(addr_b),
-        "plain UDP must rebuild the connected sender when DNS moves"
+        Some(addr_a),
+        "existing DTLS association must remain pinned"
     );
 }
 
 #[test]
 fn test_udp_logging_dtls_docs_retain_association_when_rebuild_fails() {
-    // Runtime retain-on-failed-rebuild is covered by the warn path in
-    // `send_batch` plus the docs contract below; the pure predicate pins the
-    // unchanged-address half of the lifecycle.
     let addr: SocketAddr = "127.0.0.1:9514".parse().unwrap();
     assert!(
         !ferrum_edge::_test_support::udp_logging_should_replace_sender_on_resolve_for_test(
@@ -1014,7 +1284,7 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
     let client = ferrum_edge::dtls::DtlsConnection::connect(client_socket, params)
         .await
         .expect("handshake");
-    let _server_conn = accept.await.expect("join accept");
+    let server_conn = accept.await.expect("join accept");
 
     let max = ferrum_edge::dtls::max_plaintext_bytes();
     let oversized = vec![b'x'; max.saturating_add(1)];
@@ -1024,10 +1294,105 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
         .expect_err("oversized plaintext must fail");
     assert!(err.to_string().contains("max_plaintext"), "got: {err}");
 
+    // Exact in-limit boundary must complete successfully.
+    let exact = vec![b'y'; max];
     client
-        .send(b"ok")
+        .send(&exact)
         .await
-        .expect("in-limit send must succeed");
+        .expect("exact max_plaintext send must succeed");
+
+    // Connection close must propagate as a send failure (not hang).
+    server_conn.close().await;
+    client.close().await;
+    let closed_err = client
+        .send(b"after-close")
+        .await
+        .expect_err("send after close must fail");
+    assert!(
+        closed_err.to_string().contains("closed")
+            || closed_err.to_string().contains("DTLS"),
+        "close/cancel failure must propagate: {closed_err}"
+    );
+
+    // Hosted CI cannot safely force a specific OS UDP socket-send errno
+    // (ENETUNREACH / EMSGSIZE / etc.) without flaky routing tricks; those
+    // paths remain covered by the driver's socket-error branch mapping into
+    // the same completion Err used above.
+}
+
+#[test]
+fn test_udp_logging_dtls_loss_and_reset_classification() {
+    assert_eq!(
+        ferrum_edge::_test_support::udp_logging_dtls_send_timeout_secs_for_test(),
+        10,
+        "udp_logging DTLS send budget must stay aligned with the 10s connect budget"
+    );
+    assert!(
+        ferrum_edge::_test_support::udp_logging_dtls_send_timeout_requires_sender_reset_for_test(),
+        "DTLS send timeout is a transport failure and must reset the sender"
+    );
+    assert!(
+        ferrum_edge::_test_support::udp_logging_local_dtls_size_rejection_preserves_sender_for_test(),
+        "deterministic local size rejection must preserve the sender"
+    );
+    assert!(
+        ferrum_edge::_test_support::udp_logging_transport_dtls_failure_requires_sender_reset_for_test(),
+        "transport/driver failure must reset the sender"
+    );
+}
+
+#[test]
+fn test_udp_logging_openapi_dtls_policy_contract() {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/UdpLoggingConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("UdpLoggingConfig compiles");
+
+    assert!(
+        validator.is_valid(&json!({"host": "127.0.0.1", "port": 9514})),
+        "plaintext without DTLS fields must validate"
+    );
+    assert!(
+        validator.is_valid(&json!({
+            "host": "logs.example.com",
+            "port": 9514,
+            "dtls": true,
+            "dtls_no_verify": true
+        })),
+        "dtls true with no_verify must validate"
+    );
+    assert!(
+        validator.is_valid(&json!({
+            "host": "logs.example.com",
+            "port": 9514,
+            "dtls": true,
+            "dtls_cert_path": "/c.pem",
+            "dtls_key_path": "/k.pem"
+        })),
+        "paired cert/key with dtls true must validate"
+    );
+
+    for invalid in [
+        json!({"host": "127.0.0.1", "port": 9514, "dtls_no_verify": true}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls": false, "dtls_cert_path": "/c.pem", "dtls_key_path": "/k.pem"}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls": true, "dtls_cert_path": "/c.pem"}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls": true, "dtls_key_path": "/k.pem"}),
+        json!({"host": "127.0.0.1", "port": 9514, "dtls": true, "dtls_cert_path": ""}),
+        json!({"host": "udp://logs.example.com", "port": 9514}),
+        json!({"host": "logs.example.com:9514", "port": 9514}),
+        json!({"host": "", "port": 9514}),
+    ] {
+        assert!(
+            !validator.is_valid(&invalid),
+            "OpenAPI must reject {invalid}"
+        );
+    }
 }
 
 #[test]
@@ -1049,6 +1414,8 @@ fn test_udp_logging_docs_dns_and_delivery_contract() {
         "co-batched siblings",
         "OptionalFailOpen",
         "materialized at admission",
+        "10-second completion budget",
+        "requires `dtls: true`",
         "File mode",
         "Database mode",
         "DP mode",
