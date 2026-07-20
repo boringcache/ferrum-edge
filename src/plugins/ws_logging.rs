@@ -381,8 +381,9 @@ impl WsByteBudget {
 }
 
 /// Conservative retained charge for one admitted entry: queued JSON plus the
-/// contiguous batch/`Arc<str>` copy, each sized to `serialized_len`, plus two
-/// bytes of JSON-array framing budget (`+1` before `*2`).
+/// contiguous reference-counted batch payload, each sized to `serialized_len`,
+/// plus two bytes of JSON-array framing budget (`+1` before `*2`). Retries
+/// clone only the payload handle.
 fn retained_charge_for_serialized_len(serialized_len: usize) -> usize {
     serialized_len.saturating_add(1).saturating_mul(2)
 }
