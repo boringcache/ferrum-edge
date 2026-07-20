@@ -712,7 +712,10 @@ fn test_unknown_limit_by_rejected() {
         }),
     );
     let err = result.err().expect("unknown limit_by must be rejected");
-    assert!(err.contains("'limit_by' must be one of"), "got: {err}");
+    assert!(
+        err.contains("'limit_by' must be exactly 'ip' or 'consumer'"),
+        "got: {err}"
+    );
 }
 
 // ── Constructor validation: rate-limit specs ──
