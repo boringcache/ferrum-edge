@@ -9,9 +9,10 @@
 //! ## Storage target
 //!
 //! Migrations and runtime writes both use the **gateway configuration
-//! database** (`FERRUM_DB_URL` / `FERRUM_DB_TYPE`). There is no separate
-//! plugin database URL: a second URL would silently diverge from the schema
-//! that migrate mode / auto-apply maintain.
+//! database** (`FERRUM_DB_URL` / `FERRUM_DB_TYPE`, resolved with the same
+//! environment-over-`ferrum.conf` precedence as the gateway). There is no
+//! separate plugin database URL: a second URL would silently diverge from the
+//! schema that migrate mode / auto-apply maintain.
 //!
 //! Supported modes for the storage path: `database`, `cp`, and standalone
 //! `migrate` (for schema). File / DP / mesh / injector / node-agent modes do
@@ -419,10 +420,11 @@ fn canonical_timestamp(input: &str) -> String {
 }
 
 fn connect_gateway_pool_lazy() -> Result<AnyPool, String> {
-    let db_url = std::env::var("FERRUM_DB_URL").map_err(|_| {
+    let db_url = crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_URL").ok_or_else(|| {
         "example_audit_plugin requires FERRUM_DB_URL (gateway configuration database)".to_string()
     })?;
-    let db_type = std::env::var("FERRUM_DB_TYPE").unwrap_or_else(|_| "sqlite".to_string());
+    let db_type = crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_TYPE")
+        .unwrap_or_else(|| "sqlite".to_string());
     if !matches!(db_type.as_str(), "sqlite" | "postgres" | "mysql") {
         return Err(format!(
             "example_audit_plugin: unsupported FERRUM_DB_TYPE '{db_type}' \

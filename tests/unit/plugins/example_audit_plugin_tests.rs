@@ -182,6 +182,19 @@ fn test_supported_protocols_is_all_protocols() {
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
 
+#[test]
+fn test_gateway_database_settings_use_canonical_conf_aware_resolution() {
+    let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
+    assert!(
+        source.contains("resolve_ferrum_var(\"FERRUM_DB_URL\")"),
+        "runtime persistence must honor ferrum.conf as well as the process environment"
+    );
+    assert!(
+        source.contains("resolve_ferrum_var(\"FERRUM_DB_TYPE\")"),
+        "runtime persistence must use the gateway's canonical database-type resolution"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_log_and_stream_hooks_enqueue_without_panic() {
     if !example_audit_plugin_registered() {
