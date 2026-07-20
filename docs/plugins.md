@@ -4860,6 +4860,8 @@ These plugins are registered built-ins even when they are most often generated o
 
 Applies per-request route overrides generated from mesh/Istio routing resources. It runs in `before_proxy` after authentication and admission plugins, so policy evaluates the original public proxy identity before the backend override is applied. For WebSockets, the override selects the upgrade backend only; individual frames are not re-routed.
 
+**Strict config validation:** unknown keys are rejected at every security-relevant nesting level — top-level plugin config, each rule, match, destination, fault, rewrite, redirect, transform, route-local `retry`, nested retry backoff, and destination `backend_tls`. Misspellings such as `reject_unmtached`, `requires_node_waypoint_auth`, `retry.max_retry`, or `backend_tls.client_certpath` fail admission on native/file/admin/translated/CP-DP paths instead of silently disabling fail-closed controls. Shared gateway `RetryConfig` / `BackendTlsConfig` consumers keep their existing compatibility boundary; mesh route policy uses strict route-local wire shapes that convert into those runtime types after validation.
+
 See [Mesh VirtualService translation](mesh.md#virtualservice-translation) and [plugin execution order](plugin_execution_order.md#why-this-order-matters) for route-collapse, fault, rewrite, redirect, and HBONE behavior.
 
 ### `proxy_alerts`

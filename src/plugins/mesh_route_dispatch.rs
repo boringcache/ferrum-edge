@@ -475,7 +475,7 @@ struct RouteRetryConfig {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum RouteBackoffStrategy {
     Fixed(RouteFixedBackoff),
     Exponential(RouteExponentialBackoff),
