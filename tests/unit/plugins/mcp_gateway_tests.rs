@@ -5123,7 +5123,10 @@ async fn composed_governor_and_mcp_gateway_normalize_omitted_mcp_arguments() {
 
     for (request_id, params) in [
         (29i64, json!({ "name": "github.ping_tool" })),
-        (30i64, json!({ "name": "github.ping_tool", "arguments": {} })),
+        (
+            30i64,
+            json!({ "name": "github.ping_tool", "arguments": {} }),
+        ),
     ] {
         let (mut ctx, mut headers) = mcp_ctx(json!({
             "jsonrpc": "2.0",
@@ -5178,7 +5181,10 @@ async fn composed_governor_and_mcp_gateway_normalize_omitted_mcp_arguments() {
 
     for (request_id, params) in [
         (31i64, json!({ "name": "github.ping_tool" })),
-        (32i64, json!({ "name": "github.ping_tool", "arguments": {} })),
+        (
+            32i64,
+            json!({ "name": "github.ping_tool", "arguments": {} }),
+        ),
     ] {
         let (mut ctx, mut headers) = mcp_ctx(json!({
             "jsonrpc": "2.0",
@@ -5188,9 +5194,7 @@ async fn composed_governor_and_mcp_gateway_normalize_omitted_mcp_arguments() {
         }));
         headers.insert("mcp-session-id".to_string(), session_id.clone());
 
-        let governor_result = required_governor
-            .before_proxy(&mut ctx, &mut headers)
-            .await;
+        let governor_result = required_governor.before_proxy(&mut ctx, &mut headers).await;
         let (status, _, _) = reject_raw(governor_result);
         assert_eq!(
             status, 403,

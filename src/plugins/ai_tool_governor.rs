@@ -620,8 +620,7 @@ impl GovernorEngine {
     /// Instant used for the whole-batch approval deadline. Production offset is
     /// zero; tests may advance it without sleeping the real 30s ceiling.
     fn approval_now(&self) -> Instant {
-        let offset =
-            Duration::from_millis(self.approval_clock_offset_ms.load(Ordering::Relaxed));
+        let offset = Duration::from_millis(self.approval_clock_offset_ms.load(Ordering::Relaxed));
         Instant::now()
             .checked_add(offset)
             .unwrap_or_else(Instant::now)
