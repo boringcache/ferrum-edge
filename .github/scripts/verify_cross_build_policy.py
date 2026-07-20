@@ -86,14 +86,14 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "build-arm64-cross",
-        "cf21166e1e4513915055ab9a1a6260a580105b5143d460fe38defd3f4751f12b",
+        "87163fa690e89218de8ae00db15d0512c0687a836e0fd32e061e35380c9e0023",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         "d775752cb399db3b0660e26e0d9bdb32d7d72cf4ed47694066ccbf629e87e80f",
     ),
     (
         "release workflow",
         "build-release-arm64-cross",
-        "0aede8bfa17c33009a588bf1d3202df52c58168eb1d1c173add01e1f76c32cc1",
+        "c84eda5b8b4e30444093a8f18b25eaa9863b51accbd77b5009e47548802facdf",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
@@ -137,7 +137,7 @@ DOCKER_CONTEXT_STEP = (
 # contract in the same commit.
 DOCKER_PUBLISH_STEPS_PREFIX = (
     "    steps:\n"
-    "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6\n"
+    "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
     "\n"
     "      - name: Download Linux binary\n"
     "        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
@@ -322,7 +322,7 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
 # Changing one is a trusted-base change, exactly like the protected build job.
 
 CI_LATEST_RELEASE_STEPS = r"""    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       # Download exactly the five trusted build artifacts by name. A wildcard
       # pattern would also accept any other artifact whose name happened to
@@ -492,7 +492,7 @@ CI_DOCKER_MANIFEST_STEPS = r"""    steps:
 """
 
 RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       # Download exactly the five trusted build artifacts by name. A wildcard
       # pattern would also accept any other artifact whose name happened to
@@ -13788,7 +13788,7 @@ pre_build = []
     benign_remote_action_workflow = safe_extra_workflow.replace(
         "      - run: echo safe\n",
         "      - uses: actions/checkout"
-        "@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+        "@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
         "        with:\n"
         "          persist-credentials: false\n"
         "      - uses: actions/upload-artifact"
