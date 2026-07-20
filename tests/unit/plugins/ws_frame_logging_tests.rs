@@ -104,8 +104,7 @@ impl tracing::field::Visit for WsLogVisitor {
         } else if field.name() == "correlation_id" {
             self.correlation_id = Some(format!("{value:?}").trim_matches('"').to_string());
         } else if field.name() == "configured_level" {
-            self.configured_level =
-                Some(format!("{value:?}").trim_matches('"').to_string());
+            self.configured_level = Some(format!("{value:?}").trim_matches('"').to_string());
         }
     }
 }
