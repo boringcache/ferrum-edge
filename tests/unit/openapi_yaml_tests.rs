@@ -1622,8 +1622,13 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!(false)
     );
     assert_eq!(
-        spec.pointer("/components/schemas/RateSpec/additionalProperties"),
+        spec.pointer("/components/schemas/GraphqlRateSpec/additionalProperties"),
         Some(&json!(false))
+    );
+    assert_ne!(
+        spec.pointer("/components/schemas/RateSpec/additionalProperties"),
+        Some(&json!(false)),
+        "GraphQL hardening must not close the shared gRPC RateSpec ahead of its runtime"
     );
     assert_eq!(
         schema["properties"]["type_rate_limits"]["properties"]
@@ -1648,7 +1653,7 @@ fn graphql_config_schema_matches_runtime_validation() {
         1
     );
     assert_eq!(
-        spec.pointer("/components/schemas/RateSpec/properties/max_requests/minimum"),
+        spec.pointer("/components/schemas/GraphqlRateSpec/properties/max_requests/minimum"),
         Some(&json!(1))
     );
 
@@ -1740,6 +1745,9 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!({"introspection_allowed": true}),
         json!({"type_rate_limits": {}}),
         json!({"operation_rate_limits": {}}),
+        json!({"type_rate_limits": {"Query": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"max_depth": 5, "limit_by": "IP"}),
+        json!({"max_depth": 5, "sync_mode": "REDIS", "redis_url": "redis://localhost:6379"}),
         json!({"operation_rate_limits": {"": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60, "burst": 2}}}),
         json!({"max_depth": 5, "introspection_allowd": false}),

@@ -99,6 +99,9 @@ fn test_graphql_rejects_invalid_rate_limit_shapes() {
         json!({"type_rate_limits": {}}),
         json!({"operation_rate_limits": {}}),
         json!({"introspection_allowed": true}),
+        json!({"type_rate_limits": {"Query": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"max_depth": 5, "limit_by": "IP"}),
+        json!({"max_depth": 5, "sync_mode": "REDIS", "redis_url": "redis://localhost:6379"}),
         json!({"max_depth": 5, "sync_mode": "database"}),
         json!({"max_depth": 5, "sync_mode": "redis"}),
     ] {

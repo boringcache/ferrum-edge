@@ -3401,10 +3401,10 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `max_complexity` | u32 (optional) | — | Maximum allowed field count |
 | `max_aliases` | u32 (optional) | — | Maximum allowed alias count |
 | `introspection_allowed` | bool | `true` | Whether introspection queries are permitted. Only `false` counts as an effective protection rule; the default `true` does not. |
-| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer`. Other values are rejected at plugin load time. |
-| `type_rate_limits` | Object | `{}` | Rate limits by operation type. Only `query`, `mutation`, and `subscription` keys are accepted; unknown keys are rejected. |
+| `limit_by` | String | `ip` | Rate limit key: exact lowercase `ip` or `consumer`. Other values are rejected at plugin load time. |
+| `type_rate_limits` | Object | `{}` | Rate limits by operation type. Only exact lowercase `query`, `mutation`, and `subscription` keys are accepted; unknown keys are rejected. |
 | `operation_rate_limits` | Object | `{}` | Rate limits by named operation. Keys must be valid GraphQL Names (`[_A-Za-z][_0-9A-Za-z]*`). |
-| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) for GraphQL rate-limit counters |
+| `sync_mode` | String | `local` | Exact lowercase `local` (in-memory per instance) or `redis` (centralized) for GraphQL rate-limit counters |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql` | Redis key namespace prefix. Defaults to `ferrum:graphql` when namespace is `"ferrum"`. Must be non-empty when set. |

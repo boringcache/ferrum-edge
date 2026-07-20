@@ -16938,11 +16938,11 @@ components:
           additionalProperties: false
           properties:
             query:
-              $ref: "#/components/schemas/RateSpec"
+              $ref: "#/components/schemas/GraphqlRateSpec"
             mutation:
-              $ref: "#/components/schemas/RateSpec"
+              $ref: "#/components/schemas/GraphqlRateSpec"
             subscription:
-              $ref: "#/components/schemas/RateSpec"
+              $ref: "#/components/schemas/GraphqlRateSpec"
           description: >-
             Rate limits by operation type. Only `query`, `mutation`, and
             `subscription` keys are accepted; unknown keys are rejected.
@@ -16951,7 +16951,7 @@ components:
           propertyNames:
             pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
           additionalProperties:
-            $ref: "#/components/schemas/RateSpec"
+            $ref: "#/components/schemas/GraphqlRateSpec"
           description: >-
             Rate limits by named operation. Keys must be valid GraphQL Names
             (`[_A-Za-z][_0-9A-Za-z]*`).
@@ -19906,13 +19906,32 @@ components:
         case-insensitive and runtime storage is normalized to uppercase. Other
         reserved, user-assigned, deleted, and alias codes are rejected.
 
-    RateSpec:
+    GraphqlRateSpec:
       type: object
       additionalProperties: false
       description: >-
-        Rate limit specification used by graphql and grpc_method_router plugins.
-        Both fields are required and must be positive integers; unknown keys are
-        rejected.
+        Closed GraphQL rate limit specification. Both fields are required and
+        must be positive integers; unknown keys are rejected.
+      required: [max_requests, window_seconds]
+      properties:
+        max_requests:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Maximum requests allowed in the window
+        window_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Time window in seconds
+
+    RateSpec:
+      type: object
+      description: >-
+        Rate limit specification used by grpc_method_router. Both fields are
+        required and must be positive integers. The gRPC runtime currently
+        ignores additional keys, so this shared component remains open to
+        preserve schema/runtime parity.
       required: [max_requests, window_seconds]
       properties:
         max_requests:

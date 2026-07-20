@@ -138,6 +138,14 @@ impl GraphqlPlugin {
         );
         reject_unknown_keys(object, "config", GRAPHQL_CONFIG_KEYS, "graphql: ")?;
 
+        if let Some(Value::String(sync_mode)) = config.get("sync_mode")
+            && !matches!(sync_mode.as_str(), "local" | "redis")
+        {
+            return Err(format!(
+                "graphql: 'sync_mode' must be exactly 'local' or 'redis', got: {sync_mode:?}"
+            ));
+        }
+
         let max_depth = optional_u32(config, "max_depth")?;
         let max_complexity = optional_u32(config, "max_complexity")?;
         let max_aliases = optional_u32(config, "max_aliases")?;
@@ -147,13 +155,12 @@ impl GraphqlPlugin {
         let limit_by = match config.get("limit_by") {
             None | Some(Value::Null) => "ip".to_string(),
             Some(Value::String(s)) => {
-                let lc = s.to_lowercase();
-                if !matches!(lc.as_str(), "ip" | "consumer") {
+                if !matches!(s.as_str(), "ip" | "consumer") {
                     return Err(format!(
-                        "graphql: 'limit_by' must be one of 'ip' or 'consumer', got: {s:?}"
+                        "graphql: 'limit_by' must be exactly 'ip' or 'consumer', got: {s:?}"
                     ));
                 }
-                lc
+                s.clone()
             }
             Some(other) => {
                 return Err(format!(
@@ -267,14 +274,13 @@ fn parse_type_rate_limits(config: &Value) -> Result<HashMap<String, RateSpec>, S
 
     let mut limits = HashMap::new();
     for (op_type, spec) in obj {
-        let op_type_lc = op_type.to_ascii_lowercase();
-        if !matches!(op_type_lc.as_str(), "query" | "mutation" | "subscription") {
+        if !matches!(op_type.as_str(), "query" | "mutation" | "subscription") {
             return Err(format!(
-                "graphql: type_rate_limits key must be one of 'query', 'mutation', or 'subscription', got: {op_type:?}"
+                "graphql: type_rate_limits key must be exactly 'query', 'mutation', or 'subscription', got: {op_type:?}"
             ));
         }
         limits.insert(
-            op_type_lc,
+            op_type.clone(),
             parse_rate_spec("type_rate_limits", op_type, spec)?,
         );
     }
