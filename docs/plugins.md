@@ -499,25 +499,30 @@ Sends transaction summaries as JSON to an external WebSocket endpoint. Like `htt
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname. Malformed or non-WebSocket schemes are rejected at config load time. |
-| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (minimum 1) |
+| `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname and must not include URL userinfo. Path/query may carry collector tokens when required; operational diagnostics always emit a structurally redacted form (`scheme://host[:port]/redacted`). Malformed or non-WebSocket schemes are rejected at config load time. |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (minimum 100) |
-| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
-| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
-| `reconnect_delay_ms` | Integer | `5000` | Delay in milliseconds before reconnecting after connection failure |
-| `buffer_capacity` | Integer | `10000` | Channel capacity (minimum 1) — new entries are dropped on the proxy hot path when the in-memory buffer is full, with a warning log |
+| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (1–60000) |
+| `reconnect_delay_ms` | Integer | `5000` | Delay in milliseconds before reconnecting after connection failure (1–60000) |
+| `connect_timeout_ms` | Integer | `5000` | Bound covering DNS, TCP, TLS, and WebSocket Upgrade establishment (100–60000). On timeout the partial transport is dropped and retry/reconnect advances. |
+| `write_timeout_ms` | Integer | `5000` | Bound covering batch write/flush progress on an established socket (100–60000). On timeout the complete connection (writer + drain task) is invalidated before retry/reconnect. Delivery is at-least-once: a timeout after partial progress may duplicate a batch on the next attempt. |
+| `buffer_capacity` | Integer | `10000` | Channel slot capacity (1–1000000). Hot-path hooks reserve a slot before serialization; when full, new entries are dropped with a rate-limited warning. |
+| `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted log record (1024–1048576). Oversized records are dropped before enqueue. |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained-byte budget across queued records (1024–268435456). Must be ≥ `max_entry_bytes`. |
 | `schema` | Object | *(none)* | Inline customizable log schema; see [Customizing Transaction Log Output](log_schema.md) |
 | `schema_ref` | String | *(none)* | Name of a schema registered by `transaction_log_schema`; mutually exclusive with `schema` |
 
-Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is sent as a single JSON array text message over the WebSocket connection.
+Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is sent as a single JSON array text message over the WebSocket connection. Entries are serialized under `max_entry_bytes` at admission (schema applied then), queued with a retained-byte lease, and the batch payload is `Arc`-shared across retries so attacker-shaped records are not re-cloned on each attempt. Overflow diagnostics are rate-limited (first drop, then every 100).
 
 Custom schemas apply to WebSocket disconnect records as well as ordinary
 HTTP/gRPC and TCP/UDP summaries. Disconnect-specific keys such as `event`,
-`frames_client_to_backend`, `frames_backend_to_client`, `direction`, and
-`io_side` can be renamed, omitted, or reordered; see the log-schema reference
-for the complete field list.
+`frames_client_to_backend`, `frames_backend_to_client`,
+`bytes_client_to_backend`, `bytes_backend_to_client`, `timestamp_connected`,
+`timestamp_disconnected`, `direction`, and `io_side` can be renamed, omitted,
+or reordered; see the log-schema reference for the complete field list.
 
-`endpoint_url` must be a valid `ws://` or `wss://` URL with a hostname. Malformed or non-WebSocket URLs reject plugin creation at config load time.
+`endpoint_url` must be a valid `ws://` or `wss://` URL with a hostname and no userinfo. Malformed or non-WebSocket URLs reject plugin creation at config load time.
 
 ```yaml
 plugin_name: ws_logging
@@ -525,9 +530,11 @@ config:
   endpoint_url: "wss://logging-service.example.com/ws/ingest"
   batch_size: 50
   flush_interval_ms: 1000
+  connect_timeout_ms: 5000
+  write_timeout_ms: 5000
 ```
 
-**Connection lifecycle:** The plugin establishes a persistent WebSocket connection on the first batch flush. If the connection drops, the plugin automatically reconnects on the next send attempt. Failed batches are retried up to `max_retries` times with `retry_delay_ms` between attempts. After exhausting retries, the batch is discarded and a warning is logged.
+**Connection lifecycle:** The plugin establishes a persistent WebSocket connection on the first batch flush, bounded by `connect_timeout_ms`. If the connection drops, write/flush stalls past `write_timeout_ms`, or the read-side drain observes unexpected application frames / Close / read errors, the complete connection (writer + drain task) is invalidated and the plugin reconnects on the next send attempt. Failed batches are retried up to `max_retries` times with `retry_delay_ms` between attempts. After exhausting retries, the batch is discarded and a warning is logged. The plugin is write-only: collectors that send Text/Binary acknowledgements cause immediate connection invalidation so Ping/Pong and Close handling are not abandoned on a stale socket.
 
 ### `tcp_logging`
 

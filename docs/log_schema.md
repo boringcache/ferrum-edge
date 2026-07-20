@@ -194,11 +194,18 @@ keys valid. The native keys available to `omit`, `rename`, and `order` are:
 `event`, `namespace`, `proxy_id`, `proxy_name`, `client_ip`,
 `consumer_username`, `auth_method`, `backend_target`, `protocol`,
 `listen_port`, `duration_ms`, `frames_client_to_backend`,
-`frames_backend_to_client`, `direction`, `io_side`, `error_class`, and
-`metadata`.
+`frames_backend_to_client`, `bytes_client_to_backend`,
+`bytes_backend_to_client`, `timestamp_connected`, `timestamp_disconnected`,
+`direction`, `io_side`, `error_class`, and `metadata`.
 
 The disconnect-specific keys are `event`, `frames_client_to_backend`,
-`frames_backend_to_client`, `direction`, and `io_side`. A
+`frames_backend_to_client`, `bytes_client_to_backend`,
+`bytes_backend_to_client`, `timestamp_connected`, `timestamp_disconnected`,
+`direction`, and `io_side`. Byte totals are the session payload volume already
+computed by the relay (including H1/H2 tunnel mode, where frame counts stay
+zero). Timestamps are RFC3339 wall-clock instants captured at upgrade and
+teardown so delayed batch delivery does not replace event time with receipt
+time; `timestamp_format` applies when a custom schema is configured. A
 `summary_type: stream` schema remains limited to TCP, UDP, and DTLS entries;
 WebSocket disconnects retain their native shape under that setting.
 

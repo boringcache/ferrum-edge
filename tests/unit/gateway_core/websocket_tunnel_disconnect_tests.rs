@@ -43,6 +43,8 @@ struct CapturedDisconnect {
     frames_b2c: u64,
     bytes_c2b: u64,
     bytes_b2c: u64,
+    timestamp_connected: String,
+    timestamp_disconnected: String,
     direction: Option<Direction>,
     io_side: Option<StreamIoSide>,
     error_class: Option<ErrorClass>,
@@ -82,6 +84,8 @@ impl Plugin for CapturingDisconnectPlugin {
             frames_b2c: ctx.frames_backend_to_client,
             bytes_c2b: ctx.bytes_client_to_backend,
             bytes_b2c: ctx.bytes_backend_to_client,
+            timestamp_connected: ctx.timestamp_connected.clone(),
+            timestamp_disconnected: ctx.timestamp_disconnected.clone(),
             direction: ctx.direction,
             io_side: ctx.io_side,
             error_class: ctx.error_class,
@@ -98,7 +102,7 @@ fn session_meta() -> ferrum_edge::proxy::WsSessionMeta {
         8000,
         Some("user-42".to_string()),
         HashMap::new(),
-        chrono::Utc::now() - chrono::Duration::milliseconds(250),
+        chrono::Utc::now() - chrono::Duration::seconds(2),
     )
 }
 
@@ -119,6 +123,12 @@ async fn test_tunnel_disconnect_fires_for_every_plugin() {
     assert_eq!(a[0].client_ip, "10.0.0.7");
     assert_eq!(a[0].bytes_c2b, 12);
     assert_eq!(a[0].bytes_b2c, 34);
+    assert_eq!(a[0].timestamp_connected, meta.session_start.to_rfc3339());
+    assert!(
+        !a[0].timestamp_disconnected.is_empty(),
+        "tunnel disconnect must carry a teardown wall-clock timestamp"
+    );
+    assert_ne!(a[0].timestamp_connected, a[0].timestamp_disconnected);
 }
 
 #[tokio::test]

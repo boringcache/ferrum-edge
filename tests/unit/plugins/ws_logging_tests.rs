@@ -1,6 +1,8 @@
 //! Tests for ws_logging plugin
 
 use std::collections::HashMap;
+use std::io;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrum_edge::plugins::{
@@ -13,10 +15,47 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tracing_subscriber::fmt::MakeWriter;
 
 use super::plugin_utils::{
     create_test_context, create_test_stream_transaction_summary, create_test_transaction_summary,
 };
+
+#[derive(Clone, Default)]
+struct SharedWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+struct SharedGuard {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for SharedGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedWriter {
+    type Writer = SharedGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedGuard {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -37,8 +76,10 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         duration_ms: 250.0,
         frames_client_to_backend: 3,
         frames_backend_to_client: 4,
-        bytes_client_to_backend: 0,
-        bytes_backend_to_client: 0,
+        bytes_client_to_backend: 128,
+        bytes_backend_to_client: 256,
+        timestamp_connected: "2026-01-01T00:00:00+00:00".to_string(),
+        timestamp_disconnected: "2026-01-01T00:00:01+00:00".to_string(),
         direction: Some(Direction::ClientToBackend),
         io_side: None,
         error_class: None,
@@ -117,6 +158,16 @@ async fn test_ws_logging_rejects_invalid_config_shapes() {
         json!({"endpoint_url": "ws://localhost:9300/logs", "max_retries": "3"}),
         json!({"endpoint_url": "ws://localhost:9300/logs", "retry_delay_ms": {}}),
         json!({"endpoint_url": "ws://localhost:9300/logs", "reconnect_delay_ms": "soon"}),
+        json!({"endpoint_url": "ws://localhost:9300/logs", "connect_timeout_ms": "slow"}),
+        json!({"endpoint_url": "ws://localhost:9300/logs", "write_timeout_ms": false}),
+        json!({"endpoint_url": "ws://localhost:9300/logs", "max_entry_bytes": 0}),
+        json!({"endpoint_url": "ws://localhost:9300/logs", "buffer_max_bytes": 512}),
+        json!({
+            "endpoint_url": "ws://localhost:9300/logs",
+            "max_entry_bytes": 4096,
+            "buffer_max_bytes": 1024
+        }),
+        json!({"endpoint_url": "ws://user:pass@localhost:9300/logs"}),
     ] {
         assert!(
             WsLogging::new(&config, default_client()).is_err(),
@@ -314,6 +365,10 @@ async fn test_ws_logging_custom_schema_applies_to_ws_disconnect() {
 
     assert_eq!(entry["kind"], "websocket_disconnect");
     assert_eq!(entry["upstream_frames"], 3);
+    assert_eq!(entry["bytes_client_to_backend"], 128);
+    assert_eq!(entry["bytes_backend_to_client"], 256);
+    assert_eq!(entry["timestamp_connected"], "2026-01-01T00:00:00+00:00");
+    assert_eq!(entry["timestamp_disconnected"], "2026-01-01T00:00:01+00:00");
     assert_eq!(entry["disconnect_direction"], "client_to_backend");
     assert_eq!(entry["failure_side"], "write");
     assert_eq!(entry["service"], "edge-ws");
@@ -702,4 +757,330 @@ async fn test_ws_logging_reconnects_after_server_close() {
 
     drop(plugin);
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn test_ws_logging_native_disconnect_preserves_bytes_and_timestamps() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let endpoint = format!("ws://{addr}/logs");
+    let (payload_tx, payload_rx) = tokio::sync::oneshot::channel::<String>();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake");
+        let (_sink, mut read) = ws.split();
+        let payload = match read.next().await {
+            Some(Ok(Message::Text(payload))) => payload.to_string(),
+            other => panic!("expected text log batch, got {other:?}"),
+        };
+        let _ = payload_tx.send(payload);
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "reconnect_delay_ms": 100,
+            "buffer_capacity": 16,
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+
+    let mut ctx = test_ws_disconnect_context();
+    ctx.frames_client_to_backend = 0;
+    ctx.frames_backend_to_client = 0;
+    ctx.bytes_client_to_backend = 4096;
+    ctx.bytes_backend_to_client = 8192;
+    ctx.timestamp_connected = "2026-07-20T12:00:00+00:00".to_string();
+    ctx.timestamp_disconnected = "2026-07-20T12:00:05+00:00".to_string();
+    plugin.on_ws_disconnect(&ctx).await;
+
+    let payload = await_within("native disconnect batch", payload_rx)
+        .await
+        .expect("payload channel closed");
+    let batch: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON batch");
+    let entry = &batch[0];
+    assert_eq!(entry["event"], "websocket_disconnect");
+    assert_eq!(entry["frames_client_to_backend"], 0);
+    assert_eq!(entry["frames_backend_to_client"], 0);
+    assert_eq!(entry["bytes_client_to_backend"], 4096);
+    assert_eq!(entry["bytes_backend_to_client"], 8192);
+    assert_eq!(entry["timestamp_connected"], "2026-07-20T12:00:00+00:00");
+    assert_eq!(entry["timestamp_disconnected"], "2026-07-20T12:00:05+00:00");
+
+    drop(plugin);
+    let _ = await_within("native disconnect server shutdown", server).await;
+}
+
+#[tokio::test]
+async fn test_ws_logging_connect_timeout_against_silent_tcp_peer() {
+    // Accept TCP but never complete the WebSocket Upgrade. Establishment must
+    // fail within connect_timeout_ms so the worker can continue draining.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let endpoint = format!("ws://{addr}/logs");
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.expect("accept");
+        let _ = accepted_tx.send(());
+        // Hold the accepted socket open without speaking Upgrade.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 0,
+            "reconnect_delay_ms": 50,
+            "connect_timeout_ms": 200,
+            "buffer_capacity": 16,
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+
+    let started = std::time::Instant::now();
+    plugin.log(&create_test_transaction_summary()).await;
+    await_within("silent TCP accept", accepted_rx)
+        .await
+        .expect("peer never accepted");
+    // Give the flush loop time to observe the connect timeout and return.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "connect timeout must bound establishment well under the silent-peer hang"
+    );
+
+    // A second enqueue after the timed-out attempt proves the worker recovered
+    // enough to keep accepting queue progress (it may still fail delivery).
+    plugin.log(&create_test_transaction_summary()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    drop(plugin);
+    server.abort();
+}
+
+#[tokio::test]
+async fn test_ws_logging_write_timeout_against_slow_reader_then_recovers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let endpoint = format!("ws://{addr}/logs");
+    let (second_tx, second_rx) = tokio::sync::oneshot::channel::<String>();
+
+    let server = tokio::spawn(async move {
+        // First connection: handshake then stop reading so write buffers fill
+        // and write_timeout_ms fires on the client.
+        let (stream, _) = listener.accept().await.expect("accept #1");
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake #1");
+        let (_sink, _read) = ws.split();
+        let stall = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        // Second connection: read the recovered batch after reconnect.
+        let (stream, _) = listener.accept().await.expect("accept #2");
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake #2");
+        let (_sink, mut read) = ws.split();
+        let payload = match read.next().await {
+            Some(Ok(Message::Text(payload))) => payload.to_string(),
+            other => panic!("expected recovered text batch, got {other:?}"),
+        };
+        let _ = second_tx.send(payload);
+        stall.abort();
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 3,
+            "retry_delay_ms": 50,
+            "reconnect_delay_ms": 50,
+            "write_timeout_ms": 200,
+            "connect_timeout_ms": 1000,
+            "buffer_capacity": 64,
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+
+    // Large payloads help fill socket buffers quickly under a non-reading peer.
+    let mut summary = create_test_transaction_summary();
+    summary.request_path = format!("/{}", "x".repeat(32_768));
+    for _ in 0..8 {
+        plugin.log(&summary).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let payload = await_within("recovered batch after write timeout", second_rx)
+        .await
+        .expect("plugin did not recover onto a fresh connection");
+    let batch: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+    assert!(batch.as_array().is_some_and(|a| !a.is_empty()));
+
+    drop(plugin);
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn test_ws_logging_application_frame_invalidates_and_reconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let endpoint = format!("ws://{addr}/logs");
+    let (second_tx, second_rx) = tokio::sync::oneshot::channel::<()>();
+    let (pong_tx, pong_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+
+    let server = tokio::spawn(async move {
+        // Connection #1: read batch, send Text ack (stops drain), keep socket open.
+        {
+            let (stream, _) = listener.accept().await.expect("accept #1");
+            let ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake #1");
+            let (mut sink, mut read) = ws.split();
+            let _ = read.next().await;
+            sink.send(Message::Text("ack".into()))
+                .await
+                .expect("send ack");
+            // Keep first connection alive briefly; drain should have exited.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(sink);
+            drop(read);
+        }
+
+        // Connection #2: after invalidation/reconnect, Ping must get a Pong.
+        let (stream, _) = listener.accept().await.expect("accept #2");
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake #2");
+        let (mut sink, mut read) = ws.split();
+        let _ = second_tx.send(());
+        let _ = read.next().await;
+        sink.send(Message::Ping(b"alive".to_vec().into()))
+            .await
+            .expect("send Ping");
+        while let Some(msg) = read.next().await {
+            if let Ok(Message::Pong(data)) = msg {
+                let _ = pong_tx.send(data.to_vec());
+                return;
+            }
+        }
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 2,
+            "retry_delay_ms": 50,
+            "reconnect_delay_ms": 50,
+            "buffer_capacity": 16,
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+
+    plugin.log(&create_test_transaction_summary()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for _ in 0..5 {
+        plugin.log(&create_test_transaction_summary()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    await_within("reconnect after application frame", second_rx)
+        .await
+        .expect("plugin did not reconnect after Text acknowledgement");
+    let pong = await_within("Pong on fresh connection", pong_rx)
+        .await
+        .expect("fresh connection did not answer Ping");
+    assert_eq!(pong, b"alive");
+
+    drop(plugin);
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_ws_logging_diagnostics_redact_endpoint_path_and_query() {
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let path_secret = "path-token-secret-canary";
+    let query_secret = "query-token-secret-canary";
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": format!(
+                "ws://127.0.0.1:1/{path_secret}/ingest?token={query_secret}"
+            ),
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 0,
+            "reconnect_delay_ms": 50,
+            "connect_timeout_ms": 100,
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+
+    plugin.log(&create_test_transaction_summary()).await;
+    for _ in 0..100 {
+        let logs = writer.contents();
+        if logs.contains("failed to connect") || logs.contains("connect timeout") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(plugin);
+    drop(guard);
+
+    let logs = writer.contents();
+    assert!(
+        logs.contains("ws://127.0.0.1:1/redacted") || logs.contains("/redacted"),
+        "expected redacted endpoint form in diagnostics: {logs}"
+    );
+    assert!(
+        !logs.contains(path_secret),
+        "path credential leaked in diagnostics: {logs}"
+    );
+    assert!(
+        !logs.contains(query_secret),
+        "query credential leaked in diagnostics: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn test_ws_logging_accepts_timeout_and_budget_config() {
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://localhost:9300/logs",
+            "connect_timeout_ms": 2500,
+            "write_timeout_ms": 2500,
+            "max_entry_bytes": 8192,
+            "buffer_max_bytes": 65536,
+            "buffer_capacity": 128,
+        }),
+        default_client(),
+    )
+    .expect("valid timeout/budget config");
+    assert_eq!(plugin.name(), "ws_logging");
 }

@@ -3,9 +3,11 @@
 //! Serializes `TransactionSummary`, `StreamTransactionSummary`, and WebSocket
 //! disconnect entries, then sends them to a remote WebSocket endpoint in batches.
 //! Uses an mpsc channel to decouple the proxy hot path from network I/O: hooks
-//! enqueue entries non-blocking, and a background task drains the channel in
-//! configurable batch sizes with a flush interval timer. The WebSocket
-//! connection is maintained persistently with automatic reconnection on failure.
+//! reserve capacity and serialize under per-entry / queued-byte budgets before
+//! enqueue, and a background task drains the channel in configurable batch sizes
+//! with a flush interval timer. The WebSocket connection is maintained
+//! persistently with automatic reconnection on failure; establishment and
+//! write/flush progress are bounded by documented timeouts.
 //!
 //! **TLS**: For `wss://` endpoints, the plugin builds a `rustls::ClientConfig`
 //! that follows the gateway's CA trust chain:
@@ -21,33 +23,49 @@ use async_trait::async_trait;
 use futures_util::SinkExt;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use tokio::sync::{mpsc, watch};
 use tokio::time::Duration;
 use tracing::warn;
 use url::{Host, Url};
 
 use super::utils::log_schema::view::{
-    MetadataNested, extract_host_from_url, serialize_schema_metadata,
+    MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata,
 };
 use super::utils::log_schema::{
     DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
     TimestampFormat, resolve_schema,
 };
-use super::utils::{BatchConfigDefaults, PluginHttpClient, validate_batch_config};
+use super::utils::{
+    BatchConfigDefaults, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient, validate_batch_config,
+};
 use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
     WsDisconnectContext,
 };
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
-/// Union type for log entries sent through the batched channel.
-#[derive(Clone, serde::Serialize)]
-#[serde(untagged)]
-enum LogEntry {
-    Http(TransactionSummary),
-    Stream(StreamTransactionSummary),
-    WebSocket(WsDisconnectLogEntry),
+/// Default / hard maxima for per-entry serialization and aggregate queued bytes.
+pub const WS_DEFAULT_MAX_ENTRY_BYTES: usize = 64 * 1024;
+pub const WS_MAX_MAX_ENTRY_BYTES: usize = 1024 * 1024;
+pub const WS_DEFAULT_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub const WS_MAX_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+const WS_MIN_RESOURCE_BYTES: usize = 1024;
+const WS_DROP_WARN_EVERY: u64 = 100;
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_WRITE_TIMEOUT_MS: u64 = 5_000;
+const MIN_TIMEOUT_MS: u64 = 100;
+const MAX_RETRY_DELAY_MS: u64 = 60_000;
+const MAX_RECONNECT_DELAY_MS: u64 = 60_000;
+const MAX_RETRIES: u64 = 10;
+
+/// Pre-serialized log entry admitted under slot + byte budgets.
+struct QueuedEntry {
+    json: Arc<str>,
+    _lease: Arc<WsByteLease>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -66,6 +84,10 @@ struct WsDisconnectLogEntry {
     duration_ms: f64,
     frames_client_to_backend: u64,
     frames_backend_to_client: u64,
+    bytes_client_to_backend: u64,
+    bytes_backend_to_client: u64,
+    timestamp_connected: String,
+    timestamp_disconnected: String,
     direction: Option<Direction>,
     io_side: Option<crate::proxy::tcp_proxy::StreamIoSide>,
     error_class: Option<crate::retry::ErrorClass>,
@@ -87,7 +109,7 @@ impl SchemaSerializable for WsDisconnectLogEntry {
         &self,
         source: &'static str,
         out_key: &str,
-        _ts_format: TimestampFormat,
+        ts_format: TimestampFormat,
         map: &mut S,
     ) -> Result<(), S::Error>
     where
@@ -113,6 +135,18 @@ impl SchemaSerializable for WsDisconnectLogEntry {
             }
             "frames_backend_to_client" => {
                 map.serialize_entry(out_key, &self.frames_backend_to_client)
+            }
+            "bytes_client_to_backend" => {
+                map.serialize_entry(out_key, &self.bytes_client_to_backend)
+            }
+            "bytes_backend_to_client" => {
+                map.serialize_entry(out_key, &self.bytes_backend_to_client)
+            }
+            "timestamp_connected" => {
+                emit_timestamp(out_key, &self.timestamp_connected, ts_format, map)
+            }
+            "timestamp_disconnected" => {
+                emit_timestamp(out_key, &self.timestamp_disconnected, ts_format, map)
             }
             "direction" => map.serialize_entry(out_key, &self.direction),
             "io_side" => map.serialize_entry(out_key, &self.io_side),
@@ -188,6 +222,10 @@ impl From<&WsDisconnectContext> for WsDisconnectLogEntry {
             duration_ms: ctx.duration_ms,
             frames_client_to_backend: ctx.frames_client_to_backend,
             frames_backend_to_client: ctx.frames_backend_to_client,
+            bytes_client_to_backend: ctx.bytes_client_to_backend,
+            bytes_backend_to_client: ctx.bytes_backend_to_client,
+            timestamp_connected: ctx.timestamp_connected.clone(),
+            timestamp_disconnected: ctx.timestamp_disconnected.clone(),
             direction: ctx.direction,
             io_side: ctx.io_side,
             error_class: ctx.error_class,
@@ -197,52 +235,116 @@ impl From<&WsDisconnectContext> for WsDisconnectLogEntry {
 }
 
 struct WsConfig {
+    /// Full dial URL retained only for connection establishment.
     endpoint_url: String,
+    /// Structurally redacted form used in every diagnostic (`scheme://host[:port]/redacted`).
+    endpoint_url_for_logs: String,
     connector: Option<tokio_tungstenite::Connector>,
     batch_size: usize,
     flush_interval: Duration,
     max_retries: u32,
     retry_delay: Duration,
     reconnect_delay: Duration,
-    schema: Option<Arc<SummarySchema>>,
+    connect_timeout: Duration,
+    write_timeout: Duration,
 }
 
-/// Serialize-time wrapper: emits the LogEntry slice as a JSON array,
-/// applying `schema` to entries when its `summary_type` matches.
-struct WsBatchView<'a> {
-    entries: &'a [LogEntry],
-    schema: Option<&'a SummarySchema>,
+struct WsByteLease {
+    used_bytes: Arc<AtomicUsize>,
+    bytes: usize,
 }
 
-impl<'a> serde::Serialize for WsBatchView<'a> {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let mut seq = ser.serialize_seq(Some(self.entries.len()))?;
-        for entry in self.entries {
-            match (entry, self.schema) {
-                (LogEntry::Http(summary), Some(schema)) if schema.applies_to_http() => {
-                    seq.serialize_element(&SchemaView { summary, schema })?;
-                }
-                (LogEntry::Stream(summary), Some(schema)) if schema.applies_to_stream() => {
-                    seq.serialize_element(&SchemaView { summary, schema })?;
-                }
-                (LogEntry::WebSocket(entry), Some(schema))
-                    if schema.applies_to_websocket_disconnect() =>
-                {
-                    seq.serialize_element(&SchemaView {
-                        summary: entry,
-                        schema,
-                    })?;
-                }
-                _ => seq.serialize_element(entry)?,
-            }
+impl Drop for WsByteLease {
+    fn drop(&mut self) {
+        self.used_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+struct WsByteBudget {
+    used_bytes: Arc<AtomicUsize>,
+    max_bytes: usize,
+    dropped_count: AtomicU64,
+}
+
+impl WsByteBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            used_bytes: Arc::new(AtomicUsize::new(0)),
+            max_bytes,
+            dropped_count: AtomicU64::new(0),
         }
-        seq.end()
+    }
+
+    fn try_acquire(&self, bytes: usize) -> Option<Arc<WsByteLease>> {
+        let reserved = self
+            .used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.max_bytes)
+            });
+        if reserved.is_err() {
+            self.record_drop("retained-content byte budget exhausted");
+            return None;
+        }
+
+        Some(Arc::new(WsByteLease {
+            used_bytes: Arc::clone(&self.used_bytes),
+            bytes,
+        }))
+    }
+
+    fn record_drop(&self, reason: &str) {
+        let dropped = self.dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if dropped == 1 || dropped.is_multiple_of(WS_DROP_WARN_EVERY) {
+            warn!(
+                plugin = "ws_logging",
+                "WebSocket logging: dropping entry because {} ({} dropped total; logging every {} drops)",
+                reason,
+                dropped,
+                WS_DROP_WARN_EVERY,
+            );
+        }
+    }
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedJsonWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(4096)),
+            max_bytes,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "serialized WebSocket logging entry exceeded its byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
 pub struct WsLogging {
-    sender: mpsc::Sender<LogEntry>,
+    sender: mpsc::Sender<QueuedEntry>,
+    schema: Option<Arc<SummarySchema>>,
+    byte_budget: Arc<WsByteBudget>,
+    max_entry_bytes: usize,
     endpoint_hostname: Option<String>,
 }
 
@@ -271,12 +373,18 @@ impl WsLogging {
                 ));
             }
         }
+        if !parsed_url.username().is_empty() || parsed_url.password().is_some() {
+            return Err(
+                "ws_logging: 'endpoint_url' must not include URL user information".to_string(),
+            );
+        }
         if !has_non_empty_authority(&endpoint_url) {
             return Err(
                 "ws_logging: 'endpoint_url' must include a hostname or IP address".to_string(),
             );
         }
         let endpoint_hostname = endpoint_hostname(&parsed_url)?;
+        let endpoint_url_for_logs = redacted_endpoint_url(&parsed_url);
 
         // Build TLS connector for wss:// using gateway CA/verify settings.
         let connector = if parsed_url.scheme() == "wss" {
@@ -295,25 +403,91 @@ impl WsLogging {
             retry_delay_ms: 1000,
         };
         validate_batch_config(config, "ws_logging", batch_defaults)?;
-        if let Some(value) = config.get("reconnect_delay_ms")
-            && value.as_u64().is_none()
-        {
-            return Err("ws_logging: 'reconnect_delay_ms' must be an unsigned integer".to_string());
+        for key in [
+            "reconnect_delay_ms",
+            "connect_timeout_ms",
+            "write_timeout_ms",
+            "max_entry_bytes",
+            "buffer_max_bytes",
+        ] {
+            if let Some(value) = config.get(key)
+                && value.as_u64().is_none()
+            {
+                return Err(format!("ws_logging: '{key}' must be an unsigned integer"));
+            }
         }
 
-        let batch_size = optional_usize(config, "batch_size", batch_defaults.batch_size)?.max(1);
-        let flush_interval_ms = optional_u64(
+        let batch_size = bounded_u64(
+            config,
+            "batch_size",
+            batch_defaults.batch_size,
+            1,
+            MAX_BATCH_SIZE as u64,
+        )? as usize;
+        let flush_interval_ms = bounded_u64(
             config,
             "flush_interval_ms",
             batch_defaults.flush_interval_ms,
-        )?
-        .max(batch_defaults.min_flush_interval_ms);
-        let buffer_capacity =
-            optional_usize(config, "buffer_capacity", batch_defaults.buffer_capacity)?.max(1);
-        let max_retries =
-            optional_u32_saturating(config, "max_retries", batch_defaults.max_retries)?;
-        let retry_delay_ms = optional_u64(config, "retry_delay_ms", batch_defaults.retry_delay_ms)?;
-        let reconnect_delay_ms = optional_u64(config, "reconnect_delay_ms", 5000)?;
+            batch_defaults.min_flush_interval_ms,
+            u64::MAX,
+        )?;
+        let buffer_capacity = bounded_u64(
+            config,
+            "buffer_capacity",
+            batch_defaults.buffer_capacity,
+            1,
+            MAX_BUFFER_CAPACITY as u64,
+        )? as usize;
+        let max_retries = bounded_u64(
+            config,
+            "max_retries",
+            batch_defaults.max_retries,
+            0,
+            MAX_RETRIES,
+        )? as u32;
+        let retry_delay_ms = bounded_u64(
+            config,
+            "retry_delay_ms",
+            batch_defaults.retry_delay_ms,
+            1,
+            MAX_RETRY_DELAY_MS,
+        )?;
+        let reconnect_delay_ms =
+            bounded_u64(config, "reconnect_delay_ms", 5000, 1, MAX_RECONNECT_DELAY_MS)?;
+        let connect_timeout_ms = bounded_u64(
+            config,
+            "connect_timeout_ms",
+            DEFAULT_CONNECT_TIMEOUT_MS,
+            MIN_TIMEOUT_MS,
+            MAX_RETRY_DELAY_MS,
+        )?;
+        let write_timeout_ms = bounded_u64(
+            config,
+            "write_timeout_ms",
+            DEFAULT_WRITE_TIMEOUT_MS,
+            MIN_TIMEOUT_MS,
+            MAX_RETRY_DELAY_MS,
+        )?;
+        let max_entry_bytes = bounded_u64(
+            config,
+            "max_entry_bytes",
+            WS_DEFAULT_MAX_ENTRY_BYTES as u64,
+            WS_MIN_RESOURCE_BYTES as u64,
+            WS_MAX_MAX_ENTRY_BYTES as u64,
+        )? as usize;
+        let buffer_max_bytes = bounded_u64(
+            config,
+            "buffer_max_bytes",
+            WS_DEFAULT_BUFFER_MAX_BYTES as u64,
+            WS_MIN_RESOURCE_BYTES as u64,
+            WS_MAX_BUFFER_MAX_BYTES as u64,
+        )? as usize;
+        if buffer_max_bytes < max_entry_bytes {
+            return Err(
+                "ws_logging: 'buffer_max_bytes' must be greater than or equal to 'max_entry_bytes'"
+                    .to_string(),
+            );
+        }
 
         // ws_logging is the only caller that serializes WebSocket-disconnect
         // entries, so it opts into that field family. Every other logging
@@ -321,13 +495,15 @@ impl WsLogging {
         let schema = resolve_schema(config, "ws_logging", SchemaCapabilities::WS_LOGGING)?;
         let ws_config = WsConfig {
             endpoint_url,
+            endpoint_url_for_logs,
             connector,
             batch_size,
             flush_interval: Duration::from_millis(flush_interval_ms),
             max_retries,
             retry_delay: Duration::from_millis(retry_delay_ms),
             reconnect_delay: Duration::from_millis(reconnect_delay_ms),
-            schema,
+            connect_timeout: Duration::from_millis(connect_timeout_ms),
+            write_timeout: Duration::from_millis(write_timeout_ms),
         };
 
         let (sender, receiver) = mpsc::channel(buffer_capacity);
@@ -335,9 +511,152 @@ impl WsLogging {
 
         Ok(Self {
             sender,
+            schema,
+            byte_budget: Arc::new(WsByteBudget::new(buffer_max_bytes)),
+            max_entry_bytes,
             endpoint_hostname: Some(endpoint_hostname),
         })
     }
+
+    fn queue_value<T>(&self, value: &T, kind: &str)
+    where
+        T: serde::Serialize,
+    {
+        let Ok(permit) = self.sender.try_reserve() else {
+            self.byte_budget.record_drop("queue slot exhausted");
+            return;
+        };
+
+        let mut writer = BoundedJsonWriter::new(self.max_entry_bytes);
+        if let Err(error) = serde_json::to_writer(&mut writer, value) {
+            if writer.limit_exceeded {
+                self.byte_budget
+                    .record_drop("serialized entry exceeded max_entry_bytes");
+            } else {
+                warn!("WebSocket logging: failed to serialize {kind}: {error}");
+            }
+            return;
+        }
+        let retained_bytes = writer.bytes.len();
+        let Some(lease) = self.byte_budget.try_acquire(retained_bytes) else {
+            return;
+        };
+        let json = match String::from_utf8(writer.bytes) {
+            Ok(line) => Arc::<str>::from(line),
+            Err(error) => {
+                warn!("WebSocket logging: serialized {kind} was not UTF-8: {error}");
+                return;
+            }
+        };
+        permit.send(QueuedEntry {
+            json,
+            _lease: lease,
+        });
+    }
+
+    fn queue_http(&self, summary: &TransactionSummary) {
+        match self.schema.as_deref() {
+            Some(schema) if schema.applies_to_http() => {
+                self.queue_value(
+                    &SchemaView {
+                        summary,
+                        schema,
+                    },
+                    "HTTP entry",
+                );
+            }
+            _ => self.queue_value(summary, "HTTP entry"),
+        }
+    }
+
+    fn queue_stream(&self, summary: &StreamTransactionSummary) {
+        match self.schema.as_deref() {
+            Some(schema) if schema.applies_to_stream() => {
+                self.queue_value(
+                    &SchemaView {
+                        summary,
+                        schema,
+                    },
+                    "stream entry",
+                );
+            }
+            _ => self.queue_value(summary, "stream entry"),
+        }
+    }
+
+    fn queue_websocket(&self, ctx: &WsDisconnectContext) {
+        // Reserve a slot before cloning attacker-shaped metadata into the
+        // disconnect entry and serializing it.
+        let Ok(permit) = self.sender.try_reserve() else {
+            self.byte_budget.record_drop("queue slot exhausted");
+            return;
+        };
+        let entry = WsDisconnectLogEntry::from(ctx);
+        let mut writer = BoundedJsonWriter::new(self.max_entry_bytes);
+        let serialize_result = match self.schema.as_deref() {
+            Some(schema) if schema.applies_to_websocket_disconnect() => {
+                serde_json::to_writer(
+                    &mut writer,
+                    &SchemaView {
+                        summary: &entry,
+                        schema,
+                    },
+                )
+            }
+            _ => serde_json::to_writer(&mut writer, &entry),
+        };
+        if let Err(error) = serialize_result {
+            if writer.limit_exceeded {
+                self.byte_budget
+                    .record_drop("serialized entry exceeded max_entry_bytes");
+            } else {
+                warn!("WebSocket logging: failed to serialize WebSocket disconnect entry: {error}");
+            }
+            return;
+        }
+        let retained_bytes = writer.bytes.len();
+        let Some(lease) = self.byte_budget.try_acquire(retained_bytes) else {
+            return;
+        };
+        let json = match String::from_utf8(writer.bytes) {
+            Ok(line) => Arc::<str>::from(line),
+            Err(error) => {
+                warn!(
+                    "WebSocket logging: serialized WebSocket disconnect entry was not UTF-8: {error}"
+                );
+                return;
+            }
+        };
+        permit.send(QueuedEntry {
+            json,
+            _lease: lease,
+        });
+    }
+}
+
+fn redacted_endpoint_url(endpoint: &Url) -> String {
+    crate::plugins::loki_logging::redacted_endpoint_url(endpoint)
+}
+
+fn bounded_u64(
+    config: &Value,
+    key: &str,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, String> {
+    let value = match config.get(key) {
+        None => default,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("ws_logging: '{key}' must be an unsigned integer"))?,
+    };
+    if !(minimum..=maximum).contains(&value) {
+        return Err(format!(
+            "ws_logging: '{key}' must be between {minimum} and {maximum}"
+        ));
+    }
+    Ok(value)
 }
 
 fn endpoint_hostname(parsed_url: &Url) -> Result<String, String> {
@@ -364,23 +683,6 @@ fn has_non_empty_authority(endpoint_url: &str) -> bool {
         .unwrap_or(authority_and_path.len());
 
     authority_end > 0
-}
-
-fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> {
-    match config.get(key) {
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| format!("ws_logging: '{key}' must be an unsigned integer")),
-        None => Ok(default),
-    }
-}
-
-fn optional_usize(config: &Value, key: &str, default: u64) -> Result<usize, String> {
-    Ok(optional_u64(config, key, default)?.min(usize::MAX as u64) as usize)
-}
-
-fn optional_u32_saturating(config: &Value, key: &str, default: u64) -> Result<u32, String> {
-    Ok(optional_u64(config, key, default)?.min(u64::from(u32::MAX)) as u32)
 }
 
 /// Build a `tokio_tungstenite::Connector::Rustls` that follows the gateway's
@@ -464,33 +766,15 @@ impl Plugin for WsLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        if self
-            .sender
-            .try_send(LogEntry::Stream(summary.clone()))
-            .is_err()
-        {
-            warn!("WebSocket logging buffer full — dropping stream log entry");
-        }
+        self.queue_stream(summary);
     }
 
     async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
-        if self
-            .sender
-            .try_send(LogEntry::WebSocket(WsDisconnectLogEntry::from(ctx)))
-            .is_err()
-        {
-            warn!("WebSocket logging buffer full — dropping WebSocket disconnect log entry");
-        }
+        self.queue_websocket(ctx);
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        if self
-            .sender
-            .try_send(LogEntry::Http(summary.clone()))
-            .is_err()
-        {
-            warn!("WebSocket logging buffer full — dropping log entry");
-        }
+        self.queue_http(summary);
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -503,13 +787,13 @@ impl Plugin for WsLogging {
 
 /// Background task that maintains a persistent WebSocket connection and
 /// flushes batched log entries as JSON text messages.
-async fn flush_loop(mut receiver: mpsc::Receiver<LogEntry>, cfg: WsConfig) {
+async fn flush_loop(mut receiver: mpsc::Receiver<QueuedEntry>, cfg: WsConfig) {
     if cfg.endpoint_url.is_empty() {
         while receiver.recv().await.is_some() {}
         return;
     }
 
-    let mut buffer: Vec<LogEntry> = Vec::with_capacity(cfg.batch_size);
+    let mut buffer: Vec<QueuedEntry> = Vec::with_capacity(cfg.batch_size);
     let mut timer = tokio::time::interval(cfg.flush_interval);
     timer.tick().await;
 
@@ -546,7 +830,29 @@ async fn flush_loop(mut receiver: mpsc::Receiver<LogEntry>, cfg: WsConfig) {
                     ws_conn = send_batch(&cfg, batch, ws_conn).await;
                 }
             }
+
+            _ = wait_drain_done(&ws_conn) => {
+                // Drain finished (application frame / Close / read error).
+                // Invalidate the complete connection so the next send reconnects
+                // and control-frame handling is not left abandoned on a stale socket.
+                if ws_conn.as_ref().is_some_and(|c| c.drain_finished()) {
+                    ws_conn = None;
+                }
+            }
         }
+    }
+}
+
+async fn wait_drain_done(conn: &Option<WsConnection>) {
+    match conn {
+        Some(c) => {
+            let mut rx = c.drain_done.clone();
+            if *rx.borrow() {
+                return;
+            }
+            let _ = rx.changed().await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -556,16 +862,28 @@ type WsSink = futures_util::stream::SplitSink<
 >;
 
 /// A live WebSocket connection paired with the abort handle for its
-/// drain task. Dropping the connection aborts the drain task so the
-/// underlying `WebSocketStream` — held alive by
+/// drain task and a completion signal. Dropping the connection aborts the
+/// drain task so the underlying `WebSocketStream` — held alive by
 /// `futures_util::stream::split`'s `BiLock` while either half lives —
 /// is released immediately. Without this, a `sink.send(...)` failure
 /// that drops only the sink leaves the read half (and the underlying
 /// TCP/TLS stream) alive until the peer eventually closes, briefly
 /// stacking two drain tasks + two connections during a reconnect.
+///
+/// The plugin is write-only. Unexpected Text/Binary frames, server Close,
+/// or read errors mark the connection finished so the flush loop invalidates
+/// the complete connection (sink + drain) rather than leaving an unpolled
+/// read half while the writer keeps the stale socket selected.
 struct WsConnection {
     sink: WsSink,
     drain: tokio::task::AbortHandle,
+    drain_done: watch::Receiver<bool>,
+}
+
+impl WsConnection {
+    fn drain_finished(&self) -> bool {
+        *self.drain_done.borrow()
+    }
 }
 
 impl Drop for WsConnection {
@@ -574,37 +892,57 @@ impl Drop for WsConnection {
     }
 }
 
+fn build_batch_payload(entries: &[QueuedEntry]) -> Arc<str> {
+    let mut total = 2; // `[` `]`
+    for (idx, entry) in entries.iter().enumerate() {
+        if idx > 0 {
+            total += 1;
+        }
+        total += entry.json.len();
+    }
+    let mut out = String::with_capacity(total);
+    out.push('[');
+    for (idx, entry) in entries.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&entry.json);
+    }
+    out.push(']');
+    Arc::from(out)
+}
+
 /// Attempt to send a batch over the WebSocket connection. Returns the
 /// connection on success, or `None` if the connection was lost and
 /// could not be re-established within the retry budget.
+///
+/// The pre-built `Arc<str>` payload is reused across retries so attacker-shaped
+/// records are not re-cloned or re-serialized on each attempt. A write timeout
+/// or send error invalidates the complete [`WsConnection`] (including its drain
+/// task) before retry/reconnect. Delivery is at-least-once: a timeout after
+/// partial transport progress may cause the collector to receive a duplicate
+/// when the batch is retried on a fresh socket.
 async fn send_batch(
     cfg: &WsConfig,
-    batch: Vec<LogEntry>,
+    batch: Vec<QueuedEntry>,
     mut conn: Option<WsConnection>,
 ) -> Option<WsConnection> {
     let total_attempts = cfg.max_retries.saturating_add(1);
     let entry_count = batch.len();
-
-    let view = WsBatchView {
-        entries: &batch,
-        schema: cfg.schema.as_deref(),
-    };
-    let payload = match serde_json::to_string(&view) {
-        Ok(json) => json,
-        Err(e) => {
-            warn!("WebSocket logging: failed to serialize batch: {e}");
-            return conn;
-        }
-    };
+    let payload = build_batch_payload(&batch);
 
     for attempt in 1..=total_attempts {
+        if conn.as_ref().is_some_and(|c| c.drain_finished()) {
+            conn = None;
+        }
+
         // Ensure we have a live connection.
         if conn.is_none() {
             conn = connect(cfg).await;
             if conn.is_none() {
                 warn!(
-                    "WebSocket logging: connection failed (attempt {}/{})",
-                    attempt, total_attempts,
+                    "WebSocket logging: connection failed to {} (attempt {}/{})",
+                    cfg.endpoint_url_for_logs, attempt, total_attempts,
                 );
                 if attempt < total_attempts {
                     tokio::time::sleep(cfg.retry_delay).await;
@@ -615,18 +953,28 @@ async fn send_batch(
 
         if let Some(ref mut ws) = conn {
             let msg =
-                tokio_tungstenite::tungstenite::protocol::Message::Text(payload.clone().into());
-            match ws.sink.send(msg).await {
-                Ok(()) => return conn,
-                Err(e) => {
+                tokio_tungstenite::tungstenite::protocol::Message::Text((&*payload).into());
+            match tokio::time::timeout(cfg.write_timeout, ws.sink.send(msg)).await {
+                Ok(Ok(())) => return conn,
+                Ok(Err(e)) => {
                     warn!(
-                        "WebSocket logging: send failed: {e} (attempt {}/{})",
-                        attempt, total_attempts,
+                        "WebSocket logging: send failed to {}: {e} (attempt {}/{})",
+                        cfg.endpoint_url_for_logs, attempt, total_attempts,
                     );
                     // Connection is broken — dropping `conn` aborts the
                     // drain task so the underlying stream is released
                     // immediately rather than lingering alongside the
                     // reconnect attempt.
+                    conn = None;
+                    if attempt < total_attempts {
+                        tokio::time::sleep(cfg.retry_delay).await;
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        "WebSocket logging: write/flush timeout to {} after {:?} (attempt {}/{})",
+                        cfg.endpoint_url_for_logs, cfg.write_timeout, attempt, total_attempts,
+                    );
                     conn = None;
                     if attempt < total_attempts {
                         tokio::time::sleep(cfg.retry_delay).await;
@@ -647,7 +995,8 @@ async fn send_batch(
 ///
 /// Uses `connect_async_tls_with_config` with the pre-built TLS connector
 /// so that `wss://` connections respect the gateway's CA trust chain and
-/// `FERRUM_TLS_NO_VERIFY` setting.
+/// `FERRUM_TLS_NO_VERIFY` setting. The entire establishment path (DNS, TCP,
+/// TLS, and WebSocket Upgrade) is bounded by `connect_timeout`.
 ///
 /// `tokio_tungstenite` handles WebSocket control frames (Ping / Pong /
 /// server-initiated Close) inside its `Stream` impl while the read half
@@ -659,9 +1008,8 @@ async fn send_batch(
 /// out, by which time the kernel receive buffer may have filled. Spawn
 /// a small drain task that polls the read side and discards every
 /// message; that drives the protocol forward without doing anything
-/// with the data. The task's abort handle rides along with the sink in
-/// [`WsConnection`] so a sink-side failure tears down both halves in
-/// lock-step (see the type's doc-comment for the race it prevents).
+/// with the data. Unexpected Text/Binary frames mark the connection
+/// finished so the flush loop invalidates both halves together.
 async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
@@ -673,43 +1021,59 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
     ws_cfg.max_message_size = Some(64 << 10);
     ws_cfg.max_frame_size = Some(16 << 10);
 
-    match tokio_tungstenite::connect_async_tls_with_config(
+    let connect_fut = tokio_tungstenite::connect_async_tls_with_config(
         &cfg.endpoint_url,
         Some(ws_cfg),
         false,
         cfg.connector.clone(),
-    )
-    .await
-    {
-        Ok((stream, _response)) => {
+    );
+
+    match tokio::time::timeout(cfg.connect_timeout, connect_fut).await {
+        Ok(Ok((stream, _response))) => {
             let (sink, mut read) = stream.split();
+            let (done_tx, done_rx) = watch::channel(false);
             // Drain the read half so tungstenite can service Ping/Pong
-            // and server-initiated Close frames. Exits cleanly when the
-            // peer closes — at that point `sink.send(...)` errors and
-            // the main loop reconnects.
+            // and server-initiated Close frames. Mark finished on
+            // application data, Close, or read error so the writer cannot
+            // keep selecting a read-dead socket.
             let drain = tokio::spawn(async move {
                 while let Some(item) = read.next().await {
                     match item {
                         Ok(Message::Text(_)) | Ok(Message::Binary(_)) => {
-                            // Unexpected application data for a write-only
-                            // channel: stop draining and let reconnect logic
-                            // establish a fresh socket.
+                            let _ = done_tx.send(true);
+                            break;
+                        }
+                        Ok(Message::Close(_)) => {
+                            let _ = done_tx.send(true);
                             break;
                         }
                         Ok(_) => {}
-                        Err(_) => break,
+                        Err(_) => {
+                            let _ = done_tx.send(true);
+                            break;
+                        }
                     }
                 }
+                let _ = done_tx.send(true);
             });
             Some(WsConnection {
                 sink,
                 drain: drain.abort_handle(),
+                drain_done: done_rx,
             })
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(
                 "WebSocket logging: failed to connect to {}: {e} — will retry in {:?}",
-                cfg.endpoint_url, cfg.reconnect_delay,
+                cfg.endpoint_url_for_logs, cfg.reconnect_delay,
+            );
+            tokio::time::sleep(cfg.reconnect_delay).await;
+            None
+        }
+        Err(_) => {
+            warn!(
+                "WebSocket logging: connect timeout to {} after {:?} — will retry in {:?}",
+                cfg.endpoint_url_for_logs, cfg.connect_timeout, cfg.reconnect_delay,
             );
             tokio::time::sleep(cfg.reconnect_delay).await;
             None
@@ -737,6 +1101,10 @@ mod tests {
             duration_ms: 42.0,
             frames_client_to_backend: 3,
             frames_backend_to_client: 5,
+            bytes_client_to_backend: 128,
+            bytes_backend_to_client: 256,
+            timestamp_connected: "2026-01-01T00:00:00+00:00".into(),
+            timestamp_disconnected: "2026-01-01T00:00:42+00:00".into(),
             direction: None,
             io_side: None,
             error_class: None,
@@ -800,6 +1168,23 @@ mod tests {
         assert_eq!(
             v.get("event").and_then(Value::as_str),
             Some("websocket_disconnect")
+        );
+        assert_eq!(
+            v.get("bytes_client_to_backend").and_then(Value::as_u64),
+            Some(128)
+        );
+        assert_eq!(
+            v.get("timestamp_connected").and_then(Value::as_str),
+            Some("2026-01-01T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn redacted_endpoint_strips_path_and_query() {
+        let url = Url::parse("wss://collector.example/ingest?token=secret-token").unwrap();
+        assert_eq!(
+            redacted_endpoint_url(&url),
+            "wss://collector.example/redacted"
         );
     }
 }

@@ -11436,20 +11436,52 @@ components:
 
     WsLoggingConfig:
       type: object
-      description: "Plugin: ws_logging — Sends transaction logs to a WebSocket endpoint in batches."
+      description: >-
+        Plugin: ws_logging — Sends transaction logs to a WebSocket endpoint in
+        batches with bounded establishment/write timeouts, per-entry and
+        queued-byte admission budgets, and structurally redacted endpoint
+        diagnostics.
       required:
         - endpoint_url
       properties:
         endpoint_url:
           type: string
-          description: WebSocket URL (ws:// or wss://) to send transaction logs to. Must include a hostname; malformed or non-WebSocket schemes are rejected at config load time.
+          description: >-
+            WebSocket URL (ws:// or wss://) to send transaction logs to. Must
+            include a hostname and must not include URL user information.
+            Path/query credentials are permitted for collectors that require
+            them, but operational diagnostics always use a structurally
+            redacted form (`scheme://host[:port]/redacted`). Malformed or
+            non-WebSocket schemes are rejected at config load time.
         reconnect_delay_ms:
           type: integer
           default: 5000
+          minimum: 1
+          maximum: 60000
           description: Delay in milliseconds before reconnecting after connection failure
+        connect_timeout_ms:
+          type: integer
+          default: 5000
+          minimum: 100
+          maximum: 60000
+          description: >-
+            Bound covering DNS, TCP, TLS, and WebSocket Upgrade establishment.
+            On timeout the partial transport is dropped and retry/reconnect
+            advances.
+        write_timeout_ms:
+          type: integer
+          default: 5000
+          minimum: 100
+          maximum: 60000
+          description: >-
+            Bound covering batch write/flush progress on an established socket.
+            On timeout the complete connection (writer and drain task) is
+            invalidated before retry/reconnect. Delivery is at-least-once.
         batch_size:
           type: integer
           default: 50
+          minimum: 1
+          maximum: 10000
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
@@ -11459,15 +11491,37 @@ components:
         max_retries:
           type: integer
           default: 3
+          minimum: 0
+          maximum: 10
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 1000
+          minimum: 1
+          maximum: 60000
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
-          description: Channel capacity — new entries are dropped when full
+          minimum: 1
+          maximum: 1000000
+          description: >-
+            Channel slot capacity. Hot-path hooks reserve a slot before
+            serialization; new entries are dropped when full.
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: Maximum serialized size of one admitted log record
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 1024
+          maximum: 268435456
+          description: >-
+            Aggregate retained-byte budget across queued records. Must be
+            greater than or equal to max_entry_bytes.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -11480,7 +11534,9 @@ components:
             `ws_logging` opts into the WebSocket-disconnect capability, the
             named schema is recompiled under that capability at resolve time, so
             the WebSocket-disconnect native fields (`event`,
-            `frames_client_to_backend`, `frames_backend_to_client`, `direction`,
+            `frames_client_to_backend`, `frames_backend_to_client`,
+            `bytes_client_to_backend`, `bytes_backend_to_client`,
+            `timestamp_connected`, `timestamp_disconnected`, `direction`,
             `io_side`, …) are available in addition to the shared HTTP fields.
             See docs/log_schema.md.
 
