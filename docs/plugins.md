@@ -1197,8 +1197,9 @@ Tracks per-consumer API usage charges across three independent pricing
 dimensions:
 
 1. **Per-call pricing** (`pricing_tiers`) — HTTP-family only (HTTP/1.1, H2, H3,
-   gRPC, WebSocket upgrades). Charges a flat fee per call keyed by response
-   status code.
+   gRPC, WebSocket upgrades). Charges a flat fee per call keyed by the ordinary
+   wire HTTP status, except native gRPC and translated gRPC-Web use the final
+   client-visible `grpc-status` mapped to an effective HTTP status.
 2. **Bandwidth pricing** (`bandwidth_pricing`) — applies to both HTTP-family
    and stream proxies (TCP, TCP+TLS, UDP, DTLS). Charges per byte using the
    unified gateway-perspective `bytes_sent` (client→backend) and
@@ -1220,15 +1221,22 @@ integration.
 Only transactions with an identified consumer (gateway Consumer or external
 authenticated identity) are charged — anonymous traffic is not tracked. For
 HTTP, status codes not listed in any pricing tier still record bandwidth (when
-configured) but no per-call charge.
+configured) but no per-call charge. For gRPC/gRPC-Web, the canonical billing
+mapping is `0→200`, `1→499`, `2→500`, `3→400`, `4→504`, `5→404`, `6→409`,
+`7→403`, `8→429`, `9→400`, `10→409`, `11→400`, `12→501`, `13→500`,
+`14→503`, `15→500`, and `16→401`; unknown, missing, or malformed terminal
+codes map to `500`. This uses finalized gateway/backend response state, never
+client request metadata. The mapped status is the `status_code` label and
+`by_status` key in charge output; the wire HTTP status remains separately
+available in transaction logs.
 
 **Priority:** 9350
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion. Scoped per plugin instance: each `api_chargeback` instance (global/proxy/proxy_group scope) stamps its own currency onto the charges it records and emits it per row, so instances with different currencies do not overwrite one another |
-| `pricing_tiers` | Array | _(optional)_ | Per-call HTTP-family pricing. Each tier maps a set of status codes to a per-call price |
-| `pricing_tiers[].status_codes` | Array\<Integer\> | _(required inside a tier)_ | HTTP status codes that trigger this tier's charge. A status code must appear in exactly one tier |
+| `pricing_tiers` | Array | _(optional)_ | Per-call HTTP-family pricing. Each tier maps ordinary HTTP status codes or canonical effective gRPC status mappings to a per-call price |
+| `pricing_tiers[].status_codes` | Array\<Integer\> | _(required inside a tier)_ | Billable status codes that trigger this tier's charge. Native gRPC and gRPC-Web terminal codes use the documented effective-HTTP mapping. A status code must appear in exactly one tier |
 | `pricing_tiers[].price_per_call` | Number | _(required inside a tier)_ | Charge per HTTP call (e.g. `0.00001`). Must be non-negative |
 | `bandwidth_pricing` | Object | _(optional)_ | Bandwidth pricing block. Applies to HTTP-family and stream transactions |
 | `bandwidth_pricing.price_per_byte_sent` | Number | `0.0` | Per-byte charge for bytes flowed client→backend. Must be non-negative |
@@ -1247,8 +1255,8 @@ authentication policy.
 
 | Query Parameter | Description |
 |---|---|
-| _(none)_ | Prometheus text exposition format. Counter families: `ferrum_api_chargeable_calls_total` and `ferrum_api_charges_total` (HTTP per-call counts and charges, status-code labelled); `ferrum_api_stream_connections_total` and `ferrum_api_stream_connection_charges_total` (stream session counts and per-session charges); `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` (bandwidth byte counters aggregated per `consumer`/`proxy_id`/`currency`/`protocol_family`); and `ferrum_api_bandwidth_charges_total` (bandwidth charges, with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`). All metrics include `currency` and `namespace` labels |
-| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries its `currency`, a `protocol_family` (`http`, `stream`, or `mixed` when one `proxy_id` carries both), per-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and a `stream` block (session counts + per-connection charges) whenever the proxy recorded stream activity — so a `mixed` proxy shows both `by_status` and `stream` and the breakdown reconciles with the totals. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree. Consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges` |
+| _(none)_ | Prometheus text exposition format. Counter families: `ferrum_api_chargeable_calls_total` and `ferrum_api_charges_total` (HTTP-family per-call counts and charges, labelled by billable status: wire status for ordinary HTTP and canonical effective status for gRPC/gRPC-Web); `ferrum_api_stream_connections_total` and `ferrum_api_stream_connection_charges_total` (stream session counts and per-session charges); `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` (bandwidth byte counters aggregated per `consumer`/`proxy_id`/`currency`/`protocol_family`); and `ferrum_api_bandwidth_charges_total` (bandwidth charges, with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`). All metrics include `currency` and `namespace` labels |
+| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries its `currency`, a `protocol_family` (`http`, `stream`, or `mixed` when one `proxy_id` carries both), per-billable-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and a `stream` block (session counts + per-connection charges) whenever the proxy recorded stream activity — so a `mixed` proxy shows both `by_status` and `stream` and the breakdown reconciles with the totals. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree. Consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges` |
 
 **Multi-node deployments (CP/DP):** Each gateway node (DP) accumulates charges
 independently in memory. In CP/DP topologies, the CP does not proxy traffic and
@@ -1317,6 +1325,10 @@ transaction-level provenance, snapshot mode for lower ingest volume, an on-disk
 spool for ClickHouse outages, `GET /charges/sink/status`, and Prometheus metrics
 under `/metrics`. See [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md)
 for DDL, configuration, spool sizing, replay, and reconciliation guidance.
+Ordinary HTTP is priced by wire status. Native gRPC and translated gRPC-Web use
+the same canonical effective-status mapping documented for `api_chargeback`;
+durable events retain the billable `status_code`, raw `http_status_code`, and
+normalized final `grpc_status` as separate fields.
 
 **Priority:** 9351
 
