@@ -477,11 +477,12 @@ async fn test_udp_logging_rejects_dtls_only_fields_unless_dtls_true() {
             "shared validation {config} got: {err}"
         );
         if let Some(object) = config.as_object() {
-            let err = ferrum_edge::_test_support::udp_logging_validate_dtls_file_dependencies_for_test(
-                object,
-            )
-            .err()
-            .unwrap_or_else(|| panic!("file-deps validation must reject {config}"));
+            let err =
+                ferrum_edge::_test_support::udp_logging_validate_dtls_file_dependencies_for_test(
+                    object,
+                )
+                .err()
+                .unwrap_or_else(|| panic!("file-deps validation must reject {config}"));
             assert!(
                 err.contains("requires dtls: true"),
                 "file-deps {config} got: {err}"
@@ -1076,7 +1077,10 @@ async fn test_udp_logging_dtls_dns_address_change_rebuilds_association() {
     )
     .await;
     let generation_a = plugin.sender_generation_for_test();
-    assert!(generation_a >= 1, "initial DTLS association must install a sender");
+    assert!(
+        generation_a >= 1,
+        "initial DTLS association must install a sender"
+    );
 
     plugin.set_next_resolve_addr_for_test(addr_b);
     plugin.age_last_resolve_for_test(Duration::from_secs(61));
@@ -1309,8 +1313,7 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
         .await
         .expect_err("send after close must fail");
     assert!(
-        closed_err.to_string().contains("closed")
-            || closed_err.to_string().contains("DTLS"),
+        closed_err.to_string().contains("closed") || closed_err.to_string().contains("DTLS"),
         "close/cancel failure must propagate: {closed_err}"
     );
 
@@ -1332,7 +1335,8 @@ fn test_udp_logging_dtls_loss_and_reset_classification() {
         "DTLS send timeout is a transport failure and must reset the sender"
     );
     assert!(
-        ferrum_edge::_test_support::udp_logging_local_dtls_size_rejection_preserves_sender_for_test(),
+        ferrum_edge::_test_support::udp_logging_local_dtls_size_rejection_preserves_sender_for_test(
+        ),
         "deterministic local size rejection must preserve the sender"
     );
     assert!(
