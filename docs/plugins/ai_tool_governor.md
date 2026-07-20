@@ -191,10 +191,12 @@ Argument checks (`max_arg_bytes`, `required_args`, `json_schema`,
 `allow`/`require_approval`, and is **redacted** under `redact_args` (buffered
 path). A `redact_args` policy must configure at least one
 `blocked_arg_patterns` entry; an empty redaction policy is rejected rather than
-silently turning the tool into an allowlist entry. Regexes that match the empty
-string (zero-width) are rejected at config load, pattern lists are capped at 32
-entries per tool, `response.redaction_placeholder` is capped at 256 bytes, and
-redacted output cannot grow past the 4 MiB inspectable body limit. On paths
+silently turning the tool into an allowlist entry. Regexes that match empty
+input are rejected at config load; a contextual zero-length match that can
+occur only beside non-empty input also fails closed at runtime. Pattern lists
+are capped at 32 entries per tool, `response.redaction_placeholder` is capped
+at 256 bytes, and every append is checked before allocation so redacted output
+cannot grow past the 4 MiB inspectable body limit. On paths
 where arguments cannot be redacted in place — the **streaming** path, the
 **request** body (no request-body transform), and the post-transform **final
 response** re-check — a `redact_args` match fails closed rather than forwarding

@@ -18404,8 +18404,8 @@ components:
                     regex:
                       type: string
                       minLength: 1
-                      description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted. Patterns that match the empty string (zero-width) are rejected at config load because replace_all would amplify argument bytes without bound."
-                description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args. At most 32 patterns per tool; redacted output is capped at the 4 MiB inspectable body limit."
+                      description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted. Patterns that match empty input are rejected at config load; contextual zero-length matches fail closed at runtime."
+                description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args. At most 32 patterns per tool; every append is checked before allocation and redacted output is capped at the 4 MiB inspectable body limit."
               json_schema:
                 type: object
                 description: "JSON Schema (validated with the jsonschema crate) the parsed arguments must satisfy, else deny. Intentionally open — arbitrary JSON Schema keywords are allowed; do not set additionalProperties: false here."

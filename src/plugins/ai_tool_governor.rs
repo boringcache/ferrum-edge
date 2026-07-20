@@ -4796,11 +4796,12 @@ fn redacted_approval_url(parsed: &Url) -> String {
 }
 
 /// Replace each blocked-pattern match in a raw arguments string with the
-/// rendered redaction placeholder. `NoExpand` keeps `$`-sequences literal.
-/// Apply every blocked-argument pattern, failing closed when the redacted
-/// output would exceed [`MAX_PARSE_BYTES`]. Zero-width-matching patterns are
-/// rejected at config load; this bound is the runtime backstop against
-/// amplification from long placeholders or sequential pattern expansion.
+/// rendered redaction placeholder. Apply every blocked-argument pattern while
+/// checking each append before allocation, failing closed when the redacted
+/// output would exceed [`MAX_PARSE_BYTES`]. Patterns that match empty input are
+/// rejected at config load; the per-match zero-width check also catches
+/// contextual assertions (for example `\b`) that can match an empty span only
+/// beside non-empty input.
 fn redact_arguments(
     args: &str,
     patterns: &[BlockedArgPattern],
@@ -4811,25 +4812,55 @@ fn redact_arguments(
     }
     let mut result = args.to_string();
     for pattern in patterns {
-        // Defense in depth: config admission rejects these, but never amplify
-        // on a pattern that matches the empty string.
+        // Defense in depth: config admission rejects patterns that match empty
+        // input. Contextual assertions can still produce a zero-length match
+        // only beside non-empty input, so reject those spans below as well.
         if pattern.regex.is_match("") {
             return Err(());
         }
-        let rendered = placeholder.replace("{name}", &pattern.name);
-        if rendered.len() > MAX_PARSE_BYTES {
-            return Err(());
+        let rendered = render_redaction_placeholder(placeholder, &pattern.name)?;
+        let mut matches = pattern.regex.find_iter(&result);
+        let Some(first_match) = matches.next() else {
+            continue;
+        };
+        let mut replaced = String::with_capacity(result.len());
+        let mut cursor = 0;
+        for matched in std::iter::once(first_match).chain(matches) {
+            if matched.start() == matched.end() {
+                return Err(());
+            }
+            push_redaction_bytes(&mut replaced, &result[cursor..matched.start()])?;
+            push_redaction_bytes(&mut replaced, &rendered)?;
+            cursor = matched.end();
         }
-        let replaced = pattern
-            .regex
-            .replace_all(&result, regex::NoExpand(rendered.as_str()));
-        if replaced.len() > MAX_PARSE_BYTES {
-            return Err(());
-        }
-        result = replaced.into_owned();
+        push_redaction_bytes(&mut replaced, &result[cursor..])?;
+        result = replaced;
     }
     let changed = result != args;
     Ok((result, changed))
+}
+
+/// Render `{name}` without allowing an unbounded intermediate allocation from
+/// an operator-supplied pattern name.
+fn render_redaction_placeholder(placeholder: &str, name: &str) -> Result<String, ()> {
+    let mut rendered = String::with_capacity(placeholder.len());
+    let mut cursor = 0;
+    for (start, token) in placeholder.match_indices("{name}") {
+        push_redaction_bytes(&mut rendered, &placeholder[cursor..start])?;
+        push_redaction_bytes(&mut rendered, name)?;
+        cursor = start + token.len();
+    }
+    push_redaction_bytes(&mut rendered, &placeholder[cursor..])?;
+    Ok(rendered)
+}
+
+fn push_redaction_bytes(output: &mut String, value: &str) -> Result<(), ()> {
+    let next_len = output.len().checked_add(value.len()).ok_or(())?;
+    if next_len > MAX_PARSE_BYTES {
+        return Err(());
+    }
+    output.push_str(value);
+    Ok(())
 }
 
 /// Borrow the leading `max_bytes` bytes of `s`, snapped down to a char boundary

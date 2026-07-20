@@ -8373,6 +8373,29 @@ fn rejects_zero_width_redaction_regex_and_oversized_placeholder() {
     assert!(err.contains("at most 32"));
 }
 
+#[tokio::test]
+async fn contextual_zero_length_redaction_match_fails_closed() {
+    // A word boundary does not match empty input, but it does yield empty spans
+    // beside words. Runtime construction must reject the span before appending
+    // any placeholder bytes rather than amplifying the response.
+    let plugin = make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "boundary", "regex": "\\b" }]
+            }
+        }
+    }));
+    let body = response_with_tool_call("search", r#"{"query":"secret"}"#);
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
 #[test]
 fn rejects_oversized_approval_timeout() {
     let err = try_make(json!({
