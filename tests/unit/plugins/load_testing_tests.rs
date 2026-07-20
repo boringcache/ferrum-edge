@@ -361,10 +361,7 @@ fn test_gateway_addresses_shape_validation() {
     let err = LoadTesting::new(&empty_entry, PluginHttpClient::default())
         .err()
         .expect("empty gateway address entry must fail");
-    assert!(
-        err.contains("entries must not be empty"),
-        "got: {err}"
-    );
+    assert!(err.contains("entries must not be empty"), "got: {err}");
 
     let not_array = json!({
         "key": VALID_KEY,
