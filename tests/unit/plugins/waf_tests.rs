@@ -1550,16 +1550,17 @@ async fn enforcing_waf_fails_closed_on_unbounded_event_stream() {
     }))
     .unwrap();
     let mut ctx = ctx("GET", "/events");
-    let mut response_headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
 
     assert!(matches!(
         plugin
             .after_proxy(&mut ctx, 200, &mut response_headers)
             .await,
-        PluginResult::Reject { status_code: 403, .. }
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
     ));
     assert_eq!(
         ctx.metadata.get("waf.block_reason").map(String::as_str),
@@ -1587,10 +1588,8 @@ async fn explicit_skip_allows_unbounded_event_stream_with_metadata() {
     }))
     .unwrap();
     let mut ctx = ctx("GET", "/events");
-    let mut response_headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
 
     assert!(matches!(
         plugin
@@ -1630,10 +1629,8 @@ async fn monitor_only_waf_allows_unbounded_event_stream_with_metadata() {
     }))
     .unwrap();
     let mut ctx = ctx("GET", "/events");
-    let mut response_headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
 
     assert!(matches!(
         plugin

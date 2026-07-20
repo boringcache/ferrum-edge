@@ -24,9 +24,7 @@ use tracing::debug;
 use super::utils::size_limit::{
     SizeLimiter, content_length_over_limit, reject_with_limit, required_positive_u64,
 };
-use super::utils::sse::{
-    is_text_event_stream_media_type, original_response_is_event_stream,
-};
+use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct ResponseSizeLimiting {

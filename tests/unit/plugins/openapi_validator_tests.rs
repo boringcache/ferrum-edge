@@ -373,12 +373,7 @@ async fn response_sse_intent_is_conservative_and_genuine_stream_fails_closed() {
         200,
         &response_headers,
     ));
-    assert!(plugin.should_buffer_response_body_for_content_type(
-        &ctx,
-        None,
-        200,
-        &HashMap::new(),
-    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new(),));
     assert!(plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("application/json; profile=event-stream"),
@@ -386,7 +381,9 @@ async fn response_sse_intent_is_conservative_and_genuine_stream_fails_closed() {
         &HashMap::new(),
     ));
     assert_reject(
-        plugin.after_proxy(&mut ctx, 200, &mut response_headers).await,
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
         Some(502),
     );
     assert_eq!(

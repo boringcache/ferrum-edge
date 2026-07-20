@@ -248,22 +248,15 @@ async fn test_sse_request_intent_cannot_skip_strict_response_limit() {
         .insert("accept".to_string(), "text/event-stream".to_string());
 
     assert!(plugin.should_buffer_response_body(&ctx));
-    let response_headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     assert!(!plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("text/event-stream"),
         200,
         &response_headers,
     ));
-    assert!(plugin.should_buffer_response_body_for_content_type(
-        &ctx,
-        None,
-        200,
-        &HashMap::new(),
-    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new(),));
     assert!(plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("application/json; profile=event-stream"),
@@ -326,10 +319,8 @@ async fn test_genuine_sse_fails_closed_at_strict_route_limit() {
         ResponseSizeLimiting::new(&json!({"max_bytes": 1024, "require_buffered_check": true}))
             .unwrap();
     let mut ctx = make_ctx();
-    let mut headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
 
     match plugin.after_proxy(&mut ctx, 200, &mut headers).await {
         PluginResult::Reject {

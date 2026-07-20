@@ -36,9 +36,7 @@ use self::scan::ScanOutcome;
 use self::stream::{
     StreamWafConfig, TLS_CLIENT_HELLO_MIN_PREFIX, looks_like_tls_client_hello, parse_stream_config,
 };
-use super::utils::sse::{
-    is_text_event_stream_media_type, original_response_is_event_stream,
-};
+use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
     StreamBytesKind, StreamConnectionContext, UdpDatagramContext, UdpDatagramDirection,
@@ -165,10 +163,7 @@ impl Waf {
         if should_block {
             if self.config.log_to_metadata {
                 ctx.set_waf_metadata("waf.action", "blocked");
-                ctx.set_waf_metadata_if_absent(
-                    "waf.block_reason",
-                    "unbounded_response_stream",
-                );
+                ctx.set_waf_metadata_if_absent("waf.block_reason", "unbounded_response_stream");
             }
             return self.reject();
         }
@@ -1092,8 +1087,7 @@ impl Plugin for Waf {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        self.requires_response_body_buffering()
-            && !self.exemptions.request_short_circuits(ctx)
+        self.requires_response_body_buffering() && !self.exemptions.request_short_circuits(ctx)
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {

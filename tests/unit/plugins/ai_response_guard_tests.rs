@@ -787,13 +787,13 @@ async fn test_event_stream_fails_closed_before_ai_guard_delivery() {
     let mut ctx = ctx_with_content_type("POST", "application/json");
     ctx.headers
         .insert("accept".to_string(), "text/event-stream".to_string());
-    let mut response_headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
 
     assert!(matches!(
-        plugin.after_proxy(&mut ctx, 200, &mut response_headers).await,
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
         PluginResult::Reject {
             status_code: 502,
             ..
@@ -814,13 +814,13 @@ async fn test_warn_only_event_stream_records_uninspectable_and_continues() {
         "action": "warn"
     }));
     let mut ctx = ctx_with_content_type("POST", "application/json");
-    let mut response_headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
 
     assert!(matches!(
-        plugin.after_proxy(&mut ctx, 200, &mut response_headers).await,
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
         PluginResult::Continue
     ));
     assert_eq!(
@@ -846,10 +846,8 @@ async fn test_pristine_event_stream_relabel_still_fails_closed() {
         "ferrum:original_response_content_type".to_string(),
         "text/event-stream".to_string(),
     );
-    let mut relabeled_headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/json".to_string(),
-    )]);
+    let mut relabeled_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     assert!(matches!(
         plugin

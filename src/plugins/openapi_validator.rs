@@ -18,9 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
 
-use super::utils::sse::{
-    is_text_event_stream_media_type, original_response_is_event_stream,
-};
+use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;

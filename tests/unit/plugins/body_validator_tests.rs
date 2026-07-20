@@ -2369,22 +2369,15 @@ fn test_sse_request_intent_cannot_skip_response_validation_buffering() {
         .insert("accept".to_string(), "text/event-stream".to_string());
 
     assert!(plugin.should_buffer_response_body(&ctx));
-    let response_headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     assert!(!plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("text/event-stream"),
         200,
         &response_headers,
     ));
-    assert!(plugin.should_buffer_response_body_for_content_type(
-        &ctx,
-        None,
-        200,
-        &HashMap::new(),
-    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new(),));
     assert!(plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("application/json; profile=event-stream"),
@@ -2404,13 +2397,13 @@ async fn test_genuine_sse_fails_closed_before_body_validation_streams() {
         "GET".to_string(),
         "/events".to_string(),
     );
-    let mut response_headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
 
     assert_reject(
-        plugin.after_proxy(&mut ctx, 200, &mut response_headers).await,
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
         Some(502),
     );
 }
@@ -2434,10 +2427,8 @@ async fn test_pristine_sse_relabel_cannot_erase_body_validation_boundary() {
         "ferrum:original_response_content_type".to_string(),
         "text/event-stream".to_string(),
     );
-    let mut relabeled_headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/json".to_string(),
-    )]);
+    let mut relabeled_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     assert_reject(
         plugin

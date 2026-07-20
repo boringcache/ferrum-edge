@@ -1207,7 +1207,10 @@ async fn strict_route_response_limit_rejects_unknown_length_json_despite_sse_acc
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = response.text().await.expect("read rejection body");
     assert!(body.contains("Response body too large"), "body={body:?}");
-    assert!(body.contains("32"), "route limit must be reported: {body:?}");
+    assert!(
+        body.contains("32"),
+        "route limit must be reported: {body:?}"
+    );
 
     assert_eq!(backend.received_requests().await.len(), 1);
     backend.assert_no_matcher_mismatches().await;

@@ -19,9 +19,7 @@ use std::collections::HashMap;
 use std::io::Read as _;
 use tracing::debug;
 
-use super::utils::sse::{
-    is_text_event_stream_media_type, original_response_is_event_stream,
-};
+use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{Plugin, PluginResult, RequestContext};
 
 /// Per-method message type descriptors for protobuf validation.

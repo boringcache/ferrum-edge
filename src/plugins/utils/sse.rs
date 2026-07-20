@@ -738,10 +738,7 @@ fn index_field(value: &Value, field: &str) -> Option<usize> {
 fn accept_includes_event_stream(accept: &str) -> bool {
     accept.split(',').any(|media_range| {
         let mut parts = media_range.split(';');
-        if !parts
-            .next()
-            .is_some_and(is_text_event_stream_media_type)
-        {
+        if !parts.next().is_some_and(is_text_event_stream_media_type) {
             return false;
         }
 
@@ -787,8 +784,7 @@ fn quality_value_is_positive(value: &str) -> bool {
             && fraction.bytes().any(|byte| byte != b'0');
     }
     if let Some(fraction) = value.strip_prefix("1.") {
-        return fraction.len() <= 3
-            && fraction.bytes().all(|byte| byte == b'0');
+        return fraction.len() <= 3 && fraction.bytes().all(|byte| byte == b'0');
     }
     false
 }
@@ -866,10 +862,8 @@ mod tests {
             crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
             "text/event-stream; charset=utf-8".to_string(),
         );
-        let live_headers = HashMap::from([(
-            "content-type".to_string(),
-            "application/json".to_string(),
-        )]);
+        let live_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
         assert!(original_response_is_event_stream(&ctx, &live_headers));
     }
 
@@ -880,10 +874,8 @@ mod tests {
             crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY.to_string(),
             "true".to_string(),
         );
-        let live_headers = HashMap::from([(
-            "content-type".to_string(),
-            "text/event-stream".to_string(),
-        )]);
+        let live_headers =
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
         assert!(!original_response_is_event_stream(&ctx, &live_headers));
     }
 
@@ -898,10 +890,8 @@ mod tests {
             crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
             "application/event-stream+json".to_string(),
         );
-        let live_headers = HashMap::from([(
-            "content-type".to_string(),
-            "text/event-stream".to_string(),
-        )]);
+        let live_headers =
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
         assert!(!original_response_is_event_stream(&ctx, &live_headers));
     }
 
