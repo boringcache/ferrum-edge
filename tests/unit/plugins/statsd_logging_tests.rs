@@ -1,8 +1,13 @@
 //! Tests for statsd_logging plugin
 
+use chrono::Utc;
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
+use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, StreamTransactionSummary,
-    statsd_logging::StatsdLogging,
+    ALL_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
+    StreamTransactionSummary, plugin_failure_policy,
+    statsd_logging::{STATSD_LOGGING_CONFIG_KEYS, StatsdLogging},
+    validate_plugin_config,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -268,7 +273,13 @@ async fn test_statsd_logging_accepts_all_config_options() {
             "global_tags": {"env": "staging", "dc": "us-west-2"},
             "flush_interval_ms": 1000,
             "buffer_capacity": 50000,
-            "max_batch_lines": 100
+            "max_batch_lines": 100,
+            "max_retries": 2,
+            "retry_delay_ms": 25,
+            "schema": {
+                "summary_type": "both",
+                "rename": { "proxy_id": "route_id" }
+            }
         }),
         default_client(),
     )
@@ -340,4 +351,233 @@ async fn test_statsd_logging_accepts_unsupported_schema_keys_with_warning() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "statsd_logging");
+}
+
+#[tokio::test]
+async fn test_statsd_logging_rejects_one_character_misspellings_of_every_key() {
+    assert_eq!(
+        plugin_failure_policy("statsd_logging"),
+        Some(PluginFailurePolicy::OptionalFailOpen)
+    );
+
+    let typos = [
+        ("host", "hos"),
+        ("port", "prot"),
+        ("prefix", "prefx"),
+        ("global_tags", "global_tgas"),
+        ("flush_interval_ms", "flush_interval_m"),
+        ("buffer_capacity", "buffer_capacit"),
+        ("max_batch_lines", "max_batch_line"),
+        ("max_retries", "max_retrie"),
+        ("retry_delay_ms", "retry_delay_m"),
+        ("schema", "schemaa"),
+        ("schema_ref", "schema_reff"),
+    ];
+    assert_eq!(
+        typos.len(),
+        STATSD_LOGGING_CONFIG_KEYS.len(),
+        "every recognized key needs a one-character misspelling case"
+    );
+
+    for (canonical, typo) in typos {
+        assert!(
+            STATSD_LOGGING_CONFIG_KEYS.contains(&canonical),
+            "typo fixture must target a recognized key: {canonical}"
+        );
+        let mut config = json!({"host": "statsd.example.test"});
+        config
+            .as_object_mut()
+            .unwrap()
+            .insert(typo.to_string(), json!(1));
+        let err = StatsdLogging::new(&config, default_client())
+            .err()
+            .unwrap_or_else(|| panic!("expected unknown-key rejection for {typo}"));
+        assert!(
+            err.contains("unknown configuration key"),
+            "got: {err}"
+        );
+        assert!(err.contains(typo), "error must name the typo key: {err}");
+        assert!(
+            err.contains("allowed keys"),
+            "error must list the allowed-key contract: {err}"
+        );
+        for key in STATSD_LOGGING_CONFIG_KEYS {
+            assert!(err.contains(key), "missing allowed key {key} in: {err}");
+        }
+
+        let shared = validate_plugin_config("statsd_logging", &config)
+            .expect_err("shared admission must reject the same typo");
+        assert!(shared.contains(typo), "got: {shared}");
+    }
+}
+
+#[tokio::test]
+async fn test_statsd_logging_rejects_multiple_unknown_keys_with_sorted_names() {
+    let err = StatsdLogging::new(
+        &json!({
+            "host": "statsd.example.test",
+            "zzz_extra": true,
+            "aaa_extra": false
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("multiple unknown keys must be rejected");
+    assert!(err.contains("aaa_extra"), "got: {err}");
+    assert!(err.contains("zzz_extra"), "got: {err}");
+    let aaa = err.find("aaa_extra").expect("aaa_extra present");
+    let zzz = err.find("zzz_extra").expect("zzz_extra present");
+    assert!(aaa < zzz, "unknown keys should be sorted in the error: {err}");
+}
+
+#[tokio::test]
+async fn test_statsd_logging_valid_complete_config_and_open_global_tags_map() {
+    let config = json!({
+        "host": "statsd.example.test",
+        "port": 9125,
+        "prefix": "edge.prod",
+        "global_tags": {
+            "env": "prod",
+            "region": "us-east-1",
+            "custom_dimension": "ok"
+        },
+        "flush_interval_ms": 250,
+        "buffer_capacity": 2048,
+        "max_batch_lines": 10,
+        "max_retries": 1,
+        "retry_delay_ms": 5,
+        "schema": {
+            "summary_type": "stream",
+            "omit": ["disconnect_cause"]
+        }
+    });
+    assert!(StatsdLogging::new(&config, default_client()).is_ok());
+    assert!(validate_plugin_config("statsd_logging", &config).is_ok());
+}
+
+#[test]
+fn test_statsd_logging_disabled_config_skips_construction_validation() {
+    let mut gateway = GatewayConfig {
+        plugin_configs: vec![PluginConfig {
+            id: "statsd-disabled".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "statsd_logging".to_string(),
+            config: json!({"prot": 9125}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: false,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }],
+        ..GatewayConfig::default()
+    };
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+    ferrum_edge::_test_support::validate_plugin_configs_fatal_for_test(&mut gateway, &policy)
+        .expect("disabled statsd_logging must skip unknown-key validation");
+}
+
+#[test]
+fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebuild() {
+    use ferrum_edge::config::types::Proxy;
+
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "p1",
+        "listen_path": "/api",
+        "backend_host": "localhost",
+        "backend_port": 3000,
+        "backend_scheme": "http"
+    }))
+    .expect("minimal proxy deserializes");
+
+    let bad_plugin = PluginConfig {
+        id: "statsd-typo".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "statsd_logging".to_string(),
+        config: json!({"host": "statsd.example.test", "prot": 9125}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let mut bad_gateway = GatewayConfig {
+        proxies: vec![proxy.clone()],
+        plugin_configs: vec![bad_plugin.clone()],
+        ..GatewayConfig::default()
+    };
+    ferrum_edge::_test_support::validate_plugin_configs_fatal_for_test(&mut bad_gateway, &policy)
+        .expect("OptionalFailOpen statsd typos warn but do not abort file-mode load");
+
+    let omitted = PluginCache::new(&bad_gateway)
+        .expect("cache construction must omit the failed optional statsd plugin");
+    assert!(
+        omitted.get_plugins("p1").is_empty(),
+        "unknown-key statsd_logging must be omitted, not silently defaulted"
+    );
+
+    let valid_gateway = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![PluginConfig {
+            config: json!({"host": "statsd.example.test", "port": 9125}),
+            ..bad_plugin
+        }],
+        ..GatewayConfig::default()
+    };
+    let cache = PluginCache::new(&valid_gateway).expect("valid statsd config constructs");
+    assert_eq!(cache.get_plugins("p1").len(), 1);
+    assert_eq!(cache.get_plugins("p1")[0].name(), "statsd_logging");
+
+    cache
+        .rebuild(&bad_gateway)
+        .expect("OptionalFailOpen reload omits bad statsd rather than rejecting the generation");
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "reload with unknown keys must drop the previously published statsd instance"
+    );
+}
+
+#[test]
+fn test_statsd_metric_docs_inventory_and_byte_directions() {
+    let docs = include_str!("../../../docs/plugins.md");
+    let statsd_section = docs
+        .split("### `statsd_logging`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("statsd_logging section present in docs/plugins.md");
+
+    for needle in [
+        "request.client_disconnect",
+        "stream.disconnect",
+        "client→backend",
+        "backend→client",
+        "last-observation",
+        "idle_timeout",
+        "recv_error",
+        "backend_error",
+        "graceful_shutdown",
+        "client_to_backend",
+        "backend_to_client",
+        "max_retries",
+        "retry_delay_ms",
+        "OptionalFailOpen",
+        "#2555",
+    ] {
+        assert!(
+            statsd_section.contains(needle),
+            "statsd docs missing `{needle}`"
+        );
+    }
+    assert!(
+        !statsd_section.contains("Bytes sent to client"),
+        "reversed byte direction must not remain in the StatsD reference"
+    );
+    assert!(
+        !statsd_section.contains("Bytes received from client"),
+        "reversed byte direction must not remain in the StatsD reference"
+    );
 }

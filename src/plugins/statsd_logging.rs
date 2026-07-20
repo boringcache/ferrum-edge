@@ -27,6 +27,27 @@ use super::utils::{
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
 
+/// Authoritative closed set of top-level `statsd_logging` configuration keys.
+///
+/// Constructor admission, OpenAPI `StatsdLoggingConfig`, and operator docs must
+/// stay in lockstep with this list. Nested maps that are intentionally open
+/// (`global_tags` string values; inline `schema` shape validated by the shared
+/// log-schema compiler) are not flattened into this set — only the outer
+/// property names are closed.
+pub const STATSD_LOGGING_CONFIG_KEYS: &[&str] = &[
+    "buffer_capacity",
+    "flush_interval_ms",
+    "global_tags",
+    "host",
+    "max_batch_lines",
+    "max_retries",
+    "port",
+    "prefix",
+    "retry_delay_ms",
+    "schema",
+    "schema_ref",
+];
+
 /// Mapping from a default statsd tag key to its backing native field on
 /// [`TransactionSummary`]. Schema `rename` / `omit` consult the native
 /// column; tags without a native backing (e.g. `status_class`) are not
@@ -43,6 +64,23 @@ const STREAM_TAG_NATIVE: &[(&str, &str)] = &[
     ("cause", "disconnect_cause"),
     ("direction", "disconnect_direction"),
 ];
+
+fn reject_unknown_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), String> {
+    let mut unknown: Vec<&str> = config
+        .keys()
+        .filter(|key| !STATSD_LOGGING_CONFIG_KEYS.contains(&key.as_str()))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    Err(format!(
+        "statsd_logging: unknown configuration key(s): {}; allowed keys: {}",
+        unknown.join(", "),
+        STATSD_LOGGING_CONFIG_KEYS.join(", ")
+    ))
+}
 
 /// Emit a `warn!` for any inline `schema:` keys that the statsd
 /// emitter does not honor. Only `rename`, `omit`, and `summary_type`
@@ -209,9 +247,13 @@ pub struct StatsdLogging {
 
 impl StatsdLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("statsd_logging: config must be an object".to_string());
-        }
+        let Some(config_object) = config.as_object() else {
+            return Err(format!(
+                "statsd_logging: config must be an object; allowed keys: {}",
+                STATSD_LOGGING_CONFIG_KEYS.join(", ")
+            ));
+        };
+        reject_unknown_config_keys(config_object)?;
 
         let raw_host = config
             .get("host")
@@ -361,7 +403,7 @@ impl Plugin for StatsdLogging {
 }
 
 /// Format HTTP transaction metrics as StatsD line protocol.
-fn format_http_metrics(
+pub(crate) fn format_http_metrics(
     summary: &TransactionSummary,
     prefix: &str,
     global_tags: &str,
@@ -433,7 +475,7 @@ fn format_http_metrics(
 }
 
 /// Format stream transaction metrics as StatsD line protocol.
-fn format_stream_metrics(
+pub(crate) fn format_stream_metrics(
     summary: &StreamTransactionSummary,
     prefix: &str,
     global_tags: &str,
@@ -834,11 +876,144 @@ mod tests {
         assert!(buf.contains("method:POST"), "got: {buf}");
     }
 
+    #[test]
+    fn formatter_output_matches_documented_metric_inventory_and_byte_directions() {
+        // Docs/OpenAPI inventory parity for #2619: one HTTP disconnect plus both
+        // stream directions, including disconnect-family metrics/tags.
+        let docs = include_str!("../../docs/plugins.md");
+        let statsd_section = docs
+            .split("### `statsd_logging`")
+            .nth(1)
+            .and_then(|rest| rest.split("\n### `").next())
+            .expect("statsd_logging section present");
+        for needle in [
+            "request.client_disconnect",
+            "stream.disconnect",
+            "client→backend",
+            "backend→client",
+            "last-observation",
+            "recv_error",
+            "backend_error",
+            "client_to_backend",
+            "backend_to_client",
+        ] {
+            assert!(
+                statsd_section.contains(needle),
+                "statsd docs missing `{needle}`"
+            );
+        }
+
+        let mut http = http_summary("GET");
+        http.client_disconnected = true;
+        http.response_status_code = 499;
+        let mut http_buf = String::new();
+        format_http_metrics(&http, "ferrum", "", None, &mut http_buf);
+        assert!(
+            http_buf.contains("ferrum.request.client_disconnect:1|c"),
+            "got: {http_buf}"
+        );
+        assert!(http_buf.contains("ferrum.request.count:1|c"), "got: {http_buf}");
+        assert!(
+            http_buf.contains("ferrum.request.status.4xx:1|c"),
+            "got: {http_buf}"
+        );
+
+        let mut client_to_backend = stream_summary();
+        client_to_backend.bytes_sent = 111;
+        client_to_backend.bytes_received = 22;
+        client_to_backend.disconnect_direction =
+            Some(crate::plugins::Direction::ClientToBackend);
+        client_to_backend.disconnect_cause =
+            Some(crate::plugins::DisconnectCause::RecvError);
+        let mut stream_buf = String::new();
+        format_stream_metrics(&client_to_backend, "ferrum", "", None, &mut stream_buf);
+        assert!(
+            stream_buf.contains("ferrum.stream.bytes_sent:111|g"),
+            "got: {stream_buf}"
+        );
+        assert!(
+            stream_buf.contains("ferrum.stream.bytes_received:22|g"),
+            "got: {stream_buf}"
+        );
+        assert!(
+            stream_buf.contains("ferrum.stream.disconnect:1|c"),
+            "got: {stream_buf}"
+        );
+        assert!(stream_buf.contains("cause:recv_error"), "got: {stream_buf}");
+        assert!(
+            stream_buf.contains("direction:client_to_backend"),
+            "got: {stream_buf}"
+        );
+
+        let mut backend_to_client = stream_summary();
+        backend_to_client.bytes_sent = 7;
+        backend_to_client.bytes_received = 900;
+        backend_to_client.disconnect_direction =
+            Some(crate::plugins::Direction::BackendToClient);
+        backend_to_client.disconnect_cause =
+            Some(crate::plugins::DisconnectCause::BackendError);
+        let mut reverse_buf = String::new();
+        format_stream_metrics(&backend_to_client, "ferrum", "", None, &mut reverse_buf);
+        assert!(
+            reverse_buf.contains("ferrum.stream.bytes_sent:7|g"),
+            "got: {reverse_buf}"
+        );
+        assert!(
+            reverse_buf.contains("ferrum.stream.bytes_received:900|g"),
+            "got: {reverse_buf}"
+        );
+        assert!(
+            reverse_buf.contains("direction:backend_to_client"),
+            "got: {reverse_buf}"
+        );
+        assert!(
+            reverse_buf.contains("cause:backend_error"),
+            "got: {reverse_buf}"
+        );
+
+        let mut unknown = stream_summary();
+        unknown.disconnect_direction = None;
+        unknown.disconnect_cause = None;
+        let mut unknown_buf = String::new();
+        format_stream_metrics(&unknown, "ferrum", "", None, &mut unknown_buf);
+        assert!(unknown_buf.contains("cause:unknown"), "got: {unknown_buf}");
+        assert!(
+            unknown_buf.contains("direction:unknown"),
+            "got: {unknown_buf}"
+        );
+    }
+
     fn http_summary(method: &str) -> TransactionSummary {
         TransactionSummary {
             http_method: method.to_string(),
             response_status_code: 200,
             ..TransactionSummary::default()
+        }
+    }
+
+    fn stream_summary() -> StreamTransactionSummary {
+        StreamTransactionSummary {
+            namespace: "ferrum".to_string(),
+            proxy_id: "tcp-proxy-1".to_string(),
+            proxy_name: Some("TCP Test".to_string()),
+            client_ip: "127.0.0.1".to_string(),
+            consumer_username: None,
+            auth_method: None,
+            backend_target: "127.0.0.1:9000".to_string(),
+            backend_resolved_ip: None,
+            protocol: "tcp".to_string(),
+            listen_port: 8080,
+            duration_ms: 15.0,
+            bytes_sent: 128,
+            bytes_received: 256,
+            connection_error: None,
+            error_class: None,
+            disconnect_direction: None,
+            disconnect_cause: None,
+            timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
+            timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
+            sni_hostname: None,
+            metadata: std::collections::HashMap::new(),
         }
     }
 }
