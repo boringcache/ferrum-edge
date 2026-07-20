@@ -1026,6 +1026,202 @@ async fn test_ws_logging_application_frame_invalidates_and_reconnects() {
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 }
 
+#[tokio::test]
+async fn test_ws_logging_connect_timeout_against_silent_tls_peer() {
+    // WSS peer accepts TCP but withholds TLS handshake progress. The same
+    // connect_timeout_ms bound must cover the TLS phase; a later accept proves
+    // the delivery worker recovered enough to keep making queue progress.
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let endpoint = format!("wss://{addr}/logs");
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
+    let (retry_tx, retry_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        // First TCP accept: hold the socket open without speaking TLS.
+        let (stream1, _) = listener.accept().await.expect("accept #1");
+        let _ = first_tx.send(());
+        let hold = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream1);
+        });
+
+        // Second accept is the observable recovery signal: establishment timed
+        // out and the worker advanced into another connect attempt.
+        let (stream2, _) = listener.accept().await.expect("accept #2");
+        let _ = retry_tx.send(());
+        hold.abort();
+        drop(stream2);
+        // Absorb any further reconnect attempts without racing test teardown.
+        while listener.accept().await.is_ok() {}
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 1,
+            "retry_delay_ms": 50,
+            "reconnect_delay_ms": 50,
+            "connect_timeout_ms": 200,
+            "buffer_capacity": 16,
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+
+    plugin.log(&create_test_transaction_summary()).await;
+    await_within("silent TLS first accept", first_rx)
+        .await
+        .expect("TLS-silent peer never accepted TCP");
+    await_within("silent TLS retry accept after connect_timeout", retry_rx)
+        .await
+        .expect("worker did not retry after TLS-phase connect timeout");
+
+    // Another enqueue after bounded establishment failure proves the flush
+    // loop is still consuming the queue (not permanently wedged on TLS).
+    plugin.log(&create_test_transaction_summary()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    drop(plugin);
+    server.abort();
+}
+
+#[tokio::test]
+async fn test_ws_logging_binary_and_repeated_ack_generations() {
+    // Extend beyond a single Text acknowledgement: Binary then Text acks across
+    // reconnect generations, with a stale first socket kept alive server-side,
+    // then Ping/Pong + Close on the latest generation. Proves delivery keeps
+    // moving and control-frame ownership stays on the selected generation.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let endpoint = format!("ws://{addr}/logs");
+    let (gen2_tx, gen2_rx) = tokio::sync::oneshot::channel::<()>();
+    let (gen3_tx, gen3_rx) = tokio::sync::oneshot::channel::<()>();
+    let (pong_tx, pong_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        // Generation 1: Binary application ack. Keep the socket open so a hard
+        // TCP close cannot be mistaken for the invalidation signal.
+        let stale_gen1 = {
+            let (stream, _) = listener.accept().await.expect("accept #1");
+            let ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake #1");
+            let (mut sink, mut read) = ws.split();
+            let _ = read.next().await;
+            sink.send(Message::Binary(b"ack-bin".to_vec().into()))
+                .await
+                .expect("send Binary ack");
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(sink);
+                drop(read);
+            })
+        };
+
+        // Generation 2: Text ack on the next reconnect generation.
+        let stale_gen2 = {
+            let (stream, _) = listener.accept().await.expect("accept #2");
+            let _ = gen2_tx.send(());
+            let ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake #2");
+            let (mut sink, mut read) = ws.split();
+            let _ = read.next().await;
+            sink.send(Message::Text("ack-text".into()))
+                .await
+                .expect("send Text ack");
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(sink);
+                drop(read);
+            })
+        };
+
+        // Generation 3: fresh drain must answer Ping and observe Close.
+        {
+            let (stream, _) = listener.accept().await.expect("accept #3");
+            let _ = gen3_tx.send(());
+            let ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake #3");
+            let (mut sink, mut read) = ws.split();
+            let _ = read.next().await;
+            sink.send(Message::Ping(b"gen3-alive".to_vec().into()))
+                .await
+                .expect("send Ping on gen3");
+            let mut saw_pong = false;
+            while let Some(msg) = read.next().await {
+                match msg {
+                    Ok(Message::Pong(data)) if !saw_pong => {
+                        let _ = pong_tx.send(data.to_vec());
+                        saw_pong = true;
+                        let _ = sink.send(Message::Close(None)).await;
+                    }
+                    Ok(Message::Close(_)) | Err(_) => {
+                        let _ = close_tx.send(());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        stale_gen1.abort();
+        stale_gen2.abort();
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 2,
+            "retry_delay_ms": 50,
+            "reconnect_delay_ms": 50,
+            "buffer_capacity": 32,
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+
+    // Establish gen1 (Binary ack), then pump until gen2 appears.
+    plugin.log(&create_test_transaction_summary()).await;
+    for _ in 0..6 {
+        plugin.log(&create_test_transaction_summary()).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    await_within("reconnect generation #2 after Binary ack", gen2_rx)
+        .await
+        .expect("plugin did not reconnect after Binary acknowledgement");
+
+    // Pump again across the Text-ack invalidation until gen3 appears.
+    for _ in 0..6 {
+        plugin.log(&create_test_transaction_summary()).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    await_within("reconnect generation #3 after repeated acks", gen3_rx)
+        .await
+        .expect("plugin stopped delivering across repeated ack generations");
+
+    let pong = await_within("Pong on generation #3", pong_rx)
+        .await
+        .expect("latest generation did not answer Ping");
+    assert_eq!(pong, b"gen3-alive");
+    await_within("Close observed on generation #3", close_rx)
+        .await
+        .expect("latest generation did not observe server Close");
+
+    drop(plugin);
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_ws_logging_diagnostics_redact_endpoint_path_and_query() {
     let writer = SharedWriter::default();
