@@ -11378,7 +11378,26 @@ components:
           default: 10000
           minimum: 1
           maximum: 100000
-          description: "Ferrum userspace channel capacity — new entries are dropped when full. Hard maximum 100000."
+          description: "Ferrum userspace channel capacity (record count). Zero is rejected. A channel slot is reserved before serialization. Hard maximum 100000."
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1
+          maximum: 1048576
+          description: >-
+            Maximum retained bytes for one pre-serialized Kafka payload plus its
+            optional partition key. Oversized entries are dropped before enqueue.
+            Hard maximum 1048576.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 1
+          maximum: 268435456
+          description: >-
+            Aggregate Ferrum retained-content byte budget across queued
+            pre-serialized records awaiting librdkafka admission. Must be at
+            least max_entry_bytes. Bytes are released when librdkafka send
+            returns. Hard maximum 268435456.
         compression:
           type: string
           enum: [none, gzip, snappy, lz4, zstd]
@@ -11388,7 +11407,8 @@ components:
           type: integer
           default: 5
           minimum: 1
-          description: Bounded seconds to await librdkafka flush during graceful shutdown and reload disposal after Ferrum admission is closed
+          maximum: 300
+          description: Bounded seconds to await librdkafka flush during graceful shutdown and reload disposal after Ferrum admission is closed. Zero is rejected. Hard maximum 300.
         acks:
           type: string
           enum: ["0", "1", "all", "-1"]
@@ -11425,7 +11445,15 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: "Escape hatch: additional librdkafka producer properties as string key-value pairs. Cannot override bootstrap.servers. Queue/message budgets cannot exceed Ferrum hard maxima. ssl.crl.location cannot conflict with gateway FERRUM_TLS_CRL_FILE_PATH when verification is enabled."
+          description: >-
+            Escape hatch: additional librdkafka producer properties as string
+            key-value pairs. Cannot override bootstrap.servers. Cannot set
+            security.protocol, enable.ssl.certificate.verification, ssl.ca.location,
+            ssl.certificate.location, ssl.key.location, sasl.mechanism,
+            sasl.username, or sasl.password (use the authoritative top-level
+            fields). Queue/message budgets cannot exceed Ferrum hard maxima.
+            ssl.crl.location cannot conflict with gateway FERRUM_TLS_CRL_FILE_PATH
+            when verification is enabled.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:

@@ -3053,6 +3053,27 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
         .expect("KafkaLoggingConfig exists");
     assert_eq!(schema.get("additionalProperties"), Some(&json!(false)));
 
+    assert_eq!(
+        schema["properties"]["flush_timeout_seconds"]["maximum"],
+        json!(300)
+    );
+    assert_eq!(
+        schema["properties"]["max_entry_bytes"]["default"],
+        json!(65536)
+    );
+    assert_eq!(
+        schema["properties"]["max_entry_bytes"]["maximum"],
+        json!(1048576)
+    );
+    assert_eq!(
+        schema["properties"]["buffer_max_bytes"]["default"],
+        json!(16777216)
+    );
+    assert_eq!(
+        schema["properties"]["buffer_max_bytes"]["maximum"],
+        json!(268435456)
+    );
+
     for valid in [
         json!({"broker_list": "localhost:9092", "topic": "logs"}),
         json!({
@@ -3060,7 +3081,14 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
             "topic": "logs",
             "security_protocol": "ssl",
             "buffer_capacity": 1000,
+            "max_entry_bytes": 65536,
+            "buffer_max_bytes": 16777216,
             "flush_timeout_seconds": 5
+        }),
+        json!({
+            "broker_list": "localhost:9092",
+            "topic": "logs",
+            "flush_timeout_seconds": 300
         }),
     ] {
         assert_component_validity(&spec, "KafkaLoggingConfig", &valid, true);
@@ -3069,6 +3097,11 @@ fn kafka_logging_schema_rejects_unknown_root_keys_and_is_closed() {
         json!({"broker_list": "localhost:9092", "topic": "logs", "security_protcol": "ssl"}),
         json!({"broker_list": "localhost:9092", "topic": "logs", "unknown": true}),
         json!({"topic": "logs"}),
+        json!({"broker_list": "localhost:9092", "topic": "logs", "buffer_capacity": 0}),
+        json!({"broker_list": "localhost:9092", "topic": "logs", "flush_timeout_seconds": 0}),
+        json!({"broker_list": "localhost:9092", "topic": "logs", "flush_timeout_seconds": 301}),
+        json!({"broker_list": "localhost:9092", "topic": "logs", "max_entry_bytes": 0}),
+        json!({"broker_list": "localhost:9092", "topic": "logs", "buffer_max_bytes": 0}),
     ] {
         assert_component_validity(&spec, "KafkaLoggingConfig", &invalid, false);
     }

@@ -1,20 +1,30 @@
-//! Kafka access logging plugin — async log shipping to Apache Kafka via
-//! `BatchingLogger<SummaryLogEntry>`, with librdkafka still owning internal
-//! batching, compression, and delivery retries for both HTTP and stream
-//! summaries.
+//! Kafka access logging plugin — async log shipping to Apache Kafka via a
+//! Ferrum userspace admission channel of pre-serialized records, with
+//! librdkafka still owning internal batching, compression, and delivery
+//! retries for both HTTP and stream summaries.
 //!
+//! Hot-path admission is lock-free: a generation publishes a cloneable
+//! [`BatchingLoggerHandle`] behind `ArcSwapOption`, reserves a channel slot
+//! before cloning or serializing attacker-shaped summary fields, enforces a
+//! Ferrum retained-byte budget, then commits a purpose-built Kafka record.
 //! Local `ThreadedProducer::send` success only means the record was admitted
-//! to librdkafka's in-memory queue. Terminal broker delivery (including
-//! `acks: 0` local completion) is observed through a custom
-//! [`ProducerContext`] delivery callback and exposed as authenticated
-//! diagnostics/metrics. Graceful shutdown and reload close Ferrum admission,
-//! await the batching worker, then await one bounded producer flush.
+//! to librdkafka's in-memory queue (Ferrum then releases its byte lease).
+//! Terminal broker delivery (including `acks: 0` local completion) is observed
+//! through a custom [`ProducerContext`] delivery callback and exposed as
+//! authenticated diagnostics/metrics.
+//!
+//! Graceful shutdown and reload atomically stop admission, await every
+//! already-reserved/transient admit, await the batching worker, then await one
+//! bounded producer flush. See #2548, #2551, #2552 and draft advisories
+//! GHSA-cm97-4gpw-2v6r, GHSA-7fgr-gqg5-xj6c, GHSA-83h5-52mw-f33p.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use rdkafka::ClientContext;
 use rdkafka::config::ClientConfig;
@@ -27,10 +37,10 @@ use tokio::task::spawn_blocking;
 use tracing::warn;
 
 use super::utils::log_schema::{
-    SchemaCapabilities, SummaryLogEntryView, SummarySchema, resolve_schema,
+    SchemaCapabilities, SchemaView, SummarySchema, resolve_schema,
 };
 use super::utils::{
-    BatchConfig, BatchingLogger, LoggerHooks, PluginHttpClient, RetryPolicy, SummaryLogEntry,
+    BatchConfig, BatchingLogger, BatchingLoggerHandle, LoggerHooks, PluginHttpClient, RetryPolicy,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -39,6 +49,18 @@ use crate::util::unknown_keys::reject_unknown_keys;
 pub const HARD_MAX_BUFFER_CAPACITY: usize = 100_000;
 /// Default Ferrum userspace channel capacity.
 pub const DEFAULT_BUFFER_CAPACITY: usize = 10_000;
+/// Default per-entry serialized payload ceiling.
+pub const DEFAULT_MAX_ENTRY_BYTES: usize = 64 * 1024;
+/// Hard maximum per-entry serialized payload ceiling.
+pub const HARD_MAX_ENTRY_BYTES: usize = 1_048_576;
+/// Default aggregate Ferrum retained-byte budget across queued records.
+pub const DEFAULT_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Hard maximum aggregate Ferrum retained-byte budget.
+pub const HARD_MAX_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Default bounded shutdown/reload producer flush budget.
+pub const DEFAULT_FLUSH_TIMEOUT_SECONDS: u64 = 5;
+/// Hard maximum for `flush_timeout_seconds` (conservative shutdown ceiling).
+pub const HARD_MAX_FLUSH_TIMEOUT_SECONDS: u64 = 300;
 /// Conservative librdkafka queue message budget (replaces 100_000 default).
 pub const DEFAULT_QUEUE_MAX_MESSAGES: u32 = 10_000;
 pub const HARD_MAX_QUEUE_MAX_MESSAGES: u32 = 100_000;
@@ -51,12 +73,16 @@ pub const HARD_MAX_MESSAGE_MAX_BYTES: u32 = 4_194_304;
 
 const DELIVERY_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const SATURATION_WARN_INTERVAL: Duration = Duration::from_secs(60);
+const ADMISSION_DRAIN_POLL: Duration = Duration::from_millis(1);
+const ADMISSION_DRAIN_BOUND: Duration = Duration::from_secs(5);
 
 const ALLOWED_CONFIG_KEYS: &[&str] = &[
     "broker_list",
     "topic",
     "key_field",
     "buffer_capacity",
+    "buffer_max_bytes",
+    "max_entry_bytes",
     "compression",
     "flush_timeout_seconds",
     "acks",
@@ -72,6 +98,20 @@ const ALLOWED_CONFIG_KEYS: &[&str] = &[
     "producer_config",
     "schema",
     "schema_ref",
+];
+
+/// `producer_config` keys that alias top-level security controls and must not
+/// silently override them after validation. Values are `(librdkafka key,
+/// authoritative top-level field)`.
+const FORBIDDEN_PRODUCER_SECURITY_KEYS: &[(&str, &str)] = &[
+    ("security.protocol", "security_protocol"),
+    ("enable.ssl.certificate.verification", "ssl_no_verify"),
+    ("ssl.ca.location", "ssl_ca_location"),
+    ("ssl.certificate.location", "ssl_certificate_location"),
+    ("ssl.key.location", "ssl_key_location"),
+    ("sasl.mechanism", "sasl_mechanism"),
+    ("sasl.username", "sasl_username"),
+    ("sasl.password", "sasl_password"),
 ];
 
 #[derive(Clone, Copy)]
@@ -95,11 +135,16 @@ pub struct KafkaSinkSnapshot {
     pub accepting: bool,
     pub finalized: bool,
     pub flush_timeout_seconds: u64,
+    pub max_entry_bytes: u64,
+    pub buffer_max_bytes: u64,
+    pub retained_bytes: u64,
     pub admitted_total: u64,
     pub delivered_total: u64,
     pub delivery_failed_total: u64,
     pub queue_rejected_total: u64,
     pub ferrum_dropped_total: u64,
+    pub entry_oversize_total: u64,
+    pub byte_budget_exhausted_total: u64,
     pub flush_failures_total: u64,
     pub flush_timeouts_total: u64,
     pub shutdown_incomplete_total: u64,
@@ -114,6 +159,8 @@ struct KafkaDeliveryMetrics {
     delivery_failed: AtomicU64,
     queue_rejected: AtomicU64,
     ferrum_dropped: AtomicU64,
+    entry_oversize: AtomicU64,
+    byte_budget_exhausted: AtomicU64,
     flush_failures: AtomicU64,
     flush_timeouts: AtomicU64,
     shutdown_incomplete: AtomicU64,
@@ -133,6 +180,8 @@ impl KafkaDeliveryMetrics {
             delivery_failed: AtomicU64::new(0),
             queue_rejected: AtomicU64::new(0),
             ferrum_dropped: AtomicU64::new(0),
+            entry_oversize: AtomicU64::new(0),
+            byte_budget_exhausted: AtomicU64::new(0),
             flush_failures: AtomicU64::new(0),
             flush_timeouts: AtomicU64::new(0),
             shutdown_incomplete: AtomicU64::new(0),
@@ -174,6 +223,18 @@ impl KafkaDeliveryMetrics {
         self.warn_saturation(reason, "ferrum_channel");
     }
 
+    fn record_entry_oversize(&self) {
+        self.entry_oversize.fetch_add(1, Ordering::Relaxed);
+        self.ferrum_dropped.fetch_add(1, Ordering::Relaxed);
+        self.warn_saturation("entry exceeded max_entry_bytes", "entry_oversize");
+    }
+
+    fn record_byte_budget_exhausted(&self) {
+        self.byte_budget_exhausted.fetch_add(1, Ordering::Relaxed);
+        self.ferrum_dropped.fetch_add(1, Ordering::Relaxed);
+        self.warn_saturation("retained-byte budget exhausted", "byte_budget");
+    }
+
     fn record_flush_failure(&self, kind: &'static str, timed_out: bool, incomplete: u64) {
         self.flush_failures.fetch_add(1, Ordering::Relaxed);
         if timed_out {
@@ -195,15 +256,33 @@ impl KafkaDeliveryMetrics {
         );
     }
 
+    fn record_shutdown_incomplete(&self, incomplete: u64) {
+        if incomplete == 0 {
+            return;
+        }
+        self.shutdown_incomplete
+            .fetch_add(incomplete, Ordering::Relaxed);
+        self.healthy.store(false, Ordering::Relaxed);
+        self.store_failure("shutdown", "ferrum_admission_incomplete");
+        warn!(
+            plugin = "kafka_logging",
+            generation_id = self.generation_id,
+            incomplete,
+            "kafka_logging: closed admission without awaiting Ferrum drain; local work reported incomplete"
+        );
+    }
+
     fn store_failure(&self, operation: &'static str, error_kind: &str) {
         let occurred_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        if let Ok(mut slot) = self.last_failure.lock() {
-            *slot = Some(KafkaSinkFailure {
-                operation,
-                error_kind: error_kind.to_string(),
-                occurred_at,
-            });
-        }
+        let mut slot = match self.last_failure.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = Some(KafkaSinkFailure {
+            operation,
+            error_kind: error_kind.to_string(),
+            occurred_at,
+        });
     }
 
     fn warn_delivery(&self, error_kind: &str) {
@@ -253,23 +332,30 @@ impl KafkaDeliveryMetrics {
         in_flight: i32,
         finalized: bool,
         flush_timeout_seconds: u64,
+        max_entry_bytes: u64,
+        buffer_max_bytes: u64,
+        retained_bytes: u64,
     ) -> KafkaSinkSnapshot {
-        let last_failure = self
-            .last_failure
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or(None);
+        let last_failure = match self.last_failure.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
         KafkaSinkSnapshot {
             generation_id: self.generation_id,
             healthy: self.healthy.load(Ordering::Relaxed),
             accepting: self.accepting.load(Ordering::Relaxed),
             finalized,
             flush_timeout_seconds,
+            max_entry_bytes,
+            buffer_max_bytes,
+            retained_bytes,
             admitted_total: self.admitted.load(Ordering::Relaxed),
             delivered_total: self.delivered.load(Ordering::Relaxed),
             delivery_failed_total: self.delivery_failed.load(Ordering::Relaxed),
             queue_rejected_total: self.queue_rejected.load(Ordering::Relaxed),
             ferrum_dropped_total: self.ferrum_dropped.load(Ordering::Relaxed),
+            entry_oversize_total: self.entry_oversize.load(Ordering::Relaxed),
+            byte_budget_exhausted_total: self.byte_budget_exhausted.load(Ordering::Relaxed),
             flush_failures_total: self.flush_failures.load(Ordering::Relaxed),
             flush_timeouts_total: self.flush_timeouts.load(Ordering::Relaxed),
             shutdown_incomplete_total: self.shutdown_incomplete.load(Ordering::Relaxed),
@@ -327,10 +413,101 @@ impl ProducerContext for KafkaDeliveryContext {
     }
 }
 
+struct KafkaByteLease {
+    used_bytes: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for KafkaByteLease {
+    fn drop(&mut self) {
+        self.used_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+struct KafkaByteBudget {
+    used_bytes: Arc<AtomicUsize>,
+    max_bytes: usize,
+}
+
+impl KafkaByteBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            used_bytes: Arc::new(AtomicUsize::new(0)),
+            max_bytes,
+        }
+    }
+
+    fn used(&self) -> usize {
+        self.used_bytes.load(Ordering::Acquire)
+    }
+
+    fn try_acquire(&self, bytes: usize) -> Option<Arc<KafkaByteLease>> {
+        let reserved = self
+            .used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.max_bytes)
+            });
+        if reserved.is_err() {
+            return None;
+        }
+        Some(Arc::new(KafkaByteLease {
+            used_bytes: Arc::clone(&self.used_bytes),
+            bytes,
+        }))
+    }
+}
+
+/// Pre-serialized Kafka record retained in the Ferrum userspace channel.
+/// The byte lease is released when librdkafka admission returns (or on drop
+/// before admission), because librdkafka copies/assumes downstream ownership.
+#[derive(Clone)]
+struct KafkaRecord {
+    payload: Arc<str>,
+    key: Option<Arc<str>>,
+    lease: Option<Arc<KafkaByteLease>>,
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedJsonWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(4096)),
+            max_bytes,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "serialized Kafka entry exceeded its byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 struct KafkaProducerState {
     producer: ThreadedProducer<KafkaDeliveryContext>,
     metrics: Arc<KafkaDeliveryMetrics>,
     flush_timeout: Duration,
+    max_entry_bytes: usize,
+    buffer_max_bytes: usize,
+    byte_budget: Arc<KafkaByteBudget>,
     finalized: AtomicBool,
 }
 
@@ -340,6 +517,9 @@ impl KafkaProducerState {
             self.producer.in_flight_count(),
             self.finalized.load(Ordering::Acquire),
             self.flush_timeout.as_secs(),
+            self.max_entry_bytes as u64,
+            self.buffer_max_bytes as u64,
+            self.byte_budget.used() as u64,
         )
     }
 
@@ -381,18 +561,161 @@ impl KafkaProducerState {
     }
 }
 
+struct KafkaAdmission {
+    handle: BatchingLoggerHandle<KafkaRecord>,
+    key_field: KeyField,
+    schema: Option<Arc<SummarySchema>>,
+    max_entry_bytes: usize,
+    byte_budget: Arc<KafkaByteBudget>,
+    metrics: Arc<KafkaDeliveryMetrics>,
+    /// Transient admits that loaded this handle and have not finished yet.
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl KafkaAdmission {
+    fn admit_http(&self, summary: &TransactionSummary) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let _guard = InFlightGuard {
+            counter: &self.in_flight,
+        };
+        let Some(permit) = self.handle.try_reserve() else {
+            self.metrics.record_ferrum_drop("ferrum channel full");
+            return;
+        };
+        let key = match self.key_field {
+            KeyField::None => None,
+            KeyField::ClientIp => Some(Arc::<str>::from(summary.client_ip.as_str())),
+            KeyField::ProxyId => summary
+                .proxy_id
+                .as_deref()
+                .map(Arc::<str>::from),
+        };
+        let record = match &self.schema {
+            Some(schema) => self.build_record(
+                &SchemaView {
+                    summary,
+                    schema: schema.as_ref(),
+                },
+                key,
+            ),
+            None => self.build_record(summary, key),
+        };
+        let Some(record) = record else {
+            return;
+        };
+        permit.send(record);
+    }
+
+    fn admit_stream(&self, summary: &StreamTransactionSummary) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let _guard = InFlightGuard {
+            counter: &self.in_flight,
+        };
+        let Some(permit) = self.handle.try_reserve() else {
+            self.metrics.record_ferrum_drop("ferrum channel full");
+            return;
+        };
+        let key = match self.key_field {
+            KeyField::None => None,
+            KeyField::ClientIp => Some(Arc::<str>::from(summary.client_ip.as_str())),
+            KeyField::ProxyId => Some(Arc::<str>::from(summary.proxy_id.as_str())),
+        };
+        let record = match &self.schema {
+            Some(schema) => self.build_record(
+                &SchemaView {
+                    summary,
+                    schema: schema.as_ref(),
+                },
+                key,
+            ),
+            None => self.build_record(summary, key),
+        };
+        let Some(record) = record else {
+            return;
+        };
+        permit.send(record);
+    }
+
+    fn build_record<T: Serialize>(
+        &self,
+        value: &T,
+        key: Option<Arc<str>>,
+    ) -> Option<KafkaRecord> {
+        let mut writer = BoundedJsonWriter::new(self.max_entry_bytes);
+        if let Err(error) = serde_json::to_writer(&mut writer, value) {
+            if writer.limit_exceeded {
+                self.metrics.record_entry_oversize();
+            } else {
+                warn!("kafka_logging: failed to serialize log entry: {error}");
+                self.metrics.record_ferrum_drop("serialize_failed");
+            }
+            return None;
+        }
+        let payload_bytes = writer.bytes.len();
+        let key_bytes = key.as_ref().map(|value| value.len()).unwrap_or(0);
+        let retained = match payload_bytes.checked_add(key_bytes) {
+            Some(total) => total,
+            None => {
+                self.metrics.record_entry_oversize();
+                return None;
+            }
+        };
+        if retained > self.max_entry_bytes {
+            self.metrics.record_entry_oversize();
+            return None;
+        }
+        let Some(lease) = self.byte_budget.try_acquire(retained) else {
+            self.metrics.record_byte_budget_exhausted();
+            return None;
+        };
+        let payload = match String::from_utf8(writer.bytes) {
+            Ok(payload) => Arc::<str>::from(payload),
+            Err(error) => {
+                warn!("kafka_logging: serialized entry was not UTF-8: {error}");
+                self.metrics.record_ferrum_drop("serialize_failed");
+                return None;
+            }
+        };
+        Some(KafkaRecord {
+            payload,
+            key,
+            lease: Some(lease),
+        })
+    }
+}
+
+struct InFlightGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct KafkaGeneration {
     state: Arc<KafkaProducerState>,
-    logger: Mutex<Option<BatchingLogger<SummaryLogEntry>>>,
+    admission: Arc<ArcSwapOption<KafkaAdmission>>,
+    /// Lifecycle-only ownership of the batching worker (not touched on hot path).
+    logger: Mutex<Option<BatchingLogger<KafkaRecord>>>,
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl KafkaGeneration {
     async fn finalize(&self) {
+        self.metrics_accepting_off();
+        // Atomically stop new hot-path admission, then await every transient
+        // admit that already observed the previous handle.
+        let previous = self.admission.swap(None);
+        wait_admissions_idle(&self.in_flight).await;
+        drop(previous);
+
         let logger = {
-            let mut guard = self
-                .logger
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = match self.logger.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             guard.take()
         };
         if let Some(mut owned) = logger {
@@ -400,6 +723,44 @@ impl KafkaGeneration {
         }
         let state = Arc::clone(&self.state);
         let _ = spawn_blocking(move || state.flush_once()).await;
+    }
+
+    fn metrics_accepting_off(&self) {
+        self.state.metrics.accepting.store(false, Ordering::Relaxed);
+    }
+
+    /// Close admission without awaiting the worker or flushing librdkafka.
+    /// Used only when an ordered graceful finalize cannot be awaited.
+    fn close_admission_report_incomplete(&self) {
+        self.metrics_accepting_off();
+        let previous = self.admission.swap(None);
+        let transient = self.in_flight.load(Ordering::Acquire) as u64;
+        let queued = previous
+            .as_ref()
+            .map(|admission| admission.handle.queue_depth() as u64)
+            .unwrap_or(0);
+        drop(previous);
+        let mut guard = match self.logger.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Drop the lifecycle owner without awaiting: channel closes once the
+        // admission handle Arc above was dropped, but the worker is not joined.
+        drop(guard.take());
+        let incomplete = transient.saturating_add(queued);
+        if incomplete > 0 {
+            self.state.metrics.record_shutdown_incomplete(incomplete);
+        }
+    }
+}
+
+async fn wait_admissions_idle(in_flight: &AtomicUsize) {
+    let deadline = Instant::now() + ADMISSION_DRAIN_BOUND;
+    while in_flight.load(Ordering::Acquire) > 0 {
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(ADMISSION_DRAIN_POLL).await;
     }
 }
 
@@ -412,25 +773,32 @@ fn active_generations() -> &'static Mutex<BTreeMap<u64, Arc<KafkaGeneration>>> {
 
 fn register_generation(generation: Arc<KafkaGeneration>) {
     let id = generation.state.metrics.generation_id;
-    if let Ok(mut guard) = active_generations().lock() {
-        guard.insert(id, generation);
-    }
+    let mut guard = match active_generations().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert(id, generation);
 }
 
 fn unregister_generation(id: u64) {
-    if let Ok(mut guard) = active_generations().lock() {
-        guard.remove(&id);
-    }
+    let mut guard = match active_generations().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.remove(&id);
 }
 
 /// Close admission, await Ferrum workers, and flush every live Kafka producer
 /// generation within each instance's configured `flush_timeout_seconds`.
 /// Exact-once: generations already finalized are skipped.
 pub async fn finalize_all_generations() {
-    let generations: Vec<Arc<KafkaGeneration>> = active_generations()
-        .lock()
-        .map(|guard| guard.values().cloned().collect())
-        .unwrap_or_default();
+    let generations: Vec<Arc<KafkaGeneration>> = {
+        let guard = match active_generations().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.values().cloned().collect()
+    };
     for generation in generations {
         generation.finalize().await;
         unregister_generation(generation.state.metrics.generation_id);
@@ -439,10 +807,11 @@ pub async fn finalize_all_generations() {
 
 /// Authenticated diagnostics snapshots for every registered generation.
 pub fn snapshots() -> Vec<KafkaSinkSnapshot> {
-    active_generations()
-        .lock()
-        .map(|guard| guard.values().map(|g| g.state.snapshot()).collect())
-        .unwrap_or_default()
+    let guard = match active_generations().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.values().map(|g| g.state.snapshot()).collect()
 }
 
 /// Prometheus exposition for Kafka logging sinks (fixed labels only).
@@ -465,6 +834,10 @@ pub fn render_prometheus() -> String {
 # TYPE ferrum_kafka_logging_in_flight gauge\n",
     );
     output.push_str(
+        "# HELP ferrum_kafka_logging_retained_bytes Ferrum userspace retained payload+key bytes awaiting librdkafka admission.\n\
+# TYPE ferrum_kafka_logging_retained_bytes gauge\n",
+    );
+    output.push_str(
         "# HELP ferrum_kafka_logging_records_total Kafka logging record outcomes.\n\
 # TYPE ferrum_kafka_logging_records_total counter\n",
     );
@@ -482,12 +855,18 @@ pub fn render_prometheus() -> String {
             "ferrum_kafka_logging_in_flight{{generation=\"{id}\"}} {}\n",
             snap.in_flight.max(0)
         ));
+        output.push_str(&format!(
+            "ferrum_kafka_logging_retained_bytes{{generation=\"{id}\"}} {}\n",
+            snap.retained_bytes
+        ));
         for (outcome, value) in [
             ("admitted", snap.admitted_total),
             ("delivered", snap.delivered_total),
             ("delivery_failed", snap.delivery_failed_total),
             ("queue_rejected", snap.queue_rejected_total),
             ("ferrum_dropped", snap.ferrum_dropped_total),
+            ("entry_oversize", snap.entry_oversize_total),
+            ("byte_budget_exhausted", snap.byte_budget_exhausted_total),
             ("flush_failures", snap.flush_failures_total),
             ("flush_timeouts", snap.flush_timeouts_total),
             ("shutdown_incomplete", snap.shutdown_incomplete_total),
@@ -539,9 +918,13 @@ impl KafkaLogging {
             }
         })?;
 
-        let buffer_capacity = optional_u64(config, "buffer_capacity")?
-            .unwrap_or(DEFAULT_BUFFER_CAPACITY as u64)
-            .max(1);
+        let buffer_capacity = match optional_u64(config, "buffer_capacity")? {
+            Some(0) => {
+                return Err("kafka_logging: 'buffer_capacity' must be >= 1".to_string());
+            }
+            Some(value) => value,
+            None => DEFAULT_BUFFER_CAPACITY as u64,
+        };
         if buffer_capacity > HARD_MAX_BUFFER_CAPACITY as u64 {
             return Err(format!(
                 "kafka_logging: 'buffer_capacity' must be <= {HARD_MAX_BUFFER_CAPACITY}"
@@ -549,9 +932,52 @@ impl KafkaLogging {
         }
         let buffer_capacity = buffer_capacity as usize;
 
-        let flush_timeout_seconds = optional_u64(config, "flush_timeout_seconds")?
-            .unwrap_or(5)
-            .max(1);
+        let max_entry_bytes = match optional_u64(config, "max_entry_bytes")? {
+            Some(0) => {
+                return Err("kafka_logging: 'max_entry_bytes' must be >= 1".to_string());
+            }
+            Some(value) => value,
+            None => DEFAULT_MAX_ENTRY_BYTES as u64,
+        };
+        if max_entry_bytes > HARD_MAX_ENTRY_BYTES as u64 {
+            return Err(format!(
+                "kafka_logging: 'max_entry_bytes' must be <= {HARD_MAX_ENTRY_BYTES}"
+            ));
+        }
+        let max_entry_bytes = max_entry_bytes as usize;
+
+        let buffer_max_bytes = match optional_u64(config, "buffer_max_bytes")? {
+            Some(0) => {
+                return Err("kafka_logging: 'buffer_max_bytes' must be >= 1".to_string());
+            }
+            Some(value) => value,
+            None => DEFAULT_BUFFER_MAX_BYTES as u64,
+        };
+        if buffer_max_bytes > HARD_MAX_BUFFER_MAX_BYTES as u64 {
+            return Err(format!(
+                "kafka_logging: 'buffer_max_bytes' must be <= {HARD_MAX_BUFFER_MAX_BYTES}"
+            ));
+        }
+        if buffer_max_bytes < max_entry_bytes as u64 {
+            return Err(
+                "kafka_logging: 'buffer_max_bytes' must be greater than or equal to 'max_entry_bytes'"
+                    .to_string(),
+            );
+        }
+        let buffer_max_bytes = buffer_max_bytes as usize;
+
+        let flush_timeout_seconds = match optional_u64(config, "flush_timeout_seconds")? {
+            Some(0) => {
+                return Err("kafka_logging: 'flush_timeout_seconds' must be >= 1".to_string());
+            }
+            Some(value) => value,
+            None => DEFAULT_FLUSH_TIMEOUT_SECONDS,
+        };
+        if flush_timeout_seconds > HARD_MAX_FLUSH_TIMEOUT_SECONDS {
+            return Err(format!(
+                "kafka_logging: 'flush_timeout_seconds' must be <= {HARD_MAX_FLUSH_TIMEOUT_SECONDS}"
+            ));
+        }
 
         let key_field = match optional_non_empty_string(config, "key_field")?.as_deref() {
             None => KeyField::ClientIp,
@@ -653,7 +1079,14 @@ impl KafkaLogging {
             kafka_config.set("ssl.key.location", key);
         }
 
-        let gateway_crl_path = resolve_gateway_crl_path(http_client)?;
+        // Resolve the gateway CRL filesystem identity only when verification
+        // is enabled so ssl_no_verify=true does not fail merely because loaded
+        // CRLs lack a path suitable for librdkafka.
+        let gateway_crl_path = if ssl_no_verify {
+            None
+        } else {
+            resolve_gateway_crl_path(http_client)?
+        };
         let admitted = admit_producer_config(
             config.get("producer_config"),
             ssl_no_verify,
@@ -707,10 +1140,14 @@ impl KafkaLogging {
             })
             .collect();
 
+        let byte_budget = Arc::new(KafkaByteBudget::new(buffer_max_bytes));
         let state = Arc::new(KafkaProducerState {
             producer,
             metrics: Arc::clone(&metrics),
             flush_timeout: Duration::from_secs(flush_timeout_seconds),
+            max_entry_bytes,
+            buffer_max_bytes,
+            byte_budget: Arc::clone(&byte_budget),
             finalized: AtomicBool::new(false),
         });
         let schema = resolve_schema(config, "kafka_logging", SchemaCapabilities::BASE)?;
@@ -742,15 +1179,29 @@ impl KafkaLogging {
                 move |batch| {
                     let state = Arc::clone(&state);
                     let topic = topic.clone();
-                    let schema = schema.clone();
-                    async move { send_batch(&state, &topic, key_field, batch, schema.as_deref()).await }
+                    async move { send_batch(&state, &topic, batch).await }
                 }
             },
         );
+        let handle = logger.handle().ok_or_else(|| {
+            "kafka_logging: failed to publish Ferrum admission handle".to_string()
+        })?;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let admission = Arc::new(KafkaAdmission {
+            handle,
+            key_field,
+            schema,
+            max_entry_bytes,
+            byte_budget,
+            metrics: Arc::clone(&metrics),
+            in_flight: Arc::clone(&in_flight),
+        });
 
         let generation = Arc::new(KafkaGeneration {
             state,
+            admission: Arc::new(ArcSwapOption::from(Some(admission))),
             logger: Mutex::new(Some(logger)),
+            in_flight,
         });
         register_generation(Arc::clone(&generation));
 
@@ -780,32 +1231,34 @@ impl Drop for KafkaLogging {
             unregister_generation(self.generation.state.metrics.generation_id);
             return;
         }
-        // Reload disposal / abandoned instance: close admission and run one
-        // bounded flush so pending records are not silently detached from
-        // process lifetime. Multi-thread runtimes can await the worker;
-        // current-thread test runtimes close admission and flush without
-        // `block_in_place` (which would panic there).
-        if let Ok(handle) = tokio::runtime::Handle::try_current()
-            && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-        {
-            let generation = Arc::clone(&self.generation);
-            tokio::task::block_in_place(|| {
-                handle.block_on(async move {
-                    generation.finalize().await;
-                    unregister_generation(generation.state.metrics.generation_id);
+        // Reload disposal / abandoned instance. Prefer an ordered finalize
+        // (close admission → await Ferrum worker → bounded librdkafka flush).
+        // Never flush librdkafka while Ferrum entries may still enqueue.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                let generation = Arc::clone(&self.generation);
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        generation.finalize().await;
+                        unregister_generation(generation.state.metrics.generation_id);
+                    });
                 });
+                return;
+            }
+            // Current-thread / non-multi-thread runtime: owned asynchronous
+            // handoff preserves order without blocking the runtime or claiming
+            // a synchronous graceful flush.
+            let generation = Arc::clone(&self.generation);
+            handle.spawn(async move {
+                generation.finalize().await;
+                unregister_generation(generation.state.metrics.generation_id);
             });
             return;
         }
-        let _ = self
-            .generation
-            .logger
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let state = Arc::clone(&self.generation.state);
-        let _ = state.flush_once();
-        unregister_generation(state.metrics.generation_id);
+        // No runtime: close admission and account incomplete local work. Do
+        // not flush librdkafka — the Ferrum worker cannot be awaited here.
+        self.generation.close_admission_report_incomplete();
+        unregister_generation(self.generation.state.metrics.generation_id);
     }
 }
 
@@ -826,6 +1279,75 @@ fn resolve_gateway_crl_path(http_client: &PluginHttpClient) -> Result<Option<Str
     Ok(from_env)
 }
 
+/// Deterministic admission-order probe for external unit tests: a hanging
+/// Ferrum worker keeps the channel full so a subsequent oversized summary can
+/// only observe channel rejection (never `entry_oversize`). Returns
+/// `(ferrum_dropped_total, entry_oversize_total)`.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) async fn probe_reserve_before_serialize_for_test(
+    oversized: &TransactionSummary,
+) -> (u64, u64) {
+    let metrics = Arc::new(KafkaDeliveryMetrics::new(u64::MAX - 7));
+    let byte_budget = Arc::new(KafkaByteBudget::new(4_096));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let logger = BatchingLogger::spawn_with_hooks(
+        BatchConfig {
+            batch_size: 1,
+            flush_interval: Duration::from_secs(3600),
+            buffer_capacity: 1,
+            retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
+            plugin_name: "kafka_logging",
+        },
+        LoggerHooks::default(),
+        move |batch| async move {
+            drop(batch);
+            // Keep the worker inside flush so it cannot drain subsequent
+            // injected records for the duration of this probe.
+            std::future::pending::<()>().await;
+            Ok(())
+        },
+    );
+    let Some(handle) = logger.handle() else {
+        return (0, 0);
+    };
+
+    // Inject tiny pre-built records so channel saturation does not depend on
+    // serializing a real TransactionSummary under a tiny max_entry_bytes.
+    let inject = |handle: &BatchingLoggerHandle<KafkaRecord>, budget: &KafkaByteBudget| -> bool {
+        let Some(lease) = budget.try_acquire(2) else {
+            return false;
+        };
+        handle.try_send(KafkaRecord {
+            payload: Arc::from("{}"),
+            key: None,
+            lease: Some(lease),
+        })
+    };
+    let _ = inject(&handle, &byte_budget);
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    let _ = inject(&handle, &byte_budget);
+
+    let admission = KafkaAdmission {
+        handle,
+        key_field: KeyField::None,
+        schema: None,
+        max_entry_bytes: 64,
+        byte_budget,
+        metrics: Arc::clone(&metrics),
+        in_flight,
+    };
+    admission.admit_http(oversized);
+
+    let dropped = metrics.ferrum_dropped.load(Ordering::Relaxed);
+    let oversize = metrics.entry_oversize.load(Ordering::Relaxed);
+    // Drop without awaiting: the worker is intentionally parked in pending()
+    // for this probe; the test runtime tears the detached task down.
+    drop(logger);
+    (dropped, oversize)
+}
+
 /// Pure producer-configuration admission used by construction and exposed to
 /// external unit tests through `_test_support`. Keeps CRL conflict / budget
 /// policy coverage independent of librdkafka OpenSSL availability.
@@ -836,7 +1358,11 @@ pub(crate) fn validate_producer_admission(
 ) -> Result<(), String> {
     let ssl_no_verify =
         optional_bool(config, "ssl_no_verify")?.unwrap_or(http_client.tls_no_verify());
-    let gateway_crl_path = resolve_gateway_crl_path(http_client)?;
+    let gateway_crl_path = if ssl_no_verify {
+        None
+    } else {
+        resolve_gateway_crl_path(http_client)?
+    };
     admit_producer_config(
         config.get("producer_config"),
         ssl_no_verify,
@@ -890,6 +1416,16 @@ fn admit_producer_config(
         {
             return Err(format!(
                 "kafka_logging: 'producer_config.{key}' is not allowed"
+            ));
+        }
+        if let Some((_, authoritative)) = FORBIDDEN_PRODUCER_SECURITY_KEYS
+            .iter()
+            .find(|(forbidden, _)| key.eq_ignore_ascii_case(forbidden))
+        {
+            // Do not echo the configured value — it may be a secret
+            // (sasl.password) or otherwise sensitive identity material.
+            return Err(format!(
+                "kafka_logging: 'producer_config.{key}' is not allowed; use top-level '{authoritative}'"
             ));
         }
         if key.eq_ignore_ascii_case("ssl.crl.location") {
@@ -1022,24 +1558,14 @@ impl Plugin for KafkaLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        let logger = self
-            .generation
-            .logger
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(logger) = logger.as_ref() {
-            let _ = logger.try_send(summary.into());
+        if let Some(admission) = self.generation.admission.load_full() {
+            admission.admit_stream(summary);
         }
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        let logger = self
-            .generation
-            .logger
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(logger) = logger.as_ref() {
-            let _ = logger.try_send(summary.into());
+        if let Some(admission) = self.generation.admission.load_full() {
+            admission.admit_http(summary);
         }
     }
 
@@ -1051,49 +1577,28 @@ impl Plugin for KafkaLogging {
 async fn send_batch(
     state: &Arc<KafkaProducerState>,
     topic: &str,
-    key_field: KeyField,
-    batch: Vec<SummaryLogEntry>,
-    schema: Option<&SummarySchema>,
+    batch: Vec<KafkaRecord>,
 ) -> Result<(), String> {
-    for entry in batch {
-        // Serialize only after Ferrum-side admission succeeded; the worker
-        // already owns the SummaryLogEntry.
-        let serialized = match schema {
-            Some(schema) => serde_json::to_string(&SummaryLogEntryView {
-                entry: &entry,
-                schema,
-            }),
-            None => serde_json::to_string(&entry),
-        };
-        let payload = match serialized {
-            Ok(json) => json,
-            Err(error) => {
-                warn!("kafka_logging: failed to serialize log entry: {error}");
-                continue;
-            }
-        };
-        let key = match key_field {
-            KeyField::None => None,
-            KeyField::ClientIp => Some(entry.client_ip().to_string()),
-            KeyField::ProxyId => entry.proxy_id().map(str::to_string),
-        };
+    for mut record in batch {
+        let payload = Arc::clone(&record.payload);
+        let key = record.key.clone();
         let state = Arc::clone(state);
         let topic = topic.to_string();
 
-        spawn_blocking(move || {
-            let enqueue_error = match key {
+        let enqueue_result = spawn_blocking(move || {
+            let enqueue_error = match key.as_deref() {
                 Some(key) => state
                     .producer
                     .send(
                         BaseRecord::<str, str>::to(&topic)
-                            .payload(&payload)
-                            .key(key.as_str()),
+                            .payload(payload.as_ref())
+                            .key(key),
                     )
                     .err()
                     .map(|(error, _)| error),
                 None => state
                     .producer
-                    .send(BaseRecord::<(), str>::to(&topic).payload(&payload))
+                    .send(BaseRecord::<(), str>::to(&topic).payload(payload.as_ref()))
                     .err()
                     .map(|(error, _)| error),
             };
@@ -1110,7 +1615,12 @@ async fn send_batch(
             }
         })
         .await
-        .map_err(|error| format!("kafka_logging: producer task join failed: {error}"))??;
+        .map_err(|error| format!("kafka_logging: producer task join failed: {error}"))?;
+
+        // librdkafka has copied/assumed ownership (or rejected). Release the
+        // Ferrum retained-byte lease on every path, including errors.
+        drop(record.lease.take());
+        enqueue_result?;
     }
 
     Ok(())
