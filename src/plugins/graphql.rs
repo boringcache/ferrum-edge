@@ -36,11 +36,51 @@ use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
     RateLimitWindowSpec,
 };
+use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Maximum rate-limit state entries before triggering stale eviction.
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
+
+/// GraphQL-specific top-level config keys (excludes shared Redis sync fields).
+const GRAPHQL_POLICY_CONFIG_KEYS: &[&str] = &[
+    "max_depth",
+    "max_complexity",
+    "max_aliases",
+    "introspection_allowed",
+    "limit_by",
+    "type_rate_limits",
+    "operation_rate_limits",
+];
+
+/// Closed top-level key set for `graphql` plugin config.
+///
+/// Must stay aligned with OpenAPI `GraphqlConfig`, `REDIS_PLUGIN_CONFIG_KEYS`,
+/// and `docs/plugins.md`. Unknown root keys fail closed so typos cannot silently
+/// replace introspection, identity, rate-map, or Redis synchronization policy.
+pub const GRAPHQL_CONFIG_KEYS: &[&str] = &[
+    "max_depth",
+    "max_complexity",
+    "max_aliases",
+    "introspection_allowed",
+    "limit_by",
+    "type_rate_limits",
+    "operation_rate_limits",
+    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    "sync_mode",
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
+
+const RATE_SPEC_KEYS: &[&str] = &["max_requests", "window_seconds"];
 
 /// A rate window spec parsed from config.
 #[derive(Debug, Clone)]
@@ -83,9 +123,20 @@ pub struct GraphqlPlugin {
 
 impl GraphqlPlugin {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("graphql: config must be an object".to_string());
-        }
+        let object = config
+            .as_object()
+            .ok_or_else(|| "graphql: config must be an object".to_string())?;
+        // Debug assertion keeps the documented key groups aligned with the
+        // closed root allowlist used for admission and OpenAPI parity.
+        debug_assert!(
+            GRAPHQL_POLICY_CONFIG_KEYS
+                .iter()
+                .chain(REDIS_PLUGIN_CONFIG_KEYS.iter())
+                .all(|key| GRAPHQL_CONFIG_KEYS.contains(key))
+                && GRAPHQL_CONFIG_KEYS.len()
+                    == GRAPHQL_POLICY_CONFIG_KEYS.len() + REDIS_PLUGIN_CONFIG_KEYS.len()
+        );
+        reject_unknown_keys(object, "config", GRAPHQL_CONFIG_KEYS, "graphql: ")?;
 
         let max_depth = optional_u32(config, "max_depth")?;
         let max_complexity = optional_u32(config, "max_complexity")?;
@@ -256,9 +307,11 @@ fn parse_operation_rate_limits(config: &Value) -> Result<HashMap<String, RateSpe
 }
 
 fn parse_rate_spec(field: &str, key: &str, spec: &Value) -> Result<RateSpec, String> {
-    if !spec.is_object() {
-        return Err(format!("graphql: {field}['{key}'] must be an object"));
-    }
+    let object = spec
+        .as_object()
+        .ok_or_else(|| format!("graphql: {field}['{key}'] must be an object"))?;
+    let path = format!("config.{field}[{key}]");
+    reject_unknown_keys(object, &path, RATE_SPEC_KEYS, "graphql: ")?;
     let max_requests = required_positive_u64(spec, field, key, "max_requests")?;
     let window_seconds = required_positive_u64(spec, field, key, "window_seconds")?;
     let window = Duration::from_secs(window_seconds);

@@ -1606,6 +1606,192 @@ fn grpc_method_router_schema_matches_runtime_validation() {
 }
 
 #[test]
+fn graphql_config_schema_matches_runtime_validation() {
+    use ferrum_edge::plugins::create_plugin;
+    use ferrum_edge::plugins::graphql::GRAPHQL_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/GraphqlConfig")
+        .expect("GraphqlConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["type_rate_limits"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/RateSpec/additionalProperties"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        schema["properties"]["type_rate_limits"]["properties"]
+            .as_object()
+            .expect("type_rate_limits properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["query", "mutation", "subscription"])
+    );
+    assert_eq!(
+        schema["properties"]["operation_rate_limits"]["propertyNames"]["pattern"],
+        json!("^[A-Za-z_][A-Za-z0-9_]*$")
+    );
+    assert_eq!(schema["properties"]["redis_pool_size"]["minimum"], 1);
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["minimum"],
+        1
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["minimum"],
+        1
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/RateSpec/properties/max_requests/minimum"),
+        Some(&json!(1))
+    );
+
+    let schema_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("GraphqlConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fields: BTreeSet<_> = GRAPHQL_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(
+        schema_fields, runtime_fields,
+        "graphql OpenAPI/runtime key drift"
+    );
+    for key in REDIS_PLUGIN_CONFIG_KEYS {
+        assert!(
+            GRAPHQL_CONFIG_KEYS.contains(key),
+            "GRAPHQL_CONFIG_KEYS must include Redis key {key}"
+        );
+    }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let docs = plugin_docs
+        .split("### `graphql`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("graphql docs section");
+    for key in GRAPHQL_CONFIG_KEYS {
+        assert!(
+            docs.contains(&format!("`{key}`")),
+            "docs/plugins.md graphql section missing `{key}`"
+        );
+    }
+    assert!(docs.contains("Unknown top-level keys are rejected"));
+    assert!(docs.contains("valid GraphQL Names"));
+
+    let validator_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/GraphqlConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&validator_schema)
+        .expect("GraphqlConfig schema compiles");
+
+    let accepted = [
+        json!({"max_depth": 5}),
+        json!({"max_complexity": 100}),
+        json!({"max_aliases": 3}),
+        json!({"introspection_allowed": false}),
+        json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"type_rate_limits": {
+            "query": {"max_requests": 10, "window_seconds": 60},
+            "mutation": {"max_requests": 5, "window_seconds": 60},
+            "subscription": {"max_requests": 2, "window_seconds": 60}
+        }}),
+        json!({"operation_rate_limits": {"getUser": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"operation_rate_limits": {"_internal": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({
+            "type_rate_limits": {
+                "query": { "max_requests": 10, "window_seconds": 60 }
+            },
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_pool_size": 1,
+            "redis_connect_timeout_seconds": 1,
+            "redis_health_check_interval_seconds": 1
+        }),
+    ];
+    for config in &accepted {
+        assert!(
+            validator.validate(config).is_ok(),
+            "config should be schema-valid: {config}"
+        );
+        assert!(
+            create_plugin("graphql", config).is_ok(),
+            "config should be runtime-valid: {config}"
+        );
+    }
+
+    let rejected = [
+        // Issue #2496 reproduction shapes
+        json!({}),
+        json!({"type_rate_limits": {"other": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"operation_rate_limits": {"bad-name": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"type_rate_limits": {"query": {"max_requests": 0, "window_seconds": 60}}}),
+        json!({"max_depth": 5, "sync_mode": "redis"}),
+        // Effective-rule and closed-object residuals
+        json!({"introspection_allowed": true}),
+        json!({"type_rate_limits": {}}),
+        json!({"operation_rate_limits": {}}),
+        json!({"operation_rate_limits": {"": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60, "burst": 2}}}),
+        json!({"max_depth": 5, "introspection_allowd": false}),
+        json!({"max_depth": 5, "sync_mdoe": "redis", "redis_url": "redis://localhost:6379/0"}),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": ""
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": "http://localhost:6379"
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_key_prefix": ""
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_pool_size": 0
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_connect_timeout_seconds": 0
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_health_check_interval_seconds": 0
+        }),
+    ];
+    for config in &rejected {
+        assert!(
+            validator.validate(config).is_err(),
+            "config should be schema-invalid: {config}"
+        );
+        assert!(
+            create_plugin("graphql", config).is_err(),
+            "config should be runtime-invalid: {config}"
+        );
+    }
+}
+
+#[test]
 fn key_auth_location_schema_matches_runtime_whitespace_contract() {
     use ferrum_edge::plugins::key_auth::KeyAuth;
 
