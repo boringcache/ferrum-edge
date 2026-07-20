@@ -51,8 +51,9 @@ changing `tool_calls[].id` values for the same `(choice, index)` slot, are
 **ungovernable** and fail closed in enforce mode on both the live inspector and
 buffered-SSE extraction — they are never concatenated into a synthetic
 allowed identity. Duplicate `choices[].index` entries and explicitly empty or
-non-string call IDs are likewise malformed; an omitted ID remains valid on
-continuation fragments after a stable ID was established.
+non-string call IDs are likewise malformed. Introducing an ID only after an
+untagged fragment is an identity change and fails closed; an omitted ID remains
+valid on continuation fragments after a stable ID was established.
 Ordinary content/role deltas stream through live **until a tool-call batch
 opens**; once a batch is pending, ALL subsequent events (other choices'
 content, keepalives) are held too and released in original arrival order when

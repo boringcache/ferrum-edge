@@ -815,17 +815,44 @@ impl GovernorEngine {
             .iter()
             .map(|call| self.evaluate(&call.name, &call.raw_args, call.parsed_args.as_ref()))
             .collect();
+        // Preflight every deterministic redaction failure before resolving any
+        // approval. Otherwise an earlier require_approval call could still
+        // fan out to the webhook even though a later call already makes the
+        // enforce-mode batch unshippable.
+        let redaction_amplification: Vec<bool> = calls
+            .iter()
+            .zip(evaluations.iter())
+            .map(|(call, (outcome, _, _))| {
+                matches!(
+                    outcome,
+                    PolicyOutcome::Redact(patterns)
+                        if !redaction_unavailable && !patterns.is_empty()
+                )
+                    && self.tools.get(&call.name).is_some_and(|policy| {
+                        redact_arguments(
+                            &call.raw_args,
+                            &policy.blocked_arg_patterns,
+                            &self.response.redaction_placeholder,
+                        )
+                        .is_err()
+                    })
+            })
+            .collect();
         let mut skip_approvals = self.mode == Mode::Enforce
-            && evaluations.iter().any(|(outcome, _, _)| match outcome {
+            && (evaluations.iter().any(|(outcome, _, _)| match outcome {
                 PolicyOutcome::Deny(_) => true,
                 PolicyOutcome::Redact(patterns) => redaction_unavailable && !patterns.is_empty(),
                 _ => false,
-            });
+            }) || redaction_amplification.iter().any(|failed| *failed));
         // Whole-batch approval deadline: sequential webhook waits cannot exceed
         // this ceiling even when every call misses the cache.
         let approval_deadline = Instant::now() + MAX_APPROVAL_BATCH_DEADLINE;
 
-        for (call, (outcome, matched, risk)) in calls.iter().zip(evaluations) {
+        for ((call, (outcome, matched, risk)), amplification) in calls
+            .iter()
+            .zip(evaluations)
+            .zip(redaction_amplification)
+        {
             let arguments_hash = self
                 .observability
                 .hash_arguments
@@ -865,16 +892,6 @@ impl GovernorEngine {
                             call.name
                         ));
                     } else if !patterns.is_empty() {
-                        // Preflight the redaction so an amplifying pattern cannot
-                        // pass governance and then explode during the transform.
-                        let amplification = self.tools.get(&call.name).is_some_and(|policy| {
-                            redact_arguments(
-                                &call.raw_args,
-                                &policy.blocked_arg_patterns,
-                                &self.response.redaction_placeholder,
-                            )
-                            .is_err()
-                        });
                         if amplification {
                             cd.label = "deny";
                             cd.blocks = true;
@@ -3391,6 +3408,10 @@ struct StreamingCall {
     arguments: String,
     /// Stable protocol call id observed for this slot, when present.
     call_id: Option<String>,
+    /// Whether any fragment has already been accumulated for this slot. An ID
+    /// introduced only after an untagged fragment is an identity change, not a
+    /// stable initial identity; fail closed rather than merge the two shapes.
+    saw_fragment: bool,
     /// A tool-call delta supplied `function.arguments` as a non-string JSON
     /// value (object/array/number). Those bytes are not accumulated, so the
     /// call cannot be policy-checked and must be treated as ungovernable.
@@ -3503,7 +3524,12 @@ impl StreamingToolCallAccumulator {
         let entry = self.entry(choice, slot);
         if let Some(id) = call_id.filter(|id| !id.is_empty()) {
             match &entry.call_id {
-                None => entry.call_id = Some(id.to_string()),
+                None => {
+                    if entry.saw_fragment {
+                        entry.ambiguous_identity = true;
+                    }
+                    entry.call_id = Some(id.to_string());
+                }
                 Some(existing) if existing == id => {}
                 Some(_) => entry.ambiguous_identity = true,
             }
@@ -3517,6 +3543,7 @@ impl StreamingToolCallAccumulator {
         if non_string_args {
             entry.non_string_args = true;
         }
+        entry.saw_fragment = true;
     }
 
     fn entry(&mut self, choice: usize, slot: ToolSlot) -> &mut StreamingCall {

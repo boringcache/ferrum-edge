@@ -8600,6 +8600,70 @@ async fn stream_id_change_within_slot_fails_closed() {
     assert!(!String::from_utf8_lossy(&out).contains("danger"));
 }
 
+/// Introducing an id only after an untagged fragment is ambiguous: the first
+/// bytes may belong to an independently addressed call rather than a
+/// continuation. Both live and buffered-SSE paths must fail closed, while an
+/// omitted id after a stable initial id remains a valid continuation.
+#[tokio::test]
+async fn stream_late_id_introduction_fails_closed_but_missing_continuation_id_is_valid() {
+    let plugin = make(streaming_config(
+        json!({ "danger": { "action": "deny" } }),
+        "allow",
+    ));
+    let ctx = create_test_context();
+    let ambiguous = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"function\":{\"name\":\"safe\",\"arguments\":\"\"}}",
+        "]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"late-id\",\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}",
+        "]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[ambiguous.as_bytes()]).await;
+    assert!(terminated, "late id introduction must fail closed");
+    assert!(!String::from_utf8_lossy(&out).contains("danger"));
+
+    let buffered = make(json!({
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" } }
+    }));
+    let mut buffered_ctx = create_test_context();
+    assert_reject(
+        buffered
+            .on_response_body(
+                &mut buffered_ctx,
+                200,
+                &sse_headers(),
+                ambiguous.as_bytes(),
+            )
+            .await,
+        Some(502),
+    );
+
+    let valid_chunks: &[&[u8]] = &[
+        br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"stable-id","function":{"name":"safe","arguments":"{"}}]}}]}"#,
+        b"\n\n",
+        br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}"#,
+        b"\n\n",
+        br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        b"\n\n",
+        b"data: [DONE]\n\n",
+    ];
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (_out, terminated) = drive_stream(&mut inspector, valid_chunks).await;
+    assert!(
+        !terminated,
+        "missing id on a continuation after a stable id must remain valid"
+    );
+}
+
 #[tokio::test]
 async fn duplicate_choice_index_and_malformed_call_id_fail_closed() {
     let plugin = make(streaming_config(
@@ -8685,6 +8749,68 @@ fn amplifying_redact_config(mode: &str) -> Value {
 fn amplifying_argument_blob() -> String {
     // 17_000 × 256-byte placeholder exceeds MAX_PARSE_BYTES (4 MiB).
     "a".repeat(17_000)
+}
+
+/// A deterministic amplification failure anywhere in an enforce-mode batch
+/// must suppress all approval fan-out, including require_approval calls that
+/// appear earlier in the response array.
+#[tokio::test]
+async fn redaction_amplification_block_skips_earlier_approval_webhook() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": {
+            "deploy": { "action": "require_approval" },
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "a", "regex": "a" }]
+            }
+        },
+        "approval": {
+            "endpoint_url": format!("{}/approve", server.uri()),
+            "cache_ttl_seconds": 0
+        },
+        "response": { "redaction_placeholder": "X".repeat(256) }
+    }));
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "tool_calls": [
+                    {
+                        "id": "approval-first",
+                        "type": "function",
+                        "function": { "name": "deploy", "arguments": "{}" }
+                    },
+                    {
+                        "id": "amplification-second",
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "arguments": amplifying_argument_blob()
+                        }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+    .expect("serialize response");
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+    server.verify().await;
 }
 
 fn response_with_function_call(name: &str, arguments: &str) -> Vec<u8> {

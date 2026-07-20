@@ -18340,7 +18340,7 @@ components:
             streaming_response_tool_calls:
               type: boolean
               default: false
-              description: "Govern OpenAI SSE tool-call deltas. Held tool-call frames are released only after policy/approval clears the call; a block cuts the stream with a terminal SSE error event. In streaming, a redact_args match fails closed (denies) since mid-stream surgical redaction of split-JSON arguments is out of scope."
+              description: "Govern OpenAI SSE tool-call deltas. Held tool-call frames are released only after policy/approval clears the call; a block cuts the stream with a terminal SSE error event. Duplicate choice/tool indexes, malformed IDs, conflicting IDs, or an ID introduced after an untagged fragment are ungovernable and fail closed in enforce mode. In streaming, a redact_args match fails closed (denies) since mid-stream surgical redaction of split-JSON arguments is out of scope."
             mcp_tool_calls:
               type: boolean
               default: false
