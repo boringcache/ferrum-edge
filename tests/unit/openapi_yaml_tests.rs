@@ -4064,6 +4064,16 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         json!({
             "rules": [{
                 "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "api.internal",
+                    "backend_port": 443,
+                    "backend_tls": {"verify_server_certificate": false}
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
                 "destination": {"upstream_id": "api"},
                 "retry": {"max_retry": 2}
             }]
@@ -4072,7 +4082,36 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             "rules": [{
                 "match": {"methods": ["GET"]},
                 "destination": {"upstream_id": "api"},
+                "retry": {"retry_on_connect_failur": false}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
                 "retry": {"backoff": {"fixed": {"delay_ms": 25, "delay_millis": 25}}}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {
+                    "backoff": {
+                        "exponential": {"base_ms": 10, "max_ms": 100, "max_millis": 100}
+                    }
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {
+                    "backoff": {
+                        "exponentiall": {"base_ms": 10, "max_ms": 100}
+                    }
+                }
             }]
         }),
     ] {
@@ -4084,6 +4123,41 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         );
         assert!(MeshRouteDispatch::new(&invalid_route_policy).is_err());
     }
+
+    assert_eq!(
+        spec.pointer("/components/schemas/MeshRouteRetryConfig/additionalProperties"),
+        Some(&json!(false)),
+        "MeshRouteRetryConfig must stay closed"
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/MeshRouteBackendTlsConfig/additionalProperties"),
+        Some(&json!(false)),
+        "MeshRouteBackendTlsConfig must stay closed"
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/MeshRouteBackoffStrategy/oneOf/0/additionalProperties"),
+        Some(&json!(false)),
+        "fixed backoff wrapper must stay closed"
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/MeshRouteBackoffStrategy/oneOf/1/additionalProperties"),
+        Some(&json!(false)),
+        "exponential backoff wrapper must stay closed"
+    );
+    assert_eq!(
+        spec.pointer(
+            "/components/schemas/MeshRouteBackoffStrategy/oneOf/0/properties/fixed/additionalProperties"
+        ),
+        Some(&json!(false)),
+        "fixed backoff payload must stay closed"
+    );
+    assert_eq!(
+        spec.pointer(
+            "/components/schemas/MeshRouteBackoffStrategy/oneOf/1/properties/exponential/additionalProperties"
+        ),
+        Some(&json!(false)),
+        "exponential backoff payload must stay closed"
+    );
 
     let status_only_redirect = json!({
         "rules": [{

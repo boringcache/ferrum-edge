@@ -865,6 +865,73 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_unknown_mesh_route_dispatch_nested_policy_keys() {
+    for (id, config) in [
+        (
+            "mesh-route-reject-typo",
+            serde_json::json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"}
+                }],
+                "reject_unmtached": true
+            }),
+        ),
+        (
+            "mesh-route-retry-typo",
+            serde_json::json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "retry": {"max_retry": 2}
+                }]
+            }),
+        ),
+        (
+            "mesh-route-backend-tls-typo",
+            serde_json::json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "api.internal",
+                        "backend_port": 443,
+                        "backend_tls": {"client_certpath": "/tls/client.pem"}
+                    }
+                }]
+            }),
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "mesh_route_dispatch",
+                "config": config,
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let err = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect_err("file-mode load must reject unknown mesh_route_dispatch nested keys");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("1 plugin config error(s)") || message.contains("unknown field"),
+            "unexpected file-load error: {message}"
+        );
+    }
+}
+
+#[test]
 fn test_file_config_rejects_unknown_ai_prompt_compressor_policy_keys() {
     for (id, config) in [
         (

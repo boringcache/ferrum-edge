@@ -145,121 +145,323 @@ fn mesh_route_dispatch_file_dependency_validation_reports_empty_tls_paths() {
 #[test]
 fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
     let invalid_configs = [
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {"upstream_id": "api"}
-            }],
-            "reject_unmtached": true
-        }),
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {"upstream_id": "api"},
-                "timeout_millis": 100
-            }]
-        }),
-        json!({
-            "rules": [{
-                "match": {"method": ["GET"], "methods": ["GET"]},
-                "destination": {"upstream_id": "api"}
-            }]
-        }),
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {
-                    "upstream_id": "api",
-                    "requires_node_waypoint_auth": true
-                }
-            }]
-        }),
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {"upstream_id": "api"},
-                "fault": {
-                    "delay": {"duration_ms": 1, "percentage": 1.0},
-                    "delai": {"duration_ms": 1, "percentage": 1.0}
-                }
-            }]
-        }),
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {"upstream_id": "api"},
-                "fault": {
-                    "delay": {"duration_ms": 1, "percentage": 1.0, "percent": 1.0}
-                }
-            }]
-        }),
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {"upstream_id": "api"},
-                "fault": {
-                    "abort": {"status_code": 503, "percentage": 1.0, "status": 503}
-                }
-            }]
-        }),
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {"upstream_id": "api"},
-                "rewrite": {"uri": "/v2", "authorit": "api.internal"}
-            }]
-        }),
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {"upstream_id": "api"},
-                "request_transform": [{
-                    "operation": "update",
-                    "key": "x-route",
-                    "value": "api",
-                    "new_key": "x-route-new"
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"}
+                }],
+                "reject_unmtached": true
+            }),
+            "reject_unmtached",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "timeout_millis": 100
                 }]
-            }]
-        }),
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "redirect": {"redirect_code": 308, "redirect_cod": 307}
-            }]
-        }),
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {"upstream_id": "api"},
-                "retry": {"max_retry": 2}
-            }]
-        }),
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {"upstream_id": "api"},
-                "retry": {
-                    "backoff": {"fixed": {"delay_ms": 25, "delay_millis": 25}}
-                }
-            }]
-        }),
-        json!({
-            "rules": [{
-                "match": {"methods": ["GET"]},
-                "destination": {
-                    "backend_host": "api.internal",
-                    "backend_port": 443,
-                    "backend_tls": {"client_certpath": "/tls/client.pem"}
-                }
-            }]
-        }),
+            }),
+            "timeout_millis",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"method": ["GET"], "methods": ["GET"]},
+                    "destination": {"upstream_id": "api"}
+                }]
+            }),
+            "method",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "upstream_id": "api",
+                        "requires_node_waypoint_auth": true
+                    }
+                }]
+            }),
+            "requires_node_waypoint_auth",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "fault": {
+                        "delay": {"duration_ms": 1, "percentage": 1.0},
+                        "delai": {"duration_ms": 1, "percentage": 1.0}
+                    }
+                }]
+            }),
+            "delai",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "fault": {
+                        "delay": {"duration_ms": 1, "percentage": 1.0, "percent": 1.0}
+                    }
+                }]
+            }),
+            "percent",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "fault": {
+                        "abort": {"status_code": 503, "percentage": 1.0, "status": 503}
+                    }
+                }]
+            }),
+            "status",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "rewrite": {"uri": "/v2", "authorit": "api.internal"}
+                }]
+            }),
+            "authorit",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "request_transform": [{
+                        "operation": "update",
+                        "key": "x-route",
+                        "value": "api",
+                        "new_key": "x-route-new"
+                    }]
+                }]
+            }),
+            "new_key",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "redirect": {"redirect_code": 308, "redirect_cod": 307}
+                }]
+            }),
+            "redirect_cod",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "retry": {"max_retry": 2}
+                }]
+            }),
+            "max_retry",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "retry": {"retry_on_connect_failur": false}
+                }]
+            }),
+            "retry_on_connect_failur",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "retry": {
+                        "backoff": {"fixed": {"delay_ms": 25, "delay_millis": 25}}
+                    }
+                }]
+            }),
+            "delay_millis",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "retry": {
+                        "backoff": {
+                            "exponential": {"base_ms": 10, "max_ms": 100, "max_millis": 100}
+                        }
+                    }
+                }]
+            }),
+            "max_millis",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "retry": {
+                        "backoff": {
+                            "exponentiall": {"base_ms": 10, "max_ms": 100}
+                        }
+                    }
+                }]
+            }),
+            "exponentiall",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "retry": {
+                        "backoff": {
+                            "fixed": {"delay_ms": 25},
+                            "exponential": {"base_ms": 10, "max_ms": 100}
+                        }
+                    }
+                }]
+            }),
+            "expected map with a single key",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "api.internal",
+                        "backend_port": 443,
+                        "backend_tls": {"client_certpath": "/tls/client.pem"}
+                    }
+                }]
+            }),
+            "client_certpath",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "api.internal",
+                        "backend_port": 443,
+                        "backend_tls": {"verify_server_certificate": false}
+                    }
+                }]
+            }),
+            "verify_server_certificate",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "api.internal",
+                        "backend_port": 443,
+                        "backend_tls": {"sni_name": "api.internal"}
+                    }
+                }]
+            }),
+            "sni_name",
+        ),
+        (
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "api.internal",
+                        "backend_port": 443,
+                        "backend_tls": {"san_allowlist": ["api.internal"]}
+                    }
+                }]
+            }),
+            "san_allowlist",
+        ),
     ];
 
-    for config in invalid_configs {
+    for (config, expected_fragment) in invalid_configs {
         let error = MeshRouteDispatch::new(&config)
             .expect_err("unknown mesh_route_dispatch fields must fail closed");
-        assert!(error.contains("unknown field"), "got: {error}");
+        assert!(
+            error.contains(expected_fragment),
+            "expected {expected_fragment:?} in: {error}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("mesh_route_dispatch", &config).is_err(),
+            "shared file/admin plugin admission must reject {config}"
+        );
     }
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_accepts_valid_retry_and_backend_tls_controls() {
+    let config = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {
+                "backend_host": "api.internal",
+                "backend_port": 443,
+                "backend_tls": {
+                    "client_cert_path": "/tls/client.pem",
+                    "client_key_path": "/tls/client.key",
+                    "server_ca_cert_path": "/tls/ca.pem",
+                    "verify_server_cert": true,
+                    "sni": "api.internal",
+                    "san_allow_list": ["api.internal"]
+                }
+            },
+            "retry": {
+                "max_retries": 2,
+                "retryable_status_codes": [502, 503],
+                "retryable_methods": ["GET"],
+                "backoff": {"exponential": {"base_ms": 10, "max_ms": 100}},
+                "retry_on_connect_failure": false
+            }
+        }],
+        "reject_unmatched": true
+    });
+
+    let plugin = MeshRouteDispatch::new(&config).expect("valid nested route policy must admit");
+    assert!(
+        ferrum_edge::plugins::validate_plugin_config("mesh_route_dispatch", &config).is_ok(),
+        "shared admission must accept the same valid nested controls"
+    );
+
+    let mut request = ctx();
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut request, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    assert_eq!(
+        request.route_override_backend_host.as_deref(),
+        Some("api.internal")
+    );
+    assert_eq!(request.route_override_backend_port, Some(443));
+    let tls = request
+        .route_override_resolved_tls
+        .as_ref()
+        .expect("valid backend_tls must publish a resolved override");
+    assert_eq!(tls.client_cert_path.as_deref(), Some("/tls/client.pem"));
+    assert_eq!(tls.client_key_path.as_deref(), Some("/tls/client.key"));
+    assert_eq!(tls.server_ca_cert_path.as_deref(), Some("/tls/ca.pem"));
+    assert!(tls.verify_server_cert);
+    assert_eq!(tls.sni.as_deref(), Some("api.internal"));
+    assert_eq!(tls.san_allow_list, vec!["api.internal".to_string()]);
+    let retry = request
+        .route_override_retry
+        .clone()
+        .flatten()
+        .expect("valid retry must publish a route override");
+    assert_eq!(retry.max_retries, 2);
+    assert_eq!(retry.retryable_status_codes, vec![502, 503]);
+    assert_eq!(retry.retryable_methods, vec!["GET".to_string()]);
+    assert!(!retry.retry_on_connect_failure);
 }
 
 #[test]

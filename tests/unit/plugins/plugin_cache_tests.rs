@@ -2786,6 +2786,88 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
 }
 
 #[test]
+fn test_apply_delta_rejects_unknown_mesh_route_nested_keys_and_keeps_last_known_good() {
+    let good_route = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "retry": {
+                "max_retries": 1,
+                "backoff": {"fixed": {"delay_ms": 10}},
+                "retry_on_connect_failure": true
+            }
+        }],
+        "reject_unmatched": true
+    });
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc-route"])],
+        vec![make_plugin_config_with_json(
+            "pc-route",
+            "mesh_route_dispatch",
+            good_route,
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config1).expect("valid mesh_route_dispatch must admit");
+    assert!(
+        cache
+            .get_plugins("p1")
+            .iter()
+            .any(|plugin| plugin.name() == "mesh_route_dispatch"),
+        "baseline cache must include mesh_route_dispatch"
+    );
+
+    for bad_route in [
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {"max_retry": 2}
+            }],
+            "reject_unmatched": true
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "api.internal",
+                    "backend_port": 443,
+                    "backend_tls": {"verify_server_certificate": false}
+                }
+            }],
+            "reject_unmatched": true
+        }),
+    ] {
+        let config2 = make_config(
+            vec![make_proxy("p1", "/api", vec!["pc-route"])],
+            vec![make_plugin_config_with_json(
+                "pc-route",
+                "mesh_route_dispatch",
+                bad_route,
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        );
+        let proxy_ids = std::collections::HashSet::from(["p1".to_string()]);
+        let error = cache
+            .apply_delta(&config2, &proxy_ids, &[], false)
+            .expect_err("unknown nested mesh_route_dispatch keys must reject the reload");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected reload error: {error}"
+        );
+        assert!(
+            cache
+                .get_plugins("p1")
+                .iter()
+                .any(|plugin| plugin.name() == "mesh_route_dispatch"),
+            "rejected candidate must retain the last-known-good mesh_route_dispatch generation"
+        );
+    }
+}
+
+#[test]
 fn test_plugin_cache_rejects_invalid_waf_config_as_security_plugin() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["pc1"])],

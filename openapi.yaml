@@ -9083,7 +9083,11 @@ components:
     MeshRouteBackendTlsConfig:
       type: object
       additionalProperties: false
-      description: Strict route-local backend TLS override for mesh_route_dispatch.
+      description: |
+        Strict route-local backend TLS override for mesh_route_dispatch.
+        Unknown keys (for example `client_certpath` or
+        `verify_server_certificate`) fail admission instead of silently
+        disabling intended mTLS materials or verification.
       properties:
         client_cert_path:
           type: [string, "null"]
@@ -9111,7 +9115,10 @@ components:
     MeshRouteRetryConfig:
       type: object
       additionalProperties: false
-      description: Strict route-local retry policy for mesh_route_dispatch.
+      description: |
+        Strict route-local retry policy for mesh_route_dispatch. Unknown keys
+        (for example `max_retry` or `retry_on_connect_failur`) fail admission
+        instead of silently falling back to defaults.
       properties:
         max_retries:
           type: integer
@@ -13309,6 +13316,13 @@ components:
         set by earlier instances. Per-rule `backend_tls` is direct-backend
         only (`upstream_id` destinations inherit TLS from the referenced
         Upstream).
+
+        Unknown keys are rejected at every owned nesting level, including
+        route-local `retry` / backoff and destination `backend_tls`
+        (`additionalProperties: false` / serde `deny_unknown_fields`). Shared
+        gateway `RetryConfig` and `BackendTlsConfig` schemas remain open for
+        other consumers; mesh routes use `MeshRouteRetryConfig` and
+        `MeshRouteBackendTlsConfig`.
       required: [rules]
       properties:
         rules:
