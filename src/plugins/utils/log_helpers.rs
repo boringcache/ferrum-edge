@@ -51,6 +51,13 @@ impl HttpBatchDrainOutcome {
 ///
 /// Used by [`handle_http_batch_response`] and by Loki's delivery classifier so
 /// every HTTP log sink shares one keep-alive-safe drain contract.
+///
+/// After a complete EOF drain the reqwest/hyper client returns the socket to
+/// its idle pool asynchronously. Log-sink flush workers (especially
+/// `batch_size = 1`) may start the next POST on the same task immediately;
+/// yielding once after EOF lets that pool reclaim run before the next
+/// checkout. This is cold-path sink I/O only — it does not change status,
+/// retry, cap, or timeout semantics.
 pub async fn drain_http_batch_response_body(response: reqwest::Response) -> HttpBatchDrainOutcome {
     if response
         .content_length()
@@ -65,7 +72,13 @@ pub async fn drain_http_batch_response_body(response: reqwest::Response) -> Http
     .await
     {
         Err(_) => HttpBatchDrainOutcome::Timeout,
-        Ok(Ok(bytes)) => HttpBatchDrainOutcome::Complete(bytes),
+        Ok(Ok(bytes)) => {
+            // Response (and its pooled connection) were dropped when the
+            // measure future completed; give the idle-pool reclaim a turn
+            // before the caller issues another request on this client.
+            tokio::task::yield_now().await;
+            HttpBatchDrainOutcome::Complete(bytes)
+        }
         Ok(Err(BoundedReadError::LimitExceeded { .. })) => HttpBatchDrainOutcome::LimitExceeded,
         Ok(Err(BoundedReadError::Stream(_))) => HttpBatchDrainOutcome::TransportFailure,
     }
