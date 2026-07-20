@@ -1255,7 +1255,7 @@ async fn test_otel_tracing_parent_not_sampled_skips_export() {
     let plugin = new_otel_trusted(&json!({
         "endpoint": format!("{}/v1/traces", mock_server.uri()),
         "batch_size": 1,
-        "flush_interval_ms": 50
+        "flush_interval_ms": 100
     }));
     let mut ctx = make_ctx();
     ctx.headers.insert(
@@ -1286,7 +1286,7 @@ async fn test_otel_tracing_grpc_nonzero_status_is_error() {
     let plugin = new_otel(&json!({
         "endpoint": format!("{}/v1/traces", mock_server.uri()),
         "batch_size": 1,
-        "flush_interval_ms": 50
+        "flush_interval_ms": 100
     }));
     let mut summary = make_summary(make_trace_metadata());
     summary.response_status_code = 200;
@@ -1325,7 +1325,7 @@ async fn test_otel_tracing_body_error_is_error_status() {
     let plugin = new_otel(&json!({
         "endpoint": format!("{}/v1/traces", mock_server.uri()),
         "batch_size": 1,
-        "flush_interval_ms": 50
+        "flush_interval_ms": 100
     }));
     let mut summary = make_summary(make_trace_metadata());
     summary.response_status_code = 200;
@@ -1351,7 +1351,7 @@ async fn test_otel_tracing_stream_error_is_error_status() {
     let plugin = new_otel(&json!({
         "endpoint": format!("{}/v1/traces", mock_server.uri()),
         "batch_size": 1,
-        "flush_interval_ms": 50
+        "flush_interval_ms": 100
     }));
     let mut summary = make_stream_summary(make_trace_metadata());
     summary.error_class = Some(ferrum_edge::retry::ErrorClass::ConnectionTimeout);
@@ -1374,7 +1374,7 @@ async fn test_otel_tracing_ws_disconnect_uses_new_span_id() {
     let plugin = new_otel(&json!({
         "endpoint": format!("{}/v1/traces", mock_server.uri()),
         "batch_size": 1,
-        "flush_interval_ms": 50
+        "flush_interval_ms": 100
     }));
     assert!(plugin.requires_ws_disconnect_hooks());
 
@@ -1426,7 +1426,7 @@ async fn test_otel_tracing_otlp_partial_success_is_logged_not_retried() {
     let plugin = new_otel(&json!({
         "endpoint": format!("{}/v1/traces", mock_server.uri()),
         "batch_size": 1,
-        "flush_interval_ms": 50,
+        "flush_interval_ms": 100,
         "max_retries": 3
     }));
     plugin.log(&make_summary(make_trace_metadata())).await;
@@ -1448,7 +1448,7 @@ async fn test_otel_tracing_http_4xx_is_not_error() {
     let plugin = new_otel(&json!({
         "endpoint": format!("{}/v1/traces", mock_server.uri()),
         "batch_size": 1,
-        "flush_interval_ms": 50
+        "flush_interval_ms": 100
     }));
     let mut summary = make_summary(make_trace_metadata());
     summary.response_status_code = 404;
@@ -1471,7 +1471,7 @@ async fn test_otel_tracing_span_name_ignores_high_cardinality_path() {
     let plugin = new_otel(&json!({
         "endpoint": format!("{}/v1/traces", mock_server.uri()),
         "batch_size": 1,
-        "flush_interval_ms": 50
+        "flush_interval_ms": 100
     }));
     let mut summary = make_summary(make_trace_metadata());
     summary.request_path = "/probe/00000001".to_string();
