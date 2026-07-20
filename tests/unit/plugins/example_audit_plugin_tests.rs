@@ -257,7 +257,13 @@ fn test_dialect_sql_forms_use_table_name_and_correct_placeholders() {
     );
     let sqlite_mysql_placeholders = vec!["?"; 13];
     assert_eq!(sqlite_mysql_placeholders.len(), 13);
-    assert_eq!(sqlite_mysql_placeholders.iter().filter(|p| **p == "?").count(), 13);
+    assert_eq!(
+        sqlite_mysql_placeholders
+            .iter()
+            .filter(|p| **p == "?")
+            .count(),
+        13
+    );
 }
 
 #[test]
@@ -740,9 +746,15 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         }
     }
 
-    assert!(saw_http, "expected HTTP audit row (H1/H2/H3 share this label)");
+    assert!(
+        saw_http,
+        "expected HTTP audit row (H1/H2/H3 share this label)"
+    );
     assert!(saw_grpc, "expected gRPC audit row with terminal status");
-    assert!(saw_grpc_web, "expected gRPC-Web audit row from mesh metadata");
+    assert!(
+        saw_grpc_web,
+        "expected gRPC-Web audit row from mesh metadata"
+    );
     assert!(saw_h1_websocket, "expected H1 WebSocket upgrade audit row");
     assert!(
         saw_h2_websocket,
