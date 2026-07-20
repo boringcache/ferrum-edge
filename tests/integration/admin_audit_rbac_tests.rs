@@ -489,10 +489,7 @@ async fn nested_provider_credentials_are_recursively_redacted() {
 
     let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
     assert_eq!(status, 201, "plugin create failed: {body:?}");
-    assert_eq!(
-        body["config"]["providers"][0]["api_key"],
-        provider_api_key
-    );
+    assert_eq!(body["config"]["providers"][0]["api_key"], provider_api_key);
 
     let audit_body = wait_for_audit_total(
         &base,
@@ -504,18 +501,11 @@ async fn nested_provider_credentials_are_recursively_redacted() {
     let audit_config =
         &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
     assert_eq!(audit_config["providers"][0]["api_key"], "[REDACTED]");
-    assert_eq!(
-        audit_config["providers"][0]["name"],
-        "redaction-provider"
-    );
+    assert_eq!(audit_config["providers"][0]["name"], "redaction-provider");
     assert_eq!(audit_config["providers"][0]["model_patterns"][0], "gpt-*");
 
-    let (status, viewer_body) = get_json(
-        &base,
-        "/plugins/config/nested-provider-redaction",
-        &viewer,
-    )
-    .await;
+    let (status, viewer_body) =
+        get_json(&base, "/plugins/config/nested-provider-redaction", &viewer).await;
     assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
     assert_eq!(
         viewer_body["config"]["providers"][0]["api_key"],
@@ -526,12 +516,8 @@ async fn nested_provider_credentials_are_recursively_redacted() {
         "redaction-provider"
     );
 
-    let (status, admin_body) = get_json(
-        &base,
-        "/plugins/config/nested-provider-redaction",
-        &admin,
-    )
-    .await;
+    let (status, admin_body) =
+        get_json(&base, "/plugins/config/nested-provider-redaction", &admin).await;
     assert_eq!(status, 200, "admin plugin get failed: {admin_body:?}");
     assert_eq!(
         admin_body["config"]["providers"][0]["api_key"],
