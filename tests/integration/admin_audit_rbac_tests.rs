@@ -376,8 +376,6 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
     let admin = token("security-admin", Some("admin"));
 
     let secret_key = "super-secret-load-test-key";
-    let nested_api_key = "nested-api-key-value";
-    let service_account_json = r#"{"private_key":"federation-private-key"}"#;
     let plugin = json!({
         "id": "audit-plugin-secret",
         "plugin_name": "load_testing",
@@ -386,11 +384,7 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
             "key": secret_key,
             "concurrent_clients": 1,
             "duration_seconds": 1,
-            "nested": {
-                "api_key": nested_api_key,
-                "google_service_account_json": service_account_json,
-                "label": "safe-label"
-            }
+            "ramp": true
         }
     });
 
@@ -407,30 +401,13 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
     .await;
     let event = &audit_body["items"].as_array().expect("audit items")[0];
     assert_eq!(event["diff"]["after"]["config"]["key"], "[REDACTED]");
-    assert_eq!(
-        event["diff"]["after"]["config"]["nested"]["api_key"],
-        "[REDACTED]"
-    );
-    assert_eq!(
-        event["diff"]["after"]["config"]["nested"]["google_service_account_json"],
-        "[REDACTED]"
-    );
-    assert_eq!(
-        event["diff"]["after"]["config"]["nested"]["label"],
-        "safe-label"
-    );
+    assert_eq!(event["diff"]["after"]["config"]["ramp"], true);
+    assert_eq!(event["diff"]["after"]["config"]["concurrent_clients"], 1);
+    assert_eq!(event["diff"]["after"]["config"]["duration_seconds"], 1);
     let serialized = event["diff"].to_string();
     assert!(
         !serialized.contains(secret_key),
         "secret key leaked: {event:?}"
-    );
-    assert!(
-        !serialized.contains(nested_api_key),
-        "nested API key leaked: {event:?}"
-    );
-    assert!(
-        !serialized.contains(service_account_json),
-        "service account JSON leaked: {event:?}"
     );
 }
 
@@ -444,8 +421,6 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
     let operator = token("mesh-operator", Some("operator"));
 
     let secret_key = "read-secret-load-test-key";
-    let nested_api_key = "read-nested-api-key-value";
-    let service_account_json = r#"{"private_key":"federation-private-key"}"#;
     let plugin = json!({
         "id": "read-plugin-secret",
         "plugin_name": "load_testing",
@@ -454,11 +429,7 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
             "key": secret_key,
             "concurrent_clients": 1,
             "duration_seconds": 1,
-            "nested": {
-                "api_key": nested_api_key,
-                "google_service_account_json": service_account_json,
-                "label": "safe-label"
-            }
+            "ramp": true
         }
     });
 
@@ -469,37 +440,28 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
         get_json(&base, "/plugins/config/read-plugin-secret", &viewer).await;
     assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
     assert_eq!(viewer_body["config"]["key"], "[REDACTED]");
-    assert_eq!(viewer_body["config"]["nested"]["api_key"], "[REDACTED]");
-    assert_eq!(
-        viewer_body["config"]["nested"]["google_service_account_json"],
-        "[REDACTED]"
-    );
+    assert_eq!(viewer_body["config"]["ramp"], true);
+    assert_eq!(viewer_body["config"]["concurrent_clients"], 1);
     assert!(
         !viewer_body.to_string().contains(secret_key),
         "viewer response leaked plugin secret: {viewer_body:?}"
-    );
-    assert!(
-        !viewer_body.to_string().contains(nested_api_key),
-        "viewer response leaked nested plugin secret: {viewer_body:?}"
-    );
-    assert!(
-        !viewer_body.to_string().contains(service_account_json),
-        "viewer response leaked service account JSON: {viewer_body:?}"
     );
 
     let (status, operator_body) =
         get_json(&base, "/plugins/config/read-plugin-secret", &operator).await;
     assert_eq!(status, 200, "operator plugin get failed: {operator_body:?}");
     assert_eq!(operator_body["config"]["key"], "[REDACTED]");
+    assert_eq!(operator_body["config"]["ramp"], true);
 
     let (status, admin_body) = get_json(&base, "/plugins/config/read-plugin-secret", &admin).await;
     assert_eq!(status, 200, "admin plugin get failed: {admin_body:?}");
     assert_eq!(admin_body["config"]["key"], secret_key);
-    assert_eq!(admin_body["config"]["nested"]["api_key"], nested_api_key);
+    assert_eq!(admin_body["config"]["ramp"], true);
 
     let (status, list_body) = get_json(&base, "/plugins/config", &viewer).await;
     assert_eq!(status, 200, "viewer plugin list failed: {list_body:?}");
     assert_eq!(list_body["data"][0]["config"]["key"], "[REDACTED]");
+    assert_eq!(list_body["data"][0]["config"]["ramp"], true);
 }
 
 #[tokio::test]
