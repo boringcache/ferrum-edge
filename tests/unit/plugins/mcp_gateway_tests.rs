@@ -5079,10 +5079,12 @@ async fn aggregate_initialize_echoes_requested_supported_version() {
 /// the direct governor unit test.
 #[tokio::test]
 async fn composed_governor_and_mcp_gateway_normalize_omitted_mcp_arguments() {
-    assert!(
-        priority::AI_TOOL_GOVERNOR < priority::MCP_GATEWAY,
-        "composition must run ai_tool_governor before mcp_gateway"
-    );
+    const {
+        assert!(
+            priority::AI_TOOL_GOVERNOR < priority::MCP_GATEWAY,
+            "composition must run ai_tool_governor before mcp_gateway"
+        );
+    }
 
     // --- Permissive object schema: omitted and {} accepted by both layers ---
     let server = start_mcp_zero_arg_tool_server().await;
