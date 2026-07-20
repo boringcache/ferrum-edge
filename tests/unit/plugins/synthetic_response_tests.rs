@@ -42,7 +42,9 @@ fn prepare_no_body_status_strips_content_length() {
         let wire = prepare_synthetic_response_wire("GET", status, &mut headers, b"x");
         assert!(wire.is_empty(), "status {status}");
         assert!(
-            !headers.keys().any(|k| k.eq_ignore_ascii_case("content-length")),
+            !headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-length")),
             "status {status} must drop Content-Length"
         );
     }

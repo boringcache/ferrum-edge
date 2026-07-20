@@ -2139,12 +2139,13 @@ impl Plugin for ServerlessFunction {
                 // this lifecycle and deliberately do not set the marker again.
                 ctx.serverless_terminate_response = true;
                 let mut response_headers = response_headers;
-                let wire = crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
-                    &ctx.method,
-                    status,
-                    &mut response_headers,
-                    &body,
-                );
+                let wire =
+                    crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+                        &ctx.method,
+                        status,
+                        &mut response_headers,
+                        &body,
+                    );
                 PluginResult::RejectBinary {
                     status_code: status,
                     body: Bytes::copy_from_slice(wire.as_ref()),

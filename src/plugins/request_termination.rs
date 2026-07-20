@@ -68,7 +68,8 @@ impl RequestTermination {
         let content_type = parse_content_type(config)?;
         let raw_body = optional_string(config, "body")?;
         let message = optional_string(config, "message")?;
-        let no_body_status = super::utils::synthetic_response::status_forbids_response_body(status_code);
+        let no_body_status =
+            super::utils::synthetic_response::status_forbids_response_body(status_code);
 
         // Pre-render the response body so the hot path skips format!/replace.
         let body = if no_body_status {

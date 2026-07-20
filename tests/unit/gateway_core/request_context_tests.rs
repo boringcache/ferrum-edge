@@ -175,10 +175,7 @@ fn raw_header_get_remains_available_after_materialization() {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
     let mut raw = HeaderMap::new();
     raw.insert("host", "example.com".parse().unwrap());
-    raw.append(
-        "x-policy",
-        http::HeaderValue::from_bytes(&[0x80]).unwrap(),
-    );
+    raw.append("x-policy", http::HeaderValue::from_bytes(&[0x80]).unwrap());
     ctx.set_raw_headers(raw);
 
     ctx.materialize_headers();
