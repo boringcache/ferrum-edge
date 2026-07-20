@@ -2350,13 +2350,10 @@ async fn test_protobuf_empty_message_valid() {
     assert_continue(plugin.on_final_request_body(&headers, &frame).await);
 }
 
-// ─── SSE response buffering bypass ──────────────────────────────────
+// ─── SSE response policy boundary ───────────────────────────────────
 
 #[test]
-fn test_sse_request_skips_response_validation_buffering() {
-    // A response-validating body_validator config buffers responses for
-    // the validator to inspect. SSE responses must bypass that buffer or
-    // the gateway 502s once the max-response-body limit is hit.
+fn test_sse_request_intent_cannot_skip_response_validation_buffering() {
     let plugin = BodyValidator::new(&json!({
         "response_required_fields": ["id"]
     }))
@@ -2371,7 +2368,95 @@ fn test_sse_request_skips_response_validation_buffering() {
     ctx.headers
         .insert("accept".to_string(), "text/event-stream".to_string());
 
-    assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(plugin.should_buffer_response_body(&ctx));
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &response_headers));
+    assert!(
+        plugin.should_release_response_body_before_content_type_rewrite(
+            &ctx,
+            200,
+            &response_headers,
+        )
+    );
+    let json_profile_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/json; profile=event-stream".to_string(),
+    )]);
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &json_profile_headers,));
+    assert!(
+        !plugin.should_release_response_body_before_content_type_rewrite(
+            &ctx,
+            200,
+            &json_profile_headers,
+        )
+    );
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &response_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new(),));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json; profile=event-stream"),
+        200,
+        &HashMap::new(),
+    ));
+}
+
+#[tokio::test]
+async fn test_genuine_sse_fails_closed_before_body_validation_streams() {
+    let plugin = BodyValidator::new(&json!({
+        "response_required_fields": ["id"]
+    }))
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/events".to_string(),
+    );
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+
+    assert_reject(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn test_pristine_sse_relabel_cannot_erase_body_validation_boundary() {
+    let plugin = BodyValidator::new(&json!({
+        "response_required_fields": ["id"]
+    }))
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/events".to_string(),
+    );
+    ctx.metadata.insert(
+        "ferrum:original_response_metadata_stamped".to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata.insert(
+        "ferrum:original_response_content_type".to_string(),
+        "text/event-stream".to_string(),
+    );
+    let mut relabeled_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    assert_reject(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut relabeled_headers)
+            .await,
+        Some(502),
+    );
 }
 
 #[test]

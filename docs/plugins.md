@@ -3092,6 +3092,22 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `reject_content_type` | string | `application/json` | Content-Type header for enforced rejects. |
 | `reject_body` | string | `{"error":"Forbidden"}` | Body returned for enforced rejects. |
 
+**Unbounded SSE responses:** Request-controlled `Accept: text/event-stream` and
+internal streaming markers never bypass response-body policy. When the pristine
+backend response is `text/event-stream` and response-body inspection is active,
+WAF decides before headers are committed. `on_body_too_large: skip` explicitly
+allows the stream uninspected; `block` rejects in global enforce mode; and the
+default `scan_truncated` rejects when an enforcing response-body rule or anomaly
+scoring policy would otherwise claim inspection, while monitor-only policy
+records and permits the stream. With `log_to_metadata: true`, the decision sets
+`waf.response_stream_uninspectable=true`; allowed streams use
+`waf.action=stream_uninspected`, and blocked streams use `waf.action=blocked`
+with `waf.block_reason=unbounded_response_stream`. `on_scan_timeout` governs a
+scan that actually runs and is not used for a stream on which no bounded scan
+can start. Missing, ambiguous, and later-relabeled response types are not proof
+of SSE; WAF applies its ordinary content-type eligibility rules and may release
+representations explicitly outside the configured response-body scan scope.
+
 > **Reserved log-metadata namespace:** the `waf.` prefix in `TransactionSummary.metadata` is owned by the WAF plugin. `clone_log_metadata` (called on every HTTP-family transaction-log emission path) strips all `waf.*` keys that were not written by the WAF plugin itself and re-applies only the WAF-owned values. This prevents other plugins or inbound request data from spoofing WAF transaction-log fields on HTTP-family transactions. (Stream-proxy summaries — TCP/UDP/DTLS, built by `build_udp_stream_summary` / `build_dtls_stream_summary` — clone their context metadata directly and do not route through `clone_log_metadata`; the WAF runs only on HTTP-family protocols, so there is no authoritative `waf.*` to protect on stream logs.) As a result, any `waf.`-prefixed key inserted into `ctx.metadata` by a custom plugin or operator-side code will be silently dropped from HTTP-family transaction logs on every proxy, regardless of whether a WAF plugin is active. Use a different prefix for custom metadata that should coexist with WAF output.
 
 **Custom rule fields:**
@@ -3200,6 +3216,13 @@ Request-side validation only buffers matching request bodies: methods that can c
 
 **Scope**: Protobuf validation supports unary RPCs only (single frame per message). Streaming RPCs with multiple concatenated frames are not validated — the length mismatch check will reject multi-frame bodies.
 
+When response validation is configured, request `Accept` and internal streaming
+markers cannot waive it. The plugin buffers conservatively until pristine
+backend headers are known and rejects a genuine `text/event-stream` response
+with HTTP 502 before committing headers, because it has no bounded streaming
+JSON/XML/protobuf validator. Missing, ambiguous, or later-relabeled content
+types remain on the ordinary validation path.
+
 **Supported JSON Schema `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
 
 ### `openapi_validator`
@@ -3225,7 +3248,7 @@ Validates request and response bodies against operation schemas generated from a
 | `bypass.consumers` | String[] | `[]` | Consumer identities that skip validation |
 | `bypass.header_present` | object | `{}` | Header presence/value checks that skip validation |
 
-`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses, skips SSE responses, supports gzip and brotli decompression, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata, supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
+`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses, supports gzip and brotli decompression, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata, supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. Request `Accept` and internal streaming markers cannot waive response validation. If a matching operation with response schemas receives a pristine backend `text/event-stream`, the plugin records an uninspectable response mismatch before header commit: `block` returns the configured response error (502 by default), while `log_only` records the mismatch and permits the stream. Missing, ambiguous, or later-relabeled types stay on the normal validation path. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
 
 See [openapi_validator.md](openapi_validator.md) for the full generated config shape, `x-ferrum-validate` options, and emergency override behavior.
 
@@ -3262,6 +3285,13 @@ Enforcement happens in two places:
 - `on_final_response_body` re-checks the final post-transform body when buffering is active (either via `require_buffered_check: true` or because another plugin requires response buffering).
 
 For streaming responses without `Content-Length` where buffering is disabled, the global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies via the gateway's `SizeLimitedStreamingResponse` adapter (frame-by-frame enforcement, no buffering).
+
+With `require_buffered_check: true`, the configured route ceiling is a strict
+whole-body policy. Request `Accept` and internal streaming markers cannot bypass
+it. A pristine backend `text/event-stream` response is rejected with HTTP 502
+before headers are committed because the complete route-bounded size cannot be
+proven without collecting an unbounded stream; the generally larger global
+streaming ceiling is not silently substituted for the configured route limit.
 
 ### `response_caching`
 
@@ -3915,7 +3945,7 @@ config:
 
 **Endpoint URLs.** An endpoint that carries its own query string (e.g. an Azure-style `?api-version=…`) is preserved: the endpoint query and the client's own query are merged with `&` into the forwarded URL (the client's parameters are marked as consumed so the dispatch path does not append a second `?`). IPv6 literal hosts are bracketed in the forwarded authority/`Host`. By default an `https` endpoint is verified against the system trust store; set `inherit_backend_tls: true` on a provider to keep the proxy's own resolved backend TLS (custom CA bundle, SNI/SAN policy, backend mTLS client certificate) for internal `openai_compatible` endpoints behind private PKI.
 
-**Composition with `ai_federation`.** Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`. `ai_federation` checks this at the top of its final request-body hook and immediately `Continue`s, so the two plugins compose on the same proxy: `stream: true` is served by `ai_stream_router`, `stream: false` by `ai_federation`. Claimed requests also set the shared `ai_request_streaming` marker so response-side plugins (`ai_response_guard`, `ai_token_metrics`, …) keep the provider SSE on the streaming path even when the client did not send `Accept: text/event-stream`.
+**Composition with `ai_federation`.** Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`. `ai_federation` checks this at the top of its final request-body hook and immediately `Continue`s, so the two plugins compose on the same proxy: `stream: true` is served by `ai_stream_router`, `stream: false` by `ai_federation`. Claimed requests also set the shared `ai_request_streaming` marker for non-policy streaming helpers such as token metrics. The marker is not authority to waive an outbound security policy: `ai_response_guard`, WAF response-body inspection, response validators, and strict response-size policy buffer conservatively and decide from the pristine backend representation. In particular, an enforcing/redacting `ai_response_guard` rejects a genuine provider SSE response before commit because it cannot promise complete bounded inspection; use a stream-aware policy such as `ai_semantic_firewall` progressive inspection instead of relying on the marker.
 
 **Metadata keys written:** `ai_stream_router.enabled`, `ai_stream_router.claimed`, `ai_stream_router_claimed`, `ai_request_streaming`, `suppress_backend_consumer_identity_headers`, `ai_stream_router.provider`, `ai_stream_router.provider_type`, `ai_stream_router.model`, `ai_stream_router.normalized_response_stream`, and `ai_stream_router.fallback_attempts`.
 
@@ -3946,7 +3976,7 @@ Semantically inspects LLM request and response bodies for prompt injection, jail
 
 > **Choosing a streaming mode.** Production enforcement should use `streaming_response: reject`, `buffer`, or `inspect` and `on_error: reject`. Use `buffer` when full-context accuracy matters more than UX (short responses, agent/batch backends) and you can spend the time-to-first-byte; `inspect` (block) when streaming UX must be preserved and windowed granularity + per-window latency are acceptable; `inspect` + `enforcement: detect` when you want to observe/log violations without affecting the stream; `reject` when no streaming is acceptable; `skip` only when response inspection is advisory. `buffer`'s memory cost is the dimension to weigh: because `stream: true` is the common case for production LLM clients, enabling `buffer` means *most* responses on that proxy are held fully in memory — up to `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` each — before the client receives a byte, so peak memory scales roughly as **concurrent streams × buffered completion size**; size that cap and the overload-manager thresholds for the aggregate, and do **not** set `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0` (unlimited) on a `buffer`-mode proxy or the oversize-502 bound is lost. `inspect` avoids the full-hold cost (only one window is held at a time, capped by `streaming.max_window_bytes`).
 
-Under `reject`, `buffer`, `inspect`, or explicit `skip`, a response-only policy buffers the request body solely to read the `stream` flag, which disables the direct HTTP/2 backend path for that proxy. Because `buffer` pins the SSE response onto the buffered path, any *other* response-body plugin on the same proxy (e.g. `ai_response_guard`) will now also see and inspect the buffered stream in its `on_response_body`, where a streamed response would previously have bypassed it — safe (those plugins are SSE-aware) and generally desirable (more inspection), but a latency/memory behavior change worth noting when several response-body plugins are configured together. The `response_inspection_skipped` marker is written from the request path when an explicit `skip` response-only policy or request-side inspection makes the request body available. Native gRPC protobuf payloads are not inspected.
+Under `reject`, `buffer`, `inspect`, or explicit `skip`, a response-only policy buffers the request body solely to read the `stream` flag, which disables the direct HTTP/2 backend path for that proxy. All active response-body plugins still make independent decisions. An enforcing/redacting `ai_response_guard`, response validator, strict response-size limiter, or enforcing WAF cannot be made permissive by the firewall's `buffer` choice: each recognizes the pristine event-stream representation and applies its own pre-commit fail-closed posture. A warn-only guard or monitor/explicit-skip WAF can permit the firewall's selected bounded/progressive handling while recording that its own complete-body policy was not enforceable. The `response_inspection_skipped` marker is written from the request path when an explicit `skip` response-only policy or request-side inspection makes the request body available. Native gRPC protobuf payloads are not inspected.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -4536,7 +4566,7 @@ In `scan_fields: "all"` mode, the recursive redactor preserves only **top-level 
 
 The `redaction_placeholder` template is emitted literally: any `$`-sequences in it or in an operator-supplied custom pattern name are written verbatim and are never interpreted as regex capture-group references. Literal blocked phrases never become public identifiers: placeholders, reject bodies, metadata, and logs use bounded positional IDs such as `blocked_phrase:0`, never the configured phrase itself.
 
-**Streaming (SSE):** Genuine streaming clients — `Accept: text/event-stream` or requests marked streaming by an earlier AI plugin — are never re-buffered. For an already-buffered SSE-framed response, the guard parses complete SSE events (including legal multi-`data:` events), redacts the joined JSON event, and preserves LF/CRLF framing. If restricted content spans events or otherwise cannot be rewritten, enforcing redaction fails closed with 502 instead of forwarding content while claiming it was redacted. Malformed or non-UTF-8 buffered SSE also fails closed for reject/redact policies.
+**Streaming (SSE):** Request-controlled `Accept: text/event-stream` and internal streaming markers never waive the guard. An active guard buffers conservatively until the pristine backend representation is known. A genuine backend `text/event-stream` response is decided before header commit: `reject`, `redact`, and structural enforcement reject with HTTP 502 because complete inspection of an unbounded stream cannot be promised; a genuinely warn-only guard records the uninspectable response and permits it. A later response-header plugin cannot manufacture or erase the pristine content type used for this decision, and a missing or ambiguous backend type remains on the ordinary buffered inspection path. The existing bounded SSE parser remains applicable to finite gateway-generated or otherwise already-buffered SSE bodies: it joins legal multi-`data:` events, preserves LF/CRLF framing, and fails closed for enforcing/redacting malformed or non-UTF-8 content.
 
 **Multi-provider support:** Content mode covers OpenAI chat text strings and content-part arrays (including `{type: refusal}` parts and message/delta `refusal` strings), tool/function names and arguments, legacy `choices[].text`/`function_call`, Responses API `output_text` and `output[].{content,arguments}`, Anthropic `content[].text`, and Google Gemini `candidates[].content.parts[].text`. Adjacent text-bearing parts of one content array (and adjacent Anthropic text blocks / Gemini parts) are joined before detection and length enforcement, so a match or length overflow split across part boundaries cannot bypass the guard; a redact-mode match that exists only across part boundaries fails closed with 502. Tool/function `arguments` are nested JSON serialized into a string: both modes scan the raw string and its decoded tokens (one bounded parse per argument string), and redact mode rewrites the decoded document — argument content that cannot be rewritten (a decoded object key or numeric scalar) fails closed. The buffered SSE path reassembles the corresponding OpenAI chat/tool, Responses API, and refusal deltas before detection and applies the same decoded-argument scanning.
 

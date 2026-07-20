@@ -179,7 +179,11 @@ Built-in plugins with per-request refinement:
 | `compression` | `Accept-Encoding` header is absent (nothing to compress) |
 | `ai_token_metrics` | Request is native gRPC, or the client asked for a stream (`Accept: text/event-stream` / a `stream: true` request) without `buffer_streaming_responses: true` (pre-header); additionally, after headers, when the response content type is not JSON, or is `text/event-stream` without `buffer_streaming_responses: true` |
 | `ai_rate_limiter` | Never for active HTTP/gRPC responses; response usage reconciliation needs the body. Its pre-request reservation path only buffers request bodies for JSON `POST` requests. |
-| `ai_response_guard` | Client requested SSE (`Accept: text/event-stream`) or an earlier AI request plugin marked the request as streaming; all other HTTP requests request buffering, then response status/content type determine inspection |
+| `ai_response_guard` | Never from request-side intent. An active guard buffers conservatively until pristine backend headers are known. A genuine backend event stream is then decided before header commit: enforcing/redacting/structural policies reject with 502 because they cannot inspect an unbounded stream completely, while a warn-only guard records the uninspectable stream and permits it. |
+| `body_validator` response rules | Never from request-side intent. A genuine backend event stream is rejected with 502 before header commit while response validation is active. |
+| `openapi_validator` response rules | Never from request-side intent. A genuine backend event stream follows the configured response-mismatch posture: `block` rejects before commit; `log_only` records the mismatch and permits the stream. |
+| `waf` response-body rules | Never from request-side intent. A genuine backend event stream follows `on_body_too_large`: explicit `skip` permits it uninspected, `block` rejects in enforce mode, and `scan_truncated` rejects when an enforcing response-body rule or scoring policy would otherwise claim inspection (monitor-only policy records and permits it). |
+| `response_size_limiting` with `require_buffered_check: true` | Never from request-side intent. A genuine backend event stream is rejected with 502 before commit because the strict route ceiling is a whole-body policy; without strict buffering, the global streaming byte counter remains the applicable bound. |
 | `response_transformer` body rules | Never from request-side SSE intent: `Accept: text/event-stream` is client controlled, so pre-header buffering remains conservative. After backend headers, a response that actually declares `text/event-stream` is released; JSON, missing, and ambiguous types remain buffered. |
 
 The decision in code:
@@ -219,6 +223,20 @@ streaming representation out after headers arrive only when every other active
 buffering plugin reports that it does not need that content type; the MCP and
 A2A gateways use this for `text/event-stream`, whose retry decision is complete
 from status and headers and whose body must not be collected to EOF.
+
+Outbound body-policy plugins never use `Accept: text/event-stream` or an
+internal request-streaming marker as authority to waive inspection. The Accept
+parser treats `q=0`, malformed/bare `q`, duplicate `q`, and invalid qvalues as
+non-affirmative even for non-policy streaming hints. The policy decision uses
+the pristine backend `Content-Type` stamped before `after_proxy`; a later header
+plugin cannot manufacture, erase, or relabel that evidence. A stamped missing
+or ambiguous type is therefore never accepted as proof of SSE: each plugin's
+ordinary non-SSE eligibility rules still apply. In particular, WAF may release a
+type that is explicitly outside its configured response-body scan scope, while
+the JSON/XML validators and strict response-size policies continue to claim it.
+When several buffering plugins are active, release still requires every one of
+them to agree; any plugin that claims the representation pins it to buffering or
+returns its configured pre-commit rejection.
 
 Because this check can only release a previously buffered response, complete-body
 inspectors must treat opaque representation metadata conservatively. For example,
@@ -285,6 +303,12 @@ buffering decision and may narrow that decision by request or response
 |------------------------|------------------------|-------------------|
 | `response_transformer` header-only rules | No | No |
 | `response_transformer` body rules | Yes for JSON; genuine SSE is outside the document policy | Yes before headers; released after headers only for backend `text/event-stream` |
+| `ai_response_guard` enforcing/redacting rules | Yes | Yes before headers; genuine backend SSE is rejected with 502 before commit |
+| `ai_response_guard` warn-only rules | No mutation | Yes before headers; genuine backend SSE is recorded as uninspectable and may stream only if every other active plugin permits it |
+| `body_validator` response rules | Validation only | Yes before headers; genuine backend SSE is rejected with 502 before commit |
+| `openapi_validator` response rules | Validation only | Yes before headers; genuine backend SSE is rejected in `block` mode or recorded/allowed in `log_only` mode |
+| `waf` response-body rules | Inspection/rejection only | Yes before headers; genuine backend SSE follows the explicit `on_body_too_large` and enforcement/scoring posture |
+| strict `response_size_limiting` | Validation only | Yes before headers; genuine backend SSE is rejected because a whole-body route ceiling cannot be proven incrementally |
 | `cors` | No (headers only) | No |
 | `stdout_logging` | No | No |
 | `http_logging` | No | No |

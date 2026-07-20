@@ -14648,6 +14648,12 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
         "true".to_string(),
     );
 
+    // Once a response-body phase selects a gateway-authored terminal response,
+    // later final-body validators must not inspect that error payload and replace
+    // the original policy decision with a second rejection. Presentation and
+    // protocol transforms still run below so the selected response keeps the
+    // correct client wire shape.
+    let mut terminal_body_response_selected = false;
     let mut response_body_reject = None;
     for plugin in plugins.iter() {
         let deadline = ctx.grpc_deadline_at();
@@ -14677,6 +14683,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
         // the caller so one-shot response state survives this replacement.
         *response_body =
             rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+        terminal_body_response_selected = true;
     }
 
     // Same shared representation gate as every backend path. The bytes here were
@@ -14702,6 +14709,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
         false,
     )
     .await;
+    terminal_body_response_selected |= matches!(admission, BufferedTransformAdmission::Rejected);
     // Read after the gate: a decoded body installs fresh representation headers.
     let content_type = response_headers.get("content-type").cloned();
     let ct_ref = content_type.as_deref();
@@ -14766,38 +14774,50 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                     headers: HashMap::new(),
                 },
             );
+            terminal_body_response_selected = true;
         }
     }
 
-    let mut response_body_reject = None;
-    for plugin in plugins.iter() {
-        let deadline = ctx.grpc_deadline_at();
-        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
-            deadline,
-            plugin.on_final_response_body(ctx, *response_status, response_headers, response_body),
-        )
-        .await
-        .into_plugin_result(ctx);
-        match result {
-            PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                let reject = plugin_result_into_reject_parts(reject)
-                    .expect("reject result should convert to rejection parts");
-                debug!(
-                    plugin = plugin.name(),
-                    status_code = reject.status_code,
-                    "Plugin rejected finalized synthetic response body"
-                );
-                response_body_reject = Some(reject);
-                break;
+    if !terminal_body_response_selected {
+        let mut response_body_reject = None;
+        for plugin in plugins.iter() {
+            let deadline = ctx.grpc_deadline_at();
+            let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+                deadline,
+                plugin.on_final_response_body(
+                    ctx,
+                    *response_status,
+                    response_headers,
+                    response_body,
+                ),
+            )
+            .await
+            .into_plugin_result(ctx);
+            match result {
+                PluginResult::Continue => {}
+                reject @ PluginResult::Reject { .. }
+                | reject @ PluginResult::RejectBinary { .. } => {
+                    let reject = plugin_result_into_reject_parts(reject)
+                        .expect("reject result should convert to rejection parts");
+                    debug!(
+                        plugin = plugin.name(),
+                        status_code = reject.status_code,
+                        "Plugin rejected finalized synthetic response body"
+                    );
+                    response_body_reject = Some(reject);
+                    break;
+                }
             }
         }
-    }
-    if let Some(reject) = response_body_reject {
-        // Rebuild headers/body only; the after_proxy reject hooks run once in
-        // the caller so one-shot response state survives this replacement.
-        *response_body =
-            rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+        if let Some(reject) = response_body_reject {
+            // Rebuild headers/body only; the after_proxy reject hooks run once in
+            // the caller so one-shot response state survives this replacement.
+            *response_body = rebuild_plugin_rejection_response_headers(
+                response_status,
+                response_headers,
+                reject,
+            );
+        }
     }
 
     // Restore the synthetic short-circuit marker to its prior state so it does
@@ -21998,10 +22018,12 @@ async fn handle_proxy_request_inner(
                 let mut terminal_metadata_is_body_framed = false;
                 let initial_response_header_policy_names =
                     plugin_cache_view.initial_response_header_policy_names();
-                // Set once an `on_response_body` hook replaces the backend
-                // response with a gateway-authored rejection. From that point the
-                // buffered bytes are the gateway's own, so the representation gate
-                // must judge them as such instead of against the backend snapshot.
+                // Set once an earlier body phase selects a gateway-authored
+                // terminal response. The transform phase still runs so protocol
+                // transforms such as gRPC-Web can emit the correct wire shape,
+                // but final-body validators must not replace the selected error.
+                // While this is first set by `on_response_body`, it also records a
+                // representation-gate or deadline replacement below.
                 let mut response_body_rejected = false;
                 let mut authoritative_trailers_only_terminal_metadata = (response_body.is_empty()
                     && response_trailers.is_empty())
@@ -22163,6 +22185,7 @@ async fn handle_proxy_request_inner(
                         terminal_metadata_is_body_framed |=
                             grpc_web_response_content_type.is_some();
                     }
+                    response_body_rejected |= response_replaced;
                     // Record genuine transform-phase edits BEFORE retiring stale
                     // compatibility-view trailers below. The discard removes
                     // trailer-only names from the merged view; if it ran first, a
@@ -22186,7 +22209,7 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
-                if !after_proxy_rejected {
+                if !after_proxy_rejected && !response_body_rejected {
                     let phase_start = Instant::now();
                     for plugin in plugins.iter() {
                         let deadline = ctx.grpc_deadline_at();
@@ -23832,10 +23855,12 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    // Set once an `on_response_body` hook replaces the backend response with a
-    // gateway-authored rejection. From that point the buffered bytes are the
-    // gateway's own, so the representation gate must judge them as such instead
-    // of against the replaced backend response's snapshot.
+    // Set once an earlier body phase selects a gateway-authored terminal
+    // response. The transform phase still runs so presentation/protocol
+    // transforms can emit the correct wire shape, but final-body validators must
+    // not replace the selected error. While this is first set by
+    // `on_response_body`, it also records a representation-gate or deadline
+    // replacement below.
     let mut response_body_rejected = false;
 
     // on_response_body hooks — only for buffered responses, only when plugins exist.
@@ -23895,7 +23920,7 @@ async fn handle_proxy_request_inner(
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
-        transform_buffered_response_body_with_deadline(
+        let (response_replaced, _) = transform_buffered_response_body_with_deadline(
             &plugins,
             &mut ctx,
             buffered_response_representation_origin(response_body_rejected),
@@ -23906,12 +23931,14 @@ async fn handle_proxy_request_inner(
             initial_response_header_policy_plugins.as_ref(),
         )
         .await;
+        response_body_rejected |= response_replaced;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     // on_final_response_body hooks — buffered responses after all body transforms.
     // This lets plugins validate or persist the final client-visible payload.
     if !after_proxy_rejected
+        && !response_body_rejected
         && !plugins.is_empty()
         && let ResponseBody::Buffered(ref data) = response_body
     {

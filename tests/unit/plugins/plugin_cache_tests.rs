@@ -5424,8 +5424,29 @@ fn test_priority_override_delegates_response_buffering_refinement() {
         .insert("accept".to_string(), "text/event-stream".to_string());
 
     assert!(
-        !plugins[0].should_buffer_response_body(&ctx),
-        "priority override wrapper must preserve plugin-specific SSE buffering skip"
+        plugins[0].should_buffer_response_body(&ctx),
+        "priority override wrapper must preserve conservative pre-header buffering"
+    );
+
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    assert!(plugins[0].may_release_response_body_under_retries(&ctx));
+    assert!(plugins[0].should_release_response_body_under_retries(&ctx, 200, &response_headers));
+    assert!(
+        plugins[0].should_release_response_body_before_content_type_rewrite(
+            &ctx,
+            200,
+            &response_headers
+        )
+    );
+    assert!(
+        !plugins[0].should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/event-stream"),
+            200,
+            &response_headers
+        ),
+        "priority override wrapper must preserve backend-content-type refinement"
     );
 }
 

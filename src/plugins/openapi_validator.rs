@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
 
+use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -620,11 +621,67 @@ impl Plugin for OpenapiValidator {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
-            && !super::utils::sse::is_sse_request(ctx)
             && self.bypass_reason(ctx).is_none()
             && self
                 .operation_for_context(ctx)
                 .is_some_and(OperationEntry::has_response_schema)
+    }
+
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+    }
+
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && !content_type.is_some_and(is_text_event_stream_media_type)
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if self.should_buffer_response_body(ctx)
+            && original_response_is_event_stream(ctx, response_headers)
+        {
+            let operation_label = self
+                .operation_for_context(ctx)
+                .map(|operation| operation.operation_label.as_str());
+            return self.handle_violation(
+                ctx,
+                ValidationSide::Response,
+                operation_label,
+                "event-stream responses require a bounded streaming validator".to_string(),
+            );
+        }
+        PluginResult::Continue
     }
 
     async fn on_final_response_body(
@@ -635,10 +692,6 @@ impl Plugin for OpenapiValidator {
         body: &[u8],
     ) -> PluginResult {
         if !self.requires_response_body_buffering() {
-            return PluginResult::Continue;
-        }
-        if super::utils::sse::is_sse_request(ctx) {
-            self.mark_skip(ctx, "content_type");
             return PluginResult::Continue;
         }
         if let Some(reason) = self.bypass_reason(ctx) {

@@ -255,6 +255,8 @@ Post-routing method-filter responses and native-gRPC gateway errors also apply t
 
 `on_response_committed` is buffered-only and observe-only. It receives mutable request context plus the final client-visible status, headers, and body after every `on_final_response_body` hook and any rejection replacement. It cannot mutate or reject the response. Exporters use it for record construction while retaining fail-closed sink admission in an earlier rejecting hook. Each opted-in hook is invoked at most once. If the gRPC deadline expires inside one committed hook, the gateway first replaces the outcome with the terminal `DEADLINE_EXCEEDED` representation, then transfers that pending invocation and the remaining committed hooks to owned state. They continue in order under a post-response timeout, so a blocked exporter cannot retain the H1/H2/H3 response writer indefinitely. The proxy uses a precomputed per-protocol committed-hook list, so normal buffered requests do not rescan the full plugin chain.
 
+If `on_response_body`, the shared representation gate, or a body-transform deadline has already selected a gateway-authored terminal response, the remaining presentation/protocol transforms may still run to preserve the client's wire shape, but `on_final_response_body` is skipped. A final validator or storage hook must never reinterpret the gateway's error payload and replace the first fail-closed decision. `on_response_committed` still observes the response that will actually be sent.
+
 `on_response_stream_terminated` is streaming-only. It receives mutable request context plus the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before the final `TransactionSummary.metadata` snapshot and `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup, accounting, and aggregate metadata write-back after the stream ends. Plugins can key bounded shared inspector state by `ctx.response_stream_id()`, remove it here on every terminal outcome (including client disconnect), and write the aggregate into `ctx.metadata`; for example, `ai_tool_governor` writes streamed dry-run decisions before transaction logging. `request_deduplication` uses the same hook to release an ordinary non-buffered streamed marker on clean completion (`body_completed`) but intentionally retains it until `inflight_ttl_seconds` when the stream is interrupted (client disconnect or backend error), or when a terminate-mode `serverless_function` may already have executed before `on_error: continue` fell through to the stream. In either uncertain-side-effect case, a same-key retry cannot immediately re-execute an operation that has no replayable response or tombstone.
 
 The absolute gRPC response-deadline wrapper sits outside the response-inspector chain. Its partial-DATA decision therefore counts only bytes emitted by the final inspected body, not backend chunks an inspector consumed and buffered. If an inspector has emitted zero bytes when the deadline fires, the client still receives the clean status-4 terminal representation.
@@ -529,8 +531,8 @@ Given all built-in plugins enabled, the execution order is:
 | 37 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
 | 38 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
 | 39 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
-| 40 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
-| 41 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, on_final_response_body |
+| 40 | `body_validator` | 2950 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
+| 41 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
 | 42 | `ai_semantic_firewall` | 2968 | before_proxy, on_final_request_body, on_response_body, on_final_response_body, response_stream_inspector |
 | 43 | `ai_request_guard` | 2975 | before_proxy, transform_request_body, on_final_request_body |
 | 44 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
@@ -551,7 +553,7 @@ Given all built-in plugins enabled, the execution order is:
 | 59 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
 | 60 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 61 | `ai_federation` | 4060 | final request body (HTTP only) |
-| 62 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
+| 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body |
 | 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |

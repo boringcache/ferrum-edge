@@ -16,7 +16,10 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use ferrum_edge::_test_support::{
     apply_synthetic_response_body_hooks_for_test, clone_log_metadata_for_test,
@@ -1161,6 +1164,89 @@ impl Plugin for InitialHeaderPolicy {
             "gateway-enforced".to_string(),
         );
     }
+}
+
+/// A guardrail that selects the first terminal response-body rejection.
+struct InitialBodyRejector;
+
+#[async_trait::async_trait]
+impl Plugin for InitialBodyRejector {
+    fn name(&self) -> &str {
+        "test_initial_body_rejector"
+    }
+
+    async fn on_response_body(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 502,
+            body: r#"{"error":"first body rejection"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// A final validator that would mask the first rejection if the terminal
+/// response were incorrectly fed back through the validation phase.
+struct FinalBodyRejector {
+    invoked: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Plugin for FinalBodyRejector {
+    fn name(&self) -> &str {
+        "test_final_body_rejector"
+    }
+
+    async fn on_final_response_body(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        self.invoked.store(true, Ordering::SeqCst);
+        PluginResult::Reject {
+            status_code: 502,
+            body: r#"{"error":"masked by final validator"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn synthetic_body_preserves_the_first_terminal_rejection() {
+    let final_invoked = Arc::new(AtomicBool::new(false));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(InitialBodyRejector),
+        Arc::new(FinalBodyRejector {
+            invoked: Arc::clone(&final_invoked),
+        }),
+    ];
+    let mut ctx = make_ctx();
+    let mut status = 200;
+    let mut headers = json_headers();
+    let mut body = br#"{"id":"backend"}"#.to_vec();
+
+    apply_synthetic_response_body_hooks_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+
+    assert_eq!(status, 502);
+    assert_eq!(body.as_slice(), br#"{"error":"first body rejection"}"#);
+    assert!(
+        !final_invoked.load(Ordering::SeqCst),
+        "final validators must not replace a previously selected terminal response"
+    );
 }
 
 /// H3 cross-protocol buffered publication carries the prefiltered initial-policy

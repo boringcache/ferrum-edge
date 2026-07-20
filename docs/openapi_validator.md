@@ -151,7 +151,7 @@ The generated plugin config has this shape:
 
 - Only plain HTTP proxy traffic is in scope. WebSocket frames, raw TCP/UDP, and gRPC protobuf validation are not handled by this plugin.
 - Request validation buffers only body-capable methods with a matching operation, request schema, and content type.
-- Response validation buffers only matching operations with response schemas and skips SSE.
+- Response validation buffers only matching operations with response schemas. Request `Accept` and internal streaming markers do not waive the contract. A pristine backend `text/event-stream` response is treated as uninspectable before header commit: `block` returns the configured response error (502 by default), while `log_only` records the response mismatch and permits the stream. Missing, ambiguous, or later-relabeled types remain on the ordinary validation path.
 - JSON and `+json` bodies are parsed as JSON.
 - XML and `+xml` bodies are parsed into schema-shaped objects. OpenAPI `xml.name`, `xml.attribute`, and wrapped array metadata are honored when mapping elements and attributes.
 - `application/x-www-form-urlencoded` bodies are parsed into object fields and repeated fields become arrays when the schema property is an array.

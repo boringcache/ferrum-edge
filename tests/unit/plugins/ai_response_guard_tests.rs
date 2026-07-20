@@ -741,8 +741,8 @@ fn test_requires_response_body_buffering() {
         .headers
         .insert("accept".to_string(), "text/event-stream".to_string());
     assert!(
-        !plugin.should_buffer_response_body(&sse_accept),
-        "SSE clients must keep the response streaming instead of forcing a full-body buffer"
+        plugin.should_buffer_response_body(&sse_accept),
+        "client Accept must not release an ordinary backend response"
     );
 
     let mut stream_true = ctx_with_content_type("POST", "application/json");
@@ -750,9 +750,189 @@ fn test_requires_response_body_buffering() {
         .metadata
         .insert("ai_request_streaming".to_string(), "true".to_string());
     assert!(
-        !plugin.should_buffer_response_body(&stream_true),
-        "prompt-shield stream:true metadata must prevent unbounded response buffering"
+        plugin.should_buffer_response_body(&stream_true),
+        "request-side stream metadata must not release an ordinary backend response"
     );
+
+    let sse_headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream; charset=utf-8".to_string(),
+    )]);
+    assert!(plugin.may_release_response_body_under_retries(&sse_accept));
+    assert!(plugin.should_release_response_body_under_retries(&sse_accept, 200, &sse_headers));
+    assert!(
+        plugin.should_release_response_body_before_content_type_rewrite(
+            &sse_accept,
+            200,
+            &sse_headers,
+        )
+    );
+    let json_profile_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/json; profile=event-stream".to_string(),
+    )]);
+    assert!(!plugin.should_release_response_body_under_retries(
+        &sse_accept,
+        200,
+        &json_profile_headers,
+    ));
+    assert!(
+        !plugin.should_release_response_body_before_content_type_rewrite(
+            &sse_accept,
+            200,
+            &json_profile_headers,
+        )
+    );
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &sse_accept,
+        Some("text/event-stream; charset=utf-8"),
+        200,
+        &sse_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &sse_accept,
+        None,
+        200,
+        &HashMap::new(),
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &sse_accept,
+        Some("application/json; profile=event-stream"),
+        200,
+        &HashMap::new(),
+    ));
+}
+
+#[tokio::test]
+async fn test_event_stream_fails_closed_before_ai_guard_delivery() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 502,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_response_guard_rejected")
+            .map(String::as_str),
+        Some("streaming_response_requires_bounded_inspection")
+    );
+}
+
+#[tokio::test]
+async fn test_json_event_stream_profile_stays_on_json_guard_path() {
+    let headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/json; profile=event-stream".to_string(),
+    )]);
+    let body = serde_json::to_vec(&json!({
+        "choices": [{"message": {"content": "alice@example.com"}}]
+    }))
+    .unwrap();
+
+    let reject = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "reject"
+    }));
+    let mut reject_ctx = ctx_with_content_type("GET", "application/json");
+    assert!(matches!(
+        reject
+            .on_response_body(&mut reject_ctx, 200, &headers, &body)
+            .await,
+        PluginResult::Reject {
+            status_code: 502,
+            ..
+        }
+    ));
+
+    let redact = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+    let mut redact_ctx = ctx_with_content_type("GET", "application/json");
+    assert!(matches!(
+        redact
+            .on_response_body(&mut redact_ctx, 200, &headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let transformed = redact
+        .transform_response_body(
+            &body,
+            Some("application/json; profile=event-stream"),
+            &headers,
+        )
+        .await
+        .expect("profile parameter must not bypass JSON redaction");
+    let transformed = String::from_utf8(transformed).unwrap();
+    assert!(!transformed.contains("alice@example.com"));
+    assert!(transformed.contains("[REDACTED:pii:email]"));
+}
+
+#[tokio::test]
+async fn test_warn_only_event_stream_records_uninspectable_and_continues() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "warn"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_response_guard_warning")
+            .map(String::as_str),
+        Some("streaming_response_requires_bounded_inspection")
+    );
+}
+
+#[tokio::test]
+async fn test_pristine_event_stream_relabel_still_fails_closed() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.metadata.insert(
+        "ferrum:original_response_metadata_stamped".to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata.insert(
+        "ferrum:original_response_content_type".to_string(),
+        "text/event-stream".to_string(),
+    );
+    let mut relabeled_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut relabeled_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 502,
+            ..
+        }
+    ));
 }
 
 #[test]

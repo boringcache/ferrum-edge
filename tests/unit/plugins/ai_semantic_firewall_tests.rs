@@ -1988,12 +1988,11 @@ async fn streaming_response_skip_does_not_buffer_event_stream() {
 }
 
 #[tokio::test]
-async fn streaming_response_skip_lets_downstream_response_guard_stream_sse() {
-    // Regression for the explicit-skip shared-marker fix: a downstream response
-    // plugin that keys off the shared `ai_request_streaming` marker
-    // (`ai_response_guard.should_buffer_response_body`) must still see the marker
-    // after an explicit-skip firewall flags a `stream: true` request — otherwise
-    // the guard would buffer the SSE body to EOF / the max-response-body cap.
+async fn streaming_response_skip_does_not_waive_downstream_response_guard() {
+    // An explicit firewall skip remains scoped to that firewall instance. The
+    // shared request-streaming marker is still recorded for consumers that need
+    // request intent, but an enforcing response guard must wait for backend
+    // response evidence and fail closed on an uninspectable event stream.
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "skip",
@@ -2009,9 +2008,11 @@ async fn streaming_response_skip_lets_downstream_response_guard_stream_sse() {
     let mut headers = json_headers();
     let result = firewall.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
+    assert_eq!(
+        ctx.metadata.get("ai_request_streaming").map(String::as_str),
+        Some("true")
+    );
 
-    // A response plugin with validation rules buffers JSON responses by default,
-    // but skips buffering when the shared streaming marker is set.
     let guard = AiResponseGuard::new(&json!({
         "blocked_phrases": ["illegal activity"],
         "action": "reject"
@@ -2022,8 +2023,17 @@ async fn streaming_response_skip_lets_downstream_response_guard_stream_sse() {
         "guard must have validation rules so the marker decision is meaningful"
     );
     assert!(
-        !guard.should_buffer_response_body(&ctx),
-        "explicit-skip firewall must set ai_request_streaming so downstream guard streams the SSE response"
+        guard.should_buffer_response_body(&ctx),
+        "request-streaming metadata must not disable a separate response guard"
+    );
+
+    let mut event_stream_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    assert_reject(
+        guard
+            .after_proxy(&mut ctx, 200, &mut event_stream_headers)
+            .await,
+        Some(502),
     );
 }
 

@@ -359,6 +359,76 @@ async fn response_validation_uses_default_and_strict_missing_schema() {
 }
 
 #[tokio::test]
+async fn response_sse_intent_is_conservative_and_genuine_stream_fails_closed() {
+    let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
+    let mut ctx = post_ctx("/items");
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    let mut response_headers = content_type_headers("text/event-stream");
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &response_headers));
+    assert!(
+        plugin.should_release_response_body_before_content_type_rewrite(
+            &ctx,
+            200,
+            &response_headers,
+        )
+    );
+    let json_profile_headers = content_type_headers("application/json; profile=event-stream");
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &json_profile_headers,));
+    assert!(
+        !plugin.should_release_response_body_before_content_type_rewrite(
+            &ctx,
+            200,
+            &json_profile_headers,
+        )
+    );
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &response_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new(),));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json; profile=event-stream"),
+        200,
+        &HashMap::new(),
+    ));
+    assert_reject(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        Some(502),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.action")
+            .map(String::as_str),
+        Some("rejected_response")
+    );
+
+    let log_only = OpenapiValidator::new(&validator_config("log_only")).unwrap();
+    let mut log_ctx = post_ctx("/items");
+    let mut log_headers = content_type_headers("text/event-stream");
+    assert_continue(
+        log_only
+            .after_proxy(&mut log_ctx, 200, &mut log_headers)
+            .await,
+    );
+    assert_eq!(
+        log_ctx
+            .metadata
+            .get("openapi_validator.action")
+            .map(String::as_str),
+        Some("logged_response_mismatch")
+    );
+}
+
+#[tokio::test]
 async fn xml_request_validation_honors_xml_metadata() {
     let plugin = OpenapiValidator::new(&json!({
         "operations": [{
