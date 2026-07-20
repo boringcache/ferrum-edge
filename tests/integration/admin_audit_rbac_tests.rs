@@ -766,9 +766,8 @@ async fn otel_tracing_config_projections_redact_endpoint_auth_and_headers() {
     let query_secret = "otel-query-canary";
     let auth_secret = "otel-auth-canary";
     let header_secret = "otel-header-canary";
-    let endpoint = format!(
-        "https://collector.example.com/{path_secret}/v1/traces?api_key={query_secret}"
-    );
+    let endpoint =
+        format!("https://collector.example.com/{path_secret}/v1/traces?api_key={query_secret}");
     let plugin = json!({
         "id": "otel-redaction-config",
         "plugin_name": "otel_tracing",

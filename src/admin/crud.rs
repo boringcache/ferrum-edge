@@ -2855,7 +2855,9 @@ fn redact_otel_tracing_config_projection(config: &mut Value) {
             .and_then(|value| url::Url::parse(value).ok())
         {
             Some(endpoint) => {
-                json!(crate::plugins::otel_tracing::redacted_endpoint_url(&endpoint))
+                json!(crate::plugins::otel_tracing::redacted_endpoint_url(
+                    &endpoint
+                ))
             }
             None => json!(marker),
         };

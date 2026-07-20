@@ -984,11 +984,12 @@ async fn test_otel_tracing_rich_span_attributes() {
     }));
 
     let mut summary = make_rich_summary(make_trace_metadata());
-    summary.metadata.insert(
-        "server_address".to_string(),
-        "edge.example".to_string(),
-    );
-    summary.metadata.insert("server_port".to_string(), "443".to_string());
+    summary
+        .metadata
+        .insert("server_address".to_string(), "edge.example".to_string());
+    summary
+        .metadata
+        .insert("server_port".to_string(), "443".to_string());
     plugin.log(&summary).await;
 
     let payload = received_json(&mock_server).await;
@@ -1002,15 +1003,15 @@ async fn test_otel_tracing_rich_span_attributes() {
     assert_eq!(otlp_string_attr(span, "gateway.proxy.id"), Some("proxy-1"));
     assert_eq!(otlp_string_attr(span, "http.route"), Some("llm-service"));
     assert_eq!(otlp_string_attr(span, "ferrum.namespace"), Some("ferrum"));
-    assert_eq!(otlp_string_attr(span, "server.address"), Some("edge.example"));
+    assert_eq!(
+        otlp_string_attr(span, "server.address"),
+        Some("edge.example")
+    );
     assert_eq!(
         otlp_string_attr(span, "gateway.backend.address"),
         Some("backend")
     );
-    assert_eq!(
-        otlp_string_attr(span, "url.path"),
-        Some("/api/llm/chat")
-    );
+    assert_eq!(otlp_string_attr(span, "url.path"), Some("/api/llm/chat"));
     assert_eq!(
         otlp_string_attr(span, "server.socket.address"),
         Some("10.1.2.3")
@@ -1119,7 +1120,6 @@ async fn test_otel_tracing_deployment_environment() {
     );
 }
 
-
 #[tokio::test]
 async fn test_otel_tracing_rejects_unknown_config_keys() {
     let err = OtelTracing::new_with_http_client(
@@ -1171,10 +1171,8 @@ async fn test_otel_tracing_untrusted_parent_creates_fresh_root() {
         "traceparent".to_string(),
         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
     );
-    ctx.headers.insert(
-        "tracestate".to_string(),
-        "vendor=old".to_string(),
-    );
+    ctx.headers
+        .insert("tracestate".to_string(), "vendor=old".to_string());
 
     plugin.on_request_received(&mut ctx).await;
 
@@ -1185,17 +1183,18 @@ async fn test_otel_tracing_untrusted_parent_creates_fresh_root() {
     assert!(!ctx.metadata.contains_key("parent_span_id"));
     assert!(!ctx.metadata.contains_key("tracestate"));
     assert!(ctx.metadata.contains_key("untrusted_parent_digest"));
-    assert_eq!(ctx.metadata.get("trace_sampled").map(String::as_str), Some("true"));
+    assert_eq!(
+        ctx.metadata.get("trace_sampled").map(String::as_str),
+        Some("true")
+    );
 }
 
 #[tokio::test]
 async fn test_otel_tracing_invalid_parent_drops_tracestate() {
     let plugin = new_otel(&json!({}));
     let mut ctx = make_ctx();
-    ctx.headers.insert(
-        "traceparent".to_string(),
-        "invalid".to_string(),
-    );
+    ctx.headers
+        .insert("traceparent".to_string(), "invalid".to_string());
     ctx.headers.insert(
         "tracestate".to_string(),
         "vendor=old-trace-state".to_string(),
@@ -1264,7 +1263,10 @@ async fn test_otel_tracing_parent_not_sampled_skips_export() {
         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00".to_string(),
     );
     plugin.on_request_received(&mut ctx).await;
-    assert_eq!(ctx.metadata.get("trace_sampled").map(String::as_str), Some("false"));
+    assert_eq!(
+        ctx.metadata.get("trace_sampled").map(String::as_str),
+        Some("false")
+    );
 
     let mut summary = make_summary(ctx.metadata.clone());
     summary.proxy_name = Some("api".to_string());
@@ -1288,14 +1290,21 @@ async fn test_otel_tracing_grpc_nonzero_status_is_error() {
     }));
     let mut summary = make_summary(make_trace_metadata());
     summary.response_status_code = 200;
-    summary.metadata.insert("request_protocol".to_string(), "grpc".to_string());
-    summary.metadata.insert("grpc_status".to_string(), "14".to_string());
+    summary
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    summary
+        .metadata
+        .insert("grpc_status".to_string(), "14".to_string());
     plugin.log(&summary).await;
 
     let payload = received_json(&mock_server).await;
     let span = otlp_span(&payload);
     assert_eq!(span["status"]["code"], 2);
-    assert_eq!(otlp_string_attr(span, "rpc.grpc.status_code").is_none(), false);
+    assert_eq!(
+        otlp_string_attr(span, "rpc.grpc.status_code").is_none(),
+        false
+    );
     assert_eq!(
         otlp_attr_value(span, "rpc.grpc.status_code")
             .and_then(|v| v.get("intValue"))
@@ -1404,14 +1413,12 @@ async fn test_otel_tracing_ws_disconnect_uses_new_span_id() {
 async fn test_otel_tracing_otlp_partial_success_is_logged_not_retried() {
     let mock_server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(json!({
-                "partialSuccess": {
-                    "rejectedSpans": "1",
-                    "errorMessage": "span limit exceeded"
-                }
-            })),
-        )
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "partialSuccess": {
+                "rejectedSpans": "1",
+                "errorMessage": "span limit exceeded"
+            }
+        })))
         .expect(1)
         .mount(&mock_server)
         .await;

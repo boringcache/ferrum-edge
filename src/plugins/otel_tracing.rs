@@ -255,7 +255,10 @@ impl SpanData {
         let grpc_status = summary.grpc_status();
         let otlp_error = http_span_is_error(summary);
         let http_url = if include_url_path {
-            truncate_attr(&summary.request_path, MAX_URL_PATH_BYTES.min(max_attribute_bytes))
+            truncate_attr(
+                &summary.request_path,
+                MAX_URL_PATH_BYTES.min(max_attribute_bytes),
+            )
         } else {
             String::new()
         };
@@ -319,10 +322,7 @@ impl SpanData {
             stream_listen_port: None,
             stream_bytes_sent: None,
             stream_bytes_received: None,
-            untrusted_parent_digest: summary
-                .metadata
-                .get("untrusted_parent_digest")
-                .cloned(),
+            untrusted_parent_digest: summary.metadata.get("untrusted_parent_digest").cloned(),
         })
     }
 
@@ -409,10 +409,7 @@ impl SpanData {
             stream_listen_port: Some(summary.listen_port),
             stream_bytes_sent: Some(summary.bytes_sent),
             stream_bytes_received: Some(summary.bytes_received),
-            untrusted_parent_digest: summary
-                .metadata
-                .get("untrusted_parent_digest")
-                .cloned(),
+            untrusted_parent_digest: summary.metadata.get("untrusted_parent_digest").cloned(),
         })
     }
 
@@ -424,17 +421,10 @@ impl SpanData {
         let trace_id = ctx.metadata.get("trace_id")?.clone();
         // Never reuse the HTTP upgrade span identity for the session span.
         let span_id = OtelTracing::generate_span_id();
-        let parent_span_id = ctx
-            .metadata
-            .get("span_id")
-            .cloned()
-            .unwrap_or_default();
+        let parent_span_id = ctx.metadata.get("span_id").cloned().unwrap_or_default();
         let (backend_host, backend_port) = parse_backend_host_port(&ctx.backend_target);
         let otlp_error = ctx.error_class.is_some();
-        let route = ctx
-            .proxy_name
-            .as_deref()
-            .unwrap_or("websocket");
+        let route = ctx.proxy_name.as_deref().unwrap_or("websocket");
         Some(Self {
             trace_id: truncate_attr(&trace_id, 64),
             span_id,
@@ -505,7 +495,11 @@ impl SpanData {
             + self.server_address.as_ref().map(String::len).unwrap_or(0)
             + self.backend_target.as_ref().map(String::len).unwrap_or(0)
             + self.backend_host.as_ref().map(String::len).unwrap_or(0)
-            + self.backend_resolved_ip.as_ref().map(String::len).unwrap_or(0)
+            + self
+                .backend_resolved_ip
+                .as_ref()
+                .map(String::len)
+                .unwrap_or(0)
             + self.error_class.as_ref().map(String::len).unwrap_or(0)
             + self.body_error_class.as_ref().map(String::len).unwrap_or(0)
             + self
@@ -522,10 +516,15 @@ impl OtelTracing {
         config: &Value,
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
-        let config_object = config.as_object().ok_or_else(|| {
-            "otel_tracing: configuration must be a JSON object".to_string()
-        })?;
-        reject_unknown_keys(config_object, "config", ALLOWED_CONFIG_KEYS, "otel_tracing: ")?;
+        let config_object = config
+            .as_object()
+            .ok_or_else(|| "otel_tracing: configuration must be a JSON object".to_string())?;
+        reject_unknown_keys(
+            config_object,
+            "config",
+            ALLOWED_CONFIG_KEYS,
+            "otel_tracing: ",
+        )?;
 
         let service_name = string_config(config, "service_name", "ferrum-edge")?;
         let generate_trace_id = bool_config(config, "generate_trace_id", true)?;
@@ -574,7 +573,8 @@ impl OtelTracing {
         let trace_id = Self::generate_trace_id();
         let span_id = Self::generate_span_id();
         let flags = if sampled { "01" } else { "00" };
-        let traceparent = build_traceparent(SUPPORTED_TRACEPARENT_VERSION, &trace_id, &span_id, flags);
+        let traceparent =
+            build_traceparent(SUPPORTED_TRACEPARENT_VERSION, &trace_id, &span_id, flags);
         GeneratedTraceContext {
             trace_id,
             span_id,
@@ -833,10 +833,8 @@ impl Plugin for OtelTracing {
                         if !self.generate_trace_id {
                             return PluginResult::Continue;
                         }
-                        let digest = bounded_untrusted_parent_digest(
-                            parsed.trace_id,
-                            parsed.parent_span_id,
-                        );
+                        let digest =
+                            bounded_untrusted_parent_digest(parsed.trace_id, parsed.parent_span_id);
                         ctx.metadata
                             .insert("untrusted_parent_digest".to_string(), digest);
                         // Drop companion tracestate — parent was not trusted.
@@ -1076,7 +1074,11 @@ impl BufferedTraceExporter {
         let provider_name = cfg.provider_name;
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let (started, deferred_start) = if let Ok(handle) = Handle::try_current() {
-            handle.spawn(trace_export_flush_loop(receiver, cfg, Arc::clone(&queued_bytes)));
+            handle.spawn(trace_export_flush_loop(
+                receiver,
+                cfg,
+                Arc::clone(&queued_bytes),
+            ));
             (true, Mutex::new(None))
         } else {
             (false, Mutex::new(Some((receiver, cfg))))
@@ -1533,11 +1535,7 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
                 let status = response.status();
                 warn!(
                     "{} export failed with status {} for {} (attempt {}/{})",
-                    cfg.provider_name,
-                    status,
-                    cfg.endpoint_for_logs,
-                    attempt,
-                    total_attempts,
+                    cfg.provider_name, status, cfg.endpoint_for_logs, attempt, total_attempts,
                 );
                 if status.is_client_error()
                     && status != reqwest::StatusCode::REQUEST_TIMEOUT
@@ -2081,9 +2079,9 @@ fn u64_config_range(
 ) -> Result<u64, String> {
     let value = match config.get(key) {
         None | Some(Value::Null) => default,
-        Some(Value::Number(value)) => value.as_u64().ok_or_else(|| {
-            format!("otel_tracing: '{key}' must be a non-negative integer")
-        })?,
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .ok_or_else(|| format!("otel_tracing: '{key}' must be a non-negative integer"))?,
         Some(other) => {
             return Err(format!(
                 "otel_tracing: '{key}' must be a non-negative integer, got: {other}"
@@ -2217,9 +2215,7 @@ fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {
         }
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(
-            "Datadog: 'agent_url' must not contain user information".to_string(),
-        );
+        return Err("Datadog: 'agent_url' must not contain user information".to_string());
     }
     if !has_non_empty_authority(agent_url) || normalized_url_hostname(&url).is_none() {
         return Err("Datadog: 'agent_url' must include a hostname".to_string());
@@ -2531,7 +2527,9 @@ fn extract_port_from_url_or_hostport(s: &str) -> Option<u16> {
         let end = rest.find(']')?;
         return rest[end + 1..].strip_prefix(':')?.parse().ok();
     }
-    authority.rsplit_once(':').and_then(|(_, port)| port.parse().ok())
+    authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
 }
 
 fn bounded_untrusted_parent_digest(trace_id: &str, parent_span_id: &str) -> String {
@@ -2614,8 +2612,9 @@ mod tests {
 
     #[test]
     fn buffered_trace_exporter_defers_start_without_runtime() {
-        let exporter = BufferedTraceExporter::new(test_trace_http_exporter_config(), 8, 1024 * 1024)
-            .expect("exporter config accepted");
+        let exporter =
+            BufferedTraceExporter::new(test_trace_http_exporter_config(), 8, 1024 * 1024)
+                .expect("exporter config accepted");
 
         assert!(!exporter.started.load(Ordering::Acquire));
         assert!(
@@ -2635,8 +2634,9 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_trace_exporter_marks_started_when_runtime_available() {
-        let exporter = BufferedTraceExporter::new(test_trace_http_exporter_config(), 8, 1024 * 1024)
-            .expect("exporter config accepted");
+        let exporter =
+            BufferedTraceExporter::new(test_trace_http_exporter_config(), 8, 1024 * 1024)
+                .expect("exporter config accepted");
 
         assert!(
             exporter.started.load(Ordering::Acquire),
@@ -2772,8 +2772,7 @@ mod tests {
                 && attribute["value"]["stringValue"] == "payments"
         }));
         assert!(attributes.iter().any(|attribute| {
-            attribute["key"] == "ferrum.namespace"
-                && attribute["value"]["stringValue"] == "ferrum"
+            attribute["key"] == "ferrum.namespace" && attribute["value"]["stringValue"] == "ferrum"
         }));
         assert!(attributes.iter().any(|attribute| {
             attribute["key"] == "server.address"
