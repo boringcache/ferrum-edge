@@ -3588,6 +3588,7 @@ config:
   concurrent_clients: 50
   duration_seconds: 30
   ramp: true
+  max_response_body_bytes: 1048576
   gateway_tls: true
   gateway_port: 8443
   gateway_addresses:
