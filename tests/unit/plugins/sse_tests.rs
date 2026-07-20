@@ -568,7 +568,10 @@ async fn test_h3_final_strip_removes_plugin_reintroduced_connection() {
         "X-Plugin-Hop, Keep-Alive".to_string(),
     );
     headers.insert("Keep-Alive".to_string(), "timeout=5".to_string());
-    headers.insert("X-Plugin-Hop".to_string(), "secret-routing-state".to_string());
+    headers.insert(
+        "X-Plugin-Hop".to_string(),
+        "secret-routing-state".to_string(),
+    );
     headers.insert("Transfer-Encoding".to_string(), "chunked".to_string());
     headers.insert("x-accel-buffering".to_string(), "no".to_string());
 
