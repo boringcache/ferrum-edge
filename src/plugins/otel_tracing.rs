@@ -210,7 +210,6 @@ pub(crate) struct GeneratedTraceContext {
 }
 
 pub(crate) struct ParsedTraceParent<'a> {
-    pub(crate) version: &'a str,
     pub(crate) trace_id: &'a str,
     pub(crate) parent_span_id: &'a str,
     pub(crate) flags: &'a str,
@@ -621,7 +620,6 @@ impl OtelTracing {
         }
 
         Some(ParsedTraceParent {
-            version,
             trace_id,
             parent_span_id,
             flags,
@@ -782,19 +780,22 @@ impl Plugin for OtelTracing {
             ctx.metadata
                 .insert("frontend_listen_port".to_string(), port.to_string());
         }
-        if let Some(host) = ctx.headers.get("host").or_else(|| {
-            ctx.headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-                .map(|(_, v)| v)
-        }) {
-            if let Some((address, port)) = parse_host_header_authority(host) {
+        if let Some((address, port)) = ctx
+            .headers
+            .get("host")
+            .or_else(|| {
+                ctx.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                    .map(|(_, v)| v)
+            })
+            .and_then(|host| parse_host_header_authority(host))
+        {
+            ctx.metadata
+                .insert("server_address".to_string(), truncate_attr(&address, 256));
+            if let Some(port) = port {
                 ctx.metadata
-                    .insert("server_address".to_string(), truncate_attr(&address, 256));
-                if let Some(port) = port {
-                    ctx.metadata
-                        .insert("server_port".to_string(), port.to_string());
-                }
+                    .insert("server_port".to_string(), port.to_string());
             }
         }
 
