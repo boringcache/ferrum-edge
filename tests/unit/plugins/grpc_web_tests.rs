@@ -93,18 +93,14 @@ fn test_config_must_be_an_object_for_every_json_value_class() {
 
 #[test]
 fn test_valid_empty_and_full_objects_are_accepted() {
-    GrpcWebPlugin::new(&json!({}))
-        .expect("empty object must preserve default expose list");
+    GrpcWebPlugin::new(&json!({})).expect("empty object must preserve default expose list");
     GrpcWebPlugin::new(&json!({
         "expose_headers": ["custom-header-bin", "x-request-id"]
     }))
     .expect("full object must be accepted");
     validate_plugin_config("grpc_web", &json!({})).expect("shared admission accepts {}");
-    validate_plugin_config(
-        "grpc_web",
-        &json!({"expose_headers": ["x-request-id"]}),
-    )
-    .expect("shared admission accepts a full object");
+    validate_plugin_config("grpc_web", &json!({"expose_headers": ["x-request-id"]}))
+        .expect("shared admission accepts a full object");
     assert_eq!(
         plugin_failure_policy("grpc_web"),
         Some(PluginFailurePolicy::KeepLastKnownGood)
@@ -142,7 +138,10 @@ fn test_shared_admin_file_and_snapshot_admission_reject_invalid_shapes() {
     let shared = validate_plugin_config("grpc_web", &typo)
         .expect_err("shared validate_plugin_config must reject typos");
     assert!(shared.contains("config.expose_header"), "got: {shared}");
-    assert!(shared.contains("did you mean 'expose_headers'"), "got: {shared}");
+    assert!(
+        shared.contains("did you mean 'expose_headers'"),
+        "got: {shared}"
+    );
 
     let now = chrono::Utc::now();
     let plugin_config = ferrum_edge::config::types::PluginConfig {
