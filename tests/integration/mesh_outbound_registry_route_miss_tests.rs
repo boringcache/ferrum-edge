@@ -245,16 +245,12 @@ async fn outbound_capture_route_miss_returns_configured_reject_and_deny_metric()
     let (gateway_addr, _handle) = start_test_gateway(state).await;
 
     for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
-        let (status, headers, body) = send_request(
-            gateway_addr,
-            version,
-            Method::GET,
-            "/",
-            UNKNOWN_HOST,
-            None,
-        )
-        .await
-        .unwrap_or_else(|error| panic!("{version:?} unknown-host route miss failed: {error}"));
+        let (status, headers, body) =
+            send_request(gateway_addr, version, Method::GET, "/", UNKNOWN_HOST, None)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{version:?} unknown-host route miss failed: {error}")
+                });
 
         assert_eq!(
             status, REJECT_STATUS,
@@ -284,7 +280,10 @@ async fn outbound_capture_route_miss_returns_configured_reject_and_deny_metric()
     )
     .await
     .expect("admitted-host route miss");
-    assert_eq!(status, 404, "admitted host without a route stays generic 404");
+    assert_eq!(
+        status, 404,
+        "admitted host without a route stays generic 404"
+    );
     assert_eq!(
         String::from_utf8_lossy(&body),
         r#"{"error":"Not Found"}"#,
@@ -412,7 +411,10 @@ async fn inbound_non_capture_route_miss_keeps_generic_not_found() {
     .await
     .expect("inbound route miss");
 
-    assert_eq!(status, 404, "inbound route miss must stay generic Not Found");
+    assert_eq!(
+        status, 404,
+        "inbound route miss must stay generic Not Found"
+    );
     assert_eq!(
         String::from_utf8_lossy(&body),
         r#"{"error":"Not Found"}"#,
