@@ -14784,7 +14784,12 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             let deadline = ctx.grpc_deadline_at();
             let result = crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
-                plugin.on_final_response_body(ctx, *response_status, response_headers, response_body),
+                plugin.on_final_response_body(
+                    ctx,
+                    *response_status,
+                    response_headers,
+                    response_body,
+                ),
             )
             .await
             .into_plugin_result(ctx);
@@ -14807,8 +14812,11 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
         if let Some(reject) = response_body_reject {
             // Rebuild headers/body only; the after_proxy reject hooks run once in
             // the caller so one-shot response state survives this replacement.
-            *response_body =
-                rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+            *response_body = rebuild_plugin_rejection_response_headers(
+                response_status,
+                response_headers,
+                reject,
+            );
         }
     }
 
