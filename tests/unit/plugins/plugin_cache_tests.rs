@@ -1426,8 +1426,8 @@ fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
             Some("p1"),
         )],
     );
-    let cache =
-        PluginCache::new(&invalid).expect("OptionalFailOpen must admit snapshot despite bad config");
+    let cache = PluginCache::new(&invalid)
+        .expect("OptionalFailOpen must admit snapshot despite bad config");
     assert!(
         cache.get_plugins("p1").is_empty(),
         "invalid ws_frame_logging must be omitted from published cache"

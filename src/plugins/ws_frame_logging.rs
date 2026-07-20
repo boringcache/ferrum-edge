@@ -25,7 +25,7 @@
 //! Config:
 //! ```json
 //! {
-//!   "log_level": "warn",
+//!   "log_level": "info",
 //!   "include_payload_preview": false,
 //!   "payload_preview_bytes": 128,
 //!   "log_ping_pong": false
@@ -54,10 +54,10 @@ pub const WS_FRAME_LOGGING_CONFIG_KEYS: &[&str] = &[
 /// Maximum leading payload bytes folded into a fingerprint digest.
 pub const MAX_PAYLOAD_PREVIEW_BYTES: u64 = 65_536;
 
-/// Default `log_level` when omitted. Matches the gateway default
-/// `FERRUM_LOG_LEVEL=warn` so an enabled empty config emits under the default
-/// EnvFilter.
-pub const DEFAULT_LOG_LEVEL: &str = "warn";
+/// Default `log_level` when omitted. Healthy per-frame records remain
+/// informational; construction emits an actionable warning when the active
+/// filter (including the gateway default `warn`) suppresses them.
+pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// Log level for frame logging output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,8 +106,9 @@ impl WsFrameLogging {
         // Validate log_level explicitly — unknown values are rejected per the
         // plugin-validation rules so misspellings (e.g. "info " or "INFO") are
         // caught at config-load time rather than silently downgraded.
-        // Default is `warn` so an empty config remains visible under the
-        // gateway's default `FERRUM_LOG_LEVEL=warn` EnvFilter.
+        // Healthy per-frame records default to `info`. If the gateway's
+        // default `FERRUM_LOG_LEVEL=warn` filter suppresses them, the
+        // construction-time diagnostic below remains visible instead.
         let log_level = match object.get("log_level") {
             Some(Value::Null) => {
                 return Err(
@@ -133,7 +134,7 @@ impl WsFrameLogging {
                     );
                 }
             },
-            None => LogLevel::Warn,
+            None => LogLevel::Info,
         };
 
         let include_payload_preview = match object.get("include_payload_preview") {
@@ -203,17 +204,17 @@ impl WsFrameLogging {
             None => false,
         };
 
-        // Surface a construction-time warning when a live tracing subscriber is
-        // already filtering the configured level. Skip when no subscriber is
-        // installed (unit tests constructing plugins before init_logging).
-        if tracing::dispatcher::has_been_set() && !log_level.is_enabled() {
+        // Surface a construction-time warning when the active tracing
+        // subscriber filters the configured level. With no subscriber the
+        // warning macro is a no-op, while scoped subscribers can observe it.
+        if !log_level.is_enabled() {
             warn!(
                 target: "ws_frame_log",
                 configured_level = log_level.as_str(),
                 "ws_frame_logging is enabled but its configured log_level is filtered by the active tracing EnvFilter \
                  (gateway default FERRUM_LOG_LEVEL=warn). Frame parsing, plugin selection, and on_ws_frame dispatch \
                  still occur; fingerprint/event construction is skipped. Raise FERRUM_LOG_LEVEL or set log_level to \
-                 a level admitted by the filter (default plugin log_level is warn)."
+                 a level admitted by the filter (default plugin log_level is info)."
             );
         }
 

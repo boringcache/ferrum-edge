@@ -8399,11 +8399,13 @@ components:
         Binary frames by default; Ping/Pong are opt-in via `log_ping_pong`. The
         plugin never transforms or drops frames — it is purely observational.
 
-        Default `log_level` is `warn` so an enabled empty config emits under the
-        gateway's default `FERRUM_LOG_LEVEL=warn` EnvFilter. Explicit `trace`,
-        `debug`, or `info` require a matching (or more verbose) runtime filter;
-        when a live subscriber filters the configured level, construction emits
-        an actionable warning. Filtering skips fingerprint computation and
+        Default `log_level` is `info` so healthy frame traffic does not become
+        warning-level noise. Under the gateway's default
+        `FERRUM_LOG_LEVEL=warn` EnvFilter, an enabled empty config emits one
+        actionable construction warning naming the filtered level while normal
+        frame records remain suppressed. Explicit `trace` or `debug` likewise
+        require a matching (or more verbose) runtime filter; `warn` is available
+        only when selected deliberately. Filtering skips fingerprint computation and
         tracing event construction only — frame parsing, plugin selection
         (`requires_ws_frame_hooks`), and `on_ws_frame` dispatch still occur, so
         H1 raw-copy tunnel mode remains unavailable while this plugin is
@@ -8428,11 +8430,12 @@ components:
         log_level:
           type: string
           enum: [trace, debug, info, warn]
-          default: warn
+          default: info
           description: >-
             Tracing level for frame log output. Case-sensitive; unknown values
             (e.g., `"error"`, `"INFO"`) and explicit `null` are rejected at
-            config load time. Defaults to `warn` to match `FERRUM_LOG_LEVEL`.
+            config load time. Healthy records default to `info`; construction
+            warns when the active filter suppresses the configured level.
         include_payload_preview:
           type: boolean
           default: false

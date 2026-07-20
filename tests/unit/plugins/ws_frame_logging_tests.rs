@@ -8,8 +8,8 @@ use ferrum_edge::plugins::ws_frame_logging::{
     DEFAULT_LOG_LEVEL, MAX_PAYLOAD_PREVIEW_BYTES, WS_FRAME_LOGGING_CONFIG_KEYS, WsFrameLogging,
 };
 use ferrum_edge::plugins::{
-    Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection, WsDisconnectContext,
-    plugin_failure_policy, validate_plugin_config, PluginFailurePolicy,
+    Plugin, PluginFailurePolicy, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection,
+    WsDisconnectContext, plugin_failure_policy, validate_plugin_config,
 };
 use serde_json::json;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -24,6 +24,7 @@ struct CapturedWsLog {
     preview: Option<String>,
     event: Option<String>,
     correlation_id: Option<String>,
+    configured_level: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -69,6 +70,7 @@ where
             preview: visitor.preview,
             event: visitor.event,
             correlation_id: visitor.correlation_id,
+            configured_level: visitor.configured_level,
         });
     }
 }
@@ -78,6 +80,7 @@ struct WsLogVisitor {
     preview: Option<String>,
     event: Option<String>,
     correlation_id: Option<String>,
+    configured_level: Option<String>,
 }
 
 impl tracing::field::Visit for WsLogVisitor {
@@ -88,6 +91,8 @@ impl tracing::field::Visit for WsLogVisitor {
             self.event = Some(value.to_string());
         } else if field.name() == "correlation_id" {
             self.correlation_id = Some(value.to_string());
+        } else if field.name() == "configured_level" {
+            self.configured_level = Some(value.to_string());
         }
     }
 
@@ -98,6 +103,9 @@ impl tracing::field::Visit for WsLogVisitor {
             self.event = Some(format!("{value:?}").trim_matches('"').to_string());
         } else if field.name() == "correlation_id" {
             self.correlation_id = Some(format!("{value:?}").trim_matches('"').to_string());
+        } else if field.name() == "configured_level" {
+            self.configured_level =
+                Some(format!("{value:?}").trim_matches('"').to_string());
         }
     }
 }
@@ -121,11 +129,8 @@ fn install_filtered_ws_log_capture(
     directive: &str,
     capture: &WsLogCapture,
 ) -> tracing::subscriber::DefaultGuard {
-    let subscriber = tracing_subscriber::registry().with(
-        capture
-            .layer()
-            .with_filter(EnvFilter::new(directive)),
-    );
+    let subscriber =
+        tracing_subscriber::registry().with(capture.layer().with_filter(EnvFilter::new(directive)));
     tracing::subscriber::set_default(subscriber)
 }
 
@@ -187,7 +192,7 @@ fn test_creation_defaults() {
     assert_eq!(plugin.name(), "ws_frame_logging");
     assert_eq!(plugin.priority(), 9050);
     assert_eq!(plugin.configured_log_level(), DEFAULT_LOG_LEVEL);
-    assert_eq!(plugin.configured_log_level(), "warn");
+    assert_eq!(plugin.configured_log_level(), "info");
     assert_eq!(plugin.payload_preview_bytes(), 128);
     assert!(plugin.requires_ws_frame_hooks());
     assert_eq!(
@@ -228,8 +233,14 @@ fn test_creation_rejects_unknown_config_keys() {
 fn test_creation_rejects_null_field_values() {
     for (config, field) in [
         (json!({"log_level": null}), "log_level"),
-        (json!({"include_payload_preview": null}), "include_payload_preview"),
-        (json!({"payload_preview_bytes": null}), "payload_preview_bytes"),
+        (
+            json!({"include_payload_preview": null}),
+            "include_payload_preview",
+        ),
+        (
+            json!({"payload_preview_bytes": null}),
+            "payload_preview_bytes",
+        ),
         (json!({"log_ping_pong": null}), "log_ping_pong"),
     ] {
         let err = WsFrameLogging::new(&config)
@@ -890,14 +901,25 @@ async fn test_payload_preview_omitted_when_disabled_or_control_frame() {
 // === Default gateway filter visibility (#2617) ===
 
 #[tokio::test(flavor = "current_thread")]
-async fn default_empty_config_emits_under_default_gateway_filter() {
+async fn default_empty_config_warns_when_default_gateway_filter_hides_records() {
     let capture = WsLogCapture::default();
     let _guard = install_filtered_ws_log_capture("warn", &capture);
     let plugin = WsFrameLogging::new(&json!({})).expect("empty config");
-    assert_eq!(plugin.configured_log_level(), "warn");
+    assert_eq!(plugin.configured_log_level(), "info");
     assert!(
         plugin.requires_ws_frame_hooks(),
         "enabled plugin must keep the parsed/frame-hook path (H1 raw tunnel unavailable)"
+    );
+
+    let construction_events = capture.events();
+    assert_eq!(
+        construction_events.len(),
+        1,
+        "default warn filter must retain one actionable construction warning: {construction_events:?}"
+    );
+    assert_eq!(
+        construction_events[0].configured_level.as_deref(),
+        Some("info")
     );
 
     log_frame(&plugin, 1, &Message::Text("hello".into())).await;
@@ -905,16 +927,10 @@ async fn default_empty_config_emits_under_default_gateway_filter() {
         .on_ws_disconnect(&disconnect_context(HashMap::new()))
         .await;
 
-    let events = capture.events();
-    assert!(
-        events.len() >= 2,
-        "default warn/warn combination must emit frame and disconnect records, got {events:?}"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| event.event.as_deref() == Some("disconnect")),
-        "missing disconnect record: {events:?}"
+    assert_eq!(
+        capture.events().len(),
+        1,
+        "healthy info frame/disconnect records must remain filtered at warn"
     );
 }
 
