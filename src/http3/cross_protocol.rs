@@ -123,7 +123,7 @@ use crate::proxy::grpc_proxy::{
 };
 use crate::proxy::headers::{
     apply_response_headers, is_backend_response_strip_header, parse_connection_listed_headers,
-    strip_response_hop_by_hop_trailers,
+    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
 };
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
@@ -6472,6 +6472,20 @@ where
     // accepts both the full bidi stream and a `split()` send half.
     S: SendStream<Bytes>,
 {
+    // Final hop-by-hop strip after after_proxy: connection-specific fields are
+    // malformed on HTTP/3 (RFC 9114 §4.2). Clone only when stripping is needed
+    // so the common clean map stays allocation-free on this path.
+    let mut owned_headers;
+    let headers = if headers
+        .keys()
+        .any(|name| is_backend_response_strip_header(name))
+    {
+        owned_headers = headers.clone();
+        strip_client_response_hop_by_hop_headers(&mut owned_headers);
+        &owned_headers
+    } else {
+        headers
+    };
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_builder = crate::proxy::headers::apply_response_headers(
         Response::builder().status(status_code),

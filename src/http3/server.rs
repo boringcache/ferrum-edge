@@ -38,6 +38,7 @@ use crate::proxy::grpc_proxy::{
 };
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
+    strip_client_response_hop_by_hop_headers,
     is_proxy_generated_forwarding_header, parse_connection_listed_from_str_map,
     strip_response_hop_by_hop_trailers,
 };
@@ -4943,6 +4944,10 @@ async fn handle_h3_request(
             response_headers.remove("content-length");
         }
 
+        // Final hop-by-hop strip after after_proxy: plugins (e.g. SSE) must not
+        // reintroduce connection-specific fields onto the H3 wire (RFC 9114 §4.2).
+        strip_client_response_hop_by_hop_headers(&mut response_headers);
+
         // Send response headers on the H3 stream
         let status_code = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut resp_builder =
@@ -6541,6 +6546,9 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
+        // Final hop-by-hop strip after after_proxy / committed hooks (RFC 9114 §4.2).
+        strip_client_response_hop_by_hop_headers(&mut response_headers);
+
         // Build and send buffered response
         let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
         let resp_builder =
@@ -8025,6 +8033,9 @@ async fn stream_h3_open_response_to_client(
         sticky_cookie_needed,
         &mut response_headers,
     );
+
+    // Final hop-by-hop strip after after_proxy (RFC 9114 §4.2).
+    strip_client_response_hop_by_hop_headers(&mut response_headers);
 
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_builder =
@@ -9939,6 +9950,9 @@ async fn proxy_to_backend_h3_streaming(
         &mut response_headers,
     );
 
+    // Final hop-by-hop strip after after_proxy (RFC 9114 §4.2).
+    strip_client_response_hop_by_hop_headers(&mut response_headers);
+
     // Send response headers on the H3 stream
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_builder =
@@ -10451,8 +10465,10 @@ async fn send_h3_finalized_reject_response(
     body: &[u8],
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
+    let mut headers = headers.clone();
+    strip_client_response_hop_by_hop_headers(&mut headers);
     let mut builder = Response::builder().status(status);
-    builder = apply_response_headers(builder, headers);
+    builder = apply_response_headers(builder, &headers);
     let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 reject response: {}", e))?;

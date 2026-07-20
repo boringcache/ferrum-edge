@@ -2986,10 +2986,12 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 
 **Lifecycle:**
 
-1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, stashes `Last-Event-ID` in metadata for reconnection.
+1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, bounds `Last-Event-ID` (max 1024 bytes) and stashes it for backend forwarding. The raw ID is omitted from transaction logs (`sse:leid_present` / `sse:leid_bytes` correlation only) and never interpolated into diagnostics.
 2. **`before_proxy`** — Strips `Accept-Encoding` to prevent compressed responses from breaking SSE line-delimited framing. Forwards `Last-Event-ID` header to the backend.
-3. **`after_proxy`** — Sets `Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no`. Strips `Content-Length`. Optionally forces `Content-Type: text/event-stream`.
-4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only).
+3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body.
+4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only), preserving terminal line-break semantics for EventSource `MessageEvent.data`. Wrapping uses the request-scoped wrap decision from `after_proxy`, so it composes with content-type forcing instead of canceling it.
+
+**Config admission:** Config must be a JSON object. Unknown keys are rejected. Explicit `null` members are rejected; omitted keys keep defaults. `retry_ms` must be an integer ≥ 1 when set.
 
 **Request validation:**
 
@@ -3010,11 +3012,11 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 |---|---|---|---|
 | `add_no_buffering_header` | bool | `true` | Add `X-Accel-Buffering: no` to disable nginx/ALB buffering |
 | `strip_content_length` | bool | `true` | Remove `Content-Length` (SSE streams are indefinite) |
-| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping |
+| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 |
 | `force_sse_content_type` | bool | `false` | Force `Content-Type: text/event-stream` even if backend returns something else |
-| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing |
+| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses |
 
-**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering. When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`.
+**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering and delivers a correctly framed `text/event-stream` response (composing with `force_sse_content_type`). When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`. Genuine upstream `text/event-stream` bodies are never double-wrapped. Wrapping normalizes CR/CRLF to LF and preserves terminal newlines in `MessageEvent.data` (lossy UTF-8 replacement of invalid bytes is separate from newline fidelity).
 
 ```yaml
 config:

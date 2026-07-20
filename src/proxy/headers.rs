@@ -373,6 +373,18 @@ pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap)
     }
 }
 
+/// Strip response-direction hop-by-hop names from a plugin header map.
+///
+/// Used as a final sanitation pass on HTTP/3 client-facing responses after
+/// `after_proxy` hooks (which may reintroduce connection-specific fields such
+/// as `Connection: keep-alive`) and before every H3 response writer. H1 may
+/// still carry intentional connection options; H3 must not (RFC 9114 §4.2).
+pub fn strip_client_response_hop_by_hop_headers(
+    headers: &mut std::collections::HashMap<String, String>,
+) {
+    headers.retain(|name, _| !is_backend_response_strip_header(name));
+}
+
 /// Append a cookie to the proxy's newline-separated multi-value representation.
 /// [`apply_response_headers`] emits each line as a distinct `Set-Cookie` field.
 pub fn append_set_cookie_header(
