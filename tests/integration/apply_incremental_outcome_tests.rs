@@ -1447,7 +1447,6 @@ async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
     }
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn compression_unknown_key_reload_keeps_last_known_good_generation() {
     let state = empty_proxy_state();
@@ -1503,7 +1502,6 @@ async fn compression_unknown_key_reload_keeps_last_known_good_generation() {
         "rejected reload must retain the last-known-good compression generation"
     );
 }
-
 
 #[tokio::test(flavor = "multi_thread")]
 async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation() {
