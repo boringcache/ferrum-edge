@@ -494,7 +494,7 @@ fn record_local_record_drop(error: &UdpDeliveryError) {
     let total = LOCAL_RECORD_DROPS
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
-    if total == 1 || total % LOCAL_RECORD_DROP_WARN_EVERY == 0 {
+    if total == 1 || total.is_multiple_of(LOCAL_RECORD_DROP_WARN_EVERY) {
         warn!(
             dropped_records = total,
             reason = %error.message(),
