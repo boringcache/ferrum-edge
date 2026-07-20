@@ -3309,8 +3309,7 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
         "global_tags keys must encode the runtime ASCII tag-key grammar"
     );
     assert_eq!(
-        schema["properties"]["global_tags"]["propertyNames"]["maxLength"],
-        64,
+        schema["properties"]["global_tags"]["propertyNames"]["maxLength"], 64,
         "global_tags key ceiling must match the runtime 64-byte ASCII limit"
     );
     let prefix_desc = schema["properties"]["prefix"]["description"]

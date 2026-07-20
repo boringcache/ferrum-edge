@@ -922,7 +922,9 @@ async fn test_statsd_ws_disconnect_collector_emits_session_once() {
     assert!(n <= MAX_UDP_PAYLOAD, "datagram exceeded ceiling: {n}");
     let payload = std::str::from_utf8(&buf[..n]).expect("utf8");
     assert_eq!(
-        payload.matches("ferrum.websocket.session.count:1|c").count(),
+        payload
+            .matches("ferrum.websocket.session.count:1|c")
+            .count(),
         1,
         "terminal WS session count must appear exactly once: {payload}"
     );
