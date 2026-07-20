@@ -898,8 +898,6 @@ impl GovernorEngine {
                         self.resolve_require_approval(
                             corr,
                             call,
-                            &arguments_hash,
-                            risk,
                             ns,
                             approval_deadline,
                             &mut cd,
@@ -961,12 +959,13 @@ impl GovernorEngine {
 
     /// Resolve a `require_approval` outcome onto `cd`, honoring dry-run mode,
     /// the approval cache, the webhook, and `fail_on_error`.
+    ///
+    /// Risk and arguments hash are read from `cd` (already populated by the
+    /// caller) so this helper stays under clippy's `too_many_arguments` limit.
     async fn resolve_require_approval(
         &self,
         corr: &CorrelationMeta,
         call: &ToolCall,
-        arguments_hash: &Option<String>,
-        risk: RiskLevel,
         ns: &AtomicU64,
         approval_deadline: Instant,
         cd: &mut CallDecision,
@@ -997,7 +996,10 @@ impl GovernorEngine {
             return;
         }
 
-        let hash = arguments_hash
+        // Copy fields needed for ApprovalInput before further &mut cd writes.
+        let risk = cd.risk;
+        let hash = cd
+            .arguments_hash
             .clone()
             .unwrap_or_else(|| sha256_hex(&call.raw_args));
         let input = ApprovalInput {

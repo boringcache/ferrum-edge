@@ -8302,6 +8302,8 @@ async fn mcp_omitted_arguments_normalize_to_empty_object_for_schema() {
 
 #[test]
 fn rejects_zero_width_redaction_regex_and_oversized_placeholder() {
+    // Use `.err().expect(...)` (not `Result::expect_err`) so these negative
+    // construction checks do not require `AiToolGovernor: Debug`.
     let err = try_make(json!({
         "tools": {
             "search": {
@@ -8310,7 +8312,8 @@ fn rejects_zero_width_redaction_regex_and_oversized_placeholder() {
             }
         }
     }))
-    .expect_err("zero-width regex must be rejected");
+    .err()
+    .expect("zero-width regex must be rejected");
     assert!(
         err.contains("must not match the empty string"),
         "unexpected error: {err}"
@@ -8324,7 +8327,8 @@ fn rejects_zero_width_redaction_regex_and_oversized_placeholder() {
             }
         }
     }))
-    .expect_err("a* is zero-width");
+    .err()
+    .expect("a* is zero-width");
     assert!(err.contains("must not match the empty string"));
 
     let err = try_make(json!({
@@ -8335,7 +8339,8 @@ fn rejects_zero_width_redaction_regex_and_oversized_placeholder() {
             }
         }
     }))
-    .expect_err("zero-width deny patterns are also rejected");
+    .err()
+    .expect("zero-width deny patterns are also rejected");
     assert!(err.contains("must not match the empty string"));
 
     let long = "X".repeat(257);
@@ -8348,7 +8353,8 @@ fn rejects_zero_width_redaction_regex_and_oversized_placeholder() {
         },
         "response": { "redaction_placeholder": long }
     }))
-    .expect_err("placeholder length must be bounded");
+    .err()
+    .expect("placeholder length must be bounded");
     assert!(err.contains("redaction_placeholder"));
 
     let too_many: Vec<Value> = (0..33)
@@ -8362,7 +8368,8 @@ fn rejects_zero_width_redaction_regex_and_oversized_placeholder() {
             }
         }
     }))
-    .expect_err("pattern count must be bounded");
+    .err()
+    .expect("pattern count must be bounded");
     assert!(err.contains("at most 32"));
 }
 
@@ -8375,7 +8382,8 @@ fn rejects_oversized_approval_timeout() {
             "timeout_ms": 30001
         }
     }))
-    .expect_err("timeout_ms must be capped");
+    .err()
+    .expect("timeout_ms must be capped");
     assert!(err.contains("timeout_ms"));
 }
 
