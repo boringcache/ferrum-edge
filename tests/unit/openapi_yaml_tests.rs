@@ -4802,3 +4802,138 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
     assert!(guide.contains("never reflect the client-controlled User-Agent"));
     assert!(guide.contains("Native gRPC rejections instead use an empty-body HTTP 200"));
 }
+
+#[test]
+fn response_mock_schema_matches_strict_runtime_contract() {
+    use ferrum_edge::plugins::response_mock::{
+        RESPONSE_MOCK_CONFIG_KEYS, RESPONSE_MOCK_RULE_KEYS, ResponseMock,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/ResponseMockConfig")
+        .expect("ResponseMockConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["required"], json!(["rules"]));
+    let schema_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("ResponseMockConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fields: BTreeSet<_> = RESPONSE_MOCK_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(schema_fields, runtime_fields);
+
+    let rule = &schema["properties"]["rules"]["items"];
+    assert_eq!(rule["additionalProperties"], false);
+    assert_eq!(rule["required"], json!(["path"]));
+    let rule_fields: BTreeSet<_> = rule["properties"]
+        .as_object()
+        .expect("ResponseMock rule properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_rule_fields: BTreeSet<_> = RESPONSE_MOCK_RULE_KEYS.iter().copied().collect();
+    assert_eq!(rule_fields, runtime_rule_fields);
+
+    assert_eq!(rule["properties"]["path"]["minLength"], 1);
+    assert_eq!(rule["properties"]["method"]["minLength"], 1);
+    assert_eq!(rule["properties"]["status_code"]["minimum"], 100);
+    assert_eq!(rule["properties"]["status_code"]["maximum"], 599);
+    assert_eq!(
+        rule["properties"]["headers"]["additionalProperties"]["type"],
+        "string"
+    );
+
+    let description = schema["description"].as_str().expect("description");
+    assert!(description.contains("exact (`=`)"));
+    assert!(description.contains("host-only"));
+    assert!(description.contains("WebSocket"));
+    assert!(description.contains("frame stream"));
+    assert!(
+        rule["properties"]["path"]["description"]
+            .as_str()
+            .expect("path description")
+            .contains("exact (`=`)")
+    );
+    assert!(
+        rule["properties"]["method"]["description"]
+            .as_str()
+            .expect("method description")
+            .contains("HTTP method token")
+    );
+
+    for valid in [
+        json!({"rules": [{"path": "/health", "body": "ok"}]}),
+        json!({
+            "passthrough_on_no_match": true,
+            "rules": [{
+                "method": "GET",
+                "path": "/users",
+                "status_code": 100,
+                "headers": {"x-mock": "true", "content-type": "text/plain"},
+                "body": "ok",
+                "delay_ms": 0
+            }]
+        }),
+        json!({
+            "rules": [{
+                "path": "/api/v1",
+                "status_code": 599,
+                "body": "exact-listen-path"
+            }]
+        }),
+    ] {
+        assert_component_validity(&spec, "ResponseMockConfig", &valid, true);
+        assert!(
+            ResponseMock::new(&valid).is_ok(),
+            "schema-valid config unexpectedly failed runtime: {valid}"
+        );
+    }
+
+    for invalid in [
+        json!({
+            "passthrough_on_no_mach": true,
+            "rules": [{"path": "/health", "body": "ok"}]
+        }),
+        json!({
+            "rules": [{"path": "/health", "status_cod": 503, "body": "unavailable"}]
+        }),
+        json!({"rules": [{"path": "", "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "method": "", "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 99, "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 600, "body": "ok"}]}),
+        json!({"rules": [{"body": "missing-path"}]}),
+        json!({"rules": []}),
+        json!({}),
+        json!({
+            "rules": [{
+                "path": "/health",
+                "headers": {"x-mock": 42}
+            }]
+        }),
+    ] {
+        assert_component_validity(&spec, "ResponseMockConfig", &invalid, false);
+        assert!(
+            ResponseMock::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("Exact (`=/api/v1`)"));
+    assert!(guide.contains("Host-only"));
+    assert!(guide.contains("WebSocket handshake contract"));
+    assert!(guide.contains("never establishes an upgraded frame stream"));
+    assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
+
+    let matrix = include_str!("../../docs/plugin_execution_order.md");
+    assert!(
+        matrix.contains(
+            "| `response_mock` | ✓ | ✓ | ✓ | | | Short-circuits HTTP/gRPC and WebSocket upgrade handshakes"
+        ),
+        "protocol matrix must mark WebSocket support for response_mock"
+    );
+}

@@ -4,7 +4,7 @@
 //! - Compression (gzip response compression)
 //! - Response Caching (cache hit/miss, POST bypass)
 //! - GraphQL (depth limiting, introspection control)
-//! - Response Mock (mock rules, path scoping, passthrough)
+//! - Response Mock (mock rules, path scoping, passthrough, WebSocket handshake)
 //! - SOAP WS-Security (UsernameToken validation)
 //!
 //! All tests use database mode with SQLite + admin API to configure plugins.
