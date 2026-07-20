@@ -4103,6 +4103,17 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
                 }
             }]
         }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {
+                    "backoff": {
+                        "exponentiall": {"base_ms": 10, "max_ms": 100}
+                    }
+                }
+            }]
+        }),
     ] {
         assert_component_validity(
             &spec,
@@ -4122,6 +4133,16 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         spec.pointer("/components/schemas/MeshRouteBackendTlsConfig/additionalProperties"),
         Some(&json!(false)),
         "MeshRouteBackendTlsConfig must stay closed"
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/MeshRouteBackoffStrategy/oneOf/0/additionalProperties"),
+        Some(&json!(false)),
+        "fixed backoff wrapper must stay closed"
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/MeshRouteBackoffStrategy/oneOf/1/additionalProperties"),
+        Some(&json!(false)),
+        "exponential backoff wrapper must stay closed"
     );
     assert_eq!(
         spec.pointer(

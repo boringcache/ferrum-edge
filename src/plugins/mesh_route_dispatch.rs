@@ -474,6 +474,9 @@ struct RouteRetryConfig {
     retry_on_connect_failure: bool,
 }
 
+/// Externally tagged route-local backoff. Serde JSON enforces a single variant
+/// key, and each newtype payload is independently closed below; the enum-level
+/// attribute also records the strict boundary if its representation evolves.
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum RouteBackoffStrategy {
